@@ -13,6 +13,11 @@
   real logic is `apply_to_sign`, an inherent method needing a real `BlockEntity`, not ported) →
   `inksac.nim`; `glowing_ink_sac.rs`, same shape → `glowinginksac.nim`. Both genuinely runtime-run
   (`itemsbatch2test.nim`, `nimony c -r`), no `entity.nim` import needed, same bar as shield/arrow.
+  `knowledge_book.rs`'s second, unrelated struct `DiscFragmentItem` (empty `ItemBehaviour`, same
+  shape) → `discfragment.nim`, same runtime-run bar. A systematic scan (every `impl ItemBehaviour
+  for X` block reduced to just its method-name list) found exactly these 5 as-any-only impls in
+  the whole `items/` directory - `KnowledgeBookItem` itself (the other struct sharing that file)
+  needs `player.inventory()`, so it's not in this category.
 - `potion.rs` (209 lines), `items/*.rs` (52 files, ~6.4k lines) — concrete `ItemBehaviour` impls.
   **Mostly not ported.** Ported so far, as free-standing functions rather than through
   `ItemBehaviour` (see below): `dye.rs`'s `can_mine` → `dye.nim`; `swords.rs`'s `can_mine` →

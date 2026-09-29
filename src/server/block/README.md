@@ -227,3 +227,13 @@ not the whole module.
     `statePropValues`, actually run via `nimony c -r` for the check pass
     (same closures-through-vtables `nimony c -r` runtime caveat as every
     other file here).
+
+    Systematic scan for more of this shape: every `impl BlockBehaviour for
+    X` block in `blocks/` reduced to just its method-name list. The only
+    other `on_place`-only files are `glazed_terracotta.rs`/`logs.rs`
+    (already ported). `spreading_snowy_block.rs`'s `PodzolBlock`/
+    `MyceliumBlock` looked promising (`on_place` +
+    `get_state_for_neighbor_update` only) but their shared `SnowyBlock`
+    helper calls `world.get_block(&position.up())` - a real neighbor-block
+    query `worldstub.nim` doesn't expose, same wall `end_rod.rs` already
+    hit. No further free wins in this category right now.
