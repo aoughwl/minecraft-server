@@ -245,6 +245,30 @@ since `gen_attributes.nim` landed) - revisit once `data_component_impl` lands.
   unbounded-depth directory recursion - a genuinely bigger task than
   `chunk_view_lut`/`context_provider`'s one-level scans, deferred to a
   dedicated pass rather than rushed.
+- `noise_parameter.rs` → `gen_noise_parameter.nim` →
+  `src/generated/noise_parameter.nim`. Walks the real (flat, no
+  subdirectories) `assets/datapack/data/minecraft/worldgen/noise/`
+  directory (62 files), applies upstream's `first_octave`/`base_octave`
+  and `amplitudes`/`amplitude_modifiers`/`octave_count` fallback chains,
+  and precomputes each entry's MD5-derived `lo`/`hi` (upstream hashes
+  `"minecraft:<name>"` and reads the first/second 8 bytes as big-endian
+  u64s). **Found and worked around a real Nimony `std/json` bug**: the
+  `{}` object-lookup operator returns a default-constructed `JsonNode()`
+  on a missing key, and calling `.kind` (or nearly anything else) on that
+  default value crashes at runtime with an internal assertion failure -
+  `nimony check` passes clean, only `nimony c -r` catches it. Reproduced
+  standalone (`var n = JsonNode(); discard n.kind` alone crashes). Fixed
+  by adding `jsonTryGet(tree, key): (bool, JsonNode)` to
+  `codegenutil.nim`, which walks `pairs()` itself and never touches the
+  broken default - now the house way to look up an optional JSON key
+  across this whole codegen suite, not just this file. Documented here
+  since SendFeedback quota was exhausted this session; worth filing
+  upstream once quota resets. **Verified**: `noise_parametertest.nim`
+  (`nimony c -r`) checks the entry count (62), `aquifer_barrier`'s
+  fields including its `lo`/`hi` cross-checked byte-for-byte against
+  Python's `hashlib.md5` (`16244762748638791999`/`1391399305011792652`,
+  exact match), `temperature`'s `amplitude_modifiers` fallback path, and
+  a missing-key lookup correctly returning not-found.
 
 ## What's NOT done
 

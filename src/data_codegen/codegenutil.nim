@@ -191,6 +191,24 @@ proc readStringIntSeqMapSorted*(path: string): seq[(string, seq[int])] =
     cmp(a[0], b[0]))
   pairs
 
+proc jsonTryGet*(t: var JsonTree, key: string): (bool, JsonNode) =
+  ## Safe replacement for `t{key}` when the key may be absent. Nimony's
+  ## `std/json` `{}` operator returns a default-constructed `JsonNode()`
+  ## on a missing key, and calling `.kind` (or almost anything else) on
+  ## that default value crashes at runtime with an internal assertion
+  ## failure - `nimony check` doesn't catch it, `nimony c -r` does. This
+  ## walks the object's pairs itself and never constructs/touches that
+  ## broken default value: the returned `JsonNode` is only meaningful
+  ## when the `bool` is `true`. Reproduced standalone: `var n =
+  ## JsonNode(); discard n.kind` alone crashes at runtime.
+  var root = t.root
+  if kind(root) != JObject:
+    return (false, root)
+  for k, v in pairs(root):
+    if k == key:
+      return (true, v)
+  return (false, root)
+
 proc readStringIntMapSorted*(path: string): seq[(string, int)] =
   ## Port of `serde_json::from_str::<BTreeMap<String, uN>>(...)` - a
   ## `BTreeMap` iterates in ascending key order, so this sorts by name to
