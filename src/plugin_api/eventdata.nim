@@ -1436,3 +1436,309 @@ type
   MapInitializeEventData* = object
     ## No `cancelled` field in the WIT record.
     mapId*: int32
+
+  PigZapEventData* = object
+    entityId*: int32
+    lightningId*: int32
+    pigZombieId*: int32
+    cancelled*: bool
+
+  PigZombieAngerEventData* = object
+    ## `target-id: option<s32>` becomes a (hasX, x) pair.
+    entityId*: int32
+    hasTargetId*: bool
+    targetId*: int32
+    newAnger*: int32
+    cancelled*: bool
+
+  PlayerInputEventData* = object
+    player*: PlayerUuid
+    input*: string
+    cancelled*: bool
+
+  PlayerInteractAtEntityEventData* = object
+    player*: PlayerUuid
+    entityId*: int32
+    clickedX*: float64
+    clickedY*: float64
+    clickedZ*: float64
+    hand*: uint8
+    cancelled*: bool
+
+  PlayerLinksSendEventData* = object
+    player*: PlayerUuid
+    links*: seq[string]
+    cancelled*: bool
+
+  PlayerPickupArrowEventData* = object
+    player*: PlayerUuid
+    arrowId*: int32
+    cancelled*: bool
+
+  PlayerRecipeBookClickEventData* = object
+    player*: PlayerUuid
+    recipeId*: string
+    makeAll*: bool
+    cancelled*: bool
+
+  PlayerRecipeBookSettingsChangeEventData* = object
+    player*: PlayerUuid
+    bookType*: string
+    isOpen*: bool
+    isFiltering*: bool
+    cancelled*: bool
+
+  PlayerRecipeDiscoverEventData* = object
+    player*: PlayerUuid
+    recipeId*: string
+    cancelled*: bool
+
+  PlayerRegisterChannelEventData* = object
+    player*: PlayerUuid
+    channel*: string
+    cancelled*: bool
+
+  PlayerResourcePackStatusEventData* = object
+    player*: PlayerUuid
+    packId*: string
+    status*: string
+    cancelled*: bool
+
+  PlayerSpawnLocationEventData* = object
+    player*: PlayerUuid
+    spawnPos*: Vector3[float64]
+    cancelled*: bool
+
+  PlayerUnleashEntityEventData* = object
+    player*: PlayerUuid
+    entityId*: int32
+    cancelled*: bool
+
+  PlayerUnregisterChannelEventData* = object
+    player*: PlayerUuid
+    channel*: string
+    cancelled*: bool
+
+  PlayerVelocityEventData* = object
+    player*: PlayerUuid
+    velocity*: Vector3[float64]
+    cancelled*: bool
+
+  PortalCreateEventData* = object
+    pos*: BlockPos
+    portalType*: string
+    cancelled*: bool
+
+  PotionSplashEventData* = object
+    entityId*: int32
+    location*: BlockPos
+    potionItem*: string
+    affectedEntities*: seq[int32]
+    cancelled*: bool
+
+  PrepareAnvilEventData* = object
+    ## No `cancelled` field in the WIT record.
+    player*: PlayerUuid
+    renameText*: string
+    repairCost*: uint32
+
+  PrepareGrindstoneEventData* = object
+    ## No `cancelled` field in the WIT record.
+    player*: PlayerUuid
+    hasResultItem*: bool
+    resultItem*: string
+
+  PrepareInventoryResultEventData* = object
+    ## No `cancelled` field in the WIT record.
+    player*: PlayerUuid
+    hasResultItem*: bool
+    resultItem*: string
+
+  PrepareItemCraftEventData* = object
+    player*: PlayerUuid
+    recipeId*: string
+    cancelled*: bool
+
+  EnchantmentOffer* = object
+    cost*: int32
+    enchantmentId*: int32
+    enchantmentLevel*: int32
+
+  PrepareItemEnchantEventData* = object
+    player*: PlayerUuid
+    item*: string
+    offers*: seq[EnchantmentOffer]
+    bookshelfCount*: int32
+    cancelled*: bool
+
+  PrepareSmithingEventData* = object
+    ## No `cancelled` field in the WIT record.
+    player*: PlayerUuid
+    hasResultItem*: bool
+    resultItem*: string
+
+  RaidFinishEventData* = object
+    victory*: bool
+    cancelled*: bool
+
+  RaidSpawnWaveEventData* = object
+    wave*: uint32
+    pos*: BlockPos
+    cancelled*: bool
+
+  RaidStopEventData* = object
+    reason*: string
+    cancelled*: bool
+
+  RaidTriggerEventData* = object
+    pos*: BlockPos
+    cancelled*: bool
+
+  ServerBroadcastEventData* = object
+    ## `text-component` fields become plain strings pending a real
+    ## TextComponent port, matching the rest of this file.
+    message*: string
+    sender*: string
+    cancelled*: bool
+
+  ServerListPingEventData* = object
+    ## No `cancelled` field in the WIT record. `address` (a nested record
+    ## host/port) is flattened rather than given its own type, since it's
+    ## used nowhere else.
+    hostname*: string
+    addressHost*: string
+    addressPort*: uint16
+    motd*: string
+    maxPlayers*: uint32
+    numPlayers*: uint32
+    hasFavicon*: bool
+    favicon*: string
+
+  SmithItemEventData* = object
+    player*: PlayerUuid
+    recipeId*: string
+    cancelled*: bool
+
+  SpawnerSpawnEventData* = object
+    entityId*: int32
+    spawnerPos*: BlockPos
+    cancelled*: bool
+
+  StructureGrowEventData* = object
+    pos*: BlockPos
+    species*: string
+    boneMeal*: bool
+    cancelled*: bool
+
+  TradeSelectEventData* = object
+    player*: PlayerUuid
+    slotIndex*: uint8
+    cancelled*: bool
+
+  TrialSpawnerSpawnEventData* = object
+    entityId*: int32
+    spawnerPos*: BlockPos
+    cancelled*: bool
+
+  VehicleBlockCollisionEventData* = object
+    vehicleId*: int32
+    blockPos*: BlockPos
+    cancelled*: bool
+
+  VehicleCollisionEventData* = object
+    vehicleId*: int32
+    cancelled*: bool
+
+  VehicleCreateEventData* = object
+    vehicleId*: int32
+    cancelled*: bool
+
+  VehicleDamageEventData* = object
+    vehicleId*: int32
+    damage*: float32
+    hasAttackerId*: bool
+    attackerId*: int32
+    cancelled*: bool
+
+  VehicleDestroyEventData* = object
+    vehicleId*: int32
+    hasAttackerId*: bool
+    attackerId*: int32
+    cancelled*: bool
+
+  VehicleEnterEventData* = object
+    vehicleId*: int32
+    enteredId*: int32
+    cancelled*: bool
+
+  VehicleEntityCollisionEventData* = object
+    vehicleId*: int32
+    collidedEntityId*: int32
+    cancelled*: bool
+
+  VehicleExitEventData* = object
+    vehicleId*: int32
+    exitedId*: int32
+    cancelled*: bool
+
+  VehicleMoveEventData* = object
+    vehicleId*: int32
+    fromPosition*: Vector3[float64]
+    toPosition*: Vector3[float64]
+    cancelled*: bool
+
+  VehicleUpdateEventData* = object
+    vehicleId*: int32
+    cancelled*: bool
+
+  VillagerAcquireTradeEventData* = object
+    entityId*: int32
+    recipeIndex*: int32
+    cancelled*: bool
+
+  VillagerCareerChangeEventData* = object
+    entityId*: int32
+    profession*: string
+    reason*: string
+    cancelled*: bool
+
+  VillagerReplenishTradeEventData* = object
+    entityId*: int32
+    restockQuantity*: int32
+    cancelled*: bool
+
+  VillagerReputationChangeEventData* = object
+    entityId*: int32
+    targetId*: int32
+    reputationChange*: int32
+    cancelled*: bool
+
+  WardenAngerChangeEventData* = object
+    entityId*: int32
+    targetId*: int32
+    oldAnger*: int32
+    newAnger*: int32
+    cancelled*: bool
+
+  WorldSaveEventData* = object
+    worldName*: string
+    cancelled*: bool
+
+  SculkBloomEventData* = object
+    ## `target-world: %world` dropped, per this file's established
+    ## convention.
+    blockPos*: BlockPos
+    charge*: int32
+    cancelled*: bool
+
+  VaultDisplayItemEventData* = object
+    ## `target-world: %world` dropped, per this file's established
+    ## convention.
+    blockPos*: BlockPos
+    item*: string
+    cancelled*: bool
+
+  # WorldInitEventData is NOT ported: its only field is `target-world:
+  # %world`, and dropping %world fields (the established convention
+  # throughout this file, to stay independent of an addressable-world
+  # concept that doesn't exist yet) leaves nothing behind to model.

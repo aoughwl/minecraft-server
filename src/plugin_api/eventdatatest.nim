@@ -802,4 +802,161 @@ assert lootGenData.lootTable.len > 0
 let mapInitData = MapInitializeEventData(mapId: 1'i32)
 assert mapInitData.mapId == 1'i32
 
+let pigZapData = PigZapEventData(entityId: 60'i32, lightningId: 61'i32, pigZombieId: 62'i32, cancelled: false)
+assert pigZapData.pigZombieId == 62'i32
+
+let pigZombieAngerData = PigZombieAngerEventData(entityId: 60'i32, hasTargetId: true, targetId: 1'i32, newAnger: 400'i32, cancelled: false)
+assert pigZombieAngerData.newAnger == 400'i32
+
+let playerInputData = PlayerInputEventData(player: p1, input: "forward", cancelled: false)
+assert playerInputData.input == "forward"
+
+let interactAtData = PlayerInteractAtEntityEventData(player: p1, entityId: 63'i32, clickedX: 0.5, clickedY: 0.5, clickedZ: 0.5, hand: 0'u8, cancelled: false)
+assert interactAtData.entityId == 63'i32
+
+let linksSendData = PlayerLinksSendEventData(player: p1, links: @["https://example.invalid"], cancelled: false)
+assert linksSendData.links.len == 1
+
+let pickupArrowData = PlayerPickupArrowEventData(player: p1, arrowId: 64'i32, cancelled: false)
+assert pickupArrowData.arrowId == 64'i32
+
+let recipeBookClickData = PlayerRecipeBookClickEventData(player: p1, recipeId: "minecraft:stick", makeAll: false, cancelled: false)
+assert recipeBookClickData.recipeId == "minecraft:stick"
+
+let recipeBookSettingsData = PlayerRecipeBookSettingsChangeEventData(player: p1, bookType: "crafting", isOpen: true, isFiltering: false, cancelled: false)
+assert recipeBookSettingsData.isOpen == true
+
+let recipeDiscoverData = PlayerRecipeDiscoverEventData(player: p1, recipeId: "minecraft:torch", cancelled: false)
+assert recipeDiscoverData.recipeId == "minecraft:torch"
+
+let registerChannelData = PlayerRegisterChannelEventData(player: p1, channel: "minecraft:brand", cancelled: false)
+assert registerChannelData.channel == "minecraft:brand"
+
+let resourcePackStatusData = PlayerResourcePackStatusEventData(player: p1, packId: "pack1", status: "loaded", cancelled: false)
+assert resourcePackStatusData.status == "loaded"
+
+let spawnLocationData = PlayerSpawnLocationEventData(player: p1, spawnPos: Vector3[float64](x: 0.0, y: 64.0, z: 0.0), cancelled: false)
+assert spawnLocationData.spawnPos.y == 64.0
+
+let unleashEntityData = PlayerUnleashEntityEventData(player: p1, entityId: 65'i32, cancelled: false)
+assert unleashEntityData.entityId == 65'i32
+
+let unregisterChannelData = PlayerUnregisterChannelEventData(player: p1, channel: "minecraft:brand", cancelled: false)
+assert unregisterChannelData.channel == "minecraft:brand"
+
+let velocityData = PlayerVelocityEventData(player: p1, velocity: Vector3[float64](x: 0.0, y: 0.0, z: 0.0), cancelled: false)
+assert velocityData.velocity.x == 0.0
+
+let portalCreateData = PortalCreateEventData(pos: bp1, portalType: "nether", cancelled: false)
+assert portalCreateData.portalType == "nether"
+
+let potionSplashData = PotionSplashEventData(entityId: 66'i32, location: bp1, potionItem: "minecraft:potion", affectedEntities: @[1'i32, 2'i32], cancelled: false)
+assert potionSplashData.affectedEntities.len == 2
+
+let prepareAnvilData = PrepareAnvilEventData(player: p1, renameText: "Sword", repairCost: 5'u32)
+assert prepareAnvilData.repairCost == 5'u32
+
+let prepareGrindstoneData = PrepareGrindstoneEventData(player: p1, hasResultItem: true, resultItem: "minecraft:iron_sword")
+assert prepareGrindstoneData.hasResultItem == true
+
+let prepareInvResultData = PrepareInventoryResultEventData(player: p1, hasResultItem: false, resultItem: "")
+assert prepareInvResultData.hasResultItem == false
+
+let prepareItemCraftData = PrepareItemCraftEventData(player: p1, recipeId: "minecraft:chest", cancelled: false)
+assert prepareItemCraftData.recipeId == "minecraft:chest"
+
+let offer1 = EnchantmentOffer(cost: 10'i32, enchantmentId: 5'i32, enchantmentLevel: 2'i32)
+let prepareEnchantData = PrepareItemEnchantEventData(player: p1, item: "minecraft:diamond_sword", offers: @[offer1], bookshelfCount: 15'i32, cancelled: false)
+assert prepareEnchantData.offers.len == 1
+
+let prepareSmithingData = PrepareSmithingEventData(player: p1, hasResultItem: true, resultItem: "minecraft:netherite_sword")
+assert prepareSmithingData.hasResultItem == true
+
+let raidFinishData = RaidFinishEventData(victory: true, cancelled: false)
+assert raidFinishData.victory == true
+
+let raidSpawnWaveData = RaidSpawnWaveEventData(wave: 1'u32, pos: bp1, cancelled: false)
+assert raidSpawnWaveData.wave == 1'u32
+
+let raidStopData = RaidStopEventData(reason: "victory", cancelled: false)
+assert raidStopData.reason == "victory"
+
+let raidTriggerData = RaidTriggerEventData(pos: bp1, cancelled: false)
+assert raidTriggerData.cancelled == false
+
+let sculkBloomData = SculkBloomEventData(blockPos: bp1, charge: 3'i32, cancelled: false)
+assert sculkBloomData.charge == 3'i32
+
+let serverBroadcastData = ServerBroadcastEventData(message: "hello", sender: "server", cancelled: false)
+assert serverBroadcastData.message == "hello"
+
+let serverListPingData = ServerListPingEventData(hostname: "localhost", addressHost: "127.0.0.1", addressPort: 25565'u16, motd: "A Server", maxPlayers: 20'u32, numPlayers: 1'u32, hasFavicon: false, favicon: "")
+assert serverListPingData.addressPort == 25565'u16
+
+let smithItemData = SmithItemEventData(player: p1, recipeId: "minecraft:netherite_upgrade", cancelled: false)
+assert smithItemData.recipeId == "minecraft:netherite_upgrade"
+
+let spawnerSpawnData = SpawnerSpawnEventData(entityId: 67'i32, spawnerPos: bp1, cancelled: false)
+assert spawnerSpawnData.entityId == 67'i32
+
+let structureGrowData = StructureGrowEventData(pos: bp1, species: "oak", boneMeal: true, cancelled: false)
+assert structureGrowData.boneMeal == true
+
+let tradeSelectData = TradeSelectEventData(player: p1, slotIndex: 2'u8, cancelled: false)
+assert tradeSelectData.slotIndex == 2'u8
+
+let trialSpawnerData = TrialSpawnerSpawnEventData(entityId: 68'i32, spawnerPos: bp1, cancelled: false)
+assert trialSpawnerData.entityId == 68'i32
+
+let vaultDisplayData = VaultDisplayItemEventData(blockPos: bp1, item: "minecraft:emerald", cancelled: false)
+assert vaultDisplayData.item == "minecraft:emerald"
+
+let vehicleBlockCollisionData = VehicleBlockCollisionEventData(vehicleId: 70'i32, blockPos: bp1, cancelled: false)
+assert vehicleBlockCollisionData.vehicleId == 70'i32
+
+let vehicleCollisionData = VehicleCollisionEventData(vehicleId: 70'i32, cancelled: false)
+assert vehicleCollisionData.cancelled == false
+
+let vehicleCreateData = VehicleCreateEventData(vehicleId: 70'i32, cancelled: false)
+assert vehicleCreateData.vehicleId == 70'i32
+
+let vehicleDamageData = VehicleDamageEventData(vehicleId: 70'i32, damage: 2.0'f32, hasAttackerId: true, attackerId: 71'i32, cancelled: false)
+assert vehicleDamageData.damage == 2.0'f32
+
+let vehicleDestroyData = VehicleDestroyEventData(vehicleId: 70'i32, hasAttackerId: false, attackerId: 0'i32, cancelled: false)
+assert vehicleDestroyData.hasAttackerId == false
+
+let vehicleEnterData = VehicleEnterEventData(vehicleId: 70'i32, enteredId: 72'i32, cancelled: false)
+assert vehicleEnterData.enteredId == 72'i32
+
+let vehicleEntityCollisionData = VehicleEntityCollisionEventData(vehicleId: 70'i32, collidedEntityId: 73'i32, cancelled: false)
+assert vehicleEntityCollisionData.collidedEntityId == 73'i32
+
+let vehicleExitData = VehicleExitEventData(vehicleId: 70'i32, exitedId: 72'i32, cancelled: false)
+assert vehicleExitData.exitedId == 72'i32
+
+let vehicleMoveData = VehicleMoveEventData(vehicleId: 70'i32, fromPosition: Vector3[float64](x: 0.0, y: 64.0, z: 0.0), toPosition: Vector3[float64](x: 1.0, y: 64.0, z: 0.0), cancelled: false)
+assert vehicleMoveData.toPosition.x == 1.0
+
+let vehicleUpdateData = VehicleUpdateEventData(vehicleId: 70'i32, cancelled: false)
+assert vehicleUpdateData.vehicleId == 70'i32
+
+let villagerAcquireData = VillagerAcquireTradeEventData(entityId: 74'i32, recipeIndex: 0'i32, cancelled: false)
+assert villagerAcquireData.entityId == 74'i32
+
+let villagerCareerData = VillagerCareerChangeEventData(entityId: 74'i32, profession: "farmer", reason: "employed", cancelled: false)
+assert villagerCareerData.profession == "farmer"
+
+let villagerReplenishData = VillagerReplenishTradeEventData(entityId: 74'i32, restockQuantity: 2'i32, cancelled: false)
+assert villagerReplenishData.restockQuantity == 2'i32
+
+let villagerReputationData = VillagerReputationChangeEventData(entityId: 74'i32, targetId: 1'i32, reputationChange: 5'i32, cancelled: false)
+assert villagerReputationData.reputationChange == 5'i32
+
+let wardenAngerData = WardenAngerChangeEventData(entityId: 75'i32, targetId: 1'i32, oldAnger: 10'i32, newAnger: 20'i32, cancelled: false)
+assert wardenAngerData.newAnger == 20'i32
+
+let worldSaveData = WorldSaveEventData(worldName: "world", cancelled: false)
+assert worldSaveData.worldName == "world"
+
 echo "all eventdata checks passed"

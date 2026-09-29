@@ -37,10 +37,36 @@ is settled, not the generated output by hand.
 - `permissions.nim` - the plugin sandbox capability-string constants
   (`network.*`, `fs.*`, `sys.*`, `http.outbound`). Pure data, no `wit`
   dependency. `nimony check` clean.
-- `eventdata.nim` - a real server-side `EventData` model, now for 203 events
-  (~203 of ~273 real `-event-data` WIT records covered; see the file's own
-  count against `event.wit` for the exact current tally).
-  Latest batch (33 new): `AreaEffectCloudApply`/`ArrowBodyCountChange`/
+- `eventdata.nim` - a real server-side `EventData` model, now covering
+  271 of the 273 real `-event-data` WIT records - **this closes out the
+  full list**. Only two are deliberately not ported: `PacketReceived`/
+  `PacketSent` (need a full packet-variant sum type spanning
+  src/protocol/'s concrete packet procs, which doesn't exist as one enum
+  yet) and `WorldInit` (its only field is `target-world: %world`, and
+  dropping `%world` fields per this file's established convention leaves
+  nothing behind to model - `SculkBloom`/`VaultDisplayItem` also had a
+  `%world` field but real non-`%world` content too, so those *are* ported).
+  Final batch (55 new, closing out the list): `PigZap`/`PigZombieAnger`/
+  `PlayerInput`/`PlayerInteractAtEntity`/`PlayerLinksSend`/
+  `PlayerPickupArrow`/`PlayerRecipeBookClick`/
+  `PlayerRecipeBookSettingsChange`/`PlayerRecipeDiscover`/
+  `PlayerRegisterChannel`/`PlayerResourcePackStatus`/`PlayerSpawnLocation`/
+  `PlayerUnleashEntity`/`PlayerUnregisterChannel`/`PlayerVelocity`/
+  `PortalCreate`/`PotionSplash`/`PrepareAnvil`/`PrepareGrindstone`/
+  `PrepareInventoryResult`/`PrepareItemCraft`/`PrepareItemEnchant`
+  (introduces a small `EnchantmentOffer` helper object)/`PrepareSmithing`/
+  `RaidFinish`/`RaidSpawnWave`/`RaidStop`/`RaidTrigger`/`SculkBloom`/
+  `ServerBroadcast`/`ServerListPing`/`SmithItem`/`SpawnerSpawn`/
+  `StructureGrow`/`TradeSelect`/`TrialSpawnerSpawn`/`VaultDisplayItem`/
+  `VehicleBlockCollision`/`VehicleCollision`/`VehicleCreate`/
+  `VehicleDamage`/`VehicleDestroy`/`VehicleEnter`/`VehicleEntityCollision`/
+  `VehicleExit`/`VehicleMove`/`VehicleUpdate`/`VillagerAcquireTrade`/
+  `VillagerCareerChange`/`VillagerReplenishTrade`/
+  `VillagerReputationChange`/`WardenAngerChange`/`WorldSave`.
+  `nimony check` clean, and `eventdatatest.nim` extended and **actually
+  run** (`nimony c -r`) - "all eventdata checks passed" - genuine runtime
+  proof, same as every prior batch (no `entity.nim` dependency).
+  Previous batch (33 new): `AreaEffectCloudApply`/`ArrowBodyCountChange`/
   `AsyncStructureGenerate`/`AsyncStructureSpawn`/`BatToggleSleep`/
   `BedrockFormResponse`/`BellResonate`/`BlockDamageAbort`/
   `BlockDispenseArmor`/`BlockDispense`/`BlockDispenseLoot`/
@@ -135,9 +161,11 @@ is settled, not the generated output by hand.
   closure-through-vtable runtime crash documented in
   `src/server/entity/README.md`).
 
-The remaining ~112 `events/*.rs` files are mechanical follow-ups once
-someone wants them: same WIT-record-to-Nimony-object translation
-`eventdata.nim` already demonstrates, just more of them.
+The `EventData` model is now complete (see above) - what's NOT ported is
+each individual `events/*.rs` WASM-guest wrapper file itself (the ~230
+`FromIntoEvent` shims converting between `eventdata.nim`'s equivalent
+and the real `wit::...::EventData` type), since those need the WASM-guest
+binding layer question resolved first (see the top of this file).
 
 ## Not ported
 
