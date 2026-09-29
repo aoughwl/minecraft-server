@@ -154,6 +154,29 @@ Smallest/most self-contained crates first, since later crates depend on them:
     the brigadier-style command tree/dispatcher, SNBT parsing) — see
     `src/command/lib.nim`'s doc comment for why that's a design decision
     to make once, not a mechanical per-file port.
+    **inventory: core interface + a couple of leaves ported** to
+    `src/inventory/*.nim` (6 files, all `nimony check` clean):
+    `error.rs`→`invbase.nim`, `window_property.rs`→`window_property.nim`,
+    `viewer.rs`→`viewer.nim`, `inventory/inventory.rs`→`inventory.nim`
+    (the core `Inventory`/`Clearable` trait plus the NBT slot-array sync
+    helpers), `double.rs`→`double.nim`. `itemstub.nim` is a placeholder
+    `Item`/`ItemStack` (id + count only) standing in for
+    `pumpkin_data::item`/`item_stack`, which don't exist yet — every
+    proc taking/returning `ItemStack` here will need revisiting once
+    `pumpkin-data`'s real item model lands. Nimony has no trait objects
+    (single dispatch, no `dyn Trait`), so `Inventory` is a ref object
+    holding a manual vtable of proc fields (each field/closure needs
+    `{.closure.}` - a Nimony compiler-internal AssertionDefect surfaced
+    when a vtable-field call wasn't marked, so every closure assigned to
+    an `Inventory` field is now explicit about it) rather than a trait;
+    concrete inventories (simple/player/double) fill in the vtable.
+    10,287 of ~11k LOC in the crate remain: `slot.rs`, `screen_handler.rs`
+    (1.3k, the big one), all the per-container `*_screen_handler.rs`
+    files, `crafting/`, `player/`, `brewing/`, `furnace_like/`,
+    `enchanting/`, `anvil/`, `merchant/`, `container_click.rs`,
+    `drag_handler.rs`, `sync_handler.rs`, `gui_builder.rs`,
+    `entity_equipment.rs` — all need either the real item/registry
+    types, `Player`/`World` types from the main `pumpkin` crate, or both.
 11. `pumpkin` (main server crate, ~269k LOC)
 12. `pumpkin-data` (~1.5M LOC — almost entirely generated block/item/registry
    tables; port the generator, not the generated output, once the shape of
