@@ -23,7 +23,23 @@
   `ItemBehaviour` (see below): `dye.rs`'s `can_mine` → `dye.nim`; `swords.rs`'s `can_mine` →
   `swords.nim`; `mace.rs`'s `can_mine` → `mace.nim`; `shield.rs`'s id set (an empty behaviour
   otherwise) → `shield.nim`; `arrow.rs`'s id set (also empty) → `arrow.nim`. `clock.rs` (needs
-  `World.playSound`), `egg.rs` (needs `World`/`spawnEntity`) checked and confirmed still blocked.
+  `World.playSound`) still checked and confirmed blocked (needs a real clock-animation
+  time-of-day/lodestone-compass query, not just `playSound`). `snowball.rs`'s full `normal_use`
+  → `snowball.nim`; `egg.rs`'s full `normal_use` (including `EggEntity.set_item_stack`
+  propagation) → `egg.nim` — both unblocked now that `worldstub.nim` has `spawnEntity`/
+  `playSound` and `entity.nim`'s `Player` has `position()`/`rotation()`/`heldItem()`/
+  `setHeldItem()`/`offHandItem()`/`setStackInHand()`/`decrementUnlessCreative()` (all new this
+  pass, following upstream's `PlayerInventory`/`ItemStack` call shape but backed by the minimal
+  `mainHandItem`/`offHandItem` fields this port has instead of a full hotbar). `ender_pearl.rs`
+  is the same shape again (teleport-on-hit aside, which needs `World.teleport`) - not done this
+  pass, a natural next proof case.
+  Real `Player.world()` doesn't exist (no per-player world reference yet) - both new procs take
+  `world: World` as an explicit parameter instead.
+  Verified via `eggsnowballtest.nim`: real `Player`/`World` state, spot-checked recorded
+  sound/spawn events and stack decrement/creative-mode/main-hand-then-off-hand-fallback logic
+  against upstream's exact semantics. `nimony check` clean; `nimony c -r` confirmed (not
+  assumed) to hit the closures-through-vtables crash via `entity.nim` - check-verified, not
+  runtime-proven, same as every other file here that touches `Player`.
 
 ## What's ported
 

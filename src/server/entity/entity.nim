@@ -42,6 +42,7 @@ import ../../nbt/tag      # NbtCompound
 import ../../generated/entity_pose
 import ../../util/gamemode
 import ../../inventory/inventory
+import ../../inventory/itemstub
 
 type
   RemovalReason* = enum
@@ -140,6 +141,13 @@ type
       ## is typed as the base `Inventory` interface so callers that only
       ## need generic inventory ops can use it once a concrete player
       ## inventory exists, same as any other `Inventory` implementor)
+    mainHandItem*: ItemStack  ## upstream `PlayerInventory.held_item()`/
+      ## `set_held_item()` - a real player inventory has a hotbar with a
+      ## selected-slot index, not just one bare main-hand slot; this is a
+      ## minimal stand-in (same "held item slot concept" gap the
+      ## egg/ender_pearl/snowball items were blocked on) rather than that
+      ## full layout, following this port's placeholder-type house style.
+    offHandItem*: ItemStack  ## upstream `PlayerInventory.off_hand_item()`
 
 # --- Entity's own behaviour (the `impl Entity` blocks, not the trait) ------
 
@@ -270,3 +278,42 @@ proc getScoreboardName*(eb: EntityBase): string =
     player.gameProfileName
   else:
     getEntity(eb).entityUuid
+
+# --- Player convenience accessors (upstream `player.rs`'s call shape) ------
+
+proc position*(p: Player): Vector3[float64] {.inline.} =
+  ## Port of `Player::position()`.
+  p.livingEntity.entity.pos
+
+proc rotation*(p: Player): (float32, float32) {.inline.} =
+  ## Port of `Player::rotation()`, returning `(yaw, pitch)`.
+  (p.livingEntity.entity.yaw, p.livingEntity.entity.pitch)
+
+proc getEntity*(p: Player): Entity {.inline.} =
+  p.livingEntity.entity
+
+proc heldItem*(p: Player): ItemStack {.inline.} =
+  ## Port of `PlayerInventory::held_item()`.
+  p.mainHandItem
+
+proc setHeldItem*(p: Player, stack: ItemStack) {.inline.} =
+  ## Port of `PlayerInventory::set_held_item()`.
+  p.mainHandItem = stack
+
+proc offHandItem*(p: Player): ItemStack {.inline.} =
+  ## Port of `PlayerInventory::off_hand_item()`.
+  p.offHandItem
+
+proc setStackInHand*(p: Player, offHand: bool, stack: ItemStack) =
+  ## Port of `PlayerInventory::set_stack_in_hand()`. Takes a plain
+  ## `offHand: bool` rather upstream's `pumpkin_util::Hand` - `itembehaviour.nim`
+  ## defines its own `Hand` enum but imports this module, so importing it
+  ## back here to match upstream's parameter type would be circular.
+  if offHand: p.offHandItem = stack
+  else: p.mainHandItem = stack
+
+proc decrementUnlessCreative*(s: var ItemStack, mode: GameMode, amount: uint8) =
+  ## Port of `ItemStack::decrement_unless_creative` - creative mode is
+  ## infinite-supply, so a creative player's stack is never actually spent.
+  if mode != Creative:
+    decrement(s, amount)
