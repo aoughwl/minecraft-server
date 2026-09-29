@@ -81,8 +81,11 @@ the same way (`nimony c -r src/data_codegen/gen_<name>.nim`, output
 
 - `gen_chunk_status.nim` → `ChunkStatus` (10 variants, from `chunk_status.json`, a flat string array), plus `chunkStatusToWireName` standing in for upstream's `#[serde(rename = "minecraft:<status>")]`
 - `gen_flower_pot_transformations.nim` → `getPottedItem(itemId: uint16): uint16` (from `flower_pot_transformations.json`, an item-id->potted-block-id map), returning the raw block id since the `BlockId` wrapper type doesn't exist yet
+- `gen_game_event.nim` → `GameEvent` (61 variants, from `game_event.json`, a flat string array)
+- `gen_map_color.nim` → `MapColor` object + named constants (64 entries, from `map_colors.json`, an array of `{id,name,col,hex,rgb}` objects) - added `readMapColors`/`toShoutySnakeCase` to `codegenutil.nim`; also the first generator needing object-array (not flat-array or string-map) JSON, which surfaced that Nimony's `std/json` `JsonNode` has no `[]` field-index operator - object field lookup means scanning `pairs()` for the matching key, documented in `readMapColors`'s doc comment
+- `gen_statistic.nim` → `StatisticCategory` (9 variants, explicit `i32` discriminants) + `CustomStatistic` (156 variants) from `stats.json`'s nested `{category: {id, entries: {stat: {id}}}}` shape - read directly via `JsonNode.pairs()` rather than a `codegenutil` helper since the nesting is one-off; JSON object key order is preserved by `pairs()` (matches upstream's `IndexMap` insertion-order semantics, unlike the `BTreeMap`-sorted helpers used elsewhere)
 
-That's 8/90 submodules done.
+That's 11/90 submodules done.
 
 ## What's NOT done
 

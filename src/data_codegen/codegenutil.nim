@@ -45,6 +45,43 @@ proc readIntIntMapSorted*(path: string): seq[(int, int)] =
     cmp(a[0], b[0]))
   pairs
 
+type
+  MapColorEntry* = object
+    id*: int
+    name*: string
+    col*: int
+    r*, g*, b*: int
+
+proc readMapColors*(path: string): seq[MapColorEntry] =
+  ## Port of `serde_json::from_str::<Vec<MapColorEntry>>(...)` for
+  ## map_colors.json's `[{id,name,col,hex,rgb:[r,g,b]}, ...]` shape.
+  ## `JsonNode` has no `[]` field-index operator in Nimony's std/json - only
+  ## `items`/`pairs` iterators - so object field lookup means scanning
+  ## `pairs()` for the matching key.
+  var tree = parseFile(path)
+  let arr = root(tree)
+  result = @[]
+  for elem in arr:
+    var entry = MapColorEntry(id: 0, name: "", col: 0, r: 0, g: 0, b: 0)
+    for key, val in elem.pairs():
+      case key
+      of "id": entry.id = int(val.getInt())
+      of "name": entry.name = val.getStr()
+      of "col": entry.col = int(val.getInt())
+      of "rgb":
+        var rgbVals: seq[int] = @[]
+        for v in val.items():
+          rgbVals.add(int(v.getInt()))
+        entry.r = rgbVals[0]
+        entry.g = rgbVals[1]
+        entry.b = rgbVals[2]
+      else: discard
+    result.add(entry)
+
+proc toShoutySnakeCase*(s: string): string =
+  ## Port of `heck::ToShoutySnakeCase`.
+  result = toUpperAscii(s).replace("-", "_").replace(" ", "_")
+
 proc readStringIntMapSorted*(path: string): seq[(string, int)] =
   ## Port of `serde_json::from_str::<BTreeMap<String, uN>>(...)` - a
   ## `BTreeMap` iterates in ascending key order, so this sorts by name to
