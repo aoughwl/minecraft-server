@@ -148,3 +148,30 @@ simplest cases (`structure_void.rs`, `slime.rs`) become portable:
    each method needs.
 3. A `registerBlock(name, behaviour)`-style plain call replacing the
    `#[pumpkin_block(name)]` macro's registration codegen.
+
+(Items 2-3 have since landed - see `src/server/block/blockbehaviour.nim`.
+Item 1 landed as `src/server/world/worldstub.nim` - see its own doc comment
+for scope. `Player` was also extended with `gamemode: GameMode` and
+`inventory: nil Inventory` fields to unblock the item leaf cases
+`src/server/item/README.md` found blocked.)
+
+## A THIRD independent confirmation, with a further refinement
+
+`src/server/world/worldstubtest.nim` (imports only `worldstub.nim`, which
+does NOT import `entity.nim`) runs clean end-to-end via `nimony c -r` - real
+proof the World stub's block-state math is correct, including the
+negative-coordinate floor-division case.
+
+`src/server/item/dyetest.nim`, by contrast - which imports `dye.nim`, which
+imports `entity.nim` for the `Player` type, but constructs no `EntityBase`
+and calls no closure at all - still crashes at `nimony c -r` with the same
+`eraiser.nim`/`ParamsTagId` assertion. This sharpens the "reachable, not
+executed" finding above even further: the crash isn't gated on *this file*
+containing closure-vtable-constructing code being reachable - it's
+sufficient for *any transitively imported module* (here, `entity.nim`,
+several imports away) to define such code, even when the importing file
+itself never touches it. Practically: **nothing that imports `entity.nim`
+can currently be runtime-verified via `nimony c -r`, full stop** - not just
+code that builds or calls an `EntityBase`. `dyeCanMine` itself is `nimony
+check`-clean and correct by inspection (one enum comparison), but is not,
+and currently cannot be, runtime-proven.

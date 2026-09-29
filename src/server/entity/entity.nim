@@ -40,6 +40,8 @@ import ../../world/tick   # BlockPos stand-in
 import ../../util/vector3
 import ../../nbt/tag      # NbtCompound
 import ../../generated/entity_pose
+import ../../util/gamemode
+import ../../inventory/inventory
 
 type
   RemovalReason* = enum
@@ -128,10 +130,16 @@ type
 
   Player* = ref object
     ## Port of `player.rs`'s `Player` (heavily trimmed - the real one is
-    ## thousands of lines of inventory/gamemode/permission/network state,
-    ## none of which is ported yet). Wraps a `LivingEntity`.
+    ## thousands of lines of inventory/permission/network state, none of
+    ## which is ported yet beyond what's here). Wraps a `LivingEntity`.
     livingEntity*: LivingEntity
     gameProfileName*: string   ## stands in for `gameprofile.name`
+    gamemode*: GameMode
+    inventory*: nil Inventory  ## upstream `player.inventory` (real player
+      ## inventory type still unported - see src/inventory/README.md; this
+      ## is typed as the base `Inventory` interface so callers that only
+      ## need generic inventory ops can use it once a concrete player
+      ## inventory exists, same as any other `Inventory` implementor)
 
 # --- Entity's own behaviour (the `impl Entity` blocks, not the trait) ------
 
