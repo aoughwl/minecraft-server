@@ -19,6 +19,13 @@ for the full terms and attribution. A local clone of the upstream source
 Smallest/most self-contained crates first, since later crates depend on them:
 
 1. `nbt` (~3.1k LOC) — NBT tag model, (de)serialization. **In progress.**
+   Gzip-compressed NBT (`nbt_compress.rs` → `src/nbt/nbt_compress.nim`) is
+   now wired to the `../compress` library and compiles clean, with a
+   round-trip test in `src/nbt/gziptest.nim` - but not proven at runtime
+   here: `compress` binds `libz.so.1` by that literal Linux name, which
+   doesn't resolve on this Windows dev machine, and a deeper ABI mismatch
+   surfaced even after working around the name. Expected to work on the
+   project's real Linux deployment target; re-verify there.
 2. `util` (~15.6k LOC) — **In progress.** Ported so far:
    `math/vertical_surface_type.rs`, `resource_location.rs`, `resource.rs`,
    `identifier.rs`, `difficulty.rs`, `gamemode.rs`, `y_offset.rs`,
@@ -51,10 +58,13 @@ Smallest/most self-contained crates first, since later crates depend on them:
    a security-critical root-key constant sourced properly, not guessed),
    RS256 (needs RSA, not yet in `../jwt`), and the issuer-checked/JWKS-
    fetching OIDC path (needs both RS256 and an HTTP client). `client.rs`
-   (reqwest/rustls HTTP client glue) remains skipped outright: no Nimony
-   HTTP+TLS client to build on yet — though `github.com/aoughwl/net` +
-   `.../tls` now exist and are the real path forward there, unintegrated
-   so far. See doc comments in `src/auth/jwt.nim` / `src/auth/client.nim`.
+   → `src/auth/client.nim` is now wired to the `requests` library
+   (`../requests`, curl-impersonate-based) via `nimony.paths`, but is
+   currently **blocked from compiling**: `requests`'s own `profiles.nim`
+   hits a Nimony const-eval limitation unrelated to this port (a `seq`
+   literal inside a `const array` of objects) - not fixed here since that
+   sibling repo wasn't in scope. See doc comments in `src/auth/jwt.nim` /
+   `src/auth/client.nim`.
 5. `scheduler` (~662 LOC) — **Data model done, driver deferred.**
    `domain.rs`, `error.rs`, and the pure-data parts of `task.rs`/
    `scheduler.rs` (`SchedulerTaskId`, `TaskContext`, `SchedulerConfig`,

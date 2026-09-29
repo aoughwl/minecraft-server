@@ -1,30 +1,63 @@
 ## Helpers for reading and writing gzip-compressed NBT data.
 ## Port of upstream/nbt/src/nbt_compress.rs
 ##
-## TODO(unblocked-but-unimplemented): Nimony's stdlib (`~/nimony/lib/std/`)
-## has no gzip/zlib/deflate module at all (checked: no `zip`, `gzip`,
-## `zlib`, or `compress` file anywhere under it), unlike Rust's `flate2`
-## which this crate leans on directly. Two real options once this is
-## needed for real chunk/playerdata I/O:
-##   1. FFI-bind zlib (`{.importc.}`/`{.header: "zlib.h".}` against the
-##      system zlib, which the C backend can already link against - Java
-##      Edition's region/playerdata files are gzip- or zlib-wrapped NBT,
-##      so this is needed eventually regardless).
-##   2. Port a small pure-Nimony DEFLATE/gzip implementation.
-## Neither is a quick add, so this file is a stub that establishes the
-## call shape (mirroring `nbtdoc.nim`'s `Nbt` type) without faking
-## compression. Do not have `readGzipCompoundTag`/`writeGzipCompoundTag`
-## silently pass data through uncompressed - that would corrupt real
-## on-disk NBT silently; leave them unimplemented and loud instead.
+## Backed by the aoughwl `compress` library (../compress, added via
+## nimony.paths), a one-shot `string -> string` gzip/Brotli/Zstd codec set
+## over the system zlib/brotli/zstd. Its `gzipCompress`/`gzipDecompress`
+## operate on `string`, so this file converts to/from `seq[byte]` at the
+## boundary; `compress` signals failure by returning `""`, which this
+## module turns into a proper `NbtResult` error rather than silently
+## treating it as valid empty output.
+##
+## Verification status: this file and gziptest.nim compile clean, but
+## full runtime round-trip verification was NOT achieved on this Windows
+## dev machine. `compress`'s zlib binding hardcodes the Linux shared-object
+## name `libz.so.1` via `{.dynlib.}` (no Windows name variant), so on
+## Windows it fails to load by default. Making a same-format zlib DLL
+## available under that exact literal filename gets past the load step,
+## but the subsequent `deflateInit2_`/`deflate` calls then fail (returns
+## nonzero) - a deeper ABI/calling-convention mismatch on Windows, not
+## just a naming issue, and debugging that is `compress`'s own internals
+## (a sibling project), out of scope here. `compress`'s own README targets
+## Linux (`libz.so.1`/`libbrotlienc.so.1`/`libzstd.so.1`), so this is
+## expected to work correctly on the project's actual Linux deployment
+## target; it just couldn't be proven end-to-end from here. Re-run
+## gziptest.nim on Linux to confirm before relying on this in production.
 
-import nbtbase, nbtdoc, tag
+import nbtbase, nbtdoc, tag, serializer, deserializer
+import compress
+
+const MaxDecompressedSize = 64 * 1024 * 1024 ## matches upstream's 64 MiB cap
+
+proc bytesToStr(data: seq[byte]): string =
+  result = newString(data.len)
+  for i, b in data:
+    result[i] = char(b)
+
+proc strToBytes(s: string): seq[byte] =
+  result = newSeq[byte](s.len)
+  for i, c in s:
+    result[i] = byte(c)
 
 proc readGzipCompoundTag*(input: seq[byte]): NbtResult[NbtCompound] =
-  ## TODO: gzip-decompress `input` (see file header) before parsing.
-  errRes[NbtCompound](nbtError(nekIncomplete,
-    "gzip decompression not yet implemented (no zlib/gzip module in Nimony stdlib)"))
+  let compressed = bytesToStr(input)
+  let decompressed = gzipDecompress(compressed, maxSize = MaxDecompressedSize)
+  if decompressed.len == 0 and compressed.len != 0:
+    # compress.nim signals a decode failure with "" - genuine empty-payload
+    # gzip streams still carry a nonzero (header+trailer) compressed size,
+    # so a nonempty input decompressing to "" is always the error case.
+    return errRes[NbtCompound](incomplete("gzip decompression failed (bad stream or exceeded " &
+      $MaxDecompressedSize & " byte limit)"))
+  var reader = newNbtReader(nrmJava, strToBytes(decompressed))
+  let nbtRes = read(reader)
+  if not nbtRes.isOk:
+    return errRes[NbtCompound](nbtRes.error)
+  ok[NbtCompound](nbtRes.value.rootTag)
 
 proc writeGzipCompoundTag*(compound: sink NbtCompound): NbtResult[seq[byte]] =
-  ## TODO: gzip-compress the serialized bytes (see file header).
-  errRes[seq[byte]](nbtError(nekIncomplete,
-    "gzip compression not yet implemented (no zlib/gzip module in Nimony stdlib)"))
+  let doc = newNbt("", compound)
+  let raw = write(doc, nwmJava)
+  let compressed = gzipCompress(bytesToStr(raw))
+  if compressed.len == 0 and raw.len != 0:
+    return errRes[seq[byte]](incomplete("gzip compression failed"))
+  ok[seq[byte]](strToBytes(compressed))
