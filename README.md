@@ -244,7 +244,18 @@ Smallest/most self-contained crates first, since later crates depend on them:
     arrays, worth a real design pass rather than a rushed port), `level.rs`,
     `world.rs`, `lighting/`, `poi/`, `world_info/`, `chunk_system/`, all of
     `generation/`.
-12. `pumpkin` (main server crate, ~269k LOC)
+12. `pumpkin` (main server crate, ~269k LOC) — **Assessed; tiny slice
+    ported, full map written.** Ported `error.rs`'s `PumpkinError` trait as
+    overloaded procs → `src/server/pumpkinerror.nim` (over `InventoryError`/
+    `ReadingError`; `PlayerDataError` pending that type's port). Everything
+    else is mapped in `src/server/README.md` by module (`entity/` 83.6k,
+    `block/` 47.6k, `plugin/` 47.4k, `command/` 30.3k, `net/` 19.5k,
+    `world/` 18.7k, `item/` 6.9k, `data/` 6.2k, `server/` 3.4k,
+    `enchantment/` 1.9k) with three concrete blockers identified (unported
+    `pumpkin-data` registries, no tick-loop/concurrency design yet, and
+    `entity/`'s scale needing a real `Entity`-shape design pass before wide
+    porting) and a suggested next-steps order. See that file before
+    starting more work here.
 13. `pumpkin-data` (~1.5M LOC — almost entirely generated block/item/registry
    tables; port the generator, not the generated output, once the shape of
    everything above is settled)
