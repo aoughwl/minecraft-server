@@ -106,6 +106,28 @@ Smallest/most self-contained crates first, since later crates depend on them:
    with no direct Nimony equivalent; deferred until a concrete consumer
    forces the design (e.g. `pumpkin-nbt`'s `nbt_ops.rs`, itself stubbed
    pending this).
+   `pumpkin-protocol`: `codec/var_int.rs` + `codec/var_uint.rs` +
+   `codec/var_long.rs`/`var_ulong.rs` → `src/protocol/varint.nim` (`VarInt`,
+   `VarUInt`, `VarLong`, `VarULong`), plus `src/protocol/protobase.nim`
+   (`ReadingError`/`WritingError`/result types, port of the non-serde-trait
+   parts of `ser/mod.rs`). Same Java-plain-LEB128-vs-Bedrock-ZigZag split as
+   `src/nbt/serializer.nim`/`deserializer.nim`, verified byte-for-byte
+   against `var_int.rs`'s own `#[cfg(test)]` vectors in
+   `src/protocol/varinttest.nim` (round-trip across `i32::MIN/-2/-1/0/1/2/
+   i32::MAX` for both shapes, boundary values, and both overflow-rejection
+   tests). Async `decode_async`/`encode_async` variants (tokio-specific)
+   are not ported. Everything else in the crate (~37k LOC: `codec/
+   bit_set.rs`/`bitset.rs`/`data_component.rs`/`item_stack_seralizer.rs`/
+   `uuid.rs`/etc., `ser/mod.rs`'s serializer/deserializer, `java/`'s and
+   `bedrock/`'s several hundred individual packet types, `packet_encoder.rs`/
+   `packet_decoder.rs`, `query.rs`) is not yet started - this pass
+   prioritized the varint/varlong wire primitives (used by every packet's
+   framing) over any specific packet. Did not end up drawing on Jester's
+   client-side `aoughwl.mcnet/netwire.nim` etc. beyond confirming the same
+   varint shape is the right one to match; worth a closer look by whoever
+   ports `packet_encoder.rs`/`packet_decoder.rs` next, since that's where
+   Jester's client-side framing code is the more directly relevant
+   reference.
 8. `pumpkin-plugin-utils` (~710 LOC) — **Done except HTTP.** `models.rs`,
    `updater.rs`, `license.rs` (lease read/write via `std/json`, grace-period
    evaluation), and `lib.rs`'s global-state glue → `src/plugin_utils/*.nim`.
