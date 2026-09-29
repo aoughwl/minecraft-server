@@ -2,7 +2,7 @@
 ## gen_sound_category.nim's proof-of-concept so later generators don't
 ## each reimplement `toPascalCase`/JSON-array reading.
 
-import std/[json, strutils, algorithm, syncio]
+import std/[json, strutils, algorithm, syncio, paths, dirs]
 
 proc toPascalCase*(s: string): string =
   ## Port of `heck::ToPascalCase` as the upstream generators use it: splits
@@ -81,6 +81,54 @@ proc readMapColors*(path: string): seq[MapColorEntry] =
 proc toShoutySnakeCase*(s: string): string =
   ## Port of `heck::ToShoutySnakeCase`.
   result = toUpperAscii(s).replace("-", "_").replace(" ", "_")
+
+proc lastIndexOf*(s: string, c: char): int =
+  ## `rfind` isn't available in Nimony; scan backward by hand.
+  result = -1
+  var i = s.len - 1
+  while i >= 0:
+    if s[i] == c:
+      return i
+    dec i
+
+proc stemOf*(p: Path): string =
+  ## Filename minus directory and `.json` extension. `splitFile` isn't
+  ## available.
+  var base = $p
+  let slashIdx = max(lastIndexOf(base, '/'), lastIndexOf(base, '\\'))
+  if slashIdx >= 0:
+    base = base[(slashIdx + 1) .. ^1]
+  if base.endsWith(".json"):
+    base = base[0 ..< (base.len - 5)]
+  base
+
+proc listJsonStems*(dir: Path): seq[(string, Path)] =
+  ## Port of the `fs::read_dir(dir).../sort_by_key(file_name)` dance every
+  ## per-directory generator (decorated_pot_pattern.rs, cat_variant.rs, and
+  ## siblings) does before building its own `BTreeMap<String, _>` - since a
+  ## `BTreeMap` iterates by key, the final emission order is alphabetical by
+  ## stem either way, so collecting pre-sorted here is equivalent and
+  ## reusable. Returns `(stem, fullPath)` pairs sorted by stem.
+  var pairs: seq[(string, Path)] = @[]
+  try:
+    for kind, entryPath in walkDir(dir):
+      if kind == pcFile and ($entryPath).endsWith(".json"):
+        pairs.add((stemOf(entryPath), entryPath))
+  except ErrorCode as e:
+    echo "listJsonStems: walkDir failed: " & $e
+  pairs.sort(proc(a, b: (string, Path)): int = cmp(a[0], b[0]))
+  pairs
+
+proc jsonStringField*(jsonPath: Path, key: string): string =
+  ## Reads one top-level string field from a JSON object file.
+  ## `JsonNode` has no `[]` field-index operator in Nimony's std/json -
+  ## object field lookup means scanning `pairs()` for the matching key.
+  var tree = parseFile($jsonPath)
+  let obj = root(tree)
+  result = ""
+  for k, val in obj.pairs():
+    if k == key:
+      result = val.getStr()
 
 proc readStringIntMapSorted*(path: string): seq[(string, int)] =
   ## Port of `serde_json::from_str::<BTreeMap<String, uN>>(...)` - a

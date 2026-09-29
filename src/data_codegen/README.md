@@ -84,12 +84,17 @@ the same way (`nimony c -r src/data_codegen/gen_<name>.nim`, output
 - `gen_game_event.nim` → `GameEvent` (61 variants, from `game_event.json`, a flat string array)
 - `gen_map_color.nim` → `MapColor` object + named constants (64 entries, from `map_colors.json`, an array of `{id,name,col,hex,rgb}` objects) - added `readMapColors`/`toShoutySnakeCase` to `codegenutil.nim`; also the first generator needing object-array (not flat-array or string-map) JSON, which surfaced that Nimony's `std/json` `JsonNode` has no `[]` field-index operator - object field lookup means scanning `pairs()` for the matching key, documented in `readMapColors`'s doc comment
 - `gen_statistic.nim` → `StatisticCategory` (9 variants, explicit `i32` discriminants) + `CustomStatistic` (156 variants) from `stats.json`'s nested `{category: {id, entries: {stat: {id}}}}` shape - read directly via `JsonNode.pairs()` rather than a `codegenutil` helper since the nesting is one-off; JSON object key order is preserved by `pairs()` (matches upstream's `IndexMap` insertion-order semantics, unlike the `BTreeMap`-sorted helpers used elsewhere)
+- `gen_message_type.nim` → `chat_type` constants (`u8`, from a *directory* of one-field JSON files under `assets/datapack/data/minecraft/chat_type/`, numbered by sorted filename order, plus a synthetic trailing `RAW`) - first generator to read a directory instead of a single JSON document
+- `gen_meta_data_type.nim` → `MetaDataType` (from `meta_data_type.json`'s flat name->i32 map, with a name-canonicalization/alias step: some data-type names have synonyms across Minecraft versions and must collapse to one id, then get restated as alias constants)
+- `gen_particle.nim` → `Particle` (128 variants, from `particles.json`, a flat string array) plus index-based `fromId`/`toId` (enum declaration order = wire id order)
+- `gen_decorated_pot_pattern.nim`, `gen_cat_variant.nim`, `gen_banner_pattern.nim` → same directory-of-JSON-files shape as `message_type`, but keyed by stem with per-entry string fields (`asset_id`, sometimes `translation_key`) rather than positional. This pattern (walk a directory, parse each file's small JSON object, sort by stem, emit an enum + accessor procs + an `all()`-equivalent array) recurs across several more submodules (frog_variant, wolf_variant, chat_type, trim_material, trim_pattern, painting_variant, and others) - `codegenutil.nim` now has `listJsonStems`/`jsonStringField`/`stemOf`/`lastIndexOf` factored out for it, so those should be quick following this template.
+- Skipped: `gen_spawn_egg.nim` - needs the still-unported `entity_type` generated enum (cross-references `EntityType` variants by name, which don't exist as Nimony code yet); revisit once entity_type.rs is ported.
 
-That's 11/90 submodules done.
+That's 17/90 submodules done.
 
 ## What's NOT done
 
-The other ~82 submodules up through `block.rs`, `item.rs`, `biome.rs`, `recipes.rs`,
+The other ~73 submodules up through `block.rs`, `item.rs`, `biome.rs`, `recipes.rs`,
 `noise_router.rs`, `noise_settings.rs` (these last few are large and encode
 real structural complexity - nested data shapes, cross-references between
 registries, not just flat string arrays). Each needs the same treatment as
