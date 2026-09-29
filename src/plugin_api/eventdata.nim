@@ -243,3 +243,79 @@ type
     chunkX*: int32
     chunkZ*: int32
     cancelled*: bool
+
+  PlayerLoginEventData* = object
+    player*: PlayerUuid
+    kickMessage*: string
+    cancelled*: bool
+
+  PlayerExpChangeEventData* = object
+    player*: PlayerUuid
+    amount*: int32
+
+  PlayerToggleSprintEventData* = object
+    player*: PlayerUuid
+    isSprinting*: bool
+    cancelled*: bool
+
+  InventoryCloseEventData* = object
+    ## `window-type: option<screen>` becomes a `(hasX, x)` pair, same
+    ## seq/tuple-as-option convention used throughout this file.
+    player*: PlayerUuid
+    hasWindowType*: bool
+    windowType*: uint32
+
+  EntityDismountEventData* = object
+    entityId*: int32
+    dismountedId*: int32
+    cancelled*: bool
+
+  EntityPickupItemEventData* = object
+    entityId*: int32
+    itemName*: string
+    count*: uint8
+    cancelled*: bool
+
+  EntityResurrectEventData* = object
+    entityId*: int32
+    cancelled*: bool
+
+  EntityTeleportEventData* = object
+    entityId*: int32
+    fromPosition*: Vector3[float64]
+    toPosition*: Vector3[float64]
+    cancelled*: bool
+
+  EntityToggleSwimEventData* = object
+    entityId*: int32
+    isSwimming*: bool
+    cancelled*: bool
+
+  FoodLevelChangeEventData* = object
+    entityId*: int32
+    foodLevel*: uint8
+    cancelled*: bool
+
+  ItemMergeEventData* = object
+    entityId*: int32
+    targetId*: int32
+    cancelled*: bool
+
+  BlockIgniteEventData* = object
+    blockPos*: BlockPos
+    cancelled*: bool
+
+  BlockFormEventData* = object
+    blockPos*: BlockPos
+    cancelled*: bool
+
+  TntPrimeEventData* = object
+    blockPos*: BlockPos
+    primeReason*: string
+    cancelled*: bool
+
+  NotePlayEventData* = object
+    blockPos*: BlockPos
+    instrument*: string
+    note*: uint8
+    cancelled*: bool

@@ -205,4 +205,54 @@ assert chunkLoadData.chunkZ == -4'i32
 let chunkSaveData = ChunkSaveEventData(chunkX: 3'i32, chunkZ: -4'i32, cancelled: false)
 assert chunkSaveData.chunkX == 3'i32
 
+let loginData = PlayerLoginEventData(player: p1, kickMessage: "", cancelled: false)
+assert not loginData.cancelled
+
+let expData = PlayerExpChangeEventData(player: p1, amount: 5'i32)
+assert expData.amount == 5'i32
+
+let sprintData = PlayerToggleSprintEventData(player: p1, isSprinting: true, cancelled: false)
+assert sprintData.isSprinting
+
+let invCloseData = InventoryCloseEventData(player: p1, hasWindowType: true, windowType: 2'u32)
+assert invCloseData.hasWindowType
+
+let dismountData = EntityDismountEventData(entityId: 10'i32, dismountedId: 20'i32, cancelled: false)
+assert dismountData.dismountedId == 20'i32
+
+let pickupData = EntityPickupItemEventData(entityId: 10'i32, itemName: "minecraft:stone", count: 3'u8, cancelled: false)
+assert pickupData.count == 3'u8
+
+let resurrectData = EntityResurrectEventData(entityId: 10'i32, cancelled: false)
+assert resurrectData.entityId == 10'i32
+
+let entityTeleportData = EntityTeleportEventData(
+  entityId: 10'i32,
+  fromPosition: Vector3[float64](x: 0.0, y: 64.0, z: 0.0),
+  toPosition: Vector3[float64](x: 5.0, y: 64.0, z: 5.0),
+  cancelled: false,
+)
+assert entityTeleportData.toPosition.x == 5.0
+
+let swimData = EntityToggleSwimEventData(entityId: 10'i32, isSwimming: true, cancelled: false)
+assert swimData.isSwimming
+
+let foodData = FoodLevelChangeEventData(entityId: 10'i32, foodLevel: 18'u8, cancelled: false)
+assert foodData.foodLevel == 18'u8
+
+let mergeData = ItemMergeEventData(entityId: 10'i32, targetId: 11'i32, cancelled: false)
+assert mergeData.targetId == 11'i32
+
+let igniteData = BlockIgniteEventData(blockPos: blockPos(1, 64, 1), cancelled: false)
+assert igniteData.blockPos.x == 1
+
+let formData = BlockFormEventData(blockPos: blockPos(1, 64, 1), cancelled: false)
+assert formData.blockPos.y == 64
+
+let tntData = TntPrimeEventData(blockPos: blockPos(1, 64, 1), primeReason: "fire", cancelled: false)
+assert tntData.primeReason == "fire"
+
+let notePlayData = NotePlayEventData(blockPos: blockPos(1, 64, 1), instrument: "harp", note: 12'u8, cancelled: false)
+assert notePlayData.note == 12'u8
+
 echo "all eventdata checks passed"
