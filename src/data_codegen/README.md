@@ -147,6 +147,55 @@ Skipped after investigation (documented here, not silently dropped):
 only blocked on `data_component_impl::Operation`, not `attributes` anymore
 since `gen_attributes.nim` landed) - revisit once `data_component_impl` lands.
 
+- `gen_dimension.nim` → `src/generated/dimension.nim` (`Dimension` object +
+  4 named constants: `OVERWORLD`/`OVERWORLD_CAVES`/`THE_END`/`THE_NETHER`,
+  from `assets/datapack/data/minecraft/dimension_type/*.json`). Scoped to
+  the core world-shape fields (skylight/ceiling, Y bounds, coordinate
+  scale, infiniburn/timelines tags, fixed-time) - deliberately does NOT
+  port upstream's `attributes` sub-object (visual/audio/gameplay cosmetics:
+  sky/fog/cloud color, ambient sound/music tracks, bed-sleep rules; ~15
+  optional nested JSON paths with hex-color parsing), which is
+  client-rendering data, not core world logic; documented as deferred in
+  the generator's own doc comment. `monster_spawn_light_level` (an
+  `IntProvider`, upstream's `value_to_int_provider` helper is itself
+  unported) is captured as a small structured string (`"const:<n>"` or
+  `"<type>:<min>..<max>"`) rather than dropped or fully modeled.
+  **Run and verified**: `nimony c -r src/data_codegen/gen_dimension.nim`
+  wrote all 4 real dimensions; output `nimony check`-clean; spot-checked
+  every field against the source JSON (`overworld.json`'s
+  `min_y:-64`/`height:384`/`ambient_light:0.0`/`coordinate_scale:1.0`
+  /`has_skylight:true`/`has_ceiling:false` all match, and the
+  `fixed_time`-absent vs. `has_fixed_time:true`-with-no-`fixed_time`
+  distinction between `overworld.json` and `the_end.json`/`the_nether.json`
+  is preserved correctly).
+  **Caught a real bug in its own first pass**: `{.noinit.}` (needed to
+  satisfy Nimony's "cannot prove initialized" check on the loop-filled
+  return object) skips zero-initialization entirely, so a field only set
+  on *some* branches of the parsing loop (here, `fixedTime`, only written
+  when the JSON actually has a non-null `"fixed_time"` key) held
+  uninitialized memory garbage rather than 0 for entries lacking that key
+  - `overworld.json`'s generated constant briefly showed
+  `fixedTime: 718871328032`. Fixed by explicitly assigning
+  `result = DimEntry()` before the loop even under `{.noinit.}`. Worth any
+  future generator (or any Nimony code) using `{.noinit.}` on a
+  partially-conditionally-filled object knowing this explicitly, not just
+  trusting `nimony check` passing.
+  **Also hit and worked around**, not deeply investigated: `for (a, b) in
+  someLocalSeqVar:` (tuple-destructuring a `for` loop's iteration variable
+  over a `let`-bound local `seq[(T,U)]`) crashed the compiler with an
+  internal `[Bug]` parser assertion ("expected ')', but got: (let
+  stem...)"), even though the exact same syntax over a direct call
+  expression (`for (stem, path) in listJsonStems(dir):`) works fine
+  elsewhere in this same directory. Worked around with indexed access
+  (`stems[i][0]`/`stems[i][1]`) instead of destructuring. Also noted:
+  `writeFile` resolved to a wrong/ambiguous overload (`Path`-taking
+  instead of the plain `string`-taking one) when both `std/paths` and this
+  file's own `codegenutil` import were in scope together with an explicit
+  `path(...)`-wrapped argument - reverting to a bare string-literal
+  argument (no explicit `path(...)` wrap) resolved correctly. Neither
+  filed externally (SendFeedback quota exhausted this session) - flagged
+  here for whoever next hits either.
+
 ## What's NOT done
 
 The other ~71 submodules up through `block.rs`, `item.rs`, `biome.rs`, `recipes.rs`,
