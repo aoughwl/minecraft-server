@@ -31,19 +31,29 @@ Smallest/most self-contained crates first, since later crates depend on them:
    `identifier.rs`, `difficulty.rs`, `gamemode.rs`, `y_offset.rs`,
    `math/vector2.rs`, `math/vector3.rs` (core - see its doc comment for
    what's skipped), `random/legacy_rand.rs` (the pre-1.13 Java-`Random`-
-   compatible LCG; verified byte-for-byte against the Rust file's own unit
-   test vectors, including gaussian/triangular/split derivation - see
-   `src/util/legacy_randtest.nim`) → `src/util/*.nim`. `identifier.rs`'s
+   compatible LCG), `random/xoroshiro128.rs` (the modern PRNG),
+   `random/worldgen_random.rs` (Java `WorldgenRandom` bit-source wrapper
+   over Xoroshiro), `noise/mod.rs` (`Gradient` type + gradient table) →
+   `src/util/*.nim`. legacy_rand/xoroshiro128/worldgen_random are all
+   verified byte-for-byte against the Rust files' own unit test vectors
+   (worldgen_random's specifically check against real vanilla Minecraft
+   chunk/decorator seeds and draws) - see `src/util/legacy_randtest.nim`,
+   `xoroshiro128test.nim`, `worldgen_randomtest.nim`. `identifier.rs`'s
    const/compile-time constructors (`from_static`, `parse_static`, ...) and
    all `serde` (de)serialize impls across the crate are intentionally
-   skipped for now (see doc comments). ~4.5k of ~15.6k LOC covered;
-   `text/mod.rs` (2.2k), `noise/*` (1.7k, depends on `random/`), the rest of
-   `random/*` (`mod.rs`'s `RandomImpl`/`RandomGenerator` trait/enum
-   unification, `xoroshiro128.rs`, `worldgen_random.rs`, `gaussian.rs`'s
-   trait form), and the remaining `math/` files (`position.rs`,
-   `bounds.rs`, `block_box.rs`, `boundingbox.rs`, `int_provider.rs`,
-   `float_provider.rs`, `bit_storage.rs`, `atomic_f32.rs`, `pool.rs`,
-   `euler_angle.rs`, `experience.rs`, `mod.rs`) remain.
+   skipped for now (see doc comments). ~5.3k of ~15.6k LOC covered;
+   `text/mod.rs` (2.2k), `noise/perlin.rs` + `simplex.rs` + `volume.rs`
+   (1.75k - the actual terrain-noise generators; now unblocked since their
+   `random/` and `Gradient` dependencies are ported, but need real
+   test-vector verification against vanilla output before trusting them,
+   same bar as worldgen_random), `mod.rs`'s `RandomImpl`/`RandomGenerator`
+   trait/enum unification (a real design decision, deferred - each
+   generator is a standalone concrete type for now), `gaussian.rs`'s trait
+   form (each generator has its own inlined `nextGaussian` instead), and
+   the remaining `math/` files (`position.rs`, `bounds.rs`, `block_box.rs`,
+   `boundingbox.rs`, `int_provider.rs`, `float_provider.rs`,
+   `bit_storage.rs`, `atomic_f32.rs`, `pool.rs`, `euler_angle.rs`,
+   `experience.rs`, `mod.rs`) remain.
 3. `auth` (~587 LOC) — **Core JWT verification done.** `jwt/mod.rs`'s
    claims model, error kinds, base64 decoding, `build_public_key_from_b64`,
    `decode_header_get_x5u`, the ES384 self-signed verify path
