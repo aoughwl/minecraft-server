@@ -60,10 +60,35 @@ Smallest/most self-contained crates first, since later crates depend on them:
    above), `plugins.rs`, and top-level `lib.rs` (458 LOC — the actual
    config-file load/save/merge driver; needs a design pass, not a
    line-by-line port).
-5. `pumpkin-codecs` / `pumpkin-protocol` (~40k LOC combined)
-5. `pumpkin-world`, `pumpkin-inventory`, `pumpkin-command`
-6. `pumpkin` (main server crate, ~269k LOC)
-7. `pumpkin-data` (~1.5M LOC — almost entirely generated block/item/registry
+6. `pumpkin-gametest` (~1.9k LOC) — **Small ported slice, rest blocked.**
+   `error.rs` → `src/gametest/error.nim` (full port) and `model.rs` →
+   `src/gametest/model.nim` (full port, `serde`/`serde_json` skipped;
+   `environment: Value` becomes a raw JSON-text `string` placeholder).
+   `model.nim` needed `Rotation` from pumpkin-data's `block_rotation.rs`;
+   rather than block on all of pumpkin-data, `src/gametest/rotation_stub.nim`
+   hand-copies just the 4-way enum + its `then` combinator (see its header
+   for the TODO to de-duplicate once pumpkin-data is ported for real).
+   NOT ported: `world.rs` (an `#[async_trait]` interface over
+   `pumpkin_util::math::position::BlockPos`/`pumpkin_world::world::
+   BlockFlags`/`pumpkin_data::BlockStateId`, none of which exist in this
+   port yet), and `helper.rs`, `manager.rs` (391 LOC), `runner/*` (459 LOC),
+   `structure/placement.rs` (389 LOC), `structure/template.rs` (223 LOC),
+   `block_based/test.rs` — all either depend on the above or are
+   async-trait/state-machine driven or the tick loop shape mentioned under
+   `pumpkin-scheduler` above. See `src/gametest/lib.nim`'s doc comment.
+7. `pumpkin-codecs` / `pumpkin-protocol` (~40k LOC combined) — **In
+   progress.** `lifecycle.rs`, `number.rs` (JSON interop skipped), and the
+   core `DataResult<R>` type from `data_result.rs` (its macro-generated
+   `apply2..applyN` applicative family skipped, no Nimony equivalent) →
+   `src/codecs/*.nim`. NOT ported: `map_like.rs`, `dynamic_ops.rs`,
+   `json_ops.rs`, `codec/*`, `struct_builder.rs`, `list_builder.rs` — a
+   generic Codec/DynamicOps framework built on Rust trait objects and GATs
+   with no direct Nimony equivalent; deferred until a concrete consumer
+   forces the design (e.g. `pumpkin-nbt`'s `nbt_ops.rs`, itself stubbed
+   pending this).
+8. `pumpkin-world`, `pumpkin-inventory`, `pumpkin-command`
+9. `pumpkin` (main server crate, ~269k LOC)
+10. `pumpkin-data` (~1.5M LOC — almost entirely generated block/item/registry
    tables; port the generator, not the generated output, once the shape of
    everything above is settled)
 
