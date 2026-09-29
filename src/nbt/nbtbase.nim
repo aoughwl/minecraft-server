@@ -73,7 +73,7 @@ proc okVoid*(): NbtVoidResult =
 proc errVoid*(e: NbtError): NbtVoidResult =
   NbtVoidResult(isOk: false, error: e)
 
-proc nbtError(kind: NbtErrorKind, msg: string): NbtError =
+proc nbtError*(kind: NbtErrorKind, msg: string): NbtError =
   NbtError(kind: kind, msg: msg)
 
 proc noRootCompound*(id: uint8): NbtError =
