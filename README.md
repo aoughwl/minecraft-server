@@ -37,13 +37,24 @@ Smallest/most self-contained crates first, since later crates depend on them:
    `bounds.rs`, `block_box.rs`, `boundingbox.rs`, `int_provider.rs`,
    `float_provider.rs`, `bit_storage.rs`, `atomic_f32.rs`, `pool.rs`,
    `euler_angle.rs`, `experience.rs`, `mod.rs`) remain.
-3. `auth` (~587 LOC) — **Mostly blocked.** `jwt/mod.rs`'s claims
-   model, error kinds, and base64 decoding are ported to `src/auth/jwt.nim`.
-   Its actual JWT signature verification needs NIST P-384 ECDSA, which
-   Nimony's stdlib (checked `~/nimony/lib/std/`) does not provide at all —
-   no elliptic-curve primitives beyond nothing. `client.rs` (reqwest/rustls
-   HTTP client glue) is skipped outright: no Nimony HTTP+TLS client to
-   build on. See doc comments in `src/auth/jwt.nim` / `src/auth/client.nim`.
+3. `auth` (~587 LOC) — **Core JWT verification done.** `jwt/mod.rs`'s
+   claims model, error kinds, base64 decoding, `build_public_key_from_b64`,
+   `decode_header_get_x5u`, the ES384 self-signed verify path
+   (`verify_oidc_token_self_signed`), and player-claims extraction
+   (including the MD5-based xuid→UUID derivation) are all ported to
+   `src/auth/jwt.nim` and wired to a real P-384 ECDSA implementation - a
+   new standalone sibling library at `../jwt` (built specifically to
+   unblock this; see its own README for what's implemented and how it's
+   verified), pulled in via this repo's `nimony.paths`. Proven end-to-end
+   against a real ES384 token in `src/auth/jwttest.nim` (`nimony c -r` it
+   to check). Still not ported: the Mojang-root-of-trust chain walk (needs
+   a security-critical root-key constant sourced properly, not guessed),
+   RS256 (needs RSA, not yet in `../jwt`), and the issuer-checked/JWKS-
+   fetching OIDC path (needs both RS256 and an HTTP client). `client.rs`
+   (reqwest/rustls HTTP client glue) remains skipped outright: no Nimony
+   HTTP+TLS client to build on yet — though `github.com/aoughwl/net` +
+   `.../tls` now exist and are the real path forward there, unintegrated
+   so far. See doc comments in `src/auth/jwt.nim` / `src/auth/client.nim`.
 5. `scheduler` (~662 LOC) — **Data model done, driver deferred.**
    `domain.rs`, `error.rs`, and the pure-data parts of `task.rs`/
    `scheduler.rs` (`SchedulerTaskId`, `TaskContext`, `SchedulerConfig`,
