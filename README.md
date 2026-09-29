@@ -451,8 +451,25 @@ Smallest/most self-contained crates first, since later crates depend on them:
     file, 184 lines) already needs `chunk_system::{Chunk, Cache}`, which
     doesn't exist yet even as a stub — `engine.rs`/`runtime.rs` (892/637
     lines) are built on the same foundation, so not attempted.
+    `format/anvil.rs`'s on-disk region-file (.mca) layout is now ported at
+    the format-math level: `src/world/anvilformat.nim` covers the 8 KiB
+    location/timestamp header (parse/build, with the `sectorOffset < 2`
+    reserved-sector guard), region/chunk-index math (verified against the
+    floor-division trap negative chunk coordinates hit - `>>` on a signed
+    int is arithmetic/floor-rounding in both Rust and Nimony, so this had
+    to be checked explicitly, not just trusted), per-chunk sector-count
+    accounting, and the length-prefixed/compression-tagged payload framing.
+    Deliberately NOT ported: the actual gzip/zlib/LZ4 (de)compression
+    bodies (same gap as `nbt_compress.nim` - no zlib/gzip module in
+    Nimony's stdlib) and the async file I/O / mutex-guarded in-place
+    sector allocator (`AnvilChunkFile::write`/`write_indices` - no
+    concurrency model chosen yet, same gap flagged for the scheduler).
+    `anvilformattest.nim` round-trips real data through every piece
+    (`nimony c -r`, all pass) using uncompressed payloads to exercise real
+    framing without the missing compression bodies; `format/linear.rs`
+    (the alternate Linear region format, ~778 lines) not attempted.
     Not started: `block/`, the rest of `biome/` (registry-dependent parts),
-    the rest of `chunk/` (`mod.rs`, `format/`, `io/`),
+    the rest of `chunk/` (`mod.rs`, `io/`),
     `level.rs`, `world.rs`, the rest of `lighting/`, `poi/`, `world_info/`,
     `chunk_system/`, all of `generation/`.
 12. the main server crate (~269k LOC) — **Assessed; tiny slice
