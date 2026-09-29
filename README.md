@@ -239,14 +239,38 @@ Smallest/most self-contained crates first, since later crates depend on them:
     `permissions.nim` (plugin sandbox capability-string constants, pure
     data). See `src/plugin_api/README.md`.
 10. `world`, `inventory`, `command` (~14.1k LOC) —
-    **command: tokenizer layer done.** `errors/command_syntax_error.rs`
-    (simplified), `context/string_range.rs`, `string_reader.rs`, and its
-    numeric parsing all ported to `src/command/*.nim`, type-checked clean.
-    NOT started: the `ArgumentType<S>`/`CommandSource` trait pair
-    everything else in the crate is built on (individual argument types,
-    the brigadier-style command tree/dispatcher, SNBT parsing) — see
-    `src/command/lib.nim`'s doc comment for why that's a design decision
-    to make once, not a mechanical per-file port.
+    **command: tokenizer layer AND the tree/dispatcher design pass done.**
+    `errors/command_syntax_error.rs` (simplified), `context/string_range.rs`,
+    `string_reader.rs`, and its numeric parsing → `src/command/*.nim`.
+    The `ArgumentType<S>`/`CommandSource` trait pair the rest of the crate
+    builds on got its design decision: `cmdsource.nim` collapses
+    `CommandSource`'s generic-everywhere shape into one concrete
+    manual-vtable ref object (no real Player/console type exists yet to
+    make genericity pay for itself); `argtype.nim` ports the
+    `ArgumentType`/`AnyArgumentType` pair plus the `core/*.rs` leaf types
+    (bool/integer/long/float/double/string) via a closed `ArgValue`
+    variant standing in for `Box<dyn Any>`; `cmdtree.nim` ports
+    `node/{mod,tree}.rs` (arena-of-nodes, `Command`/`Requirement` as
+    closures, redirect-by-index for the simple case, no multi-source
+    forking or ambiguity detection); `cmddispatch.nim` ports
+    `node/dispatcher.rs`'s real backtracking parse algorithm. All five
+    files `nimony check` clean, including `cmddispatchtest.nim` which
+    builds a sample "gamemode <int>"/"spawn" tree - but that test only
+    passes `nimony check`, not `nimony c -r`: full codegen currently
+    crashes the compiler once real closures flow through the vtables at
+    runtime (a lambda-lifting-stage internal AssertionDefect, distinct
+    from - and not yet reduced/filed like - the `for..in`-over-closure-seq
+    bug that WAS found, minimally reproduced, fixed here, and filed as
+    feedback: `meetsRequirements` originally crashed `nimony check` itself
+    this way). Treat the tree/dispatcher as semantically-checked, not
+    proven at runtime, until that codegen crash is resolved. See
+    `src/command/lib.nim`'s doc comment for the full breakdown.
+    NOT started: individual richer argument types (block/item/nbt/range/
+    coordinates/particle/structure/... - all need real world/registry
+    types), `errors/error_types.rs`, the SNBT parser, suggestions,
+    `argument_builder.rs` (a fluent DSL `cmdtree.nim`'s plain builder procs
+    cover already), and real command execution (needs Player/World/Server
+    from the still-mostly-unported main server crate).
     **inventory: core interface + a couple of leaves ported** to
     `src/inventory/*.nim` (6 files, all `nimony check` clean):
     `error.rs`→`invbase.nim`, `window_property.rs`→`window_property.nim`,
