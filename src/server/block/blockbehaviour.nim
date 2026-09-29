@@ -63,6 +63,20 @@ type
 
 # --- upstream's two free helper fns (mod.rs) --------------------------------
 
+proc directionOffset*(dir: BlockDirection): (int32, int32, int32) =
+  ## Port of `pumpkin_data::BlockDirection::to_offset` - the 6-way
+  ## face-to-unit-vector table. Used to turn a `BlockDirection` into the
+  ## bare `(dx, dy, dz)` offset `src/server/world/worldstub.nim`'s
+  ## `getNeighborBlockState` takes (that module stays direction-agnostic
+  ## on purpose - see its own doc comment).
+  case dir
+  of bdNorth: (0'i32, 0'i32, -1'i32)
+  of bdSouth: (0'i32, 0'i32, 1'i32)
+  of bdEast: (1'i32, 0'i32, 0'i32)
+  of bdWest: (-1'i32, 0'i32, 0'i32)
+  of bdUp: (0'i32, 1'i32, 0'i32)
+  of bdDown: (0'i32, -1'i32, 0'i32)
+
 proc stopVerticalMovementAfterFall*(entity: EntityBase) =
   let e = getEntity(entity)
   e.velocity.y = 0.0

@@ -96,3 +96,21 @@ proc defaultStateId*(blockName: string): (bool, int) =
   ## explicit orientation), straight from the generated table.
   let (found, info) = bpBlockByName(blockName)
   if found: (true, info.defaultStateId) else: (false, 0)
+
+proc isStateOfBlock*(blockName: string, stateId: int): bool =
+  ## Port of upstream's `Block::from_state_id(id).eq(args.block)` check
+  ## (e.g. `end_rod.rs`'s "is my neighbor also an end rod" test) -
+  ## whether `stateId` falls within `blockName`'s own contiguous state-id
+  ## range. `BpBlocks` is emitted in ascending `firstStateId` order (see
+  ## `src/data_codegen/gen_blockprops.nim`), so a block's range is
+  ## `[firstStateId, nextBlock.firstStateId)`, or unbounded-above for the
+  ## table's last entry.
+  let (found, info) = bpBlockByName(blockName)
+  if not found or stateId < info.firstStateId:
+    return false
+  for i, b in BpBlocks:
+    if b.name == blockName:
+      if i + 1 < BpBlocks.len:
+        return stateId < BpBlocks[i + 1].firstStateId
+      return true
+  false

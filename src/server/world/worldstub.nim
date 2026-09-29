@@ -98,3 +98,27 @@ proc setBlockState*(w: World, pos: BlockPos, state: PaletteValue): PaletteValue 
   let (coord, lx, ly, lz) = toSectionCoord(pos)
   let i = getOrCreateSection(w, coord)
   result = w.sections[i][1].blocks.set(lx, ly, lz, state)
+
+proc getBlockStateAt*(w: World, x, y, z: int32): PaletteValue {.inline.} =
+  ## Same as `getBlockState`, but takes bare coordinates instead of a
+  ## `BlockPos` - lets a caller resolve a neighbor position (`pos.x + dx`
+  ## etc.) without this module needing to know about direction enums.
+  ## Deliberately kept direction-agnostic: `BlockDirection` lives in
+  ## `src/server/block/blockbehaviour.nim`, which imports `entity.nim` -
+  ## importing it here would pull that dependency into every consumer of
+  ## this module, including `worldstubtest.nim`, which is currently one of
+  ## the few genuinely runtime-proven files in this port (no `entity.nim`
+  ## in its import graph, so it isn't affected by the closures-through-
+  ## vtables crash documented in NIMONY-COMPILER-BUGS.md #1). Callers that
+  ## have a `BlockDirection` convert it to an offset themselves (see
+  ## `directionOffset` in `src/server/block/blockbehaviour.nim`) and call
+  ## this, or the `getNeighborBlockState` wrapper below.
+  getBlockState(w, blockPos(x, y, z))
+
+proc getNeighborBlockState*(w: World, pos: BlockPos, dx, dy, dz: int32): PaletteValue {.inline.} =
+  ## Port of the read half of upstream's `world.get_block_state(&position.
+  ## offset(direction))` pattern (e.g. `end_rod.rs`'s neighbor check,
+  ## `spreading_snowy_block.rs`'s `SnowyBlock::get_state_for_neighbor_
+  ## update`). Takes an already-resolved `(dx, dy, dz)` offset rather than
+  ## a `BlockDirection` for the same reason `getBlockStateAt` does.
+  getBlockStateAt(w, pos.x + dx, pos.y + dy, pos.z + dz)

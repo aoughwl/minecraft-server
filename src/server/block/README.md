@@ -237,3 +237,42 @@ not the whole module.
     helper calls `world.get_block(&position.up())` - a real neighbor-block
     query `worldstub.nim` doesn't expose, same wall `end_rod.rs` already
     hit. No further free wins in this category right now.
+
+11. **`end_rod.rs`**: the neighbor-block-query wall above is now
+    resolved. `worldstub.nim` gained `getBlockStateAt`/
+    `getNeighborBlockState` (bare-coordinate, direction-agnostic
+    deliberately - see that file's doc comment for why it doesn't import
+    `blockbehaviour.nim`'s `BlockDirection` directly, to avoid pulling
+    `entity.nim` into every `worldstub` consumer including the currently
+    genuinely-runtime-proven `worldstubtest.nim`). `blockbehaviour.nim`
+    gained `directionOffset(BlockDirection): (dx, dy, dz)` to bridge the
+    two. `blockstateid.nim` gained `isStateOfBlock(blockName, stateId)`
+    (is a state id within a block's own contiguous range - upstream's
+    `Block::from_state_id(id).eq(args.block)` check).
+
+    `end_rod.nim` ports the real logic: read the neighbor block in the
+    placement direction, and if it's also an end rod facing back at this
+    one, align with it; otherwise face opposite the placement direction.
+    Not wired through `BlockBehaviour.onPlaceImpl` - that closure's fixed
+    `(direction, waterlogged): int` signature has no room for a
+    `World`/position and no real block-placement call site exists yet to
+    supply one meaningfully. `onPlaceEndRod(world, pos, direction)` is
+    exposed directly instead, matching the upstream logic 1:1.
+
+    `endrodtest.nim` proves both branches for real: no matching neighbor
+    → facing = opposite of placement; a real end-rod-facing-back neighbor
+    written into `worldstub` → facing = placement direction itself. Also
+    proves `getNeighborBlockState`/`getBlockStateAt` directly. `nimony
+    check` passes clean on all four changed/new files
+    (`worldstub.nim`/`blockbehaviour.nim`/`blockstateid.nim`/
+    `end_rod.nim`/`endrodtest.nim`); `nimony c -r` hits the same
+    documented closures-through-vtables crash as every other file here
+    (`eraiser.nim(128,3)`/`lambdalifting.nim(369,3)`, via
+    `end_rod.nim`'s import of `blockbehaviour.nim` → `entity.nim`) -
+    check-verified, not runtime-proven. `worldstub.nim`'s own two new
+    procs, tested in isolation, stay in the genuinely-runtime-proven
+    category (see `worldstubtest.nim`).
+
+    `spreading_snowy_block.rs` is now also unblocked in principle (same
+    neighbor-query need) but wasn't attempted in this pass - a
+    reasonable next proof case.
