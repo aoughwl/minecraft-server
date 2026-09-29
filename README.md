@@ -276,21 +276,25 @@ Smallest/most self-contained crates first, since later crates depend on them:
     paths, including the option (worth real consideration) of skipping
     WASM sandboxing entirely and loading plugins natively the way the
     sibling Jester project's `aowli` interpreter already does.
-9c. `plugin-api` (~24k LOC) — **Not portable yet; documented
-    instead, except one small data file.** Grepped every top-level and
+9c. `plugin-api` (~24k LOC) — **Mostly not portable yet (WASM-guest SDK
+    glue); one real data-model piece landed.** Grepped every top-level and
     `ext/` source file for `wit::` imports: only `permissions.rs` has none.
     Everything else - `item.rs`, `block.rs`, `enchantment.rs`, `team.rs`,
     `mobs.rs`, `forms.rs`, `display.rs`, `persistent_data.rs`, `logging.rs`,
     `ai.rs`, `worldgen.rs`, `commands.rs`, `scheduler.rs`, `datapack.rs`,
-    `inventory.rs`, `recipe.rs`, `lib.rs`, and all ~230 files under
-    `events/*` (each a ~20-line wrapper around one generated `wit`
-    `EventData` type) - is WASM-guest SDK code built directly on the same
-    `wasmtime::component::bindgen!`-generated `wit` module that blocks
-    `host-bindings`/`plugin-runtime`. `generated/block.rs`
+    `inventory.rs`, `recipe.rs`, `lib.rs` - is WASM-guest SDK code built
+    directly on the same `wasmtime::component::bindgen!`-generated `wit`
+    module that blocks `host-bindings`/`plugin-runtime`. `generated/block.rs`
     (5.2k LOC) and `generated/item.rs` (6.7k LOC) are build-time-generated
-    registry data, out of scope like `data`. Ported:
-    `permissions.nim` (plugin sandbox capability-string constants, pure
-    data). See `src/plugin_api/README.md`.
+    registry data, out of scope like `data`. Ported: `permissions.nim`
+    (plugin sandbox capability-string constants, pure data), and
+    `eventdata.nim` - a real, transport-independent `EventData` object
+    model for 8 of the ~230 `events/*` types, built from the actual field
+    shapes in `pumpkin-plugin-wit`'s `event.wit` (the `.rs` wrapper files
+    themselves carry no fields). `nimony check` clean, and its test
+    (`eventdatatest.nim`) actually **runs** via `nimony c -r` - pure data,
+    unaffected by the closure-through-vtable runtime crash. See
+    `src/plugin_api/README.md`.
 10. `world`, `inventory`, `command` (~14.1k LOC) —
     **command: tokenizer layer AND the tree/dispatcher design pass done.**
     `errors/command_syntax_error.rs` (simplified), `context/string_range.rs`,
