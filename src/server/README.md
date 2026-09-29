@@ -14,6 +14,30 @@ it's ported.
   `PlayerDataError`'s two variants aren't added yet since
   `world`'s `data/player_data.rs` isn't ported - add overloads for
   it here once it exists, don't split into a new file.
+- `enchantment/` (new) — started on the "good next target" flagged below.
+  `levelbasedvalue.nim` is a full, verified port of
+  `pumpkin-data/src/generated/enchantment.rs`'s `LevelBasedValue` enum +
+  `calculate` (the one hand-written formula in that otherwise-generated
+  file - pure math, no registry dependency at all). `add_value.nim`,
+  `multiply_value.nim`, `set_value.nim`, `remove_binomial.nim` are full
+  ports of the four effect files that only touch `LevelBasedValue`/f32/i32
+  (no `World`/`Player`/`Entity` needed). All five `nimony check` clean;
+  `lbvtest.nim` runtime-verifies the non-recursive `LevelBasedValue`
+  variants against upstream's own semantics (recursive variants -
+  `Clamped`/`Fraction`/`Lookup` - are semantically checked but not
+  runtime-tested: constructing their `ref LevelBasedValue` field hits a
+  genuine Nimony C-codegen bug, a destructor-type mismatch for a
+  self-recursive `ref` field in a case object, reported upstream but not a
+  bug in this port).
+  Remaining in `enchantment/`: the other ~15 effect files (`ignite`,
+  `explode`, `damage_entity`, `apply_mob_effect`, `apply_entity_impulse`,
+  `spawn_particles`, `summon_entity`, `replace_block`, `replace_disk`,
+  `set_block_properties`, `run_function`, `play_sound`,
+  `change_item_damage`, `apply_exhaustion`, `all_of`, `entity_effect.rs`)
+  all need `World`/`Player`/`Entity` types (per blocker #3 below) for their
+  `apply()` bodies - their field/data shape could still be ported with a
+  placeholder entity-stub type (`src/inventory/itemstub.nim`'s pattern),
+  not yet done. `helper.rs` (332 LOC) not yet inspected.
 
 Everything else in `crash.rs`, `lib.rs`, `main.rs`, `logging.rs`,
 `telemetry.rs` is process bootstrap (CLI arg parsing, panic hooks,
