@@ -35,4 +35,24 @@ assert fitness(pp, target) == 0
 let ppWithOffset = newParameterPoint(zeroPoint, zeroPoint, zeroPoint, zeroPoint, zeroPoint, zeroPoint, 5'i64)
 assert fitness(ppWithOffset, target) == 25
 
+# nearestBiome: with synthetic entries at distinct zero-width points, the
+# target should always match the entry whose point it's closest to (or
+# exactly equals).
+let coldPoint = newParameterPoint(
+  parameterPoint(-1.0'f32), zeroPoint, zeroPoint, zeroPoint, zeroPoint, zeroPoint, 0'i64)
+let hotPoint = newParameterPoint(
+  parameterPoint(1.0'f32), zeroPoint, zeroPoint, zeroPoint, zeroPoint, zeroPoint, 0'i64)
+let entries = @[
+  BiomeEntry(name: "cold_biome", point: coldPoint),
+  BiomeEntry(name: "hot_biome", point: hotPoint),
+]
+
+assert nearestBiome(entries, newTargetPoint(quantizeCoord(-1.0'f32), 0, 0, 0, 0, 0)) == "cold_biome"
+assert nearestBiome(entries, newTargetPoint(quantizeCoord(1.0'f32), 0, 0, 0, 0, 0)) == "hot_biome"
+# A target closer to the cold end than the hot end (but not exact) still
+# picks cold - proves it's scoring distance, not just exact match.
+assert nearestBiome(entries, newTargetPoint(quantizeCoord(-0.4'f32), 0, 0, 0, 0, 0)) == "cold_biome"
+assert nearestBiome(entries, newTargetPoint(quantizeCoord(0.4'f32), 0, 0, 0, 0, 0)) == "hot_biome"
+assert nearestBiome(newSeq[BiomeEntry](), target) == ""
+
 echo "biomeparam: all checks passed"

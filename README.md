@@ -479,6 +479,18 @@ Smallest/most self-contained crates first, since later crates depend on them:
     `end.rs`) needs the unported generated `BiomeTree`/biome registry and
     `MultiNoiseSampler` (noise sampling - `perlin.rs`/`simplex.rs` are
     unverified even where present), so left for later.
+    `biomeparam.nim` now also has `BiomeEntry`/`nearestBiome`, the generic
+    (tree-shape-independent) half of `BiomeTree::get`'s nearest-fitness
+    lookup, tested against synthetic entries in `biomeparamtest.nim`. The
+    REAL per-biome `ParameterPoint` table (upstream's
+    `OVERWORLD_BIOME_SOURCE`/`NETHER_BIOME_SOURCE`) is generated from
+    `assets/multi_noise_biome_tree.json` — 1.8MB, a recursive branch/leaf
+    tree, not the flat list `src/generated/biome.nim` embeds (that file's
+    `temperature`/`downfall` are unrelated rain/snow/color-effect fields
+    from `biome.json`, not placement data — the placement preset JSON
+    under `multi_noise_biome_source_parameter_list/` is just
+    `{"preset": "minecraft:overworld"}`). Parsing that tree and wiring it
+    to `nearestBiome` is a real, scoped follow-up, not attempted here.
     `lighting/` hits the same dead end `block/` already documented in
     `src/server/block/README.md`: `lighting/storage.rs` (the smallest
     file, 184 lines) already needs `chunk_system::{Chunk, Cache}`, which
