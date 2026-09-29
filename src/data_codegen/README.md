@@ -65,9 +65,26 @@ type-checked, correct `src/generated/sound_category.nim` (verified: the
 enum values, `fromName`, and `toName` case bodies match the 11 real sound
 categories in the JSON exactly, and `nimony check` passes on the output).
 
+`codegenutil.nim` factors the reusable pieces (`toPascalCase`,
+`readStringArray` for `Vec<String>`-shaped inputs, `readStringIntMapSorted`
+for `BTreeMap<String, uN>`-shaped inputs, sorted the same way a `BTreeMap`
+iterates) out of that proof-of-concept so later generators don't each
+reimplement them. Five more submodules now use it, all run-and-verified
+the same way (`nimony c -r src/data_codegen/gen_<name>.nim`, output
+`nimony check`-ed, values spot-checked against the source JSON):
+
+- `gen_entity_pose.nim` → `EntityPose` (18 variants, from `entity_pose.json`)
+- `gen_screen.nim` → `WindowType` (from `screens.json`)
+- `gen_scoreboard_slot.nim` → `ScoreboardDisplaySlot` (from `scoreboard_display_slot.json`)
+- `gen_entity_status.nim` → `EntityStatus` with explicit discriminants (64 variants, from `entity_statuses.json`, a name->u8 map)
+- `gen_world_event.nim` → `WorldEvent` with explicit discriminants (from `world_event.json`, a name->u16 map)
+
+That's 6/90 submodules done.
+
 ## What's NOT done
 
-The other ~89 submodules, ranging from `scoreboard_slot.rs` (22 lines,
+The other ~84 submodules, ranging from `chunk_status.rs`/`flower_pot_transformations.rs`
+(similar simple flat-array/map shapes, next easiest) up through `block.rs`, `item.rs`, `biome.rs`, `recipes.rs`,
 trivial) up through `block.rs`, `item.rs`, `biome.rs`, `recipes.rs`,
 `noise_router.rs`, `noise_settings.rs` (these last few are large and encode
 real structural complexity - nested data shapes, cross-references between
