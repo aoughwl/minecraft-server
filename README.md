@@ -342,7 +342,18 @@ Smallest/most self-contained crates first, since later crates depend on them:
     `enchantment/` 1.9k) with three concrete blockers identified (unported
     `data` registries, no tick-loop/concurrency design yet, and
     `entity/`'s scale needing a real `Entity`-shape design pass before wide
-    porting) and a suggested next-steps order. See that file before
+    porting). Since then: `enchantment/` - 5 files ported to
+    `src/server/enchantment/` (the `LevelBasedValue` formula type + 4 pure
+    value-transform effects; ~15 remaining effect files need `World`/
+    `Player`/`Entity` stand-ins, not yet stubbed). `block/` - assessed in
+    detail, confirmed genuinely blocked even at its simplest: tried the two
+    smallest conceivable block impls (an 8-line empty one, a 20-line
+    one-method one) and both need the `#[pumpkin_block]` registration macro
+    (unportable, see `src/macros/README.md`) and a working `Entity`
+    abstraction before *any* block can port, not just complex ones. One
+    free-standing type (`PathComputationType`) ported to
+    `src/server/block/blockmisc.nim`; full writeup with the concrete
+    unblock order in `src/server/block/README.md`. See both READMEs before
     starting more work here.
 13. `data` (~1.5M LOC — almost entirely generated block/item/registry
    tables) — **Generator path confirmed viable; proof-of-concept done.**
