@@ -508,4 +508,97 @@ assert slimeSplitData.count == 4'i32
 let striderTempData = StriderTemperatureChangeEventData(entityId: 18'i32, isShivering: true, cancelled: false)
 assert striderTempData.isShivering
 
+let bp1 = BlockPos(x: 1, y: 2, z: 3)
+let bp2 = BlockPos(x: 4, y: 5, z: 6)
+
+let brushData = BlockBrushEventData(blockPos: bp1, player: p1, item: "minecraft:brush", cancelled: false)
+assert brushData.item == "minecraft:brush"
+
+let cookData = BlockCookEventData(blockPos: bp1, source: "minecraft:cobblestone", resultItem: "minecraft:stone", cancelled: false)
+assert cookData.resultItem == "minecraft:stone"
+
+let blockDropItemData = BlockDropItemEventData(blockPos: bp1, hasPlayer: true, player: p1, items: @["minecraft:wheat"], cancelled: false)
+assert blockDropItemData.items.len == 1
+
+let blockExpData = BlockExpEventData(blockPos: bp1, exp: 3'i32)
+assert blockExpData.exp == 3'i32
+
+let fertilizeData = BlockFertilizeEventData(blockPos: bp1, hasPlayer: false, player: p1, changedPositions: @[bp1, bp2], changedStateIds: @[10'u16, 11'u16], cancelled: false)
+assert fertilizeData.changedPositions.len == 2 and fertilizeData.changedStateIds.len == 2
+
+let multiPlaceData = BlockMultiPlaceEventData(player: p1, placedPositions: @[bp1, bp2], placedStateIds: @[1'u16, 2'u16], cancelled: false)
+assert multiPlaceData.placedPositions.len == 2
+
+let shearEntityData = BlockShearEntityEventData(blockPos: bp1, targetEntityId: 20'i32, item: "minecraft:shears", cancelled: false)
+assert shearEntityData.targetEntityId == 20'i32
+
+let blockSpreadData = BlockSpreadEventData(sourcePos: bp1, targetPos: bp2, newStateId: 5'u16, cancelled: false)
+assert blockSpreadData.newStateId == 5'u16
+
+let brewData = BrewEventData(blockPos: bp1, fuelLevel: 20'u8, cancelled: false)
+assert brewData.fuelLevel == 20'u8
+
+let brewFuelData = BrewingStandFuelEventData(blockPos: bp1, fuelPower: 40'u16, cancelled: false)
+assert brewFuelData.fuelPower == 40'u16
+
+let brewStartData = BrewingStartEventData(blockPos: bp1, brewingTime: 400'i32, cancelled: false)
+assert brewStartData.brewingTime == 400'i32
+
+let campfireData = CampfireStartEventData(blockPos: bp1, item: "minecraft:beef", slot: 0'u8, cookingTime: 600'i32, cancelled: false)
+assert campfireData.cookingTime == 600'i32
+
+let cauldronData = CauldronLevelChangeEventData(blockPos: bp1, oldLevel: 1'i32, newLevel: 2'i32, reason: "fill", hasEntityId: true, entityId: 5'i32, cancelled: false)
+assert cauldronData.newLevel == 2'i32
+
+let chunkPopData = ChunkPopulateEventData(chunkX: 0'i32, chunkZ: 0'i32, cancelled: false)
+assert chunkPopData.chunkX == 0'i32
+
+let chunkSendData = ChunkSendEventData(chunkX: 1'i32, chunkZ: 1'i32, cancelled: false)
+assert chunkSendData.chunkZ == 1'i32
+
+let crafterData = CrafterCraftEventData(blockPos: bp1, resultItem: "minecraft:stick", cancelled: false)
+assert crafterData.resultItem == "minecraft:stick"
+
+let creeperPowerData = CreeperPowerEventData(entityId: 21'i32, hasLightningId: true, lightningId: 22'i32, cause: "lightning", cancelled: false)
+assert creeperPowerData.cause == "lightning"
+
+let enchantData = EnchantItemEventData(player: p1, item: "minecraft:diamond_sword", optionIndex: 0'i32, cost: 5'i32, enchantmentNames: @["minecraft:sharpness"], enchantmentLevels: @[3'i32], cancelled: false)
+assert enchantData.enchantmentNames.len == 1
+
+let entitiesLoadData = EntitiesLoadEventData(chunkX: 0'i32, chunkZ: 0'i32, entityCount: 4'u32, cancelled: false)
+assert entitiesLoadData.entityCount == 4'u32
+
+let entitiesUnloadData = EntitiesUnloadEventData(chunkX: 0'i32, chunkZ: 0'i32, entityCount: 4'u32, cancelled: false)
+assert entitiesUnloadData.entityCount == 4'u32
+
+let blockFormData = EntityBlockFormEventData(entityId: 23'i32, blockPos: bp1, newStateId: 6'u16, cancelled: false)
+assert blockFormData.newStateId == 6'u16
+
+let combustByBlockData = EntityCombustByBlockEventData(entityId: 24'i32, combuster: bp1, duration: 5.0'f32, cancelled: false)
+assert combustByBlockData.duration == 5.0'f32
+
+let combustByEntityData = EntityCombustByEntityEventData(entityId: 24'i32, combusterId: 25'i32, duration: 5.0'f32, cancelled: false)
+assert combustByEntityData.combusterId == 25'i32
+
+let expBottleData = ExpBottleEventData(entityId: 26'i32, experience: 7'i32, location: bp1, showEffect: true, cancelled: false)
+assert expBottleData.experience == 7'i32
+
+let fluidLevelData = FluidLevelChangeEventData(blockPos: bp1, newStateId: 8'u16, cancelled: false)
+assert fluidLevelData.newStateId == 8'u16
+
+let furnaceBurnData = FurnaceBurnEventData(blockPos: bp1, fuelItem: "minecraft:coal", burnTime: 1600'u32, cancelled: false)
+assert furnaceBurnData.burnTime == 1600'u32
+
+let furnaceExtractData = FurnaceExtractEventData(player: p1, blockPos: bp1, itemId: "minecraft:iron_ingot", itemAmount: 3'u32, expGained: 1.5'f32)
+assert furnaceExtractData.itemAmount == 3'u32
+
+let furnaceSmeltData = FurnaceSmeltEventData(blockPos: bp1, sourceItem: "minecraft:raw_iron", resultItem: "minecraft:iron_ingot", cancelled: false)
+assert furnaceSmeltData.resultItem == "minecraft:iron_ingot"
+
+let furnaceStartSmeltData = FurnaceStartSmeltEventData(blockPos: bp1, sourceItem: "minecraft:raw_iron", cookingTime: 200'u32, cancelled: false)
+assert furnaceStartSmeltData.cookingTime == 200'u32
+
+let hangingPlaceData = HangingPlaceEventData(entityId: 27'i32, hasPlayer: true, player: p1, blockPos: bp1, blockFace: "north", cancelled: false)
+assert hangingPlaceData.blockFace == "north"
+
 echo "all eventdata checks passed"

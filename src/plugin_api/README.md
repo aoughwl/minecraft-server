@@ -37,8 +37,22 @@ is settled, not the generated output by hand.
 - `permissions.nim` - the plugin sandbox capability-string constants
   (`network.*`, `fs.*`, `sys.*`, `http.outbound`). Pure data, no `wit`
   dependency. `nimony check` clean.
-- `eventdata.nim` - a real server-side `EventData` model, now for 108 events.
-  Latest batch (26 new): `PlayerCommandSend`/`PlayerPermissionCheck`/
+- `eventdata.nim` - a real server-side `EventData` model, now for 137 events
+  (~136 of ~273 real `-event-data` WIT records covered; see the file's own
+  count against `event.wit` for the exact current tally).
+  Latest batch (29 new): `BlockBrush`/`BlockCook`/`BlockDropItem`/`BlockExp`/
+  `BlockFertilize`/`BlockMultiPlace`/`BlockShearEntity`/`BlockSpread`/`Brew`/
+  `BrewingStandFuel`/`BrewingStart`/`CampfireStart`/`CauldronLevelChange`/
+  `ChunkPopulate`/`ChunkSend`/`CrafterCraft`/`CreeperPower`/`EnchantItem`/
+  `EntitiesLoad`/`EntitiesUnload`/`EntityBlockForm`/`EntityCombustByBlock`/
+  `EntityCombustByEntity`/`ExpBottle`/`FluidLevelChange`/`FurnaceBurn`/
+  `FurnaceExtract`/`FurnaceSmelt`/`FurnaceStartSmelt`/`HangingPlace`.
+  ~136 records remain (async player-chat/pre-login/structure variants,
+  villager/vehicle/raid/dialog/packet-received/-sent, and most of the
+  player-*/inventory-* long tail) - same mechanical translation, just more
+  of it; a future pass can keep working straight down the alphabetized
+  remaining list.
+  Previous batch (26 new): `PlayerCommandSend`/`PlayerPermissionCheck`/
   `PlayerRespawn`/`PlayerItemHeld`/`PlayerChangedMainHand`/`PlayerFish`/
   `PlayerEggThrow`/`PlayerInteract`/`PlayerToggleFlight`/
   `PlayerInteractUnknownEntity`/`PlayerInteractEntity`/`InventoryClick`/

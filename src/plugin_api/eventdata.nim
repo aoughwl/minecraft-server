@@ -830,3 +830,204 @@ type
     entityId*: int32
     isShivering*: bool
     cancelled*: bool
+
+  BlockBrushEventData* = object
+    ## `item: item-stack` becomes an item-name string (this port's
+    ## established item-field convention - see PiglinBarter above).
+    blockPos*: BlockPos
+    player*: PlayerUuid
+    item*: string
+    cancelled*: bool
+
+  BlockCookEventData* = object
+    blockPos*: BlockPos
+    source*: string
+    resultItem*: string
+    cancelled*: bool
+
+  BlockDropItemEventData* = object
+    ## `player: option<player>` becomes a (hasX, x) pair.
+    blockPos*: BlockPos
+    hasPlayer*: bool
+    player*: PlayerUuid
+    items*: seq[string]
+    cancelled*: bool
+
+  BlockExpEventData* = object
+    blockPos*: BlockPos
+    exp*: int32
+
+  BlockFertilizeEventData* = object
+    ## `changed-blocks: list<tuple<block-pos, u16>>` becomes parallel
+    ## seqs (position, new state id) rather than a seq of tuples, to
+    ## avoid an anonymous tuple type in the public object shape.
+    blockPos*: BlockPos
+    hasPlayer*: bool
+    player*: PlayerUuid
+    changedPositions*: seq[BlockPos]
+    changedStateIds*: seq[uint16]
+    cancelled*: bool
+
+  BlockMultiPlaceEventData* = object
+    player*: PlayerUuid
+    placedPositions*: seq[BlockPos]
+    placedStateIds*: seq[uint16]
+    cancelled*: bool
+
+  BlockShearEntityEventData* = object
+    blockPos*: BlockPos
+    targetEntityId*: int32
+    item*: string
+    cancelled*: bool
+
+  BlockSpreadEventData* = object
+    sourcePos*: BlockPos
+    targetPos*: BlockPos
+    newStateId*: uint16
+    cancelled*: bool
+
+  BrewEventData* = object
+    blockPos*: BlockPos
+    fuelLevel*: uint8
+    cancelled*: bool
+
+  BrewingStandFuelEventData* = object
+    blockPos*: BlockPos
+    fuelPower*: uint16
+    cancelled*: bool
+
+  BrewingStartEventData* = object
+    blockPos*: BlockPos
+    brewingTime*: int32
+    cancelled*: bool
+
+  CampfireStartEventData* = object
+    blockPos*: BlockPos
+    item*: string
+    slot*: uint8
+    cookingTime*: int32
+    cancelled*: bool
+
+  CauldronLevelChangeEventData* = object
+    ## `entity-id: option<s32>` becomes a (hasX, x) pair.
+    blockPos*: BlockPos
+    oldLevel*: int32
+    newLevel*: int32
+    reason*: string
+    hasEntityId*: bool
+    entityId*: int32
+    cancelled*: bool
+
+  ChunkPopulateEventData* = object
+    chunkX*: int32
+    chunkZ*: int32
+    cancelled*: bool
+
+  ChunkSendEventData* = object
+    chunkX*: int32
+    chunkZ*: int32
+    cancelled*: bool
+
+  CrafterCraftEventData* = object
+    blockPos*: BlockPos
+    resultItem*: string
+    cancelled*: bool
+
+  CreeperPowerEventData* = object
+    ## `lightning-id: option<s32>` becomes a (hasX, x) pair.
+    entityId*: int32
+    hasLightningId*: bool
+    lightningId*: int32
+    cause*: string
+    cancelled*: bool
+
+  EnchantItemEventData* = object
+    ## `%option: s32` (WIT's escaped-keyword field, upstream's enchant-menu
+    ## button index) becomes `optionIndex`. `enchantments-to-add:
+    ## list<enchantment-value>` becomes parallel seqs (name, level) -
+    ## `enchantment-value` isn't ported as its own type yet.
+    player*: PlayerUuid
+    item*: string
+    optionIndex*: int32
+    cost*: int32
+    enchantmentNames*: seq[string]
+    enchantmentLevels*: seq[int32]
+    cancelled*: bool
+
+  EntitiesLoadEventData* = object
+    chunkX*: int32
+    chunkZ*: int32
+    entityCount*: uint32
+    cancelled*: bool
+
+  EntitiesUnloadEventData* = object
+    chunkX*: int32
+    chunkZ*: int32
+    entityCount*: uint32
+    cancelled*: bool
+
+  EntityBlockFormEventData* = object
+    entityId*: int32
+    blockPos*: BlockPos
+    newStateId*: uint16
+    cancelled*: bool
+
+  EntityCombustByBlockEventData* = object
+    entityId*: int32
+    combuster*: BlockPos
+    duration*: float32
+    cancelled*: bool
+
+  EntityCombustByEntityEventData* = object
+    entityId*: int32
+    combusterId*: int32
+    duration*: float32
+    cancelled*: bool
+
+  ExpBottleEventData* = object
+    entityId*: int32
+    experience*: int32
+    location*: BlockPos
+    showEffect*: bool
+    cancelled*: bool
+
+  FluidLevelChangeEventData* = object
+    blockPos*: BlockPos
+    newStateId*: uint16
+    cancelled*: bool
+
+  FurnaceBurnEventData* = object
+    blockPos*: BlockPos
+    fuelItem*: string
+    burnTime*: uint32
+    cancelled*: bool
+
+  FurnaceExtractEventData* = object
+    ## No `cancelled` field in the real WIT record - extraction has
+    ## already happened by the time this fires.
+    player*: PlayerUuid
+    blockPos*: BlockPos
+    itemId*: string
+    itemAmount*: uint32
+    expGained*: float32
+
+  FurnaceSmeltEventData* = object
+    blockPos*: BlockPos
+    sourceItem*: string
+    resultItem*: string
+    cancelled*: bool
+
+  FurnaceStartSmeltEventData* = object
+    blockPos*: BlockPos
+    sourceItem*: string
+    cookingTime*: uint32
+    cancelled*: bool
+
+  HangingPlaceEventData* = object
+    ## `player: option<player>` becomes a (hasX, x) pair.
+    entityId*: int32
+    hasPlayer*: bool
+    player*: PlayerUuid
+    blockPos*: BlockPos
+    blockFace*: string
+    cancelled*: bool
