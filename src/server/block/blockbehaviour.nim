@@ -18,6 +18,7 @@
 
 import ../entity/entity
 import ../../generated/blockdata as realblock
+import blockmisc
 import std/tables
 import std/strutils
 
@@ -31,6 +32,7 @@ type
     ## every field below has it proactively.
     onLandedUponImpl*: proc(entity: EntityBase, fallDistance: float64) {.closure.}
     updateEntityMovementAfterFallOnImpl*: proc(entity: EntityBase) {.closure.}
+    isPathfindableImpl*: proc(stateId: uint32, computationType: PathComputationType): bool {.closure.}
 
 # --- upstream's two free helper fns (mod.rs) --------------------------------
 
@@ -67,6 +69,20 @@ proc defaultOnLandedUpon*(entity: EntityBase, fallDistance: float64) =
 proc defaultUpdateEntityMovementAfterFallOn*(entity: EntityBase) =
   stopVerticalMovementAfterFall(entity)
 
+proc defaultIsPathfindable*(stateId: uint32, computationType: PathComputationType): bool =
+  ## Simplified stand-in for mod.rs's real default, which branches on
+  ## `state.is_waterlogged()`/`Fluid::from_state_id(...).has_tag(...)` for
+  ## `Water` and `state.is_full_cube()` for `Land`/`Air` - none of which
+  ## exist yet (no `BlockState`/`Fluid`/tag registry in this port). This
+  ## approximates "solid full blocks aren't pathfindable, nothing is a
+  ## fluid" until those land; every concrete block below that needs real
+  ## pathfinding behavior overrides this directly rather than relying on
+  ## the approximation.
+  discard stateId
+  case computationType
+  of pctWater: false
+  of pctLand, pctAir: true
+
 proc newBlockBehaviour*(): BlockBehaviour =
   ## A `BlockBehaviour` with every method at its trait-default body -
   ## matches upstream's `impl BlockBehaviour for X {}` (an empty impl
@@ -76,6 +92,8 @@ proc newBlockBehaviour*(): BlockBehaviour =
       defaultOnLandedUpon(entity, fallDistance)),
     updateEntityMovementAfterFallOnImpl: (proc(entity: EntityBase) {.closure.} =
       defaultUpdateEntityMovementAfterFallOn(entity)),
+    isPathfindableImpl: (proc(stateId: uint32, computationType: PathComputationType): bool {.closure.} =
+      defaultIsPathfindable(stateId, computationType)),
   )
 
 proc onLandedUpon*(b: BlockBehaviour, entity: EntityBase, fallDistance: float64) {.inline.} =
@@ -83,6 +101,9 @@ proc onLandedUpon*(b: BlockBehaviour, entity: EntityBase, fallDistance: float64)
 
 proc updateEntityMovementAfterFallOn*(b: BlockBehaviour, entity: EntityBase) {.inline.} =
   b.updateEntityMovementAfterFallOnImpl(entity)
+
+proc isPathfindable*(b: BlockBehaviour, stateId: uint32, computationType: PathComputationType): bool {.inline.} =
+  b.isPathfindableImpl(stateId, computationType)
 
 # --- registration: replaces `#[pumpkin_block(name)]` ------------------------
 

@@ -105,3 +105,23 @@ not the whole module.
    `getMaxStackSize`/`getName`, backed by `src/generated/item.nim`'s
    1658 items) has no such dependency and IS runtime-verified - see
    `src/inventory/itemwiringtest.nim`.
+
+6. **Four more concrete blocks ported**, extending the vtable with a third
+   method: `tintedglass.nim` (`impl BlockBehaviour for TintedGlassBlock {}`,
+   another empty impl like `structure_void.nim`), `hay.nim` (overrides
+   `on_landed_upon` with a 0.2 fall-damage multiplier), `mud.nim`/
+   `soulsand.nim` (both override the new `is_pathfindable` method to
+   unconditionally return false). `is_pathfindable`'s trait DEFAULT body
+   (`defaultIsPathfindable` in `blockbehaviour.nim`) is a simplified
+   stand-in for upstream's real one - which branches on
+   `state.is_waterlogged()`/`Fluid::from_state_id(...)` for `Water` and
+   `state.is_full_cube()` for `Land`/`Air`, none of which exist yet (no
+   `BlockState`/`Fluid`/tag registry) - documented in-file; every block
+   that needs real pathfinding behavior overrides it directly rather than
+   relying on the approximation, same as `mud`/`soul_sand` do here.
+   `blocktest.nim` extended to register and exercise all four. Looked at
+   `logs.rs`/`glazed_terracotta.rs` as further candidates - both need a
+   `BlockStateId`/block-property-permutation system (`on_place` returning
+   a computed state id) that doesn't exist yet, genuinely blocked, not
+   attempted. Same runtime-crash caveat as above (`nimony check` clean,
+   `nimony c -r` not yet possible - anything here imports `entity.nim`).

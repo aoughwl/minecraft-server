@@ -13,8 +13,13 @@
 
 import std/syncio
 import blockbehaviour
+import blockmisc
 import structure_void
 import slime
+import tintedglass
+import hay
+import mud
+import soulsand
 import ../entity/entity
 
 proc check(cond: bool, msg: string) =
@@ -24,6 +29,10 @@ proc check(cond: bool, msg: string) =
 
 registerStructureVoid()
 registerSlime()
+registerTintedGlass()
+registerHay()
+registerMud()
+registerSoulSand()
 
 let svBehaviour = lookupBlock("minecraft:structure_void")
 let slimeBehaviour = lookupBlock("minecraft:slime_block")
@@ -53,5 +62,30 @@ if slimeBehaviour != nil:
   check(e.velocity.y > 0.0, "slime's bounce should flip vertical velocity positive")
 else:
   check(false, "slime_block should be registered")
+
+let hayBehaviour = lookupBlock("minecraft:hay_block")
+if hayBehaviour != nil:
+  onLandedUpon(hayBehaviour, eb, 3.0)  # only checks it doesn't crash statically; real damage math is a placeholder
+else:
+  check(false, "hay_block should be registered")
+
+let mudBehaviour = lookupBlock("minecraft:mud")
+if mudBehaviour != nil:
+  check(isPathfindable(mudBehaviour, 0'u32, pctLand) == false, "mud should never be pathfindable (Land)")
+  check(isPathfindable(mudBehaviour, 0'u32, pctWater) == false, "mud should never be pathfindable (Water)")
+else:
+  check(false, "mud should be registered")
+
+let soulSandBehaviour = lookupBlock("minecraft:soul_sand")
+if soulSandBehaviour != nil:
+  check(isPathfindable(soulSandBehaviour, 0'u32, pctAir) == false, "soul_sand should never be pathfindable (Air)")
+else:
+  check(false, "soul_sand should be registered")
+
+let tintedGlassBehaviour = lookupBlock("minecraft:tinted_glass")
+if tintedGlassBehaviour != nil:
+  check(isPathfindable(tintedGlassBehaviour, 0'u32, pctLand) == true, "tinted_glass falls through to the default (Land -> true)")
+else:
+  check(false, "tinted_glass should be registered")
 
 echo "all block-registration/vtable checks passed"
