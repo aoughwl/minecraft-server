@@ -139,4 +139,70 @@ let dropData = PlayerDropItemEventData(
 )
 assert dropData.count == 3'u8
 
+let redstoneData = BlockRedstoneEventData(
+  stateId: 5'u16,
+  blockPos: blockPos(2, 63, 2),
+  oldCurrent: 0'i32,
+  newCurrent: 15'i32,
+  cancelled: false,
+)
+assert redstoneData.newCurrent == 15'i32
+
+let burnData = BlockBurnEventData(
+  ignitingBlock: "minecraft:fire",
+  blockName: "minecraft:oak_planks",
+  cancelled: false,
+)
+assert burnData.blockName == "minecraft:oak_planks"
+
+let canBuildData = BlockCanBuildEventData(
+  blockToBuild: "minecraft:chest",
+  buildable: true,
+  player: p1,
+  blockName: "minecraft:air",
+  cancelled: false,
+)
+assert canBuildData.buildable
+
+let growData = BlockGrowEventData(
+  oldBlock: "minecraft:sapling",
+  oldStateId: 3'u16,
+  newBlock: "minecraft:oak_log",
+  newStateId: 9'u16,
+  blockPos: blockPos(0, 64, 0),
+  cancelled: false,
+)
+assert growData.newBlock == "minecraft:oak_log"
+
+let serverCommandData = ServerCommandEventData(
+  command: "gamemode creative Alice",
+  cancelled: false,
+)
+assert serverCommandData.command.len > 0
+
+let loadData = ServerLoadEventData(loadType: sltStartup)
+assert loadData.loadType == sltStartup
+
+let spawnChangeData = SpawnChangeEventData(
+  previousPosition: blockPos(0, 64, 0),
+  previousYaw: 0.0'f32,
+  previousPitch: 0.0'f32,
+  newPosition: blockPos(100, 70, 100),
+  newYaw: 90.0'f32,
+  newPitch: 0.0'f32,
+)
+assert spawnChangeData.newPosition.x == 100
+
+let tickStartData = ServerTickStartEventData(tick: 12345'i32)
+assert tickStartData.tick == 12345'i32
+
+let tickEndData = ServerTickEndEventData(tick: 12345'i32, durationNanos: 2_000_000'i64)
+assert tickEndData.durationNanos == 2_000_000'i64
+
+let chunkLoadData = ChunkLoadEventData(chunkX: 3'i32, chunkZ: -4'i32, cancelled: false)
+assert chunkLoadData.chunkZ == -4'i32
+
+let chunkSaveData = ChunkSaveEventData(chunkX: 3'i32, chunkZ: -4'i32, cancelled: false)
+assert chunkSaveData.chunkX == 3'i32
+
 echo "all eventdata checks passed"

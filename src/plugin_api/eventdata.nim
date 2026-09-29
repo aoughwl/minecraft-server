@@ -174,3 +174,72 @@ type
     itemName*: string
     count*: uint8
     cancelled*: bool
+
+  BlockRedstoneEventData* = object
+    ## `target-world: %world` dropped, same reasoning as EntitySpawn above.
+    stateId*: uint16
+    blockPos*: BlockPos
+    oldCurrent*: int32
+    newCurrent*: int32
+    cancelled*: bool
+
+  BlockBurnEventData* = object
+    ignitingBlock*: string
+    blockName*: string
+    cancelled*: bool
+
+  BlockCanBuildEventData* = object
+    blockToBuild*: string
+    buildable*: bool
+    player*: PlayerUuid
+    blockName*: string
+    cancelled*: bool
+
+  BlockGrowEventData* = object
+    ## `target-world: %world` dropped, same reasoning as EntitySpawn above.
+    oldBlock*: string
+    oldStateId*: uint16
+    newBlock*: string
+    newStateId*: uint16
+    blockPos*: BlockPos
+    cancelled*: bool
+
+  ServerCommandEventData* = object
+    command*: string
+    cancelled*: bool
+
+  ServerLoadType* = enum
+    sltStartup
+    sltReload
+
+  ServerLoadEventData* = object
+    loadType*: ServerLoadType
+
+  SpawnChangeEventData* = object
+    ## `target-world: %world` dropped, same reasoning as EntitySpawn above.
+    ## No `cancelled` field in the WIT record.
+    previousPosition*: BlockPos
+    previousYaw*: float32
+    previousPitch*: float32
+    newPosition*: BlockPos
+    newYaw*: float32
+    newPitch*: float32
+
+  ServerTickStartEventData* = object
+    tick*: int32
+
+  ServerTickEndEventData* = object
+    tick*: int32
+    durationNanos*: int64
+
+  ChunkLoadEventData* = object
+    ## `target-world: %world` dropped, same reasoning as EntitySpawn above.
+    chunkX*: int32
+    chunkZ*: int32
+    cancelled*: bool
+
+  ChunkSaveEventData* = object
+    ## `target-world: %world` dropped, same reasoning as EntitySpawn above.
+    chunkX*: int32
+    chunkZ*: int32
+    cancelled*: bool
