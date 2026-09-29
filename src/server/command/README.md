@@ -103,20 +103,38 @@ directory uses that library.
   other file here (bug #1, confirmed again with the same
   `lambdalifting.nim(369)`/`eraiser.nim(128)` signature).
 
+- **`defaultgamemode.nim`** - `/defaultgamemode <mode>`. First command in
+  this directory to need an actual player registry rather than a
+  single-field `CommandSource` stand-in: `context.server().get_all_players()`
+  is now backed by `src/server/playerregistry.nim`, a minimal in-memory
+  `seq[Player]` registry (lookup-by-uuid/lookup-by-name/broadcast - NOT
+  the full async multi-client server, that's still correctly deferred
+  pending a concurrency-model decision, same as everywhere else in this
+  port). `CommandSource` gained `playerRegistry*: nil PlayerRegistry`
+  and `forceGamemode*: bool` (standing in for
+  `server.basic_config.force_gamemode` - no `BasicConfiguration` type
+  exists yet). `defaultgamemodetest.nim` drives 4 real dispatch-walk
+  cases: force-on changes every non-matching player and reports the
+  right count, force-off changes nothing, a nil registry is safe
+  (0 changes, not a crash), and invalid-mode parsing still fails
+  correctly. Not ported: permission registration, the translated
+  feedback message, and persisting the new default onto a `Server`
+  type (none exists to persist it on).
+
 ## Not started
 
-The other ~20 command files under `upstream-ref/crates/pumpkin/src/command/commands/`,
+The other ~18 command files under `upstream-ref/crates/pumpkin/src/command/commands/`,
 ranging from small (`tellraw.rs` ~42 lines - needs `EntityArgumentType::Players`,
 an entity-selector argument type not in `src/command/argtype.nim`'s
 `ArgValue` union yet, plus `ComponentArgumentType` for the unported
-`text` module; `defaultgamemode.rs` ~69 lines - needs
-`Server.get_all_players()`/a player registry) to substantial
-(`execute.rs` at 1660 lines - the `/execute` conditional/redirect
-command, which needs the `RedirectModifier`/forking support
-`cmdtree.nim` explicitly deferred). Most need a real player/world
-registry (a server-wide list of connected players, which
-`src/server/world/worldstub.nim` doesn't model) beyond what's already
-ported here.
+`text` module) to substantial (`execute.rs` at 1660 lines - the
+`/execute` conditional/redirect command, which needs the
+`RedirectModifier`/forking support `cmdtree.nim` explicitly deferred).
+`src/server/playerregistry.nim`'s minimal player registry (see
+`defaultgamemode.nim` above) now covers the "needs a list of connected
+players" blocker several of these previously cited - worth re-checking
+each file's real dependencies before assuming it's still blocked the
+same way, the same lesson `defaultgamemode.rs` itself just taught.
 
 - **`setidletimeout.nim`** - `/setidletimeout <minutes>`. Single
   non-negative-integer argument, gated at the parser via

@@ -27,6 +27,7 @@
 import ../util/vector2, ../util/vector3
 import ../util/difficulty
 import ../server/entity/entity
+import ../server/playerregistry
 
 type
   ReturnValueKind* = enum
@@ -110,6 +111,18 @@ type
       ## stands in for `server.set_difficulty(difficulty, true)`
       ## (src/server/command/difficulty.nim) - same no-`Server`-type gap
       ## as `stopProc`. `nil` is a safe no-op.
+    playerRegistry*: nil PlayerRegistry
+      ## stands in for `context.source.server()`'s player-visible slice
+      ## (`server.get_all_players()`, used by e.g.
+      ## src/server/command/defaultgamemode.nim). `nil` for a source with
+      ## no server context (tests, a bare DummySource). This is the first
+      ## piece of `src/server/playerregistry.nim`'s minimal registry
+      ## design wired through the command layer - not a full `Server`
+      ## type, just enough to let a command iterate other players.
+    forceGamemode*: bool
+      ## stands in for `server.basic_config.force_gamemode`
+      ## (defaultgamemode.nim) - no `BasicConfiguration` type is threaded
+      ## through `CommandSource` yet, so this one flag stands alone.
 
 proc sendMessage*(s: CommandSource, message: string) =
   if s.sendMessageProc != nil:
