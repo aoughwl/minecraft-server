@@ -76,6 +76,15 @@ type
     stopProc*: proc() {.closure.}
       ## stands in for `crate::stop_server()` - no process-level server
       ## loop exists in this port yet. `nil` is a safe no-op.
+    tpsProc*: proc(): float64 {.closure.}
+    msptProc*: proc(): float64 {.closure.}
+      ## stand in for `context.source.server().get_tps()`/`get_mspt()`
+      ## (src/server/command/tps.nim) - no tick-loop/`Server` type exists
+      ## in this port yet. `nil` falls back to reporting 0.0.
+    reloadProc*: proc() {.closure.}
+      ## stands in for `server.reload_datapacks(&server)`
+      ## (src/server/command/reload.nim) - same no-`Server`-type gap as
+      ## `stopProc`. `nil` is a safe no-op.
 
 proc sendMessage*(s: CommandSource, message: string) =
   if s.sendMessageProc != nil:

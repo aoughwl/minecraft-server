@@ -49,17 +49,42 @@ directory uses that library.
   unported `pumpkin_data`/`text` modules) - messages are broadcast as
   plain strings, same simplification `gamemode.nim` already uses.
 
+- **`tps.nim`** - `/tps`. No arguments; reports server tick-rate/MSPT.
+  `CommandSource` gained `tpsProc*`/`msptProc*: proc(): float64
+  {.closure.}` (both `nil` = report 0.0) since no `Server`/tick-loop type
+  exists yet. `NamedColor`-coded feedback (green/yellow/red by tick
+  health) is dropped - plain string, same simplification as everywhere
+  else. Verified via `tpsreloadreturntest.nim`'s `tpsBlock`.
+
+- **`reload.nim`** - `/reload`. No arguments; announces then reloads
+  datapacks. `CommandSource` gained `reloadProc*: proc() {.closure.}`
+  (`nil` = safe no-op), matching `stopProc`'s shape exactly. Verified via
+  `tpsreloadreturntest.nim`'s `reloadBlock`, confirms `reloadProc` fires.
+
+- **`returncmd.nim`** - `/return <value>`, `/return fail`, `/return run
+  ...`. Named `returncmd.nim`, not `return.nim` - `return` is a reserved
+  word in Nimony. The `run` branch's redirect-to-root uses
+  `cmdtree.nim`'s existing simple-target `setRedirect`, no new tree
+  machinery needed (upstream's own `Redirection::Root` is exactly that
+  simple case, not a fork). Verified via `tpsreloadreturntest.nim`'s
+  `returnValueBlock`/`returnFailBlock` (both dispatch-walked, including
+  the integer-argument parse path via `newIntegerArgumentType()`).
+
+  Not ported: permission-registry registration (same simplification as
+  every other command file here).
+
 ## Not started
 
-The other ~27 command files under `upstream-ref/crates/pumpkin/src/command/commands/`,
-ranging from small (`tellraw.rs`/`return.rs` ~42-44 lines, `reload.rs`/
-`tps.rs` ~48-53 lines - reasonable next targets) to substantial
-(`execute.rs` at 1660 lines - the `/execute` conditional/redirect
-command, which needs the `RedirectModifier`/forking support
-`cmdtree.nim` explicitly deferred). Most need a real player/world
-registry (a server-wide list of connected players, which
-`src/server/world/worldstub.nim` doesn't model) beyond what
-`gamemode.nim`/`say.nim`/`me.nim`/`stop.nim` needed.
+The other ~23 command files under `upstream-ref/crates/pumpkin/src/command/commands/`,
+ranging from small (`tellraw.rs` ~42 lines - a reasonable next target,
+needs a `TextComponent`-ish argument the way `say.nim`'s plain-string
+scope doesn't quite cover) to substantial (`execute.rs` at 1660 lines -
+the `/execute` conditional/redirect command, which needs the
+`RedirectModifier`/forking support `cmdtree.nim` explicitly deferred).
+Most need a real player/world registry (a server-wide list of connected
+players, which `src/server/world/worldstub.nim` doesn't model) beyond
+what `gamemode.nim`/`say.nim`/`me.nim`/`stop.nim`/`tps.nim`/`reload.nim`/
+`returncmd.nim` needed.
 
 ## Runtime-verification status
 
