@@ -121,9 +121,39 @@ directory uses that library.
   feedback message, and persisting the new default onto a `Server`
   type (none exists to persist it on).
 
+- **`saveall.nim`** - `/save-all` and `/save-all flush` (upstream registers
+  the same executor under both literals - kept as two real tree nodes,
+  not collapsed). `CommandSource` gained `saveAllProc*: proc() {.closure.}`
+  (`nil` = safe no-op), matching `stopProc`'s shape. Async task-spawn
+  dropped (called synchronously, assumed to succeed - no concurrency
+  model exists in this port yet). Verified via `savelistkilltest.nim`'s
+  `saveAllBlock`.
+
+- **`list.nim`** - `/list` and `/list uuids`. First file to actually READ
+  `src/server/playerregistry.nim`'s registry (`defaultgamemode.nim` only
+  wrote through it). `CommandSource` gained `maxPlayersProc*: proc(): int32
+  {.closure.}` (`nil` falls back to the connected-player count itself,
+  i.e. "full") since no per-client-platform `AdvancedConfiguration` type
+  exists. A `nil` registry reports zero players rather than crashing,
+  matching `defaultgamemode.nim`'s nil-is-safe precedent. Verified via
+  `savelistkilltest.nim`'s `listEmptyBlock`/`listWithPlayersBlock`.
+
+- **`kill.nim`** - `/kill`, self-target form only. The `<targets>`
+  multi-entity form needs `EntityArgumentType::Entities`, an
+  entity-selector argument type not in `src/command/argtype.nim`'s
+  `ArgValue` union yet (same blocker `gamemode.nim`'s `<target>` form
+  cites). `target.kill()` becomes a direct `health = 0` +
+  `removalReason = (true, rrKilled)` write - no real death
+  event/drops/XP behaviour exists yet. Verified via
+  `savelistkilltest.nim`'s `killNoPlayerBlock`/`killSelfBlock`.
+
+Not ported from any of the three: permission-registry registration and
+translated feedback text, same simplifications every other file here
+already uses.
+
 ## Not started
 
-The other ~18 command files under `upstream-ref/crates/pumpkin/src/command/commands/`,
+The other ~15 command files under `upstream-ref/crates/pumpkin/src/command/commands/`,
 ranging from small (`tellraw.rs` ~42 lines - needs `EntityArgumentType::Players`,
 an entity-selector argument type not in `src/command/argtype.nim`'s
 `ArgValue` union yet, plus `ComponentArgumentType` for the unported
@@ -131,10 +161,11 @@ an entity-selector argument type not in `src/command/argtype.nim`'s
 `/execute` conditional/redirect command, which needs the
 `RedirectModifier`/forking support `cmdtree.nim` explicitly deferred).
 `src/server/playerregistry.nim`'s minimal player registry (see
-`defaultgamemode.nim` above) now covers the "needs a list of connected
-players" blocker several of these previously cited - worth re-checking
-each file's real dependencies before assuming it's still blocked the
-same way, the same lesson `defaultgamemode.rs` itself just taught.
+`defaultgamemode.nim`/`list.nim`/`kill.nim` above) now covers the "needs
+a list of connected players" blocker several of these previously cited -
+worth re-checking each file's real dependencies before assuming it's
+still blocked the same way, the same lesson `defaultgamemode.rs` itself
+already taught.
 
 - **`setidletimeout.nim`** - `/setidletimeout <minutes>`. Single
   non-negative-integer argument, gated at the parser via
@@ -162,8 +193,11 @@ need of its own): `nimony check` passes clean, but `nimony c -r` hits
 the closures-through-vtables crash cataloged as bug #1 in
 `NIMONY-COMPILER-BUGS.md` (confirmed again here for `stoptest.nim`,
 same exact signature: `lambdalifting.nim(369)`/`eraiser.nim(128)`).
-`gamemodetest.nim`/`saymetest.nim`/`stoptest.nim`/`setidletimeouttest.nim`
-are all check-verified, not runtime-proven - and `setidletimeouttest.nim`
-specifically shows the crash's real trigger is `src/command/`'s own
-closure-vtable types (`cmdtree.nim`/`cmddispatch.nim`), not `entity.nim`
-as earlier files' doc comments implied.
+`gamemodetest.nim`/`saymetest.nim`/`stoptest.nim`/`setidletimeouttest.nim`/
+`savelistkilltest.nim` are all check-verified, not runtime-proven - and
+`setidletimeouttest.nim` specifically shows the crash's real trigger is
+`src/command/`'s own closure-vtable types (`cmdtree.nim`/`cmddispatch.nim`),
+not `entity.nim` as earlier files' doc comments implied.
+`savelistkilltest.nim` confirms the identical signature again
+(`lambdalifting.nim(369,3)`/`eraiser.nim(128,3)`), run directly via
+PowerShell to double-check it's not a regression.

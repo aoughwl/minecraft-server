@@ -123,6 +123,15 @@ type
       ## stands in for `server.basic_config.force_gamemode`
       ## (defaultgamemode.nim) - no `BasicConfiguration` type is threaded
       ## through `CommandSource` yet, so this one flag stands alone.
+    saveAllProc*: proc() {.closure.}
+      ## stands in for `server.save_all()` (src/server/command/saveall.nim)
+      ## - same no-`Server`-type gap as `stopProc`. `nil` is a safe no-op.
+    maxPlayersProc*: proc(): int32 {.closure.}
+      ## stands in for `server.advanced_config.networking.{java,bedrock}.max_players`
+      ## (src/server/command/list.nim) - no `AdvancedConfiguration`/per-client-platform
+      ## type is threaded through `CommandSource` yet. `nil` falls back to
+      ## the connected-player count itself (i.e. "full"), the same
+      ## single-world-assumption spirit as `setSaveEnabledProc`'s default.
 
 proc sendMessage*(s: CommandSource, message: string) =
   if s.sendMessageProc != nil:
@@ -155,6 +164,16 @@ proc broadcastMessage*(s: CommandSource, message: string) =
 proc stopServer*(s: CommandSource) =
   if s.stopProc != nil:
     s.stopProc()
+
+proc saveAll*(s: CommandSource) =
+  if s.saveAllProc != nil:
+    s.saveAllProc()
+
+proc maxPlayers*(s: CommandSource, connected: int32): int32 =
+  if s.maxPlayersProc != nil:
+    s.maxPlayersProc()
+  else:
+    connected
 
 proc setSaveEnabled*(s: CommandSource, enabled: bool): bool =
   if s.setSaveEnabledProc != nil:
