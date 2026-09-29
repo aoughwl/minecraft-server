@@ -33,14 +33,62 @@ type
   ChunkSection = object
     blocks: PalettedContainer
 
+  SoundEvent* = object
+    ## Recorded shape of a `World.play_sound` call. `soundName`/`category`
+    ## are kept as plain strings rather than `src/generated/sound.nim`'s
+    ## `Sound` enum / a real `SoundCategory` type, for the same reason
+    ## `getBlockStateAt` stays direction-agnostic: keeping this module's
+    ## own import graph free of anything that would pull in `entity.nim`
+    ## (directly or transitively), so `worldstubtest.nim` stays in the
+    ## genuinely-runtime-proven category (NIMONY-COMPILER-BUGS.md #1).
+    soundName*: string
+    category*: string
+    pos*: BlockPos
+
+  SpawnedEntity* = object
+    ## Recorded shape of a `World.spawn_entity` call. `kind`/`entityUuid`
+    ## are plain strings for the same entity.nim-avoidance reason above -
+    ## a caller that already has a concrete `EntityBase` records its own
+    ## id/kind here rather than this module knowing the real type.
+    kind*: string
+    entityUuid*: string
+    pos*: BlockPos
+
   World* = ref object
     ## Single-world, single-dimension, in-memory-only. No chunk
     ## loading/unloading, no persistence (that's `src/world/anvilformat.nim`'s
     ## job once wired up), no entity tracking, no networking.
     sections: seq[(SectionCoord, ChunkSection)]
+    playedSounds*: seq[SoundEvent]
+      ## `playSound` is a recording stub, not a no-op: real audio/network
+      ## broadcast doesn't exist yet (no net transport, see src/server/net/
+      ## README.md's deferred concurrency-model note), but callers like
+      ## `EggItem.normal_use` need *something* to call and tests need
+      ## something to assert against - upstream fire-and-forgets this call
+      ## too (no return value), so recording rather than silently dropping
+      ## keeps the seam honest and testable.
+    spawnedEntities*: seq[SpawnedEntity]
+      ## Same reasoning as `playedSounds`: no real entity-tracking/
+      ## networking exists yet, so `spawnEntity` records what WOULD have
+      ## been spawned rather than pretending to fully simulate it.
 
 proc newWorld*(): World =
-  World(sections: @[])
+  World(sections: @[], playedSounds: @[], spawnedEntities: @[])
+
+proc playSound*(w: World, soundName, category: string, pos: BlockPos) =
+  ## Port of upstream `World::play_sound`. Real upstream broadcasts a
+  ## `SoundEffect` packet to every player in range; this port has no net
+  ## transport yet, so this just records the call - see `playedSounds`'s
+  ## doc comment above for why that's the honest stand-in, not a bare
+  ## no-op or an unported TODO stub.
+  w.playedSounds.add(SoundEvent(soundName: soundName, category: category, pos: pos))
+
+proc spawnEntity*(w: World, kind, entityUuid: string, pos: BlockPos) =
+  ## Port of upstream `World::spawn_entity`. Real upstream adds the entity
+  ## to the world's live entity list and broadcasts a spawn packet to
+  ## nearby players; this port has neither yet, so this records the call -
+  ## see `spawnedEntities`'s doc comment above.
+  w.spawnedEntities.add(SpawnedEntity(kind: kind, entityUuid: entityUuid, pos: pos))
 
 proc floorDiv(v, n: int32): int32 {.inline.} =
   var q = v div n

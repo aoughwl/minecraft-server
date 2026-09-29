@@ -31,4 +31,19 @@ assert w.getBlockState(blockPos(-17, 0, 0)) == AirState  # different section tha
 let prev = w.setBlockState(blockPos(1, 2, 3), 100'u32)
 assert prev == 42'u32
 
+# playSound/spawnEntity: recording stubs, not no-ops (see World's doc comment).
+assert w.playedSounds.len == 0
+w.playSound("minecraft:entity.egg.throw", "players", blockPos(1, 2, 3))
+assert w.playedSounds.len == 1
+assert w.playedSounds[0].soundName == "minecraft:entity.egg.throw"
+assert w.playedSounds[0].category == "players"
+assert w.playedSounds[0].pos == blockPos(1, 2, 3)
+
+assert w.spawnedEntities.len == 0
+w.spawnEntity("minecraft:egg", "00000000-0000-0000-0000-000000000001", blockPos(1, 2, 3))
+w.spawnEntity("minecraft:egg", "00000000-0000-0000-0000-000000000002", blockPos(4, 5, 6))
+assert w.spawnedEntities.len == 2
+assert w.spawnedEntities[1].entityUuid == "00000000-0000-0000-0000-000000000002"
+assert w.spawnedEntities[1].pos == blockPos(4, 5, 6)
+
 echo "World stub: all checks passed"

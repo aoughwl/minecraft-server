@@ -65,10 +65,19 @@ to clear that bar.
 
 ## What unblocks the rest
 
-- A `Player.inventory` field/accessor and a minimal `World` type (even a stub with
-  `spawnEntity`/`playSound`/`updateBlockEntity` no-ops) would unblock most of the simpler
-  concrete items (`egg.rs`, `ender_pearl.rs`, `snowball.rs`, etc. — anything that's "throw a
-  projectile and consume the stack").
+- ~~A `Player.inventory` field/accessor~~ — done (`entity.nim`'s `Player.inventory: nil
+  Inventory`). ~~A minimal `World` type (even a stub with `spawnEntity`/`playSound`/
+  `updateBlockEntity` no-ops)~~ — `spawnEntity`/`playSound` now exist on
+  `src/server/world/worldstub.nim`'s `World` as recording stubs (not silent no-ops - see that
+  file's doc comments), genuinely runtime-verified via `worldstubtest.nim`.
+- Still missing for `egg.rs`/`ender_pearl.rs`/`snowball.rs`-shaped items ("throw a projectile
+  and consume the stack"): a concrete *player* inventory type with a "held item" slot concept
+  (`src/inventory/itemstub.nim`'s `Inventory` interface is generic slot storage, not a player's
+  specific main-hand/off-hand/hotbar layout) and `Player.position()`/`Player.rotation()`
+  accessors (`Entity` has raw position/rotation fields per `entity.nim`, but no convenience
+  accessor matching upstream's call shape yet). `updateBlockEntity` still not added — no
+  concrete caller needs it yet, kept unbuilt per this repo's "don't build ahead of a real
+  caller" house style.
 - `data` (pumpkin-data, 1.5M generated lines, itself only lightly ported via `src/data_codegen/`)
   owns the real `Item`/`ItemStack` types this port currently stubs in
   `src/inventory/itemstub.nim` — several items' logic (`spawn_egg.rs`, `dye.rs`'s color lookup)
