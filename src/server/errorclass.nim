@@ -1,12 +1,12 @@
 ## Cross-cutting error classification used by the server's top-level error
 ## handling: does an error warrant kicking the client, at what log
 ## severity, and what (if any) message the client should see.
-## Port of pumpkingmc/crates/pumpkin/src/error.rs
+## Ported from the upstream reference implementation's server/error.rs
 ##
-## Rust expresses this as a `PumpkinError` trait implemented for each
+## Rust expresses this as a shared error trait implemented for each
 ## concrete error type (`InventoryError`, `ReadingError`,
 ## `PlayerDataError`), plus a blanket `From<ErrorType> for Box<dyn
-## PumpkinError>` so any of them can be handled uniformly. Nimony has no
+## ThatTrait>` so any of them can be handled uniformly. Nimony has no
 ## trait objects, but it doesn't need one here either: these are three
 ## unrelated concrete types, not a heterogeneous collection, so plain
 ## overloaded procs (resolved per-type at compile time, same as Rust's impl
@@ -51,7 +51,7 @@ proc severity*(e: ReadingError): ErrorSeverity {.inline.} = sevError
 proc clientKickReason*(e: ReadingError): (bool, string) =
   (false, "")
 
-# PlayerDataError isn't ported yet (lives in pumpkin-world's data/player_data.rs,
+# PlayerDataError isn't ported yet (lives in world's data/player_data.rs,
 # not yet in src/world/) - its two variants (`Io`/`Nbt`) and their
 # `client_kick_reason` message-formatting are straightforward once that
 # type exists; add `isKick`/`severity`/`clientKickReason` overloads for it

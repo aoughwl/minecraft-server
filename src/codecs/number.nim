@@ -1,6 +1,6 @@
 ## A generic Java-style number, plus the widening/narrowing conversions
 ## Java's numeric casts use. Port of
-## pumpkingmc/crates/pumpkin-codecs/src/number.rs
+## upstream/codecs/src/number.rs
 ##
 ## The `serde_json::Value`/`serde_json::Number` conversions at the bottom of
 ## the Rust file are skipped: no JSON codec layer (`json_ops.rs`) is ported

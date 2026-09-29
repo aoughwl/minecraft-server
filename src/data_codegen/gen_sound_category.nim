@@ -63,7 +63,7 @@ proc build(assetsPath: string): string =
 
 when isMainModule:
   # the upstream reference clone is a sibling of this repo: C:\Users\savant\Projects\{upstream-ref,minecraft-server}
-  let assetsPath = "../pumpkingmc/assets"
+  let assetsPath = "../upstream-ref/assets"
   try:
     let generated = build(assetsPath)
     writeFile(OutPath, generated)

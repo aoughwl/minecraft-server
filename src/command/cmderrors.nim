@@ -1,11 +1,11 @@
 ## Command-parsing error types.
-## Port of pumpkingmc/crates/pumpkin-command/src/errors/command_syntax_error.rs
+## Port of upstream/command/src/errors/command_syntax_error.rs
 ## (simplified) and (the shape of) src/errors/error_types.rs.
 ##
 ## Upstream's `CommandSyntaxError` carries `error_type: &'static dyn
 ## AnyCommandErrorType` (a trait object identifying *which* static error
 ## constant fired, e.g. `READER_EXPECTED_INT`) plus a `TextComponent`
-## message (pumpkin_util::text, itself not yet ported - a prior fork
+## message (util::text, itself not yet ported - a prior fork
 ## skipped `text/mod.rs`, ~2.2k lines). Reproducing that trait-object
 ## registry faithfully needs both of those first. Until then, this is a
 ## plain `kind` enum (one variant per upstream error-type constant actually

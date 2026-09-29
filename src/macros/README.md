@@ -1,11 +1,11 @@
-# pumpkin-macros (not ported — documented)
+# macros (not ported — documented)
 
-Source: `pumpkingmc/crates/pumpkin-macros/src/lib.rs`, 1,151 lines, a single
+Source: `upstream/macros/src/lib.rs`, 1,151 lines, a single
 file. Entirely Rust proc-macro codegen (`proc_macro`/`syn`/`quote`) — no
 plain runtime logic anywhere in the crate, so unlike the initial assumption
 there is nothing here to port line-by-line. Same situation as
-`pumpkin-api-macros` (see `../api_macros/README.md`) and
-`pumpkin-host-bindings` (`../host_bindings/README.md`): Nimony's macro
+`api-macros` (see `../api_macros/README.md`) and
+`host-bindings` (`../host_bindings/README.md`): Nimony's macro
 replacement is a structurally different, NIF-AST-based compiler-plugin
 mechanism, not a token-stream rewriter, so there is no mechanical
 translation. This file records what each macro actually does semantically,
@@ -52,11 +52,11 @@ Nimony equivalent: a plain `const PacketId = ...` in each packet type, or
 a table `{TypeName: id}` built by hand — no macro needed, this is just
 struct-literal boilerplate Rust chose to auto-generate.
 
-## `#[pumpkin_block]` / `#[pumpkin_block_from_tag]` (lines 351, 385)
+## `#[block]` / `#[block_from_tag]` (lines 351, 385)
 
 Similar registration macros for block-behavior structs, resolving a block
 name/tag string to a `Block`/`BlockState` ID `const`. Blocked on
-`pumpkin-data`'s (1.5M LOC, mostly generated) block registry existing in
+`data`'s (1.5M LOC, mostly generated) block registry existing in
 Nimony first — no point designing the replacement before that data exists.
 
 ## `#[derive(PacketWrite)]` / `#[derive(PacketRead)]` / `#[derive(PacketReadSlice)]` (lines 566, 640, 706)
@@ -80,7 +80,7 @@ not as something to port.
 ## `translate_cross!` / `translate_java!` (lines 1042, 1122)
 
 Compile-time-only macros that validate a translation-key string literal
-against Pumpkin's own translation resource files, erroring at Pumpkin's
+against the upstream server's own translation resource files, erroring at the upstream server's
 build time if the key doesn't exist. Purely a build-time lint with no
 runtime behavior — the Nimony equivalent (if ever wanted) would be a
 small standalone script run in CI/`tools/`, not a macro, since Nimony

@@ -1,5 +1,5 @@
 ## License validation, leasing, and offline grace periods.
-## Port of pumpkingmc/crates/pumpkin-plugin-utils/src/license.rs
+## Port of upstream/plugin-utils/src/license.rs
 ##
 ## File I/O uses Nimony's actual error mechanism (`try`/`except ErrorCode`,
 ## per ~/nimony/doc/language.md) rather than the house `PuResult[T]`
@@ -85,7 +85,7 @@ proc writeCachedLease*(c: LicenseChecker, lease: LicenseLease): PuVoidResult =
 proc currentTimestamp(): uint64 =
   uint64(toUnix(getTime()))
 
-proc evaluateLicense*(c: LicenseChecker, metadata: PumpkinMetadata,
+proc evaluateLicense*(c: LicenseChecker, metadata: ServerMetadata,
                        gracePeriodDays: uint32): LicenseStatus =
   if not metadata.isPaid:
     return LicenseStatus(kind: lskValid, metadata: metadata)
@@ -117,7 +117,7 @@ proc evaluateLicense*(c: LicenseChecker, metadata: PumpkinMetadata,
   # No cached lease yet (first run) and offline: allow initial valid state.
   LicenseStatus(kind: lskValid, metadata: metadata)
 
-proc checkLicenseOnline*(c: LicenseChecker, metadata: PumpkinMetadata,
+proc checkLicenseOnline*(c: LicenseChecker, metadata: ServerMetadata,
                           licenseKeyOverride: string,
                           hasOverride: bool): PuResult[CheckLicenseResponse] =
   var licenseKey: string

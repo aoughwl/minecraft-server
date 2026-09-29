@@ -1,5 +1,5 @@
 ## Low-level NBT serialization support.
-## Port of pumpkingmc/crates/pumpkin-nbt/src/serializer.rs
+## Port of upstream/nbt/src/serializer.rs
 ##
 ## Rust models this as a `NbtWriteHelper` trait with two implementations
 ## (Java big-endian/CESU-8, Bedrock little-endian/varint). Nimony has no

@@ -1,16 +1,16 @@
-# pumpkin-plugin-api → Nimony
+# plugin-api → Nimony
 
-Source: `crates/pumpkin-plugin-api` in the Pumpkin repo, ~24k lines of Rust.
+Source: `crates/plugin-api` in the upstream repo, ~24k lines of Rust.
 
 ## What's actually here
 
 Despite the size, this crate is almost entirely a **WASM-guest SDK**: every
-substantive module imports from `crate::wit::pumpkin::plugin::*`, which is
+substantive module imports from `crate::wit::<host>::plugin::*`, which is
 the `wasmtime::component::bindgen!`-generated binding module (same
-generation mechanism `pumpkin-host-bindings` sits on the host side of - see
+generation mechanism `host-bindings` sits on the host side of - see
 `src/host_bindings/README.md`). That module isn't hand-written Rust
-anywhere in the crate; it's produced at Pumpkin's own build time from the
-WIT interface files under `pumpkin-plugin-wit/`. There is nothing here to
+anywhere in the crate; it's produced at the upstream server's own build time from the
+WIT interface files under `plugin-wit/`. There is nothing here to
 mechanically translate without first having a Nimony WASM-guest binding
 layer, which doesn't exist (see `src/host_bindings/README.md` and
 `src/plugin_runtime/README.md` for the three replacement paths already
@@ -29,7 +29,7 @@ type) - is WASM-guest binding glue through and through.
 
 `generated/block.rs` (5.2k lines) and `generated/item.rs` (6.7k lines) are
 build-time-generated block/item registry data, out of scope for the same
-reason `pumpkin-data` is: port the generator once everything upstream of it
+reason `data` is: port the generator once everything upstream of it
 is settled, not the generated output by hand.
 
 ## Ported

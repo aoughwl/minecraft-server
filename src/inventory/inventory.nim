@@ -1,5 +1,5 @@
 ## Core `Inventory`/`Clearable` interface, and NBT slot-array sync helpers.
-## Port of pumpkingmc/crates/pumpkin-inventory/src/inventory/inventory.rs
+## Port of upstream/inventory/src/inventory/inventory.rs
 ##
 ## Rust's `Inventory: Send + Sync + Clearable` is a trait with default
 ## method bodies, stored behind `Arc<dyn Inventory>` for dynamic dispatch
@@ -121,7 +121,7 @@ proc getList(c: NbtCompound, name: string): (bool, seq[NbtTag]) =
     (false, @[])
 
 proc writeItemStack(stack: ItemStack, c: var NbtCompound) =
-  ## TODO: stub. The real `ItemStack::write_item_stack` (pumpkin_data)
+  ## TODO: stub. The real `ItemStack::write_item_stack` (data)
   ## writes item id + count + full component data; this writes only what
   ## the stub `ItemStack` in itemstub.nim carries.
   putByte(c, "id", cast[int8](stack.item.id and 0xFF'u16))

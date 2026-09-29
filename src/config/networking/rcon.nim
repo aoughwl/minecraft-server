@@ -1,4 +1,4 @@
-## Port of pumpkingmc/crates/pumpkin-config/src/networking/rcon.rs
+## Port of upstream/config/src/networking/rcon.rs
 
 import netaddr
 

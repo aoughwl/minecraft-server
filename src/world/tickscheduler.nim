@@ -1,6 +1,6 @@
 ## Per-chunk ring-buffer tick scheduler: `MaxTickDelay` delay buckets, plus
 ## a queued-set to reject duplicate (position, value) tick requests.
-## Port of pumpkingmc/crates/pumpkin-world/src/tick/scheduler.rs
+## Port of upstream/world/src/tick/scheduler.rs
 ##
 ## Upstream wraps everything in `Mutex<Option<Box<...>>>` + `AtomicUsize`
 ## because `ChunkTickScheduler` is shared across Tokio tasks. This port has

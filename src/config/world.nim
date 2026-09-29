@@ -1,4 +1,4 @@
-## Port of pumpkingmc/crates/pumpkin-config/src/world.rs
+## Port of upstream/config/src/world.rs
 
 import chunk, lighting
 

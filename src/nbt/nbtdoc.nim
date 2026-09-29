@@ -1,6 +1,6 @@
 ## A complete NBT document: a named root compound, plus its top-level
 ## read/write entry points.
-## Port of pumpkingmc/crates/pumpkin-nbt/src/lib.rs's `Nbt` struct.
+## Port of upstream/nbt/src/lib.rs's `Nbt` struct.
 
 import nbtbase, serializer, deserializer, tag
 

@@ -1,5 +1,5 @@
-## pumpkin-command port status (module index / scope notes).
-## Upstream: pumpkingmc/crates/pumpkin-command (~14.1k lines).
+## command port status (module index / scope notes).
+## Upstream: upstream/command (~14.1k lines).
 ##
 ## Ported (tokenizer layer - foundational, self-contained, no unported
 ## dependencies):
@@ -7,7 +7,7 @@
 ##                        `kind` enum + string message instead of the
 ##                        trait-object AnyCommandErrorType registry, which
 ##                        needs errors/error_types.rs (413 lines) and
-##                        pumpkin_util::text::TextComponent, itself not yet
+##                        util::text::TextComponent, itself not yet
 ##                        ported)
 ## - string_range.nim <- context/string_range.rs
 ## - string_reader.nim <- string_reader.rs (Cow<str> collapsed to owned

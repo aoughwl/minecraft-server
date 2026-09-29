@@ -2,7 +2,7 @@
 ## synchronized between server and client (progress bars, fuel indicators,
 ## etc. in container screens - furnace fire icon, enchant levels, brew
 ## time, anvil repair cost, ...).
-## Port of pumpkingmc/crates/pumpkin-inventory/src/window_property.rs
+## Port of upstream/inventory/src/window_property.rs
 ##
 ## Rust's generic `WindowProperty<T: WindowPropertyTrait>` + a per-enum
 ## trait impl becomes, here, one concrete `WindowProperty` object holding

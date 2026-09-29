@@ -1,4 +1,4 @@
-## Port of pumpkingmc/crates/pumpkin-config/src/advancement.rs
+## Port of upstream/config/src/advancement.rs
 
 type
   AdvancementConfig* = object

@@ -1,5 +1,5 @@
 ## Built-in plugin permission identifiers (sandboxing capability strings).
-## Port of pumpkingmc/crates/pumpkin-plugin-api/src/permissions.rs
+## Port of upstream/plugin-api/src/permissions.rs
 
 const
   NetworkDns* = "network.dns"

@@ -1,5 +1,5 @@
 ## 2-dimensional vector with generic numeric components.
-## Port of pumpkingmc/crates/pumpkin-util/src/math/vector2.rs
+## Port of upstream/util/src/math/vector2.rs
 ##
 ## Rust's `Vector2<T>` is generic over any type implementing its local
 ## `Math` trait (`+ - * / neg`), blanket-impl'd for f32/f64/i8/i32/i64.
@@ -8,7 +8,7 @@
 ## so this ports as a real generic rather than being monomorphized.
 ## Skipped: the `serde::Serialize` impl and the `vector_codec_impl!`
 ## macro-generated `Encode`/`Decode`/`FlatTryFrom` impls (depend on the
-## still-unported `pumpkin_codecs` codec layer).
+## still-unported `codecs` codec layer).
 
 import std/math
 

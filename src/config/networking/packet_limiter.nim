@@ -1,4 +1,4 @@
-## Port of pumpkingmc/crates/pumpkin-config/src/networking/packet_limiter.rs
+## Port of upstream/config/src/networking/packet_limiter.rs
 
 type
   PacketLimiterConfig* = object

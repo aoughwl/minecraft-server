@@ -1,5 +1,5 @@
 ## Shared error/result plumbing for the plugin-utils port.
-## Port of the error enums scattered across pumpkin-plugin-utils'
+## Port of the error enums scattered across plugin-utils'
 ## http.rs/updater.rs/license.rs. Nimony has no Nim-compatible exceptions
 ## (its raise/ErrorCode mechanism is a fixed, non-extensible enum), so every
 ## fallible Rust `Result<T,E>` here returns an explicit `PuResult[T]`
@@ -55,13 +55,13 @@ proc puError*(kind: PuErrorKind, msg: string): PuError =
 
 proc notInitializedErr*(): PuError =
   puError(pekNotInitialized,
-    "Plugin-utils has not been initialized (call pumpkin_plugin_utils::init(context) first)")
+    "Plugin-utils has not been initialized (call plugin_utils::init(context) first)")
 
 proc notImplementedErr*(what: string): PuError =
   puError(pekNotImplemented, what & " is not implemented: Nimony has no HTTP client in " &
     "its stdlib yet (checked ~/nimony/lib/std/ - no http/net/url module beyond the " &
     "errorcodes_http.nim error-code enum). Needs a real HTTP+TLS client, likely via " &
-    "C FFI (libcurl/WinHTTP) since this talks to the Pumpkin Marketplace over HTTPS.")
+    "C FFI (libcurl/WinHTTP) since this talks to the the upstream server Marketplace over HTTPS.")
 
 proc urlencoding*(input: string): string =
   ## Port of the `urlencoding` helper duplicated in updater.rs/license.rs

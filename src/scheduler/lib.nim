@@ -1,5 +1,5 @@
-## Module index for the pumpkin-scheduler port.
-## Port of pumpkingmc/crates/pumpkin-scheduler/src/lib.rs
+## Module index for the scheduler port.
+## Port of upstream/scheduler/src/lib.rs
 ##
 ## Ported: domain.nim (ExecutionDomain + *DomainId types), error.nim
 ## (SchedulerError), taskid.nim (SchedulerTaskId), task.nim (TaskContext),
@@ -16,7 +16,7 @@
 ##   driver loop. This is the crate's real logic and is substantial -
 ##   deliberately deferred rather than force-fit, since it's meaningless
 ##   without a settled Nimony concurrency design to drive it. TODO: design
-##   pass needed once `pumpkin` (the crate that owns the server tick loop)
+##   pass needed once `the upstream server` (the crate that owns the server tick loop)
 ##   is reached and it's clear what actually drives scheduler turns there.
 
 import domain, error, taskid, task, scheduler

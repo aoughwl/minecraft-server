@@ -1,23 +1,25 @@
 # minecraft-server
 
-A Nimony port of [Pumpkin](https://github.com/Pumpkin-MC/Pumpkin), a
-from-scratch Minecraft server written in Rust. This project translates
-Pumpkin's crates to Nimony, keeping the same module boundaries, so it can
-eventually serve as the server counterpart to the Minecraft voxel *client*
-protocol code already living in the Jester modpack work
-(`aoughwl.mcnet` and friends, under `jester/artifacts/release-src/minecraft/Mods/`).
-That existing code is client-only and assumes an external server is
-authoritative; this repo is the missing server half.
+A Nimony port of an upstream open-source, GPLv3-licensed Minecraft server
+implementation written in Rust. This project translates its crates to
+Nimony, keeping the same module boundaries, so it can eventually serve as
+the server counterpart to the Minecraft voxel *client* protocol code
+already living in the Jester modpack work (`aoughwl.mcnet` and friends,
+under `jester/artifacts/release-src/minecraft/Mods/`). That existing code
+is client-only and assumes an external server is authoritative; this repo
+is the missing server half.
 
-Upstream source lives at `../pumpkingmc` (cloned separately, not vendored
-here) and is the reference for every port.
+This is a derivative work under the GPLv3 - see `LICENSE` and `NOTICE.md`
+for the full terms and attribution. A local clone of the upstream source
+(not vendored into this repo) is kept as a porting reference; see
+`NOTICE.md` for where to find it.
 
 ## Porting order
 
 Smallest/most self-contained crates first, since later crates depend on them:
 
-1. `pumpkin-nbt` (~3.1k LOC) — NBT tag model, (de)serialization. **In progress.**
-2. `pumpkin-util` (~15.6k LOC) — **In progress.** Ported so far:
+1. `nbt` (~3.1k LOC) — NBT tag model, (de)serialization. **In progress.**
+2. `util` (~15.6k LOC) — **In progress.** Ported so far:
    `math/vertical_surface_type.rs`, `resource_location.rs`, `resource.rs`,
    `identifier.rs`, `difficulty.rs`, `gamemode.rs`, `y_offset.rs`,
    `math/vector2.rs`, `math/vector3.rs` (core - see its doc comment for
@@ -35,14 +37,14 @@ Smallest/most self-contained crates first, since later crates depend on them:
    `bounds.rs`, `block_box.rs`, `boundingbox.rs`, `int_provider.rs`,
    `float_provider.rs`, `bit_storage.rs`, `atomic_f32.rs`, `pool.rs`,
    `euler_angle.rs`, `experience.rs`, `mod.rs`) remain.
-3. `pumpkin-auth` (~587 LOC) — **Mostly blocked.** `jwt/mod.rs`'s claims
+3. `auth` (~587 LOC) — **Mostly blocked.** `jwt/mod.rs`'s claims
    model, error kinds, and base64 decoding are ported to `src/auth/jwt.nim`.
    Its actual JWT signature verification needs NIST P-384 ECDSA, which
    Nimony's stdlib (checked `~/nimony/lib/std/`) does not provide at all —
    no elliptic-curve primitives beyond nothing. `client.rs` (reqwest/rustls
    HTTP client glue) is skipped outright: no Nimony HTTP+TLS client to
    build on. See doc comments in `src/auth/jwt.nim` / `src/auth/client.nim`.
-5. `pumpkin-scheduler` (~662 LOC) — **Data model done, driver deferred.**
+5. `scheduler` (~662 LOC) — **Data model done, driver deferred.**
    `domain.rs`, `error.rs`, and the pure-data parts of `task.rs`/
    `scheduler.rs` (`SchedulerTaskId`, `TaskContext`, `SchedulerConfig`,
    `SchedulerState`, `SchedulerSnapshot`) are ported to `src/scheduler/*.nim`.
@@ -52,10 +54,10 @@ Smallest/most self-contained crates first, since later crates depend on them:
    LOC, the actual admission/poll driver) — these are `Pin<Box<dyn
    Future>>`/tokio-executor plumbing with no Nimony equivalent (Nimony's
    async is `passive` procs + continuations, not poll-based futures).
-   Needs a real design pass once `pumpkin` (the crate that drives the
+   Needs a real design pass once the main server crate (the crate that drives the
    server tick loop) clarifies what should drive scheduler turns. See
    `src/scheduler/lib.nim`'s doc comment.
-4a. `pumpkin-api-macros` (~152 LOC) — **Not ported; by design, documented
+4a. `api-macros` (~152 LOC) — **Not ported; by design, documented
    instead.** This is a Rust proc-macro crate (`#[plugin_method]`,
    `#[plugin_impl]`, `#[with_runtime]`) that runs as compiler codegen, not
    runtime code, so there is no Nimony module for it to become. Its
@@ -64,12 +66,12 @@ Smallest/most self-contained crates first, since later crates depend on them:
    `src/api_macros/README.md` for whoever builds the plugin host later -
    the honest Nimony replacement is a plain template/generic wrapper called
    by plugin authors plus a small codegen script, not a compiler plugin,
-   once `pumpkin`'s plugin-loading side gives it a concrete target.
-4b. `pumpkin-macros` (~1.15k LOC) — **Not ported; documented instead**
+   once the main server crate's plugin-loading side gives it a concrete target.
+4b. `macros` (~1.15k LOC) — **Not ported; documented instead**
    (`src/macros/README.md`). Single-file proc-macro crate, entirely
    compiler codegen: an `Event` derive + `cancellable`/`send_cancellable[_blocking]`
    (event-bus dispatch boilerplate), `packet`/`java_packet`/
-   `pumpkin_block[_from_tag]` (registration-constant codegen),
+   `block[_from_tag]` (registration-constant codegen),
    `PacketWrite`/`PacketRead`/`PacketReadSlice` derives (field-by-field
    protocol serialize/deserialize codegen), and `translate_cross!`/
    `translate_java!` (compile-time translation-key validation). The
@@ -77,7 +79,7 @@ Smallest/most self-contained crates first, since later crates depend on them:
    for whoever hand-ports individual `src/protocol/` packet types next,
    since Nimony has no derive macros and each packet's serialize/
    deserialize will be hand-written the way `src/nbt/tag.nim`'s is.
-4. `pumpkin-config` (~2.2k LOC) — **Mostly done for plain-data configs.**
+4. `config` (~2.2k LOC) — **Mostly done for plain-data configs.**
    Ported: `lighting.rs`, `fun.rs`, `recipe.rs`, `advancement.rs`,
    `player_data.rs`, `pvp.rs`, `logging.rs`, `whitelist.rs`, `chunk.rs`,
    `world.rs`, `server_links.rs`, `telemetry.rs`, `chat.rs`,
@@ -86,29 +88,29 @@ Smallest/most self-contained crates first, since later crates depend on them:
    under `src/config/networking/`). All type-check clean. `Uuid` and
    `SocketAddr` are represented by small local stub types (`whitelist.nim`,
    `networking/netaddr.nim`) since neither is ported anywhere yet. Skipped:
-   `op.rs`/`networking/auth.rs` (need `pumpkin_util::PermissionLvl`/
+   `op.rs`/`networking/auth.rs` (need `util::PermissionLvl`/
    `ProfileAction`, not yet ported), `networking/{java,bedrock}.rs` and
    `networking/mod.rs`'s `NetworkingConfig` aggregate (depend on java/bedrock
    above), `plugins.rs`, and top-level `lib.rs` (458 LOC — the actual
    config-file load/save/merge driver; needs a design pass, not a
    line-by-line port).
-6. `pumpkin-gametest` (~1.9k LOC) — **Small ported slice, rest blocked.**
+6. `gametest` (~1.9k LOC) — **Small ported slice, rest blocked.**
    `error.rs` → `src/gametest/error.nim` (full port) and `model.rs` →
    `src/gametest/model.nim` (full port, `serde`/`serde_json` skipped;
    `environment: Value` becomes a raw JSON-text `string` placeholder).
-   `model.nim` needed `Rotation` from pumpkin-data's `block_rotation.rs`;
-   rather than block on all of pumpkin-data, `src/gametest/rotation_stub.nim`
+   `model.nim` needed `Rotation` from data's `block_rotation.rs`;
+   rather than block on all of data, `src/gametest/rotation_stub.nim`
    hand-copies just the 4-way enum + its `then` combinator (see its header
-   for the TODO to de-duplicate once pumpkin-data is ported for real).
+   for the TODO to de-duplicate once data is ported for real).
    NOT ported: `world.rs` (an `#[async_trait]` interface over
-   `pumpkin_util::math::position::BlockPos`/`pumpkin_world::world::
-   BlockFlags`/`pumpkin_data::BlockStateId`, none of which exist in this
+   `util::math::position::BlockPos`/`world::world::
+   BlockFlags`/`data::BlockStateId`, none of which exist in this
    port yet), and `helper.rs`, `manager.rs` (391 LOC), `runner/*` (459 LOC),
    `structure/placement.rs` (389 LOC), `structure/template.rs` (223 LOC),
    `block_based/test.rs` — all either depend on the above or are
    async-trait/state-machine driven or the tick loop shape mentioned under
-   `pumpkin-scheduler` above. See `src/gametest/lib.nim`'s doc comment.
-7. `pumpkin-codecs` / `pumpkin-protocol` (~40k LOC combined) — **In
+   `scheduler` above. See `src/gametest/lib.nim`'s doc comment.
+7. `codecs` / `protocol` (~40k LOC combined) — **In
    progress.** `lifecycle.rs`, `number.rs` (JSON interop skipped), and the
    core `DataResult<R>` type from `data_result.rs` (its macro-generated
    `apply2..applyN` applicative family skipped, no Nimony equivalent) →
@@ -116,9 +118,9 @@ Smallest/most self-contained crates first, since later crates depend on them:
    `json_ops.rs`, `codec/*`, `struct_builder.rs`, `list_builder.rs` — a
    generic Codec/DynamicOps framework built on Rust trait objects and GATs
    with no direct Nimony equivalent; deferred until a concrete consumer
-   forces the design (e.g. `pumpkin-nbt`'s `nbt_ops.rs`, itself stubbed
+   forces the design (e.g. `nbt`'s `nbt_ops.rs`, itself stubbed
    pending this).
-   `pumpkin-protocol`: `codec/var_int.rs` + `codec/var_uint.rs` +
+   `protocol`: `codec/var_int.rs` + `codec/var_uint.rs` +
    `codec/var_long.rs`/`var_ulong.rs` → `src/protocol/varint.nim` (`VarInt`,
    `VarUInt`, `VarLong`, `VarULong`), plus `src/protocol/protobase.nim`
    (`ReadingError`/`WritingError`/result types, port of the non-serde-trait
@@ -140,24 +142,24 @@ Smallest/most self-contained crates first, since later crates depend on them:
    ports `packet_encoder.rs`/`packet_decoder.rs` next, since that's where
    Jester's client-side framing code is the more directly relevant
    reference.
-8. `pumpkin-plugin-utils` (~710 LOC) — **Done except HTTP.** `models.rs`,
+8. `plugin-utils` (~710 LOC) — **Done except HTTP.** `models.rs`,
    `updater.rs`, `license.rs` (lease read/write via `std/json`, grace-period
    evaluation), and `lib.rs`'s global-state glue → `src/plugin_utils/*.nim`.
    `init(context)`'s WASM-guest path is skipped (needs unported
-   `pumpkin-plugin-api`). `http.rs` is a call-shape stub only: Nimony's
+   `plugin-api`). `http.rs` is a call-shape stub only: Nimony's
    stdlib has no HTTP client or TLS at all, so `check_license_online`/
    `check_for_updates` compile and return a clear "not implemented" error
    rather than a fake success - needs libcurl/WinHTTP FFI eventually.
-9. `pumpkin-host-bindings` (~70 LOC) — **Not portable yet; documented
+9. `host-bindings` (~70 LOC) — **Not portable yet; documented
    instead.** The entire file is one `wasmtime::component::bindgen!`
-   macro call over `../pumpkin-plugin-wit/v0.1/*.wit` (~14.2k lines of
+   macro call over `../plugin-wit/v0.1/*.wit` (~14.2k lines of
    WIT across 60+ files) - there is no hand-written Rust logic to
    translate, and Nimony has no WASM component-model runtime or
    WIT-bindgen equivalent. See `src/host_bindings/README.md` for the full
    explanation and the three real options once the plugin ABI is actually
    being built (wasmtime C API FFI, a custom WIT→Nimony generator, or
    dropping the WASM sandbox model for native-loaded plugins).
-9b. `pumpkin-plugin-runtime` (~3.3k LOC) — **Not portable yet; documented
+9b. `plugin-runtime` (~3.3k LOC) — **Not portable yet; documented
     instead, except one small data type.** wasmtime `Store`
     multiplexing/execution (`executor.rs`), cross-plugin re-entry tracking
     (`chain.rs`), an async admission policy over that (`policy.rs`), and a
@@ -171,7 +173,7 @@ Smallest/most self-contained crates first, since later crates depend on them:
     paths, including the option (worth real consideration) of skipping
     WASM sandboxing entirely and loading plugins natively the way the
     sibling Jester project's `aowli` interpreter already does.
-9c. `pumpkin-plugin-api` (~24k LOC) — **Not portable yet; documented
+9c. `plugin-api` (~24k LOC) — **Not portable yet; documented
     instead, except one small data file.** Grepped every top-level and
     `ext/` source file for `wit::` imports: only `permissions.rs` has none.
     Everything else - `item.rs`, `block.rs`, `enchantment.rs`, `team.rs`,
@@ -181,12 +183,12 @@ Smallest/most self-contained crates first, since later crates depend on them:
     `events/*` (each a ~20-line wrapper around one generated `wit`
     `EventData` type) - is WASM-guest SDK code built directly on the same
     `wasmtime::component::bindgen!`-generated `wit` module that blocks
-    `pumpkin-host-bindings`/`pumpkin-plugin-runtime`. `generated/block.rs`
+    `host-bindings`/`plugin-runtime`. `generated/block.rs`
     (5.2k LOC) and `generated/item.rs` (6.7k LOC) are build-time-generated
-    registry data, out of scope like `pumpkin-data`. Ported:
+    registry data, out of scope like `data`. Ported:
     `permissions.nim` (plugin sandbox capability-string constants, pure
     data). See `src/plugin_api/README.md`.
-10. `pumpkin-world`, `pumpkin-inventory`, `pumpkin-command` (~14.1k LOC) —
+10. `world`, `inventory`, `command` (~14.1k LOC) —
     **command: tokenizer layer done.** `errors/command_syntax_error.rs`
     (simplified), `context/string_range.rs`, `string_reader.rs`, and its
     numeric parsing all ported to `src/command/*.nim`, type-checked clean.
@@ -202,9 +204,9 @@ Smallest/most self-contained crates first, since later crates depend on them:
     (the core `Inventory`/`Clearable` trait plus the NBT slot-array sync
     helpers), `double.rs`→`double.nim`. `itemstub.nim` is a placeholder
     `Item`/`ItemStack` (id + count only) standing in for
-    `pumpkin_data::item`/`item_stack`, which don't exist yet — every
+    `data::item`/`item_stack`, which don't exist yet — every
     proc taking/returning `ItemStack` here will need revisiting once
-    `pumpkin-data`'s real item model lands. Nimony has no trait objects
+    `data`'s real item model lands. Nimony has no trait objects
     (single dispatch, no `dyn Trait`), so `Inventory` is a ref object
     holding a manual vtable of proc fields (each field/closure needs
     `{.closure.}` - a Nimony compiler-internal AssertionDefect surfaced
@@ -217,48 +219,67 @@ Smallest/most self-contained crates first, since later crates depend on them:
     `enchanting/`, `anvil/`, `merchant/`, `container_click.rs`,
     `drag_handler.rs`, `sync_handler.rs`, `gui_builder.rs`,
     `entity_equipment.rs` — all need either the real item/registry
-    types, `Player`/`World` types from the main `pumpkin` crate, or both.
-11. `pumpkin-world` (~78.6k LOC) — **Just started.** The crate is
+    types, `Player`/`World` types from the main server crate, or both.
+11. `world` (~78.6k LOC) — **Just started.** The crate is
     dominated by world generation (noise/structure/feature placement under
-    `generation/`, ~65k of the 78.6k LOC) which needs pumpkin-util's
+    `generation/`, ~65k of the 78.6k LOC) which needs util's
     still-incomplete noise/random port and is out of scope for now.
     Ported instead, from the smaller top-level/tick/chunk-loading surface:
     `cylindrical_chunk_iterator.rs` → `src/world/cylindrical.nim` (view-distance
     cylinder membership + load/unload diffing; the LUT-based
     `all_chunks_within` fast path was replaced with a direct bounding-loop
-    recompute, since its LUT lives in unported pumpkin-data - same
+    recompute, since its LUT lives in unported data - same
     semantics, no precomputed table), `tick/mod.rs` → `src/world/tick.nim`
     (`TickPriority`, `ScheduledTick`/`OrderedTick`, NBT (de)serialization -
     specialized to a `value: string` id rather than upstream's generic
     `T: ToResourceLocation`, since no block/fluid registry type exists yet;
-    a local `BlockPos` stand-in covers for `pumpkin_util::math::position`,
+    a local `BlockPos` stand-in covers for `util::math::position`,
     also not ported yet), and `tick/scheduler.rs` →
     `src/world/tickscheduler.nim` (the ring-buffer `ChunkTickScheduler` -
     de-async'd to a plain single-threaded version, no concurrency model
     exists yet for the tick loop; same string-specialization as tick.nim).
     `dimension.rs` is a two-line stub documenting why it's blocked
-    (`Level`/`pumpkin_data::dimension::Dimension` both unported).
-    Not started: `block/`, `biome/` (need the full `pumpkin-data` block/
+    (`Level`/`data::dimension::Dimension` both unported).
+    Not started: `block/`, `biome/` (need the full `data` block/
     biome registry), `chunk/` (palette/section storage - `chunk/palette.rs`'s
     core `PalettedContainer<V, const DIM: usize>` needs const-generic
     arrays, worth a real design pass rather than a rushed port), `level.rs`,
     `world.rs`, `lighting/`, `poi/`, `world_info/`, `chunk_system/`, all of
     `generation/`.
-12. `pumpkin` (main server crate, ~269k LOC) — **Assessed; tiny slice
-    ported, full map written.** Ported `error.rs`'s `PumpkinError` trait as
-    overloaded procs → `src/server/pumpkinerror.nim` (over `InventoryError`/
+12. the main server crate (~269k LOC) — **Assessed; tiny slice
+    ported, full map written.** Ported `error.rs`'s a shared error trait as
+    overloaded procs → `src/server/errorclass.nim` (over `InventoryError`/
     `ReadingError`; `PlayerDataError` pending that type's port). Everything
     else is mapped in `src/server/README.md` by module (`entity/` 83.6k,
     `block/` 47.6k, `plugin/` 47.4k, `command/` 30.3k, `net/` 19.5k,
     `world/` 18.7k, `item/` 6.9k, `data/` 6.2k, `server/` 3.4k,
     `enchantment/` 1.9k) with three concrete blockers identified (unported
-    `pumpkin-data` registries, no tick-loop/concurrency design yet, and
+    `data` registries, no tick-loop/concurrency design yet, and
     `entity/`'s scale needing a real `Entity`-shape design pass before wide
     porting) and a suggested next-steps order. See that file before
     starting more work here.
-13. `pumpkin-data` (~1.5M LOC — almost entirely generated block/item/registry
-   tables; port the generator, not the generated output, once the shape of
-   everything above is settled)
+13. `data` (~1.5M LOC — almost entirely generated block/item/registry
+   tables) — **Generator path confirmed viable; proof-of-concept done.**
+   The generator (the upstream data-codegen tool, ~36.8k lines across ~90 small
+   per-domain submodules driven by one `main.rs`) reads JSON already
+   checked into the upstream repo's `assets/` (92MB, confirmed present -
+   not a blocker). Rust builds each submodule's output as a
+   `proc_macro2::TokenStream` via `quote!`; Nimony has no equivalent (and
+   doesn't need one) since a generator can just build its output as a
+   plain string and `writeFile` it directly - simpler than the Rust
+   approach, not a gap. `std/json` is present in Nimony's stdlib (unlike
+   gzip/crypto/HTTP, confirmed missing elsewhere in this port) and
+   sufficient. `src/data_codegen/gen_sound_category.nim` is a complete,
+   run-and-verified port of the smallest submodule (JSON in -> generated,
+   type-checked `src/generated/sound_category.nim` out, values verified
+   correct) establishing the pattern. The other ~89 submodules
+   (`scoreboard_slot.rs` trivial, up through `block.rs`/`item.rs`/
+   `biome.rs`/`recipes.rs`/`noise_router.rs` which encode real structural
+   complexity) each need the same file-by-file treatment - see
+   `src/data_codegen/README.md` for the full breakdown, two open design
+   questions (output layout, whether `main.rs`'s WIT-generation side
+   duties are in scope), and a note that these submodules are independent
+   of each other and would parallelize well across multiple forks.
 
 ## Layout
 

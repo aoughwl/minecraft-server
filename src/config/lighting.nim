@@ -1,5 +1,5 @@
 ## Lighting engine calculation mode.
-## Port of pumpkingmc/crates/pumpkin-config/src/lighting.rs
+## Port of upstream/config/src/lighting.rs
 ## Serde attrs (`rename_all = "lowercase"`) dropped - no (de)serialize layer
 ## ported yet.
 

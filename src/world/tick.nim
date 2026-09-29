@@ -1,12 +1,12 @@
 ## Scheduled block/fluid tick entries: priority, ordering, and NBT
 ## (de)serialization for a chunk's pending-tick lists.
-## Port of pumpkingmc/crates/pumpkin-world/src/tick/mod.rs
+## Port of upstream/world/src/tick/mod.rs
 
 import ../nbt/tag
 
 type
   BlockPos* = object
-    ## Local stand-in for `pumpkin_util::math::position::BlockPos`, which
+    ## Local stand-in for `util::math::position::BlockPos`, which
     ## isn't ported yet (src/util/ has no position.nim). Plain x/y/z i32s -
     ## replace with the real type once it exists; the field names/shape
     ## are chosen to match what that port will need.
@@ -78,7 +78,7 @@ proc `<`*[T](a, b: OrderedTick[T]): bool {.inline.} =
 # Upstream is generic over `T: ToResourceLocation`/`T: FromResourceLocation`
 # (a block/fluid registry entry that knows its own id string). Neither trait
 # nor a registry type exists in this port yet (they'd live in the unported
-# pumpkin-data), so these take/produce the id string directly rather than a
+# data), so these take/produce the id string directly rather than a
 # generic `T` - callers can wrap once a registry type exists.
 
 proc toNbtCompound*(tick: ScheduledTick[string]): NbtCompound =

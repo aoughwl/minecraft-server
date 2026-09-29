@@ -1,5 +1,5 @@
-## Local stand-in for `pumpkin_data::block_rotation::Rotation`.
-## pumpkin-data (crates/pumpkin-data) is ~1.5M lines, almost all generated
+## Local stand-in for `data::block_rotation::Rotation`.
+## data (crates/data) is ~1.5M lines, almost all generated
 ## block/item/registry tables, and is intentionally deferred to the end of
 ## the porting order (see README) - its generator gets ported, not the
 ## generated output, once everything above it has settled. `Rotation`
@@ -7,7 +7,7 @@
 ## ~800 lines of block-property transform logic this crate doesn't need.
 ## Only the 4-way rotation enum and its `then` combinator (used by
 ## `GameTestRotation.then`) are copied here. TODO: replace this with an
-## import of the real ported type once pumpkin-data's block_rotation.rs
+## import of the real ported type once data's block_rotation.rs
 ## is ported, rather than keeping two copies in sync.
 
 type

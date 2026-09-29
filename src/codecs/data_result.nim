@@ -1,6 +1,6 @@
 ## A result that can be a complete success, or a partial/no result carrying
 ## an error message and a `Lifecycle`. Port of the core (non-macro) parts of
-## pumpkingmc/crates/pumpkin-codecs/src/data_result.rs.
+## upstream/codecs/src/data_result.rs.
 ##
 ## Skipped: the `impl_apply!`-generated `apply2`..`applyN` family (applying
 ## an n-ary function across n `DataResult`s, short-circuiting to a combined

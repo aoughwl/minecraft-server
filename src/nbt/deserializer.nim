@@ -1,5 +1,5 @@
 ## Low-level NBT deserialization support.
-## Port of pumpkingmc/crates/pumpkin-nbt/src/deserializer.rs
+## Port of upstream/nbt/src/deserializer.rs
 ##
 ## Rust models this with an `NbtDataSource` trait borrowing zero-copy slices
 ## out of three different backing sources (`&[u8]`, `Bytes`, a `Read`

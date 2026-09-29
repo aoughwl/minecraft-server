@@ -1,4 +1,4 @@
-## Port of pumpkingmc/crates/pumpkin-config/src/player_data.rs
+## Port of upstream/config/src/player_data.rs
 
 type
   PlayerDataConfig* = object

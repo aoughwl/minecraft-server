@@ -1,5 +1,5 @@
-## The plain-data slice of pumpkin-plugin-runtime's driver lifecycle state.
-## Port of pumpkingmc/crates/pumpkin-plugin-runtime/src/lifecycle.rs's
+## The plain-data slice of plugin-runtime's driver lifecycle state.
+## Port of upstream/plugin-runtime/src/lifecycle.rs's
 ## `DriverError`/`DriverState` only - see README.md in this directory for
 ## why the rest of the crate (and the `Lifecycle`/`DriverJoin` types that
 ## wrap this state in a tokio `watch` channel) isn't ported.

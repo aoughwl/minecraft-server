@@ -1,5 +1,5 @@
 ## A marker to convey the lifecycle of some object: stable, experimental, or
-## deprecated. Port of pumpkingmc/crates/pumpkin-codecs/src/lifecycle.rs
+## deprecated. Port of upstream/codecs/src/lifecycle.rs
 
 type
   LifecycleKind* = enum

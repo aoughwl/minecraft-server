@@ -1,14 +1,14 @@
-# pumpkin-api-macros: not ported, by design
+# api-macros: not ported, by design
 
-Source: `crates/pumpkin-api-macros/src/lib.rs` (152 lines). This is a Rust
-`proc-macro` crate - it runs as compiler codegen during Pumpkin's own build,
+Source: `crates/api-macros/src/lib.rs` (152 lines). This is a Rust
+`proc-macro` crate - it runs as compiler codegen during the upstream server's own build,
 not as runtime code, and there is nothing here to compile to Nimony as a
 module. Nimony's own metaprogramming ("Macros replaced by compiler plugins
 (different API)", `~/nimony/doc/differences.md`) operates on NIF AST through
 a separate plugin mechanism, not a drop-in replacement for `syn`/`quote`
 token-stream rewriting, and pulling that in now would be solving a problem
 no Nimony code in this repo has yet. This doc records what each macro does
-so whoever writes the first Nimony plugin-host code (once `pumpkin`'s
+so whoever writes the first Nimony plugin-host code (once `the upstream server`'s
 plugin system itself is reached) knows what needs replacing and how.
 
 ## `#[plugin_method]`
@@ -31,7 +31,7 @@ only makes sense in Rust's macro-expansion-as-a-separate-process model.
 Applied to the plugin's main struct. Drains `PLUGIN_METHODS`, re-parses
 each stashed fn body, and emits:
 - `GLOBAL_RUNTIME`: a lazily-initialized global tokio `Runtime`.
-- `METADATA`/`PUMPKIN_API_VERSION`: `#[no_mangle]` statics read by the host
+- `METADATA`/a plugin-API-version constant: `#[no_mangle]` statics read by the host
   when it dynamically loads the compiled plugin (`.dll`/`.so`).
 - `impl Plugin for Struct { <collected methods> }`.
 - `pub fn plugin() -> Box<dyn Plugin>`, the host's dynamic-load entry point.
@@ -63,5 +63,5 @@ could equally be:
   proportionate for "stamp out the fixed METADATA/entry-point boilerplate"
   once there's a concrete plugin ABI target crate to generate it for).
 
-Revisit this once `pumpkin`'s plugin-loading side (the actual host, not
+Revisit this once `the upstream server`'s plugin-loading side (the actual host, not
 this macro crate) is reached and its target shape is known.

@@ -1,17 +1,17 @@
 ## Chunk-loading view distance math: which chunk coordinates fall within a
 ## player's cylindrical view radius, and the load/unload diff between two
 ## view positions.
-## Port of pumpkingmc/crates/pumpkin-world/src/cylindrical_chunk_iterator.rs
+## Port of upstream/world/src/cylindrical_chunk_iterator.rs
 ##
 ## Upstream's `all_chunks_within`/`get_offsets` walks a precomputed LUT
-## (`pumpkin_data::chunk_view_lut::CHUNK_VIEW_LUT`) generated at Pumpkin's
+## (`data::chunk_view_lut::CHUNK_VIEW_LUT`) generated at the upstream server's
 ## own build time for one specific reason: performance, not semantics. That
 ## LUT lives in the still-unported (1.5M-line, mostly-generated)
-## `pumpkin-data` crate. Since `is_within_distance` is the actual source of
+## `data` crate. Since `is_within_distance` is the actual source of
 ## truth for cylinder membership (the LUT is just a cache of its results),
 ## `allChunksWithin` here recomputes membership directly with a bounding
 ## nested loop instead of consulting a LUT - same results, no precomputed
-## table dependency. Revisit with a real LUT once pumpkin-data lands and
+## table dependency. Revisit with a real LUT once data lands and
 ## this becomes a hot path.
 
 import std/assertions

@@ -1,4 +1,4 @@
-## Port of pumpkingmc/crates/pumpkin-util/src/gamemode.rs
+## Port of upstream/util/src/gamemode.rs
 
 type
   GameMode* = enum

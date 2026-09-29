@@ -1,5 +1,5 @@
 ## Helpers for reading and writing gzip-compressed NBT data.
-## Port of pumpkingmc/crates/pumpkin-nbt/src/nbt_compress.rs
+## Port of upstream/nbt/src/nbt_compress.rs
 ##
 ## TODO(unblocked-but-unimplemented): Nimony's stdlib (`~/nimony/lib/std/`)
 ## has no gzip/zlib/deflate module at all (checked: no `zip`, `gzip`,

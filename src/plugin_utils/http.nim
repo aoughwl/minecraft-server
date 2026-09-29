@@ -1,5 +1,5 @@
 ## HTTP client helpers for online license checks and marketplace queries.
-## Port of pumpkingmc/crates/pumpkin-plugin-utils/src/http.rs
+## Port of upstream/plugin-utils/src/http.rs
 ##
 ## TODO: not implemented. Rust builds this on `reqwest::blocking::Client`
 ## (+ rustls). Nimony's stdlib has no HTTP client or TLS support at all
@@ -16,7 +16,7 @@ type
   HttpClient* = object
     userAgent*: string
 
-proc newHttpClient*(userAgent = "Pumpkin-Plugin-Utils/0.1.0"): HttpClient =
+proc newHttpClient*(userAgent = "Plugin-Utils/0.1.0"): HttpClient =
   HttpClient(userAgent: userAgent)
 
 proc get*(c: HttpClient, url: string): PuResult[string] =

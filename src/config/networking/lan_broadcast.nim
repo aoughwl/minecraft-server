@@ -1,4 +1,4 @@
-## Port of pumpkingmc/crates/pumpkin-config/src/networking/lan_broadcast.rs
+## Port of upstream/config/src/networking/lan_broadcast.rs
 
 import std/options
 

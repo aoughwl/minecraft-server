@@ -1,4 +1,4 @@
-## Port of pumpkingmc/crates/pumpkin-config/src/chat.rs
+## Port of upstream/config/src/chat.rs
 
 import std/options
 

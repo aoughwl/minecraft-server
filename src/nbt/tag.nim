@@ -1,6 +1,6 @@
 ## In-memory representation of individual NBT tags, plus compound-tag
 ## (de)serialization content.
-## Port of pumpkingmc/crates/pumpkin-nbt/src/tag.rs and (the content-level
+## Port of upstream/nbt/src/tag.rs and (the content-level
 ## procs of) src/compound.rs. Both live in this file because `NbtTag`'s
 ## serialize/deserialize recurses into `NbtCompound`'s and vice versa;
 ## Rust resolves that with two modules and `pub(crate)` visibility, Nimony

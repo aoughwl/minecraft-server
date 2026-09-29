@@ -1,5 +1,5 @@
 ## Tracks how many players currently have a container open.
-## Port of pumpkingmc/crates/pumpkin-inventory/src/viewer.rs
+## Port of upstream/inventory/src/viewer.rs
 ##
 ## Nimony's `std/atomics` operates directly on a plain `var T` location
 ## (GCC/Clang `__atomic_*` builtins - "atomics are operations, not type

@@ -1,5 +1,5 @@
 ## Round-trip / known-vector smoke test for varint.nim, checked against
-## pumpkin-protocol/src/codec/var_int.rs's own #[cfg(test)] vectors.
+## protocol/src/codec/var_int.rs's own #[cfg(test)] vectors.
 ## Run manually with `nimony c -r src/protocol/varinttest.nim`.
 
 import std/assertions

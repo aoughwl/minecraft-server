@@ -1,4 +1,4 @@
-## Port of pumpkingmc/crates/pumpkin-config/src/chunk.rs
+## Port of upstream/config/src/chunk.rs
 
 type
   Compression* = enum

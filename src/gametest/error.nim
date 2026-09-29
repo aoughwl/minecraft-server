@@ -1,6 +1,6 @@
-## Port of pumpkingmc/crates/pumpkin-gametest/src/error.rs
+## Port of upstream/gametest/src/error.rs
 ##
-## `Assertion`'s `position: Option<BlockPos>` needs `pumpkin_util::math::
+## `Assertion`'s `position: Option<BlockPos>` needs `util::math::
 ## position::BlockPos`, not yet ported (util's `math/` files remain).
 ## Represented here as an `(bool, x, y, z)` tuple rather than blocking on
 ## that - swap for the real `BlockPos` once `src/util/` has it.

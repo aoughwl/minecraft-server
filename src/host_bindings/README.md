@@ -1,13 +1,13 @@
-# pumpkin-host-bindings — not ported (nothing to port)
+# host-bindings — not ported (nothing to port)
 
-Upstream: `crates/pumpkin-host-bindings/src/lib.rs`, 70 lines.
+Upstream: `crates/host-bindings/src/lib.rs`, 70 lines.
 
 ## What the crate actually is
 
 The entire file is one `wasmtime::component::bindgen! { ... }` macro
 invocation. It takes no hand-written logic at all - it points wasmtime's
 code generator at the WIT (WebAssembly Interface Types) world defined in
-`../pumpkin-plugin-wit/v0.1/` (60+ `.wit` files, ~14.2k lines total,
+`../plugin-wit/v0.1/` (60+ `.wit` files, ~14.2k lines total,
 covering advancement/attributes/biomes/block-entity/command/datapack/
 entity/event/player/server/world/... interfaces) and, at Rust compile
 time, generates:
@@ -15,7 +15,7 @@ time, generates:
 - Rust struct/trait bindings for every exported/imported WIT interface
   method (the big `imports: { ... }` map pins ~50 of those methods to
   `async | store | trappable` wasmtime call semantics).
-- The host-side glue that lets the main `pumpkin` server crate call into
+- The host-side glue that lets the main server crate call into
   a loaded WASM plugin component, and vice versa, across the component
   model ABI boundary.
 
@@ -52,11 +52,11 @@ system is actually being built and one of the above is chosen deliberately.
 
 ## What IS portable right now
 
-The WIT files themselves (`../pumpkin-plugin-wit/v0.1/*.wit`, referenced
+The WIT files themselves (`../plugin-wit/v0.1/*.wit`, referenced
 by upstream's `Cargo.toml`/`bindgen!` path but not vendored into this
 port) are plain data/interface definitions, not Rust - they're the
 actual source of truth for the plugin ABI and would be the starting point
-for whichever option above gets picked. `pumpkin-plugin-api`,
-`pumpkin-plugin-runtime`, and `pumpkin-plugin-utils`'s WASM-guest `init`
+for whichever option above gets picked. `plugin-api`,
+`plugin-runtime`, and `plugin-utils`'s WASM-guest `init`
 path (see `src/plugin_utils/lib.nim`'s skipped section) all sit on the
 same unresolved dependency.

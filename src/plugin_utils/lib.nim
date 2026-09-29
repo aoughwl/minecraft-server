@@ -1,11 +1,11 @@
-## Pumpkin Plugin Utilities - module index and global plugin state.
-## Port of pumpkingmc/crates/pumpkin-plugin-utils/src/lib.rs
+## Plugin utilities - module index and global plugin state.
+## Port of upstream/plugin-utils/src/lib.rs
 ##
 ## Rust caches metadata in a `static OnceLock`, set once from a WASM guest's
-## `Context` (via `pumpkin_plugin_api`, not ported) or explicitly via
+## `Context` (via `plugin_api`, not ported) or explicitly via
 ## `init_with_metadata` for tests/host-side use. `init(context)` itself -
 ## the WASM-guest path that reads `context.get_marketplace_metadata()` - is
-## skipped entirely: it needs pumpkin-plugin-api's `Context`/
+## skipped entirely: it needs plugin-api's `Context`/
 ## `MarketplaceMetadata` types and the wasm32-vs-native `cfg` split, neither
 ## of which exists here yet. `init_with_metadata`, `get_metadata`,
 ## `metadata`, `get_data_folder`, and the three convenience wrappers below
@@ -24,12 +24,12 @@ import putbase, models, license, updater
 export models, license, updater
 
 var
-  globalMetadata: PumpkinMetadata
+  globalMetadata: ServerMetadata
   hasGlobalMetadata = false
   globalDataFolder: string
   hasGlobalDataFolder = false
 
-proc initWithMetadata*(metadata: sink PumpkinMetadata, dataFolder: string): PuResult[PumpkinMetadata] =
+proc initWithMetadata*(metadata: sink ServerMetadata, dataFolder: string): PuResult[ServerMetadata] =
   ## Rust's version only *sets* a `OnceLock` once (later calls are no-ops
   ## that still return the original value); this port simply overwrites,
   ## since there's no lock-set-once primitive to mirror faithfully without
@@ -39,15 +39,15 @@ proc initWithMetadata*(metadata: sink PumpkinMetadata, dataFolder: string): PuRe
   hasGlobalDataFolder = true
   globalMetadata = metadata
   hasGlobalMetadata = true
-  ok[PumpkinMetadata](globalMetadata)
+  ok[ServerMetadata](globalMetadata)
 
-proc getMetadata*(): PuResult[PumpkinMetadata] =
+proc getMetadata*(): PuResult[ServerMetadata] =
   if hasGlobalMetadata:
-    ok[PumpkinMetadata](globalMetadata)
+    ok[ServerMetadata](globalMetadata)
   else:
-    errRes[PumpkinMetadata](notInitializedErr())
+    errRes[ServerMetadata](notInitializedErr())
 
-proc metadata*(): PuResult[PumpkinMetadata] =
+proc metadata*(): PuResult[ServerMetadata] =
   getMetadata()
 
 proc getDataFolder*(): PuResult[string] =
@@ -77,6 +77,6 @@ proc checkForUpdates*(): PuResult[CheckUpdateResponse] =
 proc evaluateLicense*(gracePeriodDays: uint32): LicenseStatus =
   if not hasGlobalDataFolder or not hasGlobalMetadata:
     return LicenseStatus(kind: lskInvalid,
-      invalidReason: "pumpkin_plugin_utils has not been initialized")
+      invalidReason: "plugin_utils has not been initialized")
   let checker = newLicenseChecker(globalDataFolder)
   evaluateLicense(checker, globalMetadata, gracePeriodDays)

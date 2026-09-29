@@ -1,5 +1,5 @@
 ## Shared error/result plumbing for the protocol crate.
-## Port of pumpkingmc/crates/pumpkin-protocol/src/ser/mod.rs's
+## Port of upstream/protocol/src/ser/mod.rs's
 ## `ReadingError`/`WritingError` (the non-serde-trait parts).
 ##
 ## Follows the house convention established in src/nbt/nbtbase.nim: Nimony

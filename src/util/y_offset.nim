@@ -1,4 +1,4 @@
-## Port of pumpkingmc/crates/pumpkin-util/src/y_offset.rs
+## Port of upstream/util/src/y_offset.rs
 ##
 ## Rust's `YOffset` is `#[serde(untagged)]` over three struct variants;
 ## modeled here as a plain case-object variant (deserialization itself is

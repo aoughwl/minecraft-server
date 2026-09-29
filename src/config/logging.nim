@@ -1,4 +1,4 @@
-## Port of pumpkingmc/crates/pumpkin-config/src/logging.rs
+## Port of upstream/config/src/logging.rs
 
 type
   LoggingConfig* = object

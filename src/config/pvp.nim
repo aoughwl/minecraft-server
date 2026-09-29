@@ -1,4 +1,4 @@
-## Port of pumpkingmc/crates/pumpkin-config/src/pvp.rs
+## Port of upstream/config/src/pvp.rs
 
 type
   PvpConfig* = object

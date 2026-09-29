@@ -1,5 +1,5 @@
 ## Legacy (pre-1.13) Java-`Random`-compatible 48-bit LCG.
-## Port of pumpkingmc/crates/pumpkin-util/src/random/legacy_rand.rs
+## Port of upstream/util/src/random/legacy_rand.rs
 ##
 ## Ported as a standalone concrete type rather than against Rust's
 ## `RandomImpl`/`GaussianGenerator` traits and the `RandomGenerator`/

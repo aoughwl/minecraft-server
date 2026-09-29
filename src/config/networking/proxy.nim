@@ -1,4 +1,4 @@
-## Port of pumpkingmc/crates/pumpkin-config/src/networking/proxy.rs
+## Port of upstream/config/src/networking/proxy.rs
 
 type
   BungeeCordConfig* = object

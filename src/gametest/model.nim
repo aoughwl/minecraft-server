@@ -1,4 +1,4 @@
-## Port of pumpkingmc/crates/pumpkin-gametest/src/model.rs
+## Port of upstream/gametest/src/model.rs
 ##
 ## `serde`/`serde_json` (Deserialize derives, `Value`) are skipped entirely -
 ## no decode layer is ported anywhere yet. `environment: Value` (arbitrary

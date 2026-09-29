@@ -1,5 +1,5 @@
 ## Shared error type for the inventory crate.
-## Port of pumpkingmc/crates/pumpkin-inventory/src/error.rs
+## Port of upstream/inventory/src/error.rs
 ##
 ## Same house convention as src/nbt/nbtbase.nim: Nimony has no
 ## Nim-compatible exceptions, so this is a plain error-kind enum (no

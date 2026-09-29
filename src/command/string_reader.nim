@@ -1,6 +1,6 @@
 ## A cursor-based reader over a command string: the core tokenizer every
 ## argument-type parser in this crate builds on.
-## Port of pumpkingmc/crates/pumpkin-command/src/string_reader.rs
+## Port of upstream/command/src/string_reader.rs
 ##
 ## Simplifications versus upstream:
 ## - Rust's `StringReader<'a>` wraps a `Cow<'a, str>` to avoid copying when

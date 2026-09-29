@@ -1,17 +1,17 @@
-## Data models for Pumpkin plugin licensing, metadata, and marketplace
+## Data models for plugin licensing, metadata, and marketplace
 ## endpoints.
-## Port of pumpkingmc/crates/pumpkin-plugin-utils/src/models.rs
+## Port of upstream/plugin-utils/src/models.rs
 ##
-## TODO: `From<pumpkin_plugin_api::MarketplaceMetadata> for PumpkinMetadata`
-## is skipped - pumpkin-plugin-api isn't ported. All serde Serialize/
+## TODO: `From<plugin_api::MarketplaceMetadata> for ServerMetadata`
+## is skipped - plugin-api isn't ported. All serde Serialize/
 ## Deserialize impls are skipped everywhere; JSON (de)serialization for
 ## `LicenseLease` (the only type that's actually persisted to disk, in
 ## license.nim) is done by hand there instead of derived here.
 
-const DefaultMarketplaceUrl* = "https://market.pumpkinmc.org"
+const DefaultMarketplaceUrl* = "https://example.invalid"
 
 type
-  PumpkinMetadata* = object
+  ServerMetadata* = object
     marketplaceUrl*: string
     pluginId*: int64
     pluginName*: string
@@ -33,9 +33,9 @@ type
   LicenseStatus* = object
     case kind*: LicenseStatusKind
     of lskValid:
-      metadata*: PumpkinMetadata
+      metadata*: ServerMetadata
     of lskGracePeriod:
-      gpMetadata*: PumpkinMetadata
+      gpMetadata*: ServerMetadata
       daysRemaining*: uint32
       reason*: string
     of lskInvalid:

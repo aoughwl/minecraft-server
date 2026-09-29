@@ -1,5 +1,5 @@
 ## Variable-length integer codecs used by the Minecraft network protocol.
-## Port of pumpkingmc/crates/pumpkin-protocol/src/codec/var_int.rs and
+## Port of upstream/protocol/src/codec/var_int.rs and
 ## var_uint.rs.
 ##
 ## Two distinct wire shapes coexist here, matching upstream exactly (and

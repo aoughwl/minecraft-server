@@ -1,4 +1,4 @@
-## Verifies legacy_rand.nim against pumpkin-nbt/pumpkin-util's own Rust unit
+## Verifies legacy_rand.nim against nbt/util's own Rust unit
 ## test vectors (legacy_rand.rs's `#[cfg(test)] mod test`), byte-for-byte -
 ## this file's whole purpose is deterministic world-gen, so "compiles" means
 ## nothing without this. Run with `nimony c -r src/util/legacy_randtest.nim`.

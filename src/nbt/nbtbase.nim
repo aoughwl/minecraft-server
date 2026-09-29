@@ -1,5 +1,5 @@
 ## Shared constants and error type for the NBT crate.
-## Port of pumpkingmc/crates/pumpkin-nbt/src/lib.rs
+## Port of upstream/nbt/src/lib.rs
 ##
 ## Rust returns `Result<T, Error>` with a rich `Error` enum. Nimony has no
 ## Nim-compatible exceptions (see `~/nimony/doc/differences.md`): its

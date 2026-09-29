@@ -1,6 +1,6 @@
 ## Non-blocking update checks against the marketplace
 ## `/api/v1/rest/check-update` endpoint.
-## Port of pumpkingmc/crates/pumpkin-plugin-utils/src/updater.rs
+## Port of upstream/plugin-utils/src/updater.rs
 ##
 ## TODO: JSON *parsing* of the response (`serde_json::from_str::<CheckUpdateResponse>`)
 ## isn't wired up yet - `std/json` exists in Nimony and this is straightforward

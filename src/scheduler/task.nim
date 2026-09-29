@@ -1,5 +1,5 @@
 ## Task identity and causal context.
-## Port of pumpkingmc/crates/pumpkin-scheduler/src/task.rs
+## Port of upstream/scheduler/src/task.rs
 ##
 ## Ported: `SchedulerTaskId` (in taskid.nim), `TaskContext`. NOT ported:
 ## `TaskFuture`/`TaskWork`/`TaskRequest`/`TaskHandle` and `TaskHandle`'s
@@ -10,7 +10,7 @@
 ## the rest of the server settles on how it drives scheduler work, not a
 ## line-by-line translation. TODO: design the Nimony equivalent (likely a
 ## `passive proc` + explicit continuation/callback stored per task) once
-## `pumpkin` (the crate that actually drives this scheduler) is reached.
+## `the upstream server` (the crate that actually drives this scheduler) is reached.
 
 import domain, taskid
 

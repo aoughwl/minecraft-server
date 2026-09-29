@@ -1,4 +1,4 @@
-## Port of pumpkingmc/crates/pumpkin-config/src/networking/compression.rs
+## Port of upstream/config/src/networking/compression.rs
 
 type
   CompressionInfo* = object

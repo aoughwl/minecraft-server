@@ -1,5 +1,5 @@
 ## Scheduler configuration, state, and snapshot counters.
-## Port of pumpkingmc/crates/pumpkin-scheduler/src/scheduler.rs
+## Port of upstream/scheduler/src/scheduler.rs
 ##
 ## Ported: `SchedulerConfig`, `SchedulerState`, `SchedulerSnapshot`. NOT
 ## ported: the `SchedulerService` trait (`submit`/`config`/`state`/

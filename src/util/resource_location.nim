@@ -1,4 +1,4 @@
-## Port of pumpkingmc/crates/pumpkin-util/src/resource_location.rs
+## Port of upstream/util/src/resource_location.rs
 ##
 ## Rust's `ToResourceLocation`/`FromResourceLocation` are traits any type can
 ## implement. Nimony has no trait-object dispatch worth reaching for here

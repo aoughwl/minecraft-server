@@ -1,13 +1,13 @@
-# pumpkin-plugin-runtime
+# plugin-runtime
 
 Port status: **mostly documented, not ported.** ~3.3k lines of Rust across
 6 files (`lib.rs` 1734, `executor.rs` 1207, `chain.rs` 142, `lifecycle.rs`
 89, `policy.rs` 82, `spawn.rs` 29).
 
-This is the wasmtime-hosting side of Pumpkin's plugin system - it loads
-and drives the WASM plugin components whose ABI `pumpkin-host-bindings`
+This is the wasmtime-hosting side of the upstream server's plugin system - it loads
+and drives the WASM plugin components whose ABI `host-bindings`
 generates bindings for (see `src/host_bindings/README.md`) and whose
-utility layer `pumpkin-plugin-utils` partly covers (see
+utility layer `plugin-utils` partly covers (see
 `src/plugin_utils/`). As predicted before reading the source, essentially
 all of it is `wasmtime::component::*` + `tokio` async runtime plumbing:
 

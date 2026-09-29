@@ -1,4 +1,4 @@
-## Port of pumpkingmc/crates/pumpkin-config/src/recipe.rs
+## Port of upstream/config/src/recipe.rs
 
 type
   RecipeConfig* = object

@@ -1,4 +1,4 @@
-## Port of pumpkingmc/crates/pumpkin-config/src/resource_pack.rs
+## Port of upstream/config/src/resource_pack.rs
 
 import whitelist  # for the shared `Uuid` stub type
 

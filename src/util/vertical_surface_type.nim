@@ -1,8 +1,8 @@
-## Port of pumpkingmc/crates/pumpkin-util/src/math/vertical_surface_type.rs
+## Port of upstream/util/src/math/vertical_surface_type.rs
 ##
 ## Upstream derives `serde::Deserialize` (snake_case). This crate's
-## deserialization story isn't ported yet (see pumpkin-nbt/nbt_ops.rs and
-## pumpkin-config for where `serde`-shaped decode logic will eventually
+## deserialization story isn't ported yet (see nbt/nbt_ops.rs and
+## config for where `serde`-shaped decode logic will eventually
 ## live) - just the type for now.
 
 type

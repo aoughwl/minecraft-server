@@ -1,17 +1,17 @@
-## Port of pumpkingmc/crates/pumpkin-util/src/identifier.rs
+## Port of upstream/util/src/identifier.rs
 ##
-## Skipped: `from_static`/`parse_static`/`vanilla_static`/`pumpkin_static` and
+## Skipped: `from_static`/`parse_static`/`vanilla_static`/`static` and
 ## the `unsafe` `slice_bytes_to_str_unchecked` helper they use - these exist
 ## in Rust purely so an `Identifier` can be built in a `const fn` (no heap
 ## alloc, usable in const contexts). Nimony's `string` is always a normal
 ## heap-backed value and there's no const/runtime split to preserve here, so
-## `new`/`parse`/`vanilla`/`pumpkin` (the runtime paths) cover the same
+## `new`/`parse`/`vanilla`/`serverNs` (the runtime paths) cover the same
 ## ground. Also skipped: `serde` (de)serialize impls and the
-## `pumpkin_codecs::FlatTryFrom` integration - ported once pumpkin-codecs is.
+## `codecs::FlatTryFrom` integration - ported once codecs is.
 
 const
   VanillaNamespace* = "minecraft"
-  PumpkinNamespace* = "pumpkin"
+  ServerNamespace* = "server"
 
 type
   Identifier* = object
@@ -76,8 +76,8 @@ proc newIdentifier*(namespace, path: string): IdentifierResult =
 proc vanilla*(path: string): IdentifierResult =
   newIdentifier(VanillaNamespace, path)
 
-proc pumpkin*(path: string): IdentifierResult =
-  newIdentifier(PumpkinNamespace, path)
+proc serverNs*(path: string): IdentifierResult =
+  newIdentifier(ServerNamespace, path)
 
 proc parse*(identifier: string): IdentifierResult =
   ## Splits on the first `:`. No colon (or a colon at position 0) implies the
@@ -112,8 +112,8 @@ proc view*(id: Identifier): (string, string) {.inline.} =
 proc isVanilla*(id: Identifier): bool {.inline.} =
   id.namespace == VanillaNamespace
 
-proc isPumpkin*(id: Identifier): bool {.inline.} =
-  id.namespace == PumpkinNamespace
+proc isServerNs*(id: Identifier): bool {.inline.} =
+  id.namespace == ServerNamespace
 
 proc `$`*(id: Identifier): string =
   id.namespace & ":" & id.path

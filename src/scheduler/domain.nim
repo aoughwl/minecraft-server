@@ -1,5 +1,5 @@
 ## Scheduler ownership domains.
-## Port of pumpkingmc/crates/pumpkin-scheduler/src/domain.rs
+## Port of upstream/scheduler/src/domain.rs
 
 type
   WorldDomainId* = object

@@ -1,5 +1,5 @@
 ## HTTP client utilities.
-## Port of pumpkingmc/crates/pumpkin-auth/src/client.rs
+## Port of upstream/auth/src/client.rs
 ##
 ## Rust's `client()`/`client_builder()` build a `reqwest::Client` with
 ## `rustls` TLS and (on Android) a bundled Mozilla root-cert store. This is

@@ -1,4 +1,4 @@
-## Port of pumpkingmc/crates/pumpkin-util/src/difficulty.rs
+## Port of upstream/util/src/difficulty.rs
 
 type
   Difficulty* = enum

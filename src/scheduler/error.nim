@@ -1,5 +1,5 @@
 ## Scheduler error type.
-## Port of pumpkingmc/crates/pumpkin-scheduler/src/error.rs
+## Port of upstream/scheduler/src/error.rs
 ##
 ## Rust's `SchedulerError` is a plain `Error`-deriving enum used as the `E`
 ## in `Result<T, SchedulerError>`; it isn't Rust exception machinery. It

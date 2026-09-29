@@ -1,5 +1,5 @@
 ## 3-dimensional vector with generic numeric components.
-## Port of pumpkingmc/crates/pumpkin-util/src/math/vector3.rs
+## Port of upstream/util/src/math/vector3.rs
 ##
 ## As with vector2.nim, Rust's local `Math` trait becomes Nimony's built-in
 ## `std/math.Arithmetic` concept so this stays a real generic instead of
@@ -11,7 +11,7 @@
 ## a concrete-type overload set once a caller needs it), `Into<f64>`/
 ## `Into<f32>` conversion methods, all serde impls, and the
 ## `vector_codec_impl!` macro-generated Encode/Decode/FlatTryFrom impls
-## (depend on the unported pumpkin_codecs). `BlockPos` interop
+## (depend on the unported codecs). `BlockPos` interop
 ## (`is_within_bounds`'s `block_pos: Self` param, `From`/dot with
 ## `super::position::BlockPos`) is deferred until src/util/position.nim
 ## exists.

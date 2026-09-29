@@ -1,4 +1,4 @@
-## Port of pumpkingmc/crates/pumpkin-config/src/server_links.rs
+## Port of upstream/config/src/server_links.rs
 
 import std/tables
 
@@ -19,7 +19,7 @@ type
 proc defaultServerLinksConfig*(): ServerLinksConfig =
   ServerLinksConfig(
     enabled: true,
-    bugReport: "https://github.com/Pumpkin-MC/Pumpkin/issues",
+    bugReport: "https://github.com/MC/the upstream server/issues",
     support: "",
     status: "",
     feedback: "",

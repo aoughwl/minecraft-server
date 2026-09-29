@@ -1,4 +1,4 @@
-## Port of pumpkingmc/crates/pumpkin-config/src/networking/query.rs
+## Port of upstream/config/src/networking/query.rs
 
 import netaddr
 

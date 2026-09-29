@@ -1,4 +1,4 @@
-## Port of pumpkingmc/crates/pumpkin-util/src/resource.rs
+## Port of upstream/util/src/resource.rs
 
 import identifier
 

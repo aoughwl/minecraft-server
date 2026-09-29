@@ -2,7 +2,7 @@
 ## double chests (two single-chest inventories viewed as one 54-slot
 ## inventory). The first inventory's slots come first; operations are
 ## delegated to whichever underlying inventory owns the slot index.
-## Port of pumpkingmc/crates/pumpkin-inventory/src/double.rs
+## Port of upstream/inventory/src/double.rs
 
 import itemstub, inventory
 

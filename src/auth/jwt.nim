@@ -1,6 +1,6 @@
 ## JWT verifier for Minecraft: Bedrock Edition - the data model and
 ## base64 plumbing.
-## Port of pumpkingmc/crates/pumpkin-auth/src/jwt/mod.rs
+## Port of upstream/auth/src/jwt/mod.rs
 ##
 ## Rust's actual signature verification (`build_public_key_from_b64`,
 ## the chain-of-trust check against Mojang's key, `VerifyingKey::verify`)

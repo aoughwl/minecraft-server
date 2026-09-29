@@ -1,6 +1,6 @@
 ## Numeric argument parsing built on `StringReader`.
 ## Port of `read_and_parse`/`read_int`/`read_long`/`read_float`/`read_double`
-## in pumpkingmc/crates/pumpkin-command/src/string_reader.rs.
+## in upstream/command/src/string_reader.rs.
 
 import std/parseutils
 import cmderrors, string_reader

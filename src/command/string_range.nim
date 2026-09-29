@@ -1,5 +1,5 @@
 ## A byte-index range into a command string.
-## Port of pumpkingmc/crates/pumpkin-command/src/context/string_range.rs
+## Port of upstream/command/src/context/string_range.rs
 
 type
   StringRange* = object
