@@ -112,21 +112,35 @@ the same way (`nimony c -r src/data_codegen/gen_<name>.nim`, output
 - `gen_damage_type.nim` → `DamageType` object + 51 named constants (directory shape, `assets/datapack/data/minecraft/damage_type/*.json`) + `damageTypeFromName`/`damageTypeFromId`. Three small nested enums (`DeathMessageType`, `DamageEffects` - optional, absent -> `hasEffects: false` - and `DamageScaling`). Upstream's `Taggable` impl (registry-tag lookup via `tag.rs`'s `RegistryKey`) is skipped, needs that unported module.
 - `javaversion.nim` (in `src/util/`, not `src/data_codegen/` - see below) - direct port of `version.rs`'s `JavaMinecraftVersion` enum + `to_field_ident`. Not JSON-driven (it's a hand-authored, ordered version list mirrored from `pumpkin_util::version` for codegen's own token-emission use), so it's a plain hand-port rather than a `gen_*.nim` script; belongs alongside the rest of `pumpkin-util` in `src/util/`. Declaration order preserved exactly (upstream derives `Ord` from it for version comparisons).
 
-That's 33/90 submodules done (32 in `src/data_codegen/`/`src/generated/` + 1 direct util port).
+That's 34/90 submodules done (33 in `src/data_codegen/`/`src/generated/` + 1 direct util port).
 
-Investigated but deferred, not silently skipped: `registry.rs` (234 lines) -
-walks ~31 registry directories (`chat_type`, `trim_pattern`, `wolf_variant`,
-`damage_type`, `jukebox_song`, `banner_pattern`, `instrument`, `dimension_type`,
-`worldgen/biome`, and more), converts each entry's arbitrary JSON to an NBT
-compound via a recursive `json_to_nbt_tag`, and embeds the serialized bytes as
-byte-string literals keyed by registry+entry name (this is the actual
-"registry data" Java Edition's `CRegistryData` config packet - see
-`src/protocol/configpackets.nim`'s `CRegistryData` - sends to clients). This
-is now genuinely portable (a complete `src/nbt/` exists: `NbtTag`, an
-unnamed-compound `Nbt.write`), just substantial - a `JsonNode -> NbtTag`
-converter plus directory-walking across ~31 registries, each independently
-sized. Good next target, budget it as its own pass rather than folding it
-into a mixed batch.
+- `gen_registry.nim` → `src/generated/registry_data.nim` (**`registry.rs`, 234
+  lines, now done** - previously flagged as "investigated but deferred").
+  Ported `jsontonbt.nim` (`jsonToNbtTag`, a generic recursive `JsonNode ->
+  NbtTag` converter mirroring `registry.rs`'s local `json_to_nbt_tag`
+  closure exactly, 6-way match on JSON value kind) as a standalone reusable
+  module, then the generator itself: walks all 32 `SYNCED_REGISTRIES`
+  directories (the constant array has 32 entries, not ~31 as originally
+  estimated - includes both `worldgen/biome` and
+  `worldgen/block_state_provider`) under
+  `../upstream-ref/assets/datapack/data/minecraft/`, reads every entry's
+  JSON via `listJsonStems`, converts to NBT, and serializes each as an
+  unnamed compound via the existing `src/nbt/nbtdoc.nim` `writeUnnamed`
+  (Java mode) - reusing the complete NBT writer rather than reimplementing
+  serialization. Also reproduces upstream's one hardcoded special case: a
+  synthetic `"raw"` `chat_type` entry injected for vanilla parity (not
+  present in any `assets/` JSON file), built from an inline JSON literal via
+  `parseJson`. Byte output is emitted as `@[1'u8, 2'u8, ...]` seq literals
+  (Nimony has no raw byte-string literal syntax like Rust's `b"..."`).
+  **Run and verified**: `nimony c -r src/data_codegen/gen_registry.nim`
+  actually walked the real 32 directories and wrote
+  `src/generated/registry_data.nim` (511 lines, 32 registries, 433 JSON
+  entries + 1 synthetic `raw` = 434 total), which itself `nimony check`s
+  clean. Spot-checked by hand-decoding the `chat_type/chat` entry's NBT
+  bytes against its source JSON (`{"chat": {"parameters": ["sender",
+  "content"], "translation_key": "chat.type.text"}, "narration": {...}}`) -
+  the byte stream matches exactly (compound tag id, nested "chat" compound,
+  "parameters" string-list of length 2 containing "sender"/"content", etc.).
 
 Skipped after investigation (documented here, not silently dropped):
 `potion.rs` (needs `effect.rs`'s `StatusEffect` - `effect.rs` itself is now
