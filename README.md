@@ -45,8 +45,22 @@ Smallest/most self-contained crates first, since later crates depend on them:
    Needs a real design pass once `pumpkin` (the crate that drives the
    server tick loop) clarifies what should drive scheduler turns. See
    `src/scheduler/lib.nim`'s doc comment.
-4. `pumpkin-config` (~2.2k LOC)
-4. `pumpkin-codecs` / `pumpkin-protocol` (~40k LOC combined)
+4. `pumpkin-config` (~2.2k LOC) — **Mostly done for plain-data configs.**
+   Ported: `lighting.rs`, `fun.rs`, `recipe.rs`, `advancement.rs`,
+   `player_data.rs`, `pvp.rs`, `logging.rs`, `whitelist.rs`, `chunk.rs`,
+   `world.rs`, `server_links.rs`, `telemetry.rs`, `chat.rs`,
+   `resource_pack.rs`, and `networking/{lan_broadcast,compression,proxy,
+   packet_limiter,query,rcon}.rs` → `src/config/*.nim` (networking ones
+   under `src/config/networking/`). All type-check clean. `Uuid` and
+   `SocketAddr` are represented by small local stub types (`whitelist.nim`,
+   `networking/netaddr.nim`) since neither is ported anywhere yet. Skipped:
+   `op.rs`/`networking/auth.rs` (need `pumpkin_util::PermissionLvl`/
+   `ProfileAction`, not yet ported), `networking/{java,bedrock}.rs` and
+   `networking/mod.rs`'s `NetworkingConfig` aggregate (depend on java/bedrock
+   above), `plugins.rs`, and top-level `lib.rs` (458 LOC — the actual
+   config-file load/save/merge driver; needs a design pass, not a
+   line-by-line port).
+5. `pumpkin-codecs` / `pumpkin-protocol` (~40k LOC combined)
 5. `pumpkin-world`, `pumpkin-inventory`, `pumpkin-command`
 6. `pumpkin` (main server crate, ~269k LOC)
 7. `pumpkin-data` (~1.5M LOC — almost entirely generated block/item/registry
