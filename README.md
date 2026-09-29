@@ -306,12 +306,32 @@ Smallest/most self-contained crates first, since later crates depend on them:
     exists yet for the tick loop; same string-specialization as tick.nim).
     `dimension.rs` is a two-line stub documenting why it's blocked
     (`Level`/`data::dimension::Dimension` both unported).
+    `chunk/palette.rs`'s `PalettedContainer<V, const DIM: usize>` got its
+    design pass: ported to `src/world/palette.nim` as `PalettedContainer`
+    with `dim` as a runtime `int` field (Nimony has no const-generic array
+    types, and only two concrete shapes - 16 for blocks, 4 for biomes -
+    are ever used, so forcing generality bought nothing) and the stored
+    value type fixed to a concrete `uint32` (generic `V` hit real Nimony
+    friction; both real uses - block-state id, biome id - are plain
+    integers anyway). Dense/Indexed storage, palette dedup, and the
+    swap-remove-on-zero-count shrink path are all ported; `nimony c -r`
+    tested via `palettetest.nim` (fill 4096 cells with 300 distinct
+    values to force an Indexed→Dense upgrade, verify every cell, then
+    refill to one value and verify the palette shrinks back to 1). That
+    test caught a real bug: a first pass wrongly special-cased Dense
+    storage to skip palette/counts bookkeeping, which silently broke the
+    palette-shrink path once upgraded - fixed once the test failed to
+    just report "compiles". Left out: the Bedrock-specific
+    `bedrock_palette_bits`/`bedrock_water_state`/
+    `has_random_ticking_fluid` helpers (need `BlockState`/`Fluid`, not
+    ported) and the on-disk bit-packed (de)serialization
+    (`ChunkSectionBlockStates`/`ChunkSectionBiomes`, `format/anvil.rs`/
+    `format/linear.rs`, ~3.5k lines) - a separate, more mechanical
+    follow-up now that the in-memory shape is settled.
     Not started: `block/`, `biome/` (need the full `data` block/
-    biome registry), `chunk/` (palette/section storage - `chunk/palette.rs`'s
-    core `PalettedContainer<V, const DIM: usize>` needs const-generic
-    arrays, worth a real design pass rather than a rushed port), `level.rs`,
-    `world.rs`, `lighting/`, `poi/`, `world_info/`, `chunk_system/`, all of
-    `generation/`.
+    biome registry), the rest of `chunk/` (`mod.rs`, `format/`, `io/`),
+    `level.rs`, `world.rs`, `lighting/`, `poi/`, `world_info/`,
+    `chunk_system/`, all of `generation/`.
 12. the main server crate (~269k LOC) — **Assessed; tiny slice
     ported, full map written.** Ported `error.rs`'s a shared error trait as
     overloaded procs → `src/server/errorclass.nim` (over `InventoryError`/
