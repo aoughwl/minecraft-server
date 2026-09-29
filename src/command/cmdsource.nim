@@ -25,6 +25,7 @@
 ## counting already gives shared ownership.
 
 import ../util/vector2, ../util/vector3
+import ../util/difficulty
 import ../server/entity/entity
 
 type
@@ -101,6 +102,14 @@ type
       ## stands in for `context.server().player_idle_timeout.store(...)`
       ## (src/server/command/setidletimeout.nim) - same no-`Server`-type
       ## gap as `stopProc`. `nil` is a safe no-op.
+    difficultyProc*: proc(): Difficulty {.closure.}
+      ## stands in for `context.server().get_difficulty()`
+      ## (src/server/command/difficulty.nim) - `nil` falls back to
+      ## `Normal`, matching vanilla's own default.
+    setDifficultyProc*: proc(d: Difficulty) {.closure.}
+      ## stands in for `server.set_difficulty(difficulty, true)`
+      ## (src/server/command/difficulty.nim) - same no-`Server`-type gap
+      ## as `stopProc`. `nil` is a safe no-op.
 
 proc sendMessage*(s: CommandSource, message: string) =
   if s.sendMessageProc != nil:
@@ -145,6 +154,16 @@ proc getSeed*(s: CommandSource): int64 =
     s.getSeedProc()
   else:
     0'i64
+
+proc getDifficulty*(s: CommandSource): Difficulty =
+  if s.difficultyProc != nil:
+    s.difficultyProc()
+  else:
+    Normal
+
+proc setDifficulty*(s: CommandSource, d: Difficulty) =
+  if s.setDifficultyProc != nil:
+    s.setDifficultyProc(d)
 
 proc anchorPosition*(s: CommandSource): Vector3[float64] {.inline.} =
   s.position

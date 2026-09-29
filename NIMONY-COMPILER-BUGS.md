@@ -384,6 +384,44 @@ Every write then happens in the caller's own frame.
 
 ---
 
+## 13. Two `{.closure.}` procs in the same object-constructor call, both capturing the same local `var`/`ref`, break the "prove initialized" check for that variable afterward
+
+**Severity: low-medium** (a real diagnostic-quality bug — the compiler wrongly
+rejects working code with a confusing error, rather than crashing or
+miscompiling).
+
+```nim
+var current = Peaceful
+let source = CommandSource(
+  difficultyProc: proc(): Difficulty {.closure.} = current,
+  setDifficultyProc: proc(d: Difficulty) {.closure.} = current = d,
+)
+echo current  # Error: cannot prove that `current` has been initialized
+```
+
+Each closure alone captures `current` fine (`nimony check` passes with just
+one closure in the constructor). Adding the *second* closure that also
+captures it — even though both closures obviously see the same already-
+initialized variable — makes any use of `current` *after* the constructor
+call fail to prove initialization. Reproduced identically whether `current`
+is a plain `var Difficulty` or a `ref object` field access
+(`box.current`/`box.setTo`), so it's not specific to value vs. reference
+types.
+
+**Found in:** `src/server/command/difficultytest.nim`, testing `/difficulty`'s
+query+set closures sharing one `CommandSource`.
+
+**Workaround:** don't have two inline closures in the same constructor
+capture-and-mutate the same local. Use a single global `var` + a top-level
+named `{.closure.}` proc instead (the closure no longer needs to *capture*
+anything, since it reads/writes the global directly), or split the mutation
+across separately-constructed sources so no two closures alias one variable.
+
+**Filed:** no — documented in-repo only (SendFeedback quota exhausted this
+session).
+
+---
+
 ## Summary table
 
 | # | Bug | Nimony check | `c -r` / C-codegen | Filed |
@@ -400,3 +438,4 @@ Every write then happens in the caller's own frame.
 | 10 | `readFile` inside `try` inside `walkDir` | passes | broken C-codegen | no |
 | 11 | Tuple-destructure `for` over local seq var | crashes (parser) | — | no |
 | 12 | `var Table[K,V]` out-param writes lost on return | passes | **silently wrong data, no crash** | no |
+| 13 | Two closures in one constructor sharing a captured var breaks init-proof | crashes (false diagnostic) | — | no |

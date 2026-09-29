@@ -89,6 +89,20 @@ directory uses that library.
   needs the unported `text` module) is dropped for a plain string.
   Verified via `saveseedtest.nim`.
 
+- **`difficulty.nim`** - `/difficulty` (query) and `/difficulty
+  <peaceful|easy|normal|hard>` (set). `CommandSource` gained
+  `difficultyProc*`/`setDifficultyProc*` (`nil` falls back to `Normal`
+  / a no-op) since no `Server`/`Level` type exists yet, matching
+  `tpsProc`'s shape. Builds on `src/util/difficulty.nim` (already
+  ported). Verified via `difficultytest.nim`'s three blocks (query,
+  set, already-set failure) through real Tree/dispatch walks; hit and
+  worked around a new Nimony diagnostic bug along the way (two
+  closures in one object-constructor call sharing a captured local
+  broke "prove initialized" for later uses of it - see
+  `NIMONY-COMPILER-BUGS.md` #13). Same `nimony c -r` caveat as every
+  other file here (bug #1, confirmed again with the same
+  `lambdalifting.nim(369)`/`eraiser.nim(128)` signature).
+
 ## Not started
 
 The other ~20 command files under `upstream-ref/crates/pumpkin/src/command/commands/`,
