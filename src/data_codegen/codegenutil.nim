@@ -175,6 +175,22 @@ proc jsonIntField*(jsonPath: Path, key: string, default: int): int =
 proc isAsciiDigit*(c: char): bool {.inline.} =
   c >= '0' and c <= '9'
 
+proc readStringIntSeqMapSorted*(path: string): seq[(string, seq[int])] =
+  ## Port of `serde_json::from_str::<BTreeMap<String, Box<[usize]>>>(...)` -
+  ## a `BTreeMap` iterates in ascending key order, so this sorts by name to
+  ## match upstream's emitted order exactly.
+  var tree = parseFile(path)
+  let obj = root(tree)
+  var pairs: seq[(string, seq[int])] = @[]
+  for key, val in obj.pairs():
+    var nums: seq[int] = @[]
+    for v in val.items():
+      nums.add(int(v.getInt()))
+    pairs.add((key, nums))
+  pairs.sort(proc(a, b: (string, seq[int])): int =
+    cmp(a[0], b[0]))
+  pairs
+
 proc readStringIntMapSorted*(path: string): seq[(string, int)] =
   ## Port of `serde_json::from_str::<BTreeMap<String, uN>>(...)` - a
   ## `BTreeMap` iterates in ascending key order, so this sorts by name to

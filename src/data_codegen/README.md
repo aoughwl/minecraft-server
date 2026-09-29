@@ -108,7 +108,25 @@ the same way (`nimony c -r src/data_codegen/gen_<name>.nim`, output
 
 - `gen_game_rules.nim` → `GameRule` enum (59 variants) + `GameRuleKind` (bool/int) + per-rule default value accessors, from `game_rules.json`'s name -> (bool | int | {"default": int, ...}) map. Scope note: upstream's generator also emits a full `GameRuleRegistry` struct with serde (de)serialization and mutable `get`/`get_mut` accessors - that's a runtime storage/registry design, not pure data, deferred to whenever game rules get wired into an actual world/server type; this generator ports the data half only (the enum, kind, and defaults). **Found and fixed a new, more insidious Nimony compiler bug here** (minimally reproduced, documented in the file itself): `seq[T].sort(closureComparator)` crashes at C-codegen - not at `nimony check`, which passes clean - when `T` is a plain object with an enum-typed field; the same pattern works fine sorting tuples elsewhere in this port. Worked around with a closure-free manual insertion sort (`manualSortByName`) rather than `algorithm.sort`. This is worth any future generator author knowing before trusting `nimony check` alone on a `.sort()`-using file - `nimony c -r` it too.
 
-That's 30/90 submodules done.
+- `gen_slot_ranges.nim` → `slotRanges()`/`slotRangeAllNames()`/`slotRangeSingleSlotNames()`/`getSlotRange(name)` (165 entries, from `slot_ranges.json`, a flat `name -> seq[int]` map). Unlike every other generator so far, upstream doesn't build an enum here - it matches on the literal string keys directly (`get_slot_range(name: &str)`), so this does the same rather than inventing one. Added `readStringIntSeqMapSorted` to `codegenutil.nim` for the `BTreeMap<String, Box<[usize]>>` shape.
+- `gen_damage_type.nim` → `DamageType` object + 51 named constants (directory shape, `assets/datapack/data/minecraft/damage_type/*.json`) + `damageTypeFromName`/`damageTypeFromId`. Three small nested enums (`DeathMessageType`, `DamageEffects` - optional, absent -> `hasEffects: false` - and `DamageScaling`). Upstream's `Taggable` impl (registry-tag lookup via `tag.rs`'s `RegistryKey`) is skipped, needs that unported module.
+- `javaversion.nim` (in `src/util/`, not `src/data_codegen/` - see below) - direct port of `version.rs`'s `JavaMinecraftVersion` enum + `to_field_ident`. Not JSON-driven (it's a hand-authored, ordered version list mirrored from `pumpkin_util::version` for codegen's own token-emission use), so it's a plain hand-port rather than a `gen_*.nim` script; belongs alongside the rest of `pumpkin-util` in `src/util/`. Declaration order preserved exactly (upstream derives `Ord` from it for version comparisons).
+
+That's 33/90 submodules done (32 in `src/data_codegen/`/`src/generated/` + 1 direct util port).
+
+Investigated but deferred, not silently skipped: `registry.rs` (234 lines) -
+walks ~31 registry directories (`chat_type`, `trim_pattern`, `wolf_variant`,
+`damage_type`, `jukebox_song`, `banner_pattern`, `instrument`, `dimension_type`,
+`worldgen/biome`, and more), converts each entry's arbitrary JSON to an NBT
+compound via a recursive `json_to_nbt_tag`, and embeds the serialized bytes as
+byte-string literals keyed by registry+entry name (this is the actual
+"registry data" Java Edition's `CRegistryData` config packet - see
+`src/protocol/configpackets.nim`'s `CRegistryData` - sends to clients). This
+is now genuinely portable (a complete `src/nbt/` exists: `NbtTag`, an
+unnamed-compound `Nbt.write`), just substantial - a `JsonNode -> NbtTag`
+converter plus directory-walking across ~31 registries, each independently
+sized. Good next target, budget it as its own pass rather than folding it
+into a mixed batch.
 
 Skipped after investigation (documented here, not silently dropped):
 `potion.rs` (needs `effect.rs`'s `StatusEffect` - `effect.rs` itself is now
