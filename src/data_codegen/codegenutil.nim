@@ -2,7 +2,7 @@
 ## gen_sound_category.nim's proof-of-concept so later generators don't
 ## each reimplement `toPascalCase`/JSON-array reading.
 
-import std/[json, strutils, algorithm]
+import std/[json, strutils, algorithm, syncio]
 
 proc toPascalCase*(s: string): string =
   ## Port of `heck::ToPascalCase` as the upstream generators use it: splits
@@ -26,6 +26,24 @@ proc readStringArray*(path: string): seq[string] =
   result = @[]
   for elem in arr:
     result.add(elem.getStr())
+
+proc readIntIntMapSorted*(path: string): seq[(int, int)] =
+  ## Port of `serde_json::from_str::<BTreeMap<uN, uN>>(...)` - JSON object
+  ## keys are always strings, so this parses each key back to an int; a
+  ## `BTreeMap<uN, _>` iterates in ascending numeric key order.
+  var tree = parseFile(path)
+  let obj = root(tree)
+  var pairs: seq[(int, int)] = @[]
+  for key, val in obj.pairs():
+    var keyInt = 0
+    try:
+      keyInt = parseInt(key)
+    except ErrorCode as e:
+      echo "bad int key '" & key & "': " & $e
+    pairs.add((keyInt, int(val.getInt())))
+  pairs.sort(proc(a, b: (int, int)): int =
+    cmp(a[0], b[0]))
+  pairs
 
 proc readStringIntMapSorted*(path: string): seq[(string, int)] =
   ## Port of `serde_json::from_str::<BTreeMap<String, uN>>(...)` - a

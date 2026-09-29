@@ -79,13 +79,14 @@ the same way (`nimony c -r src/data_codegen/gen_<name>.nim`, output
 - `gen_entity_status.nim` → `EntityStatus` with explicit discriminants (64 variants, from `entity_statuses.json`, a name->u8 map)
 - `gen_world_event.nim` → `WorldEvent` with explicit discriminants (from `world_event.json`, a name->u16 map)
 
-That's 6/90 submodules done.
+- `gen_chunk_status.nim` → `ChunkStatus` (10 variants, from `chunk_status.json`, a flat string array), plus `chunkStatusToWireName` standing in for upstream's `#[serde(rename = "minecraft:<status>")]`
+- `gen_flower_pot_transformations.nim` → `getPottedItem(itemId: uint16): uint16` (from `flower_pot_transformations.json`, an item-id->potted-block-id map), returning the raw block id since the `BlockId` wrapper type doesn't exist yet
+
+That's 8/90 submodules done.
 
 ## What's NOT done
 
-The other ~84 submodules, ranging from `chunk_status.rs`/`flower_pot_transformations.rs`
-(similar simple flat-array/map shapes, next easiest) up through `block.rs`, `item.rs`, `biome.rs`, `recipes.rs`,
-trivial) up through `block.rs`, `item.rs`, `biome.rs`, `recipes.rs`,
+The other ~82 submodules up through `block.rs`, `item.rs`, `biome.rs`, `recipes.rs`,
 `noise_router.rs`, `noise_settings.rs` (these last few are large and encode
 real structural complexity - nested data shapes, cross-references between
 registries, not just flat string arrays). Each needs the same treatment as
