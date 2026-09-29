@@ -157,6 +157,20 @@ Smallest/most self-contained crates first, since later crates depend on them:
    explanation and the three real options once the plugin ABI is actually
    being built (wasmtime C API FFI, a custom WIT→Nimony generator, or
    dropping the WASM sandbox model for native-loaded plugins).
+9b. `pumpkin-plugin-runtime` (~3.3k LOC) — **Not portable yet; documented
+    instead, except one small data type.** wasmtime `Store`
+    multiplexing/execution (`executor.rs`), cross-plugin re-entry tracking
+    (`chain.rs`), an async admission policy over that (`policy.rs`), and a
+    runtime-agnostic spawn trait (`spawn.rs`) are all tokio+wasmtime
+    plumbing with no Nimony equivalent (no WASM runtime, and Nimony's
+    async is `passive` procs + continuations, not poll-based futures).
+    `lifecycle.rs`'s `DriverState`/`DriverError` — the one piece that's
+    plain data — is ported to `src/plugin_runtime/lifecycle.nim`; the
+    `Lifecycle`/`DriverJoin` types wrapping it in a tokio `watch` channel
+    are not. See `src/plugin_runtime/README.md` for the three replacement
+    paths, including the option (worth real consideration) of skipping
+    WASM sandboxing entirely and loading plugins natively the way the
+    sibling Jester project's `aowli` interpreter already does.
 10. `pumpkin-world`, `pumpkin-inventory`, `pumpkin-command` (~14.1k LOC) —
     **command: tokenizer layer done.** `errors/command_syntax_error.rs`
     (simplified), `context/string_range.rs`, `string_reader.rs`, and its
