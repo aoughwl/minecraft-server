@@ -65,6 +65,18 @@ Smallest/most self-contained crates first, since later crates depend on them:
    the honest Nimony replacement is a plain template/generic wrapper called
    by plugin authors plus a small codegen script, not a compiler plugin,
    once `pumpkin`'s plugin-loading side gives it a concrete target.
+4b. `pumpkin-macros` (~1.15k LOC) — **Not ported; documented instead**
+   (`src/macros/README.md`). Single-file proc-macro crate, entirely
+   compiler codegen: an `Event` derive + `cancellable`/`send_cancellable[_blocking]`
+   (event-bus dispatch boilerplate), `packet`/`java_packet`/
+   `pumpkin_block[_from_tag]` (registration-constant codegen),
+   `PacketWrite`/`PacketRead`/`PacketReadSlice` derives (field-by-field
+   protocol serialize/deserialize codegen), and `translate_cross!`/
+   `translate_java!` (compile-time translation-key validation). The
+   `PacketWrite`/`PacketRead` derive logic is flagged as the reference spec
+   for whoever hand-ports individual `src/protocol/` packet types next,
+   since Nimony has no derive macros and each packet's serialize/
+   deserialize will be hand-written the way `src/nbt/tag.nim`'s is.
 4. `pumpkin-config` (~2.2k LOC) — **Mostly done for plain-data configs.**
    Ported: `lighting.rs`, `fun.rs`, `recipe.rs`, `advancement.rs`,
    `player_data.rs`, `pvp.rs`, `logging.rs`, `whitelist.rs`, `chunk.rs`,
