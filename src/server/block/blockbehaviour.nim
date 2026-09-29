@@ -17,7 +17,9 @@
 ## as more blocks get ported is mechanical from here - the pattern's fixed.
 
 import ../entity/entity
+import ../../generated/blockdata as realblock
 import std/tables
+import std/strutils
 
 type
   BlockBehaviour* = ref object
@@ -85,13 +87,40 @@ proc updateEntityMovementAfterFallOn*(b: BlockBehaviour, entity: EntityBase) {.i
 # --- registration: replaces `#[pumpkin_block(name)]` ------------------------
 
 var blockRegistry: Table[string, BlockBehaviour] = initTable[string, BlockBehaviour]()
+var unknownRegistrations: seq[string] = @[]
+  ## Block names registered that don't resolve against the real block
+  ## table (src/generated/blockdata.nim). Kept as a plain diagnostic list
+  ## rather than a hard failure, since a block file's own name might
+  ## legitimately predate the generated table's snapshot of blocks.json
+  ## (a modded/future block, or a test fixture) - `registerBlock` still
+  ## registers it, `unresolvedBlockRegistrations()` exposes the list for
+  ## whoever wants to assert on it (e.g. a startup-sanity test).
+
+proc stripMcPrefix(name: string): string {.inline.} =
+  ## Block files register with the wire-format "minecraft:" namespace
+  ## prefix (matching upstream's registration strings); the generated
+  ## table's `name` field is unprefixed.
+  if name.startsWith("minecraft:"): name[10 .. ^1] else: name
+
+proc findRealBlock*(name: string): (bool, realblock.Block) =
+  let bare = stripMcPrefix(name)
+  for b in realblock.AllBlocks:
+    if b.name == bare:
+      return (true, b)
+  (false, realblock.Block())
 
 proc registerBlock*(name: string, behaviour: BlockBehaviour) =
   ## Each block file calls this at load time in place of the macro's
   ## registration codegen (upstream's `registry.rs` builds the equivalent
   ## table at compile-derived startup by instantiating every `impl
   ## BlockBehaviour` block - here it's an explicit call per block).
+  let (found, _) = findRealBlock(name)
+  if not found:
+    unknownRegistrations.add(name)
   blockRegistry[name] = behaviour
+
+proc unresolvedBlockRegistrations*(): seq[string] {.inline.} =
+  unknownRegistrations
 
 proc lookupBlock*(name: string): nil BlockBehaviour =
   ## `nil` = not registered, matching `entity.nim`'s established

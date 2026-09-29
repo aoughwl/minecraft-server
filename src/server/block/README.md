@@ -85,3 +85,23 @@ exist before it means anything (it's pure wiring, no logic of its own).
 `registry.rs` (the full ~200+-block wiring table) stays out of scope until
 that many concrete blocks actually exist - what's here proves the pattern,
 not the whole module.
+
+5. **Wired to the real generated block table** (`src/generated/blockdata.nim`,
+   1286 blocks from `assets/blocks.json`, once that landed via
+   `src/data_codegen/gen_block.nim`). `findRealBlock(name)` resolves a
+   `minecraft:`-prefixed registration name against real block data
+   (name/translationKey/hardness/blastResistance/mapColor/itemId/
+   defaultStateId); `registerBlock` now tracks any registration whose
+   name doesn't resolve in `unresolvedBlockRegistrations()` (soft
+   diagnostic, not a hard failure - a block file might legitimately
+   predate the generated table's snapshot). `realdatawiringtest.nim`
+   verifies `findRealBlock` against `slime_block`/`structure_void`'s real
+   field values (hand-checked against `blockdata.nim` directly) and
+   confirms both proof-case blocks resolve cleanly on registration.
+   Same runtime-crash caveat as above applies - `nimony check` clean,
+   `nimony c -r` not currently possible for anything importing
+   `entity.nim` (this file does, transitively, via `blockbehaviour.nim`).
+   The item-table equivalent (`src/inventory/itemstub.nim`'s
+   `getMaxStackSize`/`getName`, backed by `src/generated/item.nim`'s
+   1658 items) has no such dependency and IS runtime-verified - see
+   `src/inventory/itemwiringtest.nim`.

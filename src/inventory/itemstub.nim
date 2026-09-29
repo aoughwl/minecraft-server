@@ -1,15 +1,20 @@
 ## Placeholder `Item`/`ItemStack` types.
 ## TODO: these belong to `data::item`/`data::item_stack` in
-## the Rust source (item registry + stack-with-components model), and
-## `data` (1.5M LOC, almost entirely generated block/item/registry
-## tables) hasn't been ported yet - see the README's porting-order notes.
-## This stub carries just enough shape (an item id and a count) for the
-## rest of inventory's slot/container logic, which is mostly
-## slot-index and count arithmetic, to be ported and type-check now.
-## Replace this file's types with the real ones once data lands,
+## the Rust source (item registry + stack-with-components model). The
+## flat name/id/maxStackSize table now exists at `../generated/item.nim`
+## (src/data_codegen/gen_item.nim, 1658 real items), but the full
+## `components` map (enchantments, durability, custom data - what a real
+## `ItemStack` needs beyond count/id) is still unported - see that
+## generator's doc comment for why it's scoped down. This stub therefore
+## keeps its own `Item`/`ItemStack` shape (id + count) so the many
+## existing consumers (src/inventory/*, src/server/item/*) don't need a
+## breaking API change, but now backs `getMaxStackSize`/`getName` with a
+## real lookup into the generated table instead of a hardcoded guess.
+## Replace this file's types with the real ones once `components` lands,
 ## and every proc here that takes/returns `ItemStack` will need revisiting
-## for whatever richer API the real type exposes (components, NBT-backed
-## data, etc.) beyond count/id.
+## for whatever richer API the real type exposes beyond count/id.
+
+import ../generated/item as realitem
 
 type
   Item* = object
@@ -18,6 +23,15 @@ type
   ItemStack* = object
     item*: Item
     itemCount*: uint8
+
+proc findRealItem(id: uint16): (bool, realitem.Item) =
+  ## Linear scan over the generated table; `AllItems` is id-ordered so
+  ## this could be direct-indexed, but a scan is robust to any future
+  ## generator change in ordering/gaps and 1658 entries is cheap.
+  for it in realitem.AllItems:
+    if it.id == int(id):
+      return (true, it)
+  (false, realitem.Item())
 
 proc isEmpty*(s: ItemStack): bool {.inline.} =
   s.itemCount == 0 or s.item.id == 0
@@ -29,9 +43,17 @@ proc getItem*(s: ItemStack): Item {.inline.} =
   s.item
 
 proc getMaxStackSize*(s: ItemStack): uint8 {.inline.} =
-  ## TODO: real max-stack-size comes from the item's registry data
-  ## component; stubbed at the vanilla default (64) until `data` lands.
-  64'u8
+  ## Real max-stack-size, looked up from the generated item table.
+  ## Falls back to the vanilla default (64) for an unknown id (id 0/air,
+  ## or an id this port's table doesn't cover for some reason).
+  let (found, it) = findRealItem(s.item.id)
+  if found: uint8(it.maxStackSize) else: 64'u8
+
+proc getName*(s: ItemStack): string =
+  ## Real item name (e.g. "diamond_pickaxe"), looked up from the
+  ## generated item table. Empty string if the id isn't found.
+  let (found, it) = findRealItem(s.item.id)
+  if found: it.name else: ""
 
 proc areItemsAndComponentsEqual*(a, b: ItemStack): bool {.inline.} =
   ## TODO: real equality also compares item *components* (enchantments,
