@@ -263,13 +263,29 @@ Smallest/most self-contained crates first, since later crates depend on them:
     when a vtable-field call wasn't marked, so every closure assigned to
     an `Inventory` field is now explicit about it) rather than a trait;
     concrete inventories (simple/player/double) fill in the vtable.
-    10,287 of ~11k LOC in the crate remain: `slot.rs`, `screen_handler.rs`
+    **Since then, also ported** (re-checked each file's real deps rather
+    than trusting the blanket note below): `slot.rs`→`slot.nim` (the
+    `Slot` trait, same manual-vtable pattern as `Inventory`, plus
+    `NormalSlot`/`ArmorSlot`; armor-type restriction (`can_insert`) is
+    left accepting anything - needs `data`'s `Item`/`EquipmentSlot`
+    tables), `crafting/crafting_inventory.rs`→`crafting.nim` (fully
+    self-contained, ported clean), `entity_equipment.rs`→
+    `entity_equipment.nim` (keyed by a placeholder `EquipmentKind` enum
+    instead of the real `EquipmentSlot`). `itemstub.nim` grew
+    `split`/`decrement`/`increment`/`getMaxStackSize`/
+    `areItemsAndComponentsEqual` to support these. `crafting/recipes.rs`'s
+    `RecipeInputInventory` trait-extension became a plain
+    `CraftingInventory{inv, width, height}` wrapper rather than a trait
+    hierarchy (Nimony's vtable-`Inventory` has no room to extend); its
+    `recipe_provider.rs` sibling stays unported (needs
+    `pumpkin_protocol::codec::recipe`/`data::recipes`).
+    ~9.9k of ~11k LOC in the crate remain: `screen_handler.rs`
     (1.3k, the big one), all the per-container `*_screen_handler.rs`
-    files, `crafting/`, `player/`, `brewing/`, `furnace_like/`,
+    files, `player/`, `brewing/`, `furnace_like/`,
     `enchanting/`, `anvil/`, `merchant/`, `container_click.rs`,
-    `drag_handler.rs`, `sync_handler.rs`, `gui_builder.rs`,
-    `entity_equipment.rs` — all need either the real item/registry
-    types, `Player`/`World` types from the main server crate, or both.
+    `drag_handler.rs`, `sync_handler.rs`, `gui_builder.rs` — all need
+    either the real item/registry types, `Player`/`World` types from the
+    main server crate, or both.
 11. `world` (~78.6k LOC) — **Just started.** The crate is
     dominated by world generation (noise/structure/feature placement under
     `generation/`, ~65k of the 78.6k LOC) which needs util's

@@ -27,3 +27,26 @@ proc emptyStack*(): ItemStack {.inline.} =
 
 proc getItem*(s: ItemStack): Item {.inline.} =
   s.item
+
+proc getMaxStackSize*(s: ItemStack): uint8 {.inline.} =
+  ## TODO: real max-stack-size comes from the item's registry data
+  ## component; stubbed at the vanilla default (64) until `data` lands.
+  64'u8
+
+proc areItemsAndComponentsEqual*(a, b: ItemStack): bool {.inline.} =
+  ## TODO: real equality also compares item *components* (enchantments,
+  ## custom data, etc.), not ported yet - id-only for now.
+  a.item.id == b.item.id
+
+proc decrement*(s: var ItemStack, amount: uint8) {.inline.} =
+  s.itemCount = (if amount >= s.itemCount: 0'u8 else: s.itemCount - amount)
+
+proc increment*(s: var ItemStack, amount: uint8) {.inline.} =
+  s.itemCount += amount
+
+proc split*(s: var ItemStack, amount: uint8): ItemStack =
+  ## Splits `amount` items off `s` into a new stack, decrementing `s` in
+  ## place - port of `ItemStack::split`.
+  let taken = min(amount, s.itemCount)
+  result = ItemStack(item: s.item, itemCount: taken)
+  s.decrement(taken)
