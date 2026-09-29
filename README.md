@@ -55,6 +55,16 @@ Smallest/most self-contained crates first, since later crates depend on them:
    Needs a real design pass once `pumpkin` (the crate that drives the
    server tick loop) clarifies what should drive scheduler turns. See
    `src/scheduler/lib.nim`'s doc comment.
+4a. `pumpkin-api-macros` (~152 LOC) — **Not ported; by design, documented
+   instead.** This is a Rust proc-macro crate (`#[plugin_method]`,
+   `#[plugin_impl]`, `#[with_runtime]`) that runs as compiler codegen, not
+   runtime code, so there is no Nimony module for it to become. Its
+   semantics (async-plugin-method wrapping, `#[no_mangle]` plugin-ABI
+   statics, tokio `block_on` bridging) are written up in
+   `src/api_macros/README.md` for whoever builds the plugin host later -
+   the honest Nimony replacement is a plain template/generic wrapper called
+   by plugin authors plus a small codegen script, not a compiler plugin,
+   once `pumpkin`'s plugin-loading side gives it a concrete target.
 4. `pumpkin-config` (~2.2k LOC) — **Mostly done for plain-data configs.**
    Ported: `lighting.rs`, `fun.rs`, `recipe.rs`, `advancement.rs`,
    `player_data.rs`, `pvp.rs`, `logging.rs`, `whitelist.rs`, `chunk.rs`,
