@@ -9,7 +9,7 @@
 import std/[syncio, osproc, strutils, assertions]
 import codegenutil
 
-const testIds = @[3'u16, 5'u16, 64'u16, 130'u16, 9'u16]
+let testIds = @[3'u16, 5'u16, 64'u16, 130'u16, 9'u16]
 
 let src = genU16Bitset("testset", testIds)
 let genFile = "bitsetgentmp.nim"
