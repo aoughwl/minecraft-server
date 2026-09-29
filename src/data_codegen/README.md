@@ -323,6 +323,18 @@ since `gen_attributes.nim` landed) - revisit once `data_component_impl` lands.
   stack size of 1, air's id/translation key, a missing-name lookup
   correctly returning not-found) - all pass.
 
+- `bitsets.rs` → `codegenutil.nim`'s `genU16Bitset`. Not a standalone
+  JSON-driven generator (it has no assets of its own) - it's a shared
+  codegen *helper* other generators call to emit a compact `u64`-word
+  bitset membership test for a set of `u16` ids (upstream's `block.rs`/
+  `item.rs` use it for things like "is this block a valid slab base";
+  none of that structure is in the current scoped-down `blockdata.nim`/
+  `item.nim` yet, so there's no live caller here today, but the helper
+  itself is done and ready). **Verified**: `bitsettest.nim` generates real
+  Nimony source for a 5-id test set, compiles and runs it via a fresh
+  `nimony c -r` subprocess, checks every id 0..140 against expected
+  membership - all match.
+
 ## What's NOT done
 
 The remaining ~69 submodules, including `biome.rs`, `recipes.rs`,
