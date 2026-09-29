@@ -468,10 +468,25 @@ Smallest/most self-contained crates first, since later crates depend on them:
     (`nimony c -r`, all pass) using uncompressed payloads to exercise real
     framing without the missing compression bodies; `format/linear.rs`
     (the alternate Linear region format, ~778 lines) not attempted.
+    `poi/mod.rs`'s in-memory model and NBT (de)serialization are ported at
+    `src/world/poi.nim`: `PoiEntry`/`PoiRegion` (add/remove/getAll,
+    per-chunk grouping via `getChunkData`) and `buildChunkNbt`/
+    `parseChunkNbt` (the NBT-building/parsing halves of upstream's
+    `compress_chunk_data`/`decompress_chunk_data` - the zlib-wrapping half
+    is deferred, same gap as `anvilformat.nim`'s compression bodies; once
+    resolved it covers both). `save`/`load`'s on-disk MCA read/write
+    (~250 lines) not attempted, since it needs that same zlib plus real
+    file I/O. `poitest.nim` round-trips real entries through grouping and
+    NBT build/parse (`nimony c -r`, all pass).
+    `chunk_system/` (~5.4k lines: `dag.rs`, `chunk_holder.rs`,
+    `chunk_state.rs`, `schedule.rs`, etc.) is a generational-arena
+    (`slotmap`) task-scheduling system for chunk generation stages - same
+    shape as the already-deferred scheduler crate (no concurrency model
+    chosen, and it needs its own arena/slotmap equivalent besides).
+    Assessed and left blocked, not attempted.
     Not started: `block/`, the rest of `biome/` (registry-dependent parts),
     the rest of `chunk/` (`mod.rs`, `io/`),
-    `level.rs`, `world.rs`, the rest of `lighting/`, `poi/`, `world_info/`,
-    `chunk_system/`, all of `generation/`.
+    `level.rs`, `world.rs`, the rest of `lighting/`, `world_info/`.
 12. the main server crate (~269k LOC) — **Assessed; tiny slice
     ported, full map written.** Ported `error.rs`'s a shared error trait as
     overloaded procs → `src/server/errorclass.nim` (over `InventoryError`/
