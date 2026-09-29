@@ -521,6 +521,31 @@ Smallest/most self-contained crates first, since later crates depend on them:
     yet - tried the two smallest-looking candidates (`dye.rs`, `egg.rs`)
     and both hit this wall. See `src/server/item/README.md` for the exact
     unblock path.
+12c. `net/` (~19.5k LOC, part of the upstream main server crate) —
+    **Pure-data slice of `mod.rs` ported; everything else blocked on the
+    connection-state-machine design and `data`.** `GameProfile`/
+    `PropertyValue`/`ProfileAction`/`ChatMode`/`Hand`/`PlayerConfig` (+
+    `defaultPlayerConfig`), `PacketHandlerResult`, `EncryptionErrorKind`,
+    `MaxPendingBytes`/`decrementPendingBytes`, `isValidPlayerName`, and
+    `offlineUuid` (real SHA-256 math via the sibling `jwt` library, same
+    source as `hash_seed` in `src/world/biomeparam.nim`) ported to
+    `src/server/net/netbase.nim`. `isValidPlayerName` is verified against
+    every one of upstream's own `#[cfg(test)]` vectors in
+    `netbasetest.nim` (`nimony c -r`, all pass) - **caught a real bug this
+    way**: an off-by-one excluding the space byte itself from the
+    control-character range, only surfaced by the "name containing a
+    space" test vector. `PlayerUuid` is a `(hi, lo): (uint64, uint64)`
+    tuple, matching `src/protocol/uuid.nim`'s existing wire-shape
+    convention. NOT ported: `ClientPlatform`/`JavaClient`/`BedrockClient`/
+    `PendingConnection` (all `Arc<..>`-shared, tokio-task-driven - same
+    concurrency-model gap as `scheduler`/`plugin-runtime`), the hundreds of
+    individual `java/play/*.rs`/`bedrock/play/*.rs` packet handlers (need
+    `Player`/`World`/`Server`), and `handle_handshake`
+    (`java/handshake.rs`, 51 lines - close to portable, but reads
+    `CURRENT_MC_VERSION`/translation-key constants from the still-unported
+    `data` registry and calls `util::text`'s unported `TextComponent`).
+    See `src/server/net/README.md` for the full breakdown and suggested
+    next steps (`authentication.rs`, `chat/mod.rs`).
 13. `data` (~1.5M LOC — almost entirely generated block/item/registry
    tables) — **Generator path confirmed viable; proof-of-concept done.**
    The generator (the upstream data-codegen tool, ~36.8k lines across ~90 small
