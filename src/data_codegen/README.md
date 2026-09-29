@@ -90,11 +90,14 @@ the same way (`nimony c -r src/data_codegen/gen_<name>.nim`, output
 - `gen_decorated_pot_pattern.nim`, `gen_cat_variant.nim`, `gen_banner_pattern.nim` → same directory-of-JSON-files shape as `message_type`, but keyed by stem with per-entry string fields (`asset_id`, sometimes `translation_key`) rather than positional. This pattern (walk a directory, parse each file's small JSON object, sort by stem, emit an enum + accessor procs + an `all()`-equivalent array) recurs across several more submodules (frog_variant, wolf_variant, chat_type, trim_material, trim_pattern, painting_variant, and others) - `codegenutil.nim` now has `listJsonStems`/`jsonStringField`/`stemOf`/`lastIndexOf` factored out for it, so those should be quick following this template.
 - Skipped: `gen_spawn_egg.nim` - needs the still-unported `entity_type` generated enum (cross-references `EntityType` variants by name, which don't exist as Nimony code yet); revisit once entity_type.rs is ported.
 
-That's 17/90 submodules done.
+- `gen_chat_type.nim` → `ChatType` (7 variants, directory shape, with one nested field - `chat.translation_key` - handled by an inline pairs()-scan since it's one level deeper than `jsonStringField` reaches)
+- `gen_frog_variant.nim` → `FrogVariant` (3 variants) - notable upstream quirk preserved faithfully: the enum itself is hand-hardcoded to `Cold/Temperate(default)/Warm` rather than generated from the directory scan (which is only used for the name/texture accessor tables), and `from_id` falls back to `Temperate` for unrecognized ids rather than `None` like every other generator's `fromName` does
+
+That's 19/90 submodules done.
 
 ## What's NOT done
 
-The other ~73 submodules up through `block.rs`, `item.rs`, `biome.rs`, `recipes.rs`,
+The other ~71 submodules up through `block.rs`, `item.rs`, `biome.rs`, `recipes.rs`,
 `noise_router.rs`, `noise_settings.rs` (these last few are large and encode
 real structural complexity - nested data shapes, cross-references between
 registries, not just flat string arrays). Each needs the same treatment as
