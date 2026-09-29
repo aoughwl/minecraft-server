@@ -495,6 +495,17 @@ Smallest/most self-contained crates first, since later crates depend on them:
     `src/server/block/blockmisc.nim`; full writeup with the concrete
     unblock order in `src/server/block/README.md`. See both READMEs before
     starting more work here.
+12b. `item/` (~6.9k LOC, part of the upstream main server crate) —
+    **Core interface/registry ported; concrete items blocked.**
+    `ItemBehaviour`/`ItemMetadata`/`ItemRegistry`/`BlockActionResult`/`Hand`
+    ported to `src/server/item/itembehaviour.nim` (manual-vtable pattern,
+    same as `block/`/`entity/`). No `#[pumpkin_item]` macro exists here -
+    items self-register via plain `manager.register(...)` calls, unlike
+    `block/`. All ~53 concrete item files need `Player.inventory` and/or a
+    `World` type (pickup, sound, entity spawning), neither of which exist
+    yet - tried the two smallest-looking candidates (`dye.rs`, `egg.rs`)
+    and both hit this wall. See `src/server/item/README.md` for the exact
+    unblock path.
 13. `data` (~1.5M LOC — almost entirely generated block/item/registry
    tables) — **Generator path confirmed viable; proof-of-concept done.**
    The generator (the upstream data-codegen tool, ~36.8k lines across ~90 small
