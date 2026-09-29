@@ -213,3 +213,17 @@ not the whole module.
    needs `args.world.get_block_state_id` (a real neighbor-block query
    `worldstub.nim` doesn't expose yet), a step beyond what `chain.rs`/
    `logs.rs`/`glazed_terracotta.rs` needed.
+
+10. **Two more single-property proof cases**: `barrier.nim` and
+    `mangroveroots.nim` (`barrier.rs`/`mangrove_roots.rs`). Both blocks'
+    `on_place` only needs a `waterlogged` bool (`args.replacing.water_source()`,
+    no World query), so both fit `onPlaceImpl`'s existing `(direction,
+    waterlogged)` signature with `direction` simply ignored - the simplest
+    possible case on top of `blockstateid.nim`, one property instead of
+    chain's/logs'/glazed_terracotta's two-or-one-with-direction-mapping.
+    `get_state_for_neighbor_update`'s `schedule_fluid_tick` call needs a
+    real World and isn't ported. `waterloggedtest.nim` verifies both
+    blocks' dry/wet state ids differ and decode back correctly via
+    `statePropValues`, actually run via `nimony c -r` for the check pass
+    (same closures-through-vtables `nimony c -r` runtime caveat as every
+    other file here).

@@ -9,6 +9,10 @@
   themselves directly, so there was no "macro → explicit table" step needed. **Not ported**: the
   registry-population function itself, since every concrete item it references is unported (see
   below).
+- Also ported since: `ink_sac.rs`'s id set (empty `ItemBehaviour`, same shape as shield/arrow -
+  real logic is `apply_to_sign`, an inherent method needing a real `BlockEntity`, not ported) →
+  `inksac.nim`; `glowing_ink_sac.rs`, same shape → `glowinginksac.nim`. Both genuinely runtime-run
+  (`itemsbatch2test.nim`, `nimony c -r`), no `entity.nim` import needed, same bar as shield/arrow.
 - `potion.rs` (209 lines), `items/*.rs` (52 files, ~6.4k lines) — concrete `ItemBehaviour` impls.
   **Mostly not ported.** Ported so far, as free-standing functions rather than through
   `ItemBehaviour` (see below): `dye.rs`'s `can_mine` → `dye.nim`; `swords.rs`'s `can_mine` →
