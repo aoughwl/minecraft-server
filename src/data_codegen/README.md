@@ -323,6 +323,28 @@ since `gen_attributes.nim` landed) - revisit once `data_component_impl` lands.
   stack size of 1, air's id/translation key, a missing-name lookup
   correctly returning not-found) - all pass.
 
+- `entity_type.rs` → `gen_entity_type.nim` → `src/generated/entity_type.nim`,
+  161 entities from `assets/entities.json`. **Deliberately scoped down**:
+  skips upstream's `attributes: &'static [(Attributes, f64)]` field (needs
+  an extra layer of per-entry map decoding) and the `SpawnRestriction`/
+  `HeightMap`/`SpawnLocation` natural-spawn-placement fields (irrelevant to
+  the dimension/hitbox data this exists to unblock). `hurtSound`/
+  `deathSound` stay plain strings rather than linking `src/generated/
+  sound.nim`'s `Sound` enum, to avoid coupling to its exact naming scheme.
+  Hit and fixed a real borrow-checker error in the *generated output* (not
+  the generator itself): `for e in allEntityTypes(): ... return (true, e)`
+  fails to compile ("cannot borrow from 'x': path is not borrowable") since
+  `e` is borrowed from a temporary the `for` loop owns; fixed by binding
+  `let all = allEntityTypes()` first, then iterating that. **Verified**:
+  generator actually run (`nimony c -r`) against the real `entities.json`;
+  `entity_typetest.nim` checks the real count (161) plus real dimension/
+  eye-height values for `experience_orb`/`marker`/`snowball` and a
+  missing-name lookup - all pass. Checked against `src/server/entity/`'s
+  hand-authored `MarkerEntity`/`ExperienceOrbEntity`/`SnowballEntity`:
+  none of them currently set `EntityDimensions` from real data at all (no
+  conflict to resolve, just an opportunity for a future pass to wire real
+  dimensions in instead of defaults).
+
 - `bitsets.rs` → `codegenutil.nim`'s `genU16Bitset`. Not a standalone
   JSON-driven generator (it has no assets of its own) - it's a shared
   codegen *helper* other generators call to emit a compact `u64`-word
