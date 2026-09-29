@@ -376,10 +376,34 @@ since `gen_attributes.nim` landed) - revisit once `data_component_impl` lands.
   surface yet, only parameter math) - a future pass connecting the two
   is the natural next step for a real `BiomeSupplier`.
 
+- **`noise_settings.rs`** → `gen_noise_settings.nim` → `src/generated/noise_settings.nim`:
+  7 per-dimension noise-shape entries (sea level, default block/fluid name,
+  Y bounds, cell size, legacy-random flag), scoped to the tractable shape
+  fields - `aquifers`/`material_rule`/`surface_rule` (opaque noise-function
+  graphs even on the Rust side) and `spawn_target` (biome-placement
+  parameter points) are deferred, same call as `dimension.rs`'s cosmetic
+  `attributes`. `noise_settingstest.nim` actually runs the generator and
+  checks real values (overworld sea level 63/minY -64/height 384, nether
+  default block netherrack, end sea level 0) - all pass. Reuses
+  `src/world/biomeparam.nim`'s existing `Parameter`/`ParameterPoint` shape
+  (upstream's `ParameterStruct`/`ParameterPointStruct` use the identical
+  quantize-by-10000-as-i64 convention) for whenever `spawn_target` gets
+  picked up later.
+
+  This unblocked a first real end-to-end chunk-generation proof:
+  `src/world/flatgen.nim`'s flat/superflat-style section generator (not a
+  line-by-line port of any single upstream file - upstream's flat-world
+  support is config-driven layer stacking inside the generic pipeline, not
+  a standalone module) fills a real `PalettedContainer` using
+  `noise_settings.nim`'s per-dimension default block resolved against
+  `blockdata.nim`'s real 1286-block table. `flatgentest.nim` verifies real
+  block-state ids land at the right cells for both overworld (stone) and
+  nether (netherrack), actually run via `nimony c -r`, not just checked.
+
 ## What's NOT done
 
 The remaining ~68 submodules, including `recipes.rs`,
-`noise_router.rs`, `noise_settings.rs` (these last few are large and encode
+`noise_router.rs` (these last are large and encode
 real structural complexity - nested data shapes, cross-references between
 registries, not just flat string arrays). Each needs the same treatment as
 `sound_category.rs`: read its `.rs` source, understand its JSON input shape
