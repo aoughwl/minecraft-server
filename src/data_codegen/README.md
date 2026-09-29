@@ -400,9 +400,44 @@ since `gen_attributes.nim` landed) - revisit once `data_component_impl` lands.
   block-state ids land at the right cells for both overworld (stone) and
   nether (netherrack), actually run via `nimony c -r`, not just checked.
 
+## recipes.rs
+
+Ported to `gen_recipes.nim` → `src/generated/recipes.nim`, scoped to the
+common recipe types: `crafting_shaped`, `crafting_shapeless`, `smelting`,
+`blasting`, `smoking`, `campfire_cooking`, `stonecutting`. Run against all
+1763 real files under `upstream-ref/assets/datapack/data/minecraft/recipe/`:
+827 shaped + 375 shapeless + 116 cooking + 351 stonecutting = 1669 covered
+(94.7%). Recipe ids are the JSON filename stems (matching what upstream's
+codegen driver actually passes as the id - not the unused
+`generate_recipe_id` helper in the same upstream file, which nothing calls
+for real recipe emission). Verified via `recipestest.nim` (`nimony c -r`,
+actually run): `acacia_boat` (shaped, pattern/key/result), `acacia_button`
+(shapeless, category/group/ingredient), `baked_potato` (smelting,
+cookingtime/experience) all hand-checked against their real source JSON,
+plus `matches()`'s Simple/OneOf/Tagged resolution (Tagged honestly returns
+`false` - no tag-membership table is ported yet, documented in-file, not
+faked).
+
+Deliberately not ported this pass (documented in `gen_recipes.nim`'s doc
+comment, counted per-type in the generator's own stdout on each run):
+`crafting_transmute`, `crafting_decorated_pot`, `smithing_transform`,
+`smithing_trim`, and the `crafting_special_*`/`crafting_dye`/
+`crafting_imbue` family - each is a special-cased Java-side algorithm, not
+data-driven, so there's no JSON shape to generate from; they need
+hand-written logic once `src/inventory/crafting.nim` grows a real
+slot-matching engine to call them from.
+
+**Not yet wired into `src/inventory/crafting.nim`**: that module currently
+only has the crafting-grid `Inventory` wrapper, no recipe-matching logic at
+all. `recipes.nim`'s `matches()` proc and the four recipe-kind tables are
+the real ingredient data a matcher would need; building that matcher (grid
+pattern comparison for shaped recipes, multiset comparison for shapeless)
+is a genuine, separate piece of design/logic work, left for a follow-up
+pass rather than folded in here.
+
 ## What's NOT done
 
-The remaining ~68 submodules, including `recipes.rs`,
+The remaining ~67 submodules, including
 `noise_router.rs` (these last are large and encode
 real structural complexity - nested data shapes, cross-references between
 registries, not just flat string arrays). Each needs the same treatment as
