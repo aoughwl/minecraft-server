@@ -34,6 +34,22 @@ hundreds of individual packet handler files, mostly 8-100 lines each).
   `src/protocol/uuid.nim`'s existing wire-shape convention rather than
   inventing a second UUID representation.
 
+`chatmsg.nim` — the plain-data/pure-logic slice of `net/chat/mod.rs`
+(432 lines): `FilterMask` (pass-through/fully-filtered/partially-filtered,
+with the `#`-redaction `apply` logic), `SignedMessageLink`/
+`SignedMessageBody`, `PlayerChatMessage` (construction, filtering,
+signature removal, all the pure accessors), and `OutgoingChatMessage`'s
+`create`/`content` split (system messages become "disguised", player
+messages stay attributed). No `TextComponent` type exists in this port
+yet, so every `TextComponent` field is a plain `string`, matching
+`cmdsource.nim`'s/`eventdata.nim`'s convention. `send_to_player` (the
+packet-construction/player-mutation tail) is NOT ported - needs `Player`'s
+chat-session/signature-cache state and the `CPlayerChatMessage`/`SText`
+packet types, none of which exist yet; the call site is noted in-file for
+whoever wires that up. `chatmsgtest.nim` verifies all of the above for
+real (`nimony c -r`, no `entity.nim` dependency so unaffected by the
+closures-through-vtables crash) - genuine proof, not just a check pass.
+
 ## Why the rest isn't ported
 
 1. **Everything above `mod.rs`'s pure-data slice is `Arc<..>`-shared and
@@ -69,8 +85,8 @@ hundreds of individual packet handler files, mostly 8-100 lines each).
    `src/auth/jwt.nim`'s doc comment) exists, this is where it gets called
    from the actual login flow. Worth reading even before that lands, to
    understand the exact call shape needed.
-2. `chat/mod.rs` (432 lines) - chat-message signing/validation, likely has
-   a similarly-portable pure-data-and-crypto slice like this file did.
+2. ~~`chat/mod.rs` (432 lines)~~ - done, see `chatmsg.nim` above. The
+   remaining piece (`send_to_player`) needs `Player`'s chat-session state.
 3. Once `server/`'s `Server`/`World` design pass happens (see
    `src/server/README.md`'s suggested-next-steps), `java/handshake.rs` and
    the smallest `java/login/*.rs` files become tractable - they're mostly
