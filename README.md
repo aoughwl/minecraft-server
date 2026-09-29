@@ -145,7 +145,15 @@ Smallest/most self-contained crates first, since later crates depend on them:
    explanation and the three real options once the plugin ABI is actually
    being built (wasmtime C API FFI, a custom WIT→Nimony generator, or
    dropping the WASM sandbox model for native-loaded plugins).
-10. `pumpkin-world`, `pumpkin-inventory`, `pumpkin-command`
+10. `pumpkin-world`, `pumpkin-inventory`, `pumpkin-command` (~14.1k LOC) —
+    **command: tokenizer layer done.** `errors/command_syntax_error.rs`
+    (simplified), `context/string_range.rs`, `string_reader.rs`, and its
+    numeric parsing all ported to `src/command/*.nim`, type-checked clean.
+    NOT started: the `ArgumentType<S>`/`CommandSource` trait pair
+    everything else in the crate is built on (individual argument types,
+    the brigadier-style command tree/dispatcher, SNBT parsing) — see
+    `src/command/lib.nim`'s doc comment for why that's a design decision
+    to make once, not a mechanical per-file port.
 11. `pumpkin` (main server crate, ~269k LOC)
 12. `pumpkin-data` (~1.5M LOC — almost entirely generated block/item/registry
    tables; port the generator, not the generated output, once the shape of
