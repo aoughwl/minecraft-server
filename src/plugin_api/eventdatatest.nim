@@ -255,4 +255,63 @@ assert tntData.primeReason == "fire"
 let notePlayData = NotePlayEventData(blockPos: blockPos(1, 64, 1), instrument: "harp", note: 12'u8, cancelled: false)
 assert notePlayData.note == 12'u8
 
+let explodeData = EntityExplodeEventData(
+  entityId: 10'i32,
+  position: Vector3[float64](x: 0.0, y: 64.0, z: 0.0),
+  yieldRate: 0.5'f32,
+  cancelled: false,
+)
+assert explodeData.yieldRate == 0.5'f32
+
+let bedEnterData = PlayerBedEnterEventData(player: p1, bedPos: blockPos(1, 64, 1), cancelled: false)
+assert bedEnterData.bedPos.x == 1
+
+let bedLeaveData = PlayerBedLeaveEventData(player: p1, bedPos: blockPos(1, 64, 1))
+assert bedLeaveData.bedPos.y == 64
+
+let bucketEmptyData = PlayerBucketEmptyEventData(player: p1, blockPos: blockPos(1, 64, 1), bucket: "water_bucket", cancelled: false)
+assert bucketEmptyData.bucket == "water_bucket"
+
+let bucketFillData = PlayerBucketFillEventData(player: p1, blockPos: blockPos(1, 64, 1), bucket: "empty_bucket", cancelled: false)
+assert bucketFillData.bucket == "empty_bucket"
+
+let kickData = PlayerKickEventData(player: p1, reason: "AFK", cancelled: false)
+assert kickData.reason == "AFK"
+
+let pistonExtendData = BlockPistonExtendEventData(blockPos: blockPos(1, 64, 1), direction: "up", cancelled: false)
+assert pistonExtendData.direction == "up"
+
+let pistonRetractData = BlockPistonRetractEventData(blockPos: blockPos(1, 64, 1), direction: "down", cancelled: false)
+assert pistonRetractData.direction == "down"
+
+let signData = SignChangeEventData(player: p1, blockPos: blockPos(1, 64, 1), lines: @["hello", "world", "", ""], cancelled: false)
+assert signData.lines.len == 4
+assert signData.lines[0] == "hello"
+
+let bellData = BellRingEventData(
+  blockPos: blockPos(1, 64, 1),
+  hasEntityId: true,
+  entityId: 10'i32,
+  hasDirection: false,
+  direction: "",
+  cancelled: false,
+)
+assert bellData.hasEntityId
+assert not bellData.hasDirection
+
+let weatherData = WeatherChangeEventData(toWeatherState: true, cancelled: false)
+assert weatherData.toWeatherState
+
+let thunderData = ThunderChangeEventData(toThunderState: false, cancelled: false)
+assert not thunderData.toThunderState
+
+let invOpenData = InventoryOpenEventData(player: p1, cancelled: false)
+assert invOpenData.player == p1
+
+let invDragData = InventoryDragEventData(player: p1, cancelled: false)
+assert invDragData.player == p1
+
+let craftData = CraftItemEventData(player: p1, recipeId: "minecraft:stick", cancelled: false)
+assert craftData.recipeId == "minecraft:stick"
+
 echo "all eventdata checks passed"

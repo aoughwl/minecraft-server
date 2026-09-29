@@ -37,7 +37,7 @@ is settled, not the generated output by hand.
 - `permissions.nim` - the plugin sandbox capability-string constants
   (`network.*`, `fs.*`, `sys.*`, `http.outbound`). Pure data, no `wit`
   dependency. `nimony check` clean.
-- `eventdata.nim` - a real server-side `EventData` model, now for 41 events
+- `eventdata.nim` - a real server-side `EventData` model, now for 56 events
   (`PlayerJoin`/`PlayerLeave`/`PlayerTeleport`/`PlayerGamemodeChange`/
   `PlayerToggleSneak`/`PlayerMove`/`PlayerChat`/`BlockPlace`/`BlockBreak`/
   `EntityDamage`/`EntityDeath`/`PlayerDeath`/`EntitySpawn`/`ItemSpawn`/
@@ -46,7 +46,11 @@ is settled, not the generated output by hand.
   `ServerTickEnd`/`ChunkLoad`/`ChunkSave`/`PlayerLogin`/`PlayerExpChange`/
   `PlayerToggleSprint`/`InventoryClose`/`EntityDismount`/`EntityPickupItem`/
   `EntityResurrect`/`EntityTeleport`/`EntityToggleSwim`/`FoodLevelChange`/
-  `ItemMerge`/`BlockIgnite`/`BlockForm`/`TntPrime`/`NotePlay`), built from
+  `ItemMerge`/`BlockIgnite`/`BlockForm`/`TntPrime`/`NotePlay`/`EntityExplode`/
+  `PlayerBedEnter`/`PlayerBedLeave`/`PlayerBucketEmpty`/`PlayerBucketFill`/
+  `PlayerKick`/`BlockPistonExtend`/`BlockPistonRetract`/`SignChange`/
+  `BellRing`/`WeatherChange`/`ThunderChange`/`InventoryOpen`/`InventoryDrag`/
+  `CraftItem`), built from
   the actual field shapes in
   `upstream-ref/crates/pumpkin-plugin-wit/v0.1/event.wit` (the `.rs`
   wrapper files carry no fields of their own - see the file's doc comment
@@ -64,7 +68,7 @@ is settled, not the generated output by hand.
   closure-through-vtable runtime crash documented in
   `src/server/entity/README.md`).
 
-The remaining ~189 `events/*.rs` files are mechanical follow-ups once
+The remaining ~174 `events/*.rs` files are mechanical follow-ups once
 someone wants them: same WIT-record-to-Nimony-object translation
 `eventdata.nim` already demonstrates, just more of them.
 

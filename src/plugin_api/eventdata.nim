@@ -319,3 +319,88 @@ type
     instrument*: string
     note*: uint8
     cancelled*: bool
+
+  EntityExplodeEventData* = object
+    entityId*: int32
+    position*: Vector3[float64]
+    yieldRate*: float32
+    cancelled*: bool
+
+  PlayerBedEnterEventData* = object
+    player*: PlayerUuid
+    bedPos*: BlockPos
+    cancelled*: bool
+
+  PlayerBedLeaveEventData* = object
+    ## No `cancelled` field in the WIT record.
+    player*: PlayerUuid
+    bedPos*: BlockPos
+
+  PlayerBucketEmptyEventData* = object
+    player*: PlayerUuid
+    blockPos*: BlockPos
+    bucket*: string
+    cancelled*: bool
+
+  PlayerBucketFillEventData* = object
+    player*: PlayerUuid
+    blockPos*: BlockPos
+    bucket*: string
+    cancelled*: bool
+
+  PlayerKickEventData* = object
+    player*: PlayerUuid
+    reason*: string
+    cancelled*: bool
+
+  BlockPistonExtendEventData* = object
+    ## `direction` is a plain string in the WIT record (not a resolved
+    ## enum), kept as-is.
+    blockPos*: BlockPos
+    direction*: string
+    cancelled*: bool
+
+  BlockPistonRetractEventData* = object
+    blockPos*: BlockPos
+    direction*: string
+    cancelled*: bool
+
+  SignChangeEventData* = object
+    player*: PlayerUuid
+    blockPos*: BlockPos
+    lines*: seq[string]
+    cancelled*: bool
+
+  BellRingEventData* = object
+    ## `target-world: %world` dropped, same reasoning as EntitySpawn above.
+    ## `entity-id`/`direction` are both `option<T>`, becoming (hasX, x)
+    ## pairs per this file's established convention.
+    blockPos*: BlockPos
+    hasEntityId*: bool
+    entityId*: int32
+    hasDirection*: bool
+    direction*: string
+    cancelled*: bool
+
+  WeatherChangeEventData* = object
+    ## `target-world: %world` dropped, same reasoning as EntitySpawn above.
+    toWeatherState*: bool
+    cancelled*: bool
+
+  ThunderChangeEventData* = object
+    ## `target-world: %world` dropped, same reasoning as EntitySpawn above.
+    toThunderState*: bool
+    cancelled*: bool
+
+  InventoryOpenEventData* = object
+    player*: PlayerUuid
+    cancelled*: bool
+
+  InventoryDragEventData* = object
+    player*: PlayerUuid
+    cancelled*: bool
+
+  CraftItemEventData* = object
+    player*: PlayerUuid
+    recipeId*: string
+    cancelled*: bool
