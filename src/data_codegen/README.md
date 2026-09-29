@@ -296,9 +296,36 @@ since `gen_attributes.nim` landed) - revisit once `data_component_impl` lands.
   exact match), `temperature`'s `amplitude_modifiers` fallback path, and
   a missing-key lookup correctly returning not-found.
 
+- `block.rs`/`item.rs` → `gen_block.nim`/`gen_item.nim` →
+  `src/generated/blockdata.nim`/`src/generated/item.nim`. **Deliberately
+  scoped down**, not a full port: each generator emits only the flat
+  per-entry scalar fields (block: id/name/translationKey/hardness/
+  blastResistance/mapColor/itemId/defaultStateId; item: id/name/
+  maxStackSize), not block.rs's per-block `states[]` property-permutation
+  array (facing×half×shape-style state ids, needing the separate
+  `collision_shapes`/`outline_shapes` index tables too) or item.rs's full
+  per-item `components` map (needs the unported ~2887-line
+  `data_component.rs` registry, already flagged as a blocker in
+  src/protocol/README.md's `item_stack_seralizer.rs` note). That's real,
+  separate structural work for a dedicated pass. What's here is still
+  immediately useful: `src/world/palette.nim`'s block-state ids and
+  `src/inventory/itemstub.nim`'s placeholder Item can resolve against a
+  real name/id table instead of nothing. Module named `blockdata.nim`, not
+  `block.nim` - `block` is a reserved keyword in Nimony, a module literally
+  named that can't be imported (`import ../generated/block` fails to
+  parse: "expression expected, but found 'keyword block'"). Also hit and
+  worked around the already-known `const seq[T]` compile-time-fold
+  limitation (1658/1286-entry literal seqs) by emitting `let` instead of
+  `const` for `AllItems`/`AllBlocks`. **Verified**: both generators
+  actually run (`nimony c -r`) against the real 1658-entry `items.json`/
+  1286-entry `blocks.json`, and `itemblocktest.nim` (`nimony c -r`) checks
+  real counts plus specific known values (stone item/block, diamond_pickaxe's
+  stack size of 1, air's id/translation key, a missing-name lookup
+  correctly returning not-found) - all pass.
+
 ## What's NOT done
 
-The other ~71 submodules up through `block.rs`, `item.rs`, `biome.rs`, `recipes.rs`,
+The remaining ~69 submodules, including `biome.rs`, `recipes.rs`,
 `noise_router.rs`, `noise_settings.rs` (these last few are large and encode
 real structural complexity - nested data shapes, cross-references between
 registries, not just flat string arrays). Each needs the same treatment as
