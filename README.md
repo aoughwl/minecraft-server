@@ -614,6 +614,22 @@ Smallest/most self-contained crates first, since later crates depend on them:
    duties are in scope), and a note that these submodules are independent
    of each other and would parallelize well across multiple forks.
 
+14. `pumpkin` main crate's `plugin/` module (~38.9k LOC) - **Small tractable
+    slice ported, bulk confirmed WASM-bridge-specific.** `plugin/loader/wasm/
+    wasm_host/wit/v0_1/**` (~35k+ of the total) is `wasmtime::component::
+    bindgen!`-generated WIT host bindings, the same unportable category as
+    `src/host_bindings/README.md`. Ported: `permissions.nim` (permission
+    string constants + descriptions) and `native.nim` (`LoaderError`,
+    `PLUGIN_API_VERSION`, `canLoad`/`canUnload`'s platform-extension logic -
+    NOT the actual dylib load, which needs Nimony's dynlib FFI investigated
+    and a chosen async model). `plugintest.nim` has no `entity.nim`
+    dependency and **actually runs** (`nimony c -r`), proving the ported
+    logic for real. `plugin/mod.rs` (1336 lines, the real plugin
+    manager/event-dispatch core) and the ~230 `plugin/api/events/*` files
+    (native counterpart to `src/plugin_api/eventdata.nim`'s already-ported 8
+    event types) are documented but not ported this pass - see
+    `src/server/plugin/README.md` for the full module map and next steps.
+
 ## Layout
 
 ```
