@@ -73,18 +73,36 @@ directory uses that library.
   Not ported: permission-registry registration (same simplification as
   every other command file here).
 
+- **`saveoff.nim`** / **`saveon.nim`** - `/save-off` / `/save-on`.
+  Upstream iterates `context.server().worlds`, toggling each
+  `Level.save_enabled` and reporting whether any world's state actually
+  changed (the already-off/already-on error case). No world registry
+  exists in this port, so `CommandSource` gained
+  `setSaveEnabledProc*: proc(enabled: bool): bool {.closure.}` - `nil`
+  falls back to reporting "changed" unconditionally. Verified via
+  `saveseedtest.nim`, including the already-off repeat-call case.
+
+- **`seed.nim`** - `/seed`. Reports the world seed. `CommandSource`
+  gained `getSeedProc*: proc(): int64 {.closure.}` (`nil` = `0`) since
+  no `World`/`Level.seed` field is wired through a command source yet.
+  The click-to-copy/hover-tooltip feedback (`ClickEvent`/`HoverEvent`,
+  needs the unported `text` module) is dropped for a plain string.
+  Verified via `saveseedtest.nim`.
+
 ## Not started
 
-The other ~23 command files under `upstream-ref/crates/pumpkin/src/command/commands/`,
-ranging from small (`tellraw.rs` ~42 lines - a reasonable next target,
-needs a `TextComponent`-ish argument the way `say.nim`'s plain-string
-scope doesn't quite cover) to substantial (`execute.rs` at 1660 lines -
-the `/execute` conditional/redirect command, which needs the
-`RedirectModifier`/forking support `cmdtree.nim` explicitly deferred).
-Most need a real player/world registry (a server-wide list of connected
-players, which `src/server/world/worldstub.nim` doesn't model) beyond
-what `gamemode.nim`/`say.nim`/`me.nim`/`stop.nim`/`tps.nim`/`reload.nim`/
-`returncmd.nim` needed.
+The other ~20 command files under `upstream-ref/crates/pumpkin/src/command/commands/`,
+ranging from small (`tellraw.rs` ~42 lines - needs `EntityArgumentType::Players`,
+an entity-selector argument type not in `src/command/argtype.nim`'s
+`ArgValue` union yet, plus `ComponentArgumentType` for the unported
+`text` module; `defaultgamemode.rs` ~69 lines - needs
+`Server.get_all_players()`/a player registry) to substantial
+(`execute.rs` at 1660 lines - the `/execute` conditional/redirect
+command, which needs the `RedirectModifier`/forking support
+`cmdtree.nim` explicitly deferred). Most need a real player/world
+registry (a server-wide list of connected players, which
+`src/server/world/worldstub.nim` doesn't model) beyond what's already
+ported here.
 
 ## Runtime-verification status
 

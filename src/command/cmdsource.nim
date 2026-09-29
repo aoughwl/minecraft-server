@@ -85,6 +85,18 @@ type
       ## stands in for `server.reload_datapacks(&server)`
       ## (src/server/command/reload.nim) - same no-`Server`-type gap as
       ## `stopProc`. `nil` is a safe no-op.
+    setSaveEnabledProc*: proc(enabled: bool): bool {.closure.}
+      ## stands in for iterating `server.worlds` and toggling each
+      ## `Level.save_enabled` (src/server/command/saveoff.nim/saveon.nim)
+      ## - no world registry exists in this port yet. Returns whether the
+      ## call actually changed anything (upstream's `any_disabled`/
+      ## `any_enabled`), so `/save-off`/`/save-on` can still report the
+      ## already-off/already-on error case correctly. `nil` falls back to
+      ## reporting "changed" unconditionally (a single-world assumption,
+      ## since there's no registry to say otherwise).
+    getSeedProc*: proc(): int64 {.closure.}
+      ## stands in for `context.world().level.seed.0`
+      ## (src/server/command/seed.nim) - `nil` falls back to `0`.
 
 proc sendMessage*(s: CommandSource, message: string) =
   if s.sendMessageProc != nil:
@@ -117,6 +129,18 @@ proc broadcastMessage*(s: CommandSource, message: string) =
 proc stopServer*(s: CommandSource) =
   if s.stopProc != nil:
     s.stopProc()
+
+proc setSaveEnabled*(s: CommandSource, enabled: bool): bool =
+  if s.setSaveEnabledProc != nil:
+    s.setSaveEnabledProc(enabled)
+  else:
+    true
+
+proc getSeed*(s: CommandSource): int64 =
+  if s.getSeedProc != nil:
+    s.getSeedProc()
+  else:
+    0'i64
 
 proc anchorPosition*(s: CommandSource): Vector3[float64] {.inline.} =
   s.position
