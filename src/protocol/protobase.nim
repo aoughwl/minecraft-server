@@ -44,6 +44,14 @@ type
     isOk*: bool
     error*: WritingError
 
+  ProtoReadVoidResult* = object
+    ## `ProtoReadResult[void]` isn't legal (a void-typed object field
+    ## doesn't compile - same issue documented in src/nbt/nbtbase.nim's
+    ## `NbtVoidResult`), so a fallible read with no payload returns this
+    ## instead.
+    isOk*: bool
+    error*: ReadingError
+
 proc readOk*[T](value: sink T): ProtoReadResult[T] =
   ProtoReadResult[T](isOk: true, value: value)
 
@@ -55,6 +63,12 @@ proc writeOkVoid*(): ProtoWriteVoidResult =
 
 proc writeErrVoid*(e: WritingError): ProtoWriteVoidResult =
   ProtoWriteVoidResult(isOk: false, error: e)
+
+proc readOkVoid*(): ProtoReadVoidResult =
+  ProtoReadVoidResult(isOk: true)
+
+proc readErrVoid*(e: ReadingError): ProtoReadVoidResult =
+  ProtoReadVoidResult(isOk: false, error: e)
 
 proc cleanEof*(what: string): ReadingError =
   ReadingError(kind: reCleanEof, msg: "EOF, Tried to read " & what & " but No bytes left to consume")

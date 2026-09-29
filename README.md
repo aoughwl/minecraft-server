@@ -161,17 +161,36 @@ Smallest/most self-contained crates first, since later crates depend on them:
    `src/protocol/varinttest.nim` (round-trip across `i32::MIN/-2/-1/0/1/2/
    i32::MAX` for both shapes, boundary values, and both overflow-rejection
    tests). Async `decode_async`/`encode_async` variants (tokio-specific)
-   are not ported. Everything else in the crate (~37k LOC: `codec/
-   bit_set.rs`/`bitset.rs`/`data_component.rs`/`item_stack_seralizer.rs`/
-   `uuid.rs`/etc., `ser/mod.rs`'s serializer/deserializer, `java/`'s and
-   `bedrock/`'s several hundred individual packet types, `packet_encoder.rs`/
-   `packet_decoder.rs`, `query.rs`) is not yet started - this pass
-   prioritized the varint/varlong wire primitives (used by every packet's
-   framing) over any specific packet. Did not end up drawing on Jester's
-   client-side `aoughwl.mcnet/netwire.nim` etc. beyond confirming the same
-   varint shape is the right one to match; worth a closer look by whoever
-   ports `packet_encoder.rs`/`packet_decoder.rs` next, since that's where
-   Jester's client-side framing code is the more directly relevant
+   are not ported.
+   Follow-up pass added the shared codec/framing layer: `ser/mod.rs`'s
+   `NetworkReadExt`/`NetworkWriteExt` traits → `src/protocol/netcodec.nim`
+   (`NetReader`/`NetWriter`, one concrete pair over an owned `seq[byte]`
+   instead of Rust's generic-over-`Read`/`Write` trait, matching
+   `src/nbt/`'s reader/writer shape) — numeric BE reads/writes, bool,
+   var_int/uint/long via `varint.nim`, bounded strings (with a from-scratch
+   UTF-16-length bound check decoding UTF-8 by hand, including surrogate
+   pairs), `getOption`/`getList` generics, UUID as a raw (hi, lo) `u64`
+   pair (no `Uuid` type ported anywhere yet). `codec/bit_set.rs` →
+   `src/protocol/bitset.nim`, verified byte-for-byte against its own
+   `#[cfg(test)]` vectors in `src/protocol/bitsettest.nim` (all 4 tests,
+   including the exact encoded-byte assertion and the negative-length
+   rejection). `codec/uuid.rs` → `src/protocol/uuid.nim` (thin re-export,
+   see above). `lib.rs`'s `ConnectionState`, `IdOr<T>`, `RawPacket` →
+   `src/protocol/proto.nim`. Skipped: `StreamDecryptor`/`StreamEncryptor`
+   (AES-128-CFB8 login encryption over async I/O - tokio-specific, no
+   Nimony equivalent yet) and the `ClientPacket`/`ServerPacket` traits
+   (Nimony has no traits; concrete packet types will expose their own
+   read/write procs directly). `netcodectest.nim` round-trips every numeric
+   type, bools, a var_int, and a UTF-8 string with multi-byte/surrogate-pair
+   characters through the new writer/reader - passing.
+   Still not started (~36k LOC): `codec/data_component.rs` (2.9k),
+   `codec/item_stack_seralizer.rs`, `serial/*`, `query.rs`, `rcon.rs`, the
+   `java/`'s and `bedrock/`'s several hundred individual packet types,
+   `packet_encoder.rs`/`packet_decoder.rs`. Did not end up drawing on
+   Jester's client-side `aoughwl.mcnet/netwire.nim` etc. beyond confirming
+   the same varint shape is the right one to match; worth a closer look by
+   whoever ports `packet_encoder.rs`/`packet_decoder.rs` next, since that's
+   where Jester's client-side framing code is the more directly relevant
    reference.
 8. `plugin-utils` (~710 LOC) — **Done except HTTP.** `models.rs`,
    `updater.rs`, `license.rs` (lease read/write via `std/json`, grace-period
