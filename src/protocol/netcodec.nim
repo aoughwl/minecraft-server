@@ -293,6 +293,20 @@ proc writeStringBounded*(w: var NetWriter, s: string, bound: int): ProtoWriteVoi
 proc writeString*(w: var NetWriter, s: string): ProtoWriteVoidResult =
   writeStringBounded(w, s, 32767)
 
+proc writeList*[G](w: var NetWriter, items: openArray[G], put: proc(w: var NetWriter, item: G) {.closure.}) =
+  writeVarInt(w, newVarInt(int32(items.len)))
+  for i in 0 ..< items.len:
+    put(w, items[i])
+
+proc writeListRes*[G](w: var NetWriter, items: openArray[G],
+    put: proc(w: var NetWriter, item: G): ProtoWriteVoidResult {.closure.}): ProtoWriteVoidResult =
+  writeVarInt(w, newVarInt(int32(items.len)))
+  for i in 0 ..< items.len:
+    let r = put(w, items[i])
+    if not r.isOk:
+      return r
+  writeOkVoid()
+
 proc writeUuidPair*(w: var NetWriter, hi, lo: uint64) =
   writeU64Be(w, hi)
   writeU64Be(w, lo)

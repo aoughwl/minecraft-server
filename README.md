@@ -201,15 +201,37 @@ Smallest/most self-contained crates first, since later crates depend on them:
    `item_stack_seralizer.rs`, and the much larger remaining packet surface
    (most play-state packets, `java/client/config/registry_data.rs` and
    other NBT/registry-heavy ones, all of `bedrock/`).
-   Still not started (~36k LOC): `codec/data_component.rs` (2.9k),
-   `codec/item_stack_seralizer.rs`, `serial/*`, `query.rs`, `rcon.rs`, the
-   `java/`'s and `bedrock/`'s several hundred individual packet types,
-   `packet_encoder.rs`/`packet_decoder.rs`. Did not end up drawing on
-   Jester's client-side `aoughwl.mcnet/netwire.nim` etc. beyond confirming
-   the same varint shape is the right one to match; worth a closer look by
-   whoever ports `packet_encoder.rs`/`packet_decoder.rs` next, since that's
-   where Jester's client-side framing code is the more directly relevant
-   reference.
+   Follow-up pass added a `writeList`/`writeListRes` generic to
+   `netcodec.nim` (the write-side counterpart to the existing `getList`)
+   and 4 more config-state packet types: `registry_data.rs` →
+   `src/protocol/configpackets.nim` (`CRegistryData` - `RegistryEntryData`
+   modeled as `{entryId, hasData, data: seq[byte]}`, the raw NBT blob
+   written/read verbatim as upstream does; the reader's "has data" branch
+   reads to end-of-frame since there's no length prefix on the blob
+   itself, matching upstream's real one-entry-per-packet usage - documented
+   in-file as not safe for a hypothetical multi-entry-with-data packet),
+   and `reset_chat.rs`/`feature_flags.rs`/`ping.rs` →
+   `src/protocol/configpackets2.nim` (`CConfigResetChat`, `CFeatureFlags`,
+   `CConfigPing`). All with real round-trip tests
+   (`configpackets{,2}test.nim`, `nimony c -r` passing).
+   Explicitly assessed and deferred: `codec/item_stack_seralizer.rs` (856
+   lines) - genuinely blocked, not just unstarted: it's built directly on
+   `codec/data_component.rs`'s full ~2887-line `DataComponent`
+   registry/codec (itself needs `pumpkin-data`'s generated component
+   tables), `JavaMinecraftVersion` multi-version branching (not ported),
+   and a real `ItemStack.patch: Map<DataComponent, Option<Data>>` model -
+   `src/inventory/itemstub.nim`'s placeholder `ItemStack` (id+count only)
+   isn't shaped for it. Revisit once `data_component.rs` has its own
+   design pass.
+   Still not started (~34k LOC): `codec/data_component.rs` (2.9k),
+   `codec/item_stack_seralizer.rs`, `serial/*`, `query.rs`, `rcon.rs`, most
+   of the `java/`'s and all of `bedrock/`'s several hundred individual
+   packet types, `packet_encoder.rs`/`packet_decoder.rs`. Did not end up
+   drawing on Jester's client-side `aoughwl.mcnet/netwire.nim` etc. beyond
+   confirming the same varint shape is the right one to match; worth a
+   closer look by whoever ports `packet_encoder.rs`/`packet_decoder.rs`
+   next, since that's where Jester's client-side framing code is the more
+   directly relevant reference.
 8. `plugin-utils` (~710 LOC) — **Done except HTTP.** `models.rs`,
    `updater.rs`, `license.rs` (lease read/write via `std/json`, grace-period
    evaluation), and `lib.rs`'s global-state glue → `src/plugin_utils/*.nim`.
