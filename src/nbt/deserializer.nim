@@ -209,15 +209,12 @@ proc getString*(r: var NbtReader): NbtResult[string] =
       return errRes[string](s.error)
     ok[string](bytesToStringLossy(s.value))
 
-proc getByteArray*(r: var NbtReader): NbtResult[seq[int8]] =
-  let lenRes = getI32(r)
-  if not lenRes.isOk:
-    return errRes[seq[int8]](lenRes.error)
-  if lenRes.value < 0:
-    return errRes[seq[int8]](negativeLength(lenRes.value))
-  if int(lenRes.value) > MaxArrayLength:
-    return errRes[seq[int8]](largeLength(int(lenRes.value)))
-  let s = getSlice(r, int(lenRes.value))
+proc getByteArray*(r: var NbtReader, len: int): NbtResult[seq[int8]] =
+  ## Takes an already-read, already-validated element count, matching
+  ## upstream `NbtReadHelper::get_byte_array(len)` - the length prefix is
+  ## read and range-checked by the caller (`NbtTag`'s (de)serialize_data),
+  ## not here.
+  let s = getSlice(r, len)
   if not s.isOk:
     return errRes[seq[int8]](s.error)
   var out8 = newSeq[int8](s.value.len)
@@ -225,32 +222,18 @@ proc getByteArray*(r: var NbtReader): NbtResult[seq[int8]] =
     out8[i] = cast[int8](b)
   ok[seq[int8]](out8)
 
-proc getI32Array*(r: var NbtReader): NbtResult[seq[int32]] =
-  let lenRes = getI32(r)
-  if not lenRes.isOk:
-    return errRes[seq[int32]](lenRes.error)
-  if lenRes.value < 0:
-    return errRes[seq[int32]](negativeLength(lenRes.value))
-  if int(lenRes.value) > MaxArrayLength:
-    return errRes[seq[int32]](largeLength(int(lenRes.value)))
-  var out32 = newSeq[int32](int(lenRes.value))
-  for i in 0 ..< out32.len:
+proc getI32Array*(r: var NbtReader, len: int): NbtResult[seq[int32]] =
+  var out32 = newSeq[int32](len)
+  for i in 0 ..< len:
     let v = getI32(r)
     if not v.isOk:
       return errRes[seq[int32]](v.error)
     out32[i] = v.value
   ok[seq[int32]](out32)
 
-proc getI64Array*(r: var NbtReader): NbtResult[seq[int64]] =
-  let lenRes = getI32(r)
-  if not lenRes.isOk:
-    return errRes[seq[int64]](lenRes.error)
-  if lenRes.value < 0:
-    return errRes[seq[int64]](negativeLength(lenRes.value))
-  if int(lenRes.value) > MaxArrayLength:
-    return errRes[seq[int64]](largeLength(int(lenRes.value)))
-  var out64 = newSeq[int64](int(lenRes.value))
-  for i in 0 ..< out64.len:
+proc getI64Array*(r: var NbtReader, len: int): NbtResult[seq[int64]] =
+  var out64 = newSeq[int64](len)
+  for i in 0 ..< len:
     let v = getI64(r)
     if not v.isOk:
       return errRes[seq[int64]](v.error)
