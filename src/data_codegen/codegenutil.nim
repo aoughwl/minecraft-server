@@ -221,3 +221,46 @@ proc readStringIntMapSorted*(path: string): seq[(string, int)] =
   pairs.sort(proc(a, b: (string, int)): int =
     cmp(a[0], b[0]))
   pairs
+
+proc genU16Bitset*(name: string, ids: seq[uint16]): string =
+  ## Port of upstream's `bitsets.rs` `gen_u16_bitset` codegen helper - not a
+  ## standalone JSON-driven generator itself, but a shared building block
+  ## other generators (e.g. a future `block.rs`/`item.rs` pass covering
+  ## per-block/per-item membership flags) call to emit a compact
+  ## `u64`-word bitset for a set of ids. Rust builds this as a
+  ## `proc_macro2::TokenStream`; here it's just string-building, emitting
+  ## Nimony source directly (the whole reason this codegen suite doesn't
+  ## need a token-stream API - see src/data_codegen/README.md).
+  ##
+  ## Returns Nimony source text defining:
+  ##   const <NAME>MaxId: uint16 = ...
+  ##   const <NAME>Bitset: array[<N>, uint64] = [...]
+  ##   proc <name>Contains*(id: uint16): bool
+  var maxId: uint16 = 0
+  for id in ids:
+    if id > maxId:
+      maxId = id
+  let words = (int(maxId) + 64) div 64
+  var bitset = newSeq[uint64](words)
+  for id in ids:
+    let index = int(id) shr 6
+    let bit = uint32(id) and 63'u32
+    bitset[index] = bitset[index] or (1'u64 shl bit)
+
+  let upper = name.toShoutySnakeCase()
+  let lower = name.toLowerAscii()
+  var bitsetLits = ""
+  for i, w in bitset:
+    if i > 0:
+      bitsetLits.add(", ")
+    bitsetLits.add($w & "'u64")
+
+  result = "const " & upper & "_MAX_ID*: uint16 = " & $maxId & "\n"
+  result.add("const " & upper & "_WORDS = " & $words & "\n")
+  result.add("const " & upper & "_BITSET: array[" & $words & ", uint64] = [" & bitsetLits & "]\n")
+  result.add("proc " & lower & "Contains*(id: uint16): bool {.inline.} =\n")
+  result.add("  if id > " & upper & "_MAX_ID:\n")
+  result.add("    return false\n")
+  result.add("  let index = int(id) shr 6\n")
+  result.add("  let bit = uint32(id) and 63'u32\n")
+  result.add("  ((" & upper & "_BITSET[index] shr bit) and 1'u64) != 0'u64\n")
