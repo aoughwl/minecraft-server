@@ -115,6 +115,25 @@ just the base composition itself):
   all needs `World`/`Player.experiencePickUpDelay`/`applyMendingFromXp`,
   none of which exist yet - left as documented TODOs, not faked.
 
+A third: `projectile.nim` (`ThrownItemEntity`, port of
+`projectile/mod.rs`'s shared base every thrown projectile builds on) plus
+`snowball.nim` (`SnowballEntity`, the simplest concrete user of it, port of
+`projectile/snowball.rs`). `ThrownItemEntity`'s construction
+(spawn-at-owner's-eye-height) and velocity math (`set_velocity`/
+`set_velocity_from` - normalize, jitter, scale by power, derive yaw/pitch
+from the resulting vector) are ported for real and hand-verified in
+`projectiletest.nim` (zero-uncertainty cases reduce to exact closed-form
+answers, checked by direct assertion). Upstream draws its jitter from
+`rand::random::<f64>()` (Rust's unseeded system RNG, not the
+world-seeded generator), so this isn't a determinism-sensitive path the
+way `legacy_rand.nim`'s other callers are - `setVelocity`/`setVelocityFrom`
+take an explicit `var LegacyRand` parameter instead of a hidden global,
+since no ambient RNG instance exists anywhere in this port yet and any
+uniform source is faithful to upstream's own non-determinism. Not
+ported: `process_tick`'s gravity/inertia/block-collision sweep and
+`on_hit`'s entity-collision damage/particle broadcast, both need `World`
+beyond what `worldstub.nim` provides.
+
 ## Verification: a REFINED finding on the closure/vtable crash
 
 `orbsizetest.nim` runs clean end to end (`nimony c -r`) - it imports
@@ -175,3 +194,7 @@ can currently be runtime-verified via `nimony c -r`, full stop** - not just
 code that builds or calls an `EntityBase`. `dyeCanMine` itself is `nimony
 check`-clean and correct by inspection (one enum comparison), but is not,
 and currently cannot be, runtime-proven.
+
+`projectiletest.nim` (above) hits the identical `eraiser.nim`/`ParamsTagId`
+crash at `nimony c -r` - a further confirmation, not a new bug, consistent
+with "anything importing entity.nim can't run yet."
