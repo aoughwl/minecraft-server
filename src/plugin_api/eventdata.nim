@@ -36,6 +36,19 @@
 ##   ported.
 ## - `position: position` becomes `Vector3[float64]` (src/util/vector3.nim).
 ## - `game-mode` becomes `GameMode` (src/util/gamemode.nim).
+## - `entity-id: s32` becomes `int32` directly (WIT's entities are
+##   identified by a plain numeric id, not a resource, so there's no
+##   Player-style transitive-import problem to route around here).
+## - `option<player>` becomes a `(hasX: bool, x: PlayerUuid)` pair rather
+##   than an Option type, matching this port's existing seq/tuple-as-
+##   option convention (see `signature` above, or `NbtResult`'s
+##   isOk/value pairs in src/nbt/).
+## - `damage-type` (a resource from a separate, unread `damage-types.wit`)
+##   becomes a plain string (its resource-location name).
+## - `target-world: %world` fields are dropped where present (e.g.
+##   entity-spawn) - src/server/world/worldstub.nim is a single anonymous
+##   stub with no world identity/registry yet, so there's nothing to
+##   reference; add a world-id field back once worlds are addressable.
 
 import ../server/net/netbase
 import ../util/vector3
@@ -97,4 +110,67 @@ type
     blockPlacedAgainst*: string
     blockPos*: BlockPos
     canBuild*: bool
+    cancelled*: bool
+
+  BlockBreakEventData* = object
+    ## `player: option<player>` (breaking can be unattributed, e.g. an
+    ## explosion) becomes a `(bool, PlayerUuid)` pair rather than pulling
+    ## in an Option type - same seq/tuple-as-option convention used
+    ## elsewhere in this port (`signature` above; `NbtResult` isOk/value
+    ## pairs in src/nbt/).
+    hasPlayer*: bool
+    player*: PlayerUuid
+    blockName*: string
+    blockPos*: BlockPos
+    exp*: uint32
+    shouldDrop*: bool
+    cancelled*: bool
+
+  EntityDamageEventData* = object
+    ## `damage-type` is a resource type from a separate `damage-types.wit`
+    ## interface this port hasn't read/ported; kept as a plain string
+    ## (its resource-location name) rather than blocking on that.
+    entityId*: int32
+    damage*: float32
+    damageType*: string
+    cancelled*: bool
+
+  EntityDeathEventData* = object
+    ## No `cancelled` field in the WIT record - death, once decided, isn't
+    ## cancellable via this event.
+    entityId*: int32
+    droppedExp*: int32
+
+  PlayerDeathEventData* = object
+    player*: PlayerUuid
+    deathMessage*: string
+    droppedExp*: int32
+    keepInventory*: bool
+    cancelled*: bool
+
+  EntitySpawnEventData* = object
+    ## `target-world: %world` (a WIT resource) has no Nimony World
+    ## identity to map onto yet (src/server/world/worldstub.nim is a
+    ## single anonymous stub, not a named/registered world) - dropped
+    ## rather than faked; a real id can be added once worlds are
+    ## addressable.
+    entityId*: int32
+    entityType*: string
+    position*: Vector3[float64]
+    cancelled*: bool
+
+  ItemSpawnEventData* = object
+    entityId*: int32
+    position*: Vector3[float64]
+    itemName*: string
+    cancelled*: bool
+
+  ItemDespawnEventData* = object
+    entityId*: int32
+    cancelled*: bool
+
+  PlayerDropItemEventData* = object
+    player*: PlayerUuid
+    itemName*: string
+    count*: uint8
     cancelled*: bool
