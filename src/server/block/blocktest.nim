@@ -20,7 +20,10 @@ import tintedglass
 import hay
 import mud
 import soulsand
+import honey
+import fletching_table
 import ../entity/entity
+import ../item/itembehaviour
 
 proc check(cond: bool, msg: string) =
   if not cond:
@@ -33,6 +36,8 @@ registerTintedGlass()
 registerHay()
 registerMud()
 registerSoulSand()
+registerHoney()
+registerFletchingTable()
 
 let svBehaviour = lookupBlock("minecraft:structure_void")
 let slimeBehaviour = lookupBlock("minecraft:slime_block")
@@ -87,5 +92,21 @@ if tintedGlassBehaviour != nil:
   check(isPathfindable(tintedGlassBehaviour, 0'u32, pctLand) == true, "tinted_glass falls through to the default (Land -> true)")
 else:
   check(false, "tinted_glass should be registered")
+
+let honeyBehaviour = lookupBlock("minecraft:honey_block")
+if honeyBehaviour != nil:
+  e.velocity.y = -5.0
+  onLandedUpon(honeyBehaviour, eb, 3.0)
+  updateEntityMovementAfterFallOn(honeyBehaviour, eb)
+  check(e.velocity.y == 0.0, "honey's update should zero vertical velocity")
+  check(isPathfindable(honeyBehaviour, 0'u32, pctLand) == false, "honey should never be pathfindable (Land)")
+else:
+  check(false, "honey_block should be registered")
+
+let fletchingBehaviour = lookupBlock("minecraft:fletching_table")
+if fletchingBehaviour != nil:
+  check(normalUse(fletchingBehaviour) == barPass, "fletching_table's normal_use should return Pass")
+else:
+  check(false, "fletching_table should be registered")
 
 echo "all block-registration/vtable checks passed"

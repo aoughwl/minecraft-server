@@ -17,6 +17,7 @@
 ## as more blocks get ported is mechanical from here - the pattern's fixed.
 
 import ../entity/entity
+import ../item/itembehaviour
 import ../../generated/blockdata as realblock
 import blockmisc
 import std/tables
@@ -33,6 +34,12 @@ type
     onLandedUponImpl*: proc(entity: EntityBase, fallDistance: float64) {.closure.}
     updateEntityMovementAfterFallOnImpl*: proc(entity: EntityBase) {.closure.}
     isPathfindableImpl*: proc(stateId: uint32, computationType: PathComputationType): bool {.closure.}
+    normalUseImpl*: proc(): BlockActionResult {.closure.}
+      ## Port of `mod.rs`'s `normal_use` - upstream's real signature takes a
+      ## `NormalUseArgs<'_>` bundling `&World`/`&Player`/`&BlockState`/etc.;
+      ## none of those exist as real types here yet, so this is scoped to
+      ## the no-argument case every current caller (fletching_table.rs)
+      ## actually needs. Extend the signature once a block needs the args.
 
 # --- upstream's two free helper fns (mod.rs) --------------------------------
 
@@ -69,6 +76,10 @@ proc defaultOnLandedUpon*(entity: EntityBase, fallDistance: float64) =
 proc defaultUpdateEntityMovementAfterFallOn*(entity: EntityBase) =
   stopVerticalMovementAfterFall(entity)
 
+proc defaultNormalUse*(): BlockActionResult =
+  ## `mod.rs`'s `normal_use` trait default: `BlockActionResult::Pass`.
+  barPass
+
 proc defaultIsPathfindable*(stateId: uint32, computationType: PathComputationType): bool =
   ## Simplified stand-in for mod.rs's real default, which branches on
   ## `state.is_waterlogged()`/`Fluid::from_state_id(...).has_tag(...)` for
@@ -94,6 +105,8 @@ proc newBlockBehaviour*(): BlockBehaviour =
       defaultUpdateEntityMovementAfterFallOn(entity)),
     isPathfindableImpl: (proc(stateId: uint32, computationType: PathComputationType): bool {.closure.} =
       defaultIsPathfindable(stateId, computationType)),
+    normalUseImpl: (proc(): BlockActionResult {.closure.} =
+      defaultNormalUse()),
   )
 
 proc onLandedUpon*(b: BlockBehaviour, entity: EntityBase, fallDistance: float64) {.inline.} =
@@ -104,6 +117,9 @@ proc updateEntityMovementAfterFallOn*(b: BlockBehaviour, entity: EntityBase) {.i
 
 proc isPathfindable*(b: BlockBehaviour, stateId: uint32, computationType: PathComputationType): bool {.inline.} =
   b.isPathfindableImpl(stateId, computationType)
+
+proc normalUse*(b: BlockBehaviour): BlockActionResult {.inline.} =
+  b.normalUseImpl()
 
 # --- registration: replaces `#[pumpkin_block(name)]` ------------------------
 

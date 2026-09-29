@@ -125,3 +125,23 @@ not the whole module.
    a computed state id) that doesn't exist yet, genuinely blocked, not
    attempted. Same runtime-crash caveat as above (`nimony check` clean,
    `nimony c -r` not yet possible - anything here imports `entity.nim`).
+
+7. **Two more concrete blocks, one new vtable method.** `honey.nim` (`impl
+   BlockBehaviour for HoneyBlock` - overrides all three existing methods:
+   0.2 fall-damage multiplier via the already-scoped `handleFallDamage`
+   placeholder, `stopVerticalMovementAfterFall`, and `isPathfindable`
+   hardcoded false). `fletching_table.nim` needed a genuinely new method -
+   `normal_use` - added as `BlockBehaviour.normalUseImpl: proc(): BlockActionResult
+   {.closure.}` (scoped to the no-argument case; upstream's real
+   `NormalUseArgs<'_>` bundles `&World`/`&Player`/etc. that don't exist
+   yet, but `fletching_table.rs`'s override ignores all its args and just
+   returns `Pass`, so the no-arg scope covers this real caller exactly).
+   `BlockActionResult` itself already existed in `src/server/item/
+   itembehaviour.nim` (used by `ItemBehaviour.useOnBlock`) - imported and
+   reused rather than redefined. Checked every other file using only
+   already-ported methods (`chain.rs`/`end_rod.rs`/`end_portal_frame.rs`)
+   and confirmed they all need `on_place`'s state-permutation system too -
+   genuinely no more free wins in that category right now.
+   `blocktest.nim` extended to register/exercise both. Same
+   `nimony check` clean / `nimony c -r` closures-through-vtables-crash
+   caveat as every other block file.
