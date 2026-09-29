@@ -556,3 +556,22 @@ choices:
   definitions for the plugin system, not Rust source at all; those may or
   may not be in scope depending on what src/plugin_runtime/'s WASM-hosting
   gap (see its own README) resolves to).
+
+## potion_brewing.rs (previously unattempted, now done)
+
+Ported `BREWING_RECIPES` (`ITEM_RECIPES`/`POTION_RECIPES` are always
+`[]` upstream, per its own comment - not emitted). Item/potion
+references became plain lowercase snake_case name strings (matching
+`item.nim`'s `name` field convention) rather than `&'static Item`/
+`&'static Potion` references - no `Potion` table exists yet, and the
+sibling `potion.rs` generator was already found transitively blocked
+on unported `attributes`/`data_component_impl` types. A future pass
+can resolve these strings against a real registry once one exists.
+
+`gen_potion_brewing.nim` actually run against the real 279 JSON files
+under `assets/datapack/data/minecraft/recipe/brewing/`, producing
+`src/generated/potion_brewing.nim` (279 recipes, matching the file
+count exactly). `potion_brewingtest.nim` verified via `nimony c -r`
+(no `entity.nim` in its import graph, genuinely runtime-proven): the
+alphabetically-first recipe's exact fields, plus a non-empty check
+across all 279 entries to catch any silent missing-key fallback.
