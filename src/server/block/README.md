@@ -42,21 +42,46 @@ by the main-crate scoping pass (`src/server/README.md`) as the real
 prerequisite. `registry.rs` additionally needs ~all 200+ block structs to
 exist before it means anything (it's pure wiring, no logic of its own).
 
-## What would unblock this
+## What would unblock this — status update
 
-In order:
 1. ~~Stub `World`/`Player`/`Server` ref-object types... and decide
    `Entity`'s shape~~ — **`Entity`'s shape is decided**, see
    `src/server/entity/` (`entity.nim`'s `Entity`/`LivingEntity`/`Player`/
    `EntityBase`, a manual vtable matching this file's own suggested
    `src/inventory/inventory.nim` precedent). `World`/`Server` stubs are
-   still not done - smaller remaining ask.
-2. Decide `BlockBehaviour`'s Nimony shape: a manual vtable of `{.closure.}`
-   proc fields (watch the known `{.closure.}`-omission compiler crash), each
-   taking a plain object arg bundling whatever of the above it needs.
-3. A Nimony equivalent for `#[pumpkin_block(name)]` - at minimum, a plain
-   `registerBlock(name: string, behaviour: BlockBehaviour)` call each block
-   file makes at load time in place of the macro's registration codegen.
-4. Then `blocks/structure_void.rs`-style empty impls become genuinely
-   five-minute ports, and `registry.rs` becomes a plain lookup table once
-   enough blocks exist to populate it.
+   still not done.
+2. ~~Decide `BlockBehaviour`'s Nimony shape~~ — **done**, see
+   `blockbehaviour.nim`: a manual-vtable `BlockBehaviour` ref object with
+   `{.closure.}`-annotated proc fields, `newBlockBehaviour()` for the
+   all-trait-defaults case, plus the two free helper fns
+   (`stopVerticalMovementAfterFall`/`bounceEntityAfterFall`) upstream's
+   `mod.rs` defines alongside the trait. **Scoped down**: upstream's real
+   trait has ~30 methods; only the two (`on_landed_upon`/
+   `update_entity_movement_after_fall_on`) the two proof-case blocks below
+   actually use are ported. Extending the vtable with more methods as more
+   blocks land is mechanical from here.
+3. ~~A Nimony equivalent for `#[pumpkin_block(name)]`~~ — **done**:
+   `registerBlock(name: string, behaviour: BlockBehaviour)` /
+   `lookupBlock(name: string): nil BlockBehaviour`, backed by a
+   `Table[string, BlockBehaviour]`. Each block file calls `registerBlock`
+   itself at load time in place of macro-generated registration.
+4. **Both original proof cases ported and passing `nimony check`**:
+   `structure_void.nim` (`impl BlockBehaviour for StructureVoidBlock {}`
+   → `newBlockBehaviour()`, since an empty impl just inherits every
+   default) and `slime.nim` (overrides both vtable methods: 0.0 fall-damage
+   multiplier, bounce instead of stop). `blocktest.nim` registers both,
+   looks them up by name, and drives real `Entity`/`EntityBase` instances
+   through both vtable methods - `nimony check` passes clean.
+
+   **`nimony c -r blocktest.nim` crashes at runtime** -
+   `eraiser.nim(128,3) 'fnType.tagEnum == ParamsTagId' [AssertionDefect]`
+   plus a related `lambdalifting.nim(369,3) 'env.s != SymId(0)'`. This is
+   the **third independent confirmation** of the same closure-through-
+   vtable runtime crash already hit in `src/command/`'s dispatcher and
+   `src/server/entity/`'s own test - not a logic bug in this file, a
+   Nimony compiler issue affecting every manual-vtable interface in this
+   port once its closures actually execute. Filed as feedback.
+
+`registry.rs` (the full ~200+-block wiring table) stays out of scope until
+that many concrete blocks actually exist - what's here proves the pattern,
+not the whole module.
