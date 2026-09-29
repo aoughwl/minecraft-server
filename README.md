@@ -19,12 +19,22 @@ Smallest/most self-contained crates first, since later crates depend on them:
 1. `pumpkin-nbt` (~3.1k LOC) — NBT tag model, (de)serialization. **In progress.**
 2. `pumpkin-util` (~15.6k LOC) — **In progress.** Ported so far:
    `math/vertical_surface_type.rs`, `resource_location.rs`, `resource.rs`,
-   `identifier.rs`, `difficulty.rs`, `gamemode.rs`, `y_offset.rs` →
-   `src/util/*.nim`. `identifier.rs`'s const/compile-time constructors
-   (`from_static`, `parse_static`, ...) and all `serde` (de)serialize impls
-   across the crate are intentionally skipped for now (see doc comments).
-   ~2.5k of ~15.6k LOC covered; `text/mod.rs` (2.2k), `noise/*` (1.7k),
-   `random/*` (1.5k), and the `math/` vector/position/provider files remain.
+   `identifier.rs`, `difficulty.rs`, `gamemode.rs`, `y_offset.rs`,
+   `math/vector2.rs`, `math/vector3.rs` (core - see its doc comment for
+   what's skipped), `random/legacy_rand.rs` (the pre-1.13 Java-`Random`-
+   compatible LCG; verified byte-for-byte against the Rust file's own unit
+   test vectors, including gaussian/triangular/split derivation - see
+   `src/util/legacy_randtest.nim`) → `src/util/*.nim`. `identifier.rs`'s
+   const/compile-time constructors (`from_static`, `parse_static`, ...) and
+   all `serde` (de)serialize impls across the crate are intentionally
+   skipped for now (see doc comments). ~4.5k of ~15.6k LOC covered;
+   `text/mod.rs` (2.2k), `noise/*` (1.7k, depends on `random/`), the rest of
+   `random/*` (`mod.rs`'s `RandomImpl`/`RandomGenerator` trait/enum
+   unification, `xoroshiro128.rs`, `worldgen_random.rs`, `gaussian.rs`'s
+   trait form), and the remaining `math/` files (`position.rs`,
+   `bounds.rs`, `block_box.rs`, `boundingbox.rs`, `int_provider.rs`,
+   `float_provider.rs`, `bit_storage.rs`, `atomic_f32.rs`, `pool.rs`,
+   `euler_angle.rs`, `experience.rs`, `mod.rs`) remain.
 3. `pumpkin-auth` (~587 LOC) — **Mostly blocked.** `jwt/mod.rs`'s claims
    model, error kinds, and base64 decoding are ported to `src/auth/jwt.nim`.
    Its actual JWT signature verification needs NIST P-384 ECDSA, which
