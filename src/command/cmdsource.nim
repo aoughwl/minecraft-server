@@ -25,6 +25,7 @@
 ## counting already gives shared ownership.
 
 import ../util/vector2, ../util/vector3
+import ../server/entity/entity
 
 type
   ReturnValueKind* = enum
@@ -53,6 +54,13 @@ type
     rotation*: Vector2[float32]
     entityAnchor*: EntityAnchor
     resultCallbacks*: seq[ReturnValueCallback]
+    player*: nil Player ## `nil` for console/command-block sources; stands
+      ## in for upstream's `source.output.as_player()` downcast. Added
+      ## for src/server/command/'s concrete command implementations
+      ## (e.g. gamemode.nim), which need to reach the issuing player's
+      ## entity - not part of the original tokenizer/tree/dispatcher
+      ## design pass, but the smallest addition that unblocks them
+      ## without inventing a second CommandSource shape.
 
 proc sendMessage*(s: CommandSource, message: string) =
   if s.sendMessageProc != nil:

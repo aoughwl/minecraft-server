@@ -649,6 +649,20 @@ Smallest/most self-contained crates first, since later crates depend on them:
     event types) are documented but not ported this pass - see
     `src/server/plugin/README.md` for the full module map and next steps.
 
+15. `pumpkin` main crate's `command/` implementation directory (~30.3k LOC,
+    the concrete `/gamemode`/`/say`/... handlers - distinct from the
+    already-ported `pumpkin-command` tokenizer/tree/dispatcher library at
+    `src/command/`) - **one command ported as proof.** `/gamemode`'s
+    self-target form is fully wired end to end (tree registration →
+    argument parse → `Player.gamemode` mutation) in `src/server/command/`,
+    required adding a `player*: nil Player` field to `CommandSource`
+    (`src/command/cmdsource.nim`) so command handlers can reach the issuing
+    player. `gamemodetest.nim` drives it through a real dispatch walk;
+    like everything importing `entity.nim`, it's check-verified only (hits
+    NIMONY-COMPILER-BUGS.md bug #1 at `nimony c -r`, same signature). See
+    `src/server/command/README.md` for what's next (the ~30 remaining
+    command files, several trivial).
+
 ## Layout
 
 ```
