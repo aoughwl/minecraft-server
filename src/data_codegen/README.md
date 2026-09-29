@@ -103,12 +103,15 @@ the same way (`nimony c -r src/data_codegen/gen_<name>.nim`, output
 - `gen_sound.nim` → `Sound` (1991 variants, from `sounds.json`, a flat string array; id = declaration order matching upstream's `#[repr(u16)]`) - names contain dots (`"entity.allay.ambient_with_item"`), which required extending `toPascalCase` to split on `.` as well as `_`/`-`/space (heck's `ToPascalCase` already treats any non-alphanumeric as a word boundary, so this brings the port in line rather than diverging); `nimony check` takes ~14s on this file, the slowest generated output so far
 - `gen_instrument.nim` → `Instrument` (8 variants, directory shape) - first generator with a cross-reference to another *generated* module (`import sound` for the `sound()` accessor), verified the import resolves and type-checks correctly once both files sit side by side in `src/generated/`
 
-That's 27/90 submodules done.
+- `gen_attributes.nim` → `Attribute` object type + 40 named constants (from `attributes.json`, a name->{id,default_value} map, sorted by id per upstream's explicit `sort_by_key`) plus `allAttributes()`. Note: a `const seq[Attribute]` literal referencing other consts isn't foldable at compile time in Nimony ("cannot evaluate expression at compile time") - changed to a plain `proc allAttributes*(): seq[Attribute]` instead. **This unblocks `effect.rs`/`potion.rs`, previously skipped for needing this exact file** (they also need `data_component_impl::Operation`, still unported - not fully unblocked yet, but one of their two blockers is now cleared).
+- `gen_painting_variant.nim` → `PaintingVariant` (51 variants, directory shape like the cat_variant/wolf_variant family, plus a *second* input - a `tags/painting_variant/placeable.json` tag file listing which variants are placeable in survival, cross-referenced by asset id/stem to set each variant's `isPlaceable`). First generator combining two independent JSON sources. Used `path(...)` (lowercase, the `std/paths` constructor proc) rather than `Path(...)` (a type-conversion call syntax that doesn't work the same way in Nimony) - noted here since every other generator using `listJsonStems` already got this right but it's easy to typo.
 
-Skipped after investigation (documented here, not silently dropped): `effect.rs`
-(needs unported `attributes::Attributes` and `data_component_impl::Operation`)
-and `potion.rs` (needs `effect.rs`'s `StatusEffect`, transitively blocked the
-same way) - revisit once `attributes`/`data_component_impl` land.
+That's 29/90 submodules done.
+
+Skipped after investigation (documented here, not silently dropped):
+`potion.rs` (needs `effect.rs`'s `StatusEffect` - `effect.rs` itself is now
+only blocked on `data_component_impl::Operation`, not `attributes` anymore
+since `gen_attributes.nim` landed) - revisit once `data_component_impl` lands.
 
 ## What's NOT done
 
