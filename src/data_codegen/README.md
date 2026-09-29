@@ -435,9 +435,45 @@ pattern comparison for shaped recipes, multiset comparison for shapeless)
 is a genuine, separate piece of design/logic work, left for a follow-up
 pass rather than folded in here.
 
+## mob_variant.rs / villager.rs (re-attempted, previously deferred)
+
+Both were originally deferred as "nested optional arrays beyond current
+helper coverage." Re-checked against the current `codegenutil.nim` helper
+set: `mob_variant.rs` turned out fully tractable with existing helpers
+(`listJsonStems`/`jsonStringField`, same shape as `gen_wolf_variant.nim`) -
+the actual blocker back then was never the JSON shape (it's flat: one JSON
+file per directory entry, `asset_id`/`baby_asset_id`/`model`), it was
+under-triage.
+
+Ported: `src/generated/{cow_variant,pig_variant,chicken_variant,
+zombie_nautilus_variant}.nim` - four enums (3/3/3/2 variants respectively,
+matching the real asset directories) with `fromName`/`toName`/`id`/
+`assetId`/`babyAssetId`/`model` accessors. Deliberately NOT ported: upstream's
+`select_for_biome` (biome-based variant selection for farm animals/zombie
+nautilus) - that logic is hardcoded against
+`crate::tag::WorldgenBiome::MINECRAFT_SPAWNS_..._FARM_ANIMALS` biome-tag
+membership sets, and no `tag.rs` generator exists anywhere in this port yet
+(a real, separate prerequisite, not a nested-array problem). Verified via
+`mob_varianttest.nim` (`nimony c -r`): variant counts, asset ids, and the
+temperate/cold model-field presence-vs-absence distinction all match source
+JSON exactly.
+
+`villager.rs` genuinely IS more than a helper gap: its real `build()` walks
+a `trade_set` datapack directory and a `tags/villager_trade` tag directory,
+then recursively resolves tag references into concrete weighted trade lists
+with cycle detection - a real algorithm, not a data-shape problem. Scoped
+down to the flat, non-recursive parts of `villager_data.json`: `professions`
+(name/translate-key/requested_items/work_sound, 15 entries) and `types`
+(villager biome-variant name -> texture namespace, 7 entries), landed as
+`src/generated/villager.nim`. The trade-set/trade-tag resolution graph is a
+real follow-up task, not attempted here - documented in the generator's own
+doc comment. Verified via `villagertest.nim` (`nimony c -r`): profession
+count, `farmer`'s exact requested-items list, and type-name resolution all
+match source JSON.
+
 ## What's NOT done
 
-The remaining ~67 submodules, including
+The remaining ~65 submodules, including
 `noise_router.rs` (these last are large and encode
 real structural complexity - nested data shapes, cross-references between
 registries, not just flat string arrays). Each needs the same treatment as
