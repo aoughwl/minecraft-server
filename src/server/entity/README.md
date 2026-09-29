@@ -96,6 +96,44 @@ by execution. Once the underlying compiler issue is fixed, `entitytest.nim`
 should just start passing with no changes needed - it was written to prove
 real behavior, not just compile.
 
+## Concrete entities ported on top of this design
+
+Two concrete `EntityBase` implementors, picked as the simplest upstream
+has (chosen specifically to prove the design supports real subtypes, not
+just the base composition itself):
+
+- `marker.nim` (`MarkerEntity`, port of `marker.rs`) - an invisible,
+  non-physical anchor entity. Almost every override upstream gives it is a
+  constant/no-op; `writeCustomNbt`/`readCustomNbt` are real (own opaque
+  NBT payload storage). Missing: upstream's `no_physics` flag needs an
+  `Entity` field this port hasn't added yet.
+- `experienceorb.nim` (`ExperienceOrbEntity`, port of `experience_orb.rs`)
+  - has one genuinely portable pure function, `roundToOrbSize` (the
+  greedy XP-to-orb-size split table), ported and value-verified, plus
+  real per-instance state (`amount`, `orbAge`) and a real despawn-at-age
+  check in `tick`. Upstream's actual physics/pickup/XP-application logic
+  all needs `World`/`Player.experiencePickUpDelay`/`applyMendingFromXp`,
+  none of which exist yet - left as documented TODOs, not faked.
+
+## Verification: a REFINED finding on the closure/vtable crash
+
+`orbsizetest.nim` runs clean end to end (`nimony c -r`) - it imports
+`roundToOrbSize` in isolation with zero import of `entity.nim`, proving
+the pure logic is correct.
+
+`concretetest.nim` (which imports `entity.nim`/`marker.nim`/
+`experienceorb.nim` and constructs `Entity`/`MarkerEntity`/
+`ExperienceOrbEntity` instances, but never calls `markerBaseOf`/
+`experienceOrbBaseOf` - the only procs that construct `EntityBase`'s
+`{.closure.}` fields) still crashes at `nimony c -r`, before printing
+anything. This refines the bug already filed as feedback: the crash is
+**not** gated on a closure vtable field actually being called - it's
+triggered by *reachable* code that *constructs* one, even if that
+construction never executes. That's consistent with the crash living in
+closure-lifting/lowering at whole-binary init or link time rather than at
+a call site. Worth knowing for whoever eventually debugs
+`eraiser.nim`/`ParamsTagId`.
+
 ## What this unblocks
 
 `src/server/block/README.md`'s stated blocker #1 (stub `World`/`Player`/
