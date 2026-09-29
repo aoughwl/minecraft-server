@@ -69,10 +69,20 @@ closures-through-vtables crash) - genuine proof, not just a check pass.
    near-miss for this pass - version comparison + connection-state
    transition, genuinely small and mostly pure - but it reads
    `CURRENT_MC_VERSION`/`LOWEST_SUPPORTED_MC_VERSION` and translation-key
-   constants from the still-unported `data` registry (not found anywhere
-   in the ~1.5M generated lines assessed so far) and calls `TextComponent`
-   /`translate_cross` from `util::text` (also unported, see the `util`
-   entry in the main README). Worth revisiting once either of those lands.
+   constants from the still-unported `data` registry and calls
+   `TextComponent`/`translate_cross` from `util::text` (also unported, see
+   the `util` entry in the main README). Worth revisiting once either of
+   those lands. **Update:** the *version* half of this blocker is now
+   gone - `src/util/javaversion.nim` gained `protocolVersion`/
+   `fromProtocol`/`supportsConfigurationState`/`isModern`/`hasRegistries`/
+   `displayName` (direct ports of `version.rs`'s real methods, verified in
+   `javaversiontest.nim` via `nimony c -r`) plus hand-copied
+   `CurrentMcVersion`/`LowestSupportedMcVersion` constants (both `V_26_3`
+   upstream at time of writing - `pumpkin-data`'s `packet.rs` generates
+   these from one line each, not worth a whole codegen pass for two
+   constants). `handle_handshake` itself is still blocked purely on
+   `TextComponent`/`translate_cross`/`ConnectionState.store`'s
+   `PendingConnection` state, not on version math anymore.
 4. **Every Bedrock-specific file** (`bedrock/nethernet/*` - WebRTC-based
    peer discovery/signaling for Bedrock's NetherNet transport, ~1.7k lines
    alone) is a different protocol/transport family entirely, lower
