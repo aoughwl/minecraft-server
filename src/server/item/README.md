@@ -10,7 +10,11 @@
   registry-population function itself, since every concrete item it references is unported (see
   below).
 - `potion.rs` (209 lines), `items/*.rs` (52 files, ~6.4k lines) — concrete `ItemBehaviour` impls.
-  **Not ported.**
+  **Mostly not ported.** Ported so far, as free-standing functions rather than through
+  `ItemBehaviour` (see below): `dye.rs`'s `can_mine` → `dye.nim`; `swords.rs`'s `can_mine` →
+  `swords.nim`; `mace.rs`'s `can_mine` → `mace.nim`; `shield.rs`'s id set (an empty behaviour
+  otherwise) → `shield.nim`; `arrow.rs`'s id set (also empty) → `arrow.nim`. `clock.rs` (needs
+  `World.playSound`), `egg.rs` (needs `World`/`spawnEntity`) checked and confirmed still blocked.
 
 ## What's ported
 
@@ -41,9 +45,14 @@ one of those. `Player` (in `src/server/entity/entity.nim`) doesn't have an `inve
 `block/`'s leaf cases and `entity/`'s concrete mobs hit — documented instead of forced.
 
 Also known: closures flowing through a manual vtable crash at runtime (`eraiser.nim`/
-`ParamsTagId`), confirmed independently 4x elsewhere in this port already. `ItemBehaviour`'s
-dispatch is therefore statically checked only, not runtime-proven, same caveat as those other
-modules.
+`ParamsTagId`), confirmed independently 4x elsewhere in this port already (full writeup:
+`NIMONY-COMPILER-BUGS.md` #1). `ItemBehaviour`'s dispatch is therefore statically checked only,
+not runtime-proven, same caveat as those other modules. `swords.nim`/`mace.nim`/`dye.nim` avoid
+importing `itembehaviour.nim` for exactly this reason (a trivial free function stays runtime-
+provable as long as it never imports the closure-vtable definitions) but still import
+`entity.nim` for `Player`, so they're check-only too. `shield.nim`/`arrow.nim` import neither and
+ARE genuinely run (`itemsbatch2test.nim`, `nimony c -r`) - the first item files in this directory
+to clear that bar.
 
 ## What unblocks the rest
 
