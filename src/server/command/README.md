@@ -151,6 +151,20 @@ Not ported from any of the three: permission-registry registration and
 translated feedback text, same simplifications every other file here
 already uses.
 
+- **`plugins.nim`** - `/plugins`. Self-contained: needs neither the
+  player registry nor `Player`/`World` state. `CommandSource` gained
+  `pluginsProc*: proc(): seq[PluginInfo] {.closure.}` and a
+  `PluginInfo` object (name/version/authors/description) standing in
+  for `server.plugin_manager.active_plugins()` - no `Server`/
+  `PluginManager` type exists yet (the WASM plugin-host bridge is a
+  separately documented gap, see `src/plugin_runtime/README.md`).
+  `nil` reports an empty plugin list. `pluginstest.nim` drives the
+  no-plugins and plugins-loaded cases through real dispatch walks,
+  confirming the reported count and both plugin names land in the
+  feedback message. Not ported: permission registration, and the
+  colored/hover-tooltip feedback (`NamedColor`/`HoverEvent`, needs the
+  unported `text` module - plain comma-separated names stand in).
+
 ## Not started
 
 The other ~15 command files under `upstream-ref/crates/pumpkin/src/command/commands/`,

@@ -45,6 +45,17 @@ type
     eaFeet
     eaEyes
 
+  PluginInfo* = object
+    ## Port of the fields upstream's `/plugins` command reads off a
+    ## loaded plugin - stands in for the real
+    ## `server.plugin_manager.active_plugins()` entry type, which
+    ## doesn't exist yet (the WASM plugin-host bridge is a separate,
+    ## documented gap; see src/plugin_runtime/README.md).
+    name*: string
+    version*: string
+    authors*: string
+    description*: string
+
   CommandSource* = ref object
     ## Manual vtable. `nil` fields fall back to the same defaults upstream's
     ## default trait methods provide.
@@ -126,6 +137,10 @@ type
     saveAllProc*: proc() {.closure.}
       ## stands in for `server.save_all()` (src/server/command/saveall.nim)
       ## - same no-`Server`-type gap as `stopProc`. `nil` is a safe no-op.
+    pluginsProc*: proc(): seq[PluginInfo] {.closure.}
+      ## stands in for `server.plugin_manager.active_plugins()`
+      ## (src/server/command/plugins.nim). `nil` falls back to an empty
+      ## list.
     maxPlayersProc*: proc(): int32 {.closure.}
       ## stands in for `server.advanced_config.networking.{java,bedrock}.max_players`
       ## (src/server/command/list.nim) - no `AdvancedConfiguration`/per-client-platform
