@@ -222,3 +222,26 @@ from `src/generated/entity_type.nim`'s real per-type table via a small
 table existed (it didn't exist when those tests were first written).
 Confirmed marker's real dimensions are exactly 0x0 (the invisible-anchor
 shape upstream gives it) - a concrete check now catches that.
+
+## TNTEntity: NBT round-trip real, physics/explosion tick deferred
+
+`tnt.nim` (`TNTEntity`, port of `tnt.rs`, primed TNT) - the NBT
+save/load (`write_custom_nbt`/`read_custom_nbt`: `fuse`/
+`explosion_power`, with the default-power epsilon check and the 0..128
+clamp on load) and `random_short_fuse`'s pure math are ported for real.
+Not ported: `primed()`'s constructor (needs `World` beyond
+`worldstub.nim`'s surface, plus an ambient RNG - same "no hidden global
+RNG" stance `projectile.nim` already takes, so `randomShortFuse` takes
+an explicit `var LegacyRand` parameter instead) and `tick()`'s
+gravity/collision/synced-data-tracker/`World.explode` logic (needs the
+entity-physics/collision system this port hasn't reached yet).
+
+`randomshortfusetest.nim` isolates `randomShortFuse` with NO import of
+`entity.nim`/`tnt.nim` (a standalone copy of the one function, matching
+`orbsizetest.nim`'s precedent for isolating pure logic from its
+`EntityBase`-touching neighbors) - **genuinely runtime-proven** via
+`nimony c -r`: 100 draws checked against the expected `[10, 29]` range
+for `fuse=80`, plus the `fuse=0` degenerate case. `tnttest.nim`'s NBT
+round-trip (constructs a real `TNTEntity`) hits the same documented
+closures-through-vtables crash as everything else touching
+`entity.nim` - check-verified only.
