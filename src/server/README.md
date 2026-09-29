@@ -8,6 +8,14 @@ it's ported.
 
 ## What's here so far
 
+- `entity/` (new) — the `Entity`-shape design decision blocker #3 below
+  called for. `entity.nim` ports `Entity`/`LivingEntity`/`Player` (plain
+  composed ref objects) and `EntityBase` (a manual-vtable interface over
+  them, the `src/inventory/inventory.nim` pattern). `nimony check` clean;
+  `entitytest.nim` verifies the composition/dispatch semantics but hits a
+  known compiler runtime-crash (closures through a vtable) rather than
+  actually running - see `src/server/entity/README.md` for the full
+  writeup, including what this unblocks for `src/server/block/`.
 - `errorclass.nim` — port of `error.rs`'s `a shared error` trait, as plain
   overloaded procs (`isKick`/`severity`/`clientKickReason`) over
   `InventoryError` and `ReadingError` (both exist in this port already).
@@ -79,15 +87,14 @@ Three real blockers, not just scale:
    and `entity/` are where that design actually has to get made, since
    they're the modules that would drive it.
 3. **`entity/`'s scale means an ad-hoc partial port would fragment badly.**
-   With 83.6k lines built around one central `Entity`/`Player` type
-   hierarchy, porting isolated pieces (as this session did successfully for
-   smaller, more decomposable crates like `config` or
-   `inventory`) risks producing inconsistent partial models that
-   all need reconciling later. This module specifically deserves a
-   dedicated design pass (what does an `Entity` look like without Rust's
-   trait-object component pattern? enum-dispatch? a manual vtable per
-   entity kind, as `src/inventory/inventory.nim` did for `Inventory`?)
-   before wide porting starts, not file-by-file opportunism.
+   ~~With 83.6k lines built around one central `Entity`/`Player` type
+   hierarchy, porting isolated pieces...~~ **Resolved** — see `entity/`
+   above and `src/server/entity/README.md`. `EntityBase` is a manual
+   vtable, matching `src/inventory/inventory.nim`'s precedent for
+   `Inventory`. Concrete entities/blocks can now build on `Entity`/
+   `LivingEntity`/`Player`/`EntityBase` instead of waiting on this
+   decision - what's still missing is `World`/`Server` stub types and
+   `BlockBehaviour`'s equivalent vtable, both smaller asks than this was.
 
 ## Suggested next steps, in order
 

@@ -45,10 +45,12 @@ exist before it means anything (it's pure wiring, no logic of its own).
 ## What would unblock this
 
 In order:
-1. Stub `World`/`Player`/`Server` ref-object types (even minimal/empty ones)
-   and decide `Entity`'s shape (manual vtable vs. enum-dispatch - the
-   `src/inventory/inventory.nim` manual-vtable pattern is the established
-   precedent in this repo).
+1. ~~Stub `World`/`Player`/`Server` ref-object types... and decide
+   `Entity`'s shape~~ — **`Entity`'s shape is decided**, see
+   `src/server/entity/` (`entity.nim`'s `Entity`/`LivingEntity`/`Player`/
+   `EntityBase`, a manual vtable matching this file's own suggested
+   `src/inventory/inventory.nim` precedent). `World`/`Server` stubs are
+   still not done - smaller remaining ask.
 2. Decide `BlockBehaviour`'s Nimony shape: a manual vtable of `{.closure.}`
    proc fields (watch the known `{.closure.}`-omission compiler crash), each
    taking a plain object arg bundling whatever of the above it needs.
