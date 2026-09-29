@@ -1,0 +1,143 @@
+## Biome climate-parameter math: quantized coordinates, `Parameter` (a
+## quantized closed interval used for one climate axis), `TargetPoint`
+## (a concrete 6-axis climate sample), and `ParameterPoint` (a 6-axis
+## interval + offset, scored against a `TargetPoint` by squared distance).
+## Port of upstream/world/src/biome/multi_noise.rs and the `Parameter`/
+## `TargetPoint`/`ParameterPoint` types + `quantize_coord`/`unquantize_coord`
+## upstream defines in its generated `pumpkin-data` crate (biome.rs) rather
+## than in pumpkin-world itself - this file combines them since neither
+## alone is meaningful, and both are pure, registry-free math.
+##
+## `hash_seed` (from upstream/world/src/biome/mod.rs) also lives here: it's
+## the one genuinely self-contained piece of that file (everything else -
+## `BiomeSupplier`, `MultiNoiseBiomeSupplier`, `ActiveBiomeSupplier` - needs
+## the unported `BiomeTree`/generated biome registry and `MultiNoiseSampler`
+## noise sampling, so those are left for later).
+
+import sha2
+
+const QuantizationFactor*: float32 = 10000.0
+
+proc quantizeCoord*(coord: float32): int64 {.inline.} =
+  int64(coord * QuantizationFactor)
+
+proc unquantizeCoord*(coord: int64): float32 {.inline.} =
+  float32(coord) / QuantizationFactor
+
+type
+  Parameter* = object
+    min*: int64
+    max*: int64
+
+  TargetPoint* = object
+    temperature*: int64
+    humidity*: int64
+    continentalness*: int64
+    erosion*: int64
+    depth*: int64
+    weirdness*: int64
+
+  ParameterPoint* = object
+    temperature*: Parameter
+    humidity*: Parameter
+    continentalness*: Parameter
+    erosion*: Parameter
+    depth*: Parameter
+    weirdness*: Parameter
+    offset*: int64
+
+proc newParameter*(min, max: int64): Parameter {.inline.} =
+  Parameter(min: min, max: max)
+
+proc parameterPoint*(value: float32): Parameter {.inline.} =
+  ## Port of `Parameter::point` - a zero-width interval at one value.
+  let q = quantizeCoord(value)
+  Parameter(min: q, max: q)
+
+proc parameterSpan*(minF, maxF: float32): Parameter =
+  ## Port of `Parameter::span`. Upstream asserts `min <= max`; Nimony has
+  ## no exceptions to raise here, so this just orders the two rather than
+  ## producing an invalid interval (upstream's assert exists to catch a
+  ## caller bug at the call site, which a Nimony caller should still avoid,
+  ## but panicking isn't available/appropriate for this port).
+  let a = quantizeCoord(minF)
+  let b = quantizeCoord(maxF)
+  if a <= b: Parameter(min: a, max: b)
+  else: Parameter(min: b, max: a)
+
+proc distance*(p: Parameter, target: int64): int64 =
+  ## Port of `Parameter::distance`/`calc_distance`: 0 if `target` is inside
+  ## the interval, else the (positive) gap to the nearer edge.
+  let above = target - p.max
+  let below = p.min - target
+  if above > 0: above
+  elif below > 0: below
+  else: 0
+
+proc distanceParameter*(p: Parameter, target: Parameter): int64 =
+  ## Port of `Parameter::distance_parameter`: 0 if the two intervals
+  ## overlap, else the gap between their nearer edges.
+  let above = target.min - p.max
+  let below = p.min - target.max
+  if above > 0: above
+  elif below > 0: below
+  else: 0
+
+proc spanWith*(p: Parameter, other: Parameter): Parameter {.inline.} =
+  ## Port of `Parameter::span_with(Some(other))` - the smallest interval
+  ## containing both (the `None` case is just `p` unchanged, so callers
+  ## skip calling this when there's nothing to merge with).
+  Parameter(
+    min: (if p.min < other.min: p.min else: other.min),
+    max: (if p.max > other.max: p.max else: other.max),
+  )
+
+proc `$`*(p: Parameter): string =
+  if p.min == p.max: $p.min
+  else: "[" & $p.min & "-" & $p.max & "]"
+
+proc newTargetPoint*(temperature, humidity, continentalness, erosion, depth,
+    weirdness: int64): TargetPoint {.inline.} =
+  TargetPoint(temperature: temperature, humidity: humidity,
+    continentalness: continentalness, erosion: erosion, depth: depth,
+    weirdness: weirdness)
+
+proc newParameterPoint*(temperature, humidity, continentalness, erosion,
+    depth, weirdness: Parameter, offset: int64): ParameterPoint {.inline.} =
+  ParameterPoint(temperature: temperature, humidity: humidity,
+    continentalness: continentalness, erosion: erosion, depth: depth,
+    weirdness: weirdness, offset: offset)
+
+proc fitness*(p: ParameterPoint, target: TargetPoint): int64 =
+  ## Port of `ParameterPoint::fitness`: sum of squared per-axis distances
+  ## plus squared offset - the score `RTree`/`FittestPositionFinder` use to
+  ## pick the best-matching biome/position for a climate sample.
+  let tempDist = distance(p.temperature, target.temperature)
+  let humDist = distance(p.humidity, target.humidity)
+  let contDist = distance(p.continentalness, target.continentalness)
+  let eroDist = distance(p.erosion, target.erosion)
+  let depDist = distance(p.depth, target.depth)
+  let weiDist = distance(p.weirdness, target.weirdness)
+  tempDist * tempDist + humDist * humDist + contDist * contDist +
+    eroDist * eroDist + depDist * depDist + weiDist * weiDist +
+    p.offset * p.offset
+
+proc hashSeed*(seed: uint64): int64 =
+  ## Port of upstream/world/src/biome/mod.rs's `hash_seed`: SHA-256 the
+  ## seed's little-endian bytes, take the first 8 hash bytes as a
+  ## little-endian i64. Used to derive independent sub-seeds for different
+  ## world-gen subsystems from one world seed.
+  var seedBytes {.noinit.}: array[8, byte]
+  var s = seed
+  for i in 0 ..< 8:
+    seedBytes[i] = byte(s and 0xFF'u64)
+    s = s shr 8
+  let digest = sha256(seedBytes)
+  var resultBytes {.noinit.}: array[8, byte]
+  for i in 0 ..< 8:
+    resultBytes[i] = digest[i]
+  result = 0
+  var i = 7
+  while i >= 0:
+    result = (result shl 8) or int64(resultBytes[i])
+    dec i

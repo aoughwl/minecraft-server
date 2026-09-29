@@ -183,6 +183,24 @@ Smallest/most self-contained crates first, since later crates depend on them:
    read/write procs directly). `netcodectest.nim` round-trips every numeric
    type, bools, a var_int, and a UTF-8 string with multi-byte/surrogate-pair
    characters through the new writer/reader - passing.
+   First concrete packet types: 8 Java login/config-state packets (both
+   directions where upstream has both) → `src/protocol/loginpackets.nim` -
+   `CSetCompression`, `CLoginDisconnect`, `SKeepAlive` (config-state),
+   `SConfigPong`, `CFinishConfig`/`SAcknowledgeFinishConfig` (empty-body),
+   `CLoginCookieRequest`, `SLoginCookieResponse`, `SLoginPluginResponse`.
+   Picked for being small and NOT multi-version-branching (upstream's
+   `JavaMinecraftVersion`-gated field differences aren't reproduced yet -
+   these are ported against the current/latest wire shape only; a real
+   multi-version story needs `pumpkin_util::version` ported first). Each
+   exposes its own `writePacketData`/`readPacketData` procs directly
+   instead of upstream's `ClientPacket`/`ServerPacket` traits, the same
+   shape `src/nbt/tag.nim`'s serialize/deserialize use. All 8 verified
+   with real round-trip encode→decode→compare tests in
+   `src/protocol/loginpacketstest.nim` (run via `nimony c -r`, not just
+   checked) - passing. NOT started: `data_component.rs` (2.9k),
+   `item_stack_seralizer.rs`, and the much larger remaining packet surface
+   (most play-state packets, `java/client/config/registry_data.rs` and
+   other NBT/registry-heavy ones, all of `bedrock/`).
    Still not started (~36k LOC): `codec/data_component.rs` (2.9k),
    `codec/item_stack_seralizer.rs`, `serial/*`, `query.rs`, `rcon.rs`, the
    `java/`'s and `bedrock/`'s several hundred individual packet types,
@@ -352,9 +370,30 @@ Smallest/most self-contained crates first, since later crates depend on them:
     (`ChunkSectionBlockStates`/`ChunkSectionBiomes`, `format/anvil.rs`/
     `format/linear.rs`, ~3.5k lines) - a separate, more mechanical
     follow-up now that the in-memory shape is settled.
-    Not started: `block/`, `biome/` (need the full `data` block/
-    biome registry), the rest of `chunk/` (`mod.rs`, `format/`, `io/`),
-    `level.rs`, `world.rs`, `lighting/`, `poi/`, `world_info/`,
+    `biome/`'s climate-parameter math is now ported: `data`'s (generated)
+    `quantize_coord`/`unquantize_coord`/`Parameter`/`TargetPoint`/
+    `ParameterPoint` plus `biome/multi_noise.rs`'s `to_long` and
+    `biome/mod.rs`'s `hash_seed`, all combined into `src/world/biomeparam.nim`
+    since none of the individual pieces are meaningful alone and all are
+    pure, registry-free math. `hash_seed` uses the `sha256` already
+    available via the `jwt` sibling repo's cross-repo import. Verified with
+    `biomeparamtest.nim` (`nimony c -r`) against upstream's own
+    `hash_seed_test` vectors (`hash_seed(0) == 8794265229978523055`,
+    `hash_seed(-777i64 as u64) == -1087248400229165450`) plus
+    Parameter-distance/ParameterPoint-fitness sanity checks — both pass.
+    The rest of `biome/` (`BiomeSupplier`/`MultiNoiseBiomeSupplier`/
+    `ActiveBiomeSupplier` in `mod.rs`, all of `position_finder.rs`,
+    `end.rs`) needs the unported generated `BiomeTree`/biome registry and
+    `MultiNoiseSampler` (noise sampling - `perlin.rs`/`simplex.rs` are
+    unverified even where present), so left for later.
+    `lighting/` hits the same dead end `block/` already documented in
+    `src/server/block/README.md`: `lighting/storage.rs` (the smallest
+    file, 184 lines) already needs `chunk_system::{Chunk, Cache}`, which
+    doesn't exist yet even as a stub — `engine.rs`/`runtime.rs` (892/637
+    lines) are built on the same foundation, so not attempted.
+    Not started: `block/`, the rest of `biome/` (registry-dependent parts),
+    the rest of `chunk/` (`mod.rs`, `format/`, `io/`),
+    `level.rs`, `world.rs`, the rest of `lighting/`, `poi/`, `world_info/`,
     `chunk_system/`, all of `generation/`.
 12. the main server crate (~269k LOC) — **Assessed; tiny slice
     ported, full map written.** Ported `error.rs`'s a shared error trait as
