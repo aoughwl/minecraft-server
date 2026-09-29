@@ -37,7 +37,14 @@ is settled, not the generated output by hand.
 - `permissions.nim` - the plugin sandbox capability-string constants
   (`network.*`, `fs.*`, `sys.*`, `http.outbound`). Pure data, no `wit`
   dependency. `nimony check` clean.
-- `eventdata.nim` - a real server-side `EventData` model, now for 56 events
+- `eventdata.nim` - a real server-side `EventData` model, now for 82 events
+  (56 from prior passes, plus `EntityCombust`/`EntityRegainHealth`/
+  `EntityAirChange`/`EntityBreed`/`EntityMount`/`EntityPortal`/
+  `EntityShootBow`/`EntityTame`/`EntityTarget`/`EntityTargetLivingEntity`/
+  `EntityToggleGlide`/`EntityTransform`/`EntityRemove`/`BlockDamage`/
+  `BlockFromTo`/`BlockExplode`/`BlockPhysics`/`BlockFade`/`SpongeAbsorb`/
+  `HangingBreak`/`HangingBreakByEntity`/`WorldLoad`/`WorldUnload`/
+  `ChunkUnload`/`TimeSkip`/`MoistureChange`)
   (`PlayerJoin`/`PlayerLeave`/`PlayerTeleport`/`PlayerGamemodeChange`/
   `PlayerToggleSneak`/`PlayerMove`/`PlayerChat`/`BlockPlace`/`BlockBreak`/
   `EntityDamage`/`EntityDeath`/`PlayerDeath`/`EntitySpawn`/`ItemSpawn`/

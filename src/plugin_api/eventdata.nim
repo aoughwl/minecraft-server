@@ -404,3 +404,143 @@ type
     player*: PlayerUuid
     recipeId*: string
     cancelled*: bool
+
+  EntityCombustEventData* = object
+    entityId*: int32
+    durationSecs*: float32
+    cancelled*: bool
+
+  EntityRegainHealthEventData* = object
+    entityId*: int32
+    amount*: float32
+    cancelled*: bool
+
+  EntityAirChangeEventData* = object
+    entityId*: int32
+    amount*: int32
+    cancelled*: bool
+
+  EntityBreedEventData* = object
+    fatherId*: int32
+    motherId*: int32
+    childId*: int32
+    cancelled*: bool
+
+  EntityMountEventData* = object
+    entityId*: int32
+    mountedId*: int32
+    cancelled*: bool
+
+  EntityPortalEventData* = object
+    entityId*: int32
+    portalPos*: BlockPos
+    cancelled*: bool
+
+  EntityShootBowEventData* = object
+    entityId*: int32
+    weaponName*: string
+    force*: float32
+    cancelled*: bool
+
+  EntityTameEventData* = object
+    ## `owner: player` becomes `PlayerUuid`, same reasoning as `player`
+    ## fields throughout this file.
+    entityId*: int32
+    owner*: PlayerUuid
+    cancelled*: bool
+
+  EntityTargetEventData* = object
+    ## `target-id: option<s32>` becomes a (hasX, x) pair.
+    entityId*: int32
+    hasTargetId*: bool
+    targetId*: int32
+    cancelled*: bool
+
+  EntityTargetLivingEntityEventData* = object
+    entityId*: int32
+    hasTargetId*: bool
+    targetId*: int32
+    reason*: string
+    cancelled*: bool
+
+  EntityToggleGlideEventData* = object
+    entityId*: int32
+    isGliding*: bool
+    cancelled*: bool
+
+  EntityTransformEventData* = object
+    entityId*: int32
+    newEntityId*: int32
+    transformReason*: string
+    cancelled*: bool
+
+  EntityRemoveEventData* = object
+    entityId*: int32
+    cause*: string
+    cancelled*: bool
+
+  BlockDamageEventData* = object
+    player*: PlayerUuid
+    blockPos*: BlockPos
+    instaBreak*: bool
+    cancelled*: bool
+
+  BlockFromToEventData* = object
+    fromPos*: BlockPos
+    toPos*: BlockPos
+    cancelled*: bool
+
+  BlockExplodeEventData* = object
+    blockPos*: BlockPos
+    yieldRate*: float32
+    cancelled*: bool
+
+  BlockPhysicsEventData* = object
+    blockPos*: BlockPos
+    changedPos*: BlockPos
+    cancelled*: bool
+
+  BlockFadeEventData* = object
+    blockPos*: BlockPos
+    cancelled*: bool
+
+  SpongeAbsorbEventData* = object
+    blockPos*: BlockPos
+    cancelled*: bool
+
+  HangingBreakEventData* = object
+    ## `remover-entity-id: option<s32>` becomes a (hasX, x) pair.
+    entityId*: int32
+    hasRemoverEntityId*: bool
+    removerEntityId*: int32
+    cancelled*: bool
+
+  HangingBreakByEntityEventData* = object
+    entityId*: int32
+    removerEntityId*: int32
+    cancelled*: bool
+
+  WorldLoadEventData* = object
+    ## `target-world: %world` dropped, same reasoning as EntitySpawn above.
+    ## The WIT record has no other fields; kept as a marker type so the
+    ## event still exists in this model even though it's presently empty.
+    dummy*: bool
+
+  WorldUnloadEventData* = object
+    ## `target-world: %world` dropped, same reasoning as EntitySpawn above.
+    cancelled*: bool
+
+  ChunkUnloadEventData* = object
+    chunkX*: int32
+    chunkZ*: int32
+    cancelled*: bool
+
+  TimeSkipEventData* = object
+    skipAmount*: int64
+    cancelled*: bool
+
+  MoistureChangeEventData* = object
+    ## `target-world: %world` dropped, same reasoning as EntitySpawn above.
+    blockPos*: BlockPos
+    newMoisture*: int32
+    cancelled*: bool

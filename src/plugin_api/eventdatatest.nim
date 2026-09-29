@@ -314,4 +314,84 @@ assert invDragData.player == p1
 let craftData = CraftItemEventData(player: p1, recipeId: "minecraft:stick", cancelled: false)
 assert craftData.recipeId == "minecraft:stick"
 
+let combustData = EntityCombustEventData(entityId: 5'i32, durationSecs: 3.0'f32, cancelled: false)
+assert combustData.durationSecs == 3.0'f32
+
+let regainData = EntityRegainHealthEventData(entityId: 5'i32, amount: 2.0'f32, cancelled: false)
+assert regainData.amount == 2.0'f32
+
+let airData = EntityAirChangeEventData(entityId: 5'i32, amount: 300'i32, cancelled: false)
+assert airData.amount == 300'i32
+
+let breedData = EntityBreedEventData(fatherId: 1'i32, motherId: 2'i32, childId: 3'i32, cancelled: false)
+assert breedData.childId == 3'i32
+
+let mountData = EntityMountEventData(entityId: 5'i32, mountedId: 6'i32, cancelled: false)
+assert mountData.mountedId == 6'i32
+
+let portalData = EntityPortalEventData(entityId: 5'i32, portalPos: blockPos(1, 64, 1), cancelled: false)
+assert portalData.portalPos.y == 64
+
+let shootData = EntityShootBowEventData(entityId: 5'i32, weaponName: "bow", force: 1.0'f32, cancelled: false)
+assert shootData.weaponName == "bow"
+
+let tameData = EntityTameEventData(entityId: 5'i32, owner: p1, cancelled: false)
+assert tameData.owner == p1
+
+let targetData = EntityTargetEventData(entityId: 5'i32, hasTargetId: true, targetId: 9'i32, cancelled: false)
+assert targetData.hasTargetId
+assert targetData.targetId == 9'i32
+
+let targetLivingData = EntityTargetLivingEntityEventData(entityId: 5'i32, hasTargetId: false, targetId: 0'i32, reason: "closest", cancelled: false)
+assert not targetLivingData.hasTargetId
+assert targetLivingData.reason == "closest"
+
+let glideData = EntityToggleGlideEventData(entityId: 5'i32, isGliding: true, cancelled: false)
+assert glideData.isGliding
+
+let transformData = EntityTransformEventData(entityId: 5'i32, newEntityId: 7'i32, transformReason: "curing", cancelled: false)
+assert transformData.newEntityId == 7'i32
+
+let removeData = EntityRemoveEventData(entityId: 5'i32, cause: "death", cancelled: false)
+assert removeData.cause == "death"
+
+let blockDamageData = BlockDamageEventData(player: p1, blockPos: blockPos(1, 64, 1), instaBreak: true, cancelled: false)
+assert blockDamageData.instaBreak
+
+let fromToData = BlockFromToEventData(fromPos: blockPos(1, 64, 1), toPos: blockPos(2, 64, 1), cancelled: false)
+assert fromToData.toPos.x == 2
+
+let blockExplodeData = BlockExplodeEventData(blockPos: blockPos(1, 64, 1), yieldRate: 0.5'f32, cancelled: false)
+assert blockExplodeData.yieldRate == 0.5'f32
+
+let physicsData = BlockPhysicsEventData(blockPos: blockPos(1, 64, 1), changedPos: blockPos(1, 65, 1), cancelled: false)
+assert physicsData.changedPos.y == 65
+
+let fadeData = BlockFadeEventData(blockPos: blockPos(1, 64, 1), cancelled: false)
+assert not fadeData.cancelled
+
+let spongeData = SpongeAbsorbEventData(blockPos: blockPos(1, 64, 1), cancelled: false)
+assert not spongeData.cancelled
+
+let hangBreakData = HangingBreakEventData(entityId: 5'i32, hasRemoverEntityId: false, removerEntityId: 0'i32, cancelled: false)
+assert not hangBreakData.hasRemoverEntityId
+
+let hangBreakByData = HangingBreakByEntityEventData(entityId: 5'i32, removerEntityId: 6'i32, cancelled: false)
+assert hangBreakByData.removerEntityId == 6'i32
+
+let worldLoadData = WorldLoadEventData(dummy: true)
+assert worldLoadData.dummy
+
+let worldUnloadData = WorldUnloadEventData(cancelled: false)
+assert not worldUnloadData.cancelled
+
+let chunkUnloadData = ChunkUnloadEventData(chunkX: 3'i32, chunkZ: -2'i32, cancelled: false)
+assert chunkUnloadData.chunkZ == -2'i32
+
+let timeSkipData = TimeSkipEventData(skipAmount: 24000'i64, cancelled: false)
+assert timeSkipData.skipAmount == 24000'i64
+
+let moistureData = MoistureChangeEventData(blockPos: blockPos(1, 64, 1), newMoisture: 4'i32, cancelled: false)
+assert moistureData.newMoisture == 4'i32
+
 echo "all eventdata checks passed"
