@@ -203,8 +203,34 @@ Smallest/most self-contained crates first, since later crates depend on them:
     `drag_handler.rs`, `sync_handler.rs`, `gui_builder.rs`,
     `entity_equipment.rs` — all need either the real item/registry
     types, `Player`/`World` types from the main `pumpkin` crate, or both.
-11. `pumpkin` (main server crate, ~269k LOC)
-12. `pumpkin-data` (~1.5M LOC — almost entirely generated block/item/registry
+11. `pumpkin-world` (~78.6k LOC) — **Just started.** The crate is
+    dominated by world generation (noise/structure/feature placement under
+    `generation/`, ~65k of the 78.6k LOC) which needs pumpkin-util's
+    still-incomplete noise/random port and is out of scope for now.
+    Ported instead, from the smaller top-level/tick/chunk-loading surface:
+    `cylindrical_chunk_iterator.rs` → `src/world/cylindrical.nim` (view-distance
+    cylinder membership + load/unload diffing; the LUT-based
+    `all_chunks_within` fast path was replaced with a direct bounding-loop
+    recompute, since its LUT lives in unported pumpkin-data - same
+    semantics, no precomputed table), `tick/mod.rs` → `src/world/tick.nim`
+    (`TickPriority`, `ScheduledTick`/`OrderedTick`, NBT (de)serialization -
+    specialized to a `value: string` id rather than upstream's generic
+    `T: ToResourceLocation`, since no block/fluid registry type exists yet;
+    a local `BlockPos` stand-in covers for `pumpkin_util::math::position`,
+    also not ported yet), and `tick/scheduler.rs` →
+    `src/world/tickscheduler.nim` (the ring-buffer `ChunkTickScheduler` -
+    de-async'd to a plain single-threaded version, no concurrency model
+    exists yet for the tick loop; same string-specialization as tick.nim).
+    `dimension.rs` is a two-line stub documenting why it's blocked
+    (`Level`/`pumpkin_data::dimension::Dimension` both unported).
+    Not started: `block/`, `biome/` (need the full `pumpkin-data` block/
+    biome registry), `chunk/` (palette/section storage - `chunk/palette.rs`'s
+    core `PalettedContainer<V, const DIM: usize>` needs const-generic
+    arrays, worth a real design pass rather than a rushed port), `level.rs`,
+    `world.rs`, `lighting/`, `poi/`, `world_info/`, `chunk_system/`, all of
+    `generation/`.
+12. `pumpkin` (main server crate, ~269k LOC)
+13. `pumpkin-data` (~1.5M LOC — almost entirely generated block/item/registry
    tables; port the generator, not the generated output, once the shape of
    everything above is settled)
 
