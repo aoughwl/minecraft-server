@@ -264,13 +264,45 @@ since `gen_attributes.nim` landed) - revisit once `data_component_impl` lands.
   another `{.raises.}` call's `try` scope. Documented here since
   SendFeedback quota was exhausted this session; worth filing upstream
   once quota resets.
-- `test_instance.rs` (155 lines) - investigated, not ported this pass.
-  Recursively scans `test_instance/` directories across multiple
-  "packs" (the base `assets/datapack` plus every subdirectory of
-  `assets/tests/datapacks`), each pack scanned per-namespace with
-  unbounded-depth directory recursion - a genuinely bigger task than
-  `chunk_view_lut`/`context_provider`'s one-level scans, deferred to a
-  dedicated pass rather than rushed.
+- `template_bytes.rs` → `gen_template_bytes.nim` → `src/generated/template_bytes.nim`
+  and `test_instance.rs` → `gen_test_instance.nim` → `src/generated/test_instance.nim`
+  - **done, superseding the "deferred" note below**. Both were previously
+  deferred as "needing unbounded-depth multi-pack recursion" - on closer
+  reading that's just bounded recursive directory walking (each of the 3
+  packs' `structure`/`test_instance` subtree is finite and shallow in
+  practice), the same shape `registry.rs`/`painting_variant.rs` already
+  handle; the original assessment under-triaged it, same as
+  `mob_variant.rs`/`villager.rs` turned out to be. Walks the base
+  `assets/datapack` plus every subdirectory of `assets/tests/datapacks`
+  (3 packs total), each pack scanned per-namespace, recording a
+  resource-id → real-on-disk-path table (matching the default-namespace
+  bare-id aliasing upstream's `is_default` flag controls) rather than
+  embedding file contents - see `gen_template_bytes.nim`'s doc comment for
+  why (embedding ~1500 binary `.nbt` files as Nimony byte literals would
+  dwarf even `sound.nim`'s already-slow 1991-entry table for comparatively
+  little value while nothing in this port consumes structure data yet).
+  Verified for real: **1513** structure templates and **3** test
+  instances, matching an independent on-disk count exactly, with
+  `templatestest.nim` confirming real lookups (both resource-id and, for
+  the default namespace, bare-id) resolve to paths that actually
+  `fileExists` - not just that the generator ran without error.
+
+  **Found and fixed a new, real Nimony bug**: a `var Table[K, V]`
+  out-parameter's writes are lost across the proc-call boundary - an
+  instrumented first attempt showed `results.len` growing correctly
+  *inside* the callee on every write (1, 2, 3, ... past 30), but the
+  caller saw only the very first write once the proc returned, silently
+  dropping over 99% of ~1500 real entries with no error at any stage.
+  True independent of recursion depth (reproduced identically with both a
+  recursive and a flat iterative version of the same walk). Worked around
+  by having the scan proc return a `seq[TemplateEntry]`/
+  `seq[TestInstanceEntry]` by value instead of writing into a `var Table`
+  out-param, with the caller building its own table from the returned
+  seq. Filed in `NIMONY-COMPILER-BUGS.md`. Also hit and fixed the
+  already-known "Windows path separator breaks a Nimony string literal"
+  issue (forward-slash-normalize any path before embedding it as a
+  literal - the same class of issue as escaping quotes, just specific to
+  this port's Windows dev environment).
 - `noise_parameter.rs` → `gen_noise_parameter.nim` →
   `src/generated/noise_parameter.nim`. Walks the real (flat, no
   subdirectories) `assets/datapack/data/minecraft/worldgen/noise/`
@@ -498,7 +530,7 @@ which fails Nimony's C-codegen (NIMONY-COMPILER-BUGS.md #3).
 
 ## What's NOT done
 
-The remaining ~64 submodules (these last are large and encode
+The remaining ~62 submodules (these last are large and encode
 real structural complexity - nested data shapes, cross-references between
 registries, not just flat string arrays). Each needs the same treatment as
 `sound_category.rs`: read its `.rs` source, understand its JSON input shape

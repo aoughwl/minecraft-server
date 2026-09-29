@@ -340,6 +340,38 @@ first.
 
 ---
 
+## 12. `var Table[K, V]` out-parameter writes are lost across the proc-call boundary on return
+
+**Severity: high.** This is a silent-data-loss bug, not a crash — the kind
+that's easy to ship undetected. A proc taking `results: var Table[K, V]` and
+writing into it (`results[key] = value`) behaves correctly *while still
+inside that proc* — `results.len` was observed growing normally on every
+write, from 1 up past 30 in an instrumented run — but once the proc returns,
+the caller's own table reflects only the very first write. Over 99% of
+~1500 real entries vanished silently, with no error at any stage: `nimony
+check` passed, `nimony c -r` ran to completion and printed a plausible
+(wrong) result.
+
+**Reproduced independent of recursion depth**: the first attempt threaded
+`var Table` through a recursive directory-walk proc (hypothesizing the loss
+was recursion-depth-related, since deeper writes seemed to vanish first);
+rewriting the *same* walk iteratively — a single proc, one `while` loop, no
+recursion at all — hit the identical loss pattern. The bug is in `var
+Table[K, V]` parameter passing itself, not in recursion.
+
+**Found in:** `src/data_codegen/gen_template_bytes.nim`/`gen_test_instance.nim`
+while porting `template_bytes.rs`/`test_instance.rs` (a directory-walk +
+lookup-table generator pair).
+
+**Workaround:** have the callee return its findings by value (`seq[T]`, in
+this case) instead of writing into a `var Table`/`var seq`-as-accumulator
+out-parameter; have the caller build its own table from what's returned.
+Every write then happens in the caller's own frame.
+
+**Filed:** no — documented in-repo only.
+
+---
+
 ## Summary table
 
 | # | Bug | Nimony check | `c -r` / C-codegen | Filed |
@@ -355,3 +387,4 @@ first.
 | 9 | `{.noinit.}` skips zero-init, not just the proof | passes | silently wrong data | no |
 | 10 | `readFile` inside `try` inside `walkDir` | passes | broken C-codegen | no |
 | 11 | Tuple-destructure `for` over local seq var | crashes (parser) | — | no |
+| 12 | `var Table[K,V]` out-param writes lost on return | passes | **silently wrong data, no crash** | no |
