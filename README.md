@@ -356,13 +356,38 @@ Smallest/most self-contained crates first, since later crates depend on them:
     hierarchy (Nimony's vtable-`Inventory` has no room to extend); its
     `recipe_provider.rs` sibling stays unported (needs
     `pumpkin_protocol::codec::recipe`/`data::recipes`).
-    ~9.9k of ~11k LOC in the crate remain: `screen_handler.rs`
-    (1.3k, the big one), all the per-container `*_screen_handler.rs`
-    files, `player/`, `brewing/`, `furnace_like/`,
-    `enchanting/`, `anvil/`, `merchant/`, `container_click.rs`,
-    `drag_handler.rs`, `sync_handler.rs`, `gui_builder.rs` — all need
-    either the real item/registry types, `Player`/`World` types from the
-    main server crate, or both.
+    **`screen_handler.rs`'s design decision made** (1.3k lines, ~30-method
+    trait): same scoped-down manual-vtable approach as
+    `src/server/block/blockbehaviour.nim`'s - `ScreenHandler` is a
+    ref-object vtable covering `quickMove`/`onClosed` (what a proof-case
+    concrete handler needs), not the full click-routing surface
+    (`internal_on_slot_click` alone is 434 lines needing `Player`/`World`).
+    Ported to `src/inventory/screenhandler.nim`: `ScreenProperty` (full,
+    self-contained, using the existing `PropertyDelegate` vtable),
+    `ScreenHandlerBehaviour` (plain struct: slots/syncId/windowType),
+    `addSlot`/`addPlayer{Hotbar,Inventory}Slots`, and `insertItem` - a
+    full, faithful port of the 86-line slot-merge algorithm, since it's
+    pure slot-index/count arithmetic with no Player/World dependency at
+    all. Concrete proof case: `beacon_screen_handler.rs` →
+    `src/inventory/beaconhandler.nim` (`newBeaconScreenHandler`, full
+    quick-move logic). `itemstub.nim` grew `setCount`/`isStackable` to
+    support `insertItem`. `screenhandlertest.nim` exercises `insertItem`
+    directly (closure-free, pure algorithm - passes) and builds a beacon
+    handler shape-check; building/using the handler itself hits the same
+    closures-through-vtables runtime crash documented elsewhere in this
+    port (4th independent confirmation, after `src/command/`,
+    `src/server/entity/`, `src/server/block/) - `nimony check` clean,
+    `nimony c -r` crashes at `eraiser.nim`'s `ParamsTagId` assertion.
+    Documented, not hidden.
+    Still ~8.5k of ~11k LOC remain: all the per-container
+    `*_screen_handler.rs` files beyond beacon, `player/`, `brewing/`,
+    `furnace_like/`, `enchanting/`, `anvil/`, `merchant/`,
+    `container_click.rs`, `drag_handler.rs`, `sync_handler.rs`,
+    `gui_builder.rs`, and `internal_on_slot_click`'s full click-routing
+    logic — all need either the real item/registry types, `Player`/`World`
+    types from the main server crate, or both. Extending
+    `ScreenHandler`'s vtable as more handlers land is mechanical from
+    here, per `blockbehaviour.nim`'s precedent.
 11. `world` (~78.6k LOC) — **Just started.** The crate is
     dominated by world generation (noise/structure/feature placement under
     `generation/`, ~65k of the 78.6k LOC) which needs util's

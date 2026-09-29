@@ -44,6 +44,14 @@ proc decrement*(s: var ItemStack, amount: uint8) {.inline.} =
 proc increment*(s: var ItemStack, amount: uint8) {.inline.} =
   s.itemCount += amount
 
+proc setCount*(s: var ItemStack, count: uint8) {.inline.} =
+  s.itemCount = count
+
+proc isStackable*(s: ItemStack): bool {.inline.} =
+  ## TODO: real stackability also checks max-stack-size > 1 and no
+  ## uncombinable components (durability items etc.) - not ported yet.
+  s.getMaxStackSize() > 1'u8
+
 proc split*(s: var ItemStack, amount: uint8): ItemStack =
   ## Splits `amount` items off `s` into a new stack, decrementing `s` in
   ## place - port of `ItemStack::split`.
