@@ -471,10 +471,34 @@ doc comment. Verified via `villagertest.nim` (`nimony c -r`): profession
 count, `farmer`'s exact requested-items list, and type-name resolution all
 match source JSON.
 
+## noise_router.rs - scoped down (node-kind enum only, not the DAG)
+
+`noise_router.rs` (3405 lines - the largest generator in the suite) builds
+a hash-consed DAG of density-function tree nodes plus a recursive
+`SplineRepr` sub-format, emitted as Rust `static` data with index-based
+cross-references - real compiler-shaped work (hash-consing, topological
+ordering), not attempted. Scoped down to `DensityFunctionKind`, the flat
+enum of the 26 node kinds `DensityFunctionRepr` distinguishes, landed as
+`src/generated/noise_router.nim`, verified internally consistent
+(`noise_routertest.nim`, `nimony c -r`: all 26 kinds round-trip through
+`densityFunctionKindToJsonType`/`FromJsonType`).
+
+**Correction worth flagging**: `DensityFunctionRepr` is
+`#[serde(tag = "_class", content = "value")]` - a DIFFERENT wire format
+from the human-authored datapack JSON under
+`assets/datapack/.../worldgen/density_function/**/*.json`, which uses
+namespaced `"type": "minecraft:noise"`-style tags with no `_class`/`value`
+wrapper. This pass did not locate whatever internal/precomputed JSON
+source actually feeds `DensityFunctionRepr::deserialize` - the mapping
+below is NOT verified against real on-disk data, only internally
+consistent. A future pass building the real DAG should also track that
+down, and should model the tree as a flat `seq[Node]` with index-based
+child references rather than a directly self-recursive `case object`,
+which fails Nimony's C-codegen (NIMONY-COMPILER-BUGS.md #3).
+
 ## What's NOT done
 
-The remaining ~65 submodules, including
-`noise_router.rs` (these last are large and encode
+The remaining ~64 submodules (these last are large and encode
 real structural complexity - nested data shapes, cross-references between
 registries, not just flat string arrays). Each needs the same treatment as
 `sound_category.rs`: read its `.rs` source, understand its JSON input shape
