@@ -25,7 +25,14 @@ Smallest/most self-contained crates first, since later crates depend on them:
    across the crate are intentionally skipped for now (see doc comments).
    ~2.5k of ~15.6k LOC covered; `text/mod.rs` (2.2k), `noise/*` (1.7k),
    `random/*` (1.5k), and the `math/` vector/position/provider files remain.
-3. `pumpkin-config` (~2.2k LOC)
+3. `pumpkin-auth` (~587 LOC) — **Mostly blocked.** `jwt/mod.rs`'s claims
+   model, error kinds, and base64 decoding are ported to `src/auth/jwt.nim`.
+   Its actual JWT signature verification needs NIST P-384 ECDSA, which
+   Nimony's stdlib (checked `~/nimony/lib/std/`) does not provide at all —
+   no elliptic-curve primitives beyond nothing. `client.rs` (reqwest/rustls
+   HTTP client glue) is skipped outright: no Nimony HTTP+TLS client to
+   build on. See doc comments in `src/auth/jwt.nim` / `src/auth/client.nim`.
+4. `pumpkin-config` (~2.2k LOC)
 4. `pumpkin-codecs` / `pumpkin-protocol` (~40k LOC combined)
 5. `pumpkin-world`, `pumpkin-inventory`, `pumpkin-command`
 6. `pumpkin` (main server crate, ~269k LOC)
