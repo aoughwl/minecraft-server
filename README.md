@@ -548,9 +548,35 @@ Smallest/most self-contained crates first, since later crates depend on them:
     shape as the already-deferred scheduler crate (no concurrency model
     chosen, and it needs its own arena/slotmap equivalent besides).
     Assessed and left blocked, not attempted.
+    `chunk/mod.rs`'s in-memory chunk-storage data model is now ported at
+    `src/world/chunkdata.nim`: `ChunkHeightmaps` (the real 9-bit-per-column,
+    7-columns-per-i64-word packing from `set`/`get`, not a placeholder) and
+    `ChunkSections` (an array of `PalettedContainer`s - one 16³ block
+    section + one 4³ biome section per vertical slice - replacing
+    upstream's `RwLock<Box<[BlockPalette]>>`/`RwLock<Box<[BiomePalette]>>`
+    with plain fields, since no concurrency model exists yet, same punt as
+    everywhere else). `getBlock`/`setBlock` resolve a world-space (x,y,z)
+    to the right section + local cell. `chunkdatatest.nim` round-trips
+    heightmaps across a full 16×16 column grid (catching any shift/mask/
+    word-boundary bug) and blocks across 4 points spanning sections 0
+    through 23 of a -64..319 range (`nimony c -r`, both pass) - this also
+    surfaced and fixed a bug in the TEST itself, not the implementation
+    (`sectionIndex(s, minY + 319)` evaluates to `sectionIndex(255)`, not
+    319 - worth remembering when spot-checking with derived constants).
+    The full `ChunkData` (light engine, blending data, NBT (de)serialization,
+    tick-scheduler wiring) stays out of scope - it needs the still-unported
+    light engine and the zlib gap already documented for `anvilformat.nim`/
+    `poi.nim`. `level.rs`/`world.rs` (the World/Level aggregate managing
+    which chunks are loaded) were read but not ported this pass: their
+    chunk-lookup map is straightforward now (`chunkdata.nim` + a
+    `Table[(int32,int32), ChunkSections]`-shaped index would cover it), but
+    `level.rs`'s 1080 lines are dominated by the async chunk-loading
+    pipeline (ticket system, load/unload scheduling) that's still blocked
+    on the same concurrency-model decision as `chunk_system/`/scheduler -
+    a real design pass, not attempted here.
     Not started: `block/`, the rest of `biome/` (registry-dependent parts),
-    the rest of `chunk/` (`mod.rs`, `io/`),
-    `level.rs`, `world.rs`, the rest of `lighting/`, `world_info/`.
+    `chunk/io/`, `level.rs`/`world.rs` (data model above; the rest per above),
+    the rest of `lighting/`, `world_info/`.
 12. the main server crate (~269k LOC) — **Assessed; tiny slice
     ported, full map written.** Ported `error.rs`'s a shared error trait as
     overloaded procs → `src/server/errorclass.nim` (over `InventoryError`/
