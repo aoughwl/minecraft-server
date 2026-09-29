@@ -145,3 +145,42 @@ not the whole module.
    `blocktest.nim` extended to register/exercise both. Same
    `nimony check` clean / `nimony c -r` closures-through-vtables-crash
    caveat as every other block file.
+
+8. **`BlockStateId`/property-permutation system built** - the actual
+   blocker for `logs.rs`/`chain.rs`/`end_rod.rs`/`end_portal_frame.rs`/
+   `glazed_terracotta.rs`. Extended `src/data_codegen/gen_block.nim`'s
+   scope: new `gen_blockprops.nim` reads `assets/properties.json` (124
+   property definitions, each with a stable `hash_key`) and each block's
+   `properties`/`states` fields in `assets/blocks.json`, and computes the
+   same mixed-radix per-property multiplier upstream's `block.rs`
+   generator does (see `gen_blockprops.nim`'s doc comment for the exact
+   algorithm) - real output at `src/generated/blockprops.nim` (1286
+   blocks' property lists + multipliers, 124 property defs).
+   `src/server/block/blockstateid.nim` builds `resolveStateId(blockName,
+   propValues)`/`statePropValues(blockName, stateId)` on top of that -
+   given a block + property values, compute the concrete state id, and
+   the reverse. Extended `BlockBehaviour`'s vtable with `onPlaceImpl`
+   (scoped to the `(direction, waterlogged)` args `chain.rs` needs -
+   upstream's real `OnPlaceArgs<'_>` bundles far more, extend as more
+   blocks land) and its trait-default body (`args.block.default_state.id`).
+
+   **Proof case**: `chain.nim` (`minecraft:iron_chain`) - a real
+   TWO-property block (axis + waterlogged), computing a genuinely
+   different state id for each of 6 placement directions × 2 waterlogged
+   values. `blockstateidtest.nim` verifies oak_log's single-property case
+   (all 3 axis values decode to the exact real state ids 139/140/141,
+   default-omitted resolves to the real default 140) AND iron_chain's
+   two-property case (bdUp/false → axis=y decodes back correctly,
+   bdEast/true → axis=x + waterlogged=true, and the two inputs produce
+   different state ids) - actually run via `nimony c -r`. Hits the
+   documented closures-through-vtables crash (same signature, confirmed
+   again) since it imports `entity.nim` transitively via
+   `blockbehaviour.nim` - check-verified, not runtime-proven, same
+   caveat as every other file in this directory.
+
+   Not ported (same cut as `gen_block.nim`): the full per-state
+   `states[]` array (collision/outline shapes, opacity, luminance) - only
+   the id↔property-values mapping. `logs.rs`/`end_rod.rs`/
+   `end_portal_frame.rs`/`glazed_terracotta.rs` themselves not yet ported
+   as further proof cases (chain.rs alone was the scope of this pass) -
+   should now be straightforward given the same pattern.

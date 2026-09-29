@@ -20,10 +20,23 @@ import ../entity/entity
 import ../item/itembehaviour
 import ../../generated/blockdata as realblock
 import blockmisc
+import blockstateid
 import std/tables
 import std/strutils
 
 type
+  BlockDirection* = enum
+    ## Port of `pumpkin_data::BlockDirection` (the 6-way face enum used by
+    ## `on_place`'s placement direction). Only the variant NAMES are
+    ## needed here - the real type carries id/opposite/axis helpers this
+    ## port doesn't need yet.
+    bdNorth
+    bdSouth
+    bdEast
+    bdWest
+    bdUp
+    bdDown
+
   BlockBehaviour* = ref object
     ## Manual-vtable interface, the same pattern as `src/inventory/
     ## inventory.nim`'s `Inventory` and `src/server/entity/entity.nim`'s
@@ -40,6 +53,13 @@ type
       ## none of those exist as real types here yet, so this is scoped to
       ## the no-argument case every current caller (fletching_table.rs)
       ## actually needs. Extend the signature once a block needs the args.
+    onPlaceImpl*: proc(direction: BlockDirection, waterlogged: bool): int {.closure.}
+      ## Port of `mod.rs`'s `on_place`. Upstream's real `OnPlaceArgs<'_>`
+      ## bundles `&World`/`&Player`/`replacing: &BlockState`/etc.; scoped
+      ## here to the two inputs `chain.rs` (the first real state-permuting
+      ## caller) actually reads: the placement direction and whether the
+      ## replaced block was a water source. Extend once a block needs
+      ## more of the real args.
 
 # --- upstream's two free helper fns (mod.rs) --------------------------------
 
@@ -80,6 +100,11 @@ proc defaultNormalUse*(): BlockActionResult =
   ## `mod.rs`'s `normal_use` trait default: `BlockActionResult::Pass`.
   barPass
 
+proc defaultOnPlace*(blockName: string): int =
+  ## `mod.rs`'s `on_place` trait default: `args.block.default_state.id`.
+  let (found, id) = blockstateid.defaultStateId(blockName)
+  if found: id else: 0
+
 proc defaultIsPathfindable*(stateId: uint32, computationType: PathComputationType): bool =
   ## Simplified stand-in for mod.rs's real default, which branches on
   ## `state.is_waterlogged()`/`Fluid::from_state_id(...).has_tag(...)` for
@@ -94,10 +119,12 @@ proc defaultIsPathfindable*(stateId: uint32, computationType: PathComputationTyp
   of pctWater: false
   of pctLand, pctAir: true
 
-proc newBlockBehaviour*(): BlockBehaviour =
+proc newBlockBehaviour*(blockName: string = ""): BlockBehaviour =
   ## A `BlockBehaviour` with every method at its trait-default body -
   ## matches upstream's `impl BlockBehaviour for X {}` (an empty impl
-  ## block, which just inherits every default).
+  ## block, which just inherits every default). `blockName` is only
+  ## needed for `defaultOnPlace`'s real-default-state lookup; blocks that
+  ## don't need it (nothing calls `onPlace`) can omit it.
   BlockBehaviour(
     onLandedUponImpl: (proc(entity: EntityBase, fallDistance: float64) {.closure.} =
       defaultOnLandedUpon(entity, fallDistance)),
@@ -107,6 +134,10 @@ proc newBlockBehaviour*(): BlockBehaviour =
       defaultIsPathfindable(stateId, computationType)),
     normalUseImpl: (proc(): BlockActionResult {.closure.} =
       defaultNormalUse()),
+    onPlaceImpl: (proc(direction: BlockDirection, waterlogged: bool): int {.closure.} =
+      discard direction
+      discard waterlogged
+      defaultOnPlace(blockName)),
   )
 
 proc onLandedUpon*(b: BlockBehaviour, entity: EntityBase, fallDistance: float64) {.inline.} =
@@ -120,6 +151,9 @@ proc isPathfindable*(b: BlockBehaviour, stateId: uint32, computationType: PathCo
 
 proc normalUse*(b: BlockBehaviour): BlockActionResult {.inline.} =
   b.normalUseImpl()
+
+proc onPlace*(b: BlockBehaviour, direction: BlockDirection, waterlogged: bool): int {.inline.} =
+  b.onPlaceImpl(direction, waterlogged)
 
 # --- registration: replaces `#[pumpkin_block(name)]` ------------------------
 
