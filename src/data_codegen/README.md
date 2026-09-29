@@ -1,5 +1,31 @@
 # data codegen port
 
+## Audit: JsonNode missing-key crash (`{}` operator vs. `pairs()`)
+
+A generator (`noise_parameter.rs`'s port) found that Nimony's `std/json`
+`{}` lookup operator returns a default-constructed `JsonNode()` on a missing
+key, and calling `.kind` (or almost anything else) on that default crashes at
+*runtime* with an internal assertion failure - `nimony check` passes clean,
+only `nimony c -r` catches it. The fix, `codegenutil.nim`'s `jsonTryGet`, is
+now the house pattern for optional lookups.
+
+Audited every `gen_*.nim` file plus `codegenutil.nim`'s shared helpers
+(`jsonStringField`/`jsonNestedStringField`/`jsonBoolField`/`jsonFloatField`/
+`jsonIntField`, all written before `jsonTryGet` existed) for the unsafe `{}`
+operator. **Result: clean, no fix needed.** Every shared helper and every
+generator already does an explicit `pairs()` scan for field lookup (per
+`std/json`'s "no `[]` field-index operator" limitation, documented since the
+first generators), never the `{}`/`{key}` accessor that crashes. The only
+`{"..."}`-shaped matches in the whole directory are JSON example text inside
+doc comments/string literals (`gen_decorated_pot_pattern.nim`,
+`gen_dimension.nim`, `gen_game_rules.nim`, `gen_registry.nim`), not the risky
+operator. Re-ran `gen_registry.nim` (32 registries/433 files, the largest
+generator) and `gen_dimension.nim` end to end as an extra runtime check -
+both still produce correct output with no crash. So this bug, while real and
+worth having fixed, never actually affected any already-shipped generator
+output; nothing needs re-verifying.
+
+
 `crates/data` in the upstream repo is ~1.5M lines, but the project
 README's porting strategy already calls this correctly: it's almost entirely
 *generated* Rust source (block/item/biome/sound/etc. registry tables), not
