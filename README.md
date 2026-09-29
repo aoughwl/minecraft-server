@@ -86,9 +86,17 @@ Smallest/most self-contained crates first, since later crates depend on them:
    with no direct Nimony equivalent; deferred until a concrete consumer
    forces the design (e.g. `pumpkin-nbt`'s `nbt_ops.rs`, itself stubbed
    pending this).
-8. `pumpkin-world`, `pumpkin-inventory`, `pumpkin-command`
-9. `pumpkin` (main server crate, ~269k LOC)
-10. `pumpkin-data` (~1.5M LOC — almost entirely generated block/item/registry
+8. `pumpkin-plugin-utils` (~710 LOC) — **Done except HTTP.** `models.rs`,
+   `updater.rs`, `license.rs` (lease read/write via `std/json`, grace-period
+   evaluation), and `lib.rs`'s global-state glue → `src/plugin_utils/*.nim`.
+   `init(context)`'s WASM-guest path is skipped (needs unported
+   `pumpkin-plugin-api`). `http.rs` is a call-shape stub only: Nimony's
+   stdlib has no HTTP client or TLS at all, so `check_license_online`/
+   `check_for_updates` compile and return a clear "not implemented" error
+   rather than a fake success - needs libcurl/WinHTTP FFI eventually.
+9. `pumpkin-world`, `pumpkin-inventory`, `pumpkin-command`
+10. `pumpkin` (main server crate, ~269k LOC)
+11. `pumpkin-data` (~1.5M LOC — almost entirely generated block/item/registry
    tables; port the generator, not the generated output, once the shape of
    everything above is settled)
 
