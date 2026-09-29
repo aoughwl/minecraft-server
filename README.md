@@ -566,17 +566,30 @@ Smallest/most self-contained crates first, since later crates depend on them:
     The full `ChunkData` (light engine, blending data, NBT (de)serialization,
     tick-scheduler wiring) stays out of scope - it needs the still-unported
     light engine and the zlib gap already documented for `anvilformat.nim`/
-    `poi.nim`. `level.rs`/`world.rs` (the World/Level aggregate managing
-    which chunks are loaded) were read but not ported this pass: their
-    chunk-lookup map is straightforward now (`chunkdata.nim` + a
-    `Table[(int32,int32), ChunkSections]`-shaped index would cover it), but
-    `level.rs`'s 1080 lines are dominated by the async chunk-loading
-    pipeline (ticket system, load/unload scheduling) that's still blocked
-    on the same concurrency-model decision as `chunk_system/`/scheduler -
-    a real design pass, not attempted here.
+    `poi.nim`. `level.rs`/`world.rs`'s async chunk-loading pipeline (ticket
+    system, load/unload scheduling) remains blocked on the same
+    concurrency-model decision as `chunk_system/`/scheduler - a real design
+    pass, not attempted here. Its chunk-lookup HALF is done though:
+    `src/world/worldchunks.nim`'s `WorldChunks` is exactly the
+    `chunkdata.nim` + column-index shape flagged above - a
+    `seq[(ChunkPos, ChunkSections)]` linear-scan registry (matching
+    `src/server/playerregistry.nim`'s and `src/server/world/worldstub.nim`'s
+    own "plain seq, no fake concurrency" convention, deliberately not a
+    `var Table[K,V]` out-parameter given the crash cataloged for that shape
+    in `NIMONY-COMPILER-BUGS.md` #12) with `isChunkLoaded`/`loadChunk`/
+    `unloadChunk`/`getBlockState`/`setBlockState`. Kept additive alongside
+    (not merged into) `src/server/world/worldstub.nim`'s existing
+    flat-per-section `World` type, which already has live consumers across
+    `src/server/block/`/`src/server/item/`/`src/command/` - a future pass
+    can wire `WorldChunks` in once there's a concrete multi-chunk consumer.
+    `worldchunkstest.nim` genuinely runtime-proven (`nimony c -r`, no
+    `entity.nim` in its import graph): auto-load-on-write, per-column
+    isolation, negative-coordinate correctness (arithmetic shift-right
+    floors two's-complement negatives, verified not assumed), and
+    unload-removes-exactly-the-target-column all pass.
     Not started: `block/`, the rest of `biome/` (registry-dependent parts),
-    `chunk/io/`, `level.rs`/`world.rs` (data model above; the rest per above),
-    the rest of `lighting/`, `world_info/`.
+    `chunk/io/`, `level.rs`/`world.rs`'s async pipeline (chunk-lookup done
+    above), the rest of `lighting/`, `world_info/`.
 12. the main server crate (~269k LOC) — **Assessed; tiny slice
     ported, full map written.** Ported `error.rs`'s a shared error trait as
     overloaded procs → `src/server/errorclass.nim` (over `InventoryError`/
