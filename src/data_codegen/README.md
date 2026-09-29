@@ -575,3 +575,31 @@ count exactly). `potion_brewingtest.nim` verified via `nimony c -r`
 (no `entity.nim` in its import graph, genuinely runtime-proven): the
 alphabetically-first recipe's exact fields, plus a non-empty check
 across all 279 entries to catch any silent missing-key fallback.
+
+## bedrock_creative.rs (previously unattempted, now done)
+
+Ported the JSON-input branch only (upstream also falls back to a
+`.nbt`-file path and a previously-generated-file path when JSON is
+absent - neither asset exists here, so those branches don't apply).
+Reads `bedrock/runtime_item_states.json` (a flat name->id array, ~2100
+entries) to build a lookup, then `bedrock/creative_items.json`
+(groups + items) to emit `CREATIVE_GROUPS`/`CREATIVE_ENTRIES`.
+`category` string->int mapping matches upstream exactly. Items whose
+id has no match in the runtime-item-states table are silently
+dropped, matching upstream's `filter_map`.
+
+Used a local `safeGet`/`safeGetStr`/`safeGetInt` helper (a node-level
+equivalent of `codegenutil.jsonTryGet`, which only operates on a
+`var JsonTree`'s root) rather than raw `{}` lookups throughout, since
+`{}` on a missing key returns a broken default `JsonNode` that crashes
+at runtime (documented in NIMONY-COMPILER-BUGS.md) - this generator
+needed safe lookup several levels deep (group -> icon -> id).
+
+`gen_bedrock_creative.nim` actually run against the real assets,
+producing `src/generated/bedrock_creative.nim` (124 groups, 1980
+entries). `bedrock_creativetest.nim` verified via `nimony c -r` (no
+`entity.nim` in its import graph, genuinely runtime-proven): entry
+counts, the first group's exact fields (`itemGroup.name.planks`,
+category 1, icon id 5 for `oak_planks` - cross-checked against
+`runtime_item_states.json` directly), and every entry's `groupIndex`
+staying in range.
