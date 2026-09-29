@@ -32,6 +32,19 @@ Smallest/most self-contained crates first, since later crates depend on them:
    no elliptic-curve primitives beyond nothing. `client.rs` (reqwest/rustls
    HTTP client glue) is skipped outright: no Nimony HTTP+TLS client to
    build on. See doc comments in `src/auth/jwt.nim` / `src/auth/client.nim`.
+5. `pumpkin-scheduler` (~662 LOC) — **Data model done, driver deferred.**
+   `domain.rs`, `error.rs`, and the pure-data parts of `task.rs`/
+   `scheduler.rs` (`SchedulerTaskId`, `TaskContext`, `SchedulerConfig`,
+   `SchedulerState`, `SchedulerSnapshot`) are ported to `src/scheduler/*.nim`.
+   NOT ported: `backend.rs`'s `TaskExecutor` trait, `task.rs`'s
+   `TaskFuture`/`TaskWork`/`TaskRequest`/`TaskHandle` (+ its `impl Future`),
+   `scheduler.rs`'s `SchedulerService` trait, and all of `global.rs` (326
+   LOC, the actual admission/poll driver) — these are `Pin<Box<dyn
+   Future>>`/tokio-executor plumbing with no Nimony equivalent (Nimony's
+   async is `passive` procs + continuations, not poll-based futures).
+   Needs a real design pass once `pumpkin` (the crate that drives the
+   server tick loop) clarifies what should drive scheduler turns. See
+   `src/scheduler/lib.nim`'s doc comment.
 4. `pumpkin-config` (~2.2k LOC)
 4. `pumpkin-codecs` / `pumpkin-protocol` (~40k LOC combined)
 5. `pumpkin-world`, `pumpkin-inventory`, `pumpkin-command`
