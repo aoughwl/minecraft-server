@@ -37,10 +37,26 @@ is settled, not the generated output by hand.
 - `permissions.nim` - the plugin sandbox capability-string constants
   (`network.*`, `fs.*`, `sys.*`, `http.outbound`). Pure data, no `wit`
   dependency. `nimony check` clean.
-- `eventdata.nim` - a real server-side `EventData` model, now for 170 events
-  (~170 of ~273 real `-event-data` WIT records covered; see the file's own
+- `eventdata.nim` - a real server-side `EventData` model, now for 203 events
+  (~203 of ~273 real `-event-data` WIT records covered; see the file's own
   count against `event.wit` for the exact current tally).
-  Latest batch (33 new): `PlayerChangeWorld`/`PlayerCustomPayload`/
+  Latest batch (33 new): `AreaEffectCloudApply`/`ArrowBodyCountChange`/
+  `AsyncStructureGenerate`/`AsyncStructureSpawn`/`BatToggleSleep`/
+  `BedrockFormResponse`/`BellResonate`/`BlockDamageAbort`/
+  `BlockDispenseArmor`/`BlockDispense`/`BlockDispenseLoot`/
+  `BlockReceiveGame`/`DialogClear`/`DialogClickAction`/`DialogShow`/
+  `EntityKnockbackByEntity`/`EntityPortalEnter`/`EntityPortalExit`/
+  `EntityTargetBlock`/`EntityUnleash`/`GenericGame`/
+  `HopperInventorySearch`/`HorseJump`/`InventoryBlockStart`/
+  `InventoryCreative`/`InventoryInteract`/`InventoryMoveItem`/
+  `InventoryPickupItem`/`LeavesDecay`/`LightningStrike`/
+  `LingeringPotionSplash`/`LootGenerate`/`MapInitialize`.
+  Deliberately not ported: `packet-received`/`packet-sent` (need a full
+  packet-variant sum type spanning src/protocol/'s concrete packet procs,
+  which doesn't exist as one enum yet - documented in eventdata.nim's
+  header). ~70 records remain (villager/vehicle/raid, and most of the
+  long tail) - same mechanical translation, just more of it.
+  Previous batch (33 new): `PlayerChangeWorld`/`PlayerCustomPayload`/
   `PlayerItemConsume`/`PlayerItemDamage`/`AsyncPlayerChat`/
   `AsyncPlayerPreLogin`/`PlayerPreLogin`/`PlayerAdvancementDone`/
   `PlayerAnimation`/`PlayerArmorStandManipulate`/`PlayerBucketEntity`/

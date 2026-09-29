@@ -703,4 +703,103 @@ assert swapHandsData.cancelled == false
 let takeLecternBookData = PlayerTakeLecternBookEventData(player: p1, blockPos: bp1, book: "minecraft:written_book", cancelled: false)
 assert takeLecternBookData.book == "minecraft:written_book"
 
+let areaEffectData = AreaEffectCloudApplyEventData(entityId: 40'i32, affectedEntities: @[41'i32, 42'i32], cancelled: false)
+assert areaEffectData.affectedEntities.len == 2
+
+let arrowBodyData = ArrowBodyCountChangeEventData(entityId: 43'i32, oldAmount: 1'u32, newAmount: 2'u32, cancelled: false)
+assert arrowBodyData.newAmount == 2'u32
+
+let structGenData = AsyncStructureGenerateEventData(worldName: "overworld", structureName: "village", pos: bp1, cancelled: false)
+assert structGenData.structureName == "village"
+
+let structSpawnData = AsyncStructureSpawnEventData(worldName: "overworld", structureName: "village", pos: bp1, cancelled: false)
+assert structSpawnData.structureName == "village"
+
+let batSleepData = BatToggleSleepEventData(entityId: 44'i32, isAwake: true, cancelled: false)
+assert batSleepData.isAwake == true
+
+let bedrockFormData = BedrockFormResponseEventData(player: p1, formId: 1'u32, hasResponseData: true, responseData: "yes")
+assert bedrockFormData.responseData == "yes"
+
+let bellResonateData = BellResonateEventData(blockPos: bp1, cancelled: false)
+assert bellResonateData.blockPos == bp1
+
+let blockDamageAbortData = BlockDamageAbortEventData(player: p1, blockPos: bp1, itemInHand: "minecraft:diamond_pickaxe")
+assert blockDamageAbortData.itemInHand == "minecraft:diamond_pickaxe"
+
+let dispenseArmorData = BlockDispenseArmorEventData(blockPos: bp1, targetEntityId: 45'i32, item: "minecraft:iron_helmet", cancelled: false)
+assert dispenseArmorData.item == "minecraft:iron_helmet"
+
+let dispenseData = BlockDispenseEventData(blockPos: bp1, itemName: "minecraft:arrow", cancelled: false)
+assert dispenseData.itemName == "minecraft:arrow"
+
+let dispenseLootData = BlockDispenseLootEventData(blockPos: bp1, items: @["minecraft:bone", "minecraft:string"], cancelled: false)
+assert dispenseLootData.items.len == 2
+
+let receiveGameData = BlockReceiveGameEventData(blockPos: bp1, gameEvent: "minecraft:block_change", hasSourceEntity: true, sourceEntityId: 46'i32, cancelled: false)
+assert receiveGameData.hasSourceEntity == true
+
+let dialogClearData = DialogClearEventData(player: p1, cancelled: false)
+assert dialogClearData.cancelled == false
+
+let dialogClickData = DialogClickActionEventData(player: p1, id: "confirm", hasPayload: false, payload: @[], cancelled: false)
+assert dialogClickData.id == "confirm"
+
+let dialogShowData = DialogShowEventData(player: p1, dialogId: "server_links", cancelled: false)
+assert dialogShowData.dialogId == "server_links"
+
+let entityKnockbackData = EntityKnockbackByEntityEventData(entityId: 47'i32, hitById: 48'i32, force: 1.5, x: 0.1, z: 0.2, cancelled: false)
+assert entityKnockbackData.hitById == 48'i32
+
+let portalEnterData = EntityPortalEnterEventData(entityId: 49'i32, location: bp1, cancelled: false)
+assert portalEnterData.entityId == 49'i32
+
+let portalExitData = EntityPortalExitEventData(entityId: 49'i32, fromPos: bp1, hasToPos: true, toPos: bp1, cancelled: false)
+assert portalExitData.hasToPos == true
+
+let targetBlockData = EntityTargetBlockEventData(entityId: 50'i32, blockPos: bp1, cancelled: false)
+assert targetBlockData.entityId == 50'i32
+
+let unleashData = EntityUnleashEventData(entityId: 51'i32, reason: "player_unleash", cancelled: false)
+assert unleashData.reason == "player_unleash"
+
+let genericGameData = GenericGameEventData(eventId: "minecraft:custom", pos: Vector3[float64](x: 0.0, y: 64.0, z: 0.0), cancelled: false)
+assert genericGameData.eventId == "minecraft:custom"
+
+let hopperSearchData = HopperInventorySearchEventData(blockPos: bp1, searchPos: bp1, cancelled: false)
+assert hopperSearchData.cancelled == false
+
+let horseJumpData = HorseJumpEventData(entityId: 52'i32, power: 0.8'f32, cancelled: false)
+assert horseJumpData.power == 0.8'f32
+
+let invBlockStartData = InventoryBlockStartEventData(blockPos: bp1)
+assert invBlockStartData.blockPos == bp1
+
+let invCreativeData = InventoryCreativeEventData(player: p1, slot: 5'i16, itemId: "minecraft:diamond", itemCount: 64'u8, cancelled: false)
+assert invCreativeData.itemCount == 64'u8
+
+let invInteractData = InventoryInteractEventData(player: p1, cancelled: false)
+assert invInteractData.cancelled == false
+
+let invMoveItemData = InventoryMoveItemEventData(sourcePos: bp1, targetPos: bp1, itemId: "minecraft:coal", itemAmount: 3'u32, cancelled: false)
+assert invMoveItemData.itemAmount == 3'u32
+
+let invPickupData = InventoryPickupItemEventData(blockPos: bp1, itemEntityId: 53'i32, itemId: "minecraft:coal", cancelled: false)
+assert invPickupData.itemEntityId == 53'i32
+
+let leavesDecayData = LeavesDecayEventData(blockPos: bp1, cancelled: false)
+assert leavesDecayData.cancelled == false
+
+let lightningData = LightningStrikeEventData(position: Vector3[float64](x: 0.0, y: 64.0, z: 0.0), isEffect: false, cancelled: false)
+assert lightningData.isEffect == false
+
+let lingeringData = LingeringPotionSplashEventData(entityId: 54'i32, location: bp1, potionItem: "minecraft:lingering_potion", cancelled: false)
+assert lingeringData.potionItem == "minecraft:lingering_potion"
+
+let lootGenData = LootGenerateEventData(lootTable: "minecraft:chests/village/village_weaponsmith", cancelled: false)
+assert lootGenData.lootTable.len > 0
+
+let mapInitData = MapInitializeEventData(mapId: 1'i32)
+assert mapInitData.mapId == 1'i32
+
 echo "all eventdata checks passed"

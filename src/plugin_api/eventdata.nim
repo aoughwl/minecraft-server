@@ -49,6 +49,12 @@
 ##   entity-spawn) - src/server/world/worldstub.nim is a single anonymous
 ##   stub with no world identity/registry yet, so there's nothing to
 ##   reference; add a world-id field back once worlds are addressable.
+##
+## Not ported: `packet-received`/`packet-sent` (their `packet:
+## serverbound-packet`/`clientbound-packet` fields need a full packet
+## variant type spanning every packet in src/protocol/, which doesn't
+## exist as a single sum type yet - each packet is its own concrete
+## proc pair there, not cases of one enum).
 
 import ../server/net/netbase
 import ../util/vector3
@@ -1238,3 +1244,195 @@ type
     blockPos*: BlockPos
     book*: string
     cancelled*: bool
+
+  AreaEffectCloudApplyEventData* = object
+    entityId*: int32
+    affectedEntities*: seq[int32]
+    cancelled*: bool
+
+  ArrowBodyCountChangeEventData* = object
+    entityId*: int32
+    oldAmount*: uint32
+    newAmount*: uint32
+    cancelled*: bool
+
+  AsyncStructureGenerateEventData* = object
+    worldName*: string
+    structureName*: string
+    pos*: BlockPos
+    cancelled*: bool
+
+  AsyncStructureSpawnEventData* = object
+    worldName*: string
+    structureName*: string
+    pos*: BlockPos
+    cancelled*: bool
+
+  BatToggleSleepEventData* = object
+    entityId*: int32
+    isAwake*: bool
+    cancelled*: bool
+
+  BedrockFormResponseEventData* = object
+    ## No `cancelled` field in the WIT record - a form response is a
+    ## fait accompli, not something to veto.
+    player*: PlayerUuid
+    formId*: uint32
+    hasResponseData*: bool
+    responseData*: string
+
+  BellResonateEventData* = object
+    ## `target-world: %world` dropped, same reasoning as elsewhere in
+    ## this file.
+    blockPos*: BlockPos
+    cancelled*: bool
+
+  BlockDamageAbortEventData* = object
+    ## No `cancelled` field in the WIT record. `item-stack` becomes an
+    ## item-name string, matching this port's existing convention.
+    player*: PlayerUuid
+    blockPos*: BlockPos
+    itemInHand*: string
+
+  BlockDispenseArmorEventData* = object
+    blockPos*: BlockPos
+    targetEntityId*: int32
+    item*: string
+    cancelled*: bool
+
+  BlockDispenseEventData* = object
+    blockPos*: BlockPos
+    itemName*: string
+    cancelled*: bool
+
+  BlockDispenseLootEventData* = object
+    blockPos*: BlockPos
+    items*: seq[string]
+    cancelled*: bool
+
+  BlockReceiveGameEventData* = object
+    ## `source-entity-id: option<s32>` becomes a (hasX, x) pair.
+    blockPos*: BlockPos
+    gameEvent*: string
+    hasSourceEntity*: bool
+    sourceEntityId*: int32
+    cancelled*: bool
+
+  DialogClearEventData* = object
+    player*: PlayerUuid
+    cancelled*: bool
+
+  DialogClickActionEventData* = object
+    ## `payload: option<list<u8>>` becomes a (hasX, x) pair.
+    player*: PlayerUuid
+    id*: string
+    hasPayload*: bool
+    payload*: seq[byte]
+    cancelled*: bool
+
+  DialogShowEventData* = object
+    ## `dialog: dialog` is itself a whole separate resource type (its own
+    ## builder interface, unread here) - kept as a plain id/title string
+    ## placeholder rather than blocking on porting that interface too.
+    player*: PlayerUuid
+    dialogId*: string
+    cancelled*: bool
+
+  EntityKnockbackByEntityEventData* = object
+    entityId*: int32
+    hitById*: int32
+    force*: float64
+    x*: float64
+    z*: float64
+    cancelled*: bool
+
+  EntityPortalEnterEventData* = object
+    entityId*: int32
+    location*: BlockPos
+    cancelled*: bool
+
+  EntityPortalExitEventData* = object
+    ## `to-pos: option<block-pos>` becomes a (hasX, x) pair.
+    entityId*: int32
+    fromPos*: BlockPos
+    hasToPos*: bool
+    toPos*: BlockPos
+    cancelled*: bool
+
+  EntityTargetBlockEventData* = object
+    entityId*: int32
+    blockPos*: BlockPos
+    cancelled*: bool
+
+  EntityUnleashEventData* = object
+    entityId*: int32
+    reason*: string
+    cancelled*: bool
+
+  GenericGameEventData* = object
+    eventId*: string
+    pos*: Vector3[float64]
+    cancelled*: bool
+
+  HopperInventorySearchEventData* = object
+    blockPos*: BlockPos
+    searchPos*: BlockPos
+    cancelled*: bool
+
+  HorseJumpEventData* = object
+    entityId*: int32
+    power*: float32
+    cancelled*: bool
+
+  InventoryBlockStartEventData* = object
+    ## No `cancelled` field in the WIT record; `target-world: %world`
+    ## dropped.
+    blockPos*: BlockPos
+
+  InventoryCreativeEventData* = object
+    player*: PlayerUuid
+    slot*: int16
+    itemId*: string
+    itemCount*: uint8
+    cancelled*: bool
+
+  InventoryInteractEventData* = object
+    player*: PlayerUuid
+    cancelled*: bool
+
+  InventoryMoveItemEventData* = object
+    sourcePos*: BlockPos
+    targetPos*: BlockPos
+    itemId*: string
+    itemAmount*: uint32
+    cancelled*: bool
+
+  InventoryPickupItemEventData* = object
+    blockPos*: BlockPos
+    itemEntityId*: int32
+    itemId*: string
+    cancelled*: bool
+
+  LeavesDecayEventData* = object
+    ## `target-world: %world` dropped.
+    blockPos*: BlockPos
+    cancelled*: bool
+
+  LightningStrikeEventData* = object
+    position*: Vector3[float64]
+    isEffect*: bool
+    cancelled*: bool
+
+  LingeringPotionSplashEventData* = object
+    entityId*: int32
+    location*: BlockPos
+    potionItem*: string
+    cancelled*: bool
+
+  LootGenerateEventData* = object
+    lootTable*: string
+    cancelled*: bool
+
+  MapInitializeEventData* = object
+    ## No `cancelled` field in the WIT record.
+    mapId*: int32
