@@ -33,20 +33,33 @@ Smallest/most self-contained crates first, since later crates depend on them:
    what's skipped), `random/legacy_rand.rs` (the pre-1.13 Java-`Random`-
    compatible LCG), `random/xoroshiro128.rs` (the modern PRNG),
    `random/worldgen_random.rs` (Java `WorldgenRandom` bit-source wrapper
-   over Xoroshiro), `noise/mod.rs` (`Gradient` type + gradient table) →
-   `src/util/*.nim`. legacy_rand/xoroshiro128/worldgen_random are all
+   over Xoroshiro), `noise/mod.rs` (`Gradient` type + gradient table),
+   `math/mod.rs`'s `lerp`/`lerp2`/`lerp3`/`smoothstep` (as
+   `src/util/mathlerp.nim` - as concrete float32/float64 overloads, not
+   Rust's single generic `lerp<T: Float>`: a `[T: SomeFloat]` Nimony
+   generic hits a real compiler bug resolving `-` on `T` inside its own
+   body, filed as feedback, worked around with duplication), `noise/perlin.rs`'s
+   core `PerlinNoise` point-sampling (`src/util/perlin.nim` - `get`/
+   `sample_and_lerp` only; `add_to_volume`'s batched fast path,
+   `SmearedPerlinNoise`, `NoiseStack`, and `NormalNoise`'s octave-sum/
+   normalization machinery are NOT ported yet, see the file's doc comment)
+   → `src/util/*.nim`. legacy_rand/xoroshiro128/worldgen_random are all
    verified byte-for-byte against the Rust files' own unit test vectors
    (worldgen_random's specifically check against real vanilla Minecraft
    chunk/decorator seeds and draws) - see `src/util/legacy_randtest.nim`,
-   `xoroshiro128test.nim`, `worldgen_randomtest.nim`. `identifier.rs`'s
+   `xoroshiro128test.nim`, `worldgen_randomtest.nim`. `perlin.nim` has NO
+   upstream test vectors to check against (perlin.rs has no `#[cfg(test)]`
+   block) - `perlintest.nim` checks permutation-table validity, a
+   cross-computed HALF_ROUND_OFF bit-pattern constant, and sampling
+   determinism/plausible range, but this is NOT yet verified bit-for-bit
+   against vanilla world-gen output; treat it as "probably right, not yet
+   proven" until real known-answer vectors are found or derived.
+   `identifier.rs`'s
    const/compile-time constructors (`from_static`, `parse_static`, ...) and
    all `serde` (de)serialize impls across the crate are intentionally
-   skipped for now (see doc comments). ~5.3k of ~15.6k LOC covered;
-   `text/mod.rs` (2.2k), `noise/perlin.rs` + `simplex.rs` + `volume.rs`
-   (1.75k - the actual terrain-noise generators; now unblocked since their
-   `random/` and `Gradient` dependencies are ported, but need real
-   test-vector verification against vanilla output before trusting them,
-   same bar as worldgen_random), `mod.rs`'s `RandomImpl`/`RandomGenerator`
+   skipped for now (see doc comments). ~6k of ~15.6k LOC covered;
+   `text/mod.rs` (2.2k), `noise/simplex.rs` + `volume.rs`
+   (1k - simplex noise and the DensityVolume batching type), `mod.rs`'s `RandomImpl`/`RandomGenerator`
    trait/enum unification (a real design decision, deferred - each
    generator is a standalone concrete type for now), `gaussian.rs`'s trait
    form (each generator has its own inlined `nextGaussian` instead), and
