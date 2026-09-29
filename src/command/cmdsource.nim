@@ -61,6 +61,21 @@ type
       ## entity - not part of the original tokenizer/tree/dispatcher
       ## design pass, but the smallest addition that unblocks them
       ## without inventing a second CommandSource shape.
+    displayName*: string ## stands in for `context.source.display_name`
+      ## (a `TextComponent` upstream; plain string here, same
+      ## simplification the rest of this port uses for the unported
+      ## `text` module). Empty for a source with no natural name
+      ## (console/command-block).
+    broadcastProc*: proc(message: string, senderName: string) {.closure.}
+      ## stands in for `context.server().broadcast_message(...)` - there's
+      ## no `Server`/player-registry type in this port yet, so `say.nim`/
+      ## `me.nim` call through this instead of a real broadcast. `nil`
+      ## falls back to echoing to the issuing source only (see
+      ## `broadcastMessage` below), which is enough to prove the argument
+      ## parsing/dispatch wiring without a fake multi-player fanout.
+    stopProc*: proc() {.closure.}
+      ## stands in for `crate::stop_server()` - no process-level server
+      ## loop exists in this port yet. `nil` is a safe no-op.
 
 proc sendMessage*(s: CommandSource, message: string) =
   if s.sendMessageProc != nil:
@@ -83,6 +98,16 @@ proc checkBlockLoaded*(s: CommandSource, x, y, z: int32): bool =
     s.checkBlockLoadedProc(x, y, z)
   else:
     true
+
+proc broadcastMessage*(s: CommandSource, message: string) =
+  if s.broadcastProc != nil:
+    s.broadcastProc(message, s.displayName)
+  else:
+    sendMessage(s, message)
+
+proc stopServer*(s: CommandSource) =
+  if s.stopProc != nil:
+    s.stopProc()
 
 proc anchorPosition*(s: CommandSource): Vector3[float64] {.inline.} =
   s.position

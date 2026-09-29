@@ -27,23 +27,49 @@ directory uses that library.
   → plain strings, same simplification the rest of this port already
   uses for unported `text`).
 
+- **`stop.nim`** - `/stop`. The simplest command in the file: no
+  arguments, just feedback + a shutdown call. Upstream's `stop_server()`
+  (a real process-level shutdown) has no equivalent in this port yet, so
+  `CommandSource` gained a `stopProc*: proc() {.closure.}` field (`nil` =
+  safe no-op) alongside `sendMessageProc`'s existing shape. `stoptest.nim`
+  drives it through a real dispatch walk and confirms `stopProc` fires.
+
+- **`say.nim`** / **`me.nim`** - `/say <message>` and `/me <action>`,
+  structurally identical (upstream shares the shape - a single greedy
+  string argument broadcast to all players). Neither has a real
+  `Server`/player-registry to broadcast through, so `CommandSource`
+  gained `displayName*: string` and `broadcastProc*: proc(message,
+  senderName: string) {.closure.}` (falls back to echoing to the issuing
+  source alone when `nil`). `saymetest.nim` drives both through a real
+  dispatch walk and confirms the broadcast callback receives the right
+  message/sender.
+
+  Not ported from either: permission-registry registration, and the
+  translated `SAY_COMMAND`/`EMOTE_COMMAND` message-type tags (need
+  unported `pumpkin_data`/`text` modules) - messages are broadcast as
+  plain strings, same simplification `gamemode.nim` already uses.
+
 ## Not started
 
-The other ~30 command files under `upstream-ref/crates/pumpkin/src/command/commands/`,
-ranging from trivial (`say.rs`, `stop.rs`, `me.rs` - 40-70 lines each,
-good next targets) to substantial (`execute.rs` at 1660 lines - the
-`/execute` conditional/redirect command, which needs the
-`RedirectModifier`/forking support `cmdtree.nim` explicitly deferred).
-Most need a player/world registry (a server-wide list of connected
-players, which `src/server/world/worldstub.nim` doesn't model) beyond
-what `gamemode.nim` needed.
+The other ~27 command files under `upstream-ref/crates/pumpkin/src/command/commands/`,
+ranging from small (`tellraw.rs`/`return.rs` ~42-44 lines, `reload.rs`/
+`tps.rs` ~48-53 lines - reasonable next targets) to substantial
+(`execute.rs` at 1660 lines - the `/execute` conditional/redirect
+command, which needs the `RedirectModifier`/forking support
+`cmdtree.nim` explicitly deferred). Most need a real player/world
+registry (a server-wide list of connected players, which
+`src/server/world/worldstub.nim` doesn't model) beyond what
+`gamemode.nim`/`say.nim`/`me.nim`/`stop.nim` needed.
 
 ## Runtime-verification status
 
 Same as everything importing `src/server/entity/entity.nim` (now also
-true of `src/command/cmdsource.nim`, transitively, via the new `player`
-field): `nimony check` passes clean, but `nimony c -r` hits the
-closures-through-vtables crash cataloged as bug #1 in
-`NIMONY-COMPILER-BUGS.md` (confirmed again here, same signature:
-`lambdalifting.nim(369)`/`eraiser.nim(128)`). `gamemodetest.nim` is
+true of `src/command/cmdsource.nim`, transitively, via the `player`
+field - and by extension every file in this directory, since they all
+import `cmdsource.nim`, even `stop.nim` which has no direct `Player`
+need of its own): `nimony check` passes clean, but `nimony c -r` hits
+the closures-through-vtables crash cataloged as bug #1 in
+`NIMONY-COMPILER-BUGS.md` (confirmed again here for `stoptest.nim`,
+same exact signature: `lambdalifting.nim(369)`/`eraiser.nim(128)`).
+`gamemodetest.nim`/`saymetest.nim`/`stoptest.nim` are all
 check-verified, not runtime-proven.
