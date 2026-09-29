@@ -543,4 +543,290 @@ type
     ## `target-world: %world` dropped, same reasoning as EntitySpawn above.
     blockPos*: BlockPos
     newMoisture*: int32
+
+  PlayerCommandSendEventData* = object
+    player*: PlayerUuid
+    command*: string
+    cancelled*: bool
+
+  PlayerPermissionCheckEventData* = object
+    ## No `cancelled` field in the WIT record.
+    player*: PlayerUuid
+    permission*: string
+    permissionResult*: bool
+
+  PlayerRespawnEventData* = object
+    ## `previous-world`/`respawned-world: %world` dropped, same reasoning
+    ## as EntitySpawn above. No `cancelled` field in the WIT record.
+    player*: PlayerUuid
+    position*: Vector3[float64]
+    yaw*: float32
+    pitch*: float32
+    alive*: bool
+
+  PlayerItemHeldEventData* = object
+    player*: PlayerUuid
+    previousSlot*: uint8
+    newSlot*: uint8
+    cancelled*: bool
+
+  PlayerChangedMainHandEventData* = object
+    ## No `cancelled` field in the WIT record. `hand` kept as a plain
+    ## string rather than pulling in a Hand enum for one field.
+    player*: PlayerUuid
+    mainHand*: string
+
+  PlayerFishState* = enum
+    pfsFishing
+    pfsCaughtFish
+    pfsCaughtEntity
+    pfsInGround
+    pfsFailedAttempt
+    pfsReelIn
+    pfsBite
+
+  PlayerFishEventData* = object
+    ## `caught-uuid: option<uuid>` becomes a (hasX, x) pair. `hand` kept
+    ## as a plain string.
+    player*: PlayerUuid
+    hasCaughtUuid*: bool
+    caughtUuid*: string
+    caughtType*: string
+    hookUuid*: string
+    state*: PlayerFishState
+    hand*: string
+    expToDrop*: int32
+    cancelled*: bool
+
+  PlayerEggThrowEventData* = object
+    player*: PlayerUuid
+    eggUuid*: string
+    hatching*: bool
+    numHatches*: uint8
+    hatchingType*: string
+    cancelled*: bool
+
+  InteractAction* = enum
+    iaLeftClickBlock
+    iaLeftClickAir
+    iaRightClickAir
+    iaRightClickBlock
+
+  PlayerInteractEventData* = object
+    ## `clicked-pos: option<block-pos>` becomes a (hasX, x) pair.
+    player*: PlayerUuid
+    action*: InteractAction
+    hasClickedPos*: bool
+    clickedPos*: BlockPos
+    blockName*: string
+    cancelled*: bool
+
+  PlayerToggleFlightEventData* = object
+    player*: PlayerUuid
+    isFlying*: bool
+    cancelled*: bool
+
+  EntityInteractionAction* = enum
+    eiaInteract
+    eiaAttack
+    eiaInteractAt
+
+  PlayerInteractUnknownEntityEventData* = object
+    player*: PlayerUuid
+    entityId*: int32
+    action*: EntityInteractionAction
+    cancelled*: bool
+
+  PlayerInteractEntityEventData* = object
+    player*: PlayerUuid
+    entityId*: int32
+    action*: EntityInteractionAction
+    sneaking*: bool
+    cancelled*: bool
+
+  InventoryClickEventData* = object
+    ## `window-type: option<screen>`/`clicked-item`/`cursor:
+    ## option<item-stack>` all become (hasX, x) pairs; `click-type` kept
+    ## as a plain string rather than pulling in that enum for one field,
+    ## and item stacks stay as plain item-name strings, matching this
+    ## port's item-field convention elsewhere in this file.
+    player*: PlayerUuid
+    hasWindowType*: bool
+    windowType*: uint32
+    clickType*: string
+    slot*: int16
+    rawSlot*: int16
+    hasClickedItem*: bool
+    clickedItem*: string
+    hasCursor*: bool
+    cursor*: string
+    hotbarButton*: int32
+    cancelled*: bool
+
+  CreatureSpawnEventData* = object
+    ## `target-world: %world` dropped, same reasoning as EntitySpawn
+    ## above. `player: option<player>` becomes a (hasX, x) pair.
+    entityId*: int32
+    entityType*: string
+    position*: Vector3[float64]
+    spawnReason*: string
+    hasPlayer*: bool
+    player*: PlayerUuid
+    cancelled*: bool
+
+  EnderDragonChangePhaseEventData* = object
+    entityId*: int32
+    currentPhase*: string
+    newPhase*: string
+    cancelled*: bool
+
+  EntityBreakDoorEventData* = object
+    entityId*: int32
+    blockPos*: BlockPos
+    cancelled*: bool
+
+  EntityChangeBlockEventData* = object
+    entityId*: int32
+    blockPos*: BlockPos
+    newBlock*: string
+    cancelled*: bool
+
+  EntityDamageByBlockEventData* = object
+    ## `damager-pos: option<block-pos>` becomes a (hasX, x) pair.
+    entityId*: int32
+    hasDamagerPos*: bool
+    damagerPos*: BlockPos
+    damage*: float32
+    cause*: string
+    cancelled*: bool
+
+  EntityDamageByEntityEventData* = object
+    entityId*: int32
+    damagerId*: int32
+    damage*: float32
+    cause*: string
+    cancelled*: bool
+
+  EntityDropItemEventData* = object
+    entityId*: int32
+    itemName*: string
+    count*: uint8
+    cancelled*: bool
+
+  EntityEnterBlockEventData* = object
+    entityId*: int32
+    blockPos*: BlockPos
+    cancelled*: bool
+
+  EntityExhaustionEventData* = object
+    entityId*: int32
+    exhaustion*: float32
+    cancelled*: bool
+
+  EntityInteractEventData* = object
+    entityId*: int32
+    blockPos*: BlockPos
+    cancelled*: bool
+
+  EntityKnockbackEventData* = object
+    ## `hit-by-id: option<s32>` becomes a (hasX, x) pair.
+    entityId*: int32
+    hasHitById*: bool
+    hitById*: int32
+    knockback*: Vector3[float64]
+    cancelled*: bool
+
+  EntityPlaceEventData* = object
+    entityId*: int32
+    blockPos*: BlockPos
+    blockName*: string
+    cancelled*: bool
+
+  EntityPoseChangeEventData* = object
+    entityId*: int32
+    pose*: string
+    cancelled*: bool
+
+  EntityPotionEffectEventData* = object
+    entityId*: int32
+    effectName*: string
+    duration*: int32
+    amplifier*: uint8
+    cancelled*: bool
+
+  EntitySpellCastEventData* = object
+    entityId*: int32
+    spell*: string
+    cancelled*: bool
+
+  EntityDyeEventData* = object
+    ## `player: option<player>` becomes a (hasX, x) pair.
+    entityId*: int32
+    color*: string
+    hasPlayer*: bool
+    player*: PlayerUuid
+    cancelled*: bool
+
+  EntityEnterLoveModeEventData* = object
+    ## `human-entity-id: option<s32>` becomes a (hasX, x) pair.
+    entityId*: int32
+    hasHumanEntityId*: bool
+    humanEntityId*: int32
+    ticksInLove*: int32
+    cancelled*: bool
+
+  ExplosionPrimeEventData* = object
+    entityId*: int32
+    radius*: float32
+    fire*: bool
+    cancelled*: bool
+
+  FireworkExplodeEventData* = object
+    entityId*: int32
+    cancelled*: bool
+
+  PiglinBarterEventData* = object
+    ## `input-item`/`outcome: list<item-stack>` stay as item-name
+    ## strings, matching this port's item-field convention (`outcome`
+    ## becomes a single name since a full list of stacks would need a
+    ## real ItemStack type not yet threaded through event data).
+    entityId*: int32
+    inputItem*: string
+    cancelled*: bool
+
+  ProjectileHitEventData* = object
+    ## `hit-entity-id: option<s32>` becomes a (hasX, x) pair.
+    entityId*: int32
+    hitPosition*: Vector3[float64]
+    hasHitEntityId*: bool
+    hitEntityId*: int32
+    cancelled*: bool
+
+  ProjectileLaunchEventData* = object
+    ## `shooter-id: option<s32>` becomes a (hasX, x) pair.
+    entityId*: int32
+    hasShooterId*: bool
+    shooterId*: int32
+    cancelled*: bool
+
+  SheepDyeWoolEventData* = object
+    ## `player-id: option<s32>` becomes a (hasX, x) pair.
+    entityId*: int32
+    dyeColor*: uint8
+    hasPlayerId*: bool
+    playerId*: int32
+    cancelled*: bool
+
+  SheepRegrowWoolEventData* = object
+    entityId*: int32
+    cancelled*: bool
+
+  SlimeSplitEventData* = object
+    entityId*: int32
+    count*: int32
+    cancelled*: bool
+
+  StriderTemperatureChangeEventData* = object
+    entityId*: int32
+    isShivering*: bool
     cancelled*: bool

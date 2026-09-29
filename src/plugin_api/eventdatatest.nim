@@ -391,7 +391,121 @@ assert chunkUnloadData.chunkZ == -2'i32
 let timeSkipData = TimeSkipEventData(skipAmount: 24000'i64, cancelled: false)
 assert timeSkipData.skipAmount == 24000'i64
 
-let moistureData = MoistureChangeEventData(blockPos: blockPos(1, 64, 1), newMoisture: 4'i32, cancelled: false)
+let moistureData = MoistureChangeEventData(blockPos: blockPos(1, 64, 1), newMoisture: 4'i32)
 assert moistureData.newMoisture == 4'i32
+
+let cmdSendData = PlayerCommandSendEventData(player: p1, command: "/help", cancelled: false)
+assert cmdSendData.command == "/help"
+
+let permCheckData = PlayerPermissionCheckEventData(player: p1, permission: "server.stop", permissionResult: false)
+assert not permCheckData.permissionResult
+
+let respawnData = PlayerRespawnEventData(player: p1, position: Vector3[float64](x: 0.0, y: 64.0, z: 0.0), yaw: 0.0'f32, pitch: 0.0'f32, alive: true)
+assert respawnData.alive
+
+let itemHeldData = PlayerItemHeldEventData(player: p1, previousSlot: 0'u8, newSlot: 3'u8, cancelled: false)
+assert itemHeldData.newSlot == 3'u8
+
+let mainHandData = PlayerChangedMainHandEventData(player: p1, mainHand: "left")
+assert mainHandData.mainHand == "left"
+
+let fishData = PlayerFishEventData(player: p1, hasCaughtUuid: false, caughtUuid: "", caughtType: "", hookUuid: "abc", state: pfsBite, hand: "main_hand", expToDrop: 1'i32, cancelled: false)
+assert fishData.state == pfsBite
+
+let eggThrowData = PlayerEggThrowEventData(player: p1, eggUuid: "abc", hatching: true, numHatches: 1'u8, hatchingType: "minecraft:chicken", cancelled: false)
+assert eggThrowData.hatching
+
+let interactData = PlayerInteractEventData(player: p1, action: iaRightClickBlock, hasClickedPos: true, clickedPos: blockPos(1, 64, 1), blockName: "minecraft:chest", cancelled: false)
+assert interactData.action == iaRightClickBlock
+
+let toggleFlightData = PlayerToggleFlightEventData(player: p1, isFlying: true, cancelled: false)
+assert toggleFlightData.isFlying
+
+let interactUnknownData = PlayerInteractUnknownEntityEventData(player: p1, entityId: 7'i32, action: eiaAttack, cancelled: false)
+assert interactUnknownData.action == eiaAttack
+
+let interactEntityData = PlayerInteractEntityEventData(player: p1, entityId: 7'i32, action: eiaInteract, sneaking: true, cancelled: false)
+assert interactEntityData.sneaking
+
+let invClickData = InventoryClickEventData(player: p1, hasWindowType: false, windowType: 0'u32, clickType: "pickup", slot: 5'i16, rawSlot: 5'i16, hasClickedItem: true, clickedItem: "minecraft:stone", hasCursor: false, cursor: "", hotbarButton: -1'i32, cancelled: false)
+assert invClickData.clickedItem == "minecraft:stone"
+
+let creatureSpawnData = CreatureSpawnEventData(entityId: 8'i32, entityType: "minecraft:zombie", position: Vector3[float64](x: 0.0, y: 64.0, z: 0.0), spawnReason: "natural", hasPlayer: false, player: p1, cancelled: false)
+assert creatureSpawnData.entityType == "minecraft:zombie"
+
+let dragonPhaseData = EnderDragonChangePhaseEventData(entityId: 9'i32, currentPhase: "circling", newPhase: "charging_player", cancelled: false)
+assert dragonPhaseData.newPhase == "charging_player"
+
+let breakDoorData = EntityBreakDoorEventData(entityId: 10'i32, blockPos: blockPos(2, 64, 2), cancelled: false)
+assert breakDoorData.entityId == 10'i32
+
+let changeBlockData = EntityChangeBlockEventData(entityId: 10'i32, blockPos: blockPos(2, 64, 2), newBlock: "minecraft:dirt_path", cancelled: false)
+assert changeBlockData.newBlock == "minecraft:dirt_path"
+
+let dmgByBlockData = EntityDamageByBlockEventData(entityId: 10'i32, hasDamagerPos: true, damagerPos: blockPos(2, 64, 2), damage: 4.0'f32, cause: "cactus", cancelled: false)
+assert dmgByBlockData.damage == 4.0'f32
+
+let dmgByEntityData = EntityDamageByEntityEventData(entityId: 10'i32, damagerId: 11'i32, damage: 6.0'f32, cause: "attack", cancelled: false)
+assert dmgByEntityData.damagerId == 11'i32
+
+let dropItemData = EntityDropItemEventData(entityId: 10'i32, itemName: "minecraft:bone", count: 2'u8, cancelled: false)
+assert dropItemData.count == 2'u8
+
+let enterBlockData = EntityEnterBlockEventData(entityId: 10'i32, blockPos: blockPos(2, 64, 2), cancelled: false)
+assert enterBlockData.blockPos == blockPos(2, 64, 2)
+
+let exhaustionData = EntityExhaustionEventData(entityId: 10'i32, exhaustion: 0.1'f32, cancelled: false)
+assert exhaustionData.exhaustion == 0.1'f32
+
+let entityInteractData = EntityInteractEventData(entityId: 10'i32, blockPos: blockPos(2, 64, 2), cancelled: false)
+assert entityInteractData.cancelled == false
+
+let knockbackData = EntityKnockbackEventData(entityId: 10'i32, hasHitById: true, hitById: 11'i32, knockback: Vector3[float64](x: 1.0, y: 0.0, z: 0.0), cancelled: false)
+assert knockbackData.hasHitById
+
+let entityPlaceData = EntityPlaceEventData(entityId: 10'i32, blockPos: blockPos(2, 64, 2), blockName: "minecraft:armor_stand", cancelled: false)
+assert entityPlaceData.blockName == "minecraft:armor_stand"
+
+let poseData = EntityPoseChangeEventData(entityId: 10'i32, pose: "sleeping", cancelled: false)
+assert poseData.pose == "sleeping"
+
+let potionData = EntityPotionEffectEventData(entityId: 10'i32, effectName: "minecraft:speed", duration: 200'i32, amplifier: 1'u8, cancelled: false)
+assert potionData.duration == 200'i32
+
+let spellData = EntitySpellCastEventData(entityId: 10'i32, spell: "summon_vex", cancelled: false)
+assert spellData.spell == "summon_vex"
+
+let dyeData = EntityDyeEventData(entityId: 10'i32, color: "red", hasPlayer: true, player: p1, cancelled: false)
+assert dyeData.color == "red"
+
+let loveModeData = EntityEnterLoveModeEventData(entityId: 10'i32, hasHumanEntityId: true, humanEntityId: 7'i32, ticksInLove: 600'i32, cancelled: false)
+assert loveModeData.ticksInLove == 600'i32
+
+let explosionPrimeData = ExplosionPrimeEventData(entityId: 12'i32, radius: 3.0'f32, fire: false, cancelled: false)
+assert explosionPrimeData.radius == 3.0'f32
+
+let fireworkData = FireworkExplodeEventData(entityId: 12'i32, cancelled: false)
+assert fireworkData.entityId == 12'i32
+
+let piglinBarterData = PiglinBarterEventData(entityId: 13'i32, inputItem: "minecraft:gold_ingot", cancelled: false)
+assert piglinBarterData.inputItem == "minecraft:gold_ingot"
+
+let projHitData = ProjectileHitEventData(entityId: 14'i32, hitPosition: Vector3[float64](x: 0.0, y: 64.0, z: 0.0), hasHitEntityId: true, hitEntityId: 15'i32, cancelled: false)
+assert projHitData.hitEntityId == 15'i32
+
+let projLaunchData = ProjectileLaunchEventData(entityId: 14'i32, hasShooterId: true, shooterId: 1'i32, cancelled: false)
+assert projLaunchData.shooterId == 1'i32
+
+let sheepDyeData = SheepDyeWoolEventData(entityId: 16'i32, dyeColor: 3'u8, hasPlayerId: false, playerId: 0'i32, cancelled: false)
+assert sheepDyeData.dyeColor == 3'u8
+
+let sheepRegrowData = SheepRegrowWoolEventData(entityId: 16'i32, cancelled: false)
+assert sheepRegrowData.entityId == 16'i32
+
+let slimeSplitData = SlimeSplitEventData(entityId: 17'i32, count: 4'i32, cancelled: false)
+assert slimeSplitData.count == 4'i32
+
+let striderTempData = StriderTemperatureChangeEventData(entityId: 18'i32, isShivering: true, cancelled: false)
+assert striderTempData.isShivering
 
 echo "all eventdata checks passed"

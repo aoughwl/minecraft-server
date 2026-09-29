@@ -37,27 +37,44 @@ is settled, not the generated output by hand.
 - `permissions.nim` - the plugin sandbox capability-string constants
   (`network.*`, `fs.*`, `sys.*`, `http.outbound`). Pure data, no `wit`
   dependency. `nimony check` clean.
-- `eventdata.nim` - a real server-side `EventData` model, now for 82 events
-  (56 from prior passes, plus `EntityCombust`/`EntityRegainHealth`/
-  `EntityAirChange`/`EntityBreed`/`EntityMount`/`EntityPortal`/
-  `EntityShootBow`/`EntityTame`/`EntityTarget`/`EntityTargetLivingEntity`/
-  `EntityToggleGlide`/`EntityTransform`/`EntityRemove`/`BlockDamage`/
-  `BlockFromTo`/`BlockExplode`/`BlockPhysics`/`BlockFade`/`SpongeAbsorb`/
-  `HangingBreak`/`HangingBreakByEntity`/`WorldLoad`/`WorldUnload`/
-  `ChunkUnload`/`TimeSkip`/`MoistureChange`)
-  (`PlayerJoin`/`PlayerLeave`/`PlayerTeleport`/`PlayerGamemodeChange`/
-  `PlayerToggleSneak`/`PlayerMove`/`PlayerChat`/`BlockPlace`/`BlockBreak`/
-  `EntityDamage`/`EntityDeath`/`PlayerDeath`/`EntitySpawn`/`ItemSpawn`/
-  `ItemDespawn`/`PlayerDropItem`/`BlockRedstone`/`BlockBurn`/`BlockCanBuild`/
-  `BlockGrow`/`ServerCommand`/`ServerLoad`/`SpawnChange`/`ServerTickStart`/
-  `ServerTickEnd`/`ChunkLoad`/`ChunkSave`/`PlayerLogin`/`PlayerExpChange`/
-  `PlayerToggleSprint`/`InventoryClose`/`EntityDismount`/`EntityPickupItem`/
-  `EntityResurrect`/`EntityTeleport`/`EntityToggleSwim`/`FoodLevelChange`/
-  `ItemMerge`/`BlockIgnite`/`BlockForm`/`TntPrime`/`NotePlay`/`EntityExplode`/
-  `PlayerBedEnter`/`PlayerBedLeave`/`PlayerBucketEmpty`/`PlayerBucketFill`/
-  `PlayerKick`/`BlockPistonExtend`/`BlockPistonRetract`/`SignChange`/
-  `BellRing`/`WeatherChange`/`ThunderChange`/`InventoryOpen`/`InventoryDrag`/
-  `CraftItem`), built from
+- `eventdata.nim` - a real server-side `EventData` model, now for 108 events.
+  Latest batch (26 new): `PlayerCommandSend`/`PlayerPermissionCheck`/
+  `PlayerRespawn`/`PlayerItemHeld`/`PlayerChangedMainHand`/`PlayerFish`/
+  `PlayerEggThrow`/`PlayerInteract`/`PlayerToggleFlight`/
+  `PlayerInteractUnknownEntity`/`PlayerInteractEntity`/`InventoryClick`/
+  `CreatureSpawn`/`EnderDragonChangePhase`/`EntityBreakDoor`/
+  `EntityChangeBlock`/`EntityDamageByBlock`/`EntityDamageByEntity`/
+  `EntityDropItem`/`EntityEnterBlock`/`EntityExhaustion`/`EntityInteract`/
+  `EntityKnockback`/`EntityPlace`/`EntityPoseChange`/`EntityPotionEffect`/
+  `EntitySpellCast`/`EntityDye`/`EntityEnterLoveMode`/`ExplosionPrime`/
+  `FireworkExplode`/`PiglinBarter`/`ProjectileHit`/`ProjectileLaunch`/
+  `SheepDyeWool`/`SheepRegrowWool`/`SlimeSplit`/`StriderTemperatureChange`.
+  Earlier passes covered `PlayerJoin`/`PlayerLeave`/`PlayerTeleport`/
+  `PlayerGamemodeChange`/`PlayerToggleSneak`/`PlayerMove`/`PlayerChat`/
+  `BlockPlace`/`BlockBreak`/`EntityDamage`/`EntityDeath`/`PlayerDeath`/
+  `EntitySpawn`/`ItemSpawn`/`ItemDespawn`/`PlayerDropItem`/`BlockRedstone`/
+  `BlockBurn`/`BlockCanBuild`/`BlockGrow`/`ServerCommand`/`ServerLoad`/
+  `SpawnChange`/`ServerTickStart`/`ServerTickEnd`/`ChunkLoad`/`ChunkSave`/
+  `PlayerLogin`/`PlayerExpChange`/`PlayerToggleSprint`/`InventoryClose`/
+  `EntityDismount`/`EntityPickupItem`/`EntityResurrect`/`EntityTeleport`/
+  `EntityToggleSwim`/`FoodLevelChange`/`ItemMerge`/`BlockIgnite`/`BlockForm`/
+  `TntPrime`/`NotePlay`/`EntityExplode`/`PlayerBedEnter`/`PlayerBedLeave`/
+  `PlayerBucketEmpty`/`PlayerBucketFill`/`PlayerKick`/`BlockPistonExtend`/
+  `BlockPistonRetract`/`SignChange`/`BellRing`/`WeatherChange`/
+  `ThunderChange`/`InventoryOpen`/`InventoryDrag`/`CraftItem`/
+  `EntityCombust`/`EntityRegainHealth`/`EntityAirChange`/`EntityBreed`/
+  `EntityMount`/`EntityPortal`/`EntityShootBow`/`EntityTame`/`EntityTarget`/
+  `EntityTargetLivingEntity`/`EntityToggleGlide`/`EntityTransform`/
+  `EntityRemove`/`BlockDamage`/`BlockFromTo`/`BlockExplode`/`BlockPhysics`/
+  `BlockFade`/`SpongeAbsorb`/`HangingBreak`/`HangingBreakByEntity`/
+  `WorldLoad`/`WorldUnload`/`ChunkUnload`/`TimeSkip`/`MoistureChange`.
+  Also fixed two pre-existing test bugs hit while extending the file:
+  `MoistureChangeEventData` has no `cancelled` field in the real WIT record
+  (the test wrongly passed one; `nimony check` didn't catch it until the
+  file was re-checked after unrelated edits nearby) and a `placeData`
+  identifier collision between `BlockPlaceEventData`'s and
+  `EntityPlaceEventData`'s test variables (renamed the latter to
+  `entityPlaceData`). Built from
   the actual field shapes in
   `upstream-ref/crates/pumpkin-plugin-wit/v0.1/event.wit` (the `.rs`
   wrapper files carry no fields of their own - see the file's doc comment
@@ -75,7 +92,7 @@ is settled, not the generated output by hand.
   closure-through-vtable runtime crash documented in
   `src/server/entity/README.md`).
 
-The remaining ~174 `events/*.rs` files are mechanical follow-ups once
+The remaining ~112 `events/*.rs` files are mechanical follow-ups once
 someone wants them: same WIT-record-to-Nimony-object translation
 `eventdata.nim` already demonstrates, just more of them.
 
