@@ -90,9 +90,9 @@ type
     ## stand, ...) subclass it and override via a manual vtable of proc
     ## fields once a concrete implementation needs one. Left abstract
     ## here since no concrete delegate exists yet in this port.
-    getPropertyImpl*: proc(index: int32): int32
-    setPropertyImpl*: proc(index: int32, value: int32)
-    getPropertiesSizeImpl*: proc(): int32
+    getPropertyImpl*: proc(index: int32): int32 {.closure.}
+    setPropertyImpl*: proc(index: int32, value: int32) {.closure.}
+    getPropertiesSizeImpl*: proc(): int32 {.closure.}
 
 proc getProperty*(d: PropertyDelegate, index: int32): int32 = d.getPropertyImpl(index)
 proc setProperty*(d: PropertyDelegate, index: int32, value: int32) = d.setPropertyImpl(index, value)

@@ -50,9 +50,10 @@ type
       ## so this follows the tuple-optional style already used elsewhere
       ## in this port (e.g. `NbtCompound.get`).
     slots*: seq[Slot]
+    properties*: seq[ScreenProperty]
 
 proc newScreenHandlerBehaviour*(syncId: uint8, windowType: (bool, WindowType)): ScreenHandlerBehaviour =
-  ScreenHandlerBehaviour(syncId: syncId, windowType: windowType, slots: @[])
+  ScreenHandlerBehaviour(syncId: syncId, windowType: windowType, slots: @[], properties: @[])
 
 type
   ScreenHandler* = ref object
@@ -64,12 +65,19 @@ type
     behaviour*: ScreenHandlerBehaviour
     quickMoveImpl*: proc(player: InventoryPlayer, slotIndex: int32): ItemStack {.closure.}
     onClosedImpl*: proc(player: InventoryPlayer) {.closure.}
+    onButtonClickImpl*: proc(player: InventoryPlayer, id: int32): bool {.closure.}
+      ## Port of `on_button_click`. Optional (many handlers have no
+      ## buttons); `onButtonClick` below defaults to upstream's own
+      ## default trait-method body (`false`) when unset.
 
 proc getBehaviour*(h: ScreenHandler): ScreenHandlerBehaviour {.inline.} = h.behaviour
 
 proc addSlot*(h: ScreenHandler, s: Slot) =
   setId(s, h.behaviour.slots.len)
   h.behaviour.slots.add(s)
+
+proc addProperty*(h: ScreenHandler, p: ScreenProperty) =
+  h.behaviour.properties.add(p)
 
 proc addPlayerHotbarSlots*(h: ScreenHandler, playerInv: Inventory) =
   ## Slots 0..8 of a player inventory are the hotbar.
@@ -99,6 +107,21 @@ proc onClosed*(h: ScreenHandler, player: InventoryPlayer) =
 
 proc quickMove*(h: ScreenHandler, player: InventoryPlayer, slotIndex: int32): ItemStack =
   h.quickMoveImpl(player, slotIndex)
+
+proc onButtonClick*(h: ScreenHandler, player: InventoryPlayer, id: int32): bool =
+  if h.onButtonClickImpl == nil:
+    false
+  else:
+    h.onButtonClickImpl(player, id)
+
+proc offerOrDropStack*(player: InventoryPlayer, stack: ItemStack) =
+  ## Port of `offer_or_drop_stack`. TODO: upstream gives the stack to the
+  ## player's inventory or drops it in the world if full; neither
+  ## `InventoryPlayer` operation exists yet (it's still an opaque stub -
+  ## see slot.nim), so this is a documented no-op until a real Player type
+  ## backs it, same status as `defaultOnClosed`'s drop-cursor-stack path.
+  discard player
+  discard stack
 
 proc insertItem*(h: ScreenHandler, stack: var ItemStack, startIndex, endIndex: int32, fromLast: bool): bool =
   ## Port of `ScreenHandler::insert_item`: merges `stack` into existing

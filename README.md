@@ -412,10 +412,29 @@ Smallest/most self-contained crates first, since later crates depend on them:
     `src/server/entity/`, `src/server/block/) - `nimony check` clean,
     `nimony c -r` crashes at `eraiser.nim`'s `ParamsTagId` assertion.
     Documented, not hidden.
-    Still ~8.5k of ~11k LOC remain: all the per-container
-    `*_screen_handler.rs` files beyond beacon, `player/`, `brewing/`,
-    `furnace_like/`, `enchanting/`, `anvil/`, `merchant/`,
-    `container_click.rs`, `drag_handler.rs`, `sync_handler.rs`,
+    Two more concrete handlers ported: `lectern_screen_handler.rs` →
+    `src/inventory/lectern.nim` (single book slot, page-number property,
+    button-click page navigation/take-book, via a new `onButtonClickImpl`
+    vtable field added to `ScreenHandler` and `addProperty`/`properties`
+    added to `ScreenHandlerBehaviour` - both were missing before this
+    handler needed them). `generic_container_screen_handler.rs` →
+    `src/inventory/genericcontainer.nim` (the shared grid-container shape
+    behind chests/ender-chests/hoppers/dispensers/droppers/barrels/
+    crafters - 5 factory procs, one handler struct; upstream's own
+    `quick_move` boundary math (`rows * 9`, not `rows * columns`) is
+    preserved as-is, including its narrower-than-9 containers quirk, since
+    that's upstream's real behavior, not a porting bug). Both
+    `lecterntest.nim`/`genericcontainertest.nim` verify the closure-free
+    arithmetic/shape pieces for real (`nimony c -r` passes); building
+    either handler hits the closures-through-vtables runtime crash
+    (NIMONY-COMPILER-BUGS.md #1) same as beacon's - confirmed again here,
+    including on `LecternController`'s vtable alone, independent of
+    `ScreenHandler`.
+    Still ~7.8k of ~11k LOC remain: the rest of the per-container
+    `*_screen_handler.rs` files (`player/`, `brewing/`, `furnace_like/`,
+    `enchanting/`, `anvil/`, `merchant/`, `mount_`/`stonecutter_`/
+    `smithing_table_`/`cartography_table_`/`grindstone_`/`loom_`
+    handlers), `container_click.rs`, `drag_handler.rs`, `sync_handler.rs`,
     `gui_builder.rs`, and `internal_on_slot_click`'s full click-routing
     logic — all need either the real item/registry types, `Player`/`World`
     types from the main server crate, or both. Extending
