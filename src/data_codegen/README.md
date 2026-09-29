@@ -96,7 +96,9 @@ the same way (`nimony c -r src/data_codegen/gen_<name>.nim`, output
 - `gen_trim_material.nim` → `TrimMaterial` (11 variants, from `trim_material/*.json`: `palette_id` top-level + nested `description.{color,translate}`, both optional, default `""`)
 - `gen_trim_pattern.nim` → `TrimPattern` (18 variants, from `trim_pattern/*.json`: `asset_id`/`decal` (bool, default false) top-level + nested `description.translate`) - added `jsonBoolField` to `codegenutil.nim`
 
-That's 22/90 submodules done.
+- `gen_map_decoration.nim` → `MapDecorationType` (40 entries, from a single positional JSON array `map_decorations.json`, id = array index) - first generator to read a flat positional array of mixed-type objects rather than a name-keyed directory/map; `map_color` defaults to -1, `exploration_map_element` defaults to false when absent
+
+That's 23/90 submodules done.
 
 ## What's NOT done
 
