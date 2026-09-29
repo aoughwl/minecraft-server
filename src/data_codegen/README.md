@@ -98,7 +98,17 @@ the same way (`nimony c -r src/data_codegen/gen_<name>.nim`, output
 
 - `gen_map_decoration.nim` → `MapDecorationType` (40 entries, from a single positional JSON array `map_decorations.json`, id = array index) - first generator to read a flat positional array of mixed-type objects rather than a name-keyed directory/map; `map_color` defaults to -1, `exploration_map_element` defaults to false when absent
 
-That's 23/90 submodules done.
+- `gen_dye_color.nim` → `DyeColor` (16 variants, from `dye_colors.json`, a flat positional array with 7 fields per entry) - `byId`/`byName` fall back to Black on miss, matching upstream's `#[default]`/`unwrap_or_default()` behavior
+- `gen_jukebox_song.nim` → `JukeboxSong` (22 variants, directory shape, id = declaration order) - added `jsonFloatField`/`jsonIntField`/`isAsciiDigit` to `codegenutil.nim`; variant names starting with a digit (`11`, `13`, `5`) get an `Id` prefix like upstream's `format_ident!("Id{}", ...)` does
+- `gen_sound.nim` → `Sound` (1991 variants, from `sounds.json`, a flat string array; id = declaration order matching upstream's `#[repr(u16)]`) - names contain dots (`"entity.allay.ambient_with_item"`), which required extending `toPascalCase` to split on `.` as well as `_`/`-`/space (heck's `ToPascalCase` already treats any non-alphanumeric as a word boundary, so this brings the port in line rather than diverging); `nimony check` takes ~14s on this file, the slowest generated output so far
+- `gen_instrument.nim` → `Instrument` (8 variants, directory shape) - first generator with a cross-reference to another *generated* module (`import sound` for the `sound()` accessor), verified the import resolves and type-checks correctly once both files sit side by side in `src/generated/`
+
+That's 27/90 submodules done.
+
+Skipped after investigation (documented here, not silently dropped): `effect.rs`
+(needs unported `attributes::Attributes` and `data_component_impl::Operation`)
+and `potion.rs` (needs `effect.rs`'s `StatusEffect`, transitively blocked the
+same way) - revisit once `attributes`/`data_component_impl` land.
 
 ## What's NOT done
 

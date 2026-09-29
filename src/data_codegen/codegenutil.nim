@@ -11,7 +11,7 @@ proc toPascalCase*(s: string): string =
   result = ""
   var capitalizeNext = true
   for ch in s:
-    if ch == '_' or ch == '-' or ch == ' ':
+    if ch == '_' or ch == '-' or ch == ' ' or ch == '.':
       capitalizeNext = true
     elif capitalizeNext:
       result.add(toUpperAscii(ch))
@@ -153,6 +153,27 @@ proc jsonBoolField*(jsonPath: Path, key: string, default: bool): bool =
   for k, val in obj.pairs():
     if k == key:
       result = val.getBool()
+
+proc jsonFloatField*(jsonPath: Path, key: string, default: float): float =
+  ## Reads a top-level numeric field as a float, or `default` if absent.
+  var tree = parseFile($jsonPath)
+  let obj = root(tree)
+  result = default
+  for k, val in obj.pairs():
+    if k == key:
+      result = val.getFloat()
+
+proc jsonIntField*(jsonPath: Path, key: string, default: int): int =
+  ## Reads a top-level integer field, or `default` if absent.
+  var tree = parseFile($jsonPath)
+  let obj = root(tree)
+  result = default
+  for k, val in obj.pairs():
+    if k == key:
+      result = int(val.getInt())
+
+proc isAsciiDigit*(c: char): bool {.inline.} =
+  c >= '0' and c <= '9'
 
 proc readStringIntMapSorted*(path: string): seq[(string, int)] =
   ## Port of `serde_json::from_str::<BTreeMap<String, uN>>(...)` - a
