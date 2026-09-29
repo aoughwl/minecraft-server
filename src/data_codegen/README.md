@@ -357,9 +357,28 @@ since `gen_attributes.nim` landed) - revisit once `data_component_impl` lands.
   `nimony c -r` subprocess, checks every id 0..140 against expected
   membership - all match.
 
+- **`biome.rs`** → `gen_biome.nim` → `src/generated/biome.nim` (67 biomes,
+  from `assets/datapack/data/minecraft/worldgen/biome/*.json`). Scoped to
+  `has_precipitation`/`temperature`/`downfall`/`temperature_modifier`/
+  `carvers`/`features` - the climate/generation-relevant fields
+  `src/world/biomeparam.nim`'s parameter math actually needs. Deferred:
+  `spawners`/`spawn_costs` (including the `attributes` override path
+  `apply_natural_mob_spawns` reads), the rest of `attributes`, and
+  `effects` (cosmetic/client-rendering). No `id` field exists in the
+  source JSON (that ordering lives in `registry_data.nim`'s
+  `worldgen/biome` entries already), so this is name-keyed via
+  `biomeFromName`, matching what `biomeparam.nim` actually needs.
+  **Verified**: `biometest.nim` (`nimony c -r`) checks the real biome
+  count (67), `plains`'s exact fields against its source JSON (including
+  a 3-carver list and a 46-entry flattened feature list), short-name vs.
+  namespaced lookup, and a missing-name rejection - all pass. Not yet
+  wired to `biomeparam.nim` itself (that module has no biome-name lookup
+  surface yet, only parameter math) - a future pass connecting the two
+  is the natural next step for a real `BiomeSupplier`.
+
 ## What's NOT done
 
-The remaining ~69 submodules, including `biome.rs`, `recipes.rs`,
+The remaining ~68 submodules, including `recipes.rs`,
 `noise_router.rs`, `noise_settings.rs` (these last few are large and encode
 real structural complexity - nested data shapes, cross-references between
 registries, not just flat string arrays). Each needs the same treatment as
