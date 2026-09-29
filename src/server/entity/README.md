@@ -198,3 +198,27 @@ and currently cannot be, runtime-proven.
 `projectiletest.nim` (above) hits the identical `eraiser.nim`/`ParamsTagId`
 crash at `nimony c -r` - a further confirmation, not a new bug, consistent
 with "anything importing entity.nim can't run yet."
+
+## Two more concrete entities, plus real-dimension retrofitting
+
+`egg.nim` (`EggEntity`, port of `projectile/egg.rs`) and `enderpearl.nim`
+(`EnderPearlEntity`, port of `projectile/ender_pearl.rs`) - both simple
+`ThrownItemEntity` users, same shape as `snowball.nim`. Ported: both
+constructors (`new`/`new_shot`) and `EntityBase` composition. `EggEntity`
+additionally carries a real `ItemStack` (`src/inventory/itemstub.nim`,
+backed by `src/generated/item.nim`'s real 1658-item table) and
+`set_item_stack`. Not ported (need `World`/`Server`/the plugin manager,
+none of which exist beyond `worldstub.nim`): egg's chicken-hatch spawn
+logic and `PlayerEggThrowEvent` plugin hook; ender pearl's portal-particle
+spawn, owner teleport/damage, and endermite-spawn-on-hit chance.
+`eggpearltest.nim` verifies construction/velocity/item-stack fields the
+same way `concretetest.nim`/`projectiletest.nim` do - `nimony check`-clean,
+not runtime-proven (same closures-through-vtables blocker).
+
+Also retrofitted `concretetest.nim` (marker/experience-orb) and
+`projectiletest.nim` (snowball) to build their test entities' dimensions
+from `src/generated/entity_type.nim`'s real per-type table via a small
+`realDims(name)` helper, instead of the ad-hoc guesses used before that
+table existed (it didn't exist when those tests were first written).
+Confirmed marker's real dimensions are exactly 0x0 (the invisible-anchor
+shape upstream gives it) - a concrete check now catches that.

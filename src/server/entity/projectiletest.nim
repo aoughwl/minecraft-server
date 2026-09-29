@@ -14,6 +14,12 @@ import projectile
 import snowball
 import ../../util/vector3
 import ../../util/legacy_rand
+import ../../generated/entity_type
+
+proc realDims(name: string): EntityDimensions =
+  let (found, et) = entityTypeByName(name)
+  assert found, "expected " & name & " in the generated entity_type table"
+  EntityDimensions(width: et.dimensionW, height: et.dimensionH, eyeHeight: et.eyeHeight)
 
 proc approxEq(a, b: float64, eps = 1e-9): bool =
   abs(a - b) < eps
@@ -21,7 +27,7 @@ proc approxEq(a, b: float64, eps = 1e-9): bool =
 block basic_construction:
   let owner = newEntity(1'i32, "owner-uuid", EntityDimensions(width: 0.6f32, height: 1.8f32, eyeHeight: 1.62f32))
   owner.pos = vec3(0.0, 64.0, 0.0)
-  let e = newEntity(2'i32, "snowball-uuid", EntityDimensions(width: 0.25f32, height: 0.25f32, eyeHeight: 0.125f32))
+  let e = newEntity(2'i32, "snowball-uuid", realDims("snowball"))
   let snow = newSnowballEntityShot(e, owner)
   assert snow.thrown.gravity == 0.03
   let (hasOwner, ownerId) = getOwnerId(snow.thrown)

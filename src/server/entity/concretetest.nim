@@ -26,7 +26,17 @@ import std/assertions
 import entity, marker, experienceorb
 import ../../nbt/tag
 import ../../generated/entity_pose
+import ../../generated/entity_type
 import ../../util/vector3
+
+proc realDims(name: string): EntityDimensions =
+  ## Looks up real width/height/eyeHeight from `src/generated/entity_type.nim`
+  ## instead of the ad-hoc guesses this file used before that table existed.
+  let (found, et) = entityTypeByName(name)
+  if found:
+    EntityDimensions(width: et.dimensionW, height: et.dimensionH, eyeHeight: et.eyeHeight)
+  else:
+    EntityDimensions(width: 0.5'f32, height: 0.98'f32, eyeHeight: 0.0'f32)
 
 var failures = 0
 
@@ -64,13 +74,13 @@ block:
 # construction and field-access below (not calling through the vtable
 # procs) is still real signal that the types compose correctly.
 
-let dims = EntityDimensions(width: 0.5'f32, height: 0.98'f32, eyeHeight: 0.0'f32)
-let baseEntity = newEntity(1'i32, "00000000-0000-0000-0000-000000000001", dims)
+let baseEntity = newEntity(1'i32, "00000000-0000-0000-0000-000000000001", realDims("marker"))
 let markerEnt = newMarkerEntity(baseEntity)
 check(markerEnt.entity.entityId == 1'i32, "MarkerEntity wraps its Entity correctly")
 check(markerEnt.data.names.len == 0, "MarkerEntity starts with empty custom data")
+check(markerEnt.entity.dimensions.width == 0.0'f32, "marker's real dimensions are 0x0 (invisible anchor)")
 
-let orbEntity = newEntity(2'i32, "00000000-0000-0000-0000-000000000002", dims)
+let orbEntity = newEntity(2'i32, "00000000-0000-0000-0000-000000000002", realDims("experience_orb"))
 let orb = newExperienceOrbEntity(orbEntity, 37'u32)
 check(orb.amount == 37'u32, "ExperienceOrbEntity carries its amount")
 check(orb.orbAge == 0'u32, "ExperienceOrbEntity starts at age 0")
