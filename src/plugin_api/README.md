@@ -37,10 +37,23 @@ is settled, not the generated output by hand.
 - `permissions.nim` - the plugin sandbox capability-string constants
   (`network.*`, `fs.*`, `sys.*`, `http.outbound`). Pure data, no `wit`
   dependency. `nimony check` clean.
-- `eventdata.nim` - a real server-side `EventData` model, now for 137 events
-  (~136 of ~273 real `-event-data` WIT records covered; see the file's own
+- `eventdata.nim` - a real server-side `EventData` model, now for 170 events
+  (~170 of ~273 real `-event-data` WIT records covered; see the file's own
   count against `event.wit` for the exact current tally).
-  Latest batch (29 new): `BlockBrush`/`BlockCook`/`BlockDropItem`/`BlockExp`/
+  Latest batch (33 new): `PlayerChangeWorld`/`PlayerCustomPayload`/
+  `PlayerItemConsume`/`PlayerItemDamage`/`AsyncPlayerChat`/
+  `AsyncPlayerPreLogin`/`PlayerPreLogin`/`PlayerAdvancementDone`/
+  `PlayerAnimation`/`PlayerArmorStandManipulate`/`PlayerBucketEntity`/
+  `PlayerChangedWorld`/`PlayerChannel`/`PlayerCommandPreprocess`/
+  `PlayerEditBook`/`PlayerElytraBoost`/`PlayerExpCooldownChange`/
+  `PlayerHarvestBlock`/`PlayerHideEntity`/`PlayerItemBreak`/`PlayerItemMend`/
+  `PlayerLeashEntity`/`PlayerLevelChange`/`PlayerLocaleChange`/
+  `PlayerNameEntity`/`PlayerOpenSign`/`PlayerPortal`/`PlayerRiptide`/
+  `PlayerShearEntity`/`PlayerShowEntity`/`PlayerSpawnChange`/
+  `PlayerStatisticIncrement`/`PlayerSwapHands`/`PlayerTakeLecternBook`.
+  ~103 records remain (villager/vehicle/raid/dialog/packet/entity-target
+  long tail) - same mechanical translation, just more of it.
+  Previous batch (29 new): `BlockBrush`/`BlockCook`/`BlockDropItem`/`BlockExp`/
   `BlockFertilize`/`BlockMultiPlace`/`BlockShearEntity`/`BlockSpread`/`Brew`/
   `BrewingStandFuel`/`BrewingStart`/`CampfireStart`/`CauldronLevelChange`/
   `ChunkPopulate`/`ChunkSend`/`CrafterCraft`/`CreeperPower`/`EnchantItem`/

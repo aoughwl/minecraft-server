@@ -1031,3 +1031,210 @@ type
     blockPos*: BlockPos
     blockFace*: string
     cancelled*: bool
+
+  PlayerChangeWorldEventData* = object
+    ## `previous-world`/`new-world: %world` dropped, same as elsewhere -
+    ## see the file header's `target-world` note.
+    player*: PlayerUuid
+    position*: Vector3[float64]
+    yaw*: float32
+    pitch*: float32
+    cancelled*: bool
+
+  PlayerCustomPayloadEventData* = object
+    player*: PlayerUuid
+    channel*: string
+    data*: seq[byte]
+
+  PlayerItemConsumeEventData* = object
+    player*: PlayerUuid
+    itemName*: string
+    cancelled*: bool
+
+  PlayerItemDamageEventData* = object
+    player*: PlayerUuid
+    itemName*: string
+    damage*: int32
+    cancelled*: bool
+
+  AsyncPlayerChatEventData* = object
+    ## `format: text-component` becomes plain `string`, same as elsewhere.
+    player*: PlayerUuid
+    message*: string
+    format*: string
+    cancelled*: bool
+
+  AsyncPlayerPreLoginEventData* = object
+    playerName*: string
+    playerUuid*: string
+    ipAddress*: string
+    kickMessage*: string
+    cancelled*: bool
+
+  PlayerPreLoginEventData* = object
+    playerName*: string
+    playerUuid*: string
+    ipAddress*: string
+    kickMessage*: string
+    cancelled*: bool
+
+  PlayerAdvancementDoneEventData* = object
+    player*: PlayerUuid
+    advancementId*: string
+    cancelled*: bool
+
+  PlayerAnimationEventData* = object
+    player*: PlayerUuid
+    animationType*: string
+    cancelled*: bool
+
+  PlayerArmorStandManipulateEventData* = object
+    player*: PlayerUuid
+    armorStandId*: int32
+    slot*: uint8
+    cancelled*: bool
+
+  PlayerBucketEntityEventData* = object
+    player*: PlayerUuid
+    entityId*: int32
+    bucketItem*: string
+    cancelled*: bool
+
+  PlayerChangedWorldEventData* = object
+    ## `from-world`/`to-world: %world` dropped, same as elsewhere.
+    player*: PlayerUuid
+    cancelled*: bool
+
+  PlayerChannelEventData* = object
+    player*: PlayerUuid
+    channel*: string
+    cancelled*: bool
+
+  PlayerCommandPreprocessEventData* = object
+    player*: PlayerUuid
+    command*: string
+    cancelled*: bool
+
+  PlayerEditBookEventData* = object
+    ## `title: option<string>` becomes a (hasX, x) pair.
+    player*: PlayerUuid
+    slot*: uint32
+    pages*: seq[string]
+    hasTitle*: bool
+    title*: string
+    signing*: bool
+    cancelled*: bool
+
+  PlayerElytraBoostEventData* = object
+    player*: PlayerUuid
+    fireworkId*: int32
+    cancelled*: bool
+
+  PlayerExpCooldownChangeEventData* = object
+    player*: PlayerUuid
+    newCooldown*: int32
+    cancelled*: bool
+
+  PlayerHarvestBlockEventData* = object
+    ## `harvested-items: list<item-stack>` becomes item-name strings, not
+    ## real ItemStack values - keeps this file free of the inventory
+    ## module dependency the rest of it deliberately avoids.
+    player*: PlayerUuid
+    blockPos*: BlockPos
+    harvestedItems*: seq[string]
+    cancelled*: bool
+
+  PlayerHideEntityEventData* = object
+    player*: PlayerUuid
+    entityId*: int32
+    cancelled*: bool
+
+  PlayerItemBreakEventData* = object
+    player*: PlayerUuid
+    itemName*: string
+
+  PlayerItemMendEventData* = object
+    player*: PlayerUuid
+    itemName*: string
+    repairAmount*: int32
+    expConsumed*: int32
+    cancelled*: bool
+
+  PlayerLeashEntityEventData* = object
+    player*: PlayerUuid
+    entityId*: int32
+    holderId*: int32
+    cancelled*: bool
+
+  PlayerLevelChangeEventData* = object
+    player*: PlayerUuid
+    oldLevel*: int32
+    newLevel*: int32
+
+  PlayerLocaleChangeEventData* = object
+    player*: PlayerUuid
+    newLocale*: string
+    cancelled*: bool
+
+  PlayerNameEntityEventData* = object
+    ## `name: text-component` becomes plain `string`.
+    player*: PlayerUuid
+    entityId*: int32
+    name*: string
+    cancelled*: bool
+
+  PlayerOpenSignEventData* = object
+    player*: PlayerUuid
+    blockPos*: BlockPos
+    isFront*: bool
+    cancelled*: bool
+
+  PlayerPortalEventData* = object
+    ## `to-pos: option<block-pos>` becomes a (hasX, x) pair.
+    player*: PlayerUuid
+    fromPos*: BlockPos
+    hasToPos*: bool
+    toPos*: BlockPos
+    cancelled*: bool
+
+  PlayerRiptideEventData* = object
+    player*: PlayerUuid
+    itemName*: string
+    cancelled*: bool
+
+  PlayerShearEntityEventData* = object
+    player*: PlayerUuid
+    entityId*: int32
+    hand*: uint8
+    cancelled*: bool
+
+  PlayerShowEntityEventData* = object
+    player*: PlayerUuid
+    entityId*: int32
+    cancelled*: bool
+
+  PlayerSpawnChangeEventData* = object
+    ## `new-spawn: option<block-pos>` becomes a (hasX, x) pair.
+    player*: PlayerUuid
+    hasNewSpawn*: bool
+    newSpawn*: BlockPos
+    forced*: bool
+    cancelled*: bool
+
+  PlayerStatisticIncrementEventData* = object
+    player*: PlayerUuid
+    statisticId*: string
+    amount*: int32
+    cancelled*: bool
+
+  PlayerSwapHandsEventData* = object
+    player*: PlayerUuid
+    cancelled*: bool
+
+  PlayerTakeLecternBookEventData* = object
+    ## `book: item-stack` becomes an item-name string, same reasoning as
+    ## PlayerHarvestBlockEventData.
+    player*: PlayerUuid
+    blockPos*: BlockPos
+    book*: string
+    cancelled*: bool

@@ -601,4 +601,106 @@ assert furnaceStartSmeltData.cookingTime == 200'u32
 let hangingPlaceData = HangingPlaceEventData(entityId: 27'i32, hasPlayer: true, player: p1, blockPos: bp1, blockFace: "north", cancelled: false)
 assert hangingPlaceData.blockFace == "north"
 
+let changeWorldData = PlayerChangeWorldEventData(player: p1, position: Vector3[float64](x: 1.0, y: 2.0, z: 3.0), yaw: 0.0'f32, pitch: 0.0'f32, cancelled: false)
+assert changeWorldData.position.x == 1.0
+
+let customPayloadData = PlayerCustomPayloadEventData(player: p1, channel: "minecraft:brand", data: @[1'u8, 2'u8])
+assert customPayloadData.data.len == 2
+
+let itemConsumeData = PlayerItemConsumeEventData(player: p1, itemName: "minecraft:apple", cancelled: false)
+assert itemConsumeData.itemName == "minecraft:apple"
+
+let itemDamageData = PlayerItemDamageEventData(player: p1, itemName: "minecraft:diamond_pickaxe", damage: 2'i32, cancelled: false)
+assert itemDamageData.damage == 2'i32
+
+let asyncChatData = AsyncPlayerChatEventData(player: p1, message: "hi", format: "<player> hi", cancelled: false)
+assert asyncChatData.message == "hi"
+
+let asyncPreLoginData = AsyncPlayerPreLoginEventData(playerName: "steve", playerUuid: "uuid", ipAddress: "127.0.0.1", kickMessage: "", cancelled: false)
+assert asyncPreLoginData.playerName == "steve"
+
+let preLoginData = PlayerPreLoginEventData(playerName: "steve", playerUuid: "uuid", ipAddress: "127.0.0.1", kickMessage: "", cancelled: false)
+assert preLoginData.ipAddress == "127.0.0.1"
+
+let advancementDoneData = PlayerAdvancementDoneEventData(player: p1, advancementId: "minecraft:story/mine_stone", cancelled: false)
+assert advancementDoneData.advancementId == "minecraft:story/mine_stone"
+
+let animationData = PlayerAnimationEventData(player: p1, animationType: "swing_main_arm", cancelled: false)
+assert animationData.animationType == "swing_main_arm"
+
+let armorStandData = PlayerArmorStandManipulateEventData(player: p1, armorStandId: 30'i32, slot: 5'u8, cancelled: false)
+assert armorStandData.slot == 5'u8
+
+let bucketEntityData = PlayerBucketEntityEventData(player: p1, entityId: 31'i32, bucketItem: "minecraft:water_bucket", cancelled: false)
+assert bucketEntityData.entityId == 31'i32
+
+let changedWorldData = PlayerChangedWorldEventData(player: p1, cancelled: false)
+assert changedWorldData.cancelled == false
+
+let channelData = PlayerChannelEventData(player: p1, channel: "minecraft:brand", cancelled: false)
+assert channelData.channel == "minecraft:brand"
+
+let cmdPreprocessData = PlayerCommandPreprocessEventData(player: p1, command: "/gamemode creative", cancelled: false)
+assert cmdPreprocessData.command == "/gamemode creative"
+
+let editBookData = PlayerEditBookEventData(player: p1, slot: 0'u32, pages: @["page 1"], hasTitle: true, title: "My Book", signing: false, cancelled: false)
+assert editBookData.pages.len == 1
+
+let elytraBoostData = PlayerElytraBoostEventData(player: p1, fireworkId: 32'i32, cancelled: false)
+assert elytraBoostData.fireworkId == 32'i32
+
+let expCooldownData = PlayerExpCooldownChangeEventData(player: p1, newCooldown: 40'i32, cancelled: false)
+assert expCooldownData.newCooldown == 40'i32
+
+let harvestBlockData = PlayerHarvestBlockEventData(player: p1, blockPos: bp1, harvestedItems: @["minecraft:wheat"], cancelled: false)
+assert harvestBlockData.harvestedItems.len == 1
+
+let hideEntityData = PlayerHideEntityEventData(player: p1, entityId: 33'i32, cancelled: false)
+assert hideEntityData.entityId == 33'i32
+
+let itemBreakData = PlayerItemBreakEventData(player: p1, itemName: "minecraft:wooden_pickaxe")
+assert itemBreakData.itemName == "minecraft:wooden_pickaxe"
+
+let itemMendData = PlayerItemMendEventData(player: p1, itemName: "minecraft:bow", repairAmount: 5'i32, expConsumed: 2'i32, cancelled: false)
+assert itemMendData.repairAmount == 5'i32
+
+let leashEntityData = PlayerLeashEntityEventData(player: p1, entityId: 34'i32, holderId: 1'i32, cancelled: false)
+assert leashEntityData.entityId == 34'i32
+
+let levelChangeData = PlayerLevelChangeEventData(player: p1, oldLevel: 4'i32, newLevel: 5'i32)
+assert levelChangeData.newLevel == 5'i32
+
+let localeChangeData = PlayerLocaleChangeEventData(player: p1, newLocale: "en_us", cancelled: false)
+assert localeChangeData.newLocale == "en_us"
+
+let nameEntityData = PlayerNameEntityEventData(player: p1, entityId: 35'i32, name: "Rex", cancelled: false)
+assert nameEntityData.name == "Rex"
+
+let openSignData = PlayerOpenSignEventData(player: p1, blockPos: bp1, isFront: true, cancelled: false)
+assert openSignData.isFront == true
+
+let playerPortalData = PlayerPortalEventData(player: p1, fromPos: bp1, hasToPos: false, toPos: bp1, cancelled: false)
+assert playerPortalData.hasToPos == false
+
+let riptideData = PlayerRiptideEventData(player: p1, itemName: "minecraft:trident", cancelled: false)
+assert riptideData.itemName == "minecraft:trident"
+
+let playerShearEntityData = PlayerShearEntityEventData(player: p1, entityId: 36'i32, hand: 0'u8, cancelled: false)
+assert playerShearEntityData.entityId == 36'i32
+
+let showEntityData = PlayerShowEntityEventData(player: p1, entityId: 37'i32, cancelled: false)
+assert showEntityData.entityId == 37'i32
+
+let playerSpawnChangeData = PlayerSpawnChangeEventData(player: p1, hasNewSpawn: true, newSpawn: bp1, forced: true, cancelled: false)
+assert playerSpawnChangeData.forced == true
+
+let statIncrementData = PlayerStatisticIncrementEventData(player: p1, statisticId: "minecraft:custom:minecraft:jump", amount: 1'i32, cancelled: false)
+assert statIncrementData.amount == 1'i32
+
+let swapHandsData = PlayerSwapHandsEventData(player: p1, cancelled: false)
+assert swapHandsData.cancelled == false
+
+let takeLecternBookData = PlayerTakeLecternBookEventData(player: p1, blockPos: bp1, book: "minecraft:written_book", cancelled: false)
+assert takeLecternBookData.book == "minecraft:written_book"
+
 echo "all eventdata checks passed"
