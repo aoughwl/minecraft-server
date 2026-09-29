@@ -130,6 +130,30 @@ proc jsonStringField*(jsonPath: Path, key: string): string =
     if k == key:
       result = val.getStr()
 
+proc jsonNestedStringField*(jsonPath: Path, outerKey, innerKey: string): string =
+  ## Reads a string field one level deep (`obj[outerKey][innerKey]`), e.g.
+  ## `description.translate`. Missing outer/inner keys or a non-string value
+  ## yield "" (matching upstream's `.as_deref().unwrap_or("")` pattern for
+  ## `Option<String>` fields).
+  var tree = parseFile($jsonPath)
+  let obj = root(tree)
+  result = ""
+  for k, val in obj.pairs():
+    if k == outerKey:
+      for ik, iv in val.pairs():
+        if ik == innerKey:
+          result = iv.getStr()
+
+proc jsonBoolField*(jsonPath: Path, key: string, default: bool): bool =
+  ## Reads a top-level bool field, or `default` if absent (matching
+  ## upstream's `#[serde(default)]` on a `bool` field).
+  var tree = parseFile($jsonPath)
+  let obj = root(tree)
+  result = default
+  for k, val in obj.pairs():
+    if k == key:
+      result = val.getBool()
+
 proc readStringIntMapSorted*(path: string): seq[(string, int)] =
   ## Port of `serde_json::from_str::<BTreeMap<String, uN>>(...)` - a
   ## `BTreeMap` iterates in ascending key order, so this sorts by name to
