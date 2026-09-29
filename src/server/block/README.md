@@ -180,7 +180,36 @@ not the whole module.
 
    Not ported (same cut as `gen_block.nim`): the full per-state
    `states[]` array (collision/outline shapes, opacity, luminance) - only
-   the id↔property-values mapping. `logs.rs`/`end_rod.rs`/
-   `end_portal_frame.rs`/`glazed_terracotta.rs` themselves not yet ported
-   as further proof cases (chain.rs alone was the scope of this pass) -
-   should now be straightforward given the same pattern.
+   the id↔property-values mapping.
+
+9. **Two more proof cases using `BlockStateId`**: `logs.nim` (`logs.rs`,
+   ported against `oak_log` as a representative member of the
+   `minecraft:logs` tag - no tag-membership data exists yet, so this
+   registers one member rather than the whole tag; single "axis"
+   property, direction→axis mapping) and `glazed_terracotta.nim`
+   (`glazed_terracotta.rs`, ported against `white_glazed_terracotta` as a
+   representative of that tag; single "facing" property). The latter
+   needed upstream's `get_horizontal_facing()`, which isn't a method on
+   this port's `Entity` (only raw `yaw`/`pitch` fields exist) - the
+   standard Minecraft yaw-quantization formula is reproduced locally in
+   `glazed_terracotta.nim` rather than added to `entity.nim` (out of
+   scope for a block-only pass). Real logic lives in
+   `onPlaceGlazedTerracotta(player)`, callable directly with a player
+   reference; the fixed `(direction, waterlogged)` `onPlaceImpl` vtable
+   signature has no player slot (scoped to what `chain.rs` needed), so
+   its vtable entry falls back to `defaultOnPlace`.
+
+   `logsglazedtest.nim` verifies both blocks' state-id math for real:
+   `oak_log`'s three axis directions decode back to distinct real state
+   ids, `white_glazed_terracotta`'s vtable path and a direct nil-player
+   call both correctly fall back to the real default state.
+   `nimony check` passes clean on all four files; `nimony c -r` hits the
+   same documented closures-through-vtables crash as every other file
+   here (confirmed again, exact same signature -
+   `eraiser.nim(128,3)`/`lambdalifting.nim(369,3)`) - check-verified, not
+   runtime-proven.
+
+   `end_rod.rs`/`end_portal_frame.rs` remain unattempted: `end_rod.rs`
+   needs `args.world.get_block_state_id` (a real neighbor-block query
+   `worldstub.nim` doesn't expose yet), a step beyond what `chain.rs`/
+   `logs.rs`/`glazed_terracotta.rs` needed.
