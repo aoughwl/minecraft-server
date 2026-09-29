@@ -3,7 +3,9 @@
 ## What's here
 
 `blockmisc.nim` — `PathComputationType`, the one type in `mod.rs` with zero
-dependency on `World`/`Player`/`Entity`/`Server`. That's it so far.
+dependency on `World`/`Player`/`Entity`/`Server`. Plus a growing set of
+concrete `BlockBehaviour`/direct-proc ports — see the status-update section
+below for the current list and how each was unblocked.
 
 ## What's NOT here, and why
 
@@ -276,3 +278,27 @@ not the whole module.
     `spreading_snowy_block.rs` is now also unblocked in principle (same
     neighbor-query need) but wasn't attempted in this pass - a
     reasonable next proof case.
+
+12. **`spreading_snowy_block.rs`**: ported `SnowyBlock`'s `on_place`/
+    `get_state_for_neighbor_update` (podzol/mycelium's `snowy` state
+    property, resolved from whether the block above is snow) to
+    `spreadingsnowy.nim`, exposed the same way `end_rod.nim` is - direct
+    `snowyOnPlace`/`snowyGetStateForNeighborUpdate` procs taking `World`/
+    `BlockPos`, not forced through `onPlaceImpl`'s fixed signature.
+
+    **Not ported**: `SpreadingSnowyBlock`'s `random_tick`/`can_propagate`/
+    `can_stay_alive` (needs a real block-tag system, `LightEngine`'s
+    light-dampening math, `World.is_loaded`/`get_max_local_raw_brightness`,
+    and a random-tick scheduler - none of which exist). The "is this block
+    tagged as snow" check upstream does via `tag::Block::MINECRAFT_SNOW` is
+    approximated here by exact-name match against `minecraft:snow`/
+    `minecraft:snow_block` - documented in-file as a real gap pending a
+    tag system, not a faked equivalence.
+
+    `snowytest.nim` proves the real state-id math for both directions (no
+    snow above → `snowy: false`; snow written into `worldstub` above the
+    placement position → `snowy: true`; neighbor-update ignores non-`Up`
+    directions; neighbor-update flips an existing state to snowy). `nimony
+    check` passes clean on `spreadingsnowy.nim`/`snowytest.nim`; `nimony
+    c -r` hits the same documented `eraiser.nim(128,3)` crash as every
+    other file here - check-verified, not runtime-proven.
