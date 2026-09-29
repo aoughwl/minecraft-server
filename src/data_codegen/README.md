@@ -196,6 +196,56 @@ since `gen_attributes.nim` landed) - revisit once `data_component_impl` lands.
   filed externally (SendFeedback quota exhausted this session) - flagged
   here for whoever next hits either.
 
+- `chunk_view_lut.rs` → `src/generated/chunk_view_lut.nim` (**no JSON input at
+  all** - pure math: concentric view-distance and Chebyshev/square ring
+  offset tables). Upstream computes this inside a `proc_macro2`/`quote!`
+  build script to bake `static` zero-cost arrays; Nimony has no build-time
+  codegen macro to reproduce that trick and there's no external data file
+  for a generator to read, so this is ported directly as a module that
+  builds its tables once at load time (`let chunkViewLut* = build...()`)
+  rather than emitting a giant array-literal source file (the Chebyshev
+  table alone has 9409 entries at the max radius - a literal would work,
+  per `gen_sound.nim`'s 1991-variant precedent, but a computed proc is
+  simpler and behaviorally identical). **Verified**:
+  `chunk_view_luttest.nim` checks the dist<2-empty rule, the
+  relX²+relZ²<d² filter for every offset at several distances, the ring
+  size = 8r / square size = 1+4r(r+1) closed-form identities, and the
+  total-offset-count sum formula - all pass (`nimony c -r`, 9409 total
+  Chebyshev offsets confirmed).
+- `context_provider.rs` → `src/data_codegen/gen_context_provider.nim` →
+  `src/generated/context_provider.nim`. Walks
+  `assets/datapack/data/minecraft/context_{int,float}_provider/` (one level
+  of category subdirectory, e.g. `cooking/time_coal.json`) and embeds each
+  JSON file's raw text (upstream does this via `include_str!` at Rust
+  compile time) into a `case`-based lookup proc keyed by both the bare id
+  and the `minecraft:`-namespaced id, plus a name-list proc, for both int
+  and float provider kinds. **Run and verified**:
+  `nimony c -r src/data_codegen/gen_context_provider.nim` walked the real
+  26 int + 4 float provider files and wrote a 78-line
+  `src/generated/context_provider.nim` that itself `nimony check`s clean;
+  spot-checked `cooking/time_coal`'s embedded JSON byte-for-byte against
+  its source file (`"left": 1600` and the full nested `conditional`
+  structure match exactly).
+  **Found and worked around a new Nimony compiler bug**: calling two
+  different `{.raises.}` procs (a `walkDir` iterator and `readFile`)
+  within the same `try` block - even indirectly, walkDir's loop body
+  calling `readFile` - produces broken C codegen (`request for member
+  'fld_0' in something not a structure or union`, an `ErrorCode`/tuple
+  type confusion in the generated C), while `nimony check` passes clean.
+  Fixed by splitting into two passes: one `try` block collects file paths
+  via `walkDir`, a second, separate `try`-wrapped proc (`readOne`) reads
+  each file's contents afterward - no `{.raises.}` call nests inside
+  another `{.raises.}` call's `try` scope. Documented here since
+  SendFeedback quota was exhausted this session; worth filing upstream
+  once quota resets.
+- `test_instance.rs` (155 lines) - investigated, not ported this pass.
+  Recursively scans `test_instance/` directories across multiple
+  "packs" (the base `assets/datapack` plus every subdirectory of
+  `assets/tests/datapacks`), each pack scanned per-namespace with
+  unbounded-depth directory recursion - a genuinely bigger task than
+  `chunk_view_lut`/`context_provider`'s one-level scans, deferred to a
+  dedicated pass rather than rushed.
+
 ## What's NOT done
 
 The other ~71 submodules up through `block.rs`, `item.rs`, `biome.rs`, `recipes.rs`,
