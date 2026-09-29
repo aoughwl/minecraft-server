@@ -322,12 +322,41 @@ Smallest/most self-contained crates first, since later crates depend on them:
     this way). Treat the tree/dispatcher as semantically-checked, not
     proven at runtime, until that codegen crash is resolved. See
     `src/command/lib.nim`'s doc comment for the full breakdown.
-    NOT started: individual richer argument types (block/item/nbt/range/
-    coordinates/particle/structure/... - all need real world/registry
-    types), `errors/error_types.rs`, the SNBT parser, suggestions,
-    `argument_builder.rs` (a fluent DSL `cmdtree.nim`'s plain builder procs
-    cover already), and real command execution (needs Player/World/Server
-    from the still-mostly-unported main server crate).
+    **Follow-up pass ported the coordinate/misc leaf argument types**:
+    `coordinates/mod.rs` → `src/command/coordinates.nim` (`WorldCoordinate`/
+    `Coordinates`, world/local parse+resolve, the local-coordinate
+    forward/up/left rotation math); `coordinates/block_pos.rs` →
+    `blockposarg.nim` (integral parse/resolve + `is_valid_block_pos`);
+    `coordinates/vec3.rs` → `vec3arg.nim`; `coordinates/angle.rs` →
+    `angle.nim` (`Angle` + `wrap_degrees`); `uuid.rs` → `uuidarg.nim`
+    (plus a from-scratch UUID hex-string parser - none existed anywhere in
+    this port, `src/protocol/uuid.nim` only has the wire shape);
+    `gamemode.rs` → `gamemodearg.nim`; `identifier.rs` → `identifierarg.nim`.
+    uuid/gamemode/identifier wire into the existing `ArgValue`/`ArgumentType`
+    vtable as `avkString` holding validated text (a scope call documented
+    in each file, not a full `ArgValue` widening); coordinates/blockpos/
+    vec3/angle stay standalone parsers for now since `Coordinates`/`Angle`
+    don't reduce to a single `ArgValue` primitive. `coordtest.nim` verifies
+    the coordinate/blockpos/vec3/angle logic against upstream's own
+    documented `examples()` (parses "1 3 5", "-3 ~24 ~-1", "^ ^9 ^56",
+    "~ ~ ~", "0.1 -0.5 .9", integer-centering, "~-5", etc.) but is
+    check-only, NOT runtime-proven: importing `cmdsource.nim` for
+    `CommandSource` is enough to hit the closures-through-vtables crash,
+    even though `newDummySource()` never populates a real closure field -
+    the 10th confirmation of this bug, and the clearest evidence yet that
+    a closure-vtable TYPE merely being linked into the binary triggers it,
+    not any instance actually holding or calling a closure.
+    `argvaluetest.nim` (uuid/gamemode/identifier, which do touch
+    `argtype.nim`) is likewise check-only.
+    Skipped: `hex_color.rs`/`team_color.rs` (need the unported `TextComponent`
+    for their `RGBColor`/error-message types), `rotation.rs`/`swizzle.rs`/
+    `column_pos.rs`/`vec2.rs` (straightforward extensions of the
+    `coordinates.nim` pattern, not yet done).
+    NOT started: block/item/nbt/range/particle/structure argument types
+    (all need real world/registry types), `errors/error_types.rs`, the SNBT
+    parser, suggestions, `argument_builder.rs` (a fluent DSL `cmdtree.nim`'s
+    plain builder procs cover already), and real command execution (needs
+    Player/World/Server from the still-mostly-unported main server crate).
     **inventory: core interface + a couple of leaves ported** to
     `src/inventory/*.nim` (6 files, all `nimony check` clean):
     `error.rs`→`invbase.nim`, `window_property.rs`→`window_property.nim`,
