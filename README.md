@@ -114,9 +114,18 @@ Smallest/most self-contained crates first, since later crates depend on them:
    stdlib has no HTTP client or TLS at all, so `check_license_online`/
    `check_for_updates` compile and return a clear "not implemented" error
    rather than a fake success - needs libcurl/WinHTTP FFI eventually.
-9. `pumpkin-world`, `pumpkin-inventory`, `pumpkin-command`
-10. `pumpkin` (main server crate, ~269k LOC)
-11. `pumpkin-data` (~1.5M LOC — almost entirely generated block/item/registry
+9. `pumpkin-host-bindings` (~70 LOC) — **Not portable yet; documented
+   instead.** The entire file is one `wasmtime::component::bindgen!`
+   macro call over `../pumpkin-plugin-wit/v0.1/*.wit` (~14.2k lines of
+   WIT across 60+ files) - there is no hand-written Rust logic to
+   translate, and Nimony has no WASM component-model runtime or
+   WIT-bindgen equivalent. See `src/host_bindings/README.md` for the full
+   explanation and the three real options once the plugin ABI is actually
+   being built (wasmtime C API FFI, a custom WIT→Nimony generator, or
+   dropping the WASM sandbox model for native-loaded plugins).
+10. `pumpkin-world`, `pumpkin-inventory`, `pumpkin-command`
+11. `pumpkin` (main server crate, ~269k LOC)
+12. `pumpkin-data` (~1.5M LOC — almost entirely generated block/item/registry
    tables; port the generator, not the generated output, once the shape of
    everything above is settled)
 
