@@ -84,6 +84,18 @@ findings from later in the session and were not separately filed (quota
 exhausted) — worth filing as a follow-up, since they sharpen the bug
 significantly.
 
+**Further refinement — not specific to `entity.nim`:** `src/server/command/setidletimeout.nim`
+(a command file that imports neither `entity.nim` nor `cmdsource.nim`'s
+`player` field's type) hits the exact same signature. The actual trigger is
+`src/command/cmdtree.nim`/`cmddispatch.nim`'s own `Command`/`Requirement`
+closure-typed fields — anything importing the command tree/dispatcher
+infrastructure at all inherits the crash, independent of `entity.nim`. So
+the blast radius is broader than "everything touching Entity": it's
+"everything touching *any* closure-vtable type", which in this port means
+most of `src/command/`, `src/inventory/`'s screen handlers, `src/server/block/`,
+`src/server/item/`, and `src/server/entity/` alike. See
+`src/server/command/setidletimeouttest.nim` for the confirming repro.
+
 ---
 
 ## 2. Closure assigned to a `ref`-object proc-typed field without `{.closure.}` crashes `nimony check` itself

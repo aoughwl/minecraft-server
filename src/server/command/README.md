@@ -104,6 +104,22 @@ registry (a server-wide list of connected players, which
 `src/server/world/worldstub.nim` doesn't model) beyond what's already
 ported here.
 
+- **`setidletimeout.nim`** - `/setidletimeout <minutes>`. Single
+  non-negative-integer argument, gated at the parser via
+  `newIntegerArgumentType(min = 0)`. `CommandSource` gained an
+  `idleTimeoutProc*: proc(minutes: int32) {.closure.}` field standing in
+  for `context.server().player_idle_timeout.store(...)` (no `Server`
+  type in this port yet). `setidletimeouttest.nim` drives it through a
+  real Tree/dispatch walk.
+
+  **Important finding from this file**: it imports neither `entity.nim`
+  nor `cmdsource.nim`'s `player` field's type, yet `nimony c -r` still
+  hits the exact same closures-through-vtables crash. That proves the
+  crash isn't specific to `Entity`/`Player` at all - `src/command/
+  cmdtree.nim`/`cmddispatch.nim`'s own `Command`/`Requirement`
+  closure-typed fields are sufficient on their own. See
+  `NIMONY-COMPILER-BUGS.md` #1's "Further refinement" note.
+
 ## Runtime-verification status
 
 Same as everything importing `src/server/entity/entity.nim` (now also
@@ -114,5 +130,8 @@ need of its own): `nimony check` passes clean, but `nimony c -r` hits
 the closures-through-vtables crash cataloged as bug #1 in
 `NIMONY-COMPILER-BUGS.md` (confirmed again here for `stoptest.nim`,
 same exact signature: `lambdalifting.nim(369)`/`eraiser.nim(128)`).
-`gamemodetest.nim`/`saymetest.nim`/`stoptest.nim` are all
-check-verified, not runtime-proven.
+`gamemodetest.nim`/`saymetest.nim`/`stoptest.nim`/`setidletimeouttest.nim`
+are all check-verified, not runtime-proven - and `setidletimeouttest.nim`
+specifically shows the crash's real trigger is `src/command/`'s own
+closure-vtable types (`cmdtree.nim`/`cmddispatch.nim`), not `entity.nim`
+as earlier files' doc comments implied.

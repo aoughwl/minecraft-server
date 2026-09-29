@@ -97,6 +97,10 @@ type
     getSeedProc*: proc(): int64 {.closure.}
       ## stands in for `context.world().level.seed.0`
       ## (src/server/command/seed.nim) - `nil` falls back to `0`.
+    idleTimeoutProc*: proc(minutes: int32) {.closure.}
+      ## stands in for `context.server().player_idle_timeout.store(...)`
+      ## (src/server/command/setidletimeout.nim) - same no-`Server`-type
+      ## gap as `stopProc`. `nil` is a safe no-op.
 
 proc sendMessage*(s: CommandSource, message: string) =
   if s.sendMessageProc != nil:
