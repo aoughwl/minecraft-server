@@ -702,6 +702,27 @@ Smallest/most self-contained crates first, since later crates depend on them:
     `src/server/command/README.md` for what's next (the ~30 remaining
     command files, several trivial).
 
+## Entrypoint and the core/transport split
+
+`src/main.nim` is the first real bootable entrypoint: it opens a real
+Winsock2 TCP listener (`src/server/net/winsock.nim` - Nimony ships no
+working socket syscalls yet, see that file's header) and speaks the
+Java-edition handshake + status/ping sub-protocol end to end, verified
+against a real client-shaped probe (status JSON + ping/pong round trip).
+Login/play-state packet dispatch isn't implemented yet; a login attempt
+gets a clean disconnect message instead.
+
+`src/server/servercore.nim` holds the actual server state/logic
+(`ServerCore`: world, player registry, config) with **no** dependency on
+sockets or wire framing. `main.nim`'s listener is one transport in front
+of it - it decodes packets and calls straight into `ServerCore`. This
+split exists so a future in-process embedding host (Jester's
+`aoughwl.mcserver`, when it is itself the singleplayer host) can call
+`startEmbeddedServer()` directly as plain Nimony procs instead of looping
+packets through a loopback socket - see `servercore.nim`'s header comment
+for the full rationale and what's still undecided (the actual Nimony<->
+host C-ABI export shape).
+
 ## Layout
 
 ```

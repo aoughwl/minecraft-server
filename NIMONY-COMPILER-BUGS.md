@@ -422,6 +422,107 @@ session).
 
 ---
 
+## 14. Auto-generated `=dup`/`=destroy` hook for `ref object` segfaults on a nil receiver
+
+Reproduced against the *updated* `~/nimony/bin` toolchain (the one with
+fixes #1's three layers already applied — this is a different, newer bug
+uncovered only once #1 stopped masking it). `src/server/entity/entity.nim`
++ `entitytest.nim` now compile and **link** clean (no more C-codegen
+errors at all), but the produced `entitytest.exe` segfaults immediately on
+start (`STATUS_ACCESS_VIOLATION`, exit `-1073741819`).
+
+**Repro:** `nimony c -r src\server\entity\entitytest.nim` (PowerShell), or
+run the built `entitytest.exe` directly under gdb:
+
+```
+gdb -batch -ex run -ex bt -ex "info registers" --args nimcache\...\entitytest.exe
+```
+
+Crash is in a compiler-generated closure named
+`X60Qanonproc_0_entv11w8h1`, which is the `=destroy`/`=dup` pair for
+`ref Entity` (symbol names `eQdestroyQ_Aref...Entity...` /
+`eQdupQ_Aref...Entity...` visible in the disassembly right after it).
+Disassembly of the crashing function:
+
+```
+push   %rbx
+sub    $0x20,%rsp
+mov    %rcx,%rbx        ; rbx = self (the ref Entity being dup'd)
+mov    $0x0,%ecx
+call   =destroy(Entity)
+mov    0x10(%rbx),%rcx  ; <-- CRASHES HERE: rbx == 0
+call   =dup(Entity)
+```
+
+At the crash, `rbx` (the generic register alias used for `self` across
+this call) is `0x0`. The generated hook body unconditionally dereferences
+the receiver at offset `0x10` to fetch a field to pass into the next hook
+call, with **no nil-check first**. Any `ref object` value that legitimately
+holds `nil` (here: `EntityBase.vehicle*: nil EntityBase`, or any nil
+`EntityBase`/`Entity` ref flowing through a sink/copy path during object
+construction) triggers this the moment the compiler's own dup/destroy
+plumbing touches it — it's not app-level misuse, the generated hook itself
+is missing the standard `if self != nil:` guard that hand-written
+`=destroy`/`=dup` procs always have.
+
+**Workaround applied in this port:** none yet at the app level — the
+crash is inside compiler-generated code, not anything `entity.nim` calls
+directly, so there's no source-level pattern to avoid short of not using
+`ref object` fields that can hold `nil` at all (not viable here; `vehicle`
+legitimately has no value most of the time). Left failing; `entitytest.nim`
+is understood to compile+link correctly but not run correctly until this
+is fixed upstream. Next step if picked back up: patch the hook-emission
+site in hexer (wherever it synthesizes `=dup`/`=destroy` bodies for `ref
+object` types) to emit `if self.isNil: return` (or equivalent) before the
+field-access/dispatch call, mirroring what hand-written hooks already do.
+
+**Filed:** no — found at the very end of this session, after the #1 fix
+verification pass; not yet reported upstream.
+
+---
+
+## 15. `import std/strutils` crashes nifler on `std/parseutils.nim` (REGRESSION from this session's own bug #1 fix)
+
+Discovered while building `src/main.nim` (the new network entrypoint).
+Bare `import std/strutils` - nothing else, no app code - now crashes
+`nifler.exe` while parsing the stdlib's own `std/parseutils.nim`
+(strutils imports it):
+
+```
+Error: unhandled exception: bridge.nim(265, 5) `allowEmpty` unexpected
+nkEmpty in parent nkStmtListExpr at 246:24 [AssertionDefect]
+FAILURE: nifler.exe --portablePaths --deps parse
+  ...\nimony\lib\std\parseutils.nim nimcache\....p.nif
+```
+
+Confirmed as a **regression introduced by this session's own rebuild**,
+not a pre-existing bug: the same one-line `import std/strutils` file
+compiles clean under the *old* `~/nimony/bin.stale-backup-20260929/`
+toolchain (from before this session's #1 fix commits were built in), and
+crashes under the *current* `~/nimony/bin/` (rebuilt from
+`~/nimony-fix-worktree` after commits `349da94a`/`f73e7361`/`369e0758`).
+One of those three fixes touches something `std/parseutils.nim`'s own
+source shape trips over in nifler's parser - not yet bisected to which
+of the three.
+
+This is a serious regression: `strutils` is pulled in transitively by
+huge parts of this port (anything using `std/os`, many data-codegen
+files, string formatting helpers) and previously worked fine. Worked
+around locally in `src/main.nim` by avoiding `strutils` entirely (hand-
+rolled `jsonEscape` instead of `.replace`), but that's not viable
+port-wide - most existing files that already depend on `strutils`
+(`codegenutil.nim` and everything built on it) have NOT been re-verified
+against the current toolchain and may now be broken too.
+
+**Filed:** no. **This should be the top priority the next time compiler
+work resumes** - bisect which of the three #1-fix commits causes it
+(likely candidate: `369e0758`, the object-field closure-type computation
+fix, since it's the one that touches type-section rewriting broadly) and
+either fix it or revert/narrow that commit before trusting the rebuilt
+toolchain for anything beyond the entity.nim case it was built to fix.
+
+---
+
 ## Summary table
 
 | # | Bug | Nimony check | `c -r` / C-codegen | Filed |
@@ -439,3 +540,5 @@ session).
 | 11 | Tuple-destructure `for` over local seq var | crashes (parser) | — | no |
 | 12 | `var Table[K,V]` out-param writes lost on return | passes | **silently wrong data, no crash** | no |
 | 13 | Two closures in one constructor sharing a captured var breaks init-proof | crashes (false diagnostic) | — | no |
+| 14 | Auto `=dup`/`=destroy` hook for `ref object` derefs nil receiver, no guard | passes, links | segfault at runtime (`entitytest.exe`) | no |
+| 15 | `import std/strutils` crashes nifler on `std/parseutils.nim` - **REGRESSION** from this session's #1 fix rebuild | crashes (parse) | — | no |
