@@ -481,10 +481,12 @@ verification pass; not yet reported upstream.
 
 ---
 
-## 15. `import std/strutils` crashes nifler on `std/parseutils.nim` (REGRESSION from this session's own bug #1 fix)
+## 15. `import std/strutils` crashes nifler on `std/parseutils.nim` — FIXED
+
+**Status: fixed**, `~/nimony/bin/nifler.exe` rebuilt and redeployed.
 
 Discovered while building `src/main.nim` (the new network entrypoint).
-Bare `import std/strutils` - nothing else, no app code - now crashes
+Bare `import std/strutils` - nothing else, no app code - crashed
 `nifler.exe` while parsing the stdlib's own `std/parseutils.nim`
 (strutils imports it):
 
@@ -495,31 +497,40 @@ FAILURE: nifler.exe --portablePaths --deps parse
   ...\nimony\lib\std\parseutils.nim nimcache\....p.nif
 ```
 
-Confirmed as a **regression introduced by this session's own rebuild**,
-not a pre-existing bug: the same one-line `import std/strutils` file
-compiles clean under the *old* `~/nimony/bin.stale-backup-20260929/`
-toolchain (from before this session's #1 fix commits were built in), and
-crashes under the *current* `~/nimony/bin/` (rebuilt from
-`~/nimony-fix-worktree` after commits `349da94a`/`f73e7361`/`369e0758`).
-One of those three fixes touches something `std/parseutils.nim`'s own
-source shape trips over in nifler's parser - not yet bisected to which
-of the three.
+**Root cause, confirmed (not the #1-fix commits):** `git diff --stat` of
+commits `349da94a`/`f73e7361`/`369e0758` against their parent shows they
+touch only `src/hexer/` and `src/lambdalifting` - never `src/nifler/` or
+`src/lib/`. Ruled out as the cause directly. The real bug is a
+pre-existing, long-standing gap in `src/nifler/bridge.nim`'s
+`nkStmtListType, nkStmtListExpr` branch (around line 453): every other
+statement-list-shaped branch in that file passes `allowEmpty = true`
+when recursing over child statements (7 other call sites do), but this
+one branch didn't, so a `when`/conditional-compilation gap or any other
+construct in `std/parseutils.nim` that legitimately produces an empty
+statement node inside a statement-list-*expression* tripped the
+`assert allowEmpty` check. It happened to surface only now because this
+was the first time this session's rebuilt toolchain's nifler was pointed
+at `std/parseutils.nim` with a matching/current `lib/`.
 
-This is a serious regression: `strutils` is pulled in transitively by
-huge parts of this port (anything using `std/os`, many data-codegen
-files, string formatting helpers) and previously worked fine. Worked
-around locally in `src/main.nim` by avoiding `strutils` entirely (hand-
-rolled `jsonEscape` instead of `.replace`), but that's not viable
-port-wide - most existing files that already depend on `strutils`
-(`codegenutil.nim` and everything built on it) have NOT been re-verified
-against the current toolchain and may now be broken too.
+**Fix:** added `allowEmpty = true` to both `toNif` calls in that branch
+in `~/nimony-fix-worktree/src/nifler/bridge.nim`, matching the pattern
+used everywhere else in the file. Rebuilt `nifler.exe` **from PowerShell**
+(building via the Bash tool silently produced a stale binary due to the
+known gcc/Git-Bash swallowed-error gotcha - `gcc` run standalone on the
+failing translation unit succeeded, proving the Bash-reported failure was
+spurious), copied to `~/nimony/bin/nifler.exe`.
 
-**Filed:** no. **This should be the top priority the next time compiler
-work resumes** - bisect which of the three #1-fix commits causes it
-(likely candidate: `369e0758`, the object-field closure-type computation
-fix, since it's the one that touches type-section rewriting broadly) and
-either fix it or revert/narrow that commit before trusting the rebuilt
-toolchain for anything beyond the entity.nim case it was built to fix.
+**Verified:**
+- `import std/[strutils, syncio]; echo "hi".toUpperAscii()` now compiles
+  and runs, printing `HI` (exit 0).
+- `src/server/entity/entitytest.nim` (bug #1's original repro) still
+  compiles and links clean, failing only at the separate, already-known
+  bug #14 runtime crash - confirming this fix didn't reintroduce or
+  interact with the #1 closures-through-vtables fix.
+
+No other files in this port have been re-verified against the fixed
+toolchain yet; anything that depends on `strutils` transitively should
+now work again but hasn't been swept.
 
 ---
 
