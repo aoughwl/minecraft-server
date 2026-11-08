@@ -26,22 +26,22 @@ types.
 
 ## Why this isn't portable yet, and what would replace it
 
-Nimony has no WASM component-model runtime and no WIT-bindgen equivalent
-(checked `~/nimony/doc/differences.md`, `language.md`; nothing in
-`~/nimony/lib/std/` touches WASM or component-model ABI). Three real paths
+aowlmony has no WASM component-model runtime and no WIT-bindgen equivalent
+(checked `~/aowlmony/doc/differences.md`, `language.md`; nothing in
+`~/aowlmony/lib/std/` touches WASM or component-model ABI). Three real paths
 once the plugin system is actually needed:
 
-1. **Bind to wasmtime's C API from Nimony.** wasmtime ships a stable C API
-   (`wasmtime.h`); Nimony can FFI against arbitrary C via `{.importc,
-   header.}`, so a hand-written (or generated) Nimony wrapper over
+1. **Bind to wasmtime's C API from aowlmony.** wasmtime ships a stable C API
+   (`wasmtime.h`); aowlmony can FFI against arbitrary C via `{.importc,
+   header.}`, so a hand-written (or generated) aowlmony wrapper over
    `wasmtime-c-api` could reproduce this, driven off the same `.wit`
    files with a small custom generator instead of `bindgen!`.
-2. **Write a WIT-to-Nimony generator** that parses the `.wit` files
-   directly (they're a fairly simple IDL) and emits the Nimony proc
+2. **Write a WIT-to-aowlmony generator** that parses the `.wit` files
+   directly (they're a fairly simple IDL) and emits the aowlmony proc
    signatures + marshalling code by hand, sidestepping wasmtime's Rust
    macro entirely. More work, but no C FFI layer to maintain.
 3. **Drop the WASM sandboxing model** for this port and let plugins be
-   native Nimony/Nim modules loaded some other way (dynlib, or in-process
+   native aowlmony/aowlmony modules loaded some other way (dynlib, or in-process
    like `aowli` does for the Jester modpack work this project sits
    alongside) - a bigger design decision, not this crate's call to make
    alone.
@@ -58,5 +58,5 @@ port) are plain data/interface definitions, not Rust - they're the
 actual source of truth for the plugin ABI and would be the starting point
 for whichever option above gets picked. `plugin-api`,
 `plugin-runtime`, and `plugin-utils`'s WASM-guest `init`
-path (see `src/plugin_utils/lib.nim`'s skipped section) all sit on the
+path (see `src/plugin_utils/lib.aowl`'s skipped section) all sit on the
 same unresolved dependency.

@@ -2,14 +2,14 @@
 
 ## Audit: JsonNode missing-key crash (`{}` operator vs. `pairs()`)
 
-A generator (`noise_parameter.rs`'s port) found that Nimony's `std/json`
+A generator (`noise_parameter.rs`'s port) found that aowlmony's `std/json`
 `{}` lookup operator returns a default-constructed `JsonNode()` on a missing
 key, and calling `.kind` (or almost anything else) on that default crashes at
-*runtime* with an internal assertion failure - `nimony check` passes clean,
-only `nimony c -r` catches it. The fix, `codegenutil.nim`'s `jsonTryGet`, is
+*runtime* with an internal assertion failure - `aowlmony check` passes clean,
+only `aowlmony c -r` catches it. The fix, `codegenutil.aowl`'s `jsonTryGet`, is
 now the house pattern for optional lookups.
 
-Audited every `gen_*.nim` file plus `codegenutil.nim`'s shared helpers
+Audited every `gen_*.aowl` file plus `codegenutil.aowl`'s shared helpers
 (`jsonStringField`/`jsonNestedStringField`/`jsonBoolField`/`jsonFloatField`/
 `jsonIntField`, all written before `jsonTryGet` existed) for the unsafe `{}`
 operator. **Result: clean, no fix needed.** Every shared helper and every
@@ -17,10 +17,10 @@ generator already does an explicit `pairs()` scan for field lookup (per
 `std/json`'s "no `[]` field-index operator" limitation, documented since the
 first generators), never the `{}`/`{key}` accessor that crashes. The only
 `{"..."}`-shaped matches in the whole directory are JSON example text inside
-doc comments/string literals (`gen_decorated_pot_pattern.nim`,
-`gen_dimension.nim`, `gen_game_rules.nim`, `gen_registry.nim`), not the risky
-operator. Re-ran `gen_registry.nim` (32 registries/433 files, the largest
-generator) and `gen_dimension.nim` end to end as an extra runtime check -
+doc comments/string literals (`gen_decorated_pot_pattern.aowl`,
+`gen_dimension.aowl`, `gen_game_rules.aowl`, `gen_registry.aowl`), not the risky
+operator. Re-ran `gen_registry.aowl` (32 registries/433 files, the largest
+generator) and `gen_dimension.aowl` end to end as an extra runtime check -
 both still produce correct output with no crash. So this bug, while real and
 worth having fixed, never actually affected any already-shipped generator
 output; nothing needs re-verifying.
@@ -56,21 +56,21 @@ Step 2 is the only real obstacle, and it isn't a missing-primitive problem
 the way gzip/elliptic-curve-crypto/HTTP were for other crates — it's a
 *better-off-different* situation. Rust needs `quote!`/`proc_macro2` because
 it's building a real `TokenStream` (structured Rust AST) that then gets
-pretty-printed. Nimony has no equivalent macro-token-stream API for
-emitting *its own* source **and doesn't need one**: a Nimony generator can
+pretty-printed. aowlmony has no equivalent macro-token-stream API for
+emitting *its own* source **and doesn't need one**: a aowlmony generator can
 just build the output as a plain string and `writeFile` it directly. That's
 strictly simpler than what Rust is doing here, not a gap.
 
-Nimony's stdlib does have `std/json` (`~/nimony/lib/std/json.nim` +
-`parsejson.nim`) — confirmed present, unlike the gzip/crypto/HTTP gaps found
-elsewhere in this port. Its API is a bit different from classic Nim's `json`
+aowlmony's stdlib does have `std/json` (`~/aowlmony/lib/std/json.aowl` +
+`parsejson.aowl`) — confirmed present, unlike the gzip/crypto/HTTP gaps found
+elsewhere in this port. Its API is a bit different from classic aowlmony's `json`
 module (a `JsonTree`/`JsonNode` cursor pair rather than a `JsonNode` DOM with
 `%*` sugar — see `parseFile`, `root(tree)`, `.items`, `.getStr()` in the
 proof-of-concept below), but everything needed is there.
 
 ## What's done here
 
-`gen_sound_category.nim` is a complete, working, **run-and-verified** port
+`gen_sound_category.aowl` is a complete, working, **run-and-verified** port
 of the smallest submodule (`sound_category.rs`, 59 lines) establishing the
 pattern:
 
@@ -79,70 +79,70 @@ JSON (assets/sound_category.json, from ../upstream-ref, upstream's own repo)
   -> parseFile/root/items/getStr (std/json)
   -> plain string-building (toPascalCase port of heck::ToPascalCase,
      manual case/enum text assembly)
-  -> writeFile -> src/generated/sound_category.nim
+  -> writeFile -> src/generated/sound_category.aowl
 ```
 
 Run it with:
 ```
-nimony c -r src/data_codegen/gen_sound_category.nim
+aowlmony c -r src/data_codegen/gen_sound_category.aowl
 ```//
 It reads the real `../upstream-ref/assets/sound_category.json` and wrote a
-type-checked, correct `src/generated/sound_category.nim` (verified: the
+type-checked, correct `src/generated/sound_category.aowl` (verified: the
 enum values, `fromName`, and `toName` case bodies match the 11 real sound
-categories in the JSON exactly, and `nimony check` passes on the output).
+categories in the JSON exactly, and `aowlmony check` passes on the output).
 
-`codegenutil.nim` factors the reusable pieces (`toPascalCase`,
+`codegenutil.aowl` factors the reusable pieces (`toPascalCase`,
 `readStringArray` for `Vec<String>`-shaped inputs, `readStringIntMapSorted`
 for `BTreeMap<String, uN>`-shaped inputs, sorted the same way a `BTreeMap`
 iterates) out of that proof-of-concept so later generators don't each
 reimplement them. Five more submodules now use it, all run-and-verified
-the same way (`nimony c -r src/data_codegen/gen_<name>.nim`, output
-`nimony check`-ed, values spot-checked against the source JSON):
+the same way (`aowlmony c -r src/data_codegen/gen_<name>.aowl`, output
+`aowlmony check`-ed, values spot-checked against the source JSON):
 
-- `gen_entity_pose.nim` → `EntityPose` (18 variants, from `entity_pose.json`)
-- `gen_screen.nim` → `WindowType` (from `screens.json`)
-- `gen_scoreboard_slot.nim` → `ScoreboardDisplaySlot` (from `scoreboard_display_slot.json`)
-- `gen_entity_status.nim` → `EntityStatus` with explicit discriminants (64 variants, from `entity_statuses.json`, a name->u8 map)
-- `gen_world_event.nim` → `WorldEvent` with explicit discriminants (from `world_event.json`, a name->u16 map)
+- `gen_entity_pose.aowl` → `EntityPose` (18 variants, from `entity_pose.json`)
+- `gen_screen.aowl` → `WindowType` (from `screens.json`)
+- `gen_scoreboard_slot.aowl` → `ScoreboardDisplaySlot` (from `scoreboard_display_slot.json`)
+- `gen_entity_status.aowl` → `EntityStatus` with explicit discriminants (64 variants, from `entity_statuses.json`, a name->u8 map)
+- `gen_world_event.aowl` → `WorldEvent` with explicit discriminants (from `world_event.json`, a name->u16 map)
 
-- `gen_chunk_status.nim` → `ChunkStatus` (10 variants, from `chunk_status.json`, a flat string array), plus `chunkStatusToWireName` standing in for upstream's `#[serde(rename = "minecraft:<status>")]`
-- `gen_flower_pot_transformations.nim` → `getPottedItem(itemId: uint16): uint16` (from `flower_pot_transformations.json`, an item-id->potted-block-id map), returning the raw block id since the `BlockId` wrapper type doesn't exist yet
-- `gen_game_event.nim` → `GameEvent` (61 variants, from `game_event.json`, a flat string array)
-- `gen_map_color.nim` → `MapColor` object + named constants (64 entries, from `map_colors.json`, an array of `{id,name,col,hex,rgb}` objects) - added `readMapColors`/`toShoutySnakeCase` to `codegenutil.nim`; also the first generator needing object-array (not flat-array or string-map) JSON, which surfaced that Nimony's `std/json` `JsonNode` has no `[]` field-index operator - object field lookup means scanning `pairs()` for the matching key, documented in `readMapColors`'s doc comment
-- `gen_statistic.nim` → `StatisticCategory` (9 variants, explicit `i32` discriminants) + `CustomStatistic` (156 variants) from `stats.json`'s nested `{category: {id, entries: {stat: {id}}}}` shape - read directly via `JsonNode.pairs()` rather than a `codegenutil` helper since the nesting is one-off; JSON object key order is preserved by `pairs()` (matches upstream's `IndexMap` insertion-order semantics, unlike the `BTreeMap`-sorted helpers used elsewhere)
-- `gen_message_type.nim` → `chat_type` constants (`u8`, from a *directory* of one-field JSON files under `assets/datapack/data/minecraft/chat_type/`, numbered by sorted filename order, plus a synthetic trailing `RAW`) - first generator to read a directory instead of a single JSON document
-- `gen_meta_data_type.nim` → `MetaDataType` (from `meta_data_type.json`'s flat name->i32 map, with a name-canonicalization/alias step: some data-type names have synonyms across Minecraft versions and must collapse to one id, then get restated as alias constants)
-- `gen_particle.nim` → `Particle` (128 variants, from `particles.json`, a flat string array) plus index-based `fromId`/`toId` (enum declaration order = wire id order)
-- `gen_decorated_pot_pattern.nim`, `gen_cat_variant.nim`, `gen_banner_pattern.nim` → same directory-of-JSON-files shape as `message_type`, but keyed by stem with per-entry string fields (`asset_id`, sometimes `translation_key`) rather than positional. This pattern (walk a directory, parse each file's small JSON object, sort by stem, emit an enum + accessor procs + an `all()`-equivalent array) recurs across several more submodules (frog_variant, wolf_variant, chat_type, trim_material, trim_pattern, painting_variant, and others) - `codegenutil.nim` now has `listJsonStems`/`jsonStringField`/`stemOf`/`lastIndexOf` factored out for it, so those should be quick following this template.
-- Skipped: `gen_spawn_egg.nim` - needs the still-unported `entity_type` generated enum (cross-references `EntityType` variants by name, which don't exist as Nimony code yet); revisit once entity_type.rs is ported.
+- `gen_chunk_status.aowl` → `ChunkStatus` (10 variants, from `chunk_status.json`, a flat string array), plus `chunkStatusToWireName` standing in for upstream's `#[serde(rename = "minecraft:<status>")]`
+- `gen_flower_pot_transformations.aowl` → `getPottedItem(itemId: uint16): uint16` (from `flower_pot_transformations.json`, an item-id->potted-block-id map), returning the raw block id since the `BlockId` wrapper type doesn't exist yet
+- `gen_game_event.aowl` → `GameEvent` (61 variants, from `game_event.json`, a flat string array)
+- `gen_map_color.aowl` → `MapColor` object + named constants (64 entries, from `map_colors.json`, an array of `{id,name,col,hex,rgb}` objects) - added `readMapColors`/`toShoutySnakeCase` to `codegenutil.aowl`; also the first generator needing object-array (not flat-array or string-map) JSON, which surfaced that aowlmony's `std/json` `JsonNode` has no `[]` field-index operator - object field lookup means scanning `pairs()` for the matching key, documented in `readMapColors`'s doc comment
+- `gen_statistic.aowl` → `StatisticCategory` (9 variants, explicit `i32` discriminants) + `CustomStatistic` (156 variants) from `stats.json`'s nested `{category: {id, entries: {stat: {id}}}}` shape - read directly via `JsonNode.pairs()` rather than a `codegenutil` helper since the nesting is one-off; JSON object key order is preserved by `pairs()` (matches upstream's `IndexMap` insertion-order semantics, unlike the `BTreeMap`-sorted helpers used elsewhere)
+- `gen_message_type.aowl` → `chat_type` constants (`u8`, from a *directory* of one-field JSON files under `assets/datapack/data/minecraft/chat_type/`, numbered by sorted filename order, plus a synthetic trailing `RAW`) - first generator to read a directory instead of a single JSON document
+- `gen_meta_data_type.aowl` → `MetaDataType` (from `meta_data_type.json`'s flat name->i32 map, with a name-canonicalization/alias step: some data-type names have synonyms across Minecraft versions and must collapse to one id, then get restated as alias constants)
+- `gen_particle.aowl` → `Particle` (128 variants, from `particles.json`, a flat string array) plus index-based `fromId`/`toId` (enum declaration order = wire id order)
+- `gen_decorated_pot_pattern.aowl`, `gen_cat_variant.aowl`, `gen_banner_pattern.aowl` → same directory-of-JSON-files shape as `message_type`, but keyed by stem with per-entry string fields (`asset_id`, sometimes `translation_key`) rather than positional. This pattern (walk a directory, parse each file's small JSON object, sort by stem, emit an enum + accessor procs + an `all()`-equivalent array) recurs across several more submodules (frog_variant, wolf_variant, chat_type, trim_material, trim_pattern, painting_variant, and others) - `codegenutil.aowl` now has `listJsonStems`/`jsonStringField`/`stemOf`/`lastIndexOf` factored out for it, so those should be quick following this template.
+- Skipped: `gen_spawn_egg.aowl` - needs the still-unported `entity_type` generated enum (cross-references `EntityType` variants by name, which don't exist as aowlmony code yet); revisit once entity_type.rs is ported.
 
-- `gen_chat_type.nim` → `ChatType` (7 variants, directory shape, with one nested field - `chat.translation_key` - handled by an inline pairs()-scan since it's one level deeper than `jsonStringField` reaches)
-- `gen_frog_variant.nim` → `FrogVariant` (3 variants) - notable upstream quirk preserved faithfully: the enum itself is hand-hardcoded to `Cold/Temperate(default)/Warm` rather than generated from the directory scan (which is only used for the name/texture accessor tables), and `from_id` falls back to `Temperate` for unrecognized ids rather than `None` like every other generator's `fromName` does
-- `gen_wolf_variant.nim` → `WolfVariant` (9 variants, from `wolf_variant/*.json`, a nested `assets.{angry,tame,wild}` object per entry) - added `jsonNestedStringField` to `codegenutil.nim` for one-level-deep field access; upstream's `baby_assets`/`spawn_conditions` fields are parsed but never actually used in its emitted output, so skipped here too (matches real output, not the struct shape)
-- `gen_trim_material.nim` → `TrimMaterial` (11 variants, from `trim_material/*.json`: `palette_id` top-level + nested `description.{color,translate}`, both optional, default `""`)
-- `gen_trim_pattern.nim` → `TrimPattern` (18 variants, from `trim_pattern/*.json`: `asset_id`/`decal` (bool, default false) top-level + nested `description.translate`) - added `jsonBoolField` to `codegenutil.nim`
+- `gen_chat_type.aowl` → `ChatType` (7 variants, directory shape, with one nested field - `chat.translation_key` - handled by an inline pairs()-scan since it's one level deeper than `jsonStringField` reaches)
+- `gen_frog_variant.aowl` → `FrogVariant` (3 variants) - notable upstream quirk preserved faithfully: the enum itself is hand-hardcoded to `Cold/Temperate(default)/Warm` rather than generated from the directory scan (which is only used for the name/texture accessor tables), and `from_id` falls back to `Temperate` for unrecognized ids rather than `None` like every other generator's `fromName` does
+- `gen_wolf_variant.aowl` → `WolfVariant` (9 variants, from `wolf_variant/*.json`, a nested `assets.{angry,tame,wild}` object per entry) - added `jsonNestedStringField` to `codegenutil.aowl` for one-level-deep field access; upstream's `baby_assets`/`spawn_conditions` fields are parsed but never actually used in its emitted output, so skipped here too (matches real output, not the struct shape)
+- `gen_trim_material.aowl` → `TrimMaterial` (11 variants, from `trim_material/*.json`: `palette_id` top-level + nested `description.{color,translate}`, both optional, default `""`)
+- `gen_trim_pattern.aowl` → `TrimPattern` (18 variants, from `trim_pattern/*.json`: `asset_id`/`decal` (bool, default false) top-level + nested `description.translate`) - added `jsonBoolField` to `codegenutil.aowl`
 
-- `gen_map_decoration.nim` → `MapDecorationType` (40 entries, from a single positional JSON array `map_decorations.json`, id = array index) - first generator to read a flat positional array of mixed-type objects rather than a name-keyed directory/map; `map_color` defaults to -1, `exploration_map_element` defaults to false when absent
+- `gen_map_decoration.aowl` → `MapDecorationType` (40 entries, from a single positional JSON array `map_decorations.json`, id = array index) - first generator to read a flat positional array of mixed-type objects rather than a name-keyed directory/map; `map_color` defaults to -1, `exploration_map_element` defaults to false when absent
 
-- `gen_dye_color.nim` → `DyeColor` (16 variants, from `dye_colors.json`, a flat positional array with 7 fields per entry) - `byId`/`byName` fall back to Black on miss, matching upstream's `#[default]`/`unwrap_or_default()` behavior
-- `gen_jukebox_song.nim` → `JukeboxSong` (22 variants, directory shape, id = declaration order) - added `jsonFloatField`/`jsonIntField`/`isAsciiDigit` to `codegenutil.nim`; variant names starting with a digit (`11`, `13`, `5`) get an `Id` prefix like upstream's `format_ident!("Id{}", ...)` does
-- `gen_sound.nim` → `Sound` (1991 variants, from `sounds.json`, a flat string array; id = declaration order matching upstream's `#[repr(u16)]`) - names contain dots (`"entity.allay.ambient_with_item"`), which required extending `toPascalCase` to split on `.` as well as `_`/`-`/space (heck's `ToPascalCase` already treats any non-alphanumeric as a word boundary, so this brings the port in line rather than diverging); `nimony check` takes ~14s on this file, the slowest generated output so far
-- `gen_instrument.nim` → `Instrument` (8 variants, directory shape) - first generator with a cross-reference to another *generated* module (`import sound` for the `sound()` accessor), verified the import resolves and type-checks correctly once both files sit side by side in `src/generated/`
+- `gen_dye_color.aowl` → `DyeColor` (16 variants, from `dye_colors.json`, a flat positional array with 7 fields per entry) - `byId`/`byName` fall back to Black on miss, matching upstream's `#[default]`/`unwrap_or_default()` behavior
+- `gen_jukebox_song.aowl` → `JukeboxSong` (22 variants, directory shape, id = declaration order) - added `jsonFloatField`/`jsonIntField`/`isAsciiDigit` to `codegenutil.aowl`; variant names starting with a digit (`11`, `13`, `5`) get an `Id` prefix like upstream's `format_ident!("Id{}", ...)` does
+- `gen_sound.aowl` → `Sound` (1991 variants, from `sounds.json`, a flat string array; id = declaration order matching upstream's `#[repr(u16)]`) - names contain dots (`"entity.allay.ambient_with_item"`), which required extending `toPascalCase` to split on `.` as well as `_`/`-`/space (heck's `ToPascalCase` already treats any non-alphanumeric as a word boundary, so this brings the port in line rather than diverging); `aowlmony check` takes ~14s on this file, the slowest generated output so far
+- `gen_instrument.aowl` → `Instrument` (8 variants, directory shape) - first generator with a cross-reference to another *generated* module (`import sound` for the `sound()` accessor), verified the import resolves and type-checks correctly once both files sit side by side in `src/generated/`
 
-- `gen_attributes.nim` → `Attribute` object type + 40 named constants (from `attributes.json`, a name->{id,default_value} map, sorted by id per upstream's explicit `sort_by_key`) plus `allAttributes()`. Note: a `const seq[Attribute]` literal referencing other consts isn't foldable at compile time in Nimony ("cannot evaluate expression at compile time") - changed to a plain `proc allAttributes*(): seq[Attribute]` instead. **This unblocks `effect.rs`/`potion.rs`, previously skipped for needing this exact file** (they also need `data_component_impl::Operation`, still unported - not fully unblocked yet, but one of their two blockers is now cleared).
-- `gen_painting_variant.nim` → `PaintingVariant` (51 variants, directory shape like the cat_variant/wolf_variant family, plus a *second* input - a `tags/painting_variant/placeable.json` tag file listing which variants are placeable in survival, cross-referenced by asset id/stem to set each variant's `isPlaceable`). First generator combining two independent JSON sources. Used `path(...)` (lowercase, the `std/paths` constructor proc) rather than `Path(...)` (a type-conversion call syntax that doesn't work the same way in Nimony) - noted here since every other generator using `listJsonStems` already got this right but it's easy to typo.
+- `gen_attributes.aowl` → `Attribute` object type + 40 named constants (from `attributes.json`, a name->{id,default_value} map, sorted by id per upstream's explicit `sort_by_key`) plus `allAttributes()`. Note: a `const seq[Attribute]` literal referencing other consts isn't foldable at compile time in aowlmony ("cannot evaluate expression at compile time") - changed to a plain `proc allAttributes*(): seq[Attribute]` instead. **This unblocks `effect.rs`/`potion.rs`, previously skipped for needing this exact file** (they also need `data_component_impl::Operation`, still unported - not fully unblocked yet, but one of their two blockers is now cleared).
+- `gen_painting_variant.aowl` → `PaintingVariant` (51 variants, directory shape like the cat_variant/wolf_variant family, plus a *second* input - a `tags/painting_variant/placeable.json` tag file listing which variants are placeable in survival, cross-referenced by asset id/stem to set each variant's `isPlaceable`). First generator combining two independent JSON sources. Used `path(...)` (lowercase, the `std/paths` constructor proc) rather than `Path(...)` (a type-conversion call syntax that doesn't work the same way in aowlmony) - noted here since every other generator using `listJsonStems` already got this right but it's easy to typo.
 
-- `gen_game_rules.nim` → `GameRule` enum (59 variants) + `GameRuleKind` (bool/int) + per-rule default value accessors, from `game_rules.json`'s name -> (bool | int | {"default": int, ...}) map. Scope note: upstream's generator also emits a full `GameRuleRegistry` struct with serde (de)serialization and mutable `get`/`get_mut` accessors - that's a runtime storage/registry design, not pure data, deferred to whenever game rules get wired into an actual world/server type; this generator ports the data half only (the enum, kind, and defaults). **Found and fixed a new, more insidious Nimony compiler bug here** (minimally reproduced, documented in the file itself): `seq[T].sort(closureComparator)` crashes at C-codegen - not at `nimony check`, which passes clean - when `T` is a plain object with an enum-typed field; the same pattern works fine sorting tuples elsewhere in this port. Worked around with a closure-free manual insertion sort (`manualSortByName`) rather than `algorithm.sort`. This is worth any future generator author knowing before trusting `nimony check` alone on a `.sort()`-using file - `nimony c -r` it too.
+- `gen_game_rules.aowl` → `GameRule` enum (59 variants) + `GameRuleKind` (bool/int) + per-rule default value accessors, from `game_rules.json`'s name -> (bool | int | {"default": int, ...}) map. Scope note: upstream's generator also emits a full `GameRuleRegistry` struct with serde (de)serialization and mutable `get`/`get_mut` accessors - that's a runtime storage/registry design, not pure data, deferred to whenever game rules get wired into an actual world/server type; this generator ports the data half only (the enum, kind, and defaults). **Found and fixed a new, more insidious aowlmony compiler bug here** (minimally reproduced, documented in the file itself): `seq[T].sort(closureComparator)` crashes at C-codegen - not at `aowlmony check`, which passes clean - when `T` is a plain object with an enum-typed field; the same pattern works fine sorting tuples elsewhere in this port. Worked around with a closure-free manual insertion sort (`manualSortByName`) rather than `algorithm.sort`. This is worth any future generator author knowing before trusting `aowlmony check` alone on a `.sort()`-using file - `aowlmony c -r` it too.
 
-- `gen_slot_ranges.nim` → `slotRanges()`/`slotRangeAllNames()`/`slotRangeSingleSlotNames()`/`getSlotRange(name)` (165 entries, from `slot_ranges.json`, a flat `name -> seq[int]` map). Unlike every other generator so far, upstream doesn't build an enum here - it matches on the literal string keys directly (`get_slot_range(name: &str)`), so this does the same rather than inventing one. Added `readStringIntSeqMapSorted` to `codegenutil.nim` for the `BTreeMap<String, Box<[usize]>>` shape.
-- `gen_damage_type.nim` → `DamageType` object + 51 named constants (directory shape, `assets/datapack/data/minecraft/damage_type/*.json`) + `damageTypeFromName`/`damageTypeFromId`. Three small nested enums (`DeathMessageType`, `DamageEffects` - optional, absent -> `hasEffects: false` - and `DamageScaling`). Upstream's `Taggable` impl (registry-tag lookup via `tag.rs`'s `RegistryKey`) is skipped, needs that unported module.
-- `javaversion.nim` (in `src/util/`, not `src/data_codegen/` - see below) - direct port of `version.rs`'s `JavaMinecraftVersion` enum + `to_field_ident`. Not JSON-driven (it's a hand-authored, ordered version list mirrored from `pumpkin_util::version` for codegen's own token-emission use), so it's a plain hand-port rather than a `gen_*.nim` script; belongs alongside the rest of `pumpkin-util` in `src/util/`. Declaration order preserved exactly (upstream derives `Ord` from it for version comparisons).
+- `gen_slot_ranges.aowl` → `slotRanges()`/`slotRangeAllNames()`/`slotRangeSingleSlotNames()`/`getSlotRange(name)` (165 entries, from `slot_ranges.json`, a flat `name -> seq[int]` map). Unlike every other generator so far, upstream doesn't build an enum here - it matches on the literal string keys directly (`get_slot_range(name: &str)`), so this does the same rather than inventing one. Added `readStringIntSeqMapSorted` to `codegenutil.aowl` for the `BTreeMap<String, Box<[usize]>>` shape.
+- `gen_damage_type.aowl` → `DamageType` object + 51 named constants (directory shape, `assets/datapack/data/minecraft/damage_type/*.json`) + `damageTypeFromName`/`damageTypeFromId`. Three small nested enums (`DeathMessageType`, `DamageEffects` - optional, absent -> `hasEffects: false` - and `DamageScaling`). Upstream's `Taggable` impl (registry-tag lookup via `tag.rs`'s `RegistryKey`) is skipped, needs that unported module.
+- `javaversion.aowl` (in `src/util/`, not `src/data_codegen/` - see below) - direct port of `version.rs`'s `JavaMinecraftVersion` enum + `to_field_ident`. Not JSON-driven (it's a hand-authored, ordered version list mirrored from `pumpkin_util::version` for codegen's own token-emission use), so it's a plain hand-port rather than a `gen_*.aowl` script; belongs alongside the rest of `pumpkin-util` in `src/util/`. Declaration order preserved exactly (upstream derives `Ord` from it for version comparisons).
 
 That's 34/90 submodules done (33 in `src/data_codegen/`/`src/generated/` + 1 direct util port).
 
-- `gen_registry.nim` → `src/generated/registry_data.nim` (**`registry.rs`, 234
+- `gen_registry.aowl` → `src/generated/registry_data.aowl` (**`registry.rs`, 234
   lines, now done** - previously flagged as "investigated but deferred").
-  Ported `jsontonbt.nim` (`jsonToNbtTag`, a generic recursive `JsonNode ->
+  Ported `jsontonbt.aowl` (`jsonToNbtTag`, a generic recursive `JsonNode ->
   NbtTag` converter mirroring `registry.rs`'s local `json_to_nbt_tag`
   closure exactly, 6-way match on JSON value kind) as a standalone reusable
   module, then the generator itself: walks all 32 `SYNCED_REGISTRIES`
@@ -151,17 +151,17 @@ That's 34/90 submodules done (33 in `src/data_codegen/`/`src/generated/` + 1 dir
   `worldgen/block_state_provider`) under
   `../upstream-ref/assets/datapack/data/minecraft/`, reads every entry's
   JSON via `listJsonStems`, converts to NBT, and serializes each as an
-  unnamed compound via the existing `src/nbt/nbtdoc.nim` `writeUnnamed`
+  unnamed compound via the existing `src/nbt/nbtdoc.aowl` `writeUnnamed`
   (Java mode) - reusing the complete NBT writer rather than reimplementing
   serialization. Also reproduces upstream's one hardcoded special case: a
   synthetic `"raw"` `chat_type` entry injected for vanilla parity (not
   present in any `assets/` JSON file), built from an inline JSON literal via
   `parseJson`. Byte output is emitted as `@[1'u8, 2'u8, ...]` seq literals
-  (Nimony has no raw byte-string literal syntax like Rust's `b"..."`).
-  **Run and verified**: `nimony c -r src/data_codegen/gen_registry.nim`
+  (aowlmony has no raw byte-string literal syntax like Rust's `b"..."`).
+  **Run and verified**: `aowlmony c -r src/data_codegen/gen_registry.aowl`
   actually walked the real 32 directories and wrote
-  `src/generated/registry_data.nim` (511 lines, 32 registries, 433 JSON
-  entries + 1 synthetic `raw` = 434 total), which itself `nimony check`s
+  `src/generated/registry_data.aowl` (511 lines, 32 registries, 433 JSON
+  entries + 1 synthetic `raw` = 434 total), which itself `aowlmony check`s
   clean. Spot-checked by hand-decoding the `chat_type/chat` entry's NBT
   bytes against its source JSON (`{"chat": {"parameters": ["sender",
   "content"], "translation_key": "chat.type.text"}, "narration": {...}}`) -
@@ -171,9 +171,9 @@ That's 34/90 submodules done (33 in `src/data_codegen/`/`src/generated/` + 1 dir
 Skipped after investigation (documented here, not silently dropped):
 `potion.rs` (needs `effect.rs`'s `StatusEffect` - `effect.rs` itself is now
 only blocked on `data_component_impl::Operation`, not `attributes` anymore
-since `gen_attributes.nim` landed) - revisit once `data_component_impl` lands.
+since `gen_attributes.aowl` landed) - revisit once `data_component_impl` lands.
 
-- `gen_dimension.nim` → `src/generated/dimension.nim` (`Dimension` object +
+- `gen_dimension.aowl` → `src/generated/dimension.aowl` (`Dimension` object +
   4 named constants: `OVERWORLD`/`OVERWORLD_CAVES`/`THE_END`/`THE_NETHER`,
   from `assets/datapack/data/minecraft/dimension_type/*.json`). Scoped to
   the core world-shape fields (skylight/ceiling, Y bounds, coordinate
@@ -186,8 +186,8 @@ since `gen_attributes.nim` landed) - revisit once `data_component_impl` lands.
   `IntProvider`, upstream's `value_to_int_provider` helper is itself
   unported) is captured as a small structured string (`"const:<n>"` or
   `"<type>:<min>..<max>"`) rather than dropped or fully modeled.
-  **Run and verified**: `nimony c -r src/data_codegen/gen_dimension.nim`
-  wrote all 4 real dimensions; output `nimony check`-clean; spot-checked
+  **Run and verified**: `aowlmony c -r src/data_codegen/gen_dimension.aowl`
+  wrote all 4 real dimensions; output `aowlmony check`-clean; spot-checked
   every field against the source JSON (`overworld.json`'s
   `min_y:-64`/`height:384`/`ambient_light:0.0`/`coordinate_scale:1.0`
   /`has_skylight:true`/`has_ceiling:false` all match, and the
@@ -195,7 +195,7 @@ since `gen_attributes.nim` landed) - revisit once `data_component_impl` lands.
   distinction between `overworld.json` and `the_end.json`/`the_nether.json`
   is preserved correctly).
   **Caught a real bug in its own first pass**: `{.noinit.}` (needed to
-  satisfy Nimony's "cannot prove initialized" check on the loop-filled
+  satisfy aowlmony's "cannot prove initialized" check on the loop-filled
   return object) skips zero-initialization entirely, so a field only set
   on *some* branches of the parsing loop (here, `fixedTime`, only written
   when the JSON actually has a non-null `"fixed_time"` key) held
@@ -203,9 +203,9 @@ since `gen_attributes.nim` landed) - revisit once `data_component_impl` lands.
   - `overworld.json`'s generated constant briefly showed
   `fixedTime: 718871328032`. Fixed by explicitly assigning
   `result = DimEntry()` before the loop even under `{.noinit.}`. Worth any
-  future generator (or any Nimony code) using `{.noinit.}` on a
+  future generator (or any aowlmony code) using `{.noinit.}` on a
   partially-conditionally-filled object knowing this explicitly, not just
-  trusting `nimony check` passing.
+  trusting `aowlmony check` passing.
   **Also hit and worked around**, not deeply investigated: `for (a, b) in
   someLocalSeqVar:` (tuple-destructuring a `for` loop's iteration variable
   over a `let`-bound local `seq[(T,U)]`) crashed the compiler with an
@@ -222,50 +222,50 @@ since `gen_attributes.nim` landed) - revisit once `data_component_impl` lands.
   filed externally (SendFeedback quota exhausted this session) - flagged
   here for whoever next hits either.
 
-- `chunk_view_lut.rs` → `src/generated/chunk_view_lut.nim` (**no JSON input at
+- `chunk_view_lut.rs` → `src/generated/chunk_view_lut.aowl` (**no JSON input at
   all** - pure math: concentric view-distance and Chebyshev/square ring
   offset tables). Upstream computes this inside a `proc_macro2`/`quote!`
-  build script to bake `static` zero-cost arrays; Nimony has no build-time
+  build script to bake `static` zero-cost arrays; aowlmony has no build-time
   codegen macro to reproduce that trick and there's no external data file
   for a generator to read, so this is ported directly as a module that
   builds its tables once at load time (`let chunkViewLut* = build...()`)
   rather than emitting a giant array-literal source file (the Chebyshev
   table alone has 9409 entries at the max radius - a literal would work,
-  per `gen_sound.nim`'s 1991-variant precedent, but a computed proc is
+  per `gen_sound.aowl`'s 1991-variant precedent, but a computed proc is
   simpler and behaviorally identical). **Verified**:
-  `chunk_view_luttest.nim` checks the dist<2-empty rule, the
+  `chunk_view_luttest.aowl` checks the dist<2-empty rule, the
   relX²+relZ²<d² filter for every offset at several distances, the ring
   size = 8r / square size = 1+4r(r+1) closed-form identities, and the
-  total-offset-count sum formula - all pass (`nimony c -r`, 9409 total
+  total-offset-count sum formula - all pass (`aowlmony c -r`, 9409 total
   Chebyshev offsets confirmed).
-- `context_provider.rs` → `src/data_codegen/gen_context_provider.nim` →
-  `src/generated/context_provider.nim`. Walks
+- `context_provider.rs` → `src/data_codegen/gen_context_provider.aowl` →
+  `src/generated/context_provider.aowl`. Walks
   `assets/datapack/data/minecraft/context_{int,float}_provider/` (one level
   of category subdirectory, e.g. `cooking/time_coal.json`) and embeds each
   JSON file's raw text (upstream does this via `include_str!` at Rust
   compile time) into a `case`-based lookup proc keyed by both the bare id
   and the `minecraft:`-namespaced id, plus a name-list proc, for both int
   and float provider kinds. **Run and verified**:
-  `nimony c -r src/data_codegen/gen_context_provider.nim` walked the real
+  `aowlmony c -r src/data_codegen/gen_context_provider.aowl` walked the real
   26 int + 4 float provider files and wrote a 78-line
-  `src/generated/context_provider.nim` that itself `nimony check`s clean;
+  `src/generated/context_provider.aowl` that itself `aowlmony check`s clean;
   spot-checked `cooking/time_coal`'s embedded JSON byte-for-byte against
   its source file (`"left": 1600` and the full nested `conditional`
   structure match exactly).
-  **Found and worked around a new Nimony compiler bug**: calling two
+  **Found and worked around a new aowlmony compiler bug**: calling two
   different `{.raises.}` procs (a `walkDir` iterator and `readFile`)
   within the same `try` block - even indirectly, walkDir's loop body
   calling `readFile` - produces broken C codegen (`request for member
   'fld_0' in something not a structure or union`, an `ErrorCode`/tuple
-  type confusion in the generated C), while `nimony check` passes clean.
+  type confusion in the generated C), while `aowlmony check` passes clean.
   Fixed by splitting into two passes: one `try` block collects file paths
   via `walkDir`, a second, separate `try`-wrapped proc (`readOne`) reads
   each file's contents afterward - no `{.raises.}` call nests inside
   another `{.raises.}` call's `try` scope. Documented here since
   SendFeedback quota was exhausted this session; worth filing upstream
   once quota resets.
-- `template_bytes.rs` → `gen_template_bytes.nim` → `src/generated/template_bytes.nim`
-  and `test_instance.rs` → `gen_test_instance.nim` → `src/generated/test_instance.nim`
+- `template_bytes.rs` → `gen_template_bytes.aowl` → `src/generated/template_bytes.aowl`
+  and `test_instance.rs` → `gen_test_instance.aowl` → `src/generated/test_instance.aowl`
   - **done, superseding the "deferred" note below**. Both were previously
   deferred as "needing unbounded-depth multi-pack recursion" - on closer
   reading that's just bounded recursive directory walking (each of the 3
@@ -277,17 +277,17 @@ since `gen_attributes.nim` landed) - revisit once `data_component_impl` lands.
   (3 packs total), each pack scanned per-namespace, recording a
   resource-id → real-on-disk-path table (matching the default-namespace
   bare-id aliasing upstream's `is_default` flag controls) rather than
-  embedding file contents - see `gen_template_bytes.nim`'s doc comment for
-  why (embedding ~1500 binary `.nbt` files as Nimony byte literals would
-  dwarf even `sound.nim`'s already-slow 1991-entry table for comparatively
+  embedding file contents - see `gen_template_bytes.aowl`'s doc comment for
+  why (embedding ~1500 binary `.nbt` files as aowlmony byte literals would
+  dwarf even `sound.aowl`'s already-slow 1991-entry table for comparatively
   little value while nothing in this port consumes structure data yet).
   Verified for real: **1513** structure templates and **3** test
   instances, matching an independent on-disk count exactly, with
-  `templatestest.nim` confirming real lookups (both resource-id and, for
+  `templatestest.aowl` confirming real lookups (both resource-id and, for
   the default namespace, bare-id) resolve to paths that actually
   `fileExists` - not just that the generator ran without error.
 
-  **Found and fixed a new, real Nimony bug**: a `var Table[K, V]`
+  **Found and fixed a new, real aowlmony bug**: a `var Table[K, V]`
   out-parameter's writes are lost across the proc-call boundary - an
   instrumented first attempt showed `results.len` growing correctly
   *inside* the callee on every write (1, 2, 3, ... past 30), but the
@@ -298,38 +298,38 @@ since `gen_attributes.nim` landed) - revisit once `data_component_impl` lands.
   by having the scan proc return a `seq[TemplateEntry]`/
   `seq[TestInstanceEntry]` by value instead of writing into a `var Table`
   out-param, with the caller building its own table from the returned
-  seq. Filed in `NIMONY-COMPILER-BUGS.md`. Also hit and fixed the
-  already-known "Windows path separator breaks a Nimony string literal"
+  seq. Filed in `COMPILER-BUGS.md`. Also hit and fixed the
+  already-known "Windows path separator breaks a aowlmony string literal"
   issue (forward-slash-normalize any path before embedding it as a
   literal - the same class of issue as escaping quotes, just specific to
   this port's Windows dev environment).
-- `noise_parameter.rs` → `gen_noise_parameter.nim` →
-  `src/generated/noise_parameter.nim`. Walks the real (flat, no
+- `noise_parameter.rs` → `gen_noise_parameter.aowl` →
+  `src/generated/noise_parameter.aowl`. Walks the real (flat, no
   subdirectories) `assets/datapack/data/minecraft/worldgen/noise/`
   directory (62 files), applies upstream's `first_octave`/`base_octave`
   and `amplitudes`/`amplitude_modifiers`/`octave_count` fallback chains,
   and precomputes each entry's MD5-derived `lo`/`hi` (upstream hashes
   `"minecraft:<name>"` and reads the first/second 8 bytes as big-endian
-  u64s). **Found and worked around a real Nimony `std/json` bug**: the
+  u64s). **Found and worked around a real aowlmony `std/json` bug**: the
   `{}` object-lookup operator returns a default-constructed `JsonNode()`
   on a missing key, and calling `.kind` (or nearly anything else) on that
   default value crashes at runtime with an internal assertion failure -
-  `nimony check` passes clean, only `nimony c -r` catches it. Reproduced
+  `aowlmony check` passes clean, only `aowlmony c -r` catches it. Reproduced
   standalone (`var n = JsonNode(); discard n.kind` alone crashes). Fixed
   by adding `jsonTryGet(tree, key): (bool, JsonNode)` to
-  `codegenutil.nim`, which walks `pairs()` itself and never touches the
+  `codegenutil.aowl`, which walks `pairs()` itself and never touches the
   broken default - now the house way to look up an optional JSON key
   across this whole codegen suite, not just this file. Documented here
   since SendFeedback quota was exhausted this session; worth filing
-  upstream once quota resets. **Verified**: `noise_parametertest.nim`
-  (`nimony c -r`) checks the entry count (62), `aquifer_barrier`'s
+  upstream once quota resets. **Verified**: `noise_parametertest.aowl`
+  (`aowlmony c -r`) checks the entry count (62), `aquifer_barrier`'s
   fields including its `lo`/`hi` cross-checked byte-for-byte against
   Python's `hashlib.md5` (`16244762748638791999`/`1391399305011792652`,
   exact match), `temperature`'s `amplitude_modifiers` fallback path, and
   a missing-key lookup correctly returning not-found.
 
-- `block.rs`/`item.rs` → `gen_block.nim`/`gen_item.nim` →
-  `src/generated/blockdata.nim`/`src/generated/item.nim`. **Deliberately
+- `block.rs`/`item.rs` → `gen_block.aowl`/`gen_item.aowl` →
+  `src/generated/blockdata.aowl`/`src/generated/item.aowl`. **Deliberately
   scoped down**, not a full port: each generator emits only the flat
   per-entry scalar fields (block: id/name/translationKey/hardness/
   blastResistance/mapColor/itemId/defaultStateId; item: id/name/
@@ -340,36 +340,36 @@ since `gen_attributes.nim` landed) - revisit once `data_component_impl` lands.
   `data_component.rs` registry, already flagged as a blocker in
   src/protocol/README.md's `item_stack_seralizer.rs` note). That's real,
   separate structural work for a dedicated pass. What's here is still
-  immediately useful: `src/world/palette.nim`'s block-state ids and
-  `src/inventory/itemstub.nim`'s placeholder Item can resolve against a
-  real name/id table instead of nothing. Module named `blockdata.nim`, not
-  `block.nim` - `block` is a reserved keyword in Nimony, a module literally
+  immediately useful: `src/world/palette.aowl`'s block-state ids and
+  `src/inventory/itemstub.aowl`'s placeholder Item can resolve against a
+  real name/id table instead of nothing. Module named `blockdata.aowl`, not
+  `block.aowl` - `block` is a reserved keyword in aowlmony, a module literally
   named that can't be imported (`import ../generated/block` fails to
   parse: "expression expected, but found 'keyword block'"). Also hit and
   worked around the already-known `const seq[T]` compile-time-fold
   limitation (1658/1286-entry literal seqs) by emitting `let` instead of
   `const` for `AllItems`/`AllBlocks`. **Verified**: both generators
-  actually run (`nimony c -r`) against the real 1658-entry `items.json`/
-  1286-entry `blocks.json`, and `itemblocktest.nim` (`nimony c -r`) checks
+  actually run (`aowlmony c -r`) against the real 1658-entry `items.json`/
+  1286-entry `blocks.json`, and `itemblocktest.aowl` (`aowlmony c -r`) checks
   real counts plus specific known values (stone item/block, diamond_pickaxe's
   stack size of 1, air's id/translation key, a missing-name lookup
   correctly returning not-found) - all pass.
 
-- `entity_type.rs` → `gen_entity_type.nim` → `src/generated/entity_type.nim`,
+- `entity_type.rs` → `gen_entity_type.aowl` → `src/generated/entity_type.aowl`,
   161 entities from `assets/entities.json`. **Deliberately scoped down**:
   skips upstream's `attributes: &'static [(Attributes, f64)]` field (needs
   an extra layer of per-entry map decoding) and the `SpawnRestriction`/
   `HeightMap`/`SpawnLocation` natural-spawn-placement fields (irrelevant to
   the dimension/hitbox data this exists to unblock). `hurtSound`/
   `deathSound` stay plain strings rather than linking `src/generated/
-  sound.nim`'s `Sound` enum, to avoid coupling to its exact naming scheme.
+  sound.aowl`'s `Sound` enum, to avoid coupling to its exact naming scheme.
   Hit and fixed a real borrow-checker error in the *generated output* (not
   the generator itself): `for e in allEntityTypes(): ... return (true, e)`
   fails to compile ("cannot borrow from 'x': path is not borrowable") since
   `e` is borrowed from a temporary the `for` loop owns; fixed by binding
   `let all = allEntityTypes()` first, then iterating that. **Verified**:
-  generator actually run (`nimony c -r`) against the real `entities.json`;
-  `entity_typetest.nim` checks the real count (161) plus real dimension/
+  generator actually run (`aowlmony c -r`) against the real `entities.json`;
+  `entity_typetest.aowl` checks the real count (161) plus real dimension/
   eye-height values for `experience_orb`/`marker`/`snowball` and a
   missing-name lookup - all pass. Checked against `src/server/entity/`'s
   hand-authored `MarkerEntity`/`ExperienceOrbEntity`/`SnowballEntity`:
@@ -377,64 +377,64 @@ since `gen_attributes.nim` landed) - revisit once `data_component_impl` lands.
   conflict to resolve, just an opportunity for a future pass to wire real
   dimensions in instead of defaults).
 
-- `bitsets.rs` → `codegenutil.nim`'s `genU16Bitset`. Not a standalone
+- `bitsets.rs` → `codegenutil.aowl`'s `genU16Bitset`. Not a standalone
   JSON-driven generator (it has no assets of its own) - it's a shared
   codegen *helper* other generators call to emit a compact `u64`-word
   bitset membership test for a set of `u16` ids (upstream's `block.rs`/
   `item.rs` use it for things like "is this block a valid slab base";
-  none of that structure is in the current scoped-down `blockdata.nim`/
-  `item.nim` yet, so there's no live caller here today, but the helper
-  itself is done and ready). **Verified**: `bitsettest.nim` generates real
-  Nimony source for a 5-id test set, compiles and runs it via a fresh
-  `nimony c -r` subprocess, checks every id 0..140 against expected
+  none of that structure is in the current scoped-down `blockdata.aowl`/
+  `item.aowl` yet, so there's no live caller here today, but the helper
+  itself is done and ready). **Verified**: `bitsettest.aowl` generates real
+  aowlmony source for a 5-id test set, compiles and runs it via a fresh
+  `aowlmony c -r` subprocess, checks every id 0..140 against expected
   membership - all match.
 
-- **`biome.rs`** → `gen_biome.nim` → `src/generated/biome.nim` (67 biomes,
+- **`biome.rs`** → `gen_biome.aowl` → `src/generated/biome.aowl` (67 biomes,
   from `assets/datapack/data/minecraft/worldgen/biome/*.json`). Scoped to
   `has_precipitation`/`temperature`/`downfall`/`temperature_modifier`/
   `carvers`/`features` - the climate/generation-relevant fields
-  `src/world/biomeparam.nim`'s parameter math actually needs. Deferred:
+  `src/world/biomeparam.aowl`'s parameter math actually needs. Deferred:
   `spawners`/`spawn_costs` (including the `attributes` override path
   `apply_natural_mob_spawns` reads), the rest of `attributes`, and
   `effects` (cosmetic/client-rendering). No `id` field exists in the
-  source JSON (that ordering lives in `registry_data.nim`'s
+  source JSON (that ordering lives in `registry_data.aowl`'s
   `worldgen/biome` entries already), so this is name-keyed via
-  `biomeFromName`, matching what `biomeparam.nim` actually needs.
-  **Verified**: `biometest.nim` (`nimony c -r`) checks the real biome
+  `biomeFromName`, matching what `biomeparam.aowl` actually needs.
+  **Verified**: `biometest.aowl` (`aowlmony c -r`) checks the real biome
   count (67), `plains`'s exact fields against its source JSON (including
   a 3-carver list and a 46-entry flattened feature list), short-name vs.
   namespaced lookup, and a missing-name rejection - all pass. Not yet
-  wired to `biomeparam.nim` itself (that module has no biome-name lookup
+  wired to `biomeparam.aowl` itself (that module has no biome-name lookup
   surface yet, only parameter math) - a future pass connecting the two
   is the natural next step for a real `BiomeSupplier`.
 
-- **`noise_settings.rs`** → `gen_noise_settings.nim` → `src/generated/noise_settings.nim`:
+- **`noise_settings.rs`** → `gen_noise_settings.aowl` → `src/generated/noise_settings.aowl`:
   7 per-dimension noise-shape entries (sea level, default block/fluid name,
   Y bounds, cell size, legacy-random flag), scoped to the tractable shape
   fields - `aquifers`/`material_rule`/`surface_rule` (opaque noise-function
   graphs even on the Rust side) and `spawn_target` (biome-placement
   parameter points) are deferred, same call as `dimension.rs`'s cosmetic
-  `attributes`. `noise_settingstest.nim` actually runs the generator and
+  `attributes`. `noise_settingstest.aowl` actually runs the generator and
   checks real values (overworld sea level 63/minY -64/height 384, nether
   default block netherrack, end sea level 0) - all pass. Reuses
-  `src/world/biomeparam.nim`'s existing `Parameter`/`ParameterPoint` shape
+  `src/world/biomeparam.aowl`'s existing `Parameter`/`ParameterPoint` shape
   (upstream's `ParameterStruct`/`ParameterPointStruct` use the identical
   quantize-by-10000-as-i64 convention) for whenever `spawn_target` gets
   picked up later.
 
   This unblocked a first real end-to-end chunk-generation proof:
-  `src/world/flatgen.nim`'s flat/superflat-style section generator (not a
+  `src/world/flatgen.aowl`'s flat/superflat-style section generator (not a
   line-by-line port of any single upstream file - upstream's flat-world
   support is config-driven layer stacking inside the generic pipeline, not
   a standalone module) fills a real `PalettedContainer` using
-  `noise_settings.nim`'s per-dimension default block resolved against
-  `blockdata.nim`'s real 1286-block table. `flatgentest.nim` verifies real
+  `noise_settings.aowl`'s per-dimension default block resolved against
+  `blockdata.aowl`'s real 1286-block table. `flatgentest.aowl` verifies real
   block-state ids land at the right cells for both overworld (stone) and
-  nether (netherrack), actually run via `nimony c -r`, not just checked.
+  nether (netherrack), actually run via `aowlmony c -r`, not just checked.
 
 ## recipes.rs
 
-Ported to `gen_recipes.nim` → `src/generated/recipes.nim`, scoped to the
+Ported to `gen_recipes.aowl` → `src/generated/recipes.aowl`, scoped to the
 common recipe types: `crafting_shaped`, `crafting_shapeless`, `smelting`,
 `blasting`, `smoking`, `campfire_cooking`, `stonecutting`. Run against all
 1763 real files under `upstream-ref/assets/datapack/data/minecraft/recipe/`:
@@ -442,7 +442,7 @@ common recipe types: `crafting_shaped`, `crafting_shapeless`, `smelting`,
 (94.7%). Recipe ids are the JSON filename stems (matching what upstream's
 codegen driver actually passes as the id - not the unused
 `generate_recipe_id` helper in the same upstream file, which nothing calls
-for real recipe emission). Verified via `recipestest.nim` (`nimony c -r`,
+for real recipe emission). Verified via `recipestest.aowl` (`aowlmony c -r`,
 actually run): `acacia_boat` (shaped, pattern/key/result), `acacia_button`
 (shapeless, category/group/ingredient), `baked_potato` (smelting,
 cookingtime/experience) all hand-checked against their real source JSON,
@@ -450,18 +450,18 @@ plus `matches()`'s Simple/OneOf/Tagged resolution (Tagged honestly returns
 `false` - no tag-membership table is ported yet, documented in-file, not
 faked).
 
-Deliberately not ported this pass (documented in `gen_recipes.nim`'s doc
+Deliberately not ported this pass (documented in `gen_recipes.aowl`'s doc
 comment, counted per-type in the generator's own stdout on each run):
 `crafting_transmute`, `crafting_decorated_pot`, `smithing_transform`,
 `smithing_trim`, and the `crafting_special_*`/`crafting_dye`/
 `crafting_imbue` family - each is a special-cased Java-side algorithm, not
 data-driven, so there's no JSON shape to generate from; they need
-hand-written logic once `src/inventory/crafting.nim` grows a real
+hand-written logic once `src/inventory/crafting.aowl` grows a real
 slot-matching engine to call them from.
 
-**Not yet wired into `src/inventory/crafting.nim`**: that module currently
+**Not yet wired into `src/inventory/crafting.aowl`**: that module currently
 only has the crafting-grid `Inventory` wrapper, no recipe-matching logic at
-all. `recipes.nim`'s `matches()` proc and the four recipe-kind tables are
+all. `recipes.aowl`'s `matches()` proc and the four recipe-kind tables are
 the real ingredient data a matcher would need; building that matcher (grid
 pattern comparison for shaped recipes, multiset comparison for shapeless)
 is a genuine, separate piece of design/logic work, left for a follow-up
@@ -470,15 +470,15 @@ pass rather than folded in here.
 ## mob_variant.rs / villager.rs (re-attempted, previously deferred)
 
 Both were originally deferred as "nested optional arrays beyond current
-helper coverage." Re-checked against the current `codegenutil.nim` helper
+helper coverage." Re-checked against the current `codegenutil.aowl` helper
 set: `mob_variant.rs` turned out fully tractable with existing helpers
-(`listJsonStems`/`jsonStringField`, same shape as `gen_wolf_variant.nim`) -
+(`listJsonStems`/`jsonStringField`, same shape as `gen_wolf_variant.aowl`) -
 the actual blocker back then was never the JSON shape (it's flat: one JSON
 file per directory entry, `asset_id`/`baby_asset_id`/`model`), it was
 under-triage.
 
 Ported: `src/generated/{cow_variant,pig_variant,chicken_variant,
-zombie_nautilus_variant}.nim` - four enums (3/3/3/2 variants respectively,
+zombie_nautilus_variant}.aowl` - four enums (3/3/3/2 variants respectively,
 matching the real asset directories) with `fromName`/`toName`/`id`/
 `assetId`/`babyAssetId`/`model` accessors. Deliberately NOT ported: upstream's
 `select_for_biome` (biome-based variant selection for farm animals/zombie
@@ -486,7 +486,7 @@ nautilus) - that logic is hardcoded against
 `crate::tag::WorldgenBiome::MINECRAFT_SPAWNS_..._FARM_ANIMALS` biome-tag
 membership sets, and no `tag.rs` generator exists anywhere in this port yet
 (a real, separate prerequisite, not a nested-array problem). Verified via
-`mob_varianttest.nim` (`nimony c -r`): variant counts, asset ids, and the
+`mob_varianttest.aowl` (`aowlmony c -r`): variant counts, asset ids, and the
 temperate/cold model-field presence-vs-absence distinction all match source
 JSON exactly.
 
@@ -497,9 +497,9 @@ with cycle detection - a real algorithm, not a data-shape problem. Scoped
 down to the flat, non-recursive parts of `villager_data.json`: `professions`
 (name/translate-key/requested_items/work_sound, 15 entries) and `types`
 (villager biome-variant name -> texture namespace, 7 entries), landed as
-`src/generated/villager.nim`. The trade-set/trade-tag resolution graph is a
+`src/generated/villager.aowl`. The trade-set/trade-tag resolution graph is a
 real follow-up task, not attempted here - documented in the generator's own
-doc comment. Verified via `villagertest.nim` (`nimony c -r`): profession
+doc comment. Verified via `villagertest.aowl` (`aowlmony c -r`): profession
 count, `farmer`'s exact requested-items list, and type-name resolution all
 match source JSON.
 
@@ -511,8 +511,8 @@ a hash-consed DAG of density-function tree nodes plus a recursive
 cross-references - real compiler-shaped work (hash-consing, topological
 ordering), not attempted. Scoped down to `DensityFunctionKind`, the flat
 enum of the 26 node kinds `DensityFunctionRepr` distinguishes, landed as
-`src/generated/noise_router.nim`, verified internally consistent
-(`noise_routertest.nim`, `nimony c -r`: all 26 kinds round-trip through
+`src/generated/noise_router.aowl`, verified internally consistent
+(`noise_routertest.aowl`, `aowlmony c -r`: all 26 kinds round-trip through
 `densityFunctionKindToJsonType`/`FromJsonType`).
 
 **Correction worth flagging**: `DensityFunctionRepr` is
@@ -526,7 +526,7 @@ below is NOT verified against real on-disk data, only internally
 consistent. A future pass building the real DAG should also track that
 down, and should model the tree as a flat `seq[Node]` with index-based
 child references rather than a directly self-recursive `case object`,
-which fails Nimony's C-codegen (NIMONY-COMPILER-BUGS.md #3).
+which fails aowlmony's C-codegen (COMPILER-BUGS.md #3).
 
 ## What's NOT done
 
@@ -535,7 +535,7 @@ real structural complexity - nested data shapes, cross-references between
 registries, not just flat string arrays). Each needs the same treatment as
 `sound_category.rs`: read its `.rs` source, understand its JSON input shape
 and what Rust type/impl it emits, then hand-write the equivalent
-string-building Nimony generator. This is real, substantial work - the
+string-building aowlmony generator. This is real, substantial work - the
 90-file breadth is the actual cost, not any per-file blocker - budget
 accordingly; a reasonable next step is forking out several of these in
 parallel the way other crates in this port were, since each submodule is
@@ -547,7 +547,7 @@ choices:
 - **Output layout**: this PoC writes flat files under `src/generated/`.
   Once there are ~90 of them (mirroring `crates/data/src/generated/`
   upstream), consider whether they should be organized into subdirectories
-  matching upstream's, and whether a single `main.nim` driver (mirroring
+  matching upstream's, and whether a single `main.aowl` driver (mirroring
   `tools/codegen/src/main.rs`) should replace running each
   generator file individually.
 - **`main.rs`'s non-generator responsibilities**: skimmed but not yet
@@ -562,17 +562,17 @@ choices:
 Ported `BREWING_RECIPES` (`ITEM_RECIPES`/`POTION_RECIPES` are always
 `[]` upstream, per its own comment - not emitted). Item/potion
 references became plain lowercase snake_case name strings (matching
-`item.nim`'s `name` field convention) rather than `&'static Item`/
+`item.aowl`'s `name` field convention) rather than `&'static Item`/
 `&'static Potion` references - no `Potion` table exists yet, and the
 sibling `potion.rs` generator was already found transitively blocked
 on unported `attributes`/`data_component_impl` types. A future pass
 can resolve these strings against a real registry once one exists.
 
-`gen_potion_brewing.nim` actually run against the real 279 JSON files
+`gen_potion_brewing.aowl` actually run against the real 279 JSON files
 under `assets/datapack/data/minecraft/recipe/brewing/`, producing
-`src/generated/potion_brewing.nim` (279 recipes, matching the file
-count exactly). `potion_brewingtest.nim` verified via `nimony c -r`
-(no `entity.nim` in its import graph, genuinely runtime-proven): the
+`src/generated/potion_brewing.aowl` (279 recipes, matching the file
+count exactly). `potion_brewingtest.aowl` verified via `aowlmony c -r`
+(no `entity.aowl` in its import graph, genuinely runtime-proven): the
 alphabetically-first recipe's exact fields, plus a non-empty check
 across all 279 entries to catch any silent missing-key fallback.
 
@@ -592,13 +592,13 @@ Used a local `safeGet`/`safeGetStr`/`safeGetInt` helper (a node-level
 equivalent of `codegenutil.jsonTryGet`, which only operates on a
 `var JsonTree`'s root) rather than raw `{}` lookups throughout, since
 `{}` on a missing key returns a broken default `JsonNode` that crashes
-at runtime (documented in NIMONY-COMPILER-BUGS.md) - this generator
+at runtime (documented in COMPILER-BUGS.md) - this generator
 needed safe lookup several levels deep (group -> icon -> id).
 
-`gen_bedrock_creative.nim` actually run against the real assets,
-producing `src/generated/bedrock_creative.nim` (124 groups, 1980
-entries). `bedrock_creativetest.nim` verified via `nimony c -r` (no
-`entity.nim` in its import graph, genuinely runtime-proven): entry
+`gen_bedrock_creative.aowl` actually run against the real assets,
+producing `src/generated/bedrock_creative.aowl` (124 groups, 1980
+entries). `bedrock_creativetest.aowl` verified via `aowlmony c -r` (no
+`entity.aowl` in its import graph, genuinely runtime-proven): entry
 counts, the first group's exact fields (`itemGroup.name.planks`,
 category 1, icon id 5 for `oak_planks` - cross-checked against
 `runtime_item_states.json` directly), and every entry's `groupIndex`

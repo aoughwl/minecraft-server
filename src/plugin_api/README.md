@@ -1,4 +1,4 @@
-# plugin-api → Nimony
+# plugin-api → aowlmony
 
 Source: `crates/plugin-api` in the upstream repo, ~24k lines of Rust.
 
@@ -11,10 +11,10 @@ generation mechanism `host-bindings` sits on the host side of - see
 `src/host_bindings/README.md`). That module isn't hand-written Rust
 anywhere in the crate; it's produced at the upstream server's own build time from the
 WIT interface files under `plugin-wit/`. There is nothing here to
-mechanically translate without first having a Nimony WASM-guest binding
+mechanically translate without first having a aowlmony WASM-guest binding
 layer, which doesn't exist (see `src/host_bindings/README.md` and
 `src/plugin_runtime/README.md` for the three replacement paths already
-identified: wasmtime C API FFI, a custom WIT→Nimony generator, or dropping
+identified: wasmtime C API FFI, a custom WIT→aowlmony generator, or dropping
 WASM sandboxing for natively-loaded plugins the way Jester's `aowli`
 interpreter already does).
 
@@ -34,10 +34,10 @@ is settled, not the generated output by hand.
 
 ## Ported
 
-- `permissions.nim` - the plugin sandbox capability-string constants
+- `permissions.aowl` - the plugin sandbox capability-string constants
   (`network.*`, `fs.*`, `sys.*`, `http.outbound`). Pure data, no `wit`
-  dependency. `nimony check` clean.
-- `eventdata.nim` - a real server-side `EventData` model, now covering
+  dependency. `aowlmony check` clean.
+- `eventdata.aowl` - a real server-side `EventData` model, now covering
   271 of the 273 real `-event-data` WIT records - **this closes out the
   full list**. Only two are deliberately not ported: `PacketReceived`/
   `PacketSent` (need a full packet-variant sum type spanning
@@ -63,9 +63,9 @@ is settled, not the generated output by hand.
   `VehicleExit`/`VehicleMove`/`VehicleUpdate`/`VillagerAcquireTrade`/
   `VillagerCareerChange`/`VillagerReplenishTrade`/
   `VillagerReputationChange`/`WardenAngerChange`/`WorldSave`.
-  `nimony check` clean, and `eventdatatest.nim` extended and **actually
-  run** (`nimony c -r`) - "all eventdata checks passed" - genuine runtime
-  proof, same as every prior batch (no `entity.nim` dependency).
+  `aowlmony check` clean, and `eventdatatest.aowl` extended and **actually
+  run** (`aowlmony c -r`) - "all eventdata checks passed" - genuine runtime
+  proof, same as every prior batch (no `entity.aowl` dependency).
   Previous batch (33 new): `AreaEffectCloudApply`/`ArrowBodyCountChange`/
   `AsyncStructureGenerate`/`AsyncStructureSpawn`/`BatToggleSleep`/
   `BedrockFormResponse`/`BellResonate`/`BlockDamageAbort`/
@@ -79,7 +79,7 @@ is settled, not the generated output by hand.
   `LingeringPotionSplash`/`LootGenerate`/`MapInitialize`.
   Deliberately not ported: `packet-received`/`packet-sent` (need a full
   packet-variant sum type spanning src/protocol/'s concrete packet procs,
-  which doesn't exist as one enum yet - documented in eventdata.nim's
+  which doesn't exist as one enum yet - documented in eventdata.aowl's
   header). ~70 records remain (villager/vehicle/raid, and most of the
   long tail) - same mechanical translation, just more of it.
   Previous batch (33 new): `PlayerChangeWorld`/`PlayerCustomPayload`/
@@ -139,7 +139,7 @@ is settled, not the generated output by hand.
   `WorldLoad`/`WorldUnload`/`ChunkUnload`/`TimeSkip`/`MoistureChange`.
   Also fixed two pre-existing test bugs hit while extending the file:
   `MoistureChangeEventData` has no `cancelled` field in the real WIT record
-  (the test wrongly passed one; `nimony check` didn't catch it until the
+  (the test wrongly passed one; `aowlmony check` didn't catch it until the
   file was re-checked after unrelated edits nearby) and a `placeData`
   identifier collision between `BlockPlaceEventData`'s and
   `EntityPlaceEventData`'s test variables (renamed the latter to
@@ -150,20 +150,20 @@ is settled, not the generated output by hand.
   for where the real shapes live and the type-substitution choices made:
   a WIT `player` resource becomes `PlayerUuid`, not a live `Entity`/
   `Player` reference, specifically to avoid transitively importing
-  `src/server/entity/entity.nim` and inheriting its runtime-unverifiable
+  `src/server/entity/entity.aowl` and inheriting its runtime-unverifiable
   status; `text-component` becomes a plain `string` pending a real
   `TextComponent` port). This does NOT replace the WASM-guest transport
   itself (still undecided, see below) - it's a genuine, transport-
-  independent data model server code can build on now. `nimony check`
+  independent data model server code can build on now. `aowlmony check`
   clean, and - unlike most of this port's vtable-based code -
-  `eventdatatest.nim` actually **runs** clean via `nimony c -r`
+  `eventdatatest.aowl` actually **runs** clean via `aowlmony c -r`
   (pure data, no closures/vtables, so it isn't affected by the
   closure-through-vtable runtime crash documented in
   `src/server/entity/README.md`).
 
 The `EventData` model is now complete (see above) - what's NOT ported is
 each individual `events/*.rs` WASM-guest wrapper file itself (the ~230
-`FromIntoEvent` shims converting between `eventdata.nim`'s equivalent
+`FromIntoEvent` shims converting between `eventdata.aowl`'s equivalent
 and the real `wit::...::EventData` type), since those need the WASM-guest
 binding layer question resolved first (see the top of this file).
 
@@ -174,4 +174,4 @@ question - see the replacement paths in `src/host_bindings/`
 and `src/plugin_runtime/`). The larger files
 (`recipe.rs`, `mobs.rs`, `persistent_data.rs`, `enchantment.rs`, `team.rs`)
 are plugin-author-facing builder APIs over those same WIT resource types
-and should follow once the resource types themselves have a Nimony shape.
+and should follow once the resource types themselves have a aowlmony shape.

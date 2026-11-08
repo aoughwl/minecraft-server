@@ -6,10 +6,10 @@ was reported as done is actually consistent, committed, and compiling.
 
 ## Scope
 
-1. Every `import` in every `src/**/*.nim` file resolves to either a `std/`
-   module, a cross-repo path covered by `nimony.paths`, or a file actually
+1. Every `import` in every `src/**/*.aowl` file resolves to either a `std/`
+   module, a cross-repo path covered by `aowlmony.paths`, or a file actually
    tracked in this repo (not just present on some agent's local disk).
-2. `nimony check` run individually on all 347 `.nim` files under `src/`.
+2. `aowlmony check` run individually on all 347 `.aowl` files under `src/`.
 3. Spot-check of README claims (main `README.md` + each `src/*/README.md`)
    against the directories they describe.
 
@@ -17,23 +17,23 @@ was reported as done is actually consistent, committed, and compiling.
 
 ### 1. One missing committed file (found and fixed before this audit started)
 
-`src/generated/noise_settings.nim` — the generator (`gen_noise_settings.nim`)
-and its consumer (`world/flatgen.nim`) were committed, but the generated
+`src/generated/noise_settings.aowl` — the generator (`gen_noise_settings.aowl`)
+and its consumer (`world/flatgen.aowl`) were committed, but the generated
 output itself was left untracked. A fresh clone would have failed to build
-`flatgen.nim`. Fixed in commit `4a3de5d` (already on `main` before this
-audit ran) — confirmed both files `nimony check` clean with it present.
+`flatgen.aowl`. Fixed in commit `4a3de5d` (already on `main` before this
+audit ran) — confirmed both files `aowlmony check` clean with it present.
 
 ### 2. Import/tracking cross-reference: clean
 
 Every non-stdlib import used in `src/` resolves to either a tracked file in
-this repo or one of the three paths in `nimony.paths` (`../jwt/src`,
+this repo or one of the three paths in `aowlmony.paths` (`../jwt/src`,
 `../compress`, `../requests/nimony`). No other missing-file gaps found.
 
 ### 3. Full compile sweep: 347/347 clean
 
-Ran `nimony check` on every tracked `.nim` file individually. One transient
-failure was caught mid-sweep — `src/command/vec3arg.nim` failed because
-`src/command/cmdsource.nim` had a duplicate `saveAllProc*` field declaration
+Ran `aowlmony check` on every tracked `.aowl` file individually. One transient
+failure was caught mid-sweep — `src/command/vec3arg.aowl` failed because
+`src/command/cmdsource.aowl` had a duplicate `saveAllProc*` field declaration
 (two concurrent forks both extended `CommandSource`'s manual vtable with a
 field of that name around the same time). By the time this audit pulled
 latest and re-checked, a later commit from another fork had already
@@ -70,8 +70,8 @@ files, or for a dedicated follow-up sweep if strict consistency matters.
 
 ## Not covered by this audit
 
-- Runtime behavior (`nimony c -r`) beyond what NIMONY-COMPILER-BUGS.md
-  already documents — this pass only re-ran `nimony check`, which is a much
+- Runtime behavior (`aowlmony c -r`) beyond what COMPILER-BUGS.md
+  already documents — this pass only re-ran `aowlmony check`, which is a much
   weaker guarantee for anything hitting the closures-through-vtables bug.
 - Correctness of ported logic against upstream semantics (each fork's own
   report is the source of truth for what was verified and how).

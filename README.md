@@ -1,8 +1,8 @@
 # minecraft-server
 
-A Nimony port of an upstream open-source, GPLv3-licensed Minecraft server
+A aowlmony port of an upstream open-source, GPLv3-licensed Minecraft server
 implementation written in Rust. This project translates its crates to
-Nimony, keeping the same module boundaries, so it can eventually serve as
+aowlmony, keeping the same module boundaries, so it can eventually serve as
 the server counterpart to the Minecraft voxel *client* protocol code
 already living in the Jester modpack work (`aoughwl.mcnet` and friends,
 under `jester/artifacts/release-src/minecraft/Mods/`). That existing code
@@ -19,9 +19,9 @@ for the full terms and attribution. A local clone of the upstream source
 Smallest/most self-contained crates first, since later crates depend on them:
 
 1. `nbt` (~3.1k LOC) — NBT tag model, (de)serialization. **In progress.**
-   Gzip-compressed NBT (`nbt_compress.rs` → `src/nbt/nbt_compress.nim`) is
+   Gzip-compressed NBT (`nbt_compress.rs` → `src/nbt/nbt_compress.aowl`) is
    now wired to the `../compress` library and compiles clean, with a
-   round-trip test in `src/nbt/gziptest.nim` - but not proven at runtime
+   round-trip test in `src/nbt/gziptest.aowl` - but not proven at runtime
    here: `compress` binds `libz.so.1` by that literal Linux name, which
    doesn't resolve on this Windows dev machine, and a deeper ABI mismatch
    surfaced even after working around the name. Expected to work on the
@@ -35,21 +35,21 @@ Smallest/most self-contained crates first, since later crates depend on them:
    `random/worldgen_random.rs` (Java `WorldgenRandom` bit-source wrapper
    over Xoroshiro), `noise/mod.rs` (`Gradient` type + gradient table),
    `math/mod.rs`'s `lerp`/`lerp2`/`lerp3`/`smoothstep` (as
-   `src/util/mathlerp.nim` - as concrete float32/float64 overloads, not
-   Rust's single generic `lerp<T: Float>`: a `[T: SomeFloat]` Nimony
+   `src/util/mathlerp.aowl` - as concrete float32/float64 overloads, not
+   Rust's single generic `lerp<T: Float>`: a `[T: SomeFloat]` aowlmony
    generic hits a real compiler bug resolving `-` on `T` inside its own
    body, filed as feedback, worked around with duplication), `noise/perlin.rs`'s
-   core `PerlinNoise` point-sampling (`src/util/perlin.nim` - `get`/
+   core `PerlinNoise` point-sampling (`src/util/perlin.aowl` - `get`/
    `sample_and_lerp` only; `add_to_volume`'s batched fast path,
    `SmearedPerlinNoise`, `NoiseStack`, and `NormalNoise`'s octave-sum/
    normalization machinery are NOT ported yet, see the file's doc comment)
-   → `src/util/*.nim`. legacy_rand/xoroshiro128/worldgen_random are all
+   → `src/util/*.aowl`. legacy_rand/xoroshiro128/worldgen_random are all
    verified byte-for-byte against the Rust files' own unit test vectors
    (worldgen_random's specifically check against real vanilla Minecraft
-   chunk/decorator seeds and draws) - see `src/util/legacy_randtest.nim`,
-   `xoroshiro128test.nim`, `worldgen_randomtest.nim`. `perlin.nim` has NO
+   chunk/decorator seeds and draws) - see `src/util/legacy_randtest.aowl`,
+   `xoroshiro128test.aowl`, `worldgen_randomtest.aowl`. `perlin.aowl` has NO
    upstream test vectors to check against (perlin.rs has no `#[cfg(test)]`
-   block) - `perlintest.nim` checks permutation-table validity, a
+   block) - `perlintest.aowl` checks permutation-table validity, a
    cross-computed HALF_ROUND_OFF bit-pattern constant, and sampling
    determinism/plausible range, but this is NOT yet verified bit-for-bit
    against vanilla world-gen output; treat it as "probably right, not yet
@@ -72,43 +72,43 @@ Smallest/most self-contained crates first, since later crates depend on them:
    `decode_header_get_x5u`, the ES384 self-signed verify path
    (`verify_oidc_token_self_signed`), and player-claims extraction
    (including the MD5-based xuid→UUID derivation) are all ported to
-   `src/auth/jwt.nim` and wired to a real P-384 ECDSA implementation - a
+   `src/auth/jwt.aowl` and wired to a real P-384 ECDSA implementation - a
    new standalone sibling library at `../jwt` (built specifically to
    unblock this; see its own README for what's implemented and how it's
-   verified), pulled in via this repo's `nimony.paths`. Proven end-to-end
-   against a real ES384 token in `src/auth/jwttest.nim` (`nimony c -r` it
+   verified), pulled in via this repo's `aowlmony.paths`. Proven end-to-end
+   against a real ES384 token in `src/auth/jwttest.aowl` (`aowlmony c -r` it
    to check). Still not ported: the Mojang-root-of-trust chain walk (needs
    a security-critical root-key constant sourced properly, not guessed),
    RS256 (needs RSA, not yet in `../jwt`), and the issuer-checked/JWKS-
    fetching OIDC path (needs both RS256 and an HTTP client). `client.rs`
-   → `src/auth/client.nim` is now wired to the `requests` library
-   (`../requests`, curl-impersonate-based) via `nimony.paths`, but is
-   currently **blocked from compiling**: `requests`'s own `profiles.nim`
-   hits a Nimony const-eval limitation unrelated to this port (a `seq`
+   → `src/auth/client.aowl` is now wired to the `requests` library
+   (`../requests`, curl-impersonate-based) via `aowlmony.paths`, but is
+   currently **blocked from compiling**: `requests`'s own `profiles.aowl`
+   hits a aowlmony const-eval limitation unrelated to this port (a `seq`
    literal inside a `const array` of objects) - not fixed here since that
-   sibling repo wasn't in scope. See doc comments in `src/auth/jwt.nim` /
-   `src/auth/client.nim`.
+   sibling repo wasn't in scope. See doc comments in `src/auth/jwt.aowl` /
+   `src/auth/client.aowl`.
 5. `scheduler` (~662 LOC) — **Data model done, driver deferred.**
    `domain.rs`, `error.rs`, and the pure-data parts of `task.rs`/
    `scheduler.rs` (`SchedulerTaskId`, `TaskContext`, `SchedulerConfig`,
-   `SchedulerState`, `SchedulerSnapshot`) are ported to `src/scheduler/*.nim`.
+   `SchedulerState`, `SchedulerSnapshot`) are ported to `src/scheduler/*.aowl`.
    NOT ported: `backend.rs`'s `TaskExecutor` trait, `task.rs`'s
    `TaskFuture`/`TaskWork`/`TaskRequest`/`TaskHandle` (+ its `impl Future`),
    `scheduler.rs`'s `SchedulerService` trait, and all of `global.rs` (326
    LOC, the actual admission/poll driver) — these are `Pin<Box<dyn
-   Future>>`/tokio-executor plumbing with no Nimony equivalent (Nimony's
+   Future>>`/tokio-executor plumbing with no aowlmony equivalent (aowlmony's
    async is `passive` procs + continuations, not poll-based futures).
    Needs a real design pass once the main server crate (the crate that drives the
    server tick loop) clarifies what should drive scheduler turns. See
-   `src/scheduler/lib.nim`'s doc comment.
+   `src/scheduler/lib.aowl`'s doc comment.
 4a. `api-macros` (~152 LOC) — **Not ported; by design, documented
    instead.** This is a Rust proc-macro crate (`#[plugin_method]`,
    `#[plugin_impl]`, `#[with_runtime]`) that runs as compiler codegen, not
-   runtime code, so there is no Nimony module for it to become. Its
+   runtime code, so there is no aowlmony module for it to become. Its
    semantics (async-plugin-method wrapping, `#[no_mangle]` plugin-ABI
    statics, tokio `block_on` bridging) are written up in
    `src/api_macros/README.md` for whoever builds the plugin host later -
-   the honest Nimony replacement is a plain template/generic wrapper called
+   the honest aowlmony replacement is a plain template/generic wrapper called
    by plugin authors plus a small codegen script, not a compiler plugin,
    once the main server crate's plugin-loading side gives it a concrete target.
 4b. `macros` (~1.15k LOC) — **Not ported; documented instead**
@@ -121,17 +121,17 @@ Smallest/most self-contained crates first, since later crates depend on them:
    `translate_java!` (compile-time translation-key validation). The
    `PacketWrite`/`PacketRead` derive logic is flagged as the reference spec
    for whoever hand-ports individual `src/protocol/` packet types next,
-   since Nimony has no derive macros and each packet's serialize/
-   deserialize will be hand-written the way `src/nbt/tag.nim`'s is.
+   since aowlmony has no derive macros and each packet's serialize/
+   deserialize will be hand-written the way `src/nbt/tag.aowl`'s is.
 4. `config` (~2.2k LOC) — **Mostly done for plain-data configs.**
    Ported: `lighting.rs`, `fun.rs`, `recipe.rs`, `advancement.rs`,
    `player_data.rs`, `pvp.rs`, `logging.rs`, `whitelist.rs`, `chunk.rs`,
    `world.rs`, `server_links.rs`, `telemetry.rs`, `chat.rs`,
    `resource_pack.rs`, and `networking/{lan_broadcast,compression,proxy,
-   packet_limiter,query,rcon}.rs` → `src/config/*.nim` (networking ones
+   packet_limiter,query,rcon}.rs` → `src/config/*.aowl` (networking ones
    under `src/config/networking/`). All type-check clean. `Uuid` and
-   `SocketAddr` are represented by small local stub types (`whitelist.nim`,
-   `networking/netaddr.nim`) since neither is ported anywhere yet. Skipped:
+   `SocketAddr` are represented by small local stub types (`whitelist.aowl`,
+   `networking/netaddr.aowl`) since neither is ported anywhere yet. Skipped:
    `op.rs`/`networking/auth.rs` (need `util::PermissionLvl`/
    `ProfileAction`, not yet ported), `networking/{java,bedrock}.rs` and
    `networking/mod.rs`'s `NetworkingConfig` aggregate (depend on java/bedrock
@@ -139,11 +139,11 @@ Smallest/most self-contained crates first, since later crates depend on them:
    config-file load/save/merge driver; needs a design pass, not a
    line-by-line port).
 6. `gametest` (~1.9k LOC) — **Small ported slice, rest blocked.**
-   `error.rs` → `src/gametest/error.nim` (full port) and `model.rs` →
-   `src/gametest/model.nim` (full port, `serde`/`serde_json` skipped;
+   `error.rs` → `src/gametest/error.aowl` (full port) and `model.rs` →
+   `src/gametest/model.aowl` (full port, `serde`/`serde_json` skipped;
    `environment: Value` becomes a raw JSON-text `string` placeholder).
-   `model.nim` needed `Rotation` from data's `block_rotation.rs`;
-   rather than block on all of data, `src/gametest/rotation_stub.nim`
+   `model.aowl` needed `Rotation` from data's `block_rotation.rs`;
+   rather than block on all of data, `src/gametest/rotation_stub.aowl`
    hand-copies just the 4-way enum + its `then` combinator (see its header
    for the TODO to de-duplicate once data is ported for real).
    NOT ported: `world.rs` (an `#[async_trait]` interface over
@@ -153,51 +153,51 @@ Smallest/most self-contained crates first, since later crates depend on them:
    `structure/placement.rs` (389 LOC), `structure/template.rs` (223 LOC),
    `block_based/test.rs` — all either depend on the above or are
    async-trait/state-machine driven or the tick loop shape mentioned under
-   `scheduler` above. See `src/gametest/lib.nim`'s doc comment.
+   `scheduler` above. See `src/gametest/lib.aowl`'s doc comment.
 7. `codecs` / `protocol` (~40k LOC combined) — **In
    progress.** `lifecycle.rs`, `number.rs` (JSON interop skipped), and the
    core `DataResult<R>` type from `data_result.rs` (its macro-generated
-   `apply2..applyN` applicative family skipped, no Nimony equivalent) →
-   `src/codecs/*.nim`. NOT ported: `map_like.rs`, `dynamic_ops.rs`,
+   `apply2..applyN` applicative family skipped, no aowlmony equivalent) →
+   `src/codecs/*.aowl`. NOT ported: `map_like.rs`, `dynamic_ops.rs`,
    `json_ops.rs`, `codec/*`, `struct_builder.rs`, `list_builder.rs` — a
    generic Codec/DynamicOps framework built on Rust trait objects and GATs
-   with no direct Nimony equivalent; deferred until a concrete consumer
+   with no direct aowlmony equivalent; deferred until a concrete consumer
    forces the design (e.g. `nbt`'s `nbt_ops.rs`, itself stubbed
    pending this).
    `protocol`: `codec/var_int.rs` + `codec/var_uint.rs` +
-   `codec/var_long.rs`/`var_ulong.rs` → `src/protocol/varint.nim` (`VarInt`,
-   `VarUInt`, `VarLong`, `VarULong`), plus `src/protocol/protobase.nim`
+   `codec/var_long.rs`/`var_ulong.rs` → `src/protocol/varint.aowl` (`VarInt`,
+   `VarUInt`, `VarLong`, `VarULong`), plus `src/protocol/protobase.aowl`
    (`ReadingError`/`WritingError`/result types, port of the non-serde-trait
    parts of `ser/mod.rs`). Same Java-plain-LEB128-vs-Bedrock-ZigZag split as
-   `src/nbt/serializer.nim`/`deserializer.nim`, verified byte-for-byte
+   `src/nbt/serializer.aowl`/`deserializer.aowl`, verified byte-for-byte
    against `var_int.rs`'s own `#[cfg(test)]` vectors in
-   `src/protocol/varinttest.nim` (round-trip across `i32::MIN/-2/-1/0/1/2/
+   `src/protocol/varinttest.aowl` (round-trip across `i32::MIN/-2/-1/0/1/2/
    i32::MAX` for both shapes, boundary values, and both overflow-rejection
    tests). Async `decode_async`/`encode_async` variants (tokio-specific)
    are not ported.
    Follow-up pass added the shared codec/framing layer: `ser/mod.rs`'s
-   `NetworkReadExt`/`NetworkWriteExt` traits → `src/protocol/netcodec.nim`
+   `NetworkReadExt`/`NetworkWriteExt` traits → `src/protocol/netcodec.aowl`
    (`NetReader`/`NetWriter`, one concrete pair over an owned `seq[byte]`
    instead of Rust's generic-over-`Read`/`Write` trait, matching
    `src/nbt/`'s reader/writer shape) — numeric BE reads/writes, bool,
-   var_int/uint/long via `varint.nim`, bounded strings (with a from-scratch
+   var_int/uint/long via `varint.aowl`, bounded strings (with a from-scratch
    UTF-16-length bound check decoding UTF-8 by hand, including surrogate
    pairs), `getOption`/`getList` generics, UUID as a raw (hi, lo) `u64`
    pair (no `Uuid` type ported anywhere yet). `codec/bit_set.rs` →
-   `src/protocol/bitset.nim`, verified byte-for-byte against its own
-   `#[cfg(test)]` vectors in `src/protocol/bitsettest.nim` (all 4 tests,
+   `src/protocol/bitset.aowl`, verified byte-for-byte against its own
+   `#[cfg(test)]` vectors in `src/protocol/bitsettest.aowl` (all 4 tests,
    including the exact encoded-byte assertion and the negative-length
-   rejection). `codec/uuid.rs` → `src/protocol/uuid.nim` (thin re-export,
+   rejection). `codec/uuid.rs` → `src/protocol/uuid.aowl` (thin re-export,
    see above). `lib.rs`'s `ConnectionState`, `IdOr<T>`, `RawPacket` →
-   `src/protocol/proto.nim`. Skipped: `StreamDecryptor`/`StreamEncryptor`
+   `src/protocol/proto.aowl`. Skipped: `StreamDecryptor`/`StreamEncryptor`
    (AES-128-CFB8 login encryption over async I/O - tokio-specific, no
-   Nimony equivalent yet) and the `ClientPacket`/`ServerPacket` traits
-   (Nimony has no traits; concrete packet types will expose their own
-   read/write procs directly). `netcodectest.nim` round-trips every numeric
+   aowlmony equivalent yet) and the `ClientPacket`/`ServerPacket` traits
+   (aowlmony has no traits; concrete packet types will expose their own
+   read/write procs directly). `netcodectest.aowl` round-trips every numeric
    type, bools, a var_int, and a UTF-8 string with multi-byte/surrogate-pair
    characters through the new writer/reader - passing.
    First concrete packet types: 8 Java login/config-state packets (both
-   directions where upstream has both) → `src/protocol/loginpackets.nim` -
+   directions where upstream has both) → `src/protocol/loginpackets.aowl` -
    `CSetCompression`, `CLoginDisconnect`, `SKeepAlive` (config-state),
    `SConfigPong`, `CFinishConfig`/`SAcknowledgeFinishConfig` (empty-body),
    `CLoginCookieRequest`, `SLoginCookieResponse`, `SLoginPluginResponse`.
@@ -207,49 +207,49 @@ Smallest/most self-contained crates first, since later crates depend on them:
    multi-version story needs `pumpkin_util::version` ported first). Each
    exposes its own `writePacketData`/`readPacketData` procs directly
    instead of upstream's `ClientPacket`/`ServerPacket` traits, the same
-   shape `src/nbt/tag.nim`'s serialize/deserialize use. All 8 verified
+   shape `src/nbt/tag.aowl`'s serialize/deserialize use. All 8 verified
    with real round-trip encode→decode→compare tests in
-   `src/protocol/loginpacketstest.nim` (run via `nimony c -r`, not just
+   `src/protocol/loginpacketstest.aowl` (run via `aowlmony c -r`, not just
    checked) - passing. NOT started: `data_component.rs` (2.9k),
    `item_stack_seralizer.rs`, and the much larger remaining packet surface
    (most play-state packets, `java/client/config/registry_data.rs` and
    other NBT/registry-heavy ones, all of `bedrock/`).
    Follow-up pass added a `writeList`/`writeListRes` generic to
-   `netcodec.nim` (the write-side counterpart to the existing `getList`)
+   `netcodec.aowl` (the write-side counterpart to the existing `getList`)
    and 4 more config-state packet types: `registry_data.rs` →
-   `src/protocol/configpackets.nim` (`CRegistryData` - `RegistryEntryData`
+   `src/protocol/configpackets.aowl` (`CRegistryData` - `RegistryEntryData`
    modeled as `{entryId, hasData, data: seq[byte]}`, the raw NBT blob
    written/read verbatim as upstream does; the reader's "has data" branch
    reads to end-of-frame since there's no length prefix on the blob
    itself, matching upstream's real one-entry-per-packet usage - documented
    in-file as not safe for a hypothetical multi-entry-with-data packet),
    and `reset_chat.rs`/`feature_flags.rs`/`ping.rs` →
-   `src/protocol/configpackets2.nim` (`CConfigResetChat`, `CFeatureFlags`,
+   `src/protocol/configpackets2.aowl` (`CConfigResetChat`, `CFeatureFlags`,
    `CConfigPing`). All with real round-trip tests
-   (`configpackets{,2}test.nim`, `nimony c -r` passing).
+   (`configpackets{,2}test.aowl`, `aowlmony c -r` passing).
    Explicitly assessed and deferred: `codec/item_stack_seralizer.rs` (856
    lines) - genuinely blocked, not just unstarted: it's built directly on
    `codec/data_component.rs`'s full ~2887-line `DataComponent`
    registry/codec (itself needs `pumpkin-data`'s generated component
    tables), `JavaMinecraftVersion` multi-version branching (not ported),
    and a real `ItemStack.patch: Map<DataComponent, Option<Data>>` model -
-   `src/inventory/itemstub.nim`'s placeholder `ItemStack` (id+count only)
+   `src/inventory/itemstub.aowl`'s placeholder `ItemStack` (id+count only)
    isn't shaped for it. Revisit once `data_component.rs` has its own
    design pass.
    Still not started (~34k LOC): `codec/data_component.rs` (2.9k),
    `codec/item_stack_seralizer.rs`, `serial/*`, `query.rs`, `rcon.rs`, most
    of the `java/`'s and all of `bedrock/`'s several hundred individual
    packet types, `packet_encoder.rs`/`packet_decoder.rs`. Did not end up
-   drawing on Jester's client-side `aoughwl.mcnet/netwire.nim` etc. beyond
+   drawing on Jester's client-side `aoughwl.mcnet/netwire.aowl` etc. beyond
    confirming the same varint shape is the right one to match; worth a
    closer look by whoever ports `packet_encoder.rs`/`packet_decoder.rs`
    next, since that's where Jester's client-side framing code is the more
    directly relevant reference.
 8. `plugin-utils` (~710 LOC) — **Done except HTTP.** `models.rs`,
    `updater.rs`, `license.rs` (lease read/write via `std/json`, grace-period
-   evaluation), and `lib.rs`'s global-state glue → `src/plugin_utils/*.nim`.
+   evaluation), and `lib.rs`'s global-state glue → `src/plugin_utils/*.aowl`.
    `init(context)`'s WASM-guest path is skipped (needs unported
-   `plugin-api`). `http.rs` is a call-shape stub only: Nimony's
+   `plugin-api`). `http.rs` is a call-shape stub only: aowlmony's
    stdlib has no HTTP client or TLS at all, so `check_license_online`/
    `check_for_updates` compile and return a clear "not implemented" error
    rather than a fake success - needs libcurl/WinHTTP FFI eventually.
@@ -257,20 +257,20 @@ Smallest/most self-contained crates first, since later crates depend on them:
    instead.** The entire file is one `wasmtime::component::bindgen!`
    macro call over `../plugin-wit/v0.1/*.wit` (~14.2k lines of
    WIT across 60+ files) - there is no hand-written Rust logic to
-   translate, and Nimony has no WASM component-model runtime or
+   translate, and aowlmony has no WASM component-model runtime or
    WIT-bindgen equivalent. See `src/host_bindings/README.md` for the full
    explanation and the three real options once the plugin ABI is actually
-   being built (wasmtime C API FFI, a custom WIT→Nimony generator, or
+   being built (wasmtime C API FFI, a custom WIT→aowlmony generator, or
    dropping the WASM sandbox model for native-loaded plugins).
 9b. `plugin-runtime` (~3.3k LOC) — **Not portable yet; documented
     instead, except one small data type.** wasmtime `Store`
     multiplexing/execution (`executor.rs`), cross-plugin re-entry tracking
     (`chain.rs`), an async admission policy over that (`policy.rs`), and a
     runtime-agnostic spawn trait (`spawn.rs`) are all tokio+wasmtime
-    plumbing with no Nimony equivalent (no WASM runtime, and Nimony's
+    plumbing with no aowlmony equivalent (no WASM runtime, and aowlmony's
     async is `passive` procs + continuations, not poll-based futures).
     `lifecycle.rs`'s `DriverState`/`DriverError` — the one piece that's
-    plain data — is ported to `src/plugin_runtime/lifecycle.nim`; the
+    plain data — is ported to `src/plugin_runtime/lifecycle.aowl`; the
     `Lifecycle`/`DriverJoin` types wrapping it in a tokio `watch` channel
     are not. See `src/plugin_runtime/README.md` for the three replacement
     paths, including the option (worth real consideration) of skipping
@@ -286,148 +286,148 @@ Smallest/most self-contained crates first, since later crates depend on them:
     directly on the same `wasmtime::component::bindgen!`-generated `wit`
     module that blocks `host-bindings`/`plugin-runtime`. `generated/block.rs`
     (5.2k LOC) and `generated/item.rs` (6.7k LOC) are build-time-generated
-    registry data, out of scope like `data`. Ported: `permissions.nim`
+    registry data, out of scope like `data`. Ported: `permissions.aowl`
     (plugin sandbox capability-string constants, pure data), and
-    `eventdata.nim` - a real, transport-independent `EventData` object
+    `eventdata.aowl` - a real, transport-independent `EventData` object
     model for 8 of the ~230 `events/*` types, built from the actual field
     shapes in `pumpkin-plugin-wit`'s `event.wit` (the `.rs` wrapper files
-    themselves carry no fields). `nimony check` clean, and its test
-    (`eventdatatest.nim`) actually **runs** via `nimony c -r` - pure data,
+    themselves carry no fields). `aowlmony check` clean, and its test
+    (`eventdatatest.aowl`) actually **runs** via `aowlmony c -r` - pure data,
     unaffected by the closure-through-vtable runtime crash. See
     `src/plugin_api/README.md`.
 10. `world`, `inventory`, `command` (~14.1k LOC) —
     **command: tokenizer layer AND the tree/dispatcher design pass done.**
     `errors/command_syntax_error.rs` (simplified), `context/string_range.rs`,
-    `string_reader.rs`, and its numeric parsing → `src/command/*.nim`.
+    `string_reader.rs`, and its numeric parsing → `src/command/*.aowl`.
     The `ArgumentType<S>`/`CommandSource` trait pair the rest of the crate
-    builds on got its design decision: `cmdsource.nim` collapses
+    builds on got its design decision: `cmdsource.aowl` collapses
     `CommandSource`'s generic-everywhere shape into one concrete
     manual-vtable ref object (no real Player/console type exists yet to
-    make genericity pay for itself); `argtype.nim` ports the
+    make genericity pay for itself); `argtype.aowl` ports the
     `ArgumentType`/`AnyArgumentType` pair plus the `core/*.rs` leaf types
     (bool/integer/long/float/double/string) via a closed `ArgValue`
-    variant standing in for `Box<dyn Any>`; `cmdtree.nim` ports
+    variant standing in for `Box<dyn Any>`; `cmdtree.aowl` ports
     `node/{mod,tree}.rs` (arena-of-nodes, `Command`/`Requirement` as
     closures, redirect-by-index for the simple case, no multi-source
-    forking or ambiguity detection); `cmddispatch.nim` ports
+    forking or ambiguity detection); `cmddispatch.aowl` ports
     `node/dispatcher.rs`'s real backtracking parse algorithm. All five
-    files `nimony check` clean, including `cmddispatchtest.nim` which
+    files `aowlmony check` clean, including `cmddispatchtest.aowl` which
     builds a sample "gamemode <int>"/"spawn" tree - but that test only
-    passes `nimony check`, not `nimony c -r`: full codegen currently
+    passes `aowlmony check`, not `aowlmony c -r`: full codegen currently
     crashes the compiler once real closures flow through the vtables at
     runtime (a lambda-lifting-stage internal AssertionDefect, distinct
     from - and not yet reduced/filed like - the `for..in`-over-closure-seq
     bug that WAS found, minimally reproduced, fixed here, and filed as
-    feedback: `meetsRequirements` originally crashed `nimony check` itself
+    feedback: `meetsRequirements` originally crashed `aowlmony check` itself
     this way). Treat the tree/dispatcher as semantically-checked, not
     proven at runtime, until that codegen crash is resolved. See
-    `src/command/lib.nim`'s doc comment for the full breakdown.
+    `src/command/lib.aowl`'s doc comment for the full breakdown.
     **Follow-up pass ported the coordinate/misc leaf argument types**:
-    `coordinates/mod.rs` → `src/command/coordinates.nim` (`WorldCoordinate`/
+    `coordinates/mod.rs` → `src/command/coordinates.aowl` (`WorldCoordinate`/
     `Coordinates`, world/local parse+resolve, the local-coordinate
     forward/up/left rotation math); `coordinates/block_pos.rs` →
-    `blockposarg.nim` (integral parse/resolve + `is_valid_block_pos`);
-    `coordinates/vec3.rs` → `vec3arg.nim`; `coordinates/angle.rs` →
-    `angle.nim` (`Angle` + `wrap_degrees`); `uuid.rs` → `uuidarg.nim`
+    `blockposarg.aowl` (integral parse/resolve + `is_valid_block_pos`);
+    `coordinates/vec3.rs` → `vec3arg.aowl`; `coordinates/angle.rs` →
+    `angle.aowl` (`Angle` + `wrap_degrees`); `uuid.rs` → `uuidarg.aowl`
     (plus a from-scratch UUID hex-string parser - none existed anywhere in
-    this port, `src/protocol/uuid.nim` only has the wire shape);
-    `gamemode.rs` → `gamemodearg.nim`; `identifier.rs` → `identifierarg.nim`.
+    this port, `src/protocol/uuid.aowl` only has the wire shape);
+    `gamemode.rs` → `gamemodearg.aowl`; `identifier.rs` → `identifierarg.aowl`.
     uuid/gamemode/identifier wire into the existing `ArgValue`/`ArgumentType`
     vtable as `avkString` holding validated text (a scope call documented
     in each file, not a full `ArgValue` widening); coordinates/blockpos/
     vec3/angle stay standalone parsers for now since `Coordinates`/`Angle`
-    don't reduce to a single `ArgValue` primitive. `coordtest.nim` verifies
+    don't reduce to a single `ArgValue` primitive. `coordtest.aowl` verifies
     the coordinate/blockpos/vec3/angle logic against upstream's own
     documented `examples()` (parses "1 3 5", "-3 ~24 ~-1", "^ ^9 ^56",
     "~ ~ ~", "0.1 -0.5 .9", integer-centering, "~-5", etc.) but is
-    check-only, NOT runtime-proven: importing `cmdsource.nim` for
+    check-only, NOT runtime-proven: importing `cmdsource.aowl` for
     `CommandSource` is enough to hit the closures-through-vtables crash,
     even though `newDummySource()` never populates a real closure field -
     the 10th confirmation of this bug, and the clearest evidence yet that
     a closure-vtable TYPE merely being linked into the binary triggers it,
     not any instance actually holding or calling a closure.
-    `argvaluetest.nim` (uuid/gamemode/identifier, which do touch
-    `argtype.nim`) is likewise check-only.
+    `argvaluetest.aowl` (uuid/gamemode/identifier, which do touch
+    `argtype.aowl`) is likewise check-only.
     Skipped: `hex_color.rs`/`team_color.rs` (need the unported `TextComponent`
     for their `RGBColor`/error-message types), `rotation.rs`/`swizzle.rs`/
     `column_pos.rs`/`vec2.rs` (straightforward extensions of the
-    `coordinates.nim` pattern, not yet done).
+    `coordinates.aowl` pattern, not yet done).
     NOT started: block/item/nbt/range/particle/structure argument types
     (all need real world/registry types), `errors/error_types.rs`, the SNBT
-    parser, suggestions, `argument_builder.rs` (a fluent DSL `cmdtree.nim`'s
+    parser, suggestions, `argument_builder.rs` (a fluent DSL `cmdtree.aowl`'s
     plain builder procs cover already), and real command execution (needs
     Player/World/Server from the still-mostly-unported main server crate).
     **inventory: core interface + a couple of leaves ported** to
-    `src/inventory/*.nim` (6 files, all `nimony check` clean):
-    `error.rs`→`invbase.nim`, `window_property.rs`→`window_property.nim`,
-    `viewer.rs`→`viewer.nim`, `inventory/inventory.rs`→`inventory.nim`
+    `src/inventory/*.aowl` (6 files, all `aowlmony check` clean):
+    `error.rs`→`invbase.aowl`, `window_property.rs`→`window_property.aowl`,
+    `viewer.rs`→`viewer.aowl`, `inventory/inventory.rs`→`inventory.aowl`
     (the core `Inventory`/`Clearable` trait plus the NBT slot-array sync
-    helpers), `double.rs`→`double.nim`. `itemstub.nim` is a placeholder
+    helpers), `double.rs`→`double.aowl`. `itemstub.aowl` is a placeholder
     `Item`/`ItemStack` (id + count only) standing in for
     `data::item`/`item_stack`, which don't exist yet — every
     proc taking/returning `ItemStack` here will need revisiting once
-    `data`'s real item model lands. Nimony has no trait objects
+    `data`'s real item model lands. aowlmony has no trait objects
     (single dispatch, no `dyn Trait`), so `Inventory` is a ref object
     holding a manual vtable of proc fields (each field/closure needs
-    `{.closure.}` - a Nimony compiler-internal AssertionDefect surfaced
+    `{.closure.}` - a aowlmony compiler-internal AssertionDefect surfaced
     when a vtable-field call wasn't marked, so every closure assigned to
     an `Inventory` field is now explicit about it) rather than a trait;
     concrete inventories (simple/player/double) fill in the vtable.
     **Since then, also ported** (re-checked each file's real deps rather
-    than trusting the blanket note below): `slot.rs`→`slot.nim` (the
+    than trusting the blanket note below): `slot.rs`→`slot.aowl` (the
     `Slot` trait, same manual-vtable pattern as `Inventory`, plus
     `NormalSlot`/`ArmorSlot`; armor-type restriction (`can_insert`) is
     left accepting anything - needs `data`'s `Item`/`EquipmentSlot`
-    tables), `crafting/crafting_inventory.rs`→`crafting.nim` (fully
+    tables), `crafting/crafting_inventory.rs`→`crafting.aowl` (fully
     self-contained, ported clean), `entity_equipment.rs`→
-    `entity_equipment.nim` (keyed by a placeholder `EquipmentKind` enum
-    instead of the real `EquipmentSlot`). `itemstub.nim` grew
+    `entity_equipment.aowl` (keyed by a placeholder `EquipmentKind` enum
+    instead of the real `EquipmentSlot`). `itemstub.aowl` grew
     `split`/`decrement`/`increment`/`getMaxStackSize`/
     `areItemsAndComponentsEqual` to support these. `crafting/recipes.rs`'s
     `RecipeInputInventory` trait-extension became a plain
     `CraftingInventory{inv, width, height}` wrapper rather than a trait
-    hierarchy (Nimony's vtable-`Inventory` has no room to extend); its
+    hierarchy (aowlmony's vtable-`Inventory` has no room to extend); its
     `recipe_provider.rs` sibling stays unported (needs
     `pumpkin_protocol::codec::recipe`/`data::recipes`).
     **`screen_handler.rs`'s design decision made** (1.3k lines, ~30-method
     trait): same scoped-down manual-vtable approach as
-    `src/server/block/blockbehaviour.nim`'s - `ScreenHandler` is a
+    `src/server/block/blockbehaviour.aowl`'s - `ScreenHandler` is a
     ref-object vtable covering `quickMove`/`onClosed` (what a proof-case
     concrete handler needs), not the full click-routing surface
     (`internal_on_slot_click` alone is 434 lines needing `Player`/`World`).
-    Ported to `src/inventory/screenhandler.nim`: `ScreenProperty` (full,
+    Ported to `src/inventory/screenhandler.aowl`: `ScreenProperty` (full,
     self-contained, using the existing `PropertyDelegate` vtable),
     `ScreenHandlerBehaviour` (plain struct: slots/syncId/windowType),
     `addSlot`/`addPlayer{Hotbar,Inventory}Slots`, and `insertItem` - a
     full, faithful port of the 86-line slot-merge algorithm, since it's
     pure slot-index/count arithmetic with no Player/World dependency at
     all. Concrete proof case: `beacon_screen_handler.rs` →
-    `src/inventory/beaconhandler.nim` (`newBeaconScreenHandler`, full
-    quick-move logic). `itemstub.nim` grew `setCount`/`isStackable` to
-    support `insertItem`. `screenhandlertest.nim` exercises `insertItem`
+    `src/inventory/beaconhandler.aowl` (`newBeaconScreenHandler`, full
+    quick-move logic). `itemstub.aowl` grew `setCount`/`isStackable` to
+    support `insertItem`. `screenhandlertest.aowl` exercises `insertItem`
     directly (closure-free, pure algorithm - passes) and builds a beacon
     handler shape-check; building/using the handler itself hits the same
     closures-through-vtables runtime crash documented elsewhere in this
     port (4th independent confirmation, after `src/command/`,
-    `src/server/entity/`, `src/server/block/) - `nimony check` clean,
-    `nimony c -r` crashes at `eraiser.nim`'s `ParamsTagId` assertion.
+    `src/server/entity/`, `src/server/block/) - `aowlmony check` clean,
+    `aowlmony c -r` crashes at `eraiser.aowl`'s `ParamsTagId` assertion.
     Documented, not hidden.
     Two more concrete handlers ported: `lectern_screen_handler.rs` →
-    `src/inventory/lectern.nim` (single book slot, page-number property,
+    `src/inventory/lectern.aowl` (single book slot, page-number property,
     button-click page navigation/take-book, via a new `onButtonClickImpl`
     vtable field added to `ScreenHandler` and `addProperty`/`properties`
     added to `ScreenHandlerBehaviour` - both were missing before this
     handler needed them). `generic_container_screen_handler.rs` →
-    `src/inventory/genericcontainer.nim` (the shared grid-container shape
+    `src/inventory/genericcontainer.aowl` (the shared grid-container shape
     behind chests/ender-chests/hoppers/dispensers/droppers/barrels/
     crafters - 5 factory procs, one handler struct; upstream's own
     `quick_move` boundary math (`rows * 9`, not `rows * columns`) is
     preserved as-is, including its narrower-than-9 containers quirk, since
     that's upstream's real behavior, not a porting bug). Both
-    `lecterntest.nim`/`genericcontainertest.nim` verify the closure-free
-    arithmetic/shape pieces for real (`nimony c -r` passes); building
+    `lecterntest.aowl`/`genericcontainertest.aowl` verify the closure-free
+    arithmetic/shape pieces for real (`aowlmony c -r` passes); building
     either handler hits the closures-through-vtables runtime crash
-    (NIMONY-COMPILER-BUGS.md #1) same as beacon's - confirmed again here,
+    (COMPILER-BUGS.md #1) same as beacon's - confirmed again here,
     including on `LecternController`'s vtable alone, independent of
     `ScreenHandler`.
     Still ~7.8k of ~11k LOC remain: the rest of the per-container
@@ -439,37 +439,37 @@ Smallest/most self-contained crates first, since later crates depend on them:
     logic — all need either the real item/registry types, `Player`/`World`
     types from the main server crate, or both. Extending
     `ScreenHandler`'s vtable as more handlers land is mechanical from
-    here, per `blockbehaviour.nim`'s precedent.
+    here, per `blockbehaviour.aowl`'s precedent.
 11. `world` (~78.6k LOC) — **Just started.** The crate is
     dominated by world generation (noise/structure/feature placement under
     `generation/`, ~65k of the 78.6k LOC) which needs util's
     still-incomplete noise/random port and is out of scope for now.
     Ported instead, from the smaller top-level/tick/chunk-loading surface:
-    `cylindrical_chunk_iterator.rs` → `src/world/cylindrical.nim` (view-distance
+    `cylindrical_chunk_iterator.rs` → `src/world/cylindrical.aowl` (view-distance
     cylinder membership + load/unload diffing; the LUT-based
     `all_chunks_within` fast path was replaced with a direct bounding-loop
     recompute, since its LUT lives in unported data - same
-    semantics, no precomputed table), `tick/mod.rs` → `src/world/tick.nim`
+    semantics, no precomputed table), `tick/mod.rs` → `src/world/tick.aowl`
     (`TickPriority`, `ScheduledTick`/`OrderedTick`, NBT (de)serialization -
     specialized to a `value: string` id rather than upstream's generic
     `T: ToResourceLocation`, since no block/fluid registry type exists yet;
     a local `BlockPos` stand-in covers for `util::math::position`,
     also not ported yet), and `tick/scheduler.rs` →
-    `src/world/tickscheduler.nim` (the ring-buffer `ChunkTickScheduler` -
+    `src/world/tickscheduler.aowl` (the ring-buffer `ChunkTickScheduler` -
     de-async'd to a plain single-threaded version, no concurrency model
-    exists yet for the tick loop; same string-specialization as tick.nim).
+    exists yet for the tick loop; same string-specialization as tick.aowl).
     `dimension.rs` is a two-line stub documenting why it's blocked
     (`Level`/`data::dimension::Dimension` both unported).
     `chunk/palette.rs`'s `PalettedContainer<V, const DIM: usize>` got its
-    design pass: ported to `src/world/palette.nim` as `PalettedContainer`
-    with `dim` as a runtime `int` field (Nimony has no const-generic array
+    design pass: ported to `src/world/palette.aowl` as `PalettedContainer`
+    with `dim` as a runtime `int` field (aowlmony has no const-generic array
     types, and only two concrete shapes - 16 for blocks, 4 for biomes -
     are ever used, so forcing generality bought nothing) and the stored
-    value type fixed to a concrete `uint32` (generic `V` hit real Nimony
+    value type fixed to a concrete `uint32` (generic `V` hit real aowlmony
     friction; both real uses - block-state id, biome id - are plain
     integers anyway). Dense/Indexed storage, palette dedup, and the
-    swap-remove-on-zero-count shrink path are all ported; `nimony c -r`
-    tested via `palettetest.nim` (fill 4096 cells with 300 distinct
+    swap-remove-on-zero-count shrink path are all ported; `aowlmony c -r`
+    tested via `palettetest.aowl` (fill 4096 cells with 300 distinct
     values to force an Indexed→Dense upgrade, verify every cell, then
     refill to one value and verify the palette shrinks back to 1). That
     test caught a real bug: a first pass wrongly special-cased Dense
@@ -485,11 +485,11 @@ Smallest/most self-contained crates first, since later crates depend on them:
     `biome/`'s climate-parameter math is now ported: `data`'s (generated)
     `quantize_coord`/`unquantize_coord`/`Parameter`/`TargetPoint`/
     `ParameterPoint` plus `biome/multi_noise.rs`'s `to_long` and
-    `biome/mod.rs`'s `hash_seed`, all combined into `src/world/biomeparam.nim`
+    `biome/mod.rs`'s `hash_seed`, all combined into `src/world/biomeparam.aowl`
     since none of the individual pieces are meaningful alone and all are
     pure, registry-free math. `hash_seed` uses the `sha256` already
     available via the `jwt` sibling repo's cross-repo import. Verified with
-    `biomeparamtest.nim` (`nimony c -r`) against upstream's own
+    `biomeparamtest.aowl` (`aowlmony c -r`) against upstream's own
     `hash_seed_test` vectors (`hash_seed(0) == 8794265229978523055`,
     `hash_seed(-777i64 as u64) == -1087248400229165450`) plus
     Parameter-distance/ParameterPoint-fitness sanity checks — both pass.
@@ -498,13 +498,13 @@ Smallest/most self-contained crates first, since later crates depend on them:
     `end.rs`) needs the unported generated `BiomeTree`/biome registry and
     `MultiNoiseSampler` (noise sampling - `perlin.rs`/`simplex.rs` are
     unverified even where present), so left for later.
-    `biomeparam.nim` now also has `BiomeEntry`/`nearestBiome`, the generic
+    `biomeparam.aowl` now also has `BiomeEntry`/`nearestBiome`, the generic
     (tree-shape-independent) half of `BiomeTree::get`'s nearest-fitness
-    lookup, tested against synthetic entries in `biomeparamtest.nim`. The
+    lookup, tested against synthetic entries in `biomeparamtest.aowl`. The
     REAL per-biome `ParameterPoint` table (upstream's
     `OVERWORLD_BIOME_SOURCE`/`NETHER_BIOME_SOURCE`) is generated from
     `assets/multi_noise_biome_tree.json` — 1.8MB, a recursive branch/leaf
-    tree, not the flat list `src/generated/biome.nim` embeds (that file's
+    tree, not the flat list `src/generated/biome.aowl` embeds (that file's
     `temperature`/`downfall` are unrelated rain/snow/color-effect fields
     from `biome.json`, not placement data — the placement preset JSON
     under `multi_noise_biome_source_parameter_list/` is just
@@ -516,32 +516,32 @@ Smallest/most self-contained crates first, since later crates depend on them:
     doesn't exist yet even as a stub — `engine.rs`/`runtime.rs` (892/637
     lines) are built on the same foundation, so not attempted.
     `format/anvil.rs`'s on-disk region-file (.mca) layout is now ported at
-    the format-math level: `src/world/anvilformat.nim` covers the 8 KiB
+    the format-math level: `src/world/anvilformat.aowl` covers the 8 KiB
     location/timestamp header (parse/build, with the `sectorOffset < 2`
     reserved-sector guard), region/chunk-index math (verified against the
     floor-division trap negative chunk coordinates hit - `>>` on a signed
-    int is arithmetic/floor-rounding in both Rust and Nimony, so this had
+    int is arithmetic/floor-rounding in both Rust and aowlmony, so this had
     to be checked explicitly, not just trusted), per-chunk sector-count
     accounting, and the length-prefixed/compression-tagged payload framing.
     Deliberately NOT ported: the actual gzip/zlib/LZ4 (de)compression
-    bodies (same gap as `nbt_compress.nim` - no zlib/gzip module in
-    Nimony's stdlib) and the async file I/O / mutex-guarded in-place
+    bodies (same gap as `nbt_compress.aowl` - no zlib/gzip module in
+    aowlmony's stdlib) and the async file I/O / mutex-guarded in-place
     sector allocator (`AnvilChunkFile::write`/`write_indices` - no
     concurrency model chosen yet, same gap flagged for the scheduler).
-    `anvilformattest.nim` round-trips real data through every piece
-    (`nimony c -r`, all pass) using uncompressed payloads to exercise real
+    `anvilformattest.aowl` round-trips real data through every piece
+    (`aowlmony c -r`, all pass) using uncompressed payloads to exercise real
     framing without the missing compression bodies; `format/linear.rs`
     (the alternate Linear region format, ~778 lines) not attempted.
     `poi/mod.rs`'s in-memory model and NBT (de)serialization are ported at
-    `src/world/poi.nim`: `PoiEntry`/`PoiRegion` (add/remove/getAll,
+    `src/world/poi.aowl`: `PoiEntry`/`PoiRegion` (add/remove/getAll,
     per-chunk grouping via `getChunkData`) and `buildChunkNbt`/
     `parseChunkNbt` (the NBT-building/parsing halves of upstream's
     `compress_chunk_data`/`decompress_chunk_data` - the zlib-wrapping half
-    is deferred, same gap as `anvilformat.nim`'s compression bodies; once
+    is deferred, same gap as `anvilformat.aowl`'s compression bodies; once
     resolved it covers both). `save`/`load`'s on-disk MCA read/write
     (~250 lines) not attempted, since it needs that same zlib plus real
-    file I/O. `poitest.nim` round-trips real entries through grouping and
-    NBT build/parse (`nimony c -r`, all pass).
+    file I/O. `poitest.aowl` round-trips real entries through grouping and
+    NBT build/parse (`aowlmony c -r`, all pass).
     `chunk_system/` (~5.4k lines: `dag.rs`, `chunk_holder.rs`,
     `chunk_state.rs`, `schedule.rs`, etc.) is a generational-arena
     (`slotmap`) task-scheduling system for chunk generation stages - same
@@ -549,41 +549,41 @@ Smallest/most self-contained crates first, since later crates depend on them:
     chosen, and it needs its own arena/slotmap equivalent besides).
     Assessed and left blocked, not attempted.
     `chunk/mod.rs`'s in-memory chunk-storage data model is now ported at
-    `src/world/chunkdata.nim`: `ChunkHeightmaps` (the real 9-bit-per-column,
+    `src/world/chunkdata.aowl`: `ChunkHeightmaps` (the real 9-bit-per-column,
     7-columns-per-i64-word packing from `set`/`get`, not a placeholder) and
     `ChunkSections` (an array of `PalettedContainer`s - one 16³ block
     section + one 4³ biome section per vertical slice - replacing
     upstream's `RwLock<Box<[BlockPalette]>>`/`RwLock<Box<[BiomePalette]>>`
     with plain fields, since no concurrency model exists yet, same punt as
     everywhere else). `getBlock`/`setBlock` resolve a world-space (x,y,z)
-    to the right section + local cell. `chunkdatatest.nim` round-trips
+    to the right section + local cell. `chunkdatatest.aowl` round-trips
     heightmaps across a full 16×16 column grid (catching any shift/mask/
     word-boundary bug) and blocks across 4 points spanning sections 0
-    through 23 of a -64..319 range (`nimony c -r`, both pass) - this also
+    through 23 of a -64..319 range (`aowlmony c -r`, both pass) - this also
     surfaced and fixed a bug in the TEST itself, not the implementation
     (`sectionIndex(s, minY + 319)` evaluates to `sectionIndex(255)`, not
     319 - worth remembering when spot-checking with derived constants).
     The full `ChunkData` (light engine, blending data, NBT (de)serialization,
     tick-scheduler wiring) stays out of scope - it needs the still-unported
-    light engine and the zlib gap already documented for `anvilformat.nim`/
-    `poi.nim`. `level.rs`/`world.rs`'s async chunk-loading pipeline (ticket
+    light engine and the zlib gap already documented for `anvilformat.aowl`/
+    `poi.aowl`. `level.rs`/`world.rs`'s async chunk-loading pipeline (ticket
     system, load/unload scheduling) remains blocked on the same
     concurrency-model decision as `chunk_system/`/scheduler - a real design
     pass, not attempted here. Its chunk-lookup HALF is done though:
-    `src/world/worldchunks.nim`'s `WorldChunks` is exactly the
-    `chunkdata.nim` + column-index shape flagged above - a
+    `src/world/worldchunks.aowl`'s `WorldChunks` is exactly the
+    `chunkdata.aowl` + column-index shape flagged above - a
     `seq[(ChunkPos, ChunkSections)]` linear-scan registry (matching
-    `src/server/playerregistry.nim`'s and `src/server/world/worldstub.nim`'s
+    `src/server/playerregistry.aowl`'s and `src/server/world/worldstub.aowl`'s
     own "plain seq, no fake concurrency" convention, deliberately not a
     `var Table[K,V]` out-parameter given the crash cataloged for that shape
-    in `NIMONY-COMPILER-BUGS.md` #12) with `isChunkLoaded`/`loadChunk`/
+    in `COMPILER-BUGS.md` #12) with `isChunkLoaded`/`loadChunk`/
     `unloadChunk`/`getBlockState`/`setBlockState`. Kept additive alongside
-    (not merged into) `src/server/world/worldstub.nim`'s existing
+    (not merged into) `src/server/world/worldstub.aowl`'s existing
     flat-per-section `World` type, which already has live consumers across
     `src/server/block/`/`src/server/item/`/`src/command/` - a future pass
     can wire `WorldChunks` in once there's a concrete multi-chunk consumer.
-    `worldchunkstest.nim` genuinely runtime-proven (`nimony c -r`, no
-    `entity.nim` in its import graph): auto-load-on-write, per-column
+    `worldchunkstest.aowl` genuinely runtime-proven (`aowlmony c -r`, no
+    `entity.aowl` in its import graph): auto-load-on-write, per-column
     isolation, negative-coordinate correctness (arithmetic shift-right
     floors two's-complement negatives, verified not assumed), and
     unload-removes-exactly-the-target-column all pass.
@@ -592,7 +592,7 @@ Smallest/most self-contained crates first, since later crates depend on them:
     above), the rest of `lighting/`, `world_info/`.
 12. the main server crate (~269k LOC) — **Assessed; tiny slice
     ported, full map written.** Ported `error.rs`'s a shared error trait as
-    overloaded procs → `src/server/errorclass.nim` (over `InventoryError`/
+    overloaded procs → `src/server/errorclass.aowl` (over `InventoryError`/
     `ReadingError`; `PlayerDataError` pending that type's port). Everything
     else is mapped in `src/server/README.md` by module (`entity/` 83.6k,
     `block/` 47.6k, `plugin/` 47.4k, `command/` 30.3k, `net/` 19.5k,
@@ -610,13 +610,13 @@ Smallest/most self-contained crates first, since later crates depend on them:
     (unportable, see `src/macros/README.md`) and a working `Entity`
     abstraction before *any* block can port, not just complex ones. One
     free-standing type (`PathComputationType`) ported to
-    `src/server/block/blockmisc.nim`; full writeup with the concrete
+    `src/server/block/blockmisc.aowl`; full writeup with the concrete
     unblock order in `src/server/block/README.md`. See both READMEs before
     starting more work here.
 12b. `item/` (~6.9k LOC, part of the upstream main server crate) —
     **Core interface/registry ported; concrete items blocked.**
     `ItemBehaviour`/`ItemMetadata`/`ItemRegistry`/`BlockActionResult`/`Hand`
-    ported to `src/server/item/itembehaviour.nim` (manual-vtable pattern,
+    ported to `src/server/item/itembehaviour.aowl` (manual-vtable pattern,
     same as `block/`/`entity/`). No `#[pumpkin_item]` macro exists here -
     items self-register via plain `manager.register(...)` calls, unlike
     `block/`. All ~53 concrete item files need `Player.inventory` and/or a
@@ -631,14 +631,14 @@ Smallest/most self-contained crates first, since later crates depend on them:
     `defaultPlayerConfig`), `PacketHandlerResult`, `EncryptionErrorKind`,
     `MaxPendingBytes`/`decrementPendingBytes`, `isValidPlayerName`, and
     `offlineUuid` (real SHA-256 math via the sibling `jwt` library, same
-    source as `hash_seed` in `src/world/biomeparam.nim`) ported to
-    `src/server/net/netbase.nim`. `isValidPlayerName` is verified against
+    source as `hash_seed` in `src/world/biomeparam.aowl`) ported to
+    `src/server/net/netbase.aowl`. `isValidPlayerName` is verified against
     every one of upstream's own `#[cfg(test)]` vectors in
-    `netbasetest.nim` (`nimony c -r`, all pass) - **caught a real bug this
+    `netbasetest.aowl` (`aowlmony c -r`, all pass) - **caught a real bug this
     way**: an off-by-one excluding the space byte itself from the
     control-character range, only surfaced by the "name containing a
     space" test vector. `PlayerUuid` is a `(hi, lo): (uint64, uint64)`
-    tuple, matching `src/protocol/uuid.nim`'s existing wire-shape
+    tuple, matching `src/protocol/uuid.aowl`'s existing wire-shape
     convention. NOT ported: `ClientPlatform`/`JavaClient`/`BedrockClient`/
     `PendingConnection` (all `Arc<..>`-shared, tokio-task-driven - same
     concurrency-model gap as `scheduler`/`plugin-runtime`), the hundreds of
@@ -655,14 +655,14 @@ Smallest/most self-contained crates first, since later crates depend on them:
    per-domain submodules driven by one `main.rs`) reads JSON already
    checked into the upstream repo's `assets/` (92MB, confirmed present -
    not a blocker). Rust builds each submodule's output as a
-   `proc_macro2::TokenStream` via `quote!`; Nimony has no equivalent (and
+   `proc_macro2::TokenStream` via `quote!`; aowlmony has no equivalent (and
    doesn't need one) since a generator can just build its output as a
    plain string and `writeFile` it directly - simpler than the Rust
-   approach, not a gap. `std/json` is present in Nimony's stdlib (unlike
+   approach, not a gap. `std/json` is present in aowlmony's stdlib (unlike
    gzip/crypto/HTTP, confirmed missing elsewhere in this port) and
-   sufficient. `src/data_codegen/gen_sound_category.nim` is a complete,
+   sufficient. `src/data_codegen/gen_sound_category.aowl` is a complete,
    run-and-verified port of the smallest submodule (JSON in -> generated,
-   type-checked `src/generated/sound_category.nim` out, values verified
+   type-checked `src/generated/sound_category.aowl` out, values verified
    correct) establishing the pattern. The other ~89 submodules
    (`scoreboard_slot.rs` trivial, up through `block.rs`/`item.rs`/
    `biome.rs`/`recipes.rs`/`noise_router.rs` which encode real structural
@@ -676,15 +676,15 @@ Smallest/most self-contained crates first, since later crates depend on them:
     slice ported, bulk confirmed WASM-bridge-specific.** `plugin/loader/wasm/
     wasm_host/wit/v0_1/**` (~35k+ of the total) is `wasmtime::component::
     bindgen!`-generated WIT host bindings, the same unportable category as
-    `src/host_bindings/README.md`. Ported: `permissions.nim` (permission
-    string constants + descriptions) and `native.nim` (`LoaderError`,
+    `src/host_bindings/README.md`. Ported: `permissions.aowl` (permission
+    string constants + descriptions) and `native.aowl` (`LoaderError`,
     `PLUGIN_API_VERSION`, `canLoad`/`canUnload`'s platform-extension logic -
-    NOT the actual dylib load, which needs Nimony's dynlib FFI investigated
-    and a chosen async model). `plugintest.nim` has no `entity.nim`
-    dependency and **actually runs** (`nimony c -r`), proving the ported
+    NOT the actual dylib load, which needs aowlmony's dynlib FFI investigated
+    and a chosen async model). `plugintest.aowl` has no `entity.aowl`
+    dependency and **actually runs** (`aowlmony c -r`), proving the ported
     logic for real. `plugin/mod.rs` (1336 lines, the real plugin
     manager/event-dispatch core) and the ~230 `plugin/api/events/*` files
-    (native counterpart to `src/plugin_api/eventdata.nim`'s already-ported 8
+    (native counterpart to `src/plugin_api/eventdata.aowl`'s already-ported 8
     event types) are documented but not ported this pass - see
     `src/server/plugin/README.md` for the full module map and next steps.
 
@@ -695,32 +695,32 @@ Smallest/most self-contained crates first, since later crates depend on them:
     self-target form is fully wired end to end (tree registration →
     argument parse → `Player.gamemode` mutation) in `src/server/command/`,
     required adding a `player*: nil Player` field to `CommandSource`
-    (`src/command/cmdsource.nim`) so command handlers can reach the issuing
-    player. `gamemodetest.nim` drives it through a real dispatch walk;
-    like everything importing `entity.nim`, it's check-verified only (hits
-    NIMONY-COMPILER-BUGS.md bug #1 at `nimony c -r`, same signature). See
+    (`src/command/cmdsource.aowl`) so command handlers can reach the issuing
+    player. `gamemodetest.aowl` drives it through a real dispatch walk;
+    like everything importing `entity.aowl`, it's check-verified only (hits
+    COMPILER-BUGS.md bug #1 at `aowlmony c -r`, same signature). See
     `src/server/command/README.md` for what's next (the ~30 remaining
     command files, several trivial).
 
 ## Entrypoint and the core/transport split
 
-`src/main.nim` is the first real bootable entrypoint: it opens a real
-Winsock2 TCP listener (`src/server/net/winsock.nim` - Nimony ships no
+`src/main.aowl` is the first real bootable entrypoint: it opens a real
+Winsock2 TCP listener (`src/server/net/winsock.aowl` - aowlmony ships no
 working socket syscalls yet, see that file's header) and speaks the
 Java-edition handshake + status/ping sub-protocol end to end, verified
 against a real client-shaped probe (status JSON + ping/pong round trip).
 Login/play-state packet dispatch isn't implemented yet; a login attempt
 gets a clean disconnect message instead.
 
-`src/server/servercore.nim` holds the actual server state/logic
+`src/server/servercore.aowl` holds the actual server state/logic
 (`ServerCore`: world, player registry, config) with **no** dependency on
-sockets or wire framing. `main.nim`'s listener is one transport in front
+sockets or wire framing. `main.aowl`'s listener is one transport in front
 of it - it decodes packets and calls straight into `ServerCore`. This
 split exists so a future in-process embedding host (Jester's
 `aoughwl.mcserver`, when it is itself the singleplayer host) can call
-`startEmbeddedServer()` directly as plain Nimony procs instead of looping
-packets through a loopback socket - see `servercore.nim`'s header comment
-for the full rationale and what's still undecided (the actual Nimony<->
+`startEmbeddedServer()` directly as plain aowlmony procs instead of looping
+packets through a loopback socket - see `servercore.aowl`'s header comment
+for the full rationale and what's still undecided (the actual aowlmony<->
 host C-ABI export shape).
 
 ## Layout
@@ -728,10 +728,10 @@ host C-ABI export shape).
 ```
 src/
   nbt/
-    tag.nim        -- NbtTag variant type + core ops (port of tag.rs)
-    compound.nim    -- NbtCompound (TODO)
-    serializer.nim  -- writer (TODO)
-    deserializer.nim -- reader (TODO)
+    tag.aowl        -- NbtTag variant type + core ops (port of tag.rs)
+    compound.aowl    -- NbtCompound (TODO)
+    serializer.aowl  -- writer (TODO)
+    deserializer.aowl -- reader (TODO)
 ```
 
-Each `.nim` file's doc comment names the upstream `.rs` file it ports from.
+Each `.aowl` file's doc comment names the upstream `.rs` file it ports from.
