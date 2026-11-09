@@ -1,0 +1,233 @@
+## Port of pumpkin-world/src/generation/blender/mod.rs
+##
+## `Blender::get_biome_supplier` takes the base supplier by enum; see multi_noise_sampler.aowl. As upstream,
+## noise generation does not use the blender yet: populate_biomes builds an empty one, and the density and offset
+## components of the router stay `PassThrough` and constants.
+
+{.feature: "lenientnils".}
+
+import std/tables
+import std/math
+import ../../../generated/biome
+import ../../../generated/noise_parameter
+import ../../../util/xoroshiro128
+import ../generation
+import ../noise/doubleperlin
+import ../noise/router
+import ../noise/multi_noise_sampler
+import ../protochunkbase
+import blending_data
+
+export blending_data
+
+const
+  HeightBlendingRangeCells = (7'i32 shl 2) - 1'i32  # QuartPos.fromSection(7) - 1
+  HeightBlendingRangeChunks = (HeightBlendingRangeCells + 3'i32) shr 2  # QuartPos.toSection(..)
+  DensityBlendingRangeChunks = 5'i32 shr 2  # QuartPos.toSection(5)
+
+type
+  BlendingOutput* = object
+    alpha*: float64
+    blendingOffset*: float64
+
+  Blender* = ref object
+    heightAndBiomeBlendingData*: Table[uint64, BlendingData]
+    densityBlendingData*: Table[uint64, BlendingData]
+
+  BlenderBiomeSupplier* = object
+    base*: BiomeSupplierKind
+    blender*: Blender
+    shiftNoise*: DoublePerlinNoiseSampler
+
+  BlendDataGetter = proc(data: BlendingData, x, y, z: int32): float64 {.closure.}
+
+proc emptyBlender*(): Blender =
+  ## `Blender::empty`
+  Blender(heightAndBiomeBlendingData: initTable[uint64, BlendingData](),
+    densityBlendingData: initTable[uint64, BlendingData]())
+
+proc packed(chunkX, chunkZ: int32): uint64 {.inline.} =
+  uint64(cast[uint32](chunkX)) or (uint64(cast[uint32](chunkZ)) shl 32)
+
+proc blenderOf*(cache: GenerationCache): Blender =
+  ## `Blender::of`
+  let centerChunk = cache.getCenterChunk()
+  let centerX = centerChunk.x
+  let centerZ = centerChunk.z
+  result = emptyBlender()
+  let maxDistSq = (HeightBlendingRangeChunks + 1'i32) * (HeightBlendingRangeChunks + 1'i32)
+  var dx = -HeightBlendingRangeChunks
+  while dx <= HeightBlendingRangeChunks:
+    var dz = -HeightBlendingRangeChunks
+    while dz <= HeightBlendingRangeChunks:
+      if dx * dx + dz * dz <= maxDistSq:
+        let chunkX = centerX + dx
+        let chunkZ = centerZ + dz
+        let blendingData = cache.getBlendingData(chunkX, chunkZ)
+        if blendingData != nil:
+          let key = packed(chunkX, chunkZ)
+          result.heightAndBiomeBlendingData[key] = blendingData
+          if dx >= -DensityBlendingRangeChunks and dx <= DensityBlendingRangeChunks and
+              dz >= -DensityBlendingRangeChunks and dz <= DensityBlendingRangeChunks:
+            result.densityBlendingData[key] = blendingData
+      inc dz
+    inc dx
+
+proc isEmpty*(b: Blender): bool =
+  b.heightAndBiomeBlendingData.len == 0 and b.densityBlendingData.len == 0
+
+proc getDataValue(b: Blender, getter: BlendDataGetter, chunkX, chunkZ, cellX, cellY, cellZ: int32): float64 =
+  let key = packed(chunkX, chunkZ)
+  if not b.heightAndBiomeBlendingData.hasKey(key):
+    return FloatMax
+  let data = b.heightAndBiomeBlendingData.getOrDefault(key, nil)
+  getter(data, cellX - biomeFromChunk(chunkX), cellY, cellZ - biomeFromChunk(chunkZ))
+
+proc getBlendingDataValue(b: Blender, cellX, cellY, cellZ: int32, getter: BlendDataGetter): float64 =
+  let chunkX = biomeToChunk(cellX)
+  let chunkZ = biomeToChunk(cellZ)
+  let minX = (cellX and 3'i32) == 0'i32  # `trailing_zeros() >= 2`
+  let minZ = (cellZ and 3'i32) == 0'i32
+  var value = getDataValue(b, getter, chunkX, chunkZ, cellX, cellY, cellZ)
+  if value == FloatMax:
+    if minX and minZ:
+      value = getDataValue(b, getter, chunkX - 1'i32, chunkZ - 1'i32, cellX, cellY, cellZ)
+    if value == FloatMax:
+      if minX:
+        value = getDataValue(b, getter, chunkX - 1'i32, chunkZ, cellX, cellY, cellZ)
+      if value == FloatMax and minZ:
+        value = getDataValue(b, getter, chunkX, chunkZ - 1'i32, cellX, cellY, cellZ)
+  value
+
+proc heightToOffset(height: float64): float64 =
+  let targetY = height + 0.5'f64
+  let r = targetY - floor(targetY / 8.0'f64) * 8.0'f64  # `rem_euclid(8.0)` for what a height can be
+  let targetYMod = if r < 0.0'f64: r + 8.0'f64 else: r
+  (32.0'f64 * (targetY - 128.0'f64) - 3.0'f64 * (targetY - 120.0'f64) * targetYMod +
+    3.0'f64 * targetYMod * targetYMod) / (128.0'f64 * (32.0'f64 - 3.0'f64 * targetYMod))
+
+proc blendOffsetAndFactor*(b: Blender, blockX, blockZ: int32): BlendingOutput =
+  ## `Blender::blend_offset_and_factor`
+  let cellX = biomeFromBlock(blockX)
+  let cellZ = biomeFromBlock(blockZ)
+  let fixedHeight = getBlendingDataValue(b, cellX, 0'i32, cellZ,
+    proc(data: BlendingData, x, y, z: int32): float64 {.closure.} = getHeight(data, x, y, z))
+  if fixedHeight != FloatMax:
+    return BlendingOutput(alpha: 0.0'f64, blendingOffset: heightToOffset(fixedHeight))
+
+  var totalWeight = 0.0'f64
+  var weightedHeights = 0.0'f64
+  var closestDistance = PosInf
+  for packedPos, blendingData in pairs(b.heightAndBiomeBlendingData):
+    let chunkX = cast[int32](uint32(packedPos and 0xFFFFFFFF'u64))
+    let chunkZ = cast[int32](uint32(packedPos shr 32))
+    for z in 0 ..< 16:
+      for x in 0 ..< 16:
+        let h = blendingData.heights[z * 16 + x]
+        if h != FloatMax:
+          let testCellX = biomeFromChunk(chunkX) + int32(x)
+          let testCellZ = biomeFromChunk(chunkZ) + int32(z)
+          let dx = float64(cellX - testCellX)
+          let dz = float64(cellZ - testCellZ)
+          let distance = hypot(dx, dz)
+          if distance <= float64(HeightBlendingRangeCells):
+            if distance < closestDistance:
+              closestDistance = distance
+            let weight = 1.0'f64 / (distance * distance * distance * distance)
+            weightedHeights += h * weight
+            totalWeight += weight
+
+  if closestDistance == PosInf:
+    BlendingOutput(alpha: 1.0'f64, blendingOffset: 0.0'f64)
+  else:
+    let averageHeight = weightedHeights / totalWeight
+    var alpha = closestDistance / float64(HeightBlendingRangeCells + 1'i32)
+    if alpha < 0.0'f64: alpha = 0.0'f64
+    elif alpha > 1.0'f64: alpha = 1.0'f64
+    alpha = 3.0'f64 * alpha * alpha - 2.0'f64 * alpha * alpha * alpha
+    BlendingOutput(alpha: alpha, blendingOffset: heightToOffset(averageHeight))
+
+proc blendDensity*(b: Blender, blockX, blockY, blockZ: int32, noiseValue: float64): float64 =
+  ## `Blender::blend_density`
+  let cellX = biomeFromBlock(blockX)
+  let cellY = blockY div 8'i32
+  let cellZ = biomeFromBlock(blockZ)
+  let fixedDensity = getBlendingDataValue(b, cellX, cellY, cellZ,
+    proc(data: BlendingData, x, y, z: int32): float64 {.closure.} = getDensity(data, x, y, z))
+  if fixedDensity != FloatMax:
+    return fixedDensity
+
+  var totalWeight = 0.0'f64
+  var weightedDensities = 0.0'f64
+  var closestDistance = PosInf
+  for packedPos, blendingData in pairs(b.densityBlendingData):
+    let chunkX = cast[int32](uint32(packedPos and 0xFFFFFFFF'u64))
+    let chunkZ = cast[int32](uint32(packedPos shr 32))
+    let cellCountY = (blendingData.maxY - blendingData.minY) div 8'i32
+    var testCellY = cellY - 1'i32
+    while testCellY <= cellY + 1'i32:
+      if testCellY >= 0'i32 and testCellY < cellCountY:
+        for z in 0'i32 ..< 16'i32:
+          for x in 0'i32 ..< 16'i32:
+            let index = int(testCellY * 16'i32 * 16'i32 + z * 16'i32 + x)
+            if index < blendingData.densities.len and blendingData.densities[index] != FloatMax:
+              let density = blendingData.densities[index]
+              let dx = float64(cellX - (biomeFromChunk(chunkX) + x))
+              let dy = float64((cellY - testCellY) * 2'i32)
+              let dz = float64(cellZ - (biomeFromChunk(chunkZ) + z))
+              let distance = sqrt(dx * dx + dy * dy + dz * dz)
+              if distance <= 2.0'f64:
+                if distance < closestDistance:
+                  closestDistance = distance
+                let weight = 1.0'f64 / (distance * distance * distance * distance)
+                weightedDensities += density * weight
+                totalWeight += weight
+      inc testCellY
+
+  if closestDistance == PosInf:
+    noiseValue
+  else:
+    let averageDensity = weightedDensities / totalWeight
+    var alpha = closestDistance / 3.0'f64
+    if alpha < 0.0'f64: alpha = 0.0'f64
+    elif alpha > 1.0'f64: alpha = 1.0'f64
+    alpha * noiseValue + (1.0'f64 - alpha) * averageDensity
+
+proc blendBiome*(b: Blender, quartX, quartY, quartZ: int32, shiftNoise: DoublePerlinNoiseSampler): int =
+  ## `Blender::blend_biome`: the biome id, -1 for None.
+  var closestDistance = PosInf
+  var closestBiome = -1
+  for packedPos, blendingData in pairs(b.heightAndBiomeBlendingData):
+    let chunkX = cast[int32](uint32(packedPos and 0xFFFFFFFF'u64))
+    let chunkZ = cast[int32](uint32(packedPos shr 32))
+    for z in 0 ..< 16:
+      for x in 0 ..< 16:
+        let testCellX = biomeFromChunk(chunkX) + int32(x)
+        let testCellZ = biomeFromChunk(chunkZ) + int32(z)
+        let dx = float64(quartX - testCellX)
+        let dz = float64(quartZ - testCellZ)
+        let distance = hypot(dx, dz)
+        if distance <= float64(HeightBlendingRangeCells) and distance < closestDistance:
+          closestBiome = int(blendingData.biomes[z * 16 + x])
+          closestDistance = distance
+  if closestDistance == PosInf:
+    -1
+  else:
+    let shift = sample(shiftNoise, float64(quartX), 0.0'f64, float64(quartZ)) * 12.0'f64
+    var alpha = (closestDistance + shift) / float64(HeightBlendingRangeCells + 1'i32)
+    if alpha < 0.0'f64: alpha = 0.0'f64
+    elif alpha > 1.0'f64: alpha = 1.0'f64
+    if alpha > 0.5'f64: -1 else: closestBiome
+
+proc getBiomeSupplier*(b: Blender, base: BiomeSupplierKind): BlenderBiomeSupplier =
+  ## `BlenderImpl::get_biome_supplier`
+  var random = xoroshiro128.fromSeed(42'u64)
+  BlenderBiomeSupplier(base: base, blender: b, shiftNoise: doublePerlinFromParams(random, OFFSET, false))
+
+proc biome*(s: BlenderBiomeSupplier, x, y, z: int32, sampler: MultiNoiseSampler): Biome =
+  ## `<BlenderBiomeSupplier as BiomeSupplier>::biome`
+  let blended = blendBiome(s.blender, x, y, z, s.shiftNoise)
+  if blended >= 0:
+    ALL[blended]
+  else:
+    supplierBiome(s.base, x, y, z, sampler)

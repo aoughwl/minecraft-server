@@ -1,0 +1,428 @@
+## The generation steps a `ProtoChunk` goes through.
+## Port of pumpkin-world/src/generation/proto_chunk.rs; the chunk's data and accessors are protochunkbase.aowl,
+## `TerrainCache` is generator/generator.aowl and `StandardChunkFluidLevelSampler` noise/aquifer_sampler.aowl.
+##
+## PARTIAL: pumpkin-world/src/generation/proto_chunk.rs - see structurehooks.aowl for what waits on
+## generation/feature and generation/structure. `spawn_structure_entities` and `spawn_mobs_for_chunk_generation`
+## call through `WorldPortalExt`, as upstream does.
+
+{.feature: "lenientnils".}
+
+import std/tables
+import std/assertions
+import ../blockstates
+import ../chunkdata
+import ../palette
+import ../tick
+import ../world
+import ../../generated/biome
+import ../../generated/chunk_gen_settings
+import ../../generated/dimension as dimensiondata
+import ../../generated/structures
+import ../../generated/placed_feature
+import ../../generated/fluid except BlockStateId
+import ../../nbt/tag
+import ../../util/utillib
+import ../../util/math/block_box
+import ../../util/random/random
+import ../../util/xoroshiro128
+from ../../util/worldgen_random import getDecoratorSeed
+from ../../data/block_state import asU16
+import ../biomeparam
+import generation
+import positions
+import biomemix
+import protochunkbase
+import structurehooks
+import noise/noise as chunknoise
+import noise/multi_noise_sampler
+import noise/surface_height_sampler
+import surface/surface
+import generator/generator
+import blender/blender
+import carver/carvers
+
+export protochunkbase, generator
+
+let
+  LavaBlock = LavaBlockId
+  WaterBlock = WaterBlockId
+  AirBlock = AirBlockId
+
+proc biomeSupplierKindFor(dimension: Dimension): BiomeSupplierKind =
+  if dimension.minecraftName == dimensiondata.THE_END.minecraftName: BiomeSupplierKind.End
+  elif dimension.minecraftName == dimensiondata.THE_NETHER.minecraftName: BiomeSupplierKind.Nether
+  else: BiomeSupplierKind.Overworld
+
+proc newProtoChunk*(x, z: int32, generator: WorldGenerator): ProtoChunk =
+  ## `ProtoChunk::new`
+  let dim = dimension(generator)
+  let defaultBlock =
+    case generator.kind
+    of WorldGeneratorKind.Noise: generator.noise.defaultBlock
+    of WorldGeneratorKind.Flat: 0'u32
+  let biomeMixerSeed =
+    case generator.kind
+    of WorldGeneratorKind.Noise: generator.noise.biomeMixerSeed
+    of WorldGeneratorKind.Flat: hashSeed(generator.flat.seed)
+  newProtoChunkRaw(x, z, defaultBlock, biomeMixerSeed, dim.logicalHeight, dim.minY)
+
+proc fromChunkData*(chunkData: ChunkData, generator: WorldGenerator): ProtoChunk =
+  ## `ProtoChunk::from_chunk_data`
+  let proto = newProtoChunk(chunkData.x, chunkData.z, generator)
+  proto.light = chunkData.lightEngine
+  proto.blendingData = chunkData.blendingData
+  for sectionIdx in 0 ..< chunkData.section.blockSections.len:
+    let sectionBaseY = int32(sectionIdx) * 16'i32
+    if sectionBaseY >= int32(height(proto)):
+      continue
+    for x in 0 ..< 16:
+      for y in 0 ..< 16:
+        for z in 0 ..< 16:
+          let blockStateId = palette.get(chunkData.section.blockSections[sectionIdx], x, y, z)
+          let absoluteY = sectionBaseY + int32(y) + chunkData.section.minY
+          setBlockState(proto, int32(x), absoluteY, int32(z), blockStateId)
+    if sectionIdx < chunkData.section.biomeSections.len:
+      for x in 0 ..< 4:
+        for y in 0 ..< 4:
+          for z in 0 ..< 4:
+            let biomeId = palette.get(chunkData.section.biomeSections[sectionIdx], x, y, z)
+            let biomeYIdx = sectionIdx * 4 + y
+            let index = localBiomePosToBiomeIndex(proto, int32(x), int32(biomeYIdx), int32(z))
+            proto.flatBiomeMap[index] = uint8(biomeId)
+
+  let minY = chunkData.section.minY
+  for z in 0'i32 ..< 16'i32:
+    for x in 0'i32 ..< 16'i32:
+      let index = localPositionToHeightMapIndex(x, z)
+      proto.flatMotionBlockingHeightMap[index] = int16(getHeightmap(chunkData.heightmap, chmMotionBlocking, x, z, minY))
+      proto.flatMotionBlockingNoLeavesHeightMap[index] = int16(getHeightmap(chunkData.heightmap, chmMotionBlockingNoLeaves, x, z, minY))
+      proto.flatSurfaceHeightMap[index] = int16(getHeightmap(chunkData.heightmap, chmWorldSurface, x, z, minY))
+  proto.stage = stageFromStatus(chunkData.status)
+  proto
+
+proc populateBiomes*(c: ProtoChunk, generator: VanillaGenerator, multiNoiseSampler: MultiNoiseSampler) =
+  ## `ProtoChunk::populate_biomes`
+  let blenderEmpty = emptyBlender()
+  let biomeSupplier = getBiomeSupplier(blenderEmpty, biomeSupplierKindFor(generator.dimension))
+  let minY = int32(bottomY(c))
+  let bottomSection = blockToSection(minY)
+  let topSection = blockToSection(minY + int32(height(c)) - 1'i32)
+  let startBiomeX = biomeFromBlock(startBlockX(c.x))
+  let startBiomeZ = biomeFromBlock(startBlockZ(c.z))
+  var i = bottomSection
+  while i <= topSection:
+    let startBiomeY = biomeFromBlock(sectionToBlock(i))
+    for x in 0'i32 ..< 4'i32:
+      for y in 0'i32 ..< 4'i32:
+        for z in 0'i32 ..< 4'i32:
+          let b = biome(biomeSupplier, startBiomeX + x, startBiomeY + y, startBiomeZ + z, multiNoiseSampler)
+          let index = localBiomePosToBiomeIndex(c, x, startBiomeY + y - biomeFromBlock(minY), z)
+          c.flatBiomeMap[index] = b.id
+    inc i
+
+proc stepToBiomes*(c: ProtoChunk, generator: VanillaGenerator) =
+  ## `ProtoChunk::step_to_biomes`
+  assert c.stage == StagedChunkEnum.Empty
+  let startX = startBlockX(c.x)
+  let startZ = startBlockZ(c.z)
+  let horizontalBiomeEnd = biomeFromBlock(16'i32)
+  let multiNoiseConfig = newMultiNoiseSamplerBuilderOptions(biomeFromBlock(startX), biomeFromBlock(startZ), int(horizontalBiomeEnd))
+  let multiNoiseSampler = generateMultiNoiseSampler(generator.baseRouter.multiNoise, multiNoiseConfig)
+  populateBiomes(c, generator, multiNoiseSampler)
+  c.stage = StagedChunkEnum.Biomes
+
+proc surfaceConfigFor(c: ProtoChunk, generator: VanillaGenerator): SurfaceHeightSamplerBuilderOptions =
+  let shape = generator.settings.shape
+  let startX = startBlockX(c.x)
+  let startZ = startBlockZ(c.z)
+  let horizontalCellCount = int32(ChunkDim div horizontalCellBlockCount(shape))
+  let horizontalBiomeEnd = biomeFromBlock(horizontalCellCount * int32(horizontalCellBlockCount(shape)))
+  newSurfaceHeightSamplerBuilderOptions(biomeFromBlock(startX), biomeFromBlock(startZ), int(horizontalBiomeEnd),
+    int32(shape.minY), int32(maxY(shape)), int(verticalCellBlockCount(shape)))
+
+proc populateNoise*(c: ProtoChunk, generator: VanillaGenerator, noiseSampler: ChunkNoiseGenerator,
+                    oreRandomDeriver: XoroshiroSplitter, surfaceHeightEstimateSampler: SurfaceHeightEstimateSampler) =
+  ## `ProtoChunk::populate_noise`
+  let hCount = int32(horizontalCellBlockCount(noiseSampler))
+  let vCount = int32(verticalCellBlockCount(noiseSampler))
+  let horizontalCells = int32(ChunkDim) div hCount
+  let minimumCellY = int32(chunknoise.minY(noiseSampler)) div vCount
+  let cellHeight = int32(chunknoise.height(noiseSampler)) div vCount
+  let deltaYStep = 1.0'f64 / float64(vCount)
+  let deltaXZStep = 1.0'f64 / float64(hCount)
+  let chunkStartX = startBlockX(c.x)
+  let chunkStartZ = startBlockZ(c.z)
+  let startCellX = chunkStartX div hCount
+  let startCellZ = chunkStartZ div hCount
+  let defaultBlock = generator.defaultBlock
+
+  sampleStartDensity(noiseSampler)
+  var cellX = 0'i32
+  while cellX < horizontalCells:
+    sampleEndDensity(noiseSampler, cellX)
+    let sampleStartX = (startCellX + cellX) * hCount
+    let blockXBase = chunkStartX + cellX * hCount
+    var cellZ = 0'i32
+    while cellZ < horizontalCells:
+      let sampleStartZ = (startCellZ + cellZ) * hCount
+      let blockZBase = chunkStartZ + cellZ * hCount
+      var cellY = cellHeight - 1'i32
+      while cellY >= 0'i32:
+        onSampledCellCorners(noiseSampler, cellX, cellY, cellZ)
+        let sampleStartY = (minimumCellY + cellY) * vCount
+        var localY = vCount - 1'i32
+        while localY >= 0'i32:
+          let blockY = sampleStartY + localY
+          interpolateY(noiseSampler, float64(localY) * deltaYStep)
+          var localX = 0'i32
+          while localX < hCount:
+            interpolateX(noiseSampler, float64(localX) * deltaXZStep)
+            let blockX = blockXBase + localX
+            var localZ = 0'i32
+            while localZ < hCount:
+              interpolateZ(noiseSampler, float64(localZ) * deltaXZStep)
+              let blockZ = blockZBase + localZ
+              let sampled = sampleBlockState(noiseSampler, oreRandomDeriver, sampleStartX, sampleStartY, sampleStartZ,
+                localX, blockY - sampleStartY, localZ, surfaceHeightEstimateSampler)
+              setBlockState(c, blockX, blockY, blockZ, if sampled.hasState: sampled.state else: defaultBlock)
+              inc localZ
+            inc localX
+          dec localY
+        dec cellY
+      inc cellZ
+    swapBuffers(noiseSampler)
+    inc cellX
+
+proc toTerrainAdaptation(a: structures.TerrainAdaptation): router.TerrainAdaptation =
+  case a
+  of structures.TerrainAdaptation.None: router.TerrainAdaptation.None
+  of structures.TerrainAdaptation.BeardThin: router.TerrainAdaptation.BeardThin
+  of structures.TerrainAdaptation.BeardBox: router.TerrainAdaptation.BeardBox
+  of structures.TerrainAdaptation.Bury: router.TerrainAdaptation.Bury
+  of structures.TerrainAdaptation.Encapsulate: router.TerrainAdaptation.Encapsulate
+
+proc stepToNoise*(c: ProtoChunk, generator: VanillaGenerator) =
+  ## `ProtoChunk::step_to_noise`
+  assert c.stage == StagedChunkEnum.StructureReferences
+  let settings = generator.settings
+  let generationShape = settings.shape
+  let horizontalCellCount = ChunkDim div horizontalCellBlockCount(generationShape)
+  let startX = startBlockX(c.x)
+  let startZ = startBlockZ(c.z)
+
+  let sampler = newStandardChunkFluidLevelSampler(
+    newFluidLevel(settings.seaLevel, blockIdOf(uint32(asU16(settings.defaultFluid)))),
+    newFluidLevel(-54'i32, LavaBlock))
+
+  var beardifierStructures = newSeq[BeardifierStructure](0)
+  var beardifierJunctions = newSeq[BeardifierJunction](0)
+  var hasAnyPieceBoundingBox = false
+  var anyPieceBoundingBox = default(BlockBox)
+
+  template addToAny(b: BlockBox) =
+    if hasAnyPieceBoundingBox:
+      encompass(anyPieceBoundingBox, b)
+    else:
+      anyPieceBoundingBox = b
+      hasAnyPieceBoundingBox = true
+
+  let chunkStartX = startX
+  let chunkStartZ = startZ
+
+  block:
+    for key, instance in pairs(c.structureStarts):
+      let structure = structures.get(key)
+      let adaptation = toTerrainAdaptation(structure.terrainAdaptation)
+      # Vanilla strictly skips filtering Beardifier parts if adaptation is None early-on.
+      if adaptation != router.TerrainAdaptation.None:
+        let pieces = structureHooks.beardifierPieces(key, instance)
+        for pi in 0 ..< pieces.len:
+          let boundingBox = pieces[pi].boundingBox
+          # Match `piece.isCloseToChunk(chunkPos, 12)`: an expansion 12 blocks out covers the chunk borders.
+          if intersectsRawXz(boundingBox, chunkStartX - 12'i32, chunkStartZ - 12'i32,
+              chunkStartX + 15'i32 + 12'i32, chunkStartZ + 15'i32 + 12'i32):
+            if pieces[pi].isJigsaw:
+              # Java only adds to rigids if projection is RIGID.
+              if pieces[pi].projectionRigid:
+                addToAny(boundingBox)
+                beardifierStructures.add(BeardifierStructure(boundingBox: boundingBox,
+                  terrainAdaptation: adaptation, groundLevelDelta: pieces[pi].groundLevelDelta))
+              for ji in 0 ..< pieces[pi].junctions.len:
+                let jX = pieces[pi].junctions[ji].sourceX
+                let jZ = pieces[pi].junctions[ji].sourceZ
+                # Junction bounds filter (match vanilla proximity checks).
+                if jX > chunkStartX - 12'i32 and jZ > chunkStartZ - 12'i32 and
+                    jX < chunkStartX + 15'i32 + 12'i32 and jZ < chunkStartZ + 15'i32 + 12'i32:
+                  beardifierJunctions.add(BeardifierJunction(x: jX, groundY: pieces[pi].junctions[ji].sourceGroundY, z: jZ))
+                  addToAny(boundingBox)
+            else:
+              addToAny(boundingBox)
+              beardifierStructures.add(BeardifierStructure(boundingBox: boundingBox, terrainAdaptation: adaptation,
+                groundLevelDelta: 0'i32))
+
+  let affectedBox = if hasAnyPieceBoundingBox: expand(anyPieceBoundingBox, 24'i32, 24'i32, 24'i32) else: default(BlockBox)
+
+  let noiseSampler = newChunkNoiseGenerator(generator.baseRouter.noise, generator.randomConfig, int(horizontalCellCount),
+    startX, startZ, generationShape, sampler, settings.aquifersEnabled, settings.oreVeinsEnabled, beardifierStructures,
+    beardifierJunctions, hasAnyPieceBoundingBox, affectedBox)
+
+  let surfaceHeightEstimateSampler = generateSurfaceHeightEstimateSampler(generator.baseRouter.surfaceEstimator,
+    surfaceConfigFor(c, generator))
+  populateNoise(c, generator, noiseSampler, generator.randomConfig.oreRandomDeriver, surfaceHeightEstimateSampler)
+  c.stage = StagedChunkEnum.Noise
+
+proc buildSurface*(c: ProtoChunk, generator: VanillaGenerator, surfaceHeightEstimateSampler: SurfaceHeightEstimateSampler) =
+  ## `ProtoChunk::build_surface`
+  let startX = startBlockX(c.x)
+  let startZ = startBlockZ(c.z)
+  let minY = int32(bottomY(c))
+  let settings = generator.settings
+  let randomConfig = generator.randomConfig
+  let terrainCache = generator.terrainCache
+  let context = newMaterialRuleContext(bottomY(c), height(c), randomConfig.baseRandomDeriver, terrainCache.terrainBuilder,
+    terrainCache.surfaceNoise, terrainCache.secondaryNoise, settings.seaLevel)
+  for localX in 0'i32 ..< 16'i32:
+    for localZ in 0'i32 ..< 16'i32:
+      let x = startX + localX
+      let z = startZ + localZ
+      var topBlock = topBlockHeightExclusive(c, localX, localZ)
+      let biomeY = if settings.legacyRandomSource: 0'i32 else: topBlock
+      let thisBiome = getTerrainGenBiomeId(c, x, biomeY, z)
+      if thisBiome == ERODED_BADLANDS.id:
+        placeBadlandsPillar(terrainCache.terrainBuilder, c, x, z, topBlock)
+        topBlock = topBlockHeightExclusive(c, localX, localZ)
+
+      initHorizontal(context, x, z)
+
+      var stoneDepthAbove = 0'i32
+      var minV = int32.high
+      var fluidHeight = int32.low
+      var y = topBlock - 1'i32
+      while y >= minY:
+        let state = getBlockState(c, vec3[int32](x, y, z))
+        if blockstates.isAir(state):
+          stoneDepthAbove = 0'i32
+          fluidHeight = int32.low
+        elif isLiquid(state):
+          if fluidHeight == int32.low:
+            fluidHeight = y + 1'i32
+        else:
+          if minV >= y:
+            # Upstream's `min_y << 4` wraps in an i8; the search below always overwrites it.
+            minV = minY shl 4
+            var searchY = y - 1'i32
+            while searchY >= minY - 1'i32:
+              if searchY < minY:
+                minV = searchY + 1'i32
+                break
+              let blockId = blockIdOf(getBlockState(c, vec3[int32](localX, searchY, localZ)))
+              if not (blockId != AirBlock and blockId != WaterBlock and blockId != LavaBlock):
+                minV = searchY + 1'i32
+                break
+              dec searchY
+
+          stoneDepthAbove += 1'i32
+          let stoneDepthBelow = y - minV + 1'i32
+          initVertical(context, stoneDepthAbove, stoneDepthBelow, y, fluidHeight)
+
+          if state == c.defaultBlock:
+            context.biomeId = getTerrainGenBiomeId(c, context.blockPosX, context.blockPosY, context.blockPosZ)
+            let newState = tryApplyMaterialRule(settings, settings.surfaceRule, c, context, surfaceHeightEstimateSampler)
+            if newState.hasState:
+              setBlockState(c, x, y, z, newState.state)
+        dec y
+
+      if thisBiome == FROZEN_OCEAN.id or thisBiome == DEEP_FROZEN_OCEAN.id:
+        let surfaceEstimate = estimateSurfaceHeight(context, surfaceHeightEstimateSampler)
+        placeIceberg(terrainCache.terrainBuilder, c, thisBiome, x, z, surfaceEstimate, topBlock, settings.seaLevel,
+          randomConfig.baseRandomDeriver)
+
+proc stepToSurface*(c: ProtoChunk, generator: VanillaGenerator) =
+  ## `ProtoChunk::step_to_surface`
+  assert c.stage == StagedChunkEnum.Noise
+  let surfaceHeightEstimateSampler = generateSurfaceHeightEstimateSampler(generator.baseRouter.surfaceEstimator,
+    surfaceConfigFor(c, generator))
+  buildSurface(c, generator, surfaceHeightEstimateSampler)
+  c.stage = StagedChunkEnum.Surface
+
+proc stepToCarvers*(c: ProtoChunk, generator: VanillaGenerator) =
+  ## `ProtoChunk::step_to_carvers`
+  assert c.stage == StagedChunkEnum.Surface
+  carve(c, generator)
+  c.stage = StagedChunkEnum.Carvers
+
+proc setStructureStarts*(c: ProtoChunk, generator: VanillaGenerator) =
+  ## `ProtoChunk::set_structure_starts`; see the file comment.
+  assert c.stage == StagedChunkEnum.Biomes
+  structureHooks.setStructureStarts(c, cast[pointer](generator))
+  c.stage = StagedChunkEnum.StructureStart
+
+proc setStructureReferences*(c: ProtoChunk, generator: VanillaGenerator) =
+  ## `ProtoChunk::set_structure_references`; see the file comment.
+  assert c.stage == StagedChunkEnum.StructureStart
+  structureHooks.setStructureReferences(c, cast[pointer](generator))
+  c.stage = StagedChunkEnum.StructureReferences
+
+proc generateFeaturesAndStructure*(cache: GenerationCache, blockRegistry: WorldPortalExt, randomConfig: GlobalRandomConfig) =
+  ## `ProtoChunk::generate_features_and_structure`
+  let chunk = cache.getCenterChunk()
+  var biomesInChunk = newSeq[uint8](0)
+  for bi in 0 ..< chunk.flatBiomeMap.len:
+    let biomeId = chunk.flatBiomeMap[bi]
+    var seen = false
+    for known in biomesInChunk:
+      if known == biomeId:
+        seen = true
+        break
+    if not seen:
+      biomesInChunk.add(biomeId)
+  let minY = int32(bottomY(chunk))
+  let chunkHeight = int32(height(chunk))
+  let originStartX = startBlockX(chunk.x)
+  let originStartZ = startBlockZ(chunk.z)
+  let originPos = blockPos(originStartX, minY, originStartZ)
+  let populationSeed = getPopulationSeed(randomConfig.seed, originStartX, originStartZ)
+
+  for step in 0 ..< 11:
+    structureHooks.generateStructureStep(cache, blockRegistry, step, populationSeed, cast[int64](randomConfig.seed))
+
+    var featuresToRun = newSeq[int](0)
+    for bi in 0 ..< biomesInChunk.len:
+      let b = ALL[int(biomesInChunk[bi])]
+      if step < b.features.len:
+        for fi in 0 ..< b.features[step].len:
+          featuresToRun.add(ord(b.features[step][fi]))
+    # `sort_unstable`
+    for a in 1 ..< featuresToRun.len:
+      let v = featuresToRun[a]
+      var b = a - 1
+      while b >= 0 and featuresToRun[b] > v:
+        let moved = featuresToRun[b]
+        featuresToRun[b + 1] = moved
+        dec b
+      featuresToRun[b + 1] = v
+    var p = 0
+    var last = -1
+    for fi in 0 ..< featuresToRun.len:
+      if featuresToRun[fi] != last:  # `dedup`
+        last = featuresToRun[fi]
+        let decoratorSeed = getDecoratorSeed(populationSeed, uint64(p), uint64(step))
+        var random = toRandomGenerator(xoroshiro128.fromSeed(decoratorSeed))
+        structureHooks.generatePlacedFeature(PlacedFeature(last), cache, blockRegistry, int8(minY), uint16(chunkHeight), random, originPos)
+        inc p
+  chunk.stage = StagedChunkEnum.Features
+
+proc spawnMobs*(cache: GenerationCache, blockRegistry: WorldPortalExt) =
+  ## `ProtoChunk::spawn_mobs`
+  let chunk = cache.getCenterChunk()
+  if chunk.stage >= StagedChunkEnum.Spawn:
+    return
+  assert chunk.stage == StagedChunkEnum.Lighting
+  let b = getTerrainGenBiome(chunk, sectionToBlock(chunk.x), int32(bottomY(chunk)) + int32(height(chunk)) - 1'i32,
+    sectionToBlock(chunk.z))
+  if blockRegistry != nil:
+    blockRegistry.spawnMobsForChunkGeneration(cache, b, chunk.x, chunk.z)
+    let entities = takePendingStructureEntities(chunk)
+    blockRegistry.spawnStructureEntities(entities)
+  chunk.stage = StagedChunkEnum.Spawn

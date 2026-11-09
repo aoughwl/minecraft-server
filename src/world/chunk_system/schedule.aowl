@@ -1,0 +1,751 @@
+## The generation scheduler. Port of pumpkin-world/src/chunk_system/schedule.rs and
+## pumpkin-world/src/chunk_system/chunk_holder.rs, with pumpkin-world/src/chunk_system/mod.rs's type names.
+##
+## Upstream runs `work` on its own thread beside IO and generation workers. Here there are no threads:
+## `workOnce` is one pass of that loop, an IO batch or a generation task runs when it would have been sent, and its
+## result waits in `recvChunk` for the receive drain, so the loop's bookkeeping stays as it is. The caller drives
+## it, from the tick loop or from `pumpUntil` when something must wait for a chunk. `level.should_unload`,
+## `should_save` and `shut_down_chunk_system` are the fields of the same names here, set by the level. The
+## blocking `wait_and_get` becomes returning false from `workOnce`: nothing to do until the channel has news.
+
+{.feature: "lenientnils".}
+
+import std/tables
+import std/sets
+import std/heapqueue
+import std/assertions
+import std/times
+import ../../config/lighting
+import ../chunkdata
+import chunk_stage
+import channel
+import dag
+import chunk_listener
+import chunk_loading
+import generation_cache
+import worker_logic
+
+export channel, dag, chunk_listener, chunk_loading, generation_cache, worker_logic
+
+type
+  ChunkHolder* = ref object
+    ## `chunk_holder.rs`
+    targetStage*: StagedChunkEnum
+    dependencyStage*: StagedChunkEnum
+      ## Minimum stage required by generation dependencies. May exceed `targetStage` when this chunk is needed by
+      ## a neighbor's generation task but isn't in the player's view radius. Tasks up to this stage are scheduled but
+      ## the chunk is not made public and is unloaded once the dependency is satisfied.
+    currentStage*: StagedChunkEnum
+    chunk*: Chunk  ## nil for upstream's None.
+    occupied*: NodeKey
+    occupiedBy*: EdgeKey
+    public*: bool
+    tasks*: array[StagedChunkCount, NodeKey]
+
+  TaskHeapNode* = object
+    priority*: int8
+    key*: NodeKey
+
+  GenerationSchedule* = ref object
+    queue*: HeapQueue[TaskHeapNode]
+    graph*: DAG
+    lastLevel*: ChunkLevel
+    lastHighPriority*: seq[ChunkPos]
+    sendLevel*: LevelChannel
+    chunkMap*: Table[ChunkPos, ChunkHolder]
+    unloadChunks*: HashSet[ChunkPos]
+    waitingForChunks*: HashSet[NodeKey]
+      ## Tasks that are graph-ready (`in_degree` == 0) but cannot yet run because one or more of their required
+      ## neighbor chunks haven't been delivered yet. Re-queued by `checkWaitingTasks` as chunk data arrives.
+    runningTaskCount*: uint16
+    maxInFlight*: uint16
+    queueDirty*: bool
+    recvChunk*: seq[RecvChunk]
+    recvHead: int
+    host*: ScheduleHost
+    listener*: ChunkListener
+    lightingConfig*: LightingEngineConfig
+    lastUnload: Time
+    shouldUnload*: bool
+    shouldSave*: bool
+    shutDownChunkSystem*: bool
+    finished*: bool
+
+const IOBatchSize = 16
+
+proc `<`*(a, b: TaskHeapNode): bool {.inline.} =
+  ## `self.0.cmp(&other.0).reverse()` on a max-heap: lowest priority number first.
+  a.priority < b.priority
+
+proc `==`*(a, b: TaskHeapNode): bool {.inline.} = a.priority == b.priority
+
+proc newChunkHolder*(): ChunkHolder =
+  ## `ChunkHolder::default`
+  result = ChunkHolder(targetStage: StagedChunkEnum.None, dependencyStage: StagedChunkEnum.None,
+    currentStage: StagedChunkEnum.None, occupied: NullKey, occupiedBy: NullKey, public: false)
+  for i in 0 ..< StagedChunkCount:
+    result.tasks[i] = NullKey
+
+proc newGenerationSchedule*(host: ScheduleHost, levelChannel: LevelChannel, listener: ChunkListener,
+                            maxInFlight: uint16): GenerationSchedule =
+  ## `GenerationSchedule::create`, without the threads. `maxInFlight` bounds what `workOnce` runs in one pass.
+  GenerationSchedule(queue: initHeapQueue[TaskHeapNode](), graph: newDAG(), lastLevel: initTable[ChunkPos, int8](),
+    lastHighPriority: @[], sendLevel: levelChannel, chunkMap: initTable[ChunkPos, ChunkHolder](),
+    unloadChunks: initHashSet[ChunkPos](), waitingForChunks: initHashSet[NodeKey](), runningTaskCount: 0'u16,
+    maxInFlight: maxInFlight, queueDirty: false, recvChunk: @[], recvHead: 0, host: host, listener: listener,
+    lightingConfig: host.lightingConfig, lastUnload: getTime())
+
+proc applyLightingOverride(s: GenerationSchedule, chunk: ChunkData) =
+  case s.lightingConfig
+  of lecFull:
+    let engine = chunk.lightEngine
+    for i in 0 ..< engine.blockLight.len:
+      fill(engine.blockLight[i], 15'u8)
+    for i in 0 ..< engine.skyLight.len:
+      fill(engine.skyLight[i], 15'u8)
+    chunk.dirty = true
+  of lecDark:
+    let engine = chunk.lightEngine
+    for i in 0 ..< engine.blockLight.len:
+      fill(engine.blockLight[i], 0'u8)
+    for i in 0 ..< engine.skyLight.len:
+      fill(engine.skyLight[i], 0'u8)
+    chunk.dirty = true
+  of lecDefault:
+    discard
+
+proc calcPriority*(lastLevel: ChunkLevel, lastHighPriority: seq[ChunkPos], pos: ChunkPos, stage: StagedChunkEnum): int8 =
+  ## `GenerationSchedule::calc_priority`
+  let level = lastLevel.getOrDefault(pos, MaxLevel)
+  if lastHighPriority.len == 0:
+    return level + int8(ord(stage))
+  for i in 0 ..< lastHighPriority.len:
+    let dst = max(abs(lastHighPriority[i].x - pos.x), abs(lastHighPriority[i].y - pos.y))
+    if dst <= FullRadius and stage <= FullDependencies[int(dst)]:
+      return level + int8(ord(stage)) - 100'i8
+  level + int8(ord(stage))
+
+proc sortQueue(s: GenerationSchedule) =
+  if s.queue.len == 0:
+    return
+  var tasks = newSeq[TaskHeapNode](0)
+  while s.queue.len > 0:
+    tasks.add(pop(s.queue))
+  for i in 0 ..< tasks.len:
+    if containsNode(s.graph, tasks[i].key):
+      tasks[i].priority = calcPriority(s.lastLevel, s.lastHighPriority, node(s.graph, tasks[i].key).pos,
+        node(s.graph, tasks[i].key).stage)
+  for i in 0 ..< tasks.len:
+    push(s.queue, tasks[i])
+
+proc restoreReadyTasks*(s: GenerationSchedule): int =
+  ## `GenerationSchedule::restore_ready_tasks`. Upstream's TODO says it will go at some point.
+  assert s.queue.len == 0
+  var ready = newSeq[NodeKey](0)
+  let keys = nodeKeys(s.graph)
+  for ki in 0 ..< keys.len:
+    let key = keys[ki]
+    node(s.graph, key).inQueue = false
+    let stage = node(s.graph, key).stage
+    if stage != StagedChunkEnum.None and node(s.graph, key).inDegree == 0'u32 and
+        not s.waitingForChunks.contains(key) and s.chunkMap.hasKey(node(s.graph, key).pos):
+      let holder = s.chunkMap.getOrDefault(node(s.graph, key).pos, nil)
+      if not (holder.currentStage >= stage or not (holder.tasks[ord(stage)] == key)):
+        ready.add(key)
+  for ri in 0 ..< ready.len:
+    node(s.graph, ready[ri]).inQueue = true
+    push(s.queue, TaskHeapNode(priority: calcPriority(s.lastLevel, s.lastHighPriority, node(s.graph, ready[ri]).pos,
+      node(s.graph, ready[ri]).stage), key: ready[ri]))
+  ready.len
+
+proc ensureDependencyChain*(graph: DAG, queue: var HeapQueue[TaskHeapNode], lastLevel: ChunkLevel,
+                            lastHighPriority: seq[ChunkPos], dependencyTask: NodeKey, chunkPos: ChunkPos,
+                            holder: ChunkHolder, reqStage: StagedChunkEnum) =
+  ## `GenerationSchedule::ensure_dependency_chain`: the dependency chain for `reqStage` exists on `holder` and
+  ## `dependencyTask` depends on it. Bumps `dependencyStage` and not `targetStage`, so neighbor chunks pulled in
+  ## as generation dependencies are not discarded before their dependency is satisfied.
+  # Insert occupied_by edge head.
+  holder.occupiedBy = insertEdge(graph, Edge(to: dependencyTask, next: holder.occupiedBy))
+
+  if not isNull(holder.occupied):
+    addEdge(graph, holder.occupied, dependencyTask)
+
+  # Keeps this chunk's IO and generation tasks alive even if target_stage is None.
+  if holder.dependencyStage < reqStage:
+    holder.dependencyStage = reqStage
+
+  # Effective target is the max of what the player wants and what dependencies need.
+  let effectiveTarget = max(holder.targetStage, holder.dependencyStage)
+
+  # Create any missing tasks from current_stage+1 up to effective_target, also when current_stage >= req_stage,
+  # because dependency_stage may require tasks beyond req_stage that haven't been created yet.
+  if holder.currentStage < effectiveTarget:
+    let empty = ord(StagedChunkEnum.Empty)
+    let start = max(ord(holder.currentStage) + 1, empty)
+    let stop = ord(effectiveTarget)
+    var newlyCreated = default(array[StagedChunkCount, bool])
+
+    for stageI in start .. stop:
+      if isNull(holder.tasks[stageI]):
+        let newNodeKey = insertNode(graph, newNode(chunkPos, stageFromU8(stageI)))
+        holder.tasks[stageI] = newNodeKey
+        newlyCreated[stageI] = true
+        if not isNull(holder.occupied):
+          addEdge(graph, holder.occupied, newNodeKey)
+
+    for stageI in start .. stop:
+      if newlyCreated[stageI]:
+        let cur = holder.tasks[stageI]
+        if stageI > empty:
+          let prev = holder.tasks[stageI - 1]
+          if not isNull(prev):
+            addEdge(graph, prev, cur)
+        if stageI < stop:
+          let next = holder.tasks[stageI + 1]
+          if not isNull(next) and not newlyCreated[stageI + 1]:
+            addEdge(graph, cur, next)
+
+    # Queue the entry task (lowest unblocked stage).
+    let entryTask = holder.tasks[start]
+    if not isNull(entryTask) and containsNode(graph, entryTask) and node(graph, entryTask).inDegree == 0'u32 and
+        not node(graph, entryTask).inQueue:
+      node(graph, entryTask).inQueue = true
+      push(queue, TaskHeapNode(priority: calcPriority(lastLevel, lastHighPriority, chunkPos, stageFromU8(start)),
+        key: entryTask))
+
+  # If req_stage is already satisfied, dependency_task doesn't need to wait; it was only blocked on `occupied`.
+  # Do NOT add an edge here: tasks[req_stage] is null, completed and dropped.
+  if holder.currentStage >= reqStage:
+    return
+
+  # Wire req_stage task -> dependency_task, so it can't run until this chunk reaches req_stage.
+  let anoTask = holder.tasks[ord(reqStage)]
+  assert not isNull(anoTask), "holder.tasks[req_stage] must not be null before adding edge"
+  addEdge(graph, anoTask, dependencyTask)
+
+proc allChunksReady(s: GenerationSchedule, pos: ChunkPos, writeRadius: int32): bool =
+  var dx = -writeRadius
+  while dx <= writeRadius:
+    var dy = -writeRadius
+    while dy <= writeRadius:
+      let holder = s.chunkMap.getOrDefault(addRaw(pos, dx, dy), nil)
+      if holder == nil or holder.chunk == nil:
+        return false
+      inc dy
+    inc dx
+  true
+
+proc checkWaitingTasks(s: GenerationSchedule) =
+  ## Re-queues tasks in `waitingForChunks` that now have all their neighbor chunk data. Called after every
+  ## `receiveChunk`.
+  if s.waitingForChunks.len == 0:
+    return
+  var nowReady = newSeq[NodeKey](0)
+  var dropped = newSeq[NodeKey](0)
+  for nodeKey in items(s.waitingForChunks):
+    if not containsNode(s.graph, nodeKey):
+      dropped.add(nodeKey)  # node was dropped, discard silently
+    elif allChunksReady(s, node(s.graph, nodeKey).pos, getWriteRadius(node(s.graph, nodeKey).stage)):
+      nowReady.add(nodeKey)
+  for i in 0 ..< dropped.len:
+    s.waitingForChunks.excl(dropped[i])
+  for i in 0 ..< nowReady.len:
+    s.waitingForChunks.excl(nowReady[i])
+  for i in 0 ..< nowReady.len:
+    let nodeKey = nowReady[i]
+    # If in_degree > 0, drop_node will re-queue when unblocked.
+    if containsNode(s.graph, nodeKey) and node(s.graph, nodeKey).inDegree == 0'u32 and not node(s.graph, nodeKey).inQueue:
+      node(s.graph, nodeKey).inQueue = true
+      push(s.queue, TaskHeapNode(priority: calcPriority(s.lastLevel, s.lastHighPriority, node(s.graph, nodeKey).pos,
+        node(s.graph, nodeKey).stage), key: nodeKey))
+
+proc dropNode*(s: GenerationSchedule, n: NodeKey) =
+  ## `GenerationSchedule::drop_node`
+  let (ok, old) = removeNode(s.graph, n)
+  if not ok:
+    return
+  var edge = old.edge
+  while not isNull(edge):
+    let cur = removeEdge(s.graph, edge)
+    if containsNode(s.graph, cur.to):
+      assert node(s.graph, cur.to).inDegree >= 1'u32
+      node(s.graph, cur.to).inDegree -= 1'u32
+      if node(s.graph, cur.to).inDegree == 0'u32 and not node(s.graph, cur.to).inQueue:
+        # Don't queue if parked in waiting_for_chunks: check_waiting_tasks re-queues it once chunk data arrives.
+        if not s.waitingForChunks.contains(cur.to):
+          push(s.queue, TaskHeapNode(priority: calcPriority(s.lastLevel, s.lastHighPriority, node(s.graph, cur.to).pos,
+            node(s.graph, cur.to).stage), key: cur.to))
+          node(s.graph, cur.to).inQueue = true
+    edge = cur.next
+
+proc holderFor(s: GenerationSchedule, pos: ChunkPos): ChunkHolder =
+  ## `chunk_map.entry(pos).or_default()`
+  result = s.chunkMap.getOrDefault(pos, nil)
+  if result == nil:
+    result = newChunkHolder()
+    s.chunkMap[pos] = result
+
+proc resortWork*(s: GenerationSchedule, newData: LevelChannelValue): bool =
+  ## `GenerationSchedule::resort_work`
+  if not newData.hasChange and not newData.hasPriority:
+    return false
+  if newData.hasPriority:
+    s.lastHighPriority = newData.priority
+    s.queueDirty = true
+  if not newData.hasChange:
+    return true
+  for pos, change in pairs(newData.change.changes):
+    let oldStage = change.oldStage
+    let newStage = change.newStage
+    assert oldStage != newStage
+    assert newStage == levelToStage(newData.change.levels.getOrDefault(pos, MaxLevel))
+    let holder = holderFor(s, pos)
+    assert holder.targetStage == oldStage
+    holder.targetStage = newStage
+
+    # Effective target is what we actually need to schedule tasks up to.
+    let effectiveOld = max(oldStage, holder.dependencyStage)
+    let effectiveNew = max(newStage, holder.dependencyStage)
+
+    if effectiveOld > effectiveNew:
+      for i in ord(max(effectiveNew, holder.currentStage)) + 1 .. ord(effectiveOld):
+        let task = holder.tasks[i]
+        if not isNull(task):
+          let isInFlight = containsNode(s.graph, task) and node(s.graph, task).inFlight
+          if not isInFlight:
+            s.waitingForChunks.excl(task)
+            dropNode(s, task)
+            holder.tasks[i] = NullKey
+      if newStage == StagedChunkEnum.None and holder.dependencyStage == StagedChunkEnum.None:
+        s.unloadChunks.incl(pos)
+    else:
+      if oldStage == StagedChunkEnum.None:
+        s.unloadChunks.excl(pos)
+        if holder.currentStage == StagedChunkEnum.Full and not holder.public:
+          holder.public = true
+          assert holder.chunk.kind == ChunkKind.Level
+          applyLightingOverride(s, holder.chunk.level)
+          discard s.host.publicInsert(pos, holder.chunk.level)
+          processNewChunk(s.listener, pos, holder.chunk.level)
+      for i in ord(max(effectiveOld, holder.currentStage)) + 1 .. ord(effectiveNew):
+        if isNull(holder.tasks[i]):
+          holder.tasks[i] = insertNode(s.graph, newNode(pos, stageFromU8(i)))
+          if not isNull(holder.occupied):
+            addEdge(s.graph, holder.occupied, holder.tasks[i])
+        let task = holder.tasks[i]
+        if i > 1:
+          let stage = stageFromU8(i)
+          let dependency = getDirectDependencies(stage)
+          let radius = getDirectRadius(stage)
+          var dx = -radius
+          while dx <= radius:
+            var dz = -radius
+            while dz <= radius:
+              let newPos = addRaw(pos, dx, dz)
+              let reqStage = dependency[int(max(abs(dx), abs(dz)))]
+              ensureDependencyChain(s.graph, s.queue, s.lastLevel, s.lastHighPriority, task, newPos,
+                if newPos == pos: holder else: holderFor(s, newPos), reqStage)
+              inc dz
+            inc dx
+        if node(s.graph, task).inDegree == 0'u32 and not node(s.graph, task).inQueue:
+          node(s.graph, task).inQueue = true
+          push(s.queue, TaskHeapNode(priority: 0'i8, key: task))
+  s.lastLevel = newData.change.levels
+  s.queueDirty = true
+  true
+
+proc garbageCollectDependencies(s: GenerationSchedule) =
+  ## Garbage collect stranded dependencies.
+  var stranded = newSeq[ChunkPos](0)
+  for pos, holder in pairs(s.chunkMap):
+    if holder.targetStage == StagedChunkEnum.None and holder.dependencyStage != StagedChunkEnum.None:
+      stranded.add(pos)
+  for si in 0 ..< stranded.len:
+    let holder = s.chunkMap.getOrDefault(stranded[si], nil)
+    if not (not isNull(holder.occupied) and containsNode(s.graph, holder.occupied)):
+      var curEdge = holder.occupiedBy
+      var prevEdge = NullKey
+      var hasChangeHead = false
+      var changeHead = NullKey
+      var hasValidTask = false
+      while not isNull(curEdge):
+        let edge = getEdge(s.graph, curEdge)
+        if containsNode(s.graph, edge.to):
+          prevEdge = curEdge
+          curEdge = edge.next
+          hasValidTask = true
+        else:
+          let next = edge.next
+          discard removeEdge(s.graph, curEdge)
+          curEdge = next
+          if isNull(prevEdge):
+            hasChangeHead = true
+            changeHead = next
+          else:
+            setEdgeNext(s.graph, prevEdge, next)
+      if hasChangeHead:
+        holder.occupiedBy = changeHead
+      if not hasValidTask:
+        holder.dependencyStage = StagedChunkEnum.None
+        s.unloadChunks.incl(stranded[si])
+
+proc processUnloadQueue(s: GenerationSchedule) =
+  if s.unloadChunks.len == 0:
+    return
+  var unloadPositions = newSeq[ChunkPos](0)
+  for pos in items(s.unloadChunks):
+    unloadPositions.add(pos)
+  s.unloadChunks = initHashSet[ChunkPos]()
+  var chunks = newSeq[(ChunkPos, Chunk)](0)
+  for ui in 0 ..< unloadPositions.len:
+    let pos = unloadPositions[ui]
+    let holder = s.chunkMap.getOrDefault(pos, nil)
+    if holder != nil:
+      assert holder.targetStage == StagedChunkEnum.None
+      if not isNull(holder.occupied):
+        s.unloadChunks.incl(pos)
+      else:
+        s.chunkMap.del(pos)
+        for ti in 0 ..< StagedChunkCount:
+          let task = holder.tasks[ti]
+          if not isNull(task):
+            let isInFlight = containsNode(s.graph, task) and node(s.graph, task).inFlight
+            if not isInFlight:
+              s.waitingForChunks.excl(task)
+              dropNode(s, task)
+        if holder.public:
+          s.host.publicRemove(pos)
+          holder.public = false
+        if holder.chunk != nil:
+          case holder.chunk.kind
+          of ChunkKind.Level:
+            # Save chunk to disk if dirty.
+            if holder.chunk.level.dirty:
+              chunks.add((pos, holder.chunk))
+          of ChunkKind.Proto:
+            chunks.add((pos, holder.chunk))
+  if chunks.len == 0:
+    return
+  ioWriteBatch(s.host, chunks)
+
+proc saveAllChunk(s: GenerationSchedule, saveProtoChunk: bool) =
+  var chunks = newSeq[(ChunkPos, Chunk)](0)
+  for pos, holder in pairs(s.chunkMap):
+    if holder.chunk != nil:
+      let shouldSave =
+        case holder.chunk.kind
+        of ChunkKind.Level: holder.chunk.level.dirty
+        of ChunkKind.Proto:
+          saveProtoChunk and holder.chunk.proto.stage != StagedChunkEnum.Empty and
+            holder.chunk.proto.stage != StagedChunkEnum.None
+      if shouldSave:
+        chunks.add((pos, holder.chunk))
+        if holder.chunk.kind == ChunkKind.Proto:
+          holder.chunk = nil
+  if chunks.len == 0:
+    return
+  ioWriteBatch(s.host, chunks)
+
+proc dropSatisfiedTasks(s: GenerationSchedule, holder: ChunkHolder, stage: StagedChunkEnum) =
+  ## A neighboring generation cache may already have advanced this holder past the returning task's stage. Drop
+  ## every scheduled task satisfied by the returned data, including that task's stale in-flight node.
+  for taskIdx in ord(StagedChunkEnum.None) + 1 .. ord(stage):
+    if not isNull(holder.tasks[taskIdx]):
+      s.waitingForChunks.excl(holder.tasks[taskIdx])
+      dropNode(s, holder.tasks[taskIdx])
+      holder.tasks[taskIdx] = NullKey
+
+proc receiveChunk*(s: GenerationSchedule, pos: ChunkPos, data: RecvChunk) =
+  ## `GenerationSchedule::receive_chunk`
+  case data.kind
+  of RecvChunkKind.IO:
+    let chunk = data.io
+    let holder = s.chunkMap.getOrDefault(pos, nil)
+    assert holder.currentStage == StagedChunkEnum.None
+    let stage = stageFromU8(getStageId(chunk))
+    dropSatisfiedTasks(s, holder, stage)
+    holder.currentStage = stage
+    assert containsNode(s.graph, holder.occupied)
+    dropNode(s, holder.occupied)
+    holder.occupied = NullKey
+    case chunk.kind
+    of ChunkKind.Level:
+      applyLightingOverride(s, chunk.level)
+      discard s.host.publicInsert(pos, chunk.level)
+      holder.public = true
+      processNewChunk(s.listener, pos, chunk.level)
+    of ChunkKind.Proto:
+      if holder.public:
+        # Downgraded to Proto for relighting.
+        s.host.publicRemove(pos)
+        holder.public = false
+    holder.chunk = chunk
+    # A new chunk arrived: unblock any waiting generation tasks.
+    checkWaitingTasks(s)
+  of RecvChunkKind.Generation:
+    var dx = 0'i32
+    var dy = 0'i32
+    for ci in 0 ..< data.cache.chunks.len:
+      let chunk = data.cache.chunks[ci]
+      let newPos = chunkPos(data.cache.x + dx, data.cache.z + dy)
+      let holder = s.chunkMap.getOrDefault(newPos, nil)
+      case chunk.kind
+      of ChunkKind.Level:
+        let stage = StagedChunkEnum.Full
+        if newPos == pos:
+          if holder.currentStage != StagedChunkEnum.Spawn:
+            holder.currentStage = StagedChunkEnum.Spawn  # expected Spawn; aligning
+          dropSatisfiedTasks(s, holder, stage)
+          if containsNode(s.graph, holder.occupied):
+            dropNode(s, holder.occupied)
+          holder.currentStage = stage
+          applyLightingOverride(s, chunk.level)
+          holder.chunk = chunk
+          discard s.host.publicInsert(newPos, chunk.level)
+          holder.public = true
+          processNewChunk(s.listener, newPos, chunk.level)
+        else:
+          dropSatisfiedTasks(s, holder, stage)
+          holder.currentStage = stage
+          holder.chunk = chunk
+        if not isNull(holder.occupied) and containsNode(s.graph, holder.occupied):
+          dropNode(s, holder.occupied)
+        holder.occupied = NullKey
+        # If this chunk was only loaded for a dependency or cancelled and is no longer needed, clear
+        # dependency_stage and queue unload.
+        if holder.targetStage == StagedChunkEnum.None and holder.currentStage >= holder.dependencyStage:
+          holder.dependencyStage = StagedChunkEnum.None
+          s.unloadChunks.incl(newPos)
+      of ChunkKind.Proto:
+        let stage = stageFromU8(stageId(chunk.proto))
+        dropSatisfiedTasks(s, holder, stage)
+        if newPos == pos:
+          assert holder.currentStage != StagedChunkEnum.None
+          if containsNode(s.graph, holder.occupied):
+            dropNode(s, holder.occupied)
+          holder.currentStage = stage
+        else:
+          if holder.currentStage < stage:
+            holder.currentStage = stage
+          if not isNull(holder.occupied) and containsNode(s.graph, holder.occupied):
+            dropNode(s, holder.occupied)
+        # Clear dependency_stage and queue unload if no longer needed.
+        if holder.targetStage == StagedChunkEnum.None and holder.currentStage >= holder.dependencyStage:
+          holder.dependencyStage = StagedChunkEnum.None
+          s.unloadChunks.incl(newPos)
+        holder.occupied = NullKey
+        holder.chunk = chunk
+      dy += 1'i32
+      if dy == data.cache.size:
+        dy = 0'i32
+        dx += 1'i32
+    # Neighbor chunks returned to holders: unblock waiting tasks.
+    checkWaitingTasks(s)
+  of RecvChunkKind.GenerationFailure:
+    let holder = s.chunkMap.getOrDefault(pos, nil)
+    if holder != nil:
+      let targetStage = holder.targetStage
+      if not isNull(holder.occupied):
+        if containsNode(s.graph, holder.occupied):
+          dropNode(s, holder.occupied)
+        holder.occupied = NullKey
+      for i in 0 ..< StagedChunkCount:
+        if not isNull(holder.tasks[i]):
+          s.waitingForChunks.excl(holder.tasks[i])
+          dropNode(s, holder.tasks[i])
+          holder.tasks[i] = NullKey
+      holder.currentStage = StagedChunkEnum.None
+      holder.dependencyStage = StagedChunkEnum.None
+      holder.chunk = nil
+      for i in ord(StagedChunkEnum.None) + 1 .. ord(targetStage):
+        holder.tasks[i] = insertNode(s.graph, newNode(pos, stageFromU8(i)))
+        if i > ord(StagedChunkEnum.None) + 1:
+          addEdge(s.graph, holder.tasks[i - 1], holder.tasks[i])
+      if targetStage > StagedChunkEnum.None:
+        let firstTask = holder.tasks[ord(StagedChunkEnum.None) + 1]
+        if containsNode(s.graph, firstTask):
+          node(s.graph, firstTask).inQueue = true
+        push(s.queue, TaskHeapNode(priority: calcPriority(s.lastLevel, s.lastHighPriority, pos, stageFromU8(1)) - 50'i8,
+          key: firstTask))
+  s.runningTaskCount -= 1'u16
+
+proc drainReceived(s: GenerationSchedule): bool =
+  ## `while let Ok((pos, data)) = recv_chunk.try_recv() { receive_chunk }`; true when one arrived.
+  result = false
+  while s.recvHead < s.recvChunk.len:
+    let item = s.recvChunk[s.recvHead]
+    inc s.recvHead
+    receiveChunk(s, item.pos, item)
+    result = true
+  s.recvChunk = @[]
+  s.recvHead = 0
+
+proc flushIOBatch(s: GenerationSchedule, ioBatch: var seq[ChunkPos]) =
+  if ioBatch.len > 0:
+    ioReadBatch(s.host, ioBatch, s.recvChunk)
+    ioBatch = newSeq[ChunkPos](0)
+
+proc occupyForGeneration(s: GenerationSchedule, nodePos: ChunkPos, writeRadius: int32, occupy: NodeKey, cache: Cache) =
+  ## Moves the write area's chunks into the task's cache and wires what waits on them to `occupy`.
+  var dx = -writeRadius
+  while dx <= writeRadius:
+    var dy = -writeRadius
+    while dy <= writeRadius:
+      let newPos = addRaw(nodePos, dx, dy)
+      let holder = s.chunkMap.getOrDefault(newPos, nil)
+      assert holder.chunk != nil, "Missing chunk while processing generation task"
+      cache.chunks.add(holder.chunk)
+      holder.chunk = nil
+      assert isNull(holder.occupied)
+      var curEdge = holder.occupiedBy
+      var prevEdge = NullKey
+      var hasChangeHead = false
+      var changeHead = NullKey
+      while not isNull(curEdge):
+        let edge = getEdge(s.graph, curEdge)
+        if containsNode(s.graph, edge.to):
+          prevEdge = curEdge
+          curEdge = edge.next
+          addEdge(s.graph, occupy, edge.to)
+        else:
+          let next = edge.next
+          discard removeEdge(s.graph, curEdge)
+          curEdge = next
+          if isNull(prevEdge):
+            hasChangeHead = true
+            changeHead = next
+          else:
+            setEdgeNext(s.graph, prevEdge, next)
+      if hasChangeHead:
+        holder.occupiedBy = changeHead
+      holder.occupied = occupy
+      inc dy
+    inc dx
+
+proc workOnce*(s: GenerationSchedule, maxGenerationTasks: int): bool =
+  ## One pass of `GenerationSchedule::work`, running at most `maxGenerationTasks` generation tasks. False when it did
+  ## nothing and there is nothing to do until the channel has news.
+  if s.finished:
+    return false
+  var didWork = false
+  if s.shouldUnload:
+    s.shouldUnload = false
+    garbageCollectDependencies(s)
+    processUnloadQueue(s)
+  if s.shouldSave:
+    s.shouldSave = false
+    saveAllChunk(s, false)
+  if s.shutDownChunkSystem:
+    garbageCollectDependencies(s)
+    processUnloadQueue(s)
+    saveAllChunk(s, true)
+    s.finished = true
+    return false
+
+  # 1. Get latest world state (player moves, etc).
+  if resortWork(s, get(s.sendLevel)):
+    didWork = true
+
+  # Process the unload queue periodically (every 1 second) to batch writes together and act as a brief memory cache
+  # if a player walks back into the chunk.
+  if s.unloadChunks.len != 0 and (getTime() - s.lastUnload).inMilliseconds >= 1000:
+    garbageCollectDependencies(s)
+    processUnloadQueue(s)
+    s.lastUnload = getTime()
+
+  # 2. Process all pending chunk results from workers.
+  if drainReceived(s):
+    didWork = true
+
+  # 3. Re-sort if world state changed or new tasks added.
+  if s.queueDirty:
+    sortQueue(s)
+    s.queueDirty = false
+
+  # 4. Process ready tasks in the queue.
+  var ioBatch = newSeq[ChunkPos](0)
+  var generationTasks = 0
+  while s.queue.len > 0:
+    if s.runningTaskCount >= s.maxInFlight or generationTasks >= maxGenerationTasks:
+      break
+    let task = pop(s.queue)
+    if containsNode(s.graph, task.key):
+      if node(s.graph, task.key).inDegree != 0'u32:
+        node(s.graph, task.key).inQueue = false
+      else:
+        node(s.graph, task.key).inFlight = true
+        let nodeCopy = node(s.graph, task.key)
+        # A chunk can be advanced as part of a neighboring task's write cache. Its queued node may survive even
+        # though the returned ProtoChunk has already reached this stage. Dispatching the stale node would run the
+        # same stage twice and trip ProtoChunk's stage invariant.
+        let holderForNode = s.chunkMap.getOrDefault(nodeCopy.pos, nil)
+        let hasActual = holderForNode != nil and holderForNode.chunk != nil
+        let actualStage = if hasActual: getStageId(holderForNode.chunk) else: -1
+        if hasActual and actualStage >= ord(nodeCopy.stage):
+          holderForNode.currentStage = max(holderForNode.currentStage, stageFromU8(actualStage))
+          if holderForNode.tasks[ord(nodeCopy.stage)] == task.key:
+            holderForNode.tasks[ord(nodeCopy.stage)] = NullKey
+          s.waitingForChunks.excl(task.key)
+          dropNode(s, task.key)
+          didWork = true
+        elif nodeCopy.stage == StagedChunkEnum.Empty:
+          s.runningTaskCount += 1'u16
+          let holder = holderForNode
+          assert isNull(holder.occupied)
+          assert holder.currentStage == StagedChunkEnum.None
+          let occupy = insertNode(s.graph, newNode(chunkPos(int32.high, int32.high), StagedChunkEnum.None))
+          let effectiveTarget = max(holder.targetStage, holder.dependencyStage)
+          for i in ord(holder.currentStage) + 1 .. ord(effectiveTarget):
+            addEdge(s.graph, occupy, holder.tasks[i])
+          holder.occupied = occupy
+          ioBatch.add(nodeCopy.pos)
+          if ioBatch.len >= IOBatchSize:
+            flushIOBatch(s, ioBatch)
+          didWork = true
+        else:
+          # Send any pending IO batch before starting generation.
+          flushIOBatch(s, ioBatch)
+          let writeRadius = getWriteRadius(nodeCopy.stage)
+          # Pre-validate that every chunk in the write area has its data present before we swap anything out.
+          if not allChunksReady(s, nodeCopy.pos, writeRadius):
+            if containsNode(s.graph, task.key):
+              node(s.graph, task.key).inQueue = false
+              node(s.graph, task.key).inFlight = false
+            s.waitingForChunks.incl(task.key)
+            # The chunk we're waiting for may have arrived already: re-queue it now if so, so it isn't stranded.
+            checkWaitingTasks(s)
+          else:
+            let cache = newCache(nodeCopy.pos.x - writeRadius, nodeCopy.pos.y - writeRadius, (writeRadius shl 1) or 1'i32)
+            let occupy = insertNode(s.graph, newNode(chunkPos(int32.high, int32.high), StagedChunkEnum.None))
+            occupyForGeneration(s, nodeCopy.pos, writeRadius, occupy, cache)
+            s.runningTaskCount += 1'u16
+            s.recvChunk.add(runGeneration(s.host, nodeCopy.pos, cache, nodeCopy.stage))
+            inc generationTasks
+            didWork = true
+
+  # Flush any remaining IO batch.
+  flushIOBatch(s, ioBatch)
+  if drainReceived(s):
+    didWork = true
+
+  # 3. If queue is empty, see whether any work remains.
+  if s.queue.len == 0 and s.runningTaskCount == 0'u16 and s.waitingForChunks.len == 0:
+    if restoreReadyTasks(s) > 0:
+      didWork = true
+  if s.queueDirty:
+    sortQueue(s)
+    s.queueDirty = false
+  didWork
+
+proc isIdle*(s: GenerationSchedule): bool =
+  ## Nothing queued and nothing in flight; the state in which upstream waits on the channel.
+  s.queue.len == 0 and s.runningTaskCount == 0'u16 and s.recvHead >= s.recvChunk.len
+
+proc pumpUntil*(s: GenerationSchedule, done: proc(): bool {.closure.}, maxGenerationTasksPerPass: int): bool =
+  ## Runs passes until `done` answers true. False when the schedule ran out of work first.
+  while not done():
+    if not workOnce(s, maxGenerationTasksPerPass):
+      if done():
+        return true
+      return false
+  true

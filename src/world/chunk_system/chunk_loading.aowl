@@ -1,0 +1,248 @@
+## Chunk tickets and the levels they spread. Port of pumpkin-world/src/chunk_system/chunk_loading.rs
+##
+## `LevelCache` keeps upstream's `(i8, i8)` cell grid and its 256*256 size: `clean` only ever fills the window a
+## ticket reaches.
+
+{.feature: "lenientnils".}
+
+import std/tables
+import std/heapqueue
+import std/assertions
+import chunk_stage
+import channel
+import dag
+
+const
+  FullChunkLevel* = 43'i8  ## `ChunkLoading::FULL_CHUNK_LEVEL`
+  MaxLevel* = 49'i8        ## `ChunkLoading::MAX_LEVEL`; level 49 will be unloaded.
+
+type
+  HeapNode* = object
+    level*: int8
+    pos*: ChunkPos
+
+  LevelCell = object
+    orig, cur: int8
+
+  LevelCache = object
+    x, y: int32
+    size: int
+    cells: seq[LevelCell]
+
+  ChunkLoading* = ref object
+    isPriorityDirty*: bool
+    posLevel*: ChunkLevel
+    change: Table[ChunkPos, StageChange]
+    ticket*: Table[ChunkPos, seq[int8]]
+    highPriority*: seq[ChunkPos]
+    sender*: LevelChannel
+    increaseUpdate*: HeapQueue[HeapNode]
+    decreaseUpdate*: HeapQueue[HeapNode]
+    cache: LevelCache
+
+proc `<`*(a, b: HeapNode): bool {.inline.} =
+  ## `self.0.cmp(&other.0).reverse()` on a max-heap: lowest level first.
+  a.level < b.level
+
+proc `==`*(a, b: HeapNode): bool {.inline.} = a.level == b.level
+
+proc clean(c: var LevelCache, pos: ChunkPos, level: int8) =
+  let dst = MaxLevel - level + 1'i8
+  c.x = pos.x - int32(dst)
+  c.y = pos.y - int32(dst)
+  c.size = (int(dst) shl 1) or 1
+  for i in 0 ..< c.size * c.size:
+    c.cells[i] = LevelCell(orig: -127'i8, cur: -127'i8)
+
+proc getCell(c: var LevelCache, map: ChunkLevel, pos: ChunkPos): int8 =
+  let dx = int(pos.x - c.x)
+  let dy = int(pos.y - c.y)
+  assert pos.x >= c.x and pos.y >= c.y
+  let i = dx * c.size + dy
+  if c.cells[i].orig == -127'i8:
+    c.cells[i].orig = map.getOrDefault(pos, MaxLevel)
+    c.cells[i].cur = c.cells[i].orig
+  c.cells[i].cur
+
+proc setCell(c: var LevelCache, map: ChunkLevel, pos: ChunkPos, level: int8) =
+  let dx = int(pos.x - c.x)
+  let dy = int(pos.y - c.y)
+  assert pos.x >= c.x and pos.y >= c.y
+  let i = dx * c.size + dy
+  if c.cells[i].orig == -127'i8:
+    c.cells[i].orig = map.getOrDefault(pos, MaxLevel)
+  c.cells[i].cur = level
+
+proc writeCells(l: ChunkLoading) =
+  ## `LevelCache::write`
+  for i in 0 ..< l.cache.size:
+    for j in 0 ..< l.cache.size:
+      let value = l.cache.cells[i * l.cache.size + j]
+      if value.orig != value.cur:
+        let pos = chunkPos(int32(i) + l.cache.x, int32(j) + l.cache.y)
+        if value.cur == MaxLevel:
+          l.posLevel.del(pos)
+        else:
+          l.posLevel[pos] = value.cur
+        let oldStage = levelToStage(value.orig)
+        let newStage = levelToStage(value.cur)
+        if oldStage != newStage:
+          if l.change.hasKey(pos):
+            let existing = l.change.getOrDefault(pos, (oldStage: oldStage, newStage: newStage))
+            if existing.oldStage == newStage:
+              l.change.del(pos)
+            else:
+              l.change[pos] = (oldStage: existing.oldStage, newStage: newStage)
+          else:
+            l.change[pos] = (oldStage: oldStage, newStage: newStage)
+
+proc getLevelFromViewDistance*(viewDistance: uint8): int8 {.inline.} =
+  ## `ChunkLoading::get_level_from_view_distance`
+  FullChunkLevel - int8(viewDistance)
+
+proc newChunkLoading*(sender: LevelChannel): ChunkLoading =
+  ## `ChunkLoading::new`
+  ChunkLoading(isPriorityDirty: true, posLevel: initTable[ChunkPos, int8](), change: initTable[ChunkPos, StageChange](),
+    ticket: initTable[ChunkPos, seq[int8]](), highPriority: @[], sender: sender,
+    increaseUpdate: initHeapQueue[HeapNode](), decreaseUpdate: initHeapQueue[HeapNode](),
+    cache: LevelCache(cells: newSeq[LevelCell](256 * 256)))
+
+proc sendChange*(l: ChunkLoading) =
+  ## `ChunkLoading::send_change`
+  if l.change.len != 0:
+    let tmp = l.change
+    l.change = initTable[ChunkPos, StageChange]()
+    if l.isPriorityDirty:
+      l.isPriorityDirty = false
+      setBoth(l.sender, tmp, l.posLevel, l.highPriority)
+    else:
+      setLevel(l.sender, tmp, l.posLevel)
+  if l.isPriorityDirty:
+    l.isPriorityDirty = false
+    setPriority(l.sender, l.highPriority)
+
+proc checkThenPush(l: ChunkLoading, pos: ChunkPos, level: int8) =
+  assert level < MaxLevel
+  let old = getCell(l.cache, l.posLevel, pos)
+  if old <= level:
+    return
+  setCell(l.cache, l.posLevel, pos, level)
+  push(l.increaseUpdate, HeapNode(level: level, pos: pos))
+
+proc runIncreaseUpdate(l: ChunkLoading) =
+  while l.increaseUpdate.len > 0:
+    let node = pop(l.increaseUpdate)
+    let pos = node.pos
+    let level = node.level
+    assert level < MaxLevel
+    if level <= getCell(l.cache, l.posLevel, pos):
+      let spreadLevel = level + 1'i8
+      if spreadLevel < MaxLevel:
+        for dx in -1'i32 .. 1'i32:
+          for dy in -1'i32 .. 1'i32:
+            let newPos = addRaw(pos, dx, dy)
+            if not (newPos == pos):
+              checkThenPush(l, newPos, spreadLevel)
+
+proc runDecreaseUpdate(l: ChunkLoading, pos0: ChunkPos, range: int32) =
+  while l.decreaseUpdate.len > 0:
+    let node = pop(l.decreaseUpdate)
+    let pos = node.pos
+    let level = node.level
+    assert level < MaxLevel
+    let spreadLevel = level + 1'i8
+    for dx in -1'i32 .. 1'i32:
+      for dy in -1'i32 .. 1'i32:
+        let newPos = addRaw(pos, dx, dy)
+        if not (newPos == pos):
+          let newPosLevel = getCell(l.cache, l.posLevel, newPos)
+          if newPosLevel != MaxLevel:
+            assert newPosLevel <= spreadLevel
+            if newPosLevel == spreadLevel:
+              setCell(l.cache, l.posLevel, newPos, MaxLevel)
+              if spreadLevel < MaxLevel:
+                push(l.decreaseUpdate, HeapNode(level: spreadLevel, pos: newPos))
+            else:
+              push(l.increaseUpdate, HeapNode(level: newPosLevel, pos: newPos))
+
+  for ticketPos, levels in pairs(l.ticket):
+    if abs(ticketPos.x - pos0.x) <= range and abs(ticketPos.y - pos0.y) <= range:
+      var level = levels[0]
+      for v in levels:
+        if v < level:
+          level = v
+      assert level < MaxLevel
+      let old = getCell(l.cache, l.posLevel, ticketPos)
+      if old > level:
+        setCell(l.cache, l.posLevel, ticketPos, level)
+        push(l.increaseUpdate, HeapNode(level: level, pos: ticketPos))
+  runIncreaseUpdate(l)
+
+proc addTicket*(l: ChunkLoading, pos: ChunkPos, level: int8) =
+  ## `ChunkLoading::add_ticket`
+  assert level < MaxLevel
+  if l.ticket.hasKey(pos):
+    var v = l.ticket.getOrDefault(pos, @[])
+    v.add(level)
+    l.ticket[pos] = v
+  else:
+    l.ticket[pos] = @[level]
+  let old = l.posLevel.getOrDefault(pos, MaxLevel)
+  if old <= level:
+    return
+  clean(l.cache, pos, level)
+  setCell(l.cache, l.posLevel, pos, level)
+  assert l.increaseUpdate.len == 0
+  push(l.increaseUpdate, HeapNode(level: level, pos: pos))
+  runIncreaseUpdate(l)
+  writeCells(l)
+
+proc removeTicket*(l: ChunkLoading, pos: ChunkPos, level: int8) =
+  ## `ChunkLoading::remove_ticket`
+  assert level < MaxLevel
+  if not l.ticket.hasKey(pos):
+    return
+  var v = l.ticket.getOrDefault(pos, @[])
+  var index = -1
+  for i in 0 ..< v.len:
+    if v[i] == level:
+      index = i
+      break
+  if index < 0:
+    return
+  v.delete(index)
+  assert l.posLevel.hasKey(pos)
+  let oldLevel = l.posLevel.getOrDefault(pos, MaxLevel)
+  var source = MaxLevel
+  for x in v:
+    if x < source:
+      source = x
+  if v.len == 0:
+    l.ticket.del(pos)
+  else:
+    l.ticket[pos] = v
+  if level == oldLevel and source != level:
+    clean(l.cache, pos, oldLevel)
+    setCell(l.cache, l.posLevel, pos, MaxLevel)
+    assert l.decreaseUpdate.len == 0
+    push(l.decreaseUpdate, HeapNode(level: level, pos: pos))
+    runDecreaseUpdate(l, pos, int32(MaxLevel - level - 1'i8))
+    writeCells(l)
+
+proc addForceTicket*(l: ChunkLoading, pos: ChunkPos) =
+  ## `ChunkLoading::add_force_ticket`
+  l.highPriority.add(pos)
+  l.isPriorityDirty = true
+  addTicket(l, pos, FullChunkLevel)
+
+proc removeForceTicket*(l: ChunkLoading, pos: ChunkPos) =
+  ## `ChunkLoading::remove_force_ticket`
+  var index = -1
+  for i in 0 ..< l.highPriority.len:
+    if l.highPriority[i] == pos:
+      index = i
+      break
+  assert index >= 0
+  l.highPriority.delete(index)
+  l.isPriorityDirty = true
+  removeTicket(l, pos, FullChunkLevel)

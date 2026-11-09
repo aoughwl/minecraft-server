@@ -1,0 +1,451 @@
+## Fluid placement in the noise stage. Port of pumpkin-world/src/generation/noise/aquifer_sampler.rs, with
+## `StandardChunkFluidLevelSampler` from generation/proto_chunk.rs, which sits above this file here.
+##
+## `&'static Block` is the block id. `Option<&'static BlockState>` flattens to `AquiferResult.hasState`.
+
+{.feature: "lenientnils".}
+
+import std/math
+import ../../blockstates
+import ../../../generated/chunk_gen_settings
+import ../../../util/math/mathmod
+import ../../../util/math/rustnum as mathrust
+import ../../../util/xoroshiro128
+from ../../../data/block_state import asU16
+import ../generation
+import ../positions
+import router
+import surface_height_sampler
+
+type
+  FluidLevel* = object
+    maxY*: int32
+    blockId*: int
+
+  StandardChunkFluidLevelSampler* = object
+    topFluid*: FluidLevel
+    bottomFluid*: FluidLevel
+    bottomY*: int32
+
+  AquiferResult* = object
+    ## `(Option<&'static BlockState>, bool)`
+    hasState*: bool
+    state*: blockstates.BlockStateId
+    shouldScheduleFluidUpdate*: bool
+
+  CarverAquiferResult* = AquiferResult
+
+  AquiferSamplerKind* {.pure.} = enum
+    SeaLevel, Aquifer
+
+  WorldAquiferSampler* = ref object
+    fluidLevelSampler*: StandardChunkFluidLevelSampler
+    startX*, startY*, startZ*: int32
+    sizeY*, sizeZ*: int
+    levelsPresent*: seq[bool]
+    levels*: seq[FluidLevel]
+    packedPositions*: seq[int64]
+
+  AquiferSampler* = object
+    ## `enum AquiferSampler`
+    kind*: AquiferSamplerKind
+    levelSampler*: StandardChunkFluidLevelSampler  ## SeaLevel
+    aquifer*: WorldAquiferSampler                  ## Aquifer
+
+  CarverAquiferSampler* = ref object
+    aquifer*: WorldAquiferSampler
+    router*: ChunkNoiseRouter
+    heightEstimator*: SurfaceHeightEstimateSampler
+    sampleOptions*: ChunkNoiseFunctionSampleOptions
+
+let
+  AirBlockId* = blockIdByName("air")[1]
+  WaterBlockId* = blockIdByName("water")[1]    ## `WATER_BLOCK`
+  LavaBlockId* = blockIdByName("lava")[1]      ## `LAVA_BLOCK`
+  AirState = defaultStateOf(AirBlockId)
+  LavaState = defaultStateOf(LavaBlockId)
+  WaterState = defaultStateOf(WaterBlockId)
+
+proc newFluidLevel*(maxY: int32, blockId: int): FluidLevel =
+  FluidLevel(maxY: maxY, blockId: blockId)
+
+proc maxYExclusive*(l: FluidLevel): int32 {.inline.} = l.maxY
+
+proc getBlock*(l: FluidLevel, y: int32): int {.inline.} =
+  if y < l.maxY: l.blockId else: AirBlockId
+
+proc newStandardChunkFluidLevelSampler*(topFluid, bottomFluid: FluidLevel): StandardChunkFluidLevelSampler =
+  StandardChunkFluidLevelSampler(topFluid: topFluid, bottomFluid: bottomFluid,
+    bottomY: min(maxYExclusive(topFluid), maxYExclusive(bottomFluid)))
+
+proc getFluidLevel*(s: StandardChunkFluidLevelSampler, x, y, z: int32): FluidLevel {.inline.} =
+  if y < s.bottomY: s.bottomFluid else: s.topFluid
+
+proc packedPositionIndex(localX, localY, localZ, dimY, dimZ: int): int {.inline.} =
+  (localX * dimZ + localZ) * dimY + localY
+
+proc localXz(xz: int32): int32 {.inline.} = floorDiv(xz, 16'i32)
+proc localY(y: int32): int32 {.inline.} = floorDiv(y, 12'i32)
+
+const ChunkPosOffsets: array[13, (int32, int32)] = [
+  (0'i32, 0'i32), (-2'i32, -1'i32), (-1'i32, -1'i32), (0'i32, -1'i32), (1'i32, -1'i32), (-3'i32, 0'i32),
+  (-2'i32, 0'i32), (-1'i32, 0'i32), (1'i32, 0'i32), (-2'i32, 1'i32), (-1'i32, 1'i32), (0'i32, 1'i32),
+  (1'i32, 1'i32)]
+
+proc newWorldAquiferSampler*(chunkX, chunkZ: int32, randomDeriver: XoroshiroSplitter, minimumY: int8, height: uint16,
+                             fluidLevel: StandardChunkFluidLevelSampler): WorldAquiferSampler =
+  ## `WorldAquiferSampler::new`
+  let startX = localXz(startBlockX(chunkX)) - 1'i32
+  let endX = localXz(endBlockX(chunkX)) + 1'i32
+  let sizeX = int(endX - startX) + 1
+
+  let startY = localY(int32(minimumY)) - 1'i32
+  let endY = localY(int32(minimumY) + int32(height)) + 1'i32
+  let sizeY = int(endY - startY) + 1
+
+  let startZ = localXz(startBlockZ(chunkZ)) - 1'i32
+  let endZ = localXz(endBlockZ(chunkZ)) + 1'i32
+  let sizeZ = int(endZ - startZ) + 1
+
+  let cacheSize = sizeX * sizeY * sizeZ
+  var packedPositions = newSeq[int64](cacheSize)
+
+  for offsetX in 0 ..< sizeX:
+    for offsetY in 0 ..< sizeY:
+      for offsetZ in 0 ..< sizeZ:
+        let x = startX + int32(offsetX)
+        let y = startY + int32(offsetY)
+        let z = startZ + int32(offsetZ)
+        var random = splitPos(randomDeriver, x, y, z)
+        let randX = x * 16'i32 + nextBoundedI32(random, 10'i32)
+        let randY = y * 12'i32 + nextBoundedI32(random, 9'i32)
+        let randZ = z * 16'i32 + nextBoundedI32(random, 10'i32)
+        let index = packedPositionIndex(offsetX, offsetY, offsetZ, sizeY, sizeZ)
+        packedPositions[index] = packedBlock(int64(randX), int64(randY), int64(randZ))
+
+  WorldAquiferSampler(fluidLevelSampler: fluidLevel, startX: startX, startY: startY, startZ: startZ, sizeY: sizeY,
+    sizeZ: sizeZ, levelsPresent: newSeq[bool](cacheSize), levels: newSeq[FluidLevel](cacheSize),
+    packedPositions: packedPositions)
+
+proc checkedPackedPositionIndex(s: WorldAquiferSampler, x, y, z: int32): int =
+  ## -1 for upstream's None.
+  let lx = x - s.startX
+  let ly = y - s.startY
+  let lz = z - s.startZ
+  if lx < 0'i32 or ly < 0'i32 or lz < 0'i32:
+    return -1
+  if int(ly) >= s.sizeY or int(lz) >= s.sizeZ:
+    return -1
+  let index = packedPositionIndex(int(lx), int(ly), int(lz), s.sizeY, s.sizeZ)
+  if index < s.packedPositions.len: index else: -1
+
+proc randomPositionsForPos(s: WorldAquiferSampler, x, y, z: int32, into: var array[12, int64]): bool =
+  ## `random_positions_for_pos`, false for upstream's None.
+  let sy = s.sizeY
+  let syz = s.sizeY * s.sizeZ
+  let i00 = checkedPackedPositionIndex(s, x, y - 1'i32, z)
+  if i00 < 0:
+    return false
+  let i01 = i00 + sy
+  let i10 = i00 + syz
+  let i11 = i10 + sy
+  if i11 + 2 >= s.packedPositions.len:
+    return false
+  into[0] = s.packedPositions[i11 + 2]
+  into[1] = s.packedPositions[i10 + 2]
+  into[2] = s.packedPositions[i01 + 2]
+  into[3] = s.packedPositions[i00 + 2]
+  into[4] = s.packedPositions[i11 + 1]
+  into[5] = s.packedPositions[i10 + 1]
+  into[6] = s.packedPositions[i01 + 1]
+  into[7] = s.packedPositions[i00 + 1]
+  into[8] = s.packedPositions[i11]
+  into[9] = s.packedPositions[i10]
+  into[10] = s.packedPositions[i01]
+  into[11] = s.packedPositions[i00]
+  true
+
+proc maxDistance(i, a: int32): float64 {.inline.} =
+  1.0'f64 - float64(abs(a - i)) / 25.0'f64
+
+proc calculateDensity*(hasBarrierSample: var bool, barrierSample: var float64, pos: Vector3[int32],
+                       r: ChunkNoiseRouter, sampleOptions: ChunkNoiseFunctionSampleOptions,
+                       level1, level2: FluidLevel): float64 =
+  ## `WorldAquiferSampler::calculate_density`
+  let y = pos.y
+  let blockState1 = getBlock(level1, y)
+  let blockState2 = getBlock(level2, y)
+  if (blockState1 != LavaBlockId or blockState2 != WaterBlockId) and
+      (blockState1 != WaterBlockId or blockState2 != LavaBlockId):
+    let levelDiff = abs(level1.maxY - level2.maxY)
+    if levelDiff == 0'i32:
+      0.0'f64
+    else:
+      let avgLevel = 0.5'f64 * float64(level1.maxY + level2.maxY)
+      let scaledLevel = float64(y) + 0.5'f64 - avgLevel
+      let halvedDiff = float64(levelDiff) / 2.0'f64
+      let o = halvedDiff - abs(scaledLevel)
+      let q =
+        if scaledLevel > 0.0'f64:
+          if o > 0.0'f64: o / 1.5'f64 else: o / 2.5'f64
+        else:
+          let p = 3.0'f64 + o
+          if p > 0.0'f64: p / 3.0'f64 else: p / 10.0'f64
+      var rv = 0.0'f64
+      if q >= -2.0'f64 and q <= 2.0'f64:
+        if not hasBarrierSample:
+          barrierSample = sampleBarrierNoise(r, pos, sampleOptions)
+          hasBarrierSample = true
+        rv = barrierSample
+      2.0'f64 * (rv + q)
+  else:
+    2.0'f64
+
+proc getNoiseBasedFluidLevel*(blockX, blockY, blockZ, surfaceHeightEstimate: int32, r: ChunkNoiseRouter,
+                              sampleOptions: ChunkNoiseFunctionSampleOptions): int32 =
+  ## `WorldAquiferSampler::get_noise_based_fluid_level`
+  let x = floorDiv(blockX, 16'i32)
+  let y = floorDiv(blockY, 40'i32)
+  let z = floorDiv(blockZ, 16'i32)
+  let ly = y * 40'i32 + 20'i32
+  let sample = sampleFluidLevelSpreadNoise(r, vec3[int32](x, y, z), sampleOptions) * 10.0'f64
+  let toNearestMultipleOfThree = asI32(floor(sample / 3.0'f64)) * 3'i32
+  let localHeight = toNearestMultipleOfThree + ly
+  min(surfaceHeightEstimate, localHeight)
+
+proc getFluidBlockY*(blockX, blockY, blockZ: int32, defaultLevel: FluidLevel, surfaceHeightEstimate: int32, mapY: bool,
+                     r: ChunkNoiseRouter, sampleOptions: ChunkNoiseFunctionSampleOptions): int32 =
+  ## `WorldAquiferSampler::get_fluid_block_y`
+  let pos = vec3[int32](blockX, blockY, blockZ)
+  let isDeepDark = sampleErosion(r, pos, sampleOptions) < float64(-0.225'f32) and
+    sampleDepth(r, pos, sampleOptions) > float64(0.9'f32)
+  var d = -1.0'f64
+  var e = -1.0'f64
+  if not isDeepDark:
+    let topY = surfaceHeightEstimate + 8'i32 - blockY
+    let f = if mapY: clampedMap(float64(topY), 0.0'f64, 64.0'f64, 1.0'f64, 0.0'f64) else: 0.0'f64
+    let g0 = sampleFluidLevelFloodednessNoise(r, pos, sampleOptions)
+    let g = if g0 < -1.0'f64: -1.0'f64 elif g0 > 1.0'f64: 1.0'f64 else: g0
+    let h = map(f, 1.0'f64, 0.0'f64, -0.3'f64, 0.8'f64)
+    let k = map(f, 1.0'f64, 0.0'f64, -0.8'f64, 0.4'f64)
+    d = g - k
+    e = g - h
+  if e > 0.0'f64:
+    defaultLevel.maxY
+  elif d > 0.0'f64:
+    getNoiseBasedFluidLevel(blockX, blockY, blockZ, surfaceHeightEstimate, r, sampleOptions)
+  else:
+    MinHeightCell
+
+proc getFluidBlockState*(blockX, blockY, blockZ: int32, defaultLevel: FluidLevel, level: int32, r: ChunkNoiseRouter,
+                         sampleOptions: ChunkNoiseFunctionSampleOptions): int =
+  ## `WorldAquiferSampler::get_fluid_block_state`
+  if level <= -10'i32 and level != MinHeightCell and defaultLevel.blockId != LavaBlockId:
+    let x = floorDiv(blockX, 64'i32)
+    let y = floorDiv(blockY, 40'i32)
+    let z = floorDiv(blockZ, 64'i32)
+    let sample = sampleLavaNoise(r, vec3[int32](x, y, z), sampleOptions)
+    if abs(sample) > 0.3'f64:
+      return LavaBlockId
+  defaultLevel.blockId
+
+proc getFluidLevelFor*(fluidLevelSampler: StandardChunkFluidLevelSampler, blockX, blockY, blockZ: int32,
+                       r: ChunkNoiseRouter, heightEstimator: SurfaceHeightEstimateSampler,
+                       sampleOptions: ChunkNoiseFunctionSampleOptions): FluidLevel =
+  ## `WorldAquiferSampler::get_fluid_level`
+  let fluidLevel = getFluidLevel(fluidLevelSampler, blockX, blockY, blockZ)
+  let j = blockY + 12'i32
+  let k = blockY - 12'i32
+  var bl = false
+  var minSurfaceEstimate = int32.high
+  for oi in 0 ..< ChunkPosOffsets.len:
+    let offsetX = ChunkPosOffsets[oi][0]
+    let offsetZ = ChunkPosOffsets[oi][1]
+    let x = blockX + sectionToBlock(offsetX)
+    let z = blockZ + sectionToBlock(offsetZ)
+    let n = estimateHeight(heightEstimator, x, z)
+    let o = n + 8'i32
+    let bl2 = offsetX == 0'i32 and offsetZ == 0'i32
+    if bl2 and k > o:
+      return fluidLevel
+    let bl3 = j > o
+    if bl3 or bl2:
+      let neighbourLevel = getFluidLevel(fluidLevelSampler, x, o, z)
+      if not isAir(defaultStateOf(getBlock(neighbourLevel, o))):
+        if bl2:
+          bl = true
+        if bl3:
+          return neighbourLevel
+    minSurfaceEstimate = min(minSurfaceEstimate, n)
+  let p = getFluidBlockY(blockX, blockY, blockZ, fluidLevel, minSurfaceEstimate, bl, r, sampleOptions)
+  newFluidLevel(p, getFluidBlockState(blockX, blockY, blockZ, fluidLevel, p, r, sampleOptions))
+
+proc getWaterLevel(s: WorldAquiferSampler, packedPos: int64, r: ChunkNoiseRouter,
+                   heightEstimator: SurfaceHeightEstimateSampler,
+                   sampleOptions: ChunkNoiseFunctionSampleOptions): FluidLevel =
+  let x = unpackBlockX(packedPos)
+  let y = unpackBlockY(packedPos)
+  let z = unpackBlockZ(packedPos)
+  let index = checkedPackedPositionIndex(s, localXz(x), localY(y), localXz(z))
+  if index < 0:
+    return getFluidLevelFor(s.fluidLevelSampler, x, y, z, r, heightEstimator, sampleOptions)
+  if s.levelsPresent[index]:
+    return s.levels[index]
+  let sampled = getFluidLevelFor(s.fluidLevelSampler, x, y, z, r, heightEstimator, sampleOptions)
+  s.levels[index] = sampled
+  s.levelsPresent[index] = true
+  sampled
+
+proc levelsDiffer(a, b: FluidLevel): bool {.inline.} =
+  a.blockId != b.blockId or a.maxY != b.maxY
+
+proc applyInternal*(s: WorldAquiferSampler, r: ChunkNoiseRouter, pos: Vector3[int32],
+                    sampleOptions: ChunkNoiseFunctionSampleOptions, heightEstimator: SurfaceHeightEstimateSampler,
+                    density: float64): AquiferResult =
+  ## `WorldAquiferSampler::apply_internal`
+  if density > 0.0'f64:
+    return AquiferResult(hasState: false, shouldScheduleFluidUpdate: false)
+
+  let sampleX = pos.x
+  let sampleY = pos.y
+  let sampleZ = pos.z
+
+  let fluidLevel = getFluidLevel(s.fluidLevelSampler, sampleX, sampleY, sampleZ)
+  if getBlock(fluidLevel, sampleY) == LavaBlockId:
+    return AquiferResult(hasState: true, state: LavaState, shouldScheduleFluidUpdate: false)
+
+  let scaledX = localXz(sampleX - 5'i32)
+  let scaledY = localY(sampleY + 1'i32)
+  let scaledZ = localXz(sampleZ - 5'i32)
+
+  var randomPositions = default(array[12, int64])
+  if not randomPositionsForPos(s, scaledX, scaledY, scaledZ, randomPositions):
+    return AquiferResult(hasState: true, state: defaultStateOf(getBlock(fluidLevel, sampleY)),
+      shouldScheduleFluidUpdate: false)
+
+  var nearestPacked = [0'i64, 0'i64, 0'i64, 0'i64]
+  var nearestDist = [int32.high, int32.high, int32.high, int32.high]
+
+  # Same insertion order as the original array literal; sort behaviour is preserved.
+  for pi in 0 ..< 12:
+    let packed = randomPositions[pi]
+    let dx = unpackBlockX(packed) - sampleX
+    let dy = unpackBlockY(packed) - sampleY
+    let dz = unpackBlockZ(packed) - sampleZ
+    let h = dx * dx + dy * dy + dz * dz
+    if nearestDist[3] > h:
+      nearestPacked[3] = packed
+      nearestDist[3] = h
+    if nearestDist[2] > h:
+      nearestPacked[3] = nearestPacked[2]
+      nearestDist[3] = nearestDist[2]
+      nearestPacked[2] = packed
+      nearestDist[2] = h
+    if nearestDist[1] > h:
+      nearestPacked[2] = nearestPacked[1]
+      nearestDist[2] = nearestDist[1]
+      nearestPacked[1] = packed
+      nearestDist[1] = h
+    if nearestDist[0] > h:
+      nearestPacked[1] = nearestPacked[0]
+      nearestDist[1] = nearestDist[0]
+      nearestPacked[0] = packed
+      nearestDist[0] = h
+
+  let fluidLevel2 = getWaterLevel(s, nearestPacked[0], r, heightEstimator, sampleOptions)
+  let blockState = getBlock(fluidLevel2, sampleY)
+  let sim12 = maxDistance(nearestDist[0], nearestDist[1])
+
+  if sim12 <= 0.0'f64:
+    var shouldSchedule = false
+    if sim12 >= -0.12'f64:  # FLOWING_UPDATE_SIMILARITY
+      let fluidLevel3 = getWaterLevel(s, nearestPacked[1], r, heightEstimator, sampleOptions)
+      shouldSchedule = levelsDiffer(fluidLevel2, fluidLevel3)
+    return AquiferResult(hasState: true, state: defaultStateOf(blockState), shouldScheduleFluidUpdate: shouldSchedule)
+
+  if blockState == WaterBlockId and
+      getBlock(getFluidLevel(s.fluidLevelSampler, sampleX, sampleY - 1'i32, sampleZ), sampleY - 1'i32) == LavaBlockId:
+    return AquiferResult(hasState: true, state: WaterState, shouldScheduleFluidUpdate: true)
+
+  var hasBarrierSample = false
+  var barrierSample = 0.0'f64
+  let fluidLevel3 = getWaterLevel(s, nearestPacked[1], r, heightEstimator, sampleOptions)
+  let barrier12 = sim12 * calculateDensity(hasBarrierSample, barrierSample, pos, r, sampleOptions, fluidLevel2, fluidLevel3)
+
+  if density + barrier12 > 0.0'f64:
+    return AquiferResult(hasState: false, shouldScheduleFluidUpdate: false)
+
+  let fluidLevel4 = getWaterLevel(s, nearestPacked[2], r, heightEstimator, sampleOptions)
+  let sim13 = maxDistance(nearestDist[0], nearestDist[2])
+  if sim13 > 0.0'f64:
+    let barrier13 = sim12 * sim13 *
+      calculateDensity(hasBarrierSample, barrierSample, pos, r, sampleOptions, fluidLevel2, fluidLevel4)
+    if density + barrier13 > 0.0'f64:
+      return AquiferResult(hasState: false, shouldScheduleFluidUpdate: false)
+
+  let sim23 = maxDistance(nearestDist[1], nearestDist[2])
+  if sim23 > 0.0'f64:
+    let barrier23 = sim12 * sim23 *
+      calculateDensity(hasBarrierSample, barrierSample, pos, r, sampleOptions, fluidLevel3, fluidLevel4)
+    if density + barrier23 > 0.0'f64:
+      return AquiferResult(hasState: false, shouldScheduleFluidUpdate: false)
+
+  let mayFlow12 = levelsDiffer(fluidLevel2, fluidLevel3)
+  let mayFlow23 = sim23 >= -0.12'f64 and levelsDiffer(fluidLevel3, fluidLevel4)
+  let mayFlow13 = sim13 >= -0.12'f64 and levelsDiffer(fluidLevel2, fluidLevel4)
+
+  var shouldSchedule = false
+  if mayFlow12 or mayFlow23 or mayFlow13:
+    shouldSchedule = true
+  else:
+    let fluidLevel5 = getWaterLevel(s, nearestPacked[3], r, heightEstimator, sampleOptions)
+    shouldSchedule = sim13 >= -0.12'f64 and maxDistance(nearestDist[0], nearestDist[3]) >= -0.12'f64 and
+      levelsDiffer(fluidLevel2, fluidLevel5)
+
+  AquiferResult(hasState: true, state: defaultStateOf(blockState), shouldScheduleFluidUpdate: shouldSchedule)
+
+proc apply*(s: AquiferSampler, r: ChunkNoiseRouter, pos: Vector3[int32], sampleOptions: ChunkNoiseFunctionSampleOptions,
+            heightEstimator: SurfaceHeightEstimateSampler): AquiferResult =
+  ## `AquiferSamplerImpl::apply`
+  case s.kind
+  of AquiferSamplerKind.Aquifer:
+    let density = sampleFinalDensity(r, pos, sampleOptions)
+    applyInternal(s.aquifer, r, pos, sampleOptions, heightEstimator, density)
+  of AquiferSamplerKind.SeaLevel:
+    let sample = sampleFinalDensity(r, pos, sampleOptions)
+    if sample > 0.0'f64:
+      AquiferResult(hasState: false, shouldScheduleFluidUpdate: false)
+    else:
+      AquiferResult(hasState: true, shouldScheduleFluidUpdate: false,
+        state: defaultStateOf(getBlock(getFluidLevel(s.levelSampler, pos.x, pos.y, pos.z), pos.y)))
+
+proc newCarverAquiferSampler*(chunkX, chunkZ: int32, baseRouter: ProtoNoiseRouters, randomConfig: GlobalRandomConfig,
+                              settings: GenerationSettings): CarverAquiferSampler =
+  ## `CarverAquiferSampler::new`
+  let shape = settings.shape
+  let horizontalCellBlockCount = int32(horizontalCellBlockCount(shape))
+  let horizontalCellCount = 16'i32 div horizontalCellBlockCount
+  let startX = startBlockX(chunkX)
+  let startZ = startBlockZ(chunkZ)
+  let horizontalBiomeEnd = biomeFromBlock(horizontalCellCount * horizontalCellBlockCount)
+  let builderOptions = ChunkNoiseFunctionBuilderOptions(
+    horizontalCellBlockCount: int(horizontalCellBlockCount),
+    verticalCellBlockCount: int(verticalCellBlockCount(shape)),
+    verticalCellCount: int(shape.height) div int(verticalCellBlockCount(shape)),
+    horizontalCellCount: int(horizontalCellCount),
+    startBiomeX: biomeFromBlock(startX), startBiomeZ: biomeFromBlock(startZ),
+    horizontalBiomeEnd: int(horizontalBiomeEnd))
+  let surfaceConfig = newSurfaceHeightSamplerBuilderOptions(biomeFromBlock(startX), biomeFromBlock(startZ),
+    int(horizontalBiomeEnd), int32(shape.minY), int32(maxY(shape)), int(verticalCellBlockCount(shape)))
+  let fluidLevel = newStandardChunkFluidLevelSampler(
+    newFluidLevel(settings.seaLevel, blockIdOf(uint32(asU16(settings.defaultFluid)))),
+    newFluidLevel(-54'i32, LavaBlockId))
+  CarverAquiferSampler(
+    aquifer: newWorldAquiferSampler(chunkX, chunkZ, randomConfig.aquiferRandomDeriver, shape.minY, shape.height, fluidLevel),
+    router: generateChunkNoiseRouter(baseRouter.noise, builderOptions),
+    heightEstimator: generateSurfaceHeightEstimateSampler(baseRouter.surfaceEstimator, surfaceConfig),
+    sampleOptions: skipCellCachesOptions())
+
+proc compute*(s: CarverAquiferSampler, pos: Vector3[int32], density: float64): CarverAquiferResult =
+  ## `CarverAquiferSampler::compute`
+  applyInternal(s.aquifer, s.router, pos, s.sampleOptions, s.heightEstimator, density)

@@ -1,0 +1,132 @@
+## Port of pumpkin-world/src/generation/block_state_provider.rs
+##
+## One object with a kind, as block_predicate.aowl. Upstream rebuilds the double perlin sampler for each call, which
+## is pure, so `noiseBase` keeps doing that rather than holding state a shared table would need. The `TODO`s in
+## `RandomizedIntBlockStateProvider` and `PillarBlockStateProvider` are upstream's: they do not randomize.
+
+{.feature: "lenientnils".}
+
+import std/options
+import ../blockstates
+import ../tick
+import ../world
+import ../../util/legacy_rand
+import ../../util/math/int_provider
+import ../../util/math/mathmod
+from ../../util/math/pool import Pool, Weighted, get
+import ../../util/random/random
+import ../../util/random/rustnum
+import ../../util/utillib
+import ../../util/vector3
+import noise/doubleperlin
+import protochunkbase
+import block_predicate
+
+type
+  BlockStateProviderKind* {.pure.} = enum
+    Simple, WeightedList, NoiseThreshold, NoiseProvider, DualNoise, Pillar, RandomizedInt, Rule
+
+  NoiseBlockStateProviderBase* = object
+    seed*: int64
+    noise*: DoublePerlinNoiseParametersCodec
+    scale*: float32
+
+  BlockStateRule* = object
+    ifTrue*: BlockPredicate
+    then*: BlockStateProvider
+
+  BlockStateProvider* = ref object
+    kind*: BlockStateProviderKind
+    state*: blockstates.BlockStateId       ## Simple, Pillar; NoiseThreshold's default.
+    entries*: seq[Weighted[blockstates.BlockStateId]]  ## Weighted.
+    base*: NoiseBlockStateProviderBase     ## NoiseThreshold, NoiseProvider, DualNoise.
+    states*: seq[blockstates.BlockStateId] ## NoiseProvider, DualNoise.
+    threshold*, highChance*: float32       ## NoiseThreshold.
+    lowStates*, highStates*: seq[blockstates.BlockStateId]  ## NoiseThreshold.
+    variety*: array[2, uint32]             ## DualNoise.
+    slowNoise*: DoublePerlinNoiseParametersCodec  ## DualNoise.
+    slowScale*: float64                    ## DualNoise.
+    source*: BlockStateProvider            ## RandomizedInt.
+    property*: string                      ## RandomizedInt.
+    values*: IntProvider                   ## RandomizedInt.
+    fallback*: BlockStateProvider          ## Rule; nil for upstream's None.
+    rules*: seq[BlockStateRule]            ## Rule.
+
+  OptionalState* = object
+    ## `Option<&'static BlockState>`
+    hasState*: bool
+    state*: blockstates.BlockStateId
+
+proc samplerFor(seed: int64, noise: DoublePerlinNoiseParametersCodec): DoublePerlinNoiseSampler =
+  var rand = toRandomGenerator(legacy_rand.fromSeed(cast[uint64](seed)))
+  newDoublePerlinNoiseSampler(rand, noise.firstOctave, noise.amplitudes, noise.amplitude, false)
+
+proc getNoise*(b: NoiseBlockStateProviderBase, pos: BlockPos): float64 =
+  ## `NoiseBlockStateProviderBase::get_noise`
+  let sampler = samplerFor(b.seed, b.noise)
+  let scale = float64(b.scale)
+  sample(sampler, float64(pos.x) * scale, float64(pos.y) * scale, float64(pos.z) * scale)
+
+proc getStateByValue(states: seq[blockstates.BlockStateId], value: float64): blockstates.BlockStateId =
+  ## `NoiseBlockStateProvider::get_state_by_value`
+  let m = (1.0'f64 + value) / 2.0'f64  # `f64::midpoint`
+  let val = if m < 0.0'f64: 0.0'f64 elif m > 0.9999'f64: 0.9999'f64 else: m
+  states[int(asI64(val * float64(states.len)))]
+
+proc dualNoiseGet(p: BlockStateProvider, pos: BlockPos): blockstates.BlockStateId =
+  let sampler = samplerFor(p.base.seed, p.slowNoise)
+  let slow = sample(sampler, float64(pos.x) * p.slowScale, float64(pos.y) * p.slowScale, float64(pos.z) * p.slowScale)
+  let mapped = asI32(clampedMap(slow, -1.0'f64, 1.0'f64, float64(p.variety[0]), float64(p.variety[1]) + 1.0'f64))
+  var list = newSeq[blockstates.BlockStateId](0)
+  var i = 0'i32
+  while i < mapped:
+    let value = sample(sampler, float64(i) * 54545.0'f64 * p.slowScale, 0.0'f64 * p.slowScale, float64(i) * 34234.0'f64 * p.slowScale)
+    list.add(getStateByValue(p.states, value))
+    inc i
+  getStateByValue(list, getNoise(p.base, pos))
+
+proc getOptional*(p: BlockStateProvider, blockRegistry: WorldPortalExt, chunk: GenerationCache, random: var RandomGenerator,
+                  pos: BlockPos): OptionalState
+
+proc get*(p: BlockStateProvider, random: var RandomGenerator, pos: BlockPos, chunk: GenerationCache,
+          blockRegistry: WorldPortalExt): blockstates.BlockStateId =
+  ## `BlockStateProvider::get`
+  case p.kind
+  of BlockStateProviderKind.NoiseThreshold:
+    let value = getNoise(p.base, pos)
+    if value < float64(p.threshold):
+      return p.lowStates[int(nextBoundedI32(random, int32(p.lowStates.len)))]
+    if nextF32(random) < p.highChance:
+      return p.highStates[int(nextBoundedI32(random, int32(p.highStates.len)))]
+    p.state
+  of BlockStateProviderKind.NoiseProvider:
+    getStateByValue(p.states, getNoise(p.base, pos))
+  of BlockStateProviderKind.Simple, BlockStateProviderKind.Pillar:
+    p.state
+  of BlockStateProviderKind.WeightedList:
+    options.get(get(Pool, p.entries, random))
+  of BlockStateProviderKind.DualNoise:
+    dualNoiseGet(p, pos)
+  of BlockStateProviderKind.RandomizedInt:
+    get(p.source, random, pos, chunk, blockRegistry)
+  of BlockStateProviderKind.Rule:
+    let optional = getOptional(p, blockRegistry, chunk, random, pos)
+    if optional.hasState: optional.state
+    else: chunk.getBlockState(vec3[int32](pos.x, pos.y, pos.z))
+
+proc getWithContext*(p: BlockStateProvider, blockRegistry: WorldPortalExt, chunk: GenerationCache, random: var RandomGenerator,
+                     pos: BlockPos): blockstates.BlockStateId =
+  ## `BlockStateProvider::get_with_context`: the two forms of `get` read the same here.
+  get(p, random, pos, chunk, blockRegistry)
+
+proc getOptional*(p: BlockStateProvider, blockRegistry: WorldPortalExt, chunk: GenerationCache, random: var RandomGenerator,
+                  pos: BlockPos): OptionalState =
+  ## `BlockStateProvider::get_optional` and `RuleBasedBlockStateProvider::get_optional`
+  if p.kind != BlockStateProviderKind.Rule:
+    return OptionalState(hasState: true, state: get(p, random, pos, chunk, blockRegistry))
+  for ri in 0 ..< p.rules.len:
+    if test(p.rules[ri].ifTrue, blockRegistry, chunk, pos):
+      return OptionalState(hasState: true, state: getWithContext(p.rules[ri].then, blockRegistry, chunk, random, pos))
+  if p.fallback != nil:
+    return OptionalState(hasState: true, state: get(p.fallback, random, pos, chunk, blockRegistry))
+  OptionalState(hasState: false)

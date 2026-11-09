@@ -1,0 +1,221 @@
+## The surface rule engine. Port of pumpkin-world/src/generation/surface/mod.rs and
+## pumpkin-world/src/generation/surface/rule.rs
+##
+## Rules and conditions are indices into `GenerationSettings.surfaceRules` and `surfaceConditions`; see
+## generated/chunk_gen_settings.aowl. A `settings` argument carries them where upstream hands a `&'static`.
+
+{.feature: "lenientnils".}
+
+import std/math
+import ../../blockstates
+import ../../../generated/chunk_gen_settings
+import ../../../generated/biome
+import ../../../util/mathlerp
+import ../../../util/math/mathmod
+import ../../../util/random/rustnum
+import ../../../util/xoroshiro128
+from ../../../data/block_state import asU16
+import ../generation
+import ../positions
+import ../noise/doubleperlin
+import ../noise/router
+import ../noise/surface_height_sampler
+import ../protochunkbase
+import ../biomeweather
+import terrain
+
+export terrain
+
+type
+  MaterialRuleContext* = ref object
+    minY*: int8
+    height*: uint16
+    randomDeriver*: XoroshiroSplitter
+    fluidHeight: int32
+    blockPosX*, blockPosY*, blockPosZ*: int32
+    biomeId*: uint8
+    runDepth*: int32
+    secondaryDepth*: float64
+    packedChunkPos: int64
+    estimatedSurfaceHeights: array[4, int32]
+    lastUniqueHorizontalPosValue: int64
+    lastEstHeightUniqueHorizontalPosValue: int64
+    uniqueHorizontalPosValue: int64
+    surfaceMinY: int32
+    surfaceNoise*: DoublePerlinNoiseSampler
+    secondaryNoise*: DoublePerlinNoiseSampler
+    stoneDepthBelow*, stoneDepthAbove*: int32
+    terrainBuilder*: SurfaceTerrainBuilder
+    seaLevel*: int32
+    hasSteepMaterialCondition: bool
+    steepMaterialCondition: bool
+
+  RuleResult* = object
+    ## `Option<&'static BlockState>`
+    hasState*: bool
+    state*: blockstates.BlockStateId
+
+proc newMaterialRuleContext*(minY: int8, height: uint16, randomDeriver: XoroshiroSplitter,
+                             terrainBuilder: SurfaceTerrainBuilder, surfaceNoise, secondaryNoise: DoublePerlinNoiseSampler,
+                             seaLevel: int32): MaterialRuleContext =
+  ## `MaterialRuleContext::new`
+  let horizontalPos = -int64.high  # Vanilla
+  MaterialRuleContext(minY: minY, height: height, surfaceMinY: 0'i32, packedChunkPos: int64.high,
+    uniqueHorizontalPosValue: horizontalPos - 1'i64,  # Because pre increment
+    lastUniqueHorizontalPosValue: horizontalPos - 1'i64,
+    lastEstHeightUniqueHorizontalPosValue: horizontalPos - 1'i64,
+    randomDeriver: randomDeriver, terrainBuilder: terrainBuilder, biomeId: PLAINS.id,
+    surfaceNoise: surfaceNoise, secondaryNoise: secondaryNoise, seaLevel: seaLevel)
+
+proc sampleRunDepth(c: MaterialRuleContext): int32 =
+  let noise = sample(c.surfaceNoise, float64(c.blockPosX), 0.0'f64, float64(c.blockPosZ))
+  var random = splitPos(c.randomDeriver, c.blockPosX, 0'i32, c.blockPosZ)
+  asI32(noise * 2.75'f64 + 3.0'f64 + nextF64(random) * 0.25'f64)
+
+proc initHorizontal*(c: MaterialRuleContext, x, z: int32) =
+  c.uniqueHorizontalPosValue += 1'i64
+  c.blockPosX = x
+  c.blockPosZ = z
+  c.runDepth = sampleRunDepth(c)
+
+proc initVertical*(c: MaterialRuleContext, stoneDepthAbove, stoneDepthBelow, y, fluidHeight: int32) =
+  c.blockPosY = y
+  c.fluidHeight = fluidHeight
+  c.stoneDepthBelow = stoneDepthBelow
+  c.stoneDepthAbove = stoneDepthAbove
+
+proc getSecondaryDepth*(c: MaterialRuleContext): float64 =
+  if c.lastUniqueHorizontalPosValue != c.uniqueHorizontalPosValue:
+    c.lastUniqueHorizontalPosValue = c.uniqueHorizontalPosValue
+    c.secondaryDepth = sample(c.secondaryNoise, float64(c.blockPosX), 0.0'f64, float64(c.blockPosZ))
+  c.secondaryDepth
+
+proc setSteepMaterialCondition*(c: MaterialRuleContext, steep: bool) =
+  c.hasSteepMaterialCondition = true
+  c.steepMaterialCondition = steep
+
+proc steepMaterialCondition*(chunk: ProtoChunk, blockX, blockZ: int32): bool =
+  let localX = blockX and 15'i32
+  let localZ = blockZ and 15'i32
+  let localZSub = max(0'i32, localZ - 1'i32)
+  let localZAdd = min(15'i32, localZ + 1'i32)
+  let subHeightZ = topBlockHeightExclusive(chunk, localX, localZSub)
+  let addHeightZ = topBlockHeightExclusive(chunk, localX, localZAdd)
+  if addHeightZ >= subHeightZ + 4'i32:
+    return true
+  let localXSub = max(0'i32, localX - 1'i32)
+  let localXAdd = min(15'i32, localX + 1'i32)
+  let subHeightX = topBlockHeightExclusive(chunk, localXSub, localZ)
+  let addHeightX = topBlockHeightExclusive(chunk, localXAdd, localZ)
+  subHeightX >= addHeightX + 4'i32
+
+proc saturatingAdd(a, b: int32): int32 {.inline.} =
+  let s = int64(a) + int64(b)
+  if s > int64(int32.high): int32.high
+  elif s < int64(int32.low): int32.low
+  else: int32(s)
+
+proc estimateSurfaceHeight*(c: MaterialRuleContext, sampler: SurfaceHeightEstimateSampler): int32 =
+  ## `estimate_surface_height`
+  if c.lastEstHeightUniqueHorizontalPosValue != c.uniqueHorizontalPosValue:
+    c.lastEstHeightUniqueHorizontalPosValue = c.uniqueHorizontalPosValue
+    let x = blockToSection(c.blockPosX)
+    let z = blockToSection(c.blockPosZ)
+    let packed = cast[int64](packedChunkI32(x, z))
+    if c.packedChunkPos != packed:
+      c.packedChunkPos = packed
+      c.estimatedSurfaceHeights[0] = estimateHeight(sampler, sectionToBlock(x), sectionToBlock(z))
+      c.estimatedSurfaceHeights[1] = estimateHeight(sampler, sectionToBlock(x + 1'i32), sectionToBlock(z))
+      c.estimatedSurfaceHeights[2] = estimateHeight(sampler, sectionToBlock(x), sectionToBlock(z + 1'i32))
+      c.estimatedSurfaceHeights[3] = estimateHeight(sampler, sectionToBlock(x + 1'i32), sectionToBlock(z + 1'i32))
+    let surface = asI32(floor(lerp2(
+      float64(float32(c.blockPosX and 15'i32) / 16.0'f32),
+      float64(float32(c.blockPosZ and 15'i32) / 16.0'f32),
+      float64(c.estimatedSurfaceHeights[0]),
+      float64(c.estimatedSurfaceHeights[1]),
+      float64(c.estimatedSurfaceHeights[2]),
+      float64(c.estimatedSurfaceHeights[3]))))
+    c.surfaceMinY = saturatingAdd(surface, c.runDepth) - 8'i32
+  c.surfaceMinY
+
+proc testVerticalGradient(condition: MaterialCondition, c: MaterialRuleContext): bool =
+  let trueAt = getY(condition.trueAtAndBelow, int16(c.minY), c.height)
+  let falseAt = getY(condition.falseAtAndAbove, int16(c.minY), c.height)
+  let blockY = c.blockPosY
+  if blockY <= trueAt:
+    return true
+  if blockY >= falseAt:
+    return false
+  var source = fromLoAndHi(c.randomDeriver, condition.randomLo, condition.randomHi)
+  let splitter = newSplitter(source)
+  let mapped = map(float32(blockY), float32(trueAt), float32(falseAt), 1.0'f32, 0.0'f32)
+  var random = splitPos(splitter, c.blockPosX, blockY, c.blockPosZ)
+  nextF32(random) < mapped
+
+proc testStoneDepth(condition: MaterialCondition, c: MaterialRuleContext): bool =
+  let stoneDepth = if condition.surfaceType == vstCeiling: c.stoneDepthBelow else: c.stoneDepthAbove
+  let depth = if condition.addSurfaceDepth: c.runDepth else: 0'i32
+  let depthRange =
+    if condition.secondaryDepthRange == 0'i32: 0'i32
+    else: asI32(map(getSecondaryDepth(c), -1.0'f64, 1.0'f64, 0.0'f64, float64(condition.secondaryDepthRange)))
+  stoneDepth <= 1'i32 + condition.offset + depth + depthRange
+
+proc testCondition*(settings: GenerationSettings, condition: int32, chunk: ProtoChunk, c: MaterialRuleContext,
+                    sampler: SurfaceHeightEstimateSampler): bool =
+  ## `test_condition`
+  let idx = int(condition)
+  case settings.surfaceConditions[idx].kind
+  of mcBiome:
+    let id = c.biomeId
+    for bi in 0 ..< settings.surfaceConditions[idx].biomeIs.len:
+      if settings.surfaceConditions[idx].biomeIs[bi] == id:
+        return true
+    false
+  of mcNoiseThreshold:
+    let value = sampleThresholdNoise(c.terrainBuilder, int(settings.surfaceConditions[idx].noise),
+      float64(c.blockPosX), 0.0'f64, float64(c.blockPosZ))
+    value >= settings.surfaceConditions[idx].minThreshold and value <= settings.surfaceConditions[idx].maxThreshold
+  of mcVerticalGradient:
+    testVerticalGradient(settings.surfaceConditions[idx], c)
+  of mcYAbove:
+    c.blockPosY + (if settings.surfaceConditions[idx].addStoneDepth: c.stoneDepthAbove else: 0'i32) >=
+      getY(settings.surfaceConditions[idx].anchor, int16(c.minY), c.height) +
+        c.runDepth * settings.surfaceConditions[idx].surfaceDepthMultiplier
+  of mcWater:
+    c.fluidHeight == int32.low or
+      c.blockPosY + (if settings.surfaceConditions[idx].addStoneDepth: c.stoneDepthAbove else: 0'i32) >=
+        c.fluidHeight + settings.surfaceConditions[idx].offset +
+          c.runDepth * settings.surfaceConditions[idx].surfaceDepthMultiplier
+  of mcTemperature:
+    computeBiomeTemperature(c.biomeId, float64(c.blockPosX), c.blockPosY, float64(c.blockPosZ), c.seaLevel) < 0.15'f32
+  of mcSteep:
+    if c.hasSteepMaterialCondition: c.steepMaterialCondition
+    else: steepMaterialCondition(chunk, c.blockPosX, c.blockPosZ)
+  of mcNot:
+    not testCondition(settings, settings.surfaceConditions[idx].invert, chunk, c, sampler)
+  of mcHole:
+    c.runDepth <= 0'i32
+  of mcAbovePreliminarySurface:
+    c.blockPosY >= estimateSurfaceHeight(c, sampler)
+  of mcStoneDepth:
+    testStoneDepth(settings.surfaceConditions[idx], c)
+
+proc tryApplyMaterialRule*(settings: GenerationSettings, rule: int32, chunk: ProtoChunk, c: MaterialRuleContext,
+                           sampler: SurfaceHeightEstimateSampler): RuleResult =
+  ## `try_apply_material_rule`, with `try_apply_sequence` and `try_apply_condition` inline.
+  let idx = int(rule)
+  case settings.surfaceRules[idx].kind
+  of mrBadlands:
+    RuleResult(hasState: true, state: getTerracottaBlock(c.terrainBuilder, c.blockPosX, c.blockPosY, c.blockPosZ))
+  of mrBlock:
+    RuleResult(hasState: true, state: uint32(asU16(settings.surfaceRules[idx].resultState)))
+  of mrSequence:
+    for si in 0 ..< settings.surfaceRules[idx].sequence.len:
+      let r = tryApplyMaterialRule(settings, settings.surfaceRules[idx].sequence[si], chunk, c, sampler)
+      if r.hasState:
+        return r
+    RuleResult(hasState: false)
+  of mrCondition:
+    if testCondition(settings, settings.surfaceRules[idx].ifTrue, chunk, c, sampler):
+      return tryApplyMaterialRule(settings, settings.surfaceRules[idx].thenRun, chunk, c, sampler)
+    RuleResult(hasState: false)

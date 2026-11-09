@@ -1,0 +1,1292 @@
+## The density function stacks: built per seed, then per chunk, then sampled.
+## Port of pumpkin-world/src/generation/noise/router/proto_noise_router.rs,
+## pumpkin-world/src/generation/noise/router/chunk_noise_router.rs,
+## pumpkin-world/src/generation/noise/router/chunk_density_function.rs,
+## pumpkin-world/src/generation/noise/router/find_top_surface.rs,
+## pumpkin-world/src/generation/noise/router/mod.rs,
+## pumpkin-world/src/generation/noise/router/density_function/mod.rs,
+## pumpkin-world/src/generation/noise/router/density_function/math.rs,
+## pumpkin-world/src/generation/noise/router/density_function/misc.rs,
+## pumpkin-world/src/generation/noise/router/density_function/noise.rs,
+## pumpkin-world/src/generation/noise/router/density_function/spline.rs and
+## pumpkin-world/src/generation/noise/router/density_function/beardifier.rs
+##
+## One module, because upstream's enum_dispatch traits make them mutually recursive and modules here cannot be.
+## The proto component enums flatten to `ProtoComponent` with one `ProtoKind`, and the chunk ones to
+## `ChunkComponent`. Upstream hands each sample a slice `&mut stack[..=index]` to satisfy the borrow checker;
+## an index into `ChunkStack` says the same. Splines are not a recursive type here: `SplineRepr` already is an
+## arena in generated/noise_router.aowl, so a spline value is an index into `ProtoStack.splines`.
+##
+## `IndexToNoisePos` is `IndexMapper`, a closed set of upstream's two impls, so it needs no closures in a hot
+## path. The thread-local buffer pool in chunk_density_function.rs is left out: it recycles allocations and has
+## no effect on results.
+##
+## The float arithmetic is upstream's, operation for operation; do not reorder it.
+
+{.feature: "lenientnils".}
+
+import std/math
+import std/options
+import ../../../generated/noise_router
+import ../../../generated/noise_parameter
+import ../../../util/vector3
+import ../../../util/mathlerp
+import ../../../util/math/mathmod
+import ../../../util/math/block_box
+import ../../../util/math/rustnum as mathrust
+from ../../../util/random/rustnum import wrapAdd, wrapMul
+import ../../../util/noise/simplex
+import ../../../util/legacy_rand
+import ../../../util/xoroshiro128
+import ../generation
+import ../positions
+import doubleperlin
+
+export noise_router, doubleperlin, vector3
+
+proc hypotf(x, y: cfloat): cfloat {.importc: "hypotf", header: "<math.h>".}
+proc fmodf(x, y: cfloat): cfloat {.importc: "fmodf", header: "<math.h>".}
+
+# `let`, not `const`: the compiler cannot write an infinite float constant to its intermediate form.
+let
+  PosInf* = cast[float64](0x7FF0000000000000'u64)
+  NegInf* = cast[float64](0xFFF0000000000000'u64)
+  PosInfF32 = cast[float32](0x7F800000'u32)
+  NegInfF32 = cast[float32](0xFF800000'u32)
+
+type
+  ProtoKind* {.pure.} = enum
+    # `IndependentProtoNoiseFunctionComponent`
+    Constant, EndIsland, Noise, ShiftA, ShiftB, InterpolatedNoise, ClampedYGradient
+    # `DependentProtoNoiseFunctionComponent`
+    Linear, Unary, Binary, ShiftedNoise, IntervalSelect, FindTopSurface, Clamp, RangeChoice, Spline
+    # The rest of `ProtoNoiseFunctionComponent`
+    Wrapper, PassThrough, Beardifier
+
+  ProtoComponent* = ref object
+    kind*: ProtoKind
+    minValue*, maxValue*: float64
+    inputIndex*: int
+    input2Index*: int             ## Binary; ShiftedNoise's y; RangeChoice's when-in; FindTopSurface's upper bound.
+    input3Index*: int             ## ShiftedNoise's z; RangeChoice's when-out.
+    value*: float64               ## Constant; Linear's argument.
+    sampler*: DoublePerlinNoiseSampler  ## Noise, ShiftA, ShiftB, ShiftedNoise.
+    xzScale*, yScale*: float64    ## Noise, ShiftedNoise.
+    simplex*: SimplexNoiseSampler ## EndIsland.
+    lowerNoise*, upperNoise*, noise*: OctavePerlinNoiseSampler  ## InterpolatedNoise.
+    scaledXzScale*, xzFactor*, yFactor*, smearScaleMultiplier*, yMultiplier*: float64
+    fractions*: array[16, float64]
+    fromY*, toY*, fromValue*, toValue*: float64  ## ClampedYGradient; RangeChoice's bounds use fromValue, toValue.
+    linearOperation*: LinearOperation
+    unaryOperation*: UnaryOperation
+    binaryOperation*: BinaryOperation
+    thresholds*: seq[float64]
+    functionsIndices*: seq[int]
+    lowerBound*, cellHeight*: int32  ## FindTopSurface.
+    wrapper*: WrapperType
+    spline*: int                  ## Index into the stack's arena.
+
+  ProtoStack* = ref object
+    components*: seq[ProtoComponent]
+    splines*: seq[SplineRepr]
+
+  ProtoNoiseRouter* = object
+    stack*: ProtoStack
+    barrierNoise*, fluidLevelFloodednessNoise*, fluidLevelSpreadNoise*, lavaNoise*, erosion*, depth*: int
+    finalDensity*, veinToggle*, veinRidged*, veinGap*: int
+
+  ProtoSurfaceEstimator* = object
+    stack*: ProtoStack
+
+  ProtoMultiNoiseRouter* = object
+    stack*: ProtoStack
+    temperature*, vegetation*, continents*, erosion*, depth*, ridges*: int
+
+  ProtoNoiseRouters* = ref object
+    noise*: ProtoNoiseRouter
+    surfaceEstimator*: ProtoSurfaceEstimator
+    multiNoise*: ProtoMultiNoiseRouter
+
+  # beardifier.rs
+
+  TerrainAdaptation* {.pure.} = enum
+    None, BeardThin, BeardBox, Bury, Encapsulate
+
+  BeardifierJunction* = object
+    x*, groundY*, z*: int32
+
+  BeardifierStructure* = object
+    ## `Beardifier.Rigid` in vanilla.
+    boundingBox*: BlockBox
+    terrainAdaptation*: TerrainAdaptation
+    groundLevelDelta*: int32
+
+  # chunk_density_function.rs
+
+  ChunkNoiseFunctionSampleOptions* = object
+    populatingCaches*: bool
+    cellCaches*: bool             ## `SampleAction::CellCaches`, whose `WrapperData` flattens in here.
+    cellXBlockPosition*, cellYBlockPosition*, cellZBlockPosition*: int
+    horizontalCellBlockCount*, verticalCellBlockCount*: int
+    xDelta*, yDelta*, zDelta*: float64
+    cacheResultUniqueId*: uint64
+    cacheFillUniqueId*: uint64
+    fillIndex*: int
+
+  ChunkNoiseFunctionBuilderOptions* = object
+    horizontalCellBlockCount*, verticalCellBlockCount*: int
+    verticalCellCount*, horizontalCellCount*: int
+    startBiomeX*, startBiomeZ*: int32
+    horizontalBiomeEnd*: int
+    beardifierStructures*: seq[BeardifierStructure]
+    beardifierJunctions*: seq[BeardifierJunction]
+    hasAffectedBox*: bool
+    affectedBox*: BlockBox
+
+  IndexMapperKind* {.pure.} = enum
+    Interpolation, ChunkIndex
+
+  IndexMapper* = object
+    ## `IndexToNoisePos`: `InterpolationIndexMapper` and `ChunkIndexMapper`.
+    kind*: IndexMapperKind
+    x*, z*, minimumCellY*, verticalBlockCount*: int32  ## Interpolation.
+    startX*, startY*, startZ*: int32                   ## ChunkIndex.
+    horizontalCellBlockCount*, verticalCellBlockCount*: int
+
+  ChunkKind* {.pure.} = enum
+    Proto, PassThrough, DensityInterpolator, FlatCache, Cache2D, CacheOnce, CellCache, Beardifier
+
+  ChunkComponent* = ref object
+    kind*: ChunkKind
+    minValue*, maxValue*: float64
+    proto*: ProtoComponent        ## Proto: `Independent` or `Dependent`.
+    inputIndex*: int
+    # DensityInterpolator
+    startBuffer*, endBuffer*: seq[float64]
+    firstPass*: array[8, float64]
+    secondPass*: array[4, float64]
+    thirdPass*: array[2, float64]
+    result*: float64
+    verticalCellCount*: int
+    # FlatCache
+    startBiomeX*, startBiomeZ*: int32
+    horizontalBiomeEnd*: int
+    # FlatCache, CacheOnce, CellCache
+    cache*: seq[float64]
+    # Cache2D
+    lastSampleColumn*: uint64
+    # Cache2D, CacheOnce
+    lastSampleResult*: float64
+    # CacheOnce
+    cacheResultUniqueId*, cacheFillUniqueId*: uint64
+    # Beardifier
+    structures*: seq[BeardifierStructure]
+    junctions*: seq[BeardifierJunction]
+    hasAffectedBox*: bool
+    affectedBox*: BlockBox
+
+  ChunkStack* = ref object
+    ## The top of a sample is an index; `splines` is the proto stack's arena.
+    comps*: seq[ChunkComponent]
+    splines*: seq[SplineRepr]
+
+  ChunkNoiseRouter* = ref object
+    barrierNoise*, fluidLevelFloodednessNoise*, fluidLevelSpreadNoise*, lavaNoise*, erosion*, depth*: int
+    finalDensity*, veinToggle*, veinRidged*, veinGap*: int
+    stack*: ChunkStack
+    interpolatorIndices*: seq[int]
+    cellIndices*: seq[int]
+
+# --- WrapperData and the sample options ---------------------------------------------------
+
+proc newSampleOptions*(populatingCaches, cellCaches: bool, cacheResultUniqueId, cacheFillUniqueId: uint64,
+                       fillIndex: int): ChunkNoiseFunctionSampleOptions =
+  ## `ChunkNoiseFunctionSampleOptions::new`, with no wrapper data yet.
+  ChunkNoiseFunctionSampleOptions(populatingCaches: populatingCaches, cellCaches: cellCaches,
+    cacheResultUniqueId: cacheResultUniqueId, cacheFillUniqueId: cacheFillUniqueId, fillIndex: fillIndex)
+
+proc skipCellCachesOptions*(): ChunkNoiseFunctionSampleOptions =
+  ## `ChunkNoiseFunctionSampleOptions::new(false, SampleAction::SkipCellCaches, 0, 0, 0)`
+  newSampleOptions(false, false, 0'u64, 0'u64, 0)
+
+proc setWrapperData*(o: var ChunkNoiseFunctionSampleOptions, cellX, cellY, cellZ, horizontal, vertical: int) =
+  ## `WrapperData::new`
+  o.cellXBlockPosition = cellX
+  o.cellYBlockPosition = cellY
+  o.cellZBlockPosition = cellZ
+  o.horizontalCellBlockCount = horizontal
+  o.verticalCellBlockCount = vertical
+  o.xDelta = float64(cellX) / float64(horizontal)
+  o.yDelta = float64(cellY) / float64(vertical)
+  o.zDelta = float64(cellZ) / float64(horizontal)
+
+proc updatePosition(o: var ChunkNoiseFunctionSampleOptions, cellX, cellY, cellZ: int) =
+  ## `WrapperData::update_position`
+  if cellX != o.cellXBlockPosition:
+    o.cellXBlockPosition = cellX
+    o.xDelta = float64(cellX) / float64(o.horizontalCellBlockCount)
+  if cellY != o.cellYBlockPosition:
+    o.cellYBlockPosition = cellY
+    o.yDelta = float64(cellY) / float64(o.verticalCellBlockCount)
+  if cellZ != o.cellZBlockPosition:
+    o.cellZBlockPosition = cellZ
+    o.zDelta = float64(cellZ) / float64(o.horizontalCellBlockCount)
+
+proc atNoOptions(m: IndexMapper, index: int): Vector3[int32] =
+  ## `at(index, None)`
+  case m.kind
+  of IndexMapperKind.Interpolation:
+    let y = (int32(index) + m.minimumCellY) * m.verticalBlockCount
+    vec3[int32](m.x, y, m.z)
+  of IndexMapperKind.ChunkIndex:
+    let cellZ = index mod m.horizontalCellBlockCount
+    let xyPortion = index div m.horizontalCellBlockCount
+    let cellX = xyPortion mod m.horizontalCellBlockCount
+    let cellY = m.verticalCellBlockCount - 1 - (xyPortion div m.horizontalCellBlockCount)
+    vec3[int32](m.startX + int32(cellX), m.startY + int32(cellY), m.startZ + int32(cellZ))
+
+proc at(m: IndexMapper, index: int, o: var ChunkNoiseFunctionSampleOptions): Vector3[int32] =
+  ## `at(index, Some(options))`
+  case m.kind
+  of IndexMapperKind.Interpolation:
+    o.cacheResultUniqueId += 1'u64
+    o.fillIndex = index
+    let y = (int32(index) + m.minimumCellY) * m.verticalBlockCount
+    vec3[int32](m.x, y, m.z)
+  of IndexMapperKind.ChunkIndex:
+    let cellZ = index mod m.horizontalCellBlockCount
+    let xyPortion = index div m.horizontalCellBlockCount
+    let cellX = xyPortion mod m.horizontalCellBlockCount
+    let cellY = m.verticalCellBlockCount - 1 - (xyPortion div m.horizontalCellBlockCount)
+    o.fillIndex = index
+    if o.cellCaches:
+      updatePosition(o, cellX, cellY, cellZ)
+    vec3[int32](m.startX + int32(cellX), m.startY + int32(cellY), m.startZ + int32(cellZ))
+
+proc newInterpolationMapper*(x, z, minimumCellY, verticalCellBlockCount: int32): IndexMapper =
+  IndexMapper(kind: IndexMapperKind.Interpolation, x: x, z: z, minimumCellY: minimumCellY,
+    verticalBlockCount: verticalCellBlockCount)
+
+proc newChunkIndexMapper*(startX, startY, startZ: int32, horizontal, vertical: int): IndexMapper =
+  IndexMapper(kind: IndexMapperKind.ChunkIndex, startX: startX, startY: startY, startZ: startZ,
+    horizontalCellBlockCount: horizontal, verticalCellBlockCount: vertical)
+
+# --- The proto stack ------------------------------------------------------------------------
+
+proc constantProto*(value: float64): ProtoComponent =
+  ProtoComponent(kind: ProtoKind.Constant, value: value, minValue: value, maxValue: value)
+
+proc getNoiseSamplerForId*(baseRandomDeriver: XoroshiroSplitter,
+                           parameters: DoublePerlinNoiseParameters): DoublePerlinNoiseSampler =
+  ## `DoublePerlinNoiseBuilder::get_noise_sampler_for_id`
+  var random = fromLoAndHi(baseRandomDeriver, parameters.lo, parameters.hi)
+  doublePerlinFromParams(random, parameters, false)
+
+proc newEndIsland(seed: uint64): ProtoComponent =
+  ## `EndIsland::new`; its range is hardcoded from java.
+  var rand = legacy_rand.fromSeed(seed)
+  skip(rand, 17292'i32)
+  ProtoComponent(kind: ProtoKind.EndIsland, simplex: newSimplexNoiseSampler(rand),
+    minValue: -0.84375'f64, maxValue: 0.5625'f64)
+
+proc newInterpolatedNoise[R](c: BaseNoiseFunctionComponent, random: var R): ProtoComponent =
+  ## `InterpolatedNoiseSampler::new`
+  var bigAmplitudes = newSeq[float64](16)
+  for i in 0 ..< 16:
+    bigAmplitudes[i] = 1.0'f64
+  var littleAmplitudes = newSeq[float64](8)
+  for i in 0 ..< 8:
+    littleAmplitudes[i] = 1.0'f64
+  let lowerNoise = newOctavePerlinNoiseSampler(random, -15'i32, bigAmplitudes, true)
+  let upperNoise = newOctavePerlinNoiseSampler(random, -15'i32, bigAmplitudes, true)
+  let noise = newOctavePerlinNoiseSampler(random, -7'i32, littleAmplitudes, true)
+  let yMultiplier = c.scaledYScale * c.xzFactor / c.yFactor * 684.412'f64
+  let maxValue = getTotalAmplitude(lowerNoise, yMultiplier + 2.0'f64)
+  var fractions = default(array[16, float64])
+  for index in 0 ..< 16:
+    var o = 1.0'f64
+    for _ in 0 ..< index:
+      o = o / 2.0'f64
+    fractions[index] = o
+  ProtoComponent(kind: ProtoKind.InterpolatedNoise, lowerNoise: lowerNoise, upperNoise: upperNoise, noise: noise,
+    scaledXzScale: c.scaledXzScale, xzFactor: c.xzFactor, yFactor: c.yFactor,
+    smearScaleMultiplier: c.smearScaleMultiplier, fractions: fractions, maxValue: maxValue, minValue: -maxValue,
+    yMultiplier: yMultiplier)
+
+proc sampleOutsideRange(p: SplinePoint, sampleLocation, lastKnownSample: float32): float32 {.inline.} =
+  ## `SplinePoint::sample_outside_range`
+  if p.derivative == 0.0'f32:
+    lastKnownSample
+  else:
+    p.derivative * (sampleLocation - p.location) + lastKnownSample
+
+proc calculateMinAndMax(arena: seq[SplineRepr], index: int, stack: seq[ProtoComponent]): (float32, float32) =
+  ## `SplineValue::calculate_min_and_max` and `Spline::calculate_min_and_max`
+  if arena[index].kind == SplineReprKind.Fixed:
+    return (arena[index].value, arena[index].value)
+  var minV = PosInfF32
+  var maxV = NegInfF32
+  let inputFunction = stack[int(arena[index].locationFunctionIndex)]
+  let inputMax = float32(inputFunction.maxValue)
+  let inputMin = float32(inputFunction.minValue)
+  let n = arena[index].points.len
+
+  if inputMin < arena[index].points[0].location:
+    let (pointMin, pointMax) = calculateMinAndMax(arena, int(arena[index].points[0].value), stack)
+    let sampleMin = sampleOutsideRange(arena[index].points[0], inputMin, pointMin)
+    let sampleMax = sampleOutsideRange(arena[index].points[0], inputMin, pointMax)
+    minV = rmin(minV, rmin(sampleMin, sampleMax))
+    maxV = rmax(maxV, rmax(sampleMin, sampleMax))
+
+  if inputMax > arena[index].points[n - 1].location:
+    let (pointMin, pointMax) = calculateMinAndMax(arena, int(arena[index].points[n - 1].value), stack)
+    let sampleMin = sampleOutsideRange(arena[index].points[n - 1], inputMax, pointMin)
+    let sampleMax = sampleOutsideRange(arena[index].points[n - 1], inputMax, pointMax)
+    minV = rmin(minV, rmin(sampleMin, sampleMax))
+    maxV = rmax(maxV, rmax(sampleMin, sampleMax))
+
+  for i in 0 ..< n:
+    let (pointMin, pointMax) = calculateMinAndMax(arena, int(arena[index].points[i].value), stack)
+    minV = rmin(minV, pointMin)
+    maxV = rmax(maxV, pointMax)
+
+  for i in 0 ..< n - 1:
+    let point1Derivative = arena[index].points[i].derivative
+    let point2Derivative = arena[index].points[i + 1].derivative
+    if point1Derivative != 0.0'f32 or point2Derivative != 0.0'f32:
+      let locationDelta = arena[index].points[i + 1].location - arena[index].points[i].location
+      let (point1Min, point1Max) = calculateMinAndMax(arena, int(arena[index].points[i].value), stack)
+      let (point2Min, point2Max) = calculateMinAndMax(arena, int(arena[index].points[i + 1].value), stack)
+      let point1Partial = point1Derivative * locationDelta
+      let point2Partial = point2Derivative * locationDelta
+      let pointsMin = rmin(point1Min, point2Min)
+      let pointsMax = rmax(point1Max, point2Max)
+      let z = point1Partial - point2Max + point1Min
+      let aa = point1Partial - point2Min + point1Max
+      let ab = -point2Partial + point2Min - point1Max
+      let ac = -point2Partial + point2Max - point1Max
+      let ad = rmin(z, ab)
+      let ae = rmax(aa, ac)
+      minV = rmin(minV, pointsMin + 0.25'f32 * ad)
+      maxV = rmax(maxV, pointsMax + 0.25'f32 * ae)
+  (minV, maxV)
+
+proc generateProtoStack*(base: ComponentStack, randomConfig: GlobalRandomConfig): ProtoStack =
+  ## `ProtoNoiseRouters::generate_proto_stack`
+  let baseRandomDeriver = randomConfig.baseRandomDeriver
+  var stack = newSeq[ProtoComponent](0)
+  for ci in 0 ..< base.components.len:
+    let component = base.components[ci]
+    var converted: ProtoComponent = nil
+    case component.kind
+    of BaseNoiseFunctionComponentKind.Spline:
+      # Top level splines always take in a density function.
+      let (minV, maxV) = calculateMinAndMax(base.splines, int(component.spline), stack)
+      converted = ProtoComponent(kind: ProtoKind.Spline, spline: int(component.spline),
+        minValue: float64(minV), maxValue: float64(maxV))
+    of BaseNoiseFunctionComponentKind.FindTopSurface:
+      let minValue = float64(component.lowerBound)
+      let maxValue = rmax(stack[int(component.upperBoundIndex)].maxValue, minValue)
+      converted = ProtoComponent(kind: ProtoKind.FindTopSurface, inputIndex: int(component.densityIndex),
+        input2Index: int(component.upperBoundIndex), minValue: minValue, maxValue: maxValue,
+        lowerBound: component.lowerBound, cellHeight: component.cellHeight)
+    of BaseNoiseFunctionComponentKind.EndIslands:
+      converted = newEndIsland(randomConfig.seed)
+    of BaseNoiseFunctionComponentKind.Noise:
+      let sampler = getNoiseSamplerForId(baseRandomDeriver, NoiseParameters[int(component.noiseId)])
+      let maxValue = sampler.maxValue()
+      converted = ProtoComponent(kind: ProtoKind.Noise, sampler: sampler, xzScale: component.xzScale,
+        yScale: component.yScale, minValue: -maxValue, maxValue: maxValue)
+    of BaseNoiseFunctionComponentKind.ShiftA:
+      let sampler = getNoiseSamplerForId(baseRandomDeriver, NoiseParameters[int(component.noiseId)])
+      let maxValue = sampler.maxValue() * 4.0'f64
+      converted = ProtoComponent(kind: ProtoKind.ShiftA, sampler: sampler, minValue: -maxValue, maxValue: maxValue)
+    of BaseNoiseFunctionComponentKind.ShiftB:
+      let sampler = getNoiseSamplerForId(baseRandomDeriver, NoiseParameters[int(component.noiseId)])
+      let maxValue = sampler.maxValue() * 4.0'f64
+      converted = ProtoComponent(kind: ProtoKind.ShiftB, sampler: sampler, minValue: -maxValue, maxValue: maxValue)
+    of BaseNoiseFunctionComponentKind.BlendDensity:
+      # Upstream's TODO: replace this when the blender is implemented.
+      converted = ProtoComponent(kind: ProtoKind.PassThrough, inputIndex: int(component.inputIndex),
+        minValue: stack[int(component.inputIndex)].minValue, maxValue: stack[int(component.inputIndex)].maxValue)
+    of BaseNoiseFunctionComponentKind.BlendAlpha:
+      converted = constantProto(1.0'f64)
+    of BaseNoiseFunctionComponentKind.BlendOffset:
+      converted = constantProto(0.0'f64)
+    of BaseNoiseFunctionComponentKind.Beardifier:
+      converted = ProtoComponent(kind: ProtoKind.Beardifier, minValue: NegInf, maxValue: PosInf)
+    of BaseNoiseFunctionComponentKind.ShiftedNoise:
+      # NETHER_TEMPERATURE and NETHER_VEGETATION always use NormalNoise.createLegacyNetherBiome with
+      # LegacyRandomSource(seed + 0) and LegacyRandomSource(seed + 1), whatever useLegacyRandomSource says.
+      let parameters = NoiseParameters[int(component.noiseId)]
+      var sampler = default(DoublePerlinNoiseSampler)
+      if parameters.id == NETHER_TEMPERATURE.id:
+        var legacyRand = legacy_rand.fromSeed(randomConfig.seed)
+        sampler = doublePerlinFromParams(legacyRand, parameters, true)
+      elif parameters.id == NETHER_VEGETATION.id:
+        var legacyRand = legacy_rand.fromSeed(randomConfig.seed + 1'u64)
+        sampler = doublePerlinFromParams(legacyRand, parameters, true)
+      else:
+        sampler = getNoiseSamplerForId(baseRandomDeriver, parameters)
+      let maxValue = sampler.maxValue()
+      converted = ProtoComponent(kind: ProtoKind.ShiftedNoise, inputIndex: int(component.shiftXIndex),
+        input2Index: int(component.shiftYIndex), input3Index: int(component.shiftZIndex), sampler: sampler,
+        xzScale: component.xzScale, yScale: component.yScale, minValue: -maxValue, maxValue: maxValue)
+    of BaseNoiseFunctionComponentKind.RangeChoice:
+      let inIndex = int(component.whenInRangeIndex)
+      let outIndex = int(component.whenOutRangeIndex)
+      converted = ProtoComponent(kind: ProtoKind.RangeChoice, inputIndex: int(component.inputIndex),
+        input2Index: inIndex, input3Index: outIndex,
+        minValue: rmin(stack[inIndex].minValue, stack[outIndex].minValue),
+        maxValue: rmax(stack[inIndex].maxValue, stack[outIndex].maxValue),
+        fromValue: component.minInclusive, toValue: component.maxExclusive)
+    of BaseNoiseFunctionComponentKind.Binary:
+      let arg1Min = stack[int(component.argument1Index)].minValue
+      let arg1Max = stack[int(component.argument1Index)].maxValue
+      let arg2Min = stack[int(component.argument2Index)].minValue
+      let arg2Max = stack[int(component.argument2Index)].maxValue
+      var minV = 0.0'f64
+      var maxV = 0.0'f64
+      case component.binaryOperation
+      of BinaryOperation.Add:
+        minV = arg1Min + arg2Min
+        maxV = arg1Max + arg2Max
+      of BinaryOperation.Mul:
+        minV =
+          if arg1Min > 0.0'f64 and arg2Min > 0.0'f64: arg1Min * arg2Min
+          elif arg1Max < 0.0'f64 and arg2Max < 0.0'f64: arg1Max * arg2Max
+          else: rmin(arg1Min * arg2Max, arg1Max * arg2Min)
+        maxV =
+          if arg1Min > 0.0'f64 and arg2Min > 0.0'f64: arg1Max * arg2Max
+          elif arg1Max < 0.0'f64 and arg2Max < 0.0'f64: arg1Min * arg2Min
+          else: rmax(arg1Min * arg2Min, arg1Max * arg2Max)
+      of BinaryOperation.Min:
+        minV = rmin(arg1Min, arg2Min)
+        maxV = rmin(arg1Max, arg2Max)
+      of BinaryOperation.Max:
+        minV = rmax(arg1Min, arg2Min)
+        maxV = rmax(arg1Max, arg2Max)
+      converted = ProtoComponent(kind: ProtoKind.Binary, inputIndex: int(component.argument1Index),
+        input2Index: int(component.argument2Index), minValue: minV, maxValue: maxV,
+        binaryOperation: component.binaryOperation)
+    of BaseNoiseFunctionComponentKind.ClampedYGradient:
+      converted = ProtoComponent(kind: ProtoKind.ClampedYGradient, fromY: component.fromY, toY: component.toY,
+        fromValue: component.fromValue, toValue: component.toValue,
+        minValue: rmin(component.fromValue, component.toValue),
+        maxValue: rmax(component.fromValue, component.toValue))
+    of BaseNoiseFunctionComponentKind.Constant:
+      converted = constantProto(component.value)
+    of BaseNoiseFunctionComponentKind.Wrapper:
+      converted = ProtoComponent(kind: ProtoKind.Wrapper, inputIndex: int(component.inputIndex),
+        wrapper: component.wrapper, minValue: stack[int(component.inputIndex)].minValue,
+        maxValue: stack[int(component.inputIndex)].maxValue)
+    of BaseNoiseFunctionComponentKind.Linear:
+      let arg1Min = stack[int(component.inputIndex)].minValue
+      let arg1Max = stack[int(component.inputIndex)].maxValue
+      let argument = component.argument
+      var minV = 0.0'f64
+      var maxV = 0.0'f64
+      case component.linearOperation
+      of LinearOperation.Add:
+        minV = arg1Min + argument
+        maxV = arg1Max + argument
+      of LinearOperation.Mul:
+        minV =
+          if arg1Min > 0.0'f64 and argument > 0.0'f64: arg1Min * argument
+          elif arg1Max < 0.0'f64 and argument < 0.0'f64: arg1Max * argument
+          else: rmin(arg1Min * argument, arg1Max * argument)
+        maxV =
+          if arg1Min > 0.0'f64 and argument > 0.0'f64: arg1Max * argument
+          elif arg1Max < 0.0'f64 and argument < 0.0'f64: arg1Min * argument
+          else: rmax(arg1Min * argument, arg1Max * argument)
+      converted = ProtoComponent(kind: ProtoKind.Linear, inputIndex: int(component.inputIndex),
+        linearOperation: component.linearOperation, value: argument, minValue: minV, maxValue: maxV)
+    of BaseNoiseFunctionComponentKind.Clamp:
+      converted = ProtoComponent(kind: ProtoKind.Clamp, inputIndex: int(component.inputIndex),
+        minValue: component.minValue, maxValue: component.maxValue)
+    of BaseNoiseFunctionComponentKind.Unary:
+      let arg1Min = stack[int(component.inputIndex)].minValue
+      let arg1Max = stack[int(component.inputIndex)].maxValue
+      let appliedMinValue = applyDensity(component.unaryOperation, arg1Min)
+      let appliedMaxValue = applyDensity(component.unaryOperation, arg1Max)
+      var minV = 0.0'f64
+      var maxV = 0.0'f64
+      case component.unaryOperation
+      of UnaryOperation.Abs, UnaryOperation.Square:
+        minV = rmax(arg1Min, 0.0'f64)
+        maxV = rmax(appliedMinValue, appliedMaxValue)
+      of UnaryOperation.Squeeze, UnaryOperation.Cube, UnaryOperation.QuarterNegative, UnaryOperation.HalfNegative:
+        minV = appliedMinValue
+        maxV = appliedMaxValue
+      of UnaryOperation.Invert:
+        if arg1Min < 0.0'f64 and arg1Max > 0.0'f64:
+          minV = NegInf
+          maxV = PosInf
+        else:
+          minV = appliedMaxValue
+          maxV = appliedMinValue
+      converted = ProtoComponent(kind: ProtoKind.Unary, inputIndex: int(component.inputIndex),
+        unaryOperation: component.unaryOperation, minValue: minV, maxValue: maxV)
+    of BaseNoiseFunctionComponentKind.IntervalSelect:
+      var minValue = PosInf
+      var maxValue = NegInf
+      var indices = newSeq[int](component.functionsIndices.len)
+      for i in 0 ..< component.functionsIndices.len:
+        let idx = int(component.functionsIndices[i])
+        indices[i] = idx
+        if stack[idx].minValue < minValue:
+          minValue = stack[idx].minValue
+        if stack[idx].maxValue > maxValue:
+          maxValue = stack[idx].maxValue
+      converted = ProtoComponent(kind: ProtoKind.IntervalSelect, inputIndex: int(component.inputIndex),
+        thresholds: component.thresholds, functionsIndices: indices, minValue: minValue, maxValue: maxValue)
+    of BaseNoiseFunctionComponentKind.InterpolatedNoiseSampler:
+      if randomConfig.legacyRandomSource:
+        # LegacyRandomSource(worldSeed + 0) for legacy dimensions, such as the Nether.
+        var legacyRand = legacy_rand.fromSeed(randomConfig.seed)
+        converted = newInterpolatedNoise(component, legacyRand)
+      else:
+        var randomGenerator = splitString(baseRandomDeriver, "minecraft:terrain")
+        converted = newInterpolatedNoise(component, randomGenerator)
+    stack.add(converted)
+  ProtoStack(components: stack, splines: base.splines)
+
+proc generateProtoNoiseRouters*(base: BaseNoiseRouters, randomConfig: GlobalRandomConfig): ProtoNoiseRouters =
+  ## `ProtoNoiseRouters::generate`
+  let noiseStack = generateProtoStack(base.noise.fullComponentStack, randomConfig)
+  let surfaceStack = generateProtoStack(base.surfaceEstimator.fullComponentStack, randomConfig)
+  let multiNoiseStack = generateProtoStack(base.multiNoise.fullComponentStack, randomConfig)
+  ProtoNoiseRouters(
+    noise: ProtoNoiseRouter(stack: noiseStack,
+      barrierNoise: int(base.noise.barrierNoise),
+      fluidLevelFloodednessNoise: int(base.noise.fluidLevelFloodednessNoise),
+      fluidLevelSpreadNoise: int(base.noise.fluidLevelSpreadNoise),
+      lavaNoise: int(base.noise.lavaNoise),
+      erosion: int(base.noise.erosion),
+      depth: int(base.noise.depth),
+      finalDensity: int(base.noise.finalDensity),
+      veinToggle: int(base.noise.veinToggle),
+      veinRidged: int(base.noise.veinRidged),
+      veinGap: int(base.noise.veinGap)),
+    surfaceEstimator: ProtoSurfaceEstimator(stack: surfaceStack),
+    multiNoise: ProtoMultiNoiseRouter(stack: multiNoiseStack,
+      temperature: int(base.multiNoise.temperature),
+      vegetation: int(base.multiNoise.vegetation),
+      continents: int(base.multiNoise.continents),
+      erosion: int(base.multiNoise.erosion),
+      depth: int(base.multiNoise.depth),
+      ridges: int(base.multiNoise.ridges)))
+
+# --- Beardifier -------------------------------------------------------------------------------
+
+const
+  BeardKernelRadius = 12'i32
+  BeardKernelSize = 24'i32
+
+proc computeBeardContribution(dx: int32, dy: float64, dz: int32): float64 =
+  let dxf = float64(dx)
+  let dzf = float64(dz)
+  let distanceSqr = dxf * dxf + dy * dy + dzf * dzf
+  pow(E, -distanceSqr / 16.0'f64)
+
+proc buildBeardKernel(): seq[float64] =
+  result = newSeq[float64](13824)
+  for zi in 0'i32 ..< BeardKernelSize:
+    for xi in 0'i32 ..< BeardKernelSize:
+      for yi in 0'i32 ..< BeardKernelSize:
+        result[int(zi * 24'i32 * 24'i32 + xi * 24'i32 + yi)] = computeBeardContribution(
+          xi - BeardKernelRadius, float64(yi - BeardKernelRadius) + 0.5'f64, zi - BeardKernelRadius)
+
+let beardKernel = buildBeardKernel()
+
+proc getBuryContribution(dx, dy, dz: float64): float64 =
+  let distance = sqrt(dx * dx + dy * dy + dz * dz)
+  # Equivalent to Mth.clampedMap(distance, 0.0, 6.0, 1.0, 0.0)
+  if distance < 0.0'f64:
+    1.0'f64
+  elif distance > 6.0'f64:
+    0.0'f64
+  else:
+    1.0'f64 - (distance / 6.0'f64)
+
+proc getBeardContribution(dx, dy, dz, yToGround: int32): float64 =
+  let xi = dx + BeardKernelRadius
+  let yi = dy + BeardKernelRadius
+  let zi = dz + BeardKernelRadius
+  if xi >= 0'i32 and xi < BeardKernelSize and yi >= 0'i32 and yi < BeardKernelSize and
+      zi >= 0'i32 and zi < BeardKernelSize:
+    let dyWithOffset = float64(yToGround) + 0.5'f64
+    let dxf = float64(dx)
+    let dzf = float64(dz)
+    let distanceSqr = dxf * dxf + dyWithOffset * dyWithOffset + dzf * dzf
+    # Equivalent to: -dyWithOffset * Mth.fastInvSqrt(distanceSqr / 2.0) / 2.0
+    let value = -dyWithOffset * (1.0'f64 / sqrt(distanceSqr / 2.0'f64)) / 2.0'f64
+    value * beardKernel[int(zi * 24'i32 * 24'i32 + xi * 24'i32 + yi)]
+  else:
+    0.0'f64
+
+proc terrainAdaptationFromStr*(s: string): TerrainAdaptation =
+  ## `TerrainAdaptation::from_str`
+  case s
+  of "beard_thin": TerrainAdaptation.BeardThin
+  of "beard_box": TerrainAdaptation.BeardBox
+  of "bury": TerrainAdaptation.Bury
+  of "encapsulate": TerrainAdaptation.Encapsulate
+  else: TerrainAdaptation.None
+
+proc sampleBeardifier(c: ChunkComponent, pos: Vector3[int32]): float64 =
+  if not c.hasAffectedBox:
+    return 0.0'f64
+  let blockX = pos.x
+  let blockY = pos.y
+  let blockZ = pos.z
+  if not contains(c.affectedBox, blockX, blockY, blockZ):
+    return 0.0'f64
+  var weight = 0.0'f64
+  for si in 0 ..< c.structures.len:
+    let boxMinX = c.structures[si].boundingBox.min.x
+    let boxMinY = c.structures[si].boundingBox.min.y
+    let boxMinZ = c.structures[si].boundingBox.min.z
+    let boxMaxX = c.structures[si].boundingBox.max.x
+    let boxMaxY = c.structures[si].boundingBox.max.y
+    let boxMaxZ = c.structures[si].boundingBox.max.z
+    let adaptation = c.structures[si].terrainAdaptation
+    let groundLevelDelta = c.structures[si].groundLevelDelta
+    let dx = max(0'i32, max(boxMinX - blockX, blockX - boxMaxX))
+    let dz = max(0'i32, max(boxMinZ - blockZ, blockZ - boxMaxZ))
+    let groundY = boxMinY + groundLevelDelta
+    let dyToGround = blockY - groundY
+    let dy =
+      case adaptation
+      of TerrainAdaptation.None: 0'i32
+      of TerrainAdaptation.Bury, TerrainAdaptation.BeardThin: dyToGround
+      of TerrainAdaptation.BeardBox: max(0'i32, max(groundY - blockY, blockY - boxMaxY))
+      of TerrainAdaptation.Encapsulate: max(0'i32, max(boxMinY - blockY, blockY - boxMaxY))
+    let contrib =
+      case adaptation
+      of TerrainAdaptation.None: 0.0'f64
+      of TerrainAdaptation.Bury: getBuryContribution(float64(dx), float64(dy) / 2.0'f64, float64(dz))
+      of TerrainAdaptation.BeardThin, TerrainAdaptation.BeardBox:
+        getBeardContribution(dx, dy, dz, dyToGround) * 0.8'f64
+      of TerrainAdaptation.Encapsulate:
+        getBuryContribution(float64(dx) / 2.0'f64, float64(dy) / 2.0'f64, float64(dz) / 2.0'f64) * 0.8'f64
+    weight += contrib
+  for ji in 0 ..< c.junctions.len:
+    let jDx = blockX - c.junctions[ji].x
+    let jDy = blockY - c.junctions[ji].groundY
+    let jDz = blockZ - c.junctions[ji].z
+    weight += getBeardContribution(jDx, jDy, jDz, jDy) * 0.4'f64
+  weight
+
+# --- Independent components: `StaticIndependentChunkNoiseFunctionComponentImpl::sample` ------------
+
+proc endIslandSample2d(sampler: SimplexNoiseSampler, x, z: int32): float32 =
+  ## `EndIsland::sample_2d`
+  let i = x div 2'i32
+  let j = z div 2'i32
+  let k = x mod 2'i32
+  let l = z mod 2'i32
+  let squares = wrapAdd(wrapMul(x, x), wrapMul(z, z))
+  let f0 = mulAdd(sqrt(float32(squares)), -8.0'f32, 100.0'f32)
+  var f = mathrust.clamp(f0, -100.0'f32, 80.0'f32)
+  var m = -12'i32
+  while m <= 12'i32:
+    var n = -12'i32
+    while n <= 12'i32:
+      let o = int64(i + m)
+      let p = int64(j + n)
+      if (o * o + p * p) > 4096'i64 and sample2d(sampler, float64(o), float64(p)) < -0.9'f64:
+        let g0 = mulAdd(abs(float32(o)), 3439.0'f32, abs(float32(p)) * 147.0'f32)
+        let g = float32(fmodf(cfloat(g0), cfloat(13.0'f32))) + 9.0'f32
+        let h = float32(k - m * 2'i32)
+        let q = float32(l - n * 2'i32)
+        let r = mulAdd(float32(hypotf(cfloat(h), cfloat(q))), -g, 100.0'f32)
+        let s = mathrust.clamp(r, -100.0'f32, 80.0'f32)
+        f = rmax(f, s)
+      inc n
+    inc m
+  f
+
+proc shiftSample3d(sampler: DoublePerlinNoiseSampler, x, y, z: float64): float64 {.inline.} =
+  sample(sampler, x * 0.25'f64, y * 0.25'f64, z * 0.25'f64) * 4.0'f64
+
+proc sampleInterpolatedNoise(p: ProtoComponent, pos: Vector3[int32]): float64 =
+  ## `InterpolatedNoiseSampler::sample`. Samplers run from last to first, zipped with the fractions.
+  let xzMultiplier = p.scaledXzScale * 684.412'f64
+  let d = float64(pos.x) * xzMultiplier
+  let e = float64(pos.y) * p.yMultiplier
+  let f = float64(pos.z) * xzMultiplier
+  let g = d / p.xzFactor
+  let h = e / p.yFactor
+  let i = f / p.xzFactor
+  let j = p.yMultiplier * p.smearScaleMultiplier
+  let k = j / p.yFactor
+
+  var n = 0.0'f64
+  var index = 0
+  var si = p.noise.samplers.len - 1
+  while si >= 0 and index < 16:
+    let fraction = p.fractions[index]
+    let mappedX = maintainPrecision(g * fraction)
+    let mappedY = maintainPrecision(h * fraction)
+    let mappedZ = maintainPrecision(i * fraction)
+    n += sampleNoFade(p.noise.samplers[si].sampler, mappedX, mappedY, mappedZ, k * fraction, h * fraction) / fraction
+    dec si
+    inc index
+
+  # `f64::midpoint`; the guards in Rust's version only matter near the float limits.
+  let q = (n / 10.0'f64 + 1.0'f64) / 2.0'f64
+  let bl2 = q >= 1.0'f64
+  let bl3 = q <= 0.0'f64
+
+  var l = 0.0'f64
+  if not bl2:
+    index = 0
+    si = p.lowerNoise.samplers.len - 1
+    while si >= 0 and index < 16:
+      let fraction = p.fractions[index]
+      let mappedX = maintainPrecision(d * fraction)
+      let mappedY = maintainPrecision(e * fraction)
+      let mappedZ = maintainPrecision(f * fraction)
+      l += sampleNoFade(p.lowerNoise.samplers[si].sampler, mappedX, mappedY, mappedZ, j * fraction, e * fraction) / fraction
+      dec si
+      inc index
+
+  var m = 0.0'f64
+  if not bl3:
+    index = 0
+    si = p.upperNoise.samplers.len - 1
+    while si >= 0 and index < 16:
+      let fraction = p.fractions[index]
+      let mappedX = maintainPrecision(d * fraction)
+      let mappedY = maintainPrecision(e * fraction)
+      let mappedZ = maintainPrecision(f * fraction)
+      m += sampleNoFade(p.upperNoise.samplers[si].sampler, mappedX, mappedY, mappedZ, j * fraction, e * fraction) / fraction
+      dec si
+      inc index
+
+  clampedLerp(l / 512.0'f64, m / 512.0'f64, q) / 128.0'f64
+
+proc sampleIndependent(p: ProtoComponent, pos: Vector3[int32]): float64 {.inline.} =
+  case p.kind
+  of ProtoKind.Constant: p.value
+  of ProtoKind.EndIsland:
+    (float64(endIslandSample2d(p.simplex, pos.x div 8'i32, pos.z div 8'i32)) - 8.0'f64) / 128.0'f64
+  of ProtoKind.Noise:
+    sample(p.sampler, float64(pos.x) * p.xzScale, float64(pos.y) * p.yScale, float64(pos.z) * p.xzScale)
+  of ProtoKind.ShiftA: shiftSample3d(p.sampler, float64(pos.x), 0.0'f64, float64(pos.z))
+  of ProtoKind.ShiftB: shiftSample3d(p.sampler, float64(pos.z), float64(pos.x), 0.0'f64)
+  of ProtoKind.InterpolatedNoise: sampleInterpolatedNoise(p, pos)
+  of ProtoKind.ClampedYGradient:
+    clampedMap(float64(pos.y), p.fromY, p.toY, p.fromValue, p.toValue)
+  else: 0.0'f64
+
+proc isIndependent(k: ProtoKind): bool {.inline.} = k <= ProtoKind.ClampedYGradient
+
+# --- The sampling recursion ---------------------------------------------------------------------
+
+proc sampleFromStack*(st: ChunkStack, index: int, pos: Vector3[int32], o: ChunkNoiseFunctionSampleOptions): float64
+
+proc sampleSplineValue(st: ChunkStack, index: int, pos: Vector3[int32], o: ChunkNoiseFunctionSampleOptions): float32 =
+  ## `SplineValue::sample` and `Spline::sample`
+  if st.splines[index].kind == SplineReprKind.Fixed:
+    return st.splines[index].value
+  let location = float32(sampleFromStack(st, int(st.splines[index].locationFunctionIndex), pos, o))
+  let n = st.splines[index].points.len
+  # `partition_point(|p| location >= p.location)`
+  var lo = 0
+  var hi = n
+  while lo < hi:
+    let mid = lo + (hi - lo) div 2
+    if location >= st.splines[index].points[mid].location:
+      lo = mid + 1
+    else:
+      hi = mid
+  let indexGreaterThanX = lo
+
+  if indexGreaterThanX == 0:
+    let val = sampleSplineValue(st, int(st.splines[index].points[0].value), pos, o)
+    return sampleOutsideRange(st.splines[index].points[0], location, val)
+
+  if indexGreaterThanX == n:
+    let val = sampleSplineValue(st, int(st.splines[index].points[n - 1].value), pos, o)
+    return sampleOutsideRange(st.splines[index].points[n - 1], location, val)
+
+  let lowerValue = sampleSplineValue(st, int(st.splines[index].points[indexGreaterThanX - 1].value), pos, o)
+  let upperValue = sampleSplineValue(st, int(st.splines[index].points[indexGreaterThanX].value), pos, o)
+  let lowerLocation = st.splines[index].points[indexGreaterThanX - 1].location
+  let upperLocation = st.splines[index].points[indexGreaterThanX].location
+  let lowerDerivative = st.splines[index].points[indexGreaterThanX - 1].derivative
+  let upperDerivative = st.splines[index].points[indexGreaterThanX].derivative
+
+  let dist = upperLocation - lowerLocation
+  let xScale = (location - lowerLocation) / dist
+  let delta = upperValue - lowerValue
+  let extrapolatedLower = lowerDerivative * dist - delta
+  let extrapolatedUpper = -upperDerivative * dist + delta
+  let cubicPart = (xScale * (1.0'f32 - xScale)) * lerp(xScale, extrapolatedLower, extrapolatedUpper)
+  let linearPart = lerp(xScale, lowerValue, upperValue)
+  cubicPart + linearPart
+
+proc sampleFindTopSurface(st: ChunkStack, p: ProtoComponent, pos: Vector3[int32],
+                          o: ChunkNoiseFunctionSampleOptions): float64 =
+  ## `FindTopSurface::sample`
+  let upper = sampleFromStack(st, p.input2Index, pos, o)
+  let density = sampleFromStack(st, p.inputIndex, vec3[int32](pos.x, asI32(floor(upper)), pos.z), o)
+  if density > 0.0'f64:
+    return upper
+  let cellHeight = p.cellHeight
+  let lowerBound = p.lowerBound
+  # Snap upper bound down to the nearest cell boundary, as vanilla does.
+  let topY = wrapMul(asI32(floor(upper / float64(cellHeight))), cellHeight)
+  if topY <= lowerBound:
+    return float64(lowerBound)
+  # Walk downward in cellHeight steps, returning the first Y where density > 0.0.
+  var y = topY
+  while y >= lowerBound:
+    let d = sampleFromStack(st, p.inputIndex, vec3[int32](pos.x, y, pos.z), o)
+    if d > 0.0'f64:
+      return float64(y)
+    y -= cellHeight
+  float64(lowerBound)
+
+proc sampleDependent(st: ChunkStack, p: ProtoComponent, c: ChunkComponent, pos: Vector3[int32],
+                     o: ChunkNoiseFunctionSampleOptions): float64 =
+  case p.kind
+  of ProtoKind.Linear:
+    let inputDensity = sampleFromStack(st, p.inputIndex, pos, o)
+    applyDensity(p.linearOperation, p.value, inputDensity)
+  of ProtoKind.Unary:
+    let inputDensity = sampleFromStack(st, p.inputIndex, pos, o)
+    applyDensity(p.unaryOperation, inputDensity)
+  of ProtoKind.Binary:
+    let input1Density = sampleFromStack(st, p.inputIndex, pos, o)
+    case p.binaryOperation
+    of BinaryOperation.Add:
+      let input2Density = sampleFromStack(st, p.input2Index, pos, o)
+      input1Density + input2Density
+    of BinaryOperation.Mul:
+      if input1Density == 0.0'f64:
+        0.0'f64
+      else:
+        let input2Density = sampleFromStack(st, p.input2Index, pos, o)
+        input1Density * input2Density
+    of BinaryOperation.Min:
+      let input2Min = st.comps[p.input2Index].minValue
+      if input1Density < input2Min:
+        input1Density
+      else:
+        let input2Density = sampleFromStack(st, p.input2Index, pos, o)
+        rmin(input1Density, input2Density)
+    of BinaryOperation.Max:
+      let input2Max = st.comps[p.input2Index].maxValue
+      if input1Density > input2Max:
+        input1Density
+      else:
+        let input2Density = sampleFromStack(st, p.input2Index, pos, o)
+        rmax(input1Density, input2Density)
+  of ProtoKind.ShiftedNoise:
+    let translatedX = float64(pos.x) * p.xzScale + sampleFromStack(st, p.inputIndex, pos, o)
+    let translatedY = float64(pos.y) * p.yScale + sampleFromStack(st, p.input2Index, pos, o)
+    let translatedZ = float64(pos.z) * p.xzScale + sampleFromStack(st, p.input3Index, pos, o)
+    sample(p.sampler, translatedX, translatedY, translatedZ)
+  of ProtoKind.IntervalSelect:
+    let inputVal = sampleFromStack(st, p.inputIndex, pos, o)
+    var selectedIndex = p.thresholds.len
+    for i in 0 ..< p.thresholds.len:
+      if inputVal < p.thresholds[i]:
+        selectedIndex = i
+        break
+    sampleFromStack(st, p.functionsIndices[selectedIndex], pos, o)
+  of ProtoKind.FindTopSurface:
+    sampleFindTopSurface(st, p, pos, o)
+  of ProtoKind.Clamp:
+    let inputDensity = sampleFromStack(st, p.inputIndex, pos, o)
+    applyClamp(p.minValue, p.maxValue, inputDensity)
+  of ProtoKind.RangeChoice:
+    let inputSample = sampleFromStack(st, p.inputIndex, pos, o)
+    if p.fromValue <= inputSample and inputSample < p.toValue:
+      sampleFromStack(st, p.input2Index, pos, o)
+    else:
+      sampleFromStack(st, p.input3Index, pos, o)
+  of ProtoKind.Spline:
+    float64(sampleSplineValue(st, p.spline, pos, o))
+  else:
+    sampleIndependent(p, pos)
+
+proc sampleFromStack*(st: ChunkStack, index: int, pos: Vector3[int32], o: ChunkNoiseFunctionSampleOptions): float64 =
+  ## `ChunkNoiseFunctionComponent::sample_from_stack`, with `index` the top of upstream's slice.
+  let c = st.comps[index]
+  case c.kind
+  of ChunkKind.Proto:
+    sampleDependent(st, c.proto, c, pos, o)
+  of ChunkKind.PassThrough:
+    sampleFromStack(st, c.inputIndex, pos, o)
+  of ChunkKind.DensityInterpolator:
+    if o.cellCaches:
+      if o.populatingCaches:
+        lerp3(o.xDelta, o.yDelta, o.zDelta, c.firstPass[0], c.firstPass[4], c.firstPass[2], c.firstPass[6],
+          c.firstPass[1], c.firstPass[5], c.firstPass[3], c.firstPass[7])
+      else:
+        c.result
+    else:
+      sampleFromStack(st, c.inputIndex, pos, o)
+  of ChunkKind.FlatCache:
+    let relativeBiomeXPosition = biomeFromBlock(pos.x) - c.startBiomeX
+    let relativeBiomeZPosition = biomeFromBlock(pos.z) - c.startBiomeZ
+    if relativeBiomeXPosition >= 0'i32 and relativeBiomeZPosition >= 0'i32 and
+        relativeBiomeXPosition <= int32(c.horizontalBiomeEnd) and
+        relativeBiomeZPosition <= int32(c.horizontalBiomeEnd):
+      c.cache[int(relativeBiomeXPosition) * (c.horizontalBiomeEnd + 1) + int(relativeBiomeZPosition)]
+    else:
+      sampleFromStack(st, c.inputIndex, pos, o)
+  of ChunkKind.Cache2D:
+    let packedColumn = packedChunkI32(pos.x, pos.z)
+    if packedColumn == c.lastSampleColumn:
+      c.lastSampleResult
+    else:
+      let r = sampleFromStack(st, c.inputIndex, pos, o)
+      c.lastSampleColumn = packedColumn
+      c.lastSampleResult = r
+      r
+  of ChunkKind.CacheOnce:
+    if o.cellCaches:
+      if c.cacheFillUniqueId == o.cacheFillUniqueId and c.cache.len != 0:
+        c.cache[o.fillIndex]
+      elif c.cacheResultUniqueId == o.cacheResultUniqueId:
+        c.lastSampleResult
+      else:
+        let r = sampleFromStack(st, c.inputIndex, pos, o)
+        c.cacheResultUniqueId = o.cacheResultUniqueId
+        c.lastSampleResult = r
+        r
+    else:
+      sampleFromStack(st, c.inputIndex, pos, o)
+  of ChunkKind.CellCache:
+    if o.cellCaches:
+      let cacheIndex = ((o.verticalCellBlockCount - 1 - o.cellYBlockPosition) * o.horizontalCellBlockCount +
+        o.cellXBlockPosition) * o.horizontalCellBlockCount + o.cellZBlockPosition
+      c.cache[cacheIndex]
+    else:
+      sampleFromStack(st, c.inputIndex, pos, o)
+  of ChunkKind.Beardifier:
+    sampleBeardifier(c, pos)
+
+proc defaultFill(st: ChunkStack, index: int, arr: var seq[float64], off, n: int, mapper: IndexMapper,
+                 o: var ChunkNoiseFunctionSampleOptions) =
+  ## The trait's provided `fill`.
+  for i in 0 ..< n:
+    let pos = at(mapper, i, o)
+    arr[off + i] = sampleFromStack(st, index, pos, o)
+
+proc fillFromStack*(st: ChunkStack, index: int, arr: var seq[float64], off, n: int, mapper: IndexMapper,
+                    o: var ChunkNoiseFunctionSampleOptions)
+
+proc fillDependent(st: ChunkStack, index: int, p: ProtoComponent, arr: var seq[float64], off, n: int,
+                   mapper: IndexMapper, o: var ChunkNoiseFunctionSampleOptions) =
+  case p.kind
+  of ProtoKind.Binary:
+    fillFromStack(st, p.inputIndex, arr, off, n, mapper, o)
+    case p.binaryOperation
+    of BinaryOperation.Add:
+      var scratch = newSeq[float64](n)
+      fillFromStack(st, p.input2Index, scratch, 0, n, mapper, o)
+      for i in 0 ..< n:
+        arr[off + i] += scratch[i]
+    of BinaryOperation.Mul:
+      for i in 0 ..< n:
+        if arr[off + i] != 0.0'f64:
+          let pos = at(mapper, i, o)
+          let density2 = sampleFromStack(st, p.input2Index, pos, o)
+          arr[off + i] *= density2
+    of BinaryOperation.Min:
+      let input2Min = st.comps[p.input2Index].minValue
+      for i in 0 ..< n:
+        if arr[off + i] >= input2Min:
+          # NOTE: vanilla is v < min ? v : min(v, compute)
+          let pos = at(mapper, i, o)
+          let density2 = sampleFromStack(st, p.input2Index, pos, o)
+          arr[off + i] = rmin(arr[off + i], density2)
+    of BinaryOperation.Max:
+      let input2Max = st.comps[p.input2Index].maxValue
+      for i in 0 ..< n:
+        if arr[off + i] <= input2Max:
+          # NOTE: vanilla is v > max ? v : max(v, compute)
+          let pos = at(mapper, i, o)
+          let density2 = sampleFromStack(st, p.input2Index, pos, o)
+          arr[off + i] = rmax(arr[off + i], density2)
+  of ProtoKind.Unary:
+    fillFromStack(st, p.inputIndex, arr, off, n, mapper, o)
+    for i in 0 ..< n:
+      arr[off + i] = applyDensity(p.unaryOperation, arr[off + i])
+  of ProtoKind.Clamp:
+    fillFromStack(st, p.inputIndex, arr, off, n, mapper, o)
+    for i in 0 ..< n:
+      arr[off + i] = applyClamp(p.minValue, p.maxValue, arr[off + i])
+  of ProtoKind.IntervalSelect:
+    fillFromStack(st, p.inputIndex, arr, off, n, mapper, o)
+    for i in 0 ..< n:
+      let pos = at(mapper, i, o)
+      let inputVal = arr[off + i]
+      var selectedIndex = p.thresholds.len
+      for t in 0 ..< p.thresholds.len:
+        if inputVal < p.thresholds[t]:
+          selectedIndex = t
+          break
+      arr[off + i] = sampleFromStack(st, p.functionsIndices[selectedIndex], pos, o)
+  of ProtoKind.RangeChoice:
+    fillFromStack(st, p.inputIndex, arr, off, n, mapper, o)
+    for i in 0 ..< n:
+      let pos = at(mapper, i, o)
+      if p.fromValue <= arr[off + i] and arr[off + i] < p.toValue:
+        arr[off + i] = sampleFromStack(st, p.input2Index, pos, o)
+      else:
+        arr[off + i] = sampleFromStack(st, p.input3Index, pos, o)
+  else:
+    # Linear, ShiftedNoise, FindTopSurface and Spline take the trait's provided `fill`.
+    defaultFill(st, index, arr, off, n, mapper, o)
+
+proc fillFromStack*(st: ChunkStack, index: int, arr: var seq[float64], off, n: int, mapper: IndexMapper,
+                    o: var ChunkNoiseFunctionSampleOptions) =
+  ## `ChunkNoiseFunctionComponent::fill_from_stack`, on `arr[off ..< off + n]`.
+  let c = st.comps[index]
+  case c.kind
+  of ChunkKind.Proto:
+    let p = c.proto
+    if isIndependent(p.kind):
+      if p.kind == ProtoKind.Constant:
+        for i in 0 ..< n:
+          arr[off + i] = p.value
+      else:
+        for i in 0 ..< n:
+          arr[off + i] = sampleIndependent(p, atNoOptions(mapper, i))
+    else:
+      fillDependent(st, index, p, arr, off, n, mapper, o)
+  of ChunkKind.PassThrough:
+    fillFromStack(st, c.inputIndex, arr, off, n, mapper, o)
+  of ChunkKind.DensityInterpolator:
+    if o.populatingCaches:
+      defaultFill(st, index, arr, off, n, mapper, o)
+    else:
+      fillFromStack(st, c.inputIndex, arr, off, n, mapper, o)
+  of ChunkKind.CacheOnce:
+    if c.cacheFillUniqueId == o.cacheFillUniqueId and c.cache.len != 0:
+      for i in 0 ..< n:
+        arr[off + i] = c.cache[i]
+      return
+    fillFromStack(st, c.inputIndex, arr, off, n, mapper, o)
+    # We need to make a new cache.
+    if c.cache.len != n:
+      c.cache = newSeq[float64](n)
+    for i in 0 ..< n:
+      c.cache[i] = arr[off + i]
+    c.cacheFillUniqueId = o.cacheFillUniqueId
+  of ChunkKind.FlatCache, ChunkKind.Cache2D, ChunkKind.CellCache, ChunkKind.Beardifier:
+    defaultFill(st, index, arr, off, n, mapper, o)
+
+# --- Building a chunk's stack -----------------------------------------------------------------------
+
+proc newProtoChunkComponent*(p: ProtoComponent): ChunkComponent =
+  ChunkComponent(kind: ChunkKind.Proto, proto: p, minValue: p.minValue, maxValue: p.maxValue)
+
+proc newPassThroughComponent*(inputIndex: int, minValue, maxValue: float64): ChunkComponent =
+  ChunkComponent(kind: ChunkKind.PassThrough, inputIndex: inputIndex, minValue: minValue, maxValue: maxValue)
+
+proc newCache2D*(inputIndex: int, minValue, maxValue: float64): ChunkComponent =
+  ## `Cache2D::new`. The marker is how vanilla does it, world coordinates that hit it included.
+  ChunkComponent(kind: ChunkKind.Cache2D, inputIndex: inputIndex, minValue: minValue, maxValue: maxValue,
+    lastSampleColumn: ChunkPosMarker)
+
+proc newFlatCacheFilled*(st: ChunkStack, inputIndex: int, minValue, maxValue: float64,
+                         startBiomeX, startBiomeZ: int32, horizontalBiomeEnd: int): ChunkComponent =
+  ## `FlatCache::new` and the fill each generator repeats after it. Due to the stack invariant, what is
+  ## on the stack is a valid density function.
+  result = ChunkComponent(kind: ChunkKind.FlatCache, inputIndex: inputIndex, minValue: minValue, maxValue: maxValue,
+    startBiomeX: startBiomeX, startBiomeZ: startBiomeZ, horizontalBiomeEnd: horizontalBiomeEnd,
+    cache: newSeq[float64]((horizontalBiomeEnd + 1) * (horizontalBiomeEnd + 1)))
+  let sampleOptions = skipCellCachesOptions()
+  for biomeXPosition in 0 .. horizontalBiomeEnd:
+    let blockXPosition = biomeToBlock(startBiomeX + int32(biomeXPosition))
+    for biomeZPosition in 0 .. horizontalBiomeEnd:
+      let blockZPosition = biomeToBlock(startBiomeZ + int32(biomeZPosition))
+      let pos = vec3[int32](blockXPosition, 0'i32, blockZPosition)
+      result.cache[biomeXPosition * (horizontalBiomeEnd + 1) + biomeZPosition] =
+        sampleFromStack(st, inputIndex, pos, sampleOptions)
+
+proc yzToBufIndex*(c: ChunkComponent, cellYPosition, cellZPosition: int): int {.inline.} =
+  ## `DensityInterpolator::yz_to_buf_index`
+  cellZPosition * (c.verticalCellCount + 1) + cellYPosition
+
+proc generateChunkNoiseRouter*(base: ProtoNoiseRouter, buildOptions: ChunkNoiseFunctionBuilderOptions): ChunkNoiseRouter =
+  ## `ChunkNoiseRouter::generate`
+  let st = ChunkStack(comps: newSeq[ChunkComponent](0), splines: base.stack.splines)
+  var cellCacheIndices = newSeq[int](0)
+  var interpolatorIndices = newSeq[int](0)
+  for componentIndex in 0 ..< base.stack.components.len:
+    let baseComponent = base.stack.components[componentIndex]
+    var chunkComponent: ChunkComponent = nil
+    case baseComponent.kind
+    of ProtoKind.PassThrough:
+      chunkComponent = newPassThroughComponent(baseComponent.inputIndex, baseComponent.minValue, baseComponent.maxValue)
+    of ProtoKind.Beardifier:
+      chunkComponent = ChunkComponent(kind: ChunkKind.Beardifier, minValue: NegInf, maxValue: PosInf,
+        structures: buildOptions.beardifierStructures, junctions: buildOptions.beardifierJunctions,
+        hasAffectedBox: buildOptions.hasAffectedBox, affectedBox: buildOptions.affectedBox)
+    of ProtoKind.Wrapper:
+      let inputIndex = baseComponent.inputIndex
+      let minValue = st.comps[inputIndex].minValue
+      let maxValue = st.comps[inputIndex].maxValue
+      case baseComponent.wrapper
+      of WrapperType.Interpolated:
+        interpolatorIndices.add(componentIndex)
+        let size = (buildOptions.verticalCellCount + 1) * (buildOptions.horizontalCellCount + 1)
+        chunkComponent = ChunkComponent(kind: ChunkKind.DensityInterpolator, inputIndex: inputIndex,
+          minValue: minValue, maxValue: maxValue, startBuffer: newSeq[float64](size), endBuffer: newSeq[float64](size),
+          verticalCellCount: buildOptions.verticalCellCount)
+      of WrapperType.CellCache:
+        cellCacheIndices.add(componentIndex)
+        chunkComponent = ChunkComponent(kind: ChunkKind.CellCache, inputIndex: inputIndex,
+          minValue: minValue, maxValue: maxValue,
+          cache: newSeq[float64](buildOptions.horizontalCellBlockCount * buildOptions.horizontalCellBlockCount *
+            buildOptions.verticalCellBlockCount))
+      of WrapperType.CacheOnce:
+        chunkComponent = ChunkComponent(kind: ChunkKind.CacheOnce, inputIndex: inputIndex,
+          minValue: minValue, maxValue: maxValue)
+      of WrapperType.Cache2D:
+        chunkComponent = newCache2D(inputIndex, minValue, maxValue)
+      of WrapperType.CacheFlat:
+        chunkComponent = newFlatCacheFilled(st, inputIndex, minValue, maxValue, buildOptions.startBiomeX,
+          buildOptions.startBiomeZ, buildOptions.horizontalBiomeEnd)
+    else:
+      chunkComponent = newProtoChunkComponent(baseComponent)
+    st.comps.add(chunkComponent)
+  ChunkNoiseRouter(
+    barrierNoise: base.barrierNoise,
+    fluidLevelFloodednessNoise: base.fluidLevelFloodednessNoise,
+    fluidLevelSpreadNoise: base.fluidLevelSpreadNoise,
+    lavaNoise: base.lavaNoise,
+    erosion: base.erosion,
+    depth: base.depth,
+    finalDensity: base.finalDensity,
+    veinToggle: base.veinToggle,
+    veinRidged: base.veinRidged,
+    veinGap: base.veinGap,
+    stack: st,
+    interpolatorIndices: interpolatorIndices,
+    cellIndices: cellCacheIndices)
+
+proc generateStackForSampler*(stack: ProtoStack, startBiomeX, startBiomeZ: int32, horizontalBiomeEnd: int): ChunkStack =
+  ## The loop `SurfaceHeightEstimateSampler::generate` and `MultiNoiseSampler::generate` both write out.
+  ## Vanilla passes a wrapper through when the noise pos is not the chunk itself, which it never is for them.
+  let st = ChunkStack(comps: newSeq[ChunkComponent](0), splines: stack.splines)
+  let zeroConstant = constantProto(0.0'f64)
+  for bi in 0 ..< stack.components.len:
+    let baseComponent = stack.components[bi]
+    var chunkComponent: ChunkComponent = nil
+    case baseComponent.kind
+    of ProtoKind.PassThrough:
+      chunkComponent = newPassThroughComponent(baseComponent.inputIndex, baseComponent.minValue, baseComponent.maxValue)
+    of ProtoKind.Beardifier:
+      chunkComponent = newProtoChunkComponent(zeroConstant)
+    of ProtoKind.Wrapper:
+      let inputIndex = baseComponent.inputIndex
+      let minValue = st.comps[inputIndex].minValue
+      let maxValue = st.comps[inputIndex].maxValue
+      case baseComponent.wrapper
+      of WrapperType.Cache2D:
+        chunkComponent = newCache2D(inputIndex, minValue, maxValue)
+      of WrapperType.CacheFlat:
+        chunkComponent = newFlatCacheFilled(st, inputIndex, minValue, maxValue, startBiomeX, startBiomeZ,
+          horizontalBiomeEnd)
+      else:
+        chunkComponent = newPassThroughComponent(inputIndex, minValue, maxValue)
+    else:
+      chunkComponent = newProtoChunkComponent(baseComponent)
+    st.comps.add(chunkComponent)
+  st
+
+proc fillCellCaches*(r: ChunkNoiseRouter, mapper: IndexMapper, o: var ChunkNoiseFunctionSampleOptions) =
+  ## `ChunkNoiseRouter::fill_cell_caches`
+  for ii in 0 ..< r.cellIndices.len:
+    let cellCache = r.stack.comps[r.cellIndices[ii]]
+    fillFromStack(r.stack, cellCache.inputIndex, cellCache.cache, 0, cellCache.cache.len, mapper, o)
+
+proc fillInterpolatorBuffers*(r: ChunkNoiseRouter, start: bool, cellZ: int, mapper: IndexMapper,
+                              o: var ChunkNoiseFunctionSampleOptions) =
+  ## `ChunkNoiseRouter::fill_interpolator_buffers`
+  for ii in 0 ..< r.interpolatorIndices.len:
+    let interpolator = r.stack.comps[r.interpolatorIndices[ii]]
+    let startIndex = yzToBufIndex(interpolator, 0, cellZ)
+    let n = interpolator.verticalCellCount + 1
+    if start:
+      fillFromStack(r.stack, interpolator.inputIndex, interpolator.startBuffer, startIndex, n, mapper, o)
+    else:
+      fillFromStack(r.stack, interpolator.inputIndex, interpolator.endBuffer, startIndex, n, mapper, o)
+
+proc interpolateX*(r: ChunkNoiseRouter, delta: float64) =
+  for ii in 0 ..< r.interpolatorIndices.len:
+    let c = r.stack.comps[r.interpolatorIndices[ii]]
+    c.thirdPass[0] = lerp(delta, c.secondPass[0], c.secondPass[2])
+    c.thirdPass[1] = lerp(delta, c.secondPass[1], c.secondPass[3])
+
+proc interpolateY*(r: ChunkNoiseRouter, delta: float64) =
+  for ii in 0 ..< r.interpolatorIndices.len:
+    let c = r.stack.comps[r.interpolatorIndices[ii]]
+    c.secondPass[0] = lerp(delta, c.firstPass[0], c.firstPass[2])
+    c.secondPass[2] = lerp(delta, c.firstPass[4], c.firstPass[6])
+    c.secondPass[1] = lerp(delta, c.firstPass[1], c.firstPass[3])
+    c.secondPass[3] = lerp(delta, c.firstPass[5], c.firstPass[7])
+
+proc interpolateZ*(r: ChunkNoiseRouter, delta: float64) =
+  for ii in 0 ..< r.interpolatorIndices.len:
+    let c = r.stack.comps[r.interpolatorIndices[ii]]
+    c.result = lerp(delta, c.thirdPass[0], c.thirdPass[1])
+
+proc onSampledCellCorners*(r: ChunkNoiseRouter, cellYPosition, cellZPosition: int) =
+  for ii in 0 ..< r.interpolatorIndices.len:
+    let c = r.stack.comps[r.interpolatorIndices[ii]]
+    c.firstPass[0] = c.startBuffer[yzToBufIndex(c, cellYPosition, cellZPosition)]
+    c.firstPass[1] = c.startBuffer[yzToBufIndex(c, cellYPosition, cellZPosition + 1)]
+    c.firstPass[4] = c.endBuffer[yzToBufIndex(c, cellYPosition, cellZPosition)]
+    c.firstPass[5] = c.endBuffer[yzToBufIndex(c, cellYPosition, cellZPosition + 1)]
+    c.firstPass[2] = c.startBuffer[yzToBufIndex(c, cellYPosition + 1, cellZPosition)]
+    c.firstPass[3] = c.startBuffer[yzToBufIndex(c, cellYPosition + 1, cellZPosition + 1)]
+    c.firstPass[6] = c.endBuffer[yzToBufIndex(c, cellYPosition + 1, cellZPosition)]
+    c.firstPass[7] = c.endBuffer[yzToBufIndex(c, cellYPosition + 1, cellZPosition + 1)]
+
+proc swapBuffers*(r: ChunkNoiseRouter) =
+  for ii in 0 ..< r.interpolatorIndices.len:
+    let c = r.stack.comps[r.interpolatorIndices[ii]]
+    swap(c.startBuffer, c.endBuffer)
+
+# `sample_function!`
+
+proc sampleBarrierNoise*(r: ChunkNoiseRouter, pos: Vector3[int32], o: ChunkNoiseFunctionSampleOptions): float64 =
+  sampleFromStack(r.stack, r.barrierNoise, pos, o)
+
+proc sampleFluidLevelFloodednessNoise*(r: ChunkNoiseRouter, pos: Vector3[int32], o: ChunkNoiseFunctionSampleOptions): float64 =
+  sampleFromStack(r.stack, r.fluidLevelFloodednessNoise, pos, o)
+
+proc sampleFluidLevelSpreadNoise*(r: ChunkNoiseRouter, pos: Vector3[int32], o: ChunkNoiseFunctionSampleOptions): float64 =
+  sampleFromStack(r.stack, r.fluidLevelSpreadNoise, pos, o)
+
+proc sampleLavaNoise*(r: ChunkNoiseRouter, pos: Vector3[int32], o: ChunkNoiseFunctionSampleOptions): float64 =
+  sampleFromStack(r.stack, r.lavaNoise, pos, o)
+
+proc sampleErosion*(r: ChunkNoiseRouter, pos: Vector3[int32], o: ChunkNoiseFunctionSampleOptions): float64 =
+  sampleFromStack(r.stack, r.erosion, pos, o)
+
+proc sampleDepth*(r: ChunkNoiseRouter, pos: Vector3[int32], o: ChunkNoiseFunctionSampleOptions): float64 =
+  sampleFromStack(r.stack, r.depth, pos, o)
+
+proc sampleFinalDensity*(r: ChunkNoiseRouter, pos: Vector3[int32], o: ChunkNoiseFunctionSampleOptions): float64 =
+  sampleFromStack(r.stack, r.finalDensity, pos, o)
+
+proc sampleVeinToggle*(r: ChunkNoiseRouter, pos: Vector3[int32], o: ChunkNoiseFunctionSampleOptions): float64 =
+  sampleFromStack(r.stack, r.veinToggle, pos, o)
+
+proc sampleVeinRidged*(r: ChunkNoiseRouter, pos: Vector3[int32], o: ChunkNoiseFunctionSampleOptions): float64 =
+  sampleFromStack(r.stack, r.veinRidged, pos, o)
+
+proc sampleVeinGap*(r: ChunkNoiseRouter, pos: Vector3[int32], o: ChunkNoiseFunctionSampleOptions): float64 =
+  sampleFromStack(r.stack, r.veinGap, pos, o)

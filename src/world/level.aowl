@@ -1,11 +1,14 @@
 ## The world's chunk store: loaded chunks, watchers, savers, ticks, block get and set.
 ## Port of pumpkin-world/src/level.rs (level.rs)
 ##
-## PARTIAL: pumpkin-world/src/level.rs - no `world_gen`, `chunk_loading`, `GenerationSchedule`,
-## `chunk_system_tasks` or thread tracking: those are the chunk-system and generation batches. So
-## `getOrFetchChunk` loads from disk only and answers `lkNotOnDisk` where upstream would generate. No
-## async: `spawn_task`, the cancel token and the channels are plain calls. Random ticks draw from a
-## small xorshift here where upstream uses `rand::random`, since nothing depends on the sequence.
+## No threads and no async: `spawn_task`, the cancel token and the channels are plain calls, and the chunk system
+## runs when asked, from `pumpChunkSystem` or from a `fetchChunk` that has to wait for a chunk. Random ticks draw from
+## a small xorshift here where upstream uses `rand::random`, since nothing depends on the sequence.
+##
+## `fetchChunk` differs from upstream's `fetch_chunk` in two ways. Its ticket is `FULL_CHUNK_LEVEL`, not 31: 31 spreads
+## full chunks 12 chunks out, which upstream's generation threads absorb and a blocking call here would not. And what
+## it returns stays in `loadedChunks` until `removeLoadedChunk`, as the disk path always did here; nothing in this port
+## holds tickets for a player yet, and removing the ticket would otherwise drop the chunk under them.
 
 {.feature: "lenientnils".}
 
@@ -15,13 +18,13 @@ import ../generated/dimension as dimensiondata
 import ../nbt/tag
 import blockstates, palette, chunkdata, chunkio, filemanager, anvilformat, chunklinear, chunkpump,
        tick, tickscheduler, worldfs, worldinfo, worldinfodatafiles, lightingruntime, nbtget
+import world as worldtraits
+import generation/generator/generator
+import chunk_system/chunk_system
+
+export generator.FlatLayer
 
 type
-  FlatLayer* = object
-    ## `generation::generator::FlatLayer`
-    block_name*: string
-    height*: int32
-
   RandomTickSample* = object
     position*: BlockPos
     tickBlock*: bool
@@ -34,7 +37,7 @@ type
 
   FetchKind* = enum
     lkLoaded     ## In memory or read from disk.
-    lkNotOnDisk  ## Upstream's generation path; see the file comment.
+    lkNotOnDisk  ## From `fetchChunkFromDisk`; `fetchChunk` generates instead.
     lkFailed
 
   FetchResult* = object
@@ -64,6 +67,14 @@ type
     flatLayers*: seq[FlatLayer]
     flatBiome*: string
     randState: uint32
+    dimension*: dimensiondata.Dimension
+    worldPortal*: WorldPortalExt     ## Set by the server; `noOpWorldPortal` until then.
+    worldGen*: WorldGenerator        ## Built on first use: a world loaded whole from disk never needs it.
+    levelChannel*: LevelChannel
+    chunkLoading*: ChunkLoading
+    chunkListener*: ChunkListener
+    schedule*: GenerationSchedule
+    keptChunks: HashSet[int64]       ## What `fetchChunk` returned; see the file comment.
 
   DimensionType* = dimensiondata.Dimension  ## `pumpkin_data::dimension::Dimension`
 
@@ -149,7 +160,8 @@ proc fromRootFolder*(levelConfig: LevelConfig, rootFolder: string, seed: int64, 
     lightEngine: newDynamicLightEngine(), lightAccess: nil, shutDownChunkSystem: false, shouldSave: false,
     shouldUnload: false, saveEnabled: true, autosaveTicks: levelConfig.autosaveTicks,
     isFlat: false, flatLayers: @[], flatBiome: "minecraft:plains",
-    randState: 0x9E3779B9'u32 xor uint32(cast[uint64](seed) and 0xFFFFFFFF'u64) or 1'u32)
+    randState: 0x9E3779B9'u32 xor uint32(cast[uint64](seed) and 0xFFFFFFFF'u64) or 1'u32,
+    dimension: dimension, worldPortal: noOpWorldPortal(), keptChunks: initHashSet[int64]())
   let mainFolder =
     if dimension.minecraftName == OVERWORLD.minecraftName: rootFolder
     else:
@@ -173,7 +185,41 @@ proc addLoadedChunk*(l: Level, c: ChunkData) =
   l.loadedChunks[chunkKey(c.x, c.z)] = c
 
 proc removeLoadedChunk*(l: Level, x, z: int32) =
+  l.keptChunks.excl(chunkKey(x, z))
   l.loadedChunks.del(chunkKey(x, z))
+
+proc ensureChunkSystem*(l: Level): GenerationSchedule =
+  ## The part of `Level::from_root_folder` that builds `world_gen` and starts `GenerationSchedule::create`.
+  if l.schedule != nil:
+    return l.schedule
+  l.worldGen = getWorldGen(l.seed, l.dimension, l.isFlat, l.flatLayers, l.flatBiome)
+  l.levelChannel = newLevelChannel()
+  l.chunkLoading = newChunkLoading(l.levelChannel)
+  l.chunkListener = newChunkListener()
+  let host = newScheduleHost(l.worldGen, l.worldPortal, l.chunkSaver, l.levelFolder, l.lightingConfig,
+    proc(pos: ChunkPos, chunk: ChunkData): bool {.closure.} =
+      let key = chunkKey(pos.x, pos.y)
+      let replaced = l.loadedChunks.hasKey(key)
+      l.loadedChunks[key] = chunk
+      replaced,
+    proc(pos: ChunkPos) {.closure.} =
+      let key = chunkKey(pos.x, pos.y)
+      if not l.keptChunks.contains(key):
+        l.loadedChunks.del(key),
+    proc(pos: ChunkPos): nil ChunkData {.closure.} = l.loadedChunks.getOrDefault(chunkKey(pos.x, pos.y), nil))
+  l.schedule = newGenerationSchedule(host, l.levelChannel, l.chunkListener, 64'u16)
+  l.schedule
+
+proc pumpChunkSystem*(l: Level, maxGenerationTasks: int): bool =
+  ## One pass of the schedule for the tick loop to call. True while it has work; a level that never needed the chunk
+  ## system has none.
+  if l.schedule == nil:
+    return false
+  l.schedule.shouldUnload = l.shouldUnload or l.schedule.shouldUnload
+  l.schedule.shouldSave = l.shouldSave or l.schedule.shouldSave
+  l.shouldUnload = false
+  l.shouldSave = false
+  workOnce(l.schedule, maxGenerationTasks)
 
 proc readEntityChunkSync*(l: Level, x, z: int32): ChunkEntityData =
   ## `Level::read_entity_chunk_sync` and `get_entity_chunk_sync`.
@@ -199,6 +245,9 @@ proc writeEntityChunks*(l: Level, chunks: openArray[ChunkEntityData]): ChunkWrit
 proc shutdown*(l: Level): ChunkWriteStatus =
   ## `Level::shutdown`, after the chunk system is gone: flush the entity chunks.
   l.shutDownChunkSystem = true
+  if l.schedule != nil:
+    l.schedule.shutDownChunkSystem = true
+    discard workOnce(l.schedule, 0)
   blockAndAwaitOngoingTasks(l.chunkSaver)
   blockAndAwaitOngoingTasks(l.entitySaver)
   var chunksToWrite = newSeq[ChunkEntityData](0)
@@ -318,8 +367,8 @@ proc getTickData*(l: Level, activeChunks: openArray[(int32, int32)]): TickData =
   sort(result.blockTicks, tickLess)
   sort(result.fluidTicks, tickLess)
 
-proc fetchChunk*(l: Level, x, z: int32): FetchResult =
-  ## `Level::get_or_fetch_chunk` and `fetch_chunk`, from disk only; see the file comment.
+proc fetchChunkFromDisk*(l: Level, x, z: int32): FetchResult =
+  ## The disk half of `Level::get_or_fetch_chunk`: never generates.
   let inMemory = l.loadedChunks.getOrDefault(chunkKey(x, z), nil)
   if inMemory != nil:
     return FetchResult(kind: lkLoaded, chunk: inMemory, error: readErr(creIoError))
@@ -334,6 +383,40 @@ proc fetchChunk*(l: Level, x, z: int32): FetchResult =
     FetchResult(kind: lkNotOnDisk, chunk: nil, error: readErr(creChunkNotExist))
   of ldError:
     FetchResult(kind: lkFailed, chunk: nil, error: loaded[0].error)
+
+proc generateChunk(l: Level, x, z: int32): FetchResult =
+  ## `Level::fetch_chunk`: a ticket, then wait for the listener. See the file comment.
+  let s = ensureChunkSystem(l)
+  let pos = chunkPos(x, z)
+  let recv = addSingleChunkListener(l.chunkListener, pos)
+  addTicket(l.chunkLoading, pos, FullChunkLevel)
+  sendChange(l.chunkLoading)
+  let arrived = pumpUntil(s, proc(): bool {.closure.} = recv.received != nil, 8)
+  if arrived:
+    l.keptChunks.incl(chunkKey(x, z))
+  removeTicket(l.chunkLoading, pos, FullChunkLevel)
+  sendChange(l.chunkLoading)
+  discard workOnce(s, 0)
+  if not arrived:
+    return FetchResult(kind: lkFailed, chunk: nil, error: readErr(creChunkNotExist, "the chunk system stalled"))
+  FetchResult(kind: lkLoaded, chunk: recv.received, error: readErr(creIoError))
+
+proc fetchChunk*(l: Level, x, z: int32): FetchResult =
+  ## `Level::get_or_fetch_chunk` and `fetch_chunk`: memory, then disk, then generation. A chunk saved before it was
+  ## full is not returned as it is but resumes through the chunk system, as upstream's IO read does.
+  let found = fetchChunkFromDisk(l, x, z)
+  case found.kind
+  of lkLoaded:
+    if found.chunk.status == csFull:
+      l.keptChunks.incl(chunkKey(x, z))
+      return found
+    removeLoadedChunk(l, x, z)
+    generateChunk(l, x, z)
+  of lkNotOnDisk:
+    generateChunk(l, x, z)
+  of lkFailed:
+    # Upstream's IO read recreates a corrupt chunk, by generating over it.
+    generateChunk(l, x, z)
 
 proc loadSingleEntityChunk(l: Level, x, z: int32): ChunkEntityData =
   ## `Level::load_single_entity_chunk`; nil where upstream errs with ChunkNotExist.

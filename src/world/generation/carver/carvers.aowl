@@ -1,0 +1,593 @@
+## Caves and canyons. Port of pumpkin-world/src/generation/carver/mod.rs,
+## pumpkin-world/src/generation/carver/cave.rs and pumpkin-world/src/generation/carver/canyon.rs
+##
+## The `Carver` trait's two impls dispatch on the config's kind, as upstream's `match` already does. The tag test
+## is a per-tag table by block id, so a carved block does not walk a list.
+
+{.feature: "lenientnils".}
+
+import std/math
+import std/tables
+import ../../blockstates
+import ../../../generated/carver
+import ../../../generated/chunk_gen_settings
+import ../../../generated/dimension as dimensiondata
+import ../../../generated/tag
+import ../../../util/random/random
+import ../../../util/random/rustnum
+import ../../../util/legacy_rand
+import ../../../util/xoroshiro128
+import ../../../util/math/mathmod
+from ../../../util/math/float_provider import newUniformFloatProvider, newTrapezoidFloatProvider, get
+from ../../../util/math/rustnum import mulAdd
+import ../generation
+import ../positions
+import ../noise/doubleperlin
+import ../noise/router
+import ../noise/aquifer_sampler
+import ../noise/surface_height_sampler
+import ../surface/surface
+import ../generator/generator
+import ../protochunkbase
+
+const PiF32 = 3.14159265358979323846'f32
+
+type
+  CarverBlockIds* = object
+    air*, caveAir*, lava*, dirt*, grassBlock*, mycelium*: blockstates.BlockStateId
+
+  CarvingContext* = ref object
+    minY*: int8
+    height*: uint16
+    randomConfig*: GlobalRandomConfig
+    surfaceNoise*, secondaryNoise*: DoublePerlinNoiseSampler
+    terrainBuilder*: SurfaceTerrainBuilder
+    seaLevel*: int32
+    settings*: GenerationSettings
+    surfaceRule*: int32
+    surfaceHeightSampler*: SurfaceHeightEstimateSampler
+    carverAquifer*: CarverAquiferSampler  ## nil for upstream's None.
+
+  CarveRun* = ref object
+    ctx*: CarvingContext
+    chunk*: ProtoChunk
+    ids*: CarverBlockIds
+    random*: RandomGenerator  ## The stream the carver reads; `carve` passes it, and tunnels make their own.
+
+  CarveState* = object
+    ## `Option<(&'static BlockState, bool)>`
+    present*: bool
+    state*: blockstates.BlockStateId
+    shouldSchedule*: bool
+
+let
+  GrassBlockId = blockIdByName("grass_block")[1]
+  MyceliumId = blockIdByName("mycelium")[1]
+  WaterDefaultState = defaultStateByName("water")[1]
+  LavaDefaultState = defaultStateByName("lava")[1]
+
+var replaceableTables = initTable[string, seq[bool]]()
+
+proc replaceableTable(tagName: string): seq[bool] =
+  ## `block.id.has_tag(config.replaceable)`, as a table for the tag.
+  if replaceableTables.hasKey(tagName):
+    return replaceableTables.getOrDefault(tagName, @[])
+  result = newSeq[bool](BsStateCount)
+  let (found, names) = getTagValues(rkBlock, tagName)
+  if found:
+    for n in names:
+      let (ok, id) = blockIdByName(n)
+      if ok:
+        result[id] = true
+  replaceableTables[tagName] = result
+
+proc newCarverBlockIds*(): CarverBlockIds =
+  CarverBlockIds(air: defaultStateByName("air")[1], caveAir: defaultStateByName("cave_air")[1],
+    lava: defaultStateByName("lava")[1], dirt: defaultStateByName("dirt")[1],
+    grassBlock: defaultStateByName("grass_block")[1], mycelium: defaultStateByName("mycelium")[1])
+
+proc sampleFloatProvider(p: FloatProvider, random: var RandomGenerator): float32 =
+  ## `FloatProvider::get`. generated/worldgen_providers.aowl keeps the data and util/math/float_provider.aowl the
+  ## logic; these are the three kinds a carver config holds.
+  case p.kind
+  of FloatProviderKind.Constant:
+    p.value
+  of FloatProviderKind.Uniform:
+    get(newUniformFloatProvider(p.minInclusive, p.maxExclusive), random)
+  of FloatProviderKind.Trapezoid:
+    get(newTrapezoidFloatProvider(p.minInclusive, p.maxExclusive, p.plateau), random)
+
+proc topMaterial*(ctx: CarvingContext, chunk: ProtoChunk, x, y, z: int32, underFluid, steep: bool): RuleResult =
+  ## `CarvingContext::top_material`
+  let context = newMaterialRuleContext(ctx.minY, ctx.height, ctx.randomConfig.baseRandomDeriver, ctx.terrainBuilder,
+    ctx.surfaceNoise, ctx.secondaryNoise, ctx.seaLevel)
+  initHorizontal(context, x, z)
+  context.biomeId = getTerrainGenBiomeId(chunk, x, y, z)
+  setSteepMaterialCondition(context, steep)
+  initVertical(context, 1'i32, 1'i32, y, if underFluid: y + 1'i32 else: int32.low)
+  tryApplyMaterialRule(ctx.settings, ctx.surfaceRule, chunk, context, ctx.surfaceHeightSampler)
+
+proc scheduleFluidTickForState(chunk: ProtoChunk, x, y, z: int32, state: blockstates.BlockStateId) =
+  if state == WaterDefaultState:
+    scheduleFluidTick(chunk, x, y, z, "minecraft:water")
+  elif state == LavaDefaultState:
+    scheduleFluidTick(chunk, x, y, z, "minecraft:lava")
+
+proc carveTopMaterial*(run: CarveRun, x, carvedY, z: int32, carvedState: blockstates.BlockStateId, hasGrass, overworld: bool) =
+  if not overworld or not hasGrass:
+    return
+  let belowY = carvedY - 1'i32
+  let belowState = getBlockState(run.chunk, vec3[int32](x, belowY, z))
+  if belowState != run.ids.dirt:
+    return
+  let steep = steepMaterialCondition(run.chunk, x, z)
+  let topMaterialResult = topMaterial(run.ctx, run.chunk, x, belowY, z, isLiquid(carvedState), steep)
+  if topMaterialResult.hasState:
+    setBlockState(run.chunk, x, belowY, z, topMaterialResult.state)
+    scheduleFluidTickForState(run.chunk, x, belowY, z, topMaterialResult.state)
+
+proc overworldCarveState*(run: CarveRun, config: CarverConfig, x, y, z: int32): CarveState =
+  let lavaY = getY(config.lavaLevel, int16(bottomY(run.chunk)), height(run.chunk))
+  if y <= lavaY:
+    return CarveState(present: true, state: run.ids.lava, shouldSchedule: false)
+  if run.ctx.carverAquifer == nil:
+    return CarveState(present: true, state: run.ids.air, shouldSchedule: false)
+  let r = compute(run.ctx.carverAquifer, vec3[int32](x, y, z), 0.0'f64)
+  CarveState(present: r.hasState, state: r.state, shouldSchedule: r.shouldScheduleFluidUpdate)
+
+proc placeCarvedBlock(run: CarveRun, x, y, z: int32, state: blockstates.BlockStateId, shouldScheduleFluidUpdate,
+                      hasGrass, overworld: bool) =
+  setBlockState(run.chunk, x, y, z, state)
+  if overworld and shouldScheduleFluidUpdate and isLiquid(state):
+    scheduleFluidTickForState(run.chunk, x, y, z, state)
+  carveTopMaterial(run, x, y, z, state, hasGrass, overworld)
+
+proc newCarverRandom(seed: uint64, nonVanillaRandom: bool): RandomGenerator =
+  if nonVanillaRandom:
+    toRandomGenerator(xoroshiro128.fromSeed(seed))
+  else:
+    toRandomGenerator(legacy_rand.fromSeed(seed))
+
+proc getHeight*(p: HeightProvider, random: var RandomGenerator, minY: int8, height: uint16): int32 =
+  ## `get_height` in cave.rs
+  case p.kind
+  of HeightProviderKind.Uniform:
+    let minV = getY(p.minInclusive, int16(minY), height)
+    let maxV = getY(p.maxInclusive, int16(minY), height)
+    nextInbetweenI32(random, minV, maxV)
+  of HeightProviderKind.Trapezoid:
+    let i = getY(p.minInclusive, int16(minY), height)
+    let j = getY(p.maxInclusive, int16(minY), height)
+    let plateau = if p.hasPlateau: p.plateau else: 0'i32
+    let k = j - i
+    if plateau >= k:
+      nextInbetweenI32(random, i, j)
+    else:
+      let l = (k - plateau) div 2'i32
+      let m = k - l
+      let a = nextInbetweenI32(random, 0'i32, m)
+      let b = nextInbetweenI32(random, 0'i32, l)
+      i + a + b
+  of HeightProviderKind.VeryBiasedToBottom:
+    let minV = getY(p.minInclusive, int16(minY), height)
+    let maxV = getY(p.maxInclusive, int16(minY), height)
+    let inner = if p.hasInner: int32(p.inner) else: 1'i32
+    let minRnd = nextInbetweenI32(random, minV + inner, maxV)
+    let maxRnd = nextInbetweenI32(random, minV, minRnd - 1'i32)
+    nextInbetweenI32(random, minV, maxRnd - 1'i32 + inner)
+
+proc canReach(chunkX, chunkZ: int32, x, z: float64, step, distance: int32, thickness: float32): bool =
+  ## `can_reach`, the same in cave.rs and canyon.rs.
+  let chunkMiddleX = (chunkX shl 4) + 8'i32
+  let chunkMiddleZ = (chunkZ shl 4) + 8'i32
+  let dx = x - float64(chunkMiddleX)
+  let dz = z - float64(chunkMiddleZ)
+  let remaining = float64(distance - step)
+  let rr = float64(thickness + 2.0'f32 + 16.0'f32)
+  dx * dx + dz * dz - remaining * remaining <= rr * rr
+
+# --- cave.rs ------------------------------------------------------------------------------------
+
+proc caveCarveBlock*(run: CarveRun, config: CarverConfig, x, y, z: int32, isNether: bool, hasGrass: var bool): bool =
+  ## `CaveCarver::carve_block`
+  let replaceable = replaceableTable(config.replaceable)
+  let blockId = blockIdOf(getBlockState(run.chunk, vec3[int32](x, y, z)))
+  if blockId == GrassBlockId or blockId == MyceliumId:
+    hasGrass = true
+  if not replaceable[blockId]:
+    return false
+  var state = 0'u32
+  var shouldScheduleFluidUpdate = false
+  if isNether:
+    state = if y <= int32(bottomY(run.chunk)) + 31'i32: run.ids.lava else: run.ids.caveAir
+    shouldScheduleFluidUpdate = false
+  else:
+    let s = overworldCarveState(run, config, x, y, z)
+    if not s.present:
+      return false
+    state = s.state
+    shouldScheduleFluidUpdate = s.shouldSchedule
+  placeCarvedBlock(run, x, y, z, state, shouldScheduleFluidUpdate, hasGrass, not isNether)
+  true
+
+proc caveShouldSkip(xd, yd, zd, floorLevel: float64): bool {.inline.} =
+  if yd <= floorLevel: true
+  else: xd * xd + yd * yd + zd * zd >= 1.0'f64
+
+proc caveCarveEllipsoid(run: CarveRun, config: CarverConfig, replaceable: seq[bool], x, y, z, horizontalRadius,
+                        verticalRadius, floorLevel: float64, isNether: bool) =
+  let centerX = float64(run.chunk.x shl 4) + 8.0'f64
+  let centerZ = float64(run.chunk.z shl 4) + 8.0'f64
+  let maxDelta = 16.0'f64 + horizontalRadius * 2.0'f64
+  if abs(x - centerX) > maxDelta or abs(z - centerZ) > maxDelta:
+    return
+  let chunkMinX = run.chunk.x shl 4
+  let chunkMinZ = run.chunk.z shl 4
+  let xIndexMin = max(asI32(floor(x - horizontalRadius)) - chunkMinX - 1'i32, 0'i32)
+  let xIndexMax = min(asI32(floor(x + horizontalRadius)) - chunkMinX, 15'i32)
+  let minY = max(asI32(floor(y - verticalRadius)) - 1'i32, int32(bottomY(run.chunk)) + 1'i32)
+  let protectedBlocksOnTop = 7'i32
+  let maxY = min(asI32(floor(y + verticalRadius)) + 1'i32,
+    int32(bottomY(run.chunk)) + int32(height(run.chunk)) - 1'i32 - protectedBlocksOnTop)
+  let zIndexMin = max(asI32(floor(z - horizontalRadius)) - chunkMinZ - 1'i32, 0'i32)
+  let zIndexMax = min(asI32(floor(z + horizontalRadius)) - chunkMinZ, 15'i32)
+
+  var xIndex = xIndexMin
+  while xIndex <= xIndexMax:
+    let worldX = chunkMinX + xIndex
+    let xd = (float64(worldX) + 0.5'f64 - x) / horizontalRadius
+    var zIndex = zIndexMin
+    while zIndex <= zIndexMax:
+      let worldZ = chunkMinZ + zIndex
+      let zd = (float64(worldZ) + 0.5'f64 - z) / horizontalRadius
+      if xd * xd + zd * zd < 1.0'f64:
+        var hasGrass = false
+        var worldY = maxY
+        while worldY >= minY + 1'i32:
+          let yd = (float64(worldY) - 0.5'f64 - y) / verticalRadius
+          if not caveShouldSkip(xd, yd, zd, floorLevel) and not get(run.chunk.carvingMask, worldX, worldY, worldZ):
+            set(run.chunk.carvingMask, worldX, worldY, worldZ)
+            discard caveCarveBlock(run, config, worldX, worldY, worldZ, isNether, hasGrass)
+          dec worldY
+      inc zIndex
+    inc xIndex
+
+proc caveGetThickness(random: var RandomGenerator, isNether: bool): float32 =
+  if isNether:
+    let a = nextF32(random) * 2.0'f32
+    let b = nextF32(random)
+    (a + b) * 2.0'f32
+  else:
+    let a = nextF32(random) * 2.0'f32
+    let b = nextF32(random)
+    var thickness = a + b
+    if nextBoundedI32(random, 10'i32) == 0'i32:
+      let c = nextF32(random)
+      let d = nextF32(random)
+      thickness *= c * d * 3.0'f32 + 1.0'f32
+    thickness
+
+proc caveCreateRoom(run: CarveRun, config: CarverConfig, replaceable: seq[bool], x, y, z: float64, thickness: float32,
+                    yScale, floorLevel: float64, isNether: bool) =
+  let horizontalRadius = 1.5'f64 + float64(mathmod.sin(1.5707963267948966'f32) * thickness)
+  let verticalRadius = horizontalRadius * yScale
+  caveCarveEllipsoid(run, config, replaceable, x + 1.0'f64, y, z, horizontalRadius, verticalRadius, floorLevel, isNether)
+
+proc caveCreateTunnel(config: CarverConfig, run: CarveRun, replaceable: seq[bool], tunnelSeed: int64, x0, y0, z0,
+                      horizontalRadiusMultiplier, verticalRadiusMultiplier: float64, thickness: float32,
+                      horizontalRotation0, verticalRotation0: float32, step, dist: int32, yScale, floorLevel: float64,
+                      isNether, legacyRandomSource: bool) =
+  var x = x0
+  var y = y0
+  var z = z0
+  var horizontalRotation = horizontalRotation0
+  var verticalRotation = verticalRotation0
+  var random = newCarverRandom(cast[uint64](tunnelSeed), legacyRandomSource)
+  let splitPoint = nextBoundedI32(random, dist div 2'i32) + dist div 4'i32
+  let isSteep = nextBoundedI32(random, 6'i32) == 0'i32
+  var yRota = 0.0'f32
+  var xRota = 0.0'f32
+
+  var currentStep = step
+  while currentStep < dist:
+    let progressArg = PiF32 * float32(currentStep) / float32(dist)
+    let horizontalRadius = 1.5'f64 + float64(mathmod.sin(progressArg) * thickness)
+    let verticalRadius = horizontalRadius * yScale
+    let cosX = mathmod.cos(verticalRotation)
+    x += float64(mathmod.cos(horizontalRotation) * cosX)
+    y += float64(mathmod.sin(verticalRotation))
+    z += float64(mathmod.sin(horizontalRotation) * cosX)
+
+    verticalRotation *= (if isSteep: 0.92'f32 else: 0.7'f32)
+    verticalRotation += xRota * 0.1'f32
+    horizontalRotation += yRota * 0.1'f32
+    xRota *= 0.9'f32
+    yRota *= 0.75'f32
+    block:
+      let a = nextF32(random)
+      let b = nextF32(random)
+      let c = nextF32(random)
+      xRota += (a - b) * c * 2.0'f32
+    block:
+      let a = nextF32(random)
+      let b = nextF32(random)
+      let c = nextF32(random)
+      yRota += (a - b) * c * 4.0'f32
+
+    if currentStep == splitPoint and thickness > 1.0'f32:
+      block:
+        let seed = nextI64(random)
+        let t = nextF32(random) * 0.5'f32 + 0.5'f32
+        caveCreateTunnel(config, run, replaceable, seed, x, y, z, horizontalRadiusMultiplier, verticalRadiusMultiplier,
+          t, horizontalRotation - (PiF32 / 2.0'f32), verticalRotation / 3.0'f32, currentStep, dist, 1.0'f64, floorLevel,
+          isNether, legacyRandomSource)
+      block:
+        let seed = nextI64(random)
+        let t = nextF32(random) * 0.5'f32 + 0.5'f32
+        caveCreateTunnel(config, run, replaceable, seed, x, y, z, horizontalRadiusMultiplier, verticalRadiusMultiplier,
+          t, horizontalRotation + (PiF32 / 2.0'f32), verticalRotation / 3.0'f32, currentStep, dist, 1.0'f64, floorLevel,
+          isNether, legacyRandomSource)
+      return
+
+    if nextBoundedI32(random, 4'i32) != 0'i32:
+      if not canReach(run.chunk.x, run.chunk.z, x, z, currentStep, dist, thickness):
+        return
+      caveCarveEllipsoid(run, config, replaceable, x, y, z, horizontalRadius * horizontalRadiusMultiplier,
+        verticalRadius * verticalRadiusMultiplier, floorLevel, isNether)
+    inc currentStep
+
+proc caveCarve(config: CarverConfig, run: CarveRun, replaceable: seq[bool], random: var RandomGenerator,
+               carverChunkX, carverChunkZ: int32, legacyRandomSource: bool) =
+  ## `<CaveCarver as Carver>::carve`
+  let isNether = config.additional.kind == CarverAdditionalKind.NetherCave
+  let caveConfig = config.additional.cave
+  let minY = bottomY(run.chunk)
+  let height = height(run.chunk)
+  let maxDistance = ((4'i32 * 2'i32) - 1'i32) shl 4
+  let bound = if isNether: 10'i32 else: 15'i32
+  let c1 = nextBoundedI32(random, bound)
+  let c2 = nextBoundedI32(random, c1 + 1'i32)
+  let caveCount = nextBoundedI32(random, c2 + 1'i32)
+  var cave = 0'i32
+  while cave < caveCount:
+    let x = (carverChunkX shl 4) + nextBoundedI32(random, 16'i32)
+    let y = float64(getHeight(config.y, random, minY, height))
+    let z = (carverChunkZ shl 4) + nextBoundedI32(random, 16'i32)
+
+    let horizontalRadiusMultiplier = float64(sampleFloatProvider(caveConfig.horizontalRadiusMultiplier, random))
+    let verticalRadiusMultiplier = float64(sampleFloatProvider(caveConfig.verticalRadiusMultiplier, random))
+    let floorLevel = float64(sampleFloatProvider(caveConfig.floorLevel, random))
+
+    var tunnels = 1'i32
+    if nextBoundedI32(random, 4'i32) == 0'i32:
+      let yScale = float64(sampleFloatProvider(config.yScale, random))
+      let thickness = 1.0'f32 + nextF32(random) * 6.0'f32
+      caveCreateRoom(run, config, replaceable, float64(x), y, float64(z), thickness, yScale, floorLevel, isNether)
+      tunnels += nextBoundedI32(random, 4'i32)
+
+    var t = 0'i32
+    while t < tunnels:
+      let horizontalRotation = nextF32(random) * PiF32 * 2.0'f32
+      let verticalRotation = (nextF32(random) - 0.5'f32) / 4.0'f32
+      let thickness = caveGetThickness(random, isNether)
+      let distance = maxDistance - nextBoundedI32(random, maxDistance div 4'i32)
+      let seed = nextI64(random)
+      caveCreateTunnel(config, run, replaceable, seed, float64(x), y, float64(z), horizontalRadiusMultiplier,
+        verticalRadiusMultiplier, thickness, horizontalRotation, verticalRotation, 0'i32, distance,
+        if isNether: 5.0'f64 else: 1.0'f64, floorLevel, isNether, legacyRandomSource)
+      inc t
+    inc cave
+
+# --- canyon.rs ----------------------------------------------------------------------------------
+
+proc canyonCarveBlock(run: CarveRun, config: CarverConfig, replaceable: seq[bool], x, y, z: int32, hasGrass: var bool): bool =
+  let localY = y - int32(bottomY(run.chunk))
+  let stateId = getBlockStateRaw(run.chunk, x and 15'i32, localY, z and 15'i32)
+  let blockId = blockIdOf(stateId)
+  if blockId == GrassBlockId or blockId == MyceliumId:
+    hasGrass = true
+  if replaceable[blockId]:
+    let s = overworldCarveState(run, config, x, y, z)
+    if not s.present:
+      return false
+    placeCarvedBlock(run, x, y, z, s.state, s.shouldSchedule, hasGrass, true)
+    return true
+  false
+
+proc canyonShouldSkip(widthFactorPerHeight: seq[float32], xd, yd, zd: float64, y, minGenY: int32): bool =
+  let yIndex = int(y - minGenY)
+  if yIndex == 0:
+    return true
+  (xd * xd + zd * zd) * float64(widthFactorPerHeight[yIndex - 1]) + yd * yd / 6.0'f64 >= 1.0'f64
+
+proc canyonCarveEllipsoid(run: CarveRun, config: CarverConfig, replaceable: seq[bool], x, y, z, horizontalRadius,
+                          verticalRadius: float64, widthFactorPerHeight: seq[float32]) =
+  let centerX = float64(run.chunk.x shl 4) + 8.0'f64
+  let centerZ = float64(run.chunk.z shl 4) + 8.0'f64
+  let maxDelta = 16.0'f64 + horizontalRadius * 2.0'f64
+  if abs(x - centerX) > maxDelta or abs(z - centerZ) > maxDelta:
+    return
+  let chunkMinX = run.chunk.x shl 4
+  let chunkMinZ = run.chunk.z shl 4
+  let xIndexMin = max(asI32(floor(x - horizontalRadius)) - chunkMinX - 1'i32, 0'i32)
+  let xIndexMax = min(asI32(floor(x + horizontalRadius)) - chunkMinX, 15'i32)
+  let minY = max(asI32(floor(y - verticalRadius)) - 1'i32, int32(bottomY(run.chunk)) + 1'i32)
+  let protectedBlocksOnTop = 7'i32
+  let maxY = min(asI32(floor(y + verticalRadius)) + 1'i32,
+    int32(bottomY(run.chunk)) + int32(height(run.chunk)) - 1'i32 - protectedBlocksOnTop)
+  let zIndexMin = max(asI32(floor(z - horizontalRadius)) - chunkMinZ - 1'i32, 0'i32)
+  let zIndexMax = min(asI32(floor(z + horizontalRadius)) - chunkMinZ, 15'i32)
+
+  var xIndex = xIndexMin
+  while xIndex <= xIndexMax:
+    let worldX = chunkMinX + xIndex
+    let xd = (float64(worldX) + 0.5'f64 - x) / horizontalRadius
+    var zIndex = zIndexMin
+    while zIndex <= zIndexMax:
+      let worldZ = chunkMinZ + zIndex
+      let zd = (float64(worldZ) + 0.5'f64 - z) / horizontalRadius
+      if xd * xd + zd * zd < 1.0'f64:
+        var hasGrass = false
+        var worldY = maxY
+        while worldY >= minY + 1'i32:
+          let yd = (float64(worldY) - 0.5'f64 - y) / verticalRadius
+          if not canyonShouldSkip(widthFactorPerHeight, xd, yd, zd, worldY, int32(bottomY(run.chunk))) and
+              not get(run.chunk.carvingMask, worldX, worldY, worldZ):
+            set(run.chunk.carvingMask, worldX, worldY, worldZ)
+            discard canyonCarveBlock(run, config, replaceable, worldX, worldY, worldZ, hasGrass)
+          dec worldY
+      inc zIndex
+    inc xIndex
+
+proc canyonInitWidthFactors(depth: int, config: CarverConfig, random: var RandomGenerator): seq[float32] =
+  let smoothness = config.additional.canyon.shape.widthSmoothness
+  result = newSeq[float32](depth)
+  var widthFactor = 1.0'f32
+  for yIndex in 0 ..< depth:
+    if yIndex == 0 or nextBoundedI32(random, smoothness) == 0'i32:
+      let a = nextF32(random)
+      let b = nextF32(random)
+      widthFactor = 1.0'f32 + a * b
+    result[yIndex] = widthFactor * widthFactor
+
+proc canyonUpdateVerticalRadius(config: CarverConfig, random: var RandomGenerator, verticalRadius: float64,
+                                distance, currentStep: float32): float64 =
+  let shape = config.additional.canyon.shape
+  let verticalMultiplier = 1.0'f32 - abs(0.5'f32 - currentStep / distance) * 2.0'f32
+  let factor = shape.verticalRadiusDefaultFactor + shape.verticalRadiusCenterFactor * verticalMultiplier
+  float64(factor) * verticalRadius * float64(nextInbetweenF32(random, 0.75'f32, 1.0'f32))
+
+proc canyonDoCarve(config: CarverConfig, run: CarveRun, replaceable: seq[bool], tunnelSeed: int64, x0, y0, z0: float64,
+                   thickness, horizontalRotation0, verticalRotation0: float32, step, distance: int32, yScale: float64,
+                   legacyRandomSource: bool) =
+  var x = x0
+  var y = y0
+  var z = z0
+  var horizontalRotation = horizontalRotation0
+  var verticalRotation = verticalRotation0
+  var random = newCarverRandom(cast[uint64](tunnelSeed), legacyRandomSource)
+  let widthFactorPerHeight = canyonInitWidthFactors(int(height(run.chunk)), config, random)
+  var yRota = 0.0'f32
+  var xRota = 0.0'f32
+  let canyonConfig = config.additional.canyon
+
+  var currentStep = step
+  while currentStep < distance:
+    let progress = float32(currentStep) * PiF32 / float32(distance)
+    var horizontalRadius = 1.5'f64 + float64(mathmod.sin(progress) * thickness)
+    var verticalRadius = horizontalRadius * yScale
+    horizontalRadius *= float64(sampleFloatProvider(canyonConfig.shape.horizontalRadiusFactor, random))
+    verticalRadius = canyonUpdateVerticalRadius(config, random, verticalRadius, float32(distance), float32(currentStep))
+
+    let xc = mathmod.cos(verticalRotation)
+    let xs = mathmod.sin(verticalRotation)
+    x += float64(mathmod.cos(horizontalRotation) * xc)
+    y += float64(xs)
+    z += float64(mathmod.sin(horizontalRotation) * xc)
+
+    verticalRotation *= 0.7'f32
+    verticalRotation += xRota * 0.05'f32
+    horizontalRotation += yRota * 0.05'f32
+    xRota *= 0.8'f32
+    yRota *= 0.5'f32
+    block:
+      let a = nextF32(random)
+      let b = nextF32(random)
+      let c = nextF32(random)
+      xRota += (a - b) * c * 2.0'f32
+    block:
+      let a = nextF32(random)
+      let b = nextF32(random)
+      let c = nextF32(random)
+      yRota += (a - b) * c * 4.0'f32
+
+    if nextBoundedI32(random, 4'i32) != 0'i32:
+      if not canReach(run.chunk.x, run.chunk.z, x, z, currentStep, distance, thickness):
+        return
+      canyonCarveEllipsoid(run, config, replaceable, x, y, z, horizontalRadius, verticalRadius, widthFactorPerHeight)
+    inc currentStep
+
+proc canyonCarve(config: CarverConfig, run: CarveRun, replaceable: seq[bool], random: var RandomGenerator,
+                 carverChunkX, carverChunkZ: int32, legacyRandomSource: bool) =
+  ## `<CanyonCarver as Carver>::carve`
+  let canyonConfig = config.additional.canyon
+  let minY = bottomY(run.chunk)
+  let height = height(run.chunk)
+  let maxDistance = ((4'i32 * 2'i32) - 1'i32) * 16'i32
+  let x = (carverChunkX shl 4) + nextBoundedI32(random, 16'i32)
+  let y = getHeight(config.y, random, minY, height)
+  let z = (carverChunkZ shl 4) + nextBoundedI32(random, 16'i32)
+  let horizontalRotation = nextF32(random) * PiF32 * 2.0'f32
+  let verticalRotation = sampleFloatProvider(canyonConfig.verticalRotation, random)
+  let yScale = float64(sampleFloatProvider(config.yScale, random))
+  let thickness = sampleFloatProvider(canyonConfig.shape.thickness, random)
+  let distance = asI32(float32(maxDistance) * sampleFloatProvider(canyonConfig.shape.distanceFactor, random))
+  let seed = nextI64(random)
+  canyonDoCarve(config, run, replaceable, seed, float64(x), float64(y), float64(z), thickness, horizontalRotation,
+    verticalRotation, 0'i32, distance, yScale, legacyRandomSource)
+
+# --- mod.rs ------------------------------------------------------------------------------------
+
+proc getLargeFeatureSeed(seed: uint64, chunkX, chunkZ: int32): uint64 =
+  var random = legacy_rand.fromSeed(seed)
+  let xScale = nextI64(random)
+  let zScale = nextI64(random)
+  let r = wrapMul(int64(chunkX), xScale) xor wrapMul(int64(chunkZ), zScale) xor cast[int64](seed)
+  cast[uint64](r)
+
+proc carversForDimension(dimension: Dimension): seq[CarverConfig] =
+  if dimension.minecraftName == dimensiondata.OVERWORLD.minecraftName:
+    @[CAVE, CAVE_EXTRA_UNDERGROUND, CANYON]
+  elif dimension.minecraftName == dimensiondata.THE_NETHER.minecraftName:
+    @[NETHER_CAVE]
+  else:
+    @[]
+
+proc newCarvingContext*(chunk: ProtoChunk, generator: VanillaGenerator, surfaceRule: int32,
+                        useCarverAquifer: bool): CarvingContext =
+  ## The context `carve` and upstream's test helper `with_carve_run_options` both build.
+  let startX = startBlockX(chunk.x)
+  let startZ = startBlockZ(chunk.z)
+  let generationShape = generator.settings.shape
+  let horizontalCellCount = int32(16'u8 div horizontalCellBlockCount(generationShape))
+  let horizontalBiomeEnd = biomeFromBlock(horizontalCellCount * int32(horizontalCellBlockCount(generationShape)))
+  let surfaceConfig = newSurfaceHeightSamplerBuilderOptions(biomeFromBlock(startX), biomeFromBlock(startZ),
+    int(horizontalBiomeEnd), int32(generationShape.minY), int32(maxY(generationShape)),
+    int(verticalCellBlockCount(generationShape)))
+  let surfaceHeightSampler = generateSurfaceHeightEstimateSampler(generator.baseRouter.surfaceEstimator, surfaceConfig)
+  var carverAquifer: CarverAquiferSampler = nil
+  if useCarverAquifer:
+    carverAquifer = newCarverAquiferSampler(chunk.x, chunk.z, generator.baseRouter, generator.randomConfig, generator.settings)
+  CarvingContext(minY: int8(generator.dimension.minY), height: uint16(generator.dimension.logicalHeight),
+    randomConfig: generator.randomConfig, surfaceNoise: generator.terrainCache.surfaceNoise,
+    secondaryNoise: generator.terrainCache.secondaryNoise, terrainBuilder: generator.terrainCache.terrainBuilder,
+    seaLevel: generator.settings.seaLevel, settings: generator.settings, surfaceRule: surfaceRule,
+    surfaceHeightSampler: surfaceHeightSampler, carverAquifer: carverAquifer)
+
+proc carve*(chunk: ProtoChunk, generator: VanillaGenerator) =
+  ## `carve`. Vanilla's applyCarvers uses a range of 8 chunks, a 17x17 area.
+  let radius = 8'i32
+  let chunkX = chunk.x
+  let chunkZ = chunk.z
+  let carversToUse = carversForDimension(generator.dimension)
+  let context = newCarvingContext(chunk, generator, generator.settings.surfaceRule, generator.settings.aquifersEnabled)
+  let run = CarveRun(ctx: context, chunk: chunk, ids: newCarverBlockIds())
+  var dx = -radius
+  while dx <= radius:
+    var dz = -radius
+    while dz <= radius:
+      let carverX = chunkX + dx
+      let carverZ = chunkZ + dz
+      # In vanilla, carvers are per-biome. Here we use the hardcoded list but maintain the random seed logic.
+      for index in 0 ..< carversToUse.len:
+        let seed = getLargeFeatureSeed(generator.randomConfig.seed + uint64(index), carverX, carverZ)
+        var carverRandom = newCarverRandom(seed, generator.settings.legacyRandomSource)
+        if nextF32(carverRandom) <= carversToUse[index].probability:
+          let replaceable = replaceableTable(carversToUse[index].replaceable)
+          case carversToUse[index].additional.kind
+          of CarverAdditionalKind.Cave, CarverAdditionalKind.NetherCave:
+            caveCarve(carversToUse[index], run, replaceable, carverRandom, carverX, carverZ, generator.settings.legacyRandomSource)
+          of CarverAdditionalKind.Canyon:
+            canyonCarve(carversToUse[index], run, replaceable, carverRandom, carverX, carverZ, generator.settings.legacyRandomSource)
+      inc dz
+    inc dx

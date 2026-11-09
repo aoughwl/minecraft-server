@@ -1,0 +1,302 @@
+## A chunk in the system, and the grid of them a generation task runs over.
+## Port of pumpkin-world/src/chunk_system/chunk_state.rs (the enum is chunk_stage.aowl) and of the data and
+## `GenerationCache` half of pumpkin-world/src/chunk_system/generation_cache.rs. `Cache::advance` is
+## generation_cache.aowl: it calls the lighting engine, which runs over this `Cache`.
+
+{.feature: "lenientnils".}
+
+import std/options
+import std/assertions
+import ../blockstates
+import ../chunkdata
+import ../palette
+import ../tick
+import ../tickscheduler
+import ../nbtget
+import ../../config/lighting
+import ../../nbt/tag
+import ../../generated/biome
+import ../../generated/dimension as dimensiondata
+import ../../generated/fluid except BlockStateId
+from ../../data/block_state import newBlockStateIdUnchecked
+import ../../util/vector3
+import ../../util/utillib
+import ../generation/protochunkbase
+import ../generation/generation
+
+export protochunkbase
+
+type
+  ChunkKind* {.pure.} = enum
+    Level, Proto
+
+  Chunk* = ref object
+    ## `enum Chunk`
+    kind*: ChunkKind
+    level*: ChunkData    ## `Chunk::Level`
+    proto*: ProtoChunk   ## `Chunk::Proto`
+
+  Cache* = ref object
+    x*, z*, size*: int32
+    chunks*: seq[Chunk]
+
+proc levelChunk*(c: ChunkData): Chunk = Chunk(kind: ChunkKind.Level, level: c)
+proc protoChunk*(c: ProtoChunk): Chunk = Chunk(kind: ChunkKind.Proto, proto: c)
+
+proc getStageId*(c: Chunk): int =
+  ## `Chunk::get_stage_id`
+  case c.kind
+  of ChunkKind.Proto: stageId(c.proto)
+  of ChunkKind.Level: ord(StagedChunkEnum.Full)
+
+proc light*(c: Chunk): ChunkLight =
+  ## Either variant's light, which lighting reads and writes in place.
+  case c.kind
+  of ChunkKind.Proto: c.proto.light
+  of ChunkKind.Level: c.level.lightEngine
+
+proc getProtoChunk*(c: Chunk): ProtoChunk =
+  ## `Chunk::get_proto_chunk`. Upstream panics on a level chunk.
+  assert c.kind == ChunkKind.Proto, "chunk isn't a ProtoChunk"
+  c.proto
+
+proc blockSectionFromProto(proto: ProtoChunk, baseY: int): PalettedContainer =
+  # The Nether's `height` is 256 and its `logical_height`, which sizes a proto chunk, is 128. Upstream's read past the
+  # proto chunk panics there; above it is air, as in vanilla.
+  fromFn(16, proc(x, y, z: int): PaletteValue {.closure.} =
+    if baseY + y >= int(height(proto)): 0'u32
+    else: getBlockStateRaw(proto, int32(x), int32(baseY + y), int32(z)))
+
+proc biomeSectionFromProto(proto: ProtoChunk, baseY: int32): PalettedContainer =
+  # Above a short proto chunk, its top layer, as `get_biome_blend` clamps a position.
+  let topBiomeY = biomeFromBlock(int32(bottomY(proto))) + (int32(height(proto)) shr 2) - 1'i32
+  fromFn(4, proc(x, y, z: int): PaletteValue {.closure.} =
+    uint32(getBiomeId(proto, int32(x), min(baseY + int32(y), topBiomeY), int32(z))))
+
+proc buildLevelSections(proto: ProtoChunk, dimension: Dimension): ChunkSections =
+  ## `Chunk::build_level_sections`
+  let totalSections = int(dimension.height) div 16
+  let biomeMinY = biomeFromBlock(dimension.minY)
+  var blockSections = newSeq[PalettedContainer](totalSections)
+  var biomeSections = newSeq[PalettedContainer](totalSections)
+  for sectionIndex in 0 ..< totalSections:
+    blockSections[sectionIndex] = blockSectionFromProto(proto, sectionIndex * 16)
+    biomeSections[sectionIndex] = biomeSectionFromProto(proto, biomeMinY + int32(sectionIndex * 4))
+  fromPalettes(blockSections, biomeSections, dimension.minY)
+
+proc buildLevelHeightmaps(proto: ProtoChunk, minY: int32): ChunkHeightmaps =
+  ## `Chunk::build_level_heightmaps`
+  result = newChunkHeightmaps()
+  for x in 0'i32 ..< 16'i32:
+    for z in 0'i32 ..< 16'i32:
+      let sourceIndex = int(x) * 16 + int(z)
+      setHeightmap(result, chmWorldSurface, x, z, int32(proto.flatSurfaceHeightMap[sourceIndex]), minY)
+      setHeightmap(result, chmMotionBlocking, x, z, int32(proto.flatMotionBlockingHeightMap[sourceIndex]), minY)
+      setHeightmap(result, chmMotionBlockingNoLeaves, x, z, int32(proto.flatMotionBlockingNoLeavesHeightMap[sourceIndex]), minY)
+
+proc upgradeToLevelChunk*(c: Chunk, dimension: Dimension, lightingConfig: LightingEngineConfig) =
+  ## `Chunk::upgrade_to_level_chunk`
+  assert c.kind == ChunkKind.Proto, "Cannot upgrade a Level chunk"
+  let proto = c.proto
+  let sections = buildLevelSections(proto, dimension)
+  let heightmaps = buildLevelHeightmaps(proto, dimension.minY)
+  let sectionCount = sections.count
+  let chunk = newChunkData(proto.x, proto.z, sections)
+  chunk.heightmap = heightmaps
+  # The light moves rather than clones; nothing else holds the proto chunk after this.
+  chunk.lightEngine = proto.light
+  # One light section per block section, also above a short proto chunk.
+  while chunk.lightEngine.skyLight.len < sectionCount:
+    chunk.lightEngine.skyLight.add(newLightEmpty(0'u8))
+  while chunk.lightEngine.blockLight.len < sectionCount:
+    chunk.lightEngine.blockLight.add(newLightEmpty(0'u8))
+  # Only mark lit if past the lighting stage and the lighting config is default: full and dark skip proper lighting.
+  chunk.lightPopulated = proto.stage >= StagedChunkEnum.Lighting and lightingConfig == lecDefault
+  # Convert pending block entities from structure generation to actual block entities.
+  for ei in 0 ..< proto.pendingBlockEntities.len:
+    let nbt = proto.pendingBlockEntities[ei]
+    let (hasX, x) = nbtInt(nbt, "x")
+    let (hasY, y) = nbtInt(nbt, "y")
+    let (hasZ, z) = nbtInt(nbt, "z")
+    if hasX and hasY and hasZ:
+      putBlockEntity(chunk, blockPos(x, y, z), nbt)
+  chunk.dirty = true
+  chunk.fluidTicks = fromTicks(proto.fluidTicks)
+  chunk.status = statusFromStage(proto.stage)
+  chunk.blendingData = proto.blendingData
+  c.kind = ChunkKind.Level
+  c.level = chunk
+  c.proto = nil
+
+# --- Cache ------------------------------------------------------------------------------------
+
+proc newCache*(x, z, size: int32): Cache =
+  ## `Cache::new`
+  Cache(x: x, z: z, size: size, chunks: newSeq[Chunk](0))
+
+proc midIndex*(c: Cache): int {.inline.} = int((c.size * c.size) shr 1)
+
+proc chunkIndexOf(c: Cache, chunkX, chunkZ: int32): int {.inline.} =
+  ## -1 outside the grid.
+  let dx = chunkX - c.x
+  let dz = chunkZ - c.z
+  if dx < 0'i32 or dx >= c.size or dz < 0'i32 or dz >= c.size:
+    return -1
+  int(dx * c.size + dz)
+
+proc heightOf*(c: Cache): uint16 =
+  ## `<Cache as HeightLimitView>::height`. Upstream panics on a level center; the lighting tests run on one, and
+  ## the sections answer as well.
+  let mid = c.chunks[midIndex(c)]
+  case mid.kind
+  of ChunkKind.Proto: height(mid.proto)
+  of ChunkKind.Level: uint16(mid.level.section.count * 16)
+
+proc bottomYOf*(c: Cache): int8 =
+  ## `<Cache as HeightLimitView>::bottom_y`
+  let mid = c.chunks[midIndex(c)]
+  case mid.kind
+  of ChunkKind.Proto: bottomY(mid.proto)
+  of ChunkKind.Level: int8(mid.level.section.minY)
+
+proc getCenterChunk*(c: Cache): ProtoChunk =
+  getProtoChunk(c.chunks[midIndex(c)])
+
+proc tryGetProtoChunk*(c: Cache, chunkX, chunkZ: int32): ProtoChunk =
+  ## `get_chunk`, `get_chunk_mut` and `try_get_proto_chunk`, which read the same; nil outside or on a level chunk.
+  let i = chunkIndexOf(c, chunkX, chunkZ)
+  if i < 0 or c.chunks[i].kind == ChunkKind.Level:
+    return nil
+  c.chunks[i].proto
+
+proc getBlockState*(c: Cache, pos: Vector3[int32]): blockstates.BlockStateId =
+  ## `<Cache as GenerationCache>::get_block_state`. Outside the grid reads air, and upstream logs it.
+  let i = chunkIndexOf(c, pos.x shr 4, pos.z shr 4)
+  if i < 0:
+    return 0'u32
+  case c.chunks[i].kind
+  of ChunkKind.Level:
+    let (ok, id) = getBlockAbsoluteY(c.chunks[i].level.section, int(pos.x and 15'i32), pos.y, int(pos.z and 15'i32))
+    if ok: id else: 0'u32
+  of ChunkKind.Proto:
+    getBlockState(c.chunks[i].proto, pos)
+
+proc setBlockState*(c: Cache, pos: Vector3[int32], state: blockstates.BlockStateId) =
+  ## `<Cache as GenerationCache>::set_block_state`
+  let i = chunkIndexOf(c, pos.x shr 4, pos.z shr 4)
+  if i < 0:
+    return
+  case c.chunks[i].kind
+  of ChunkKind.Level:
+    discard setBlockAbsoluteY(c.chunks[i].level, int(pos.x and 15'i32), pos.y, int(pos.z and 15'i32), state)
+  of ChunkKind.Proto:
+    setBlockState(c.chunks[i].proto, pos.x, pos.y, pos.z, state)
+
+proc addBlockEntity*(c: Cache, pos: Vector3[int32], nbt: NbtCompound) =
+  ## `<Cache as GenerationCache>::add_block_entity`
+  let i = chunkIndexOf(c, pos.x shr 4, pos.z shr 4)
+  if i < 0:
+    return
+  if c.chunks[i].kind == ChunkKind.Proto:
+    addBlockEntity(c.chunks[i].proto, nbt)
+
+proc gridIndex(c: Cache, x, z: int32): int {.inline.} =
+  ## Upstream debug_asserts the position is inside.
+  int(((x shr 4) - c.x) * c.size + ((z shr 4) - c.z))
+
+proc topMotionBlockingBlockHeightExclusive*(c: Cache, x, z: int32): int32 =
+  let i = gridIndex(c, x, z)
+  case c.chunks[i].kind
+  of ChunkKind.Level: getHeightmap(c.chunks[i].level.heightmap, chmMotionBlocking, x, z, c.chunks[i].level.section.minY)
+  of ChunkKind.Proto: topMotionBlockingBlockHeightExclusive(c.chunks[i].proto, x, z)
+
+proc topMotionBlockingBlockNoLeavesHeightExclusive*(c: Cache, x, z: int32): int32 =
+  let i = gridIndex(c, x, z)
+  case c.chunks[i].kind
+  of ChunkKind.Level: getHeightmap(c.chunks[i].level.heightmap, chmMotionBlockingNoLeaves, x, z, c.chunks[i].level.section.minY)
+  of ChunkKind.Proto: topMotionBlockingBlockNoLeavesHeightExclusive(c.chunks[i].proto, x, z)
+
+proc topBlockHeightExclusive*(c: Cache, x, z: int32): int32 =
+  let i = gridIndex(c, x, z)
+  case c.chunks[i].kind
+  of ChunkKind.Level: getHeightmap(c.chunks[i].level.heightmap, chmWorldSurface, x, z, c.chunks[i].level.section.minY)
+  of ChunkKind.Proto: topBlockHeightExclusive(c.chunks[i].proto, x, z)
+
+proc oceanFloorHeightExclusive*(c: Cache, x, z: int32): int32 =
+  let i = chunkIndexOf(c, x shr 4, z shr 4)
+  if i < 0:
+    return 0'i32
+  case c.chunks[i].kind
+  of ChunkKind.Level: 0'i32  # Upstream's "todo missing".
+  of ChunkKind.Proto: oceanFloorHeightExclusive(c.chunks[i].proto, x, z)
+
+proc getTopY*(c: Cache, heightmap: HeightMap, x, z: int32): int32 =
+  case heightmap
+  of WorldSurfaceWg, WorldSurface: topBlockHeightExclusive(c, x, z)
+  of OceanFloorWg, OceanFloor: oceanFloorHeightExclusive(c, x, z)
+  of MotionBlocking: topMotionBlockingBlockHeightExclusive(c, x, z)
+  of MotionBlockingNoLeaves: topMotionBlockingBlockNoLeavesHeightExclusive(c, x, z)
+
+proc getBiomeForTerrainGen*(c: Cache, x, y, z: int32): Biome =
+  ## `<Cache as GenerationCache>::get_biome_for_terrain_gen`
+  var dx = (x shr 4) - c.x
+  var dy = (z shr 4) - c.z
+  if dx < 0'i32 or dy < 0'i32 or dx >= c.size or dy >= c.size:
+    # Position is outside the cache: fall back to the centre chunk's biome.
+    let mid = c.size div 2'i32
+    dx = mid
+    dy = mid
+  let i = int(dx * c.size + dy)
+  case c.chunks[i].kind
+  of ChunkKind.Level:
+    let (ok, id) = getRoughBiomeAbsoluteY(c.chunks[i].level.section, int(x and 15'i32), y, int(z and 15'i32))
+    ALL[int(if ok: id else: 0'u8)]
+  of ChunkKind.Proto:
+    getTerrainGenBiome(c.chunks[i].proto, x, y, z)
+
+proc getBlendingData*(c: Cache, chunkX, chunkZ: int32): BlendingData =
+  let i = chunkIndexOf(c, chunkX, chunkZ)
+  if i < 0:
+    return nil
+  case c.chunks[i].kind
+  of ChunkKind.Proto: c.chunks[i].proto.blendingData
+  of ChunkKind.Level: c.chunks[i].level.blendingData
+
+proc getFluidAndFluidState*(c: Cache, pos: Vector3[int32]): (Fluid, FluidState) =
+  ## `<Cache as GenerationCache>::get_fluid_and_fluid_state`
+  let id = getBlockState(c, pos)
+  let fluid = Fluid.fromStateId(newBlockStateIdUnchecked(uint16(id)))
+  if isNone(fluid):
+    let props = stateProperties(id)
+    for pi in 0 ..< props.len:
+      if props[pi].name == "waterlogged":
+        if props[pi].value == "true":
+          return (Fluid.FLOWING_WATER, Fluid.FLOWING_WATER.states[0])
+        break
+    return (Fluid.EMPTY, Fluid.EMPTY.states[0])
+  # Upstream's commented-out `fluid.get_state(id)`: it hands back the first state.
+  let f = get(fluid)
+  (f, f.states[0])
+
+proc cacheAsGenerationCache*(c: Cache): GenerationCache =
+  ## `impl GenerationCache for Cache`
+  GenerationCache(
+    getCenterChunk: proc(): ProtoChunk {.closure.} = getCenterChunk(c),
+    getChunk: proc(cx, cz: int32): nil ProtoChunk {.closure.} = tryGetProtoChunk(c, cx, cz),
+    tryGetProtoChunk: proc(cx, cz: int32): nil ProtoChunk {.closure.} = tryGetProtoChunk(c, cx, cz),
+    getBlockState: proc(pos: Vector3[int32]): blockstates.BlockStateId {.closure.} = getBlockState(c, pos),
+    getFluidAndFluidState: proc(pos: Vector3[int32]): (Fluid, FluidState) {.closure.} = getFluidAndFluidState(c, pos),
+    setBlockState: proc(pos: Vector3[int32], state: blockstates.BlockStateId) {.closure.} = setBlockState(c, pos, state),
+    addBlockEntity: proc(pos: Vector3[int32], nbt: NbtCompound) {.closure.} = addBlockEntity(c, pos, nbt),
+    topMotionBlockingBlockHeightExclusive: proc(x, z: int32): int32 {.closure.} =
+      topMotionBlockingBlockHeightExclusive(c, x, z),
+    topMotionBlockingBlockNoLeavesHeightExclusive: proc(x, z: int32): int32 {.closure.} =
+      topMotionBlockingBlockNoLeavesHeightExclusive(c, x, z),
+    getTopY: proc(heightmap: HeightMap, x, z: int32): int32 {.closure.} = getTopY(c, heightmap, x, z),
+    topBlockHeightExclusive: proc(x, z: int32): int32 {.closure.} = topBlockHeightExclusive(c, x, z),
+    oceanFloorHeightExclusive: proc(x, z: int32): int32 {.closure.} = oceanFloorHeightExclusive(c, x, z),
+    isAirAt: proc(localPos: Vector3[int32]): bool {.closure.} = blockstates.isAir(getBlockState(c, localPos)),
+    getBiomeForTerrainGen: proc(x, y, z: int32): Biome {.closure.} = getBiomeForTerrainGen(c, x, y, z),
+    getBlendingData: proc(cx, cz: int32): nil BlendingData {.closure.} = getBlendingData(c, cx, cz),
+    height: proc(): uint16 {.closure.} = heightOf(c),
+    bottomY: proc(): int8 {.closure.} = bottomYOf(c))

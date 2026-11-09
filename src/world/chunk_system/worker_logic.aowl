@@ -1,0 +1,130 @@
+## What the schedule's workers do. Port of pumpkin-world/src/chunk_system/worker_logic.rs
+##
+## No threads and no channels here: `ioReadBatch`, `ioWriteBatch` and `runGeneration` are plain calls the schedule
+## makes, and `ScheduleHost` is the part of `Level` they read, since level.aowl imports this. `catch_unwind` has no
+## counterpart: a generation step that fails aborts, which is what an unwinding panic there would do for a port
+## without unwinding.
+
+{.feature: "lenientnils".}
+
+import ../../config/lighting
+import ../chunkdata
+import ../chunkio
+import ../filemanager
+import ../world
+import ../generation/proto_chunk
+import dag
+import generation_cache
+
+type
+  RecvChunkKind* {.pure.} = enum
+    IO, Generation, GenerationFailure
+
+  RecvChunk* = object
+    kind*: RecvChunkKind
+    pos*: ChunkPos
+    io*: Chunk            ## IO
+    cache*: Cache         ## Generation
+    stage*: StagedChunkEnum  ## GenerationFailure
+    error*: string        ## GenerationFailure
+
+  ScheduleHost* = ref object
+    ## `Arc<Level>`, as the workers and the schedule read it.
+    worldGen*: WorldGenerator
+    worldPortal*: WorldPortalExt
+    chunkSaver*: ChunkFileManager
+    levelFolder*: LevelFolder
+    lightingConfig*: LightingEngineConfig
+    publicInsert*: proc(pos: ChunkPos, chunk: ChunkData): bool {.closure.}
+      ## `public_chunk_map.insert`; true when it replaced a chunk.
+    publicRemove*: proc(pos: ChunkPos) {.closure.}
+    publicGet*: proc(pos: ChunkPos): nil ChunkData {.closure.}
+
+proc newScheduleHost*(worldGen: WorldGenerator, worldPortal: WorldPortalExt, chunkSaver: ChunkFileManager,
+                      levelFolder: LevelFolder, lightingConfig: LightingEngineConfig,
+                      publicInsert: proc(pos: ChunkPos, chunk: ChunkData): bool {.closure.},
+                      publicRemove: proc(pos: ChunkPos) {.closure.},
+                      publicGet: proc(pos: ChunkPos): nil ChunkData {.closure.}): ScheduleHost =
+  ScheduleHost(worldGen: worldGen, worldPortal: worldPortal, chunkSaver: chunkSaver, levelFolder: levelFolder,
+    lightingConfig: lightingConfig, publicInsert: publicInsert, publicRemove: publicRemove, publicGet: publicGet)
+
+proc noHostPublicMap*(): ScheduleHost =
+  ## A host with only its chunk map: what a test that never reads or writes disk wants.
+  ScheduleHost(
+    publicInsert: proc(pos: ChunkPos, chunk: ChunkData): bool {.closure.} = false,
+    publicRemove: proc(pos: ChunkPos) {.closure.} = discard,
+    publicGet: proc(pos: ChunkPos): nil ChunkData {.closure.} = nil)
+
+proc needsRelighting(chunk: ChunkData, config: LightingEngineConfig): bool =
+  ## `needs_relighting`: uniform lighting from full or dark mode while the server now runs in default mode.
+  if config != lecDefault:
+    return false
+  # If the chunk says it's already lit, believe it.
+  if chunk.lightPopulated:
+    return false
+  let engine = chunk.lightEngine
+  # Scan for any complex lighting data. If it has complex light, we don't need to relight.
+  for li in 0 ..< engine.skyLight.len:
+    if engine.skyLight[li].data.len > 0:
+      for b in engine.skyLight[li].data:
+        if b != 0x00'u8 and b != 0xFF'u8:
+          return false
+    elif engine.skyLight[li].default != 0'u8 and engine.skyLight[li].default != 15'u8:
+      return false
+  for li in 0 ..< engine.blockLight.len:
+    if engine.blockLight[li].data.len > 0:
+      for b in engine.blockLight[li].data:
+        if b != 0x00'u8 and b != 0xFF'u8:
+          return false
+    elif engine.blockLight[li].default != 0'u8 and engine.blockLight[li].default != 15'u8:
+      return false
+  true
+
+proc ioReadBatch*(host: ScheduleHost, batch: seq[ChunkPos], send: var seq[RecvChunk]) =
+  ## The body of `io_read_work`'s loop. The IO lock waited for writes of these positions to finish; writes here are
+  ## finished before this runs.
+  var coords = newSeq[(int32, int32)](batch.len)
+  for i in 0 ..< batch.len:
+    coords[i] = (batch[i].x, batch[i].y)
+  let loaded = fetchChunks(host.chunkSaver, host.levelFolder, coords)
+  for li in 0 ..< loaded.len:
+    let pos = chunkPos(loaded[li].x, loaded[li].z)
+    # A chunk the level still has in memory, such as one fetched and kept, is newer than the disk.
+    let held = host.publicGet(pos)
+    if held != nil:
+      send.add(RecvChunk(kind: RecvChunkKind.IO, pos: pos, io: levelChunk(held)))
+    else:
+      case loaded[li].kind
+      of ldLoaded:
+        let chunk = loaded[li].chunk
+        if chunk.status == csFull:
+          if needsRelighting(chunk, host.lightingConfig):
+            # Uniform lighting: downgrade to the Features stage for relighting.
+            let proto = fromChunkData(chunk, host.worldGen)
+            let sectionCount = proto.light.skyLight.len
+            for s in 0 ..< sectionCount:
+              proto.light.skyLight[s] = newLightEmpty(15'u8)
+              proto.light.blockLight[s] = newLightEmpty(0'u8)
+            proto.stage = StagedChunkEnum.Features
+            send.add(RecvChunk(kind: RecvChunkKind.IO, pos: pos, io: protoChunk(proto)))
+          else:
+            send.add(RecvChunk(kind: RecvChunkKind.IO, pos: pos, io: levelChunk(chunk)))
+        else:
+          send.add(RecvChunk(kind: RecvChunkKind.IO, pos: pos, io: protoChunk(fromChunkData(chunk, host.worldGen))))
+      of ldMissing, ldError:
+        send.add(RecvChunk(kind: RecvChunkKind.IO, pos: pos, io: protoChunk(newProtoChunk(pos.x, pos.y, host.worldGen))))
+
+proc ioWriteBatch*(host: ScheduleHost, data: seq[(ChunkPos, Chunk)]) =
+  ## The body of `io_write_work`'s loop.
+  var vec = newSeq[ChunkData](0)
+  for i in 0 ..< data.len:
+    let chunk = data[i][1]
+    if chunk.kind == ChunkKind.Proto:
+      upgradeToLevelChunk(chunk, dimension(host.worldGen), host.lightingConfig)
+    vec.add(chunk.level)
+  discard saveChunks(host.chunkSaver, host.levelFolder, vec)
+
+proc runGeneration*(host: ScheduleHost, pos: ChunkPos, cache: Cache, stage: StagedChunkEnum): RecvChunk =
+  ## `run_generation`
+  advance(cache, stage, host.worldGen, host.worldPortal, host.lightingConfig)
+  RecvChunk(kind: RecvChunkKind.Generation, pos: pos, cache: cache)

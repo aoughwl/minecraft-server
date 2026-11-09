@@ -1,0 +1,250 @@
+## Port of chunk_system/tests.rs, of the `test` in chunk_loading.rs with its level grid checked against a recount (the
+## recount is upstream's `debug_check_error`), and of `generate_chunk_should_return` in generation.rs.
+##
+## `configured_seed_generates_vanilla_ancient_city_chunk`, `seed_zero_generates_the_vanilla_pillager_outpost_chunk` and
+## `pillager_outpost_features_shape_ground_at_vanilla_height` in generation.rs wait for generation/structure and
+## generation/feature: see structurehooks.aowl.
+
+{.feature: "lenientnils".}
+
+import std/assertions
+import std/syncio
+import std/tables
+import std/heapqueue
+import ../chunkdata
+import ../blockstates
+import ../world
+import ../../generated/dimension
+import ../generation/generator/generator
+import chunk_system
+
+proc emptyLevels(): ChunkLevel = initTable[ChunkPos, int8]()
+
+proc ensure(graph: DAG, queue: var HeapQueue[TaskHeapNode], dependencyTask: NodeKey, holder: ChunkHolder,
+            req: StagedChunkEnum) =
+  ensureDependencyChain(graph, queue, emptyLevels(), @[], dependencyTask, chunkPos(0'i32, 0'i32), holder, req)
+
+block ensureDependencyChainBuildsMultistageChain:
+  let graph = newDAG()
+  var queue = initHeapQueue[TaskHeapNode]()
+  let dependencyTask = insertNode(graph, newNode(chunkPos(10'i32, 10'i32), StagedChunkEnum.Features))
+  let holder = newChunkHolder()
+  ensure(graph, queue, dependencyTask, holder, StagedChunkEnum.Surface)
+  let start = max(ord(holder.currentStage) + 1, ord(StagedChunkEnum.Empty))
+  let stop = ord(StagedChunkEnum.Surface)
+  # Ensure tasks were created, present in the DAG, and correctly chained.
+  for idx in start .. stop:
+    let key = holder.tasks[idx]
+    assert not isNull(key), "task was not created"
+    assert containsNode(graph, key), "graph missing node"
+    if idx == start:
+      assert node(graph, key).inDegree == 0'u32, "Start task should have 0 in_degree"
+    else:
+      assert node(graph, key).inDegree == 1'u32, "Intermediate task should have in_degree of 1"
+  # The dependency node should have its in_degree incremented.
+  assert node(graph, dependencyTask).inDegree == 1'u32
+  # The entry task should have been queued.
+  assert queue.len > 0, "queue should have entry task"
+  assert pop(queue).key == holder.tasks[start]
+
+block ensureDependencyChainResumesPartialChain:
+  let graph = newDAG()
+  var queue = initHeapQueue[TaskHeapNode]()
+  let dependencyTask = insertNode(graph, newNode(chunkPos(10'i32, 10'i32), StagedChunkEnum.Features))
+  let holder = newChunkHolder()
+  holder.currentStage = StagedChunkEnum.Biomes
+  ensure(graph, queue, dependencyTask, holder, StagedChunkEnum.Surface)
+  let start = max(ord(holder.currentStage) + 1, ord(StagedChunkEnum.Empty))
+  let queued = pop(queue)
+  assert queued.key == holder.tasks[start], "Should resume directly from the next stage after Biomes"
+  assert node(graph, queued.key).inDegree == 0'u32, "Resumed task should have 0 in_degree"
+
+block ensureDependencyChainDoesNothingIfAlreadyMet:
+  let graph = newDAG()
+  var queue = initHeapQueue[TaskHeapNode]()
+  let dependencyTask = insertNode(graph, newNode(chunkPos(10'i32, 10'i32), StagedChunkEnum.Features))
+  let holder = newChunkHolder()
+  holder.currentStage = StagedChunkEnum.Full
+  ensure(graph, queue, dependencyTask, holder, StagedChunkEnum.Surface)
+  for i in 0 ..< StagedChunkCount:
+    assert isNull(holder.tasks[i]), "No tasks should be created if the stage requirement is already met"
+  assert queue.len == 0, "Nothing should be queued"
+
+block ensureDependencyChainRespectsOccupiedLock:
+  let graph = newDAG()
+  var queue = initHeapQueue[TaskHeapNode]()
+  let dependencyTask = insertNode(graph, newNode(chunkPos(10'i32, 10'i32), StagedChunkEnum.Features))
+  # An "occupy" node simulates another process currently working on this chunk.
+  let occupyNode = insertNode(graph, newNode(chunkPos(int32.high, int32.high), StagedChunkEnum.None))
+  let holder = newChunkHolder()
+  holder.occupied = occupyNode
+  ensure(graph, queue, dependencyTask, holder, StagedChunkEnum.Surface)
+  let entryTask = holder.tasks[ord(StagedChunkEnum.Empty)]
+  # The first task should depend on the occupy node finishing.
+  assert node(graph, entryTask).inDegree == 1'u32, "Entry task should be blocked by the occupy node"
+  assert queue.len == 0, "Task should not be queued because it is blocked by occupied status"
+
+block ensureDependencyChainEarlyReturnSkipsEdge:
+  let graph = newDAG()
+  var queue = initHeapQueue[TaskHeapNode]()
+  let dependencyTask = insertNode(graph, newNode(chunkPos(1'i32, 1'i32), StagedChunkEnum.Surface))
+  # A holder already at the required stage (Features > Surface).
+  let holder = newChunkHolder()
+  holder.currentStage = StagedChunkEnum.Features
+  holder.targetStage = StagedChunkEnum.Features
+  ensure(graph, queue, dependencyTask, holder, StagedChunkEnum.Empty)
+  assert node(graph, dependencyTask).inDegree == 0'u32,
+    "Dependency task should not be blocked if the neighbor is already past the required stage"
+
+proc dropFromGraph(graph: DAG, key: NodeKey) =
+  ## The hand-written `drop_node` these upstream tests use.
+  let (ok, old) = removeNode(graph, key)
+  if ok:
+    var edge = old.edge
+    while not isNull(edge):
+      let cur = removeEdge(graph, edge)
+      if containsNode(graph, cur.to):
+        node(graph, cur.to).inDegree -= 1'u32
+      edge = cur.next
+
+block completedProtoStageDropsAllSatisfiedTasks:
+  let graph = newDAG()
+  let holder = newChunkHolder()
+  holder.targetStage = StagedChunkEnum.StructureStart
+  for stage in ord(StagedChunkEnum.Empty) .. ord(StagedChunkEnum.StructureStart):
+    holder.tasks[stage] = insertNode(graph, newNode(chunkPos(0'i32, 0'i32), stageFromU8(stage)))
+  for stage in ord(StagedChunkEnum.Empty) ..< ord(StagedChunkEnum.StructureStart):
+    addEdge(graph, holder.tasks[stage], holder.tasks[stage + 1])
+  let returnedStage = ord(StagedChunkEnum.Biomes)
+  for taskIdx in ord(holder.currentStage) + 1 .. min(returnedStage, StagedChunkCount - 1):
+    if not isNull(holder.tasks[taskIdx]):
+      dropFromGraph(graph, holder.tasks[taskIdx])
+      holder.tasks[taskIdx] = NullKey
+  assert isNull(holder.tasks[ord(StagedChunkEnum.Empty)])
+  assert isNull(holder.tasks[ord(StagedChunkEnum.Biomes)])
+  assert not isNull(holder.tasks[ord(StagedChunkEnum.StructureStart)])
+  assert containsNode(graph, holder.tasks[ord(StagedChunkEnum.StructureStart)])
+
+block cancellationPathDecrementsInDegree:
+  let graph = newDAG()
+  # A task that is waiting.
+  let waitingTaskKey = insertNode(graph, newNode(chunkPos(0'i32, 0'i32), StagedChunkEnum.Surface))
+  node(graph, waitingTaskKey).inDegree = 1'u32
+  # The occupy node that the task is waiting on.
+  let occupyKey = insertNode(graph, newNode(chunkPos(int32.high, int32.high), StagedChunkEnum.None))
+  addEdge(graph, occupyKey, waitingTaskKey)
+  let holder = newChunkHolder()
+  holder.currentStage = StagedChunkEnum.Empty
+  holder.targetStage = StagedChunkEnum.Surface
+  holder.occupied = occupyKey
+  holder.tasks[ord(StagedChunkEnum.Surface)] = waitingTaskKey
+  # The cancellation logic from `work()`.
+  var nodesToDrop = newSeq[NodeKey](0)
+  for i in 0 ..< StagedChunkCount:
+    if not isNull(holder.tasks[i]):
+      nodesToDrop.add(holder.tasks[i])
+      holder.tasks[i] = NullKey
+  if not isNull(holder.occupied):
+    nodesToDrop.add(holder.occupied)
+    holder.occupied = NullKey
+  for i in 0 ..< nodesToDrop.len:
+    dropFromGraph(graph, nodesToDrop[i])
+  assert not containsNode(graph, waitingTaskKey), "The waiting task should have been dropped during cancellation"
+
+proc debugCheckError(a: ChunkLoading) =
+  ## `ChunkLoading::debug_check_error`: the incremental levels equal a recount from the tickets.
+  var temp = initTable[ChunkPos, int8]()
+  for ticketPos, levels in pairs(a.ticket):
+    var level = levels[0]
+    for v in levels:
+      if v < level:
+        level = v
+    let range = int32(MaxLevel - level - 1'i8)
+    var dx = -range
+    while dx <= range:
+      var dy = -range
+      while dy <= range:
+        let newPos = addRaw(ticketPos, dx, dy)
+        let fromSource = level + int8(max(abs(dx), abs(dy)))
+        temp[newPos] = min(temp.getOrDefault(newPos, MaxLevel), fromSource)
+        inc dy
+      inc dx
+  assert temp.len == a.posLevel.len
+  for pos, level in pairs(temp):
+    assert a.posLevel.getOrDefault(pos, -1'i8) == level
+
+block chunkLoadingTest:
+  let a = newChunkLoading(newLevelChannel())
+  template step(body: untyped) =
+    body
+    debugCheckError(a)
+  step: addTicket(a, chunkPos(0'i32, 0'i32), 44'i8)
+  step: addTicket(a, chunkPos(0'i32, 1'i32), 44'i8)
+  step: removeTicket(a, chunkPos(0'i32, 0'i32), 44'i8)
+  step: addTicket(a, chunkPos(0'i32, 0'i32), 30'i8)
+  step: addTicket(a, chunkPos(0'i32, 10'i32), 25'i8)
+  step: addTicket(a, chunkPos(10'i32, 10'i32), 26'i8)
+  step: addTicket(a, chunkPos(10'i32, 10'i32), 26'i8)
+  step: removeTicket(a, chunkPos(0'i32, 0'i32), 30'i8)
+  step: removeTicket(a, chunkPos(0'i32, 10'i32), 25'i8)
+  step: removeTicket(a, chunkPos(10'i32, 10'i32), 26'i8)
+  step: removeTicket(a, chunkPos(10'i32, 10'i32), 26'i8)
+  step: addTicket(a, chunkPos(-72'i32, 457'i32), 24'i8)
+  step: addTicket(a, chunkPos(-72'i32, 455'i32), 33'i8)
+  step: addTicket(a, chunkPos(-72'i32, 456'i32), 24'i8)
+  step: removeTicket(a, chunkPos(-72'i32, 457'i32), 24'i8)
+  step: addTicket(a, chunkPos(-72'i32, 455'i32), 24'i8)
+  step: addTicket(a, chunkPos(-59'i32, 495'i32), 33'i8)
+  step: addTicket(a, chunkPos(-51'i32, 504'i32), 24'i8)
+  step: removeTicket(a, chunkPos(-51'i32, 504'i32), 24'i8)
+
+block generateChunkShouldReturn:
+  let worldGen = getWorldGen(42'u64, OVERWORLD, false, @[], "")
+  let chunk = generateSingleChunk(worldGen, noOpWorldPortal(), 0'i32, 0'i32, StagedChunkEnum.Full)
+  assert chunk.kind == ChunkKind.Level, "full generation must return a level chunk"
+  let recalculated = calculateHeightmap(chunk.level)
+  for x in 0'i32 ..< 16'i32:
+    for z in 0'i32 ..< 16'i32:
+      for t in [chmWorldSurface, chmMotionBlocking, chmMotionBlockingNoLeaves]:
+        assert getHeightmap(chunk.level.heightmap, t, x, z, chunk.level.section.minY) ==
+          getHeightmap(recalculated, t, x, z, chunk.level.section.minY)
+
+block otherDimensionsAndFlat:
+  # No upstream vector here: each generator runs to Full and leaves the terrain its dimension should have.
+  block:
+    let nether = getWorldGen(42'u64, THE_NETHER, false, @[], "")
+    let chunk = generateSingleChunk(nether, noOpWorldPortal(), 0'i32, 0'i32, StagedChunkEnum.Full)
+    assert chunk.kind == ChunkKind.Level
+    var netherrack = 0
+    for x in 0 ..< 16:
+      for z in 0 ..< 16:
+        for y in 0'i32 ..< 128'i32:
+          let (ok, id) = getBlockAbsoluteY(chunk.level.section, x, y, z)
+          if ok and blockNameOfState(id) == "netherrack":
+            inc netherrack
+    assert netherrack > 1000
+  block:
+    let endGen = getWorldGen(42'u64, THE_END, false, @[], "")
+    let chunk = generateSingleChunk(endGen, noOpWorldPortal(), 0'i32, 0'i32, StagedChunkEnum.Full)
+    assert chunk.kind == ChunkKind.Level
+    var endStone = 0
+    for x in 0 ..< 16:
+      for z in 0 ..< 16:
+        for y in 0'i32 ..< 128'i32:
+          let (ok, id) = getBlockAbsoluteY(chunk.level.section, x, y, z)
+          if ok and blockNameOfState(id) == "end_stone":
+            inc endStone
+    assert endStone > 100
+  block:
+    let flat = getWorldGen(42'u64, OVERWORLD, true, @[FlatLayer(block_name: "minecraft:bedrock", height: 1'i32),
+      FlatLayer(block_name: "minecraft:dirt", height: 3'i32)], "minecraft:desert")
+    let chunk = generateSingleChunk(flat, noOpWorldPortal(), 1'i32, 2'i32, StagedChunkEnum.Full)
+    assert chunk.kind == ChunkKind.Level
+    let (ok0, id0) = getBlockAbsoluteY(chunk.level.section, 3, -64'i32, 4)
+    let (ok1, id1) = getBlockAbsoluteY(chunk.level.section, 3, -61'i32, 4)
+    let (ok2, id2) = getBlockAbsoluteY(chunk.level.section, 3, -60'i32, 4)
+    assert ok0 and blockNameOfState(id0) == "bedrock"
+    assert ok1 and blockNameOfState(id1) == "dirt"
+    assert ok2 and isAir(id2)
+
+echo "schedulelogictest ok"
