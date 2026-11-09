@@ -1,0 +1,239 @@
+## Structure template loading from NBT files.
+## Port of pumpkin-world/src/generation/structure/template/structure_template.rs
+##
+## `jigsawBlocks` has no upstream counterpart: the indices of `blocks` whose palette entry is a jigsaw, in order, so that
+## the jigsaw search (which runs per candidate element) does not walk a whole template to find them.
+
+{.feature: "lenientnils".}
+
+import std/options
+import std/strutils
+import ../../../../nbt/tag
+import ../../../../nbt/nbt_compress
+import ../../../../nbt/nbtbase
+import ../../../../util/vector3
+
+type
+  PaletteEntry* = object
+    name*: string
+    properties*: seq[(string, string)]
+
+  TemplateBlock* = object
+    pos*: Vector3[int32]
+    state*: uint32
+    hasNbt*: bool
+    nbt*: NbtCompound
+
+  TemplateEntity* = object
+    pos*: Vector3[float64]
+    blockPos*: Vector3[int32]
+    nbt*: NbtCompound
+
+  StructureTemplate* = ref object
+    size*: Vector3[int32]
+    palette*: seq[PaletteEntry]
+    blocks*: seq[TemplateBlock]
+    entities*: seq[TemplateEntity]
+    jigsawBlocks*: seq[int]
+
+  TemplateResult* = object
+    ## `Result<StructureTemplate, TemplateError>`
+    ok*: bool
+    error*: string
+    value*: StructureTemplate
+
+proc newPaletteEntry*(name: string): PaletteEntry =
+  PaletteEntry(name: name, properties: @[])
+
+proc paletteEntryWithProperties*(name: string, properties: seq[(string, string)]): PaletteEntry =
+  PaletteEntry(name: name, properties: properties)
+
+proc paletteEntryFromString*(s: string): PaletteEntry =
+  ## `PaletteEntry::from_string`: `minecraft:oak_log[axis=x]`
+  let bracketPos = find(s, '[')
+  if bracketPos < 0:
+    return newPaletteEntry(s)
+  result = newPaletteEntry(s[0 ..< bracketPos])
+  var endBracket = s.len
+  var i = s.len - 1
+  while i >= 0:
+    if s[i] == ']':
+      endBracket = i
+      break
+    dec i
+  let propsStr = s[bracketPos + 1 ..< endBracket]
+  for part in split(propsStr, ','):
+    let parts = split(part, '=')
+    if parts.len >= 2:
+      result.properties.add((strip(parts[0]), strip(parts[1])))
+
+proc extractInt(tag: NbtTag): (bool, int32) =
+  case tag.kind
+  of ntkByte: (true, int32(tag.byteVal))
+  of ntkShort: (true, int32(tag.shortVal))
+  of ntkInt: (true, tag.intVal)
+  of ntkLong: (true, cast[int32](uint32(cast[uint64](tag.longVal) and 0xFFFFFFFF'u64)))
+  else: (false, 0'i32)
+
+proc extractDouble(tag: NbtTag): (bool, float64) =
+  case tag.kind
+  of ntkFloat: (true, float64(tag.floatVal))
+  of ntkDouble: (true, tag.doubleVal)
+  of ntkInt: (true, float64(tag.intVal))
+  of ntkLong: (true, float64(tag.longVal))
+  else: (false, 0.0'f64)
+
+proc fail(message: string): TemplateResult =
+  TemplateResult(ok: false, error: message, value: nil)
+
+proc parseIntTriple(list: seq[NbtTag], ok: var bool): Vector3[int32] =
+  if list.len != 3:
+    ok = false
+    return vec3[int32](0, 0, 0)
+  let (ax, x) = extractInt(list[0])
+  let (ay, y) = extractInt(list[1])
+  let (az, z) = extractInt(list[2])
+  if not (ax and ay and az):
+    ok = false
+  vec3[int32](x, y, z)
+
+proc parsePalette(compound: NbtCompound, palette: var seq[PaletteEntry]): string =
+  ## "" or the error.
+  var paletteList: seq[NbtTag] = @[]
+  let direct = getList(compound, "palette")
+  if isSome(direct):
+    paletteList = get(direct)
+  else:
+    let palettes = getList(compound, "palettes")
+    if isNone(palettes):
+      return "Missing required field: palette"
+    let outer = get(palettes)
+    if outer.len > 0 and outer[0].kind == ntkList:
+      paletteList = outer[0].listVal
+    else:
+      return "Missing required field: palette"
+  for i in 0 ..< paletteList.len:
+    if paletteList[i].kind != ntkCompound:
+      return "Invalid field type for palette entry"
+    let entryCompound = paletteList[i].compoundVal
+    let name = getString(entryCompound, "Name")
+    if isNone(name):
+      return "Missing required field: palette.Name"
+    var entry = newPaletteEntry(get(name))
+    let props = getCompound(entryCompound, "Properties")
+    if isSome(props):
+      let propsCompound = get(props)
+      for pi in 0 ..< propsCompound.names.len:
+        if propsCompound.values[pi].kind == ntkString:
+          entry.properties.add((propsCompound.names[pi], propsCompound.values[pi].stringVal))
+    palette.add(entry)
+  ""
+
+proc parseBlocks(compound: NbtCompound, paletteSize: int, blocks: var seq[TemplateBlock]): string =
+  let blocksList = getList(compound, "blocks")
+  if isNone(blocksList):
+    return "Missing required field: blocks"
+  let list = get(blocksList)
+  blocks = newSeqOfCap[TemplateBlock](list.len)
+  for i in 0 ..< list.len:
+    if list[i].kind != ntkCompound:
+      return "Invalid field type for blocks entry"
+    let blockCompound = list[i].compoundVal
+    let posList = getList(blockCompound, "pos")
+    if isNone(posList):
+      return "Missing required field: blocks.pos"
+    var good = true
+    let pos = parseIntTriple(get(posList), good)
+    if not good:
+      return "Invalid field type for blocks.pos"
+    let stateTag = getInt(blockCompound, "state")
+    if isNone(stateTag):
+      return "Missing required field: blocks.state"
+    let state = cast[uint32](get(stateTag))
+    if int64(state) >= int64(paletteSize):
+      return "Invalid palette index: " & $state
+    let nbt = getCompound(blockCompound, "nbt")
+    if isSome(nbt):
+      blocks.add(TemplateBlock(pos: pos, state: state, hasNbt: true, nbt: get(nbt)))
+    else:
+      blocks.add(TemplateBlock(pos: pos, state: state, hasNbt: false, nbt: newCompound()))
+  ""
+
+proc parseEntities(compound: NbtCompound, entities: var seq[TemplateEntity]): string =
+  let entitiesList = getList(compound, "entities")
+  if isNone(entitiesList):
+    return ""
+  let list = get(entitiesList)
+  for i in 0 ..< list.len:
+    if list[i].kind != ntkCompound:
+      return "Invalid field type for entities entry"
+    let entityCompound = list[i].compoundVal
+    let posList = getList(entityCompound, "pos")
+    if isNone(posList):
+      return "Missing required field: entities.pos"
+    let p = get(posList)
+    if p.len != 3:
+      return "Invalid field type for entities.pos"
+    let (ax, x) = extractDouble(p[0])
+    let (ay, y) = extractDouble(p[1])
+    let (az, z) = extractDouble(p[2])
+    if not (ax and ay and az):
+      return "Invalid field type for entities.pos"
+    let blockPosList = getList(entityCompound, "blockPos")
+    if isNone(blockPosList):
+      return "Missing required field: entities.blockPos"
+    var good = true
+    let blockPos = parseIntTriple(get(blockPosList), good)
+    if not good:
+      return "Invalid field type for entities.blockPos"
+    let nbt = getCompound(entityCompound, "nbt")
+    if isNone(nbt):
+      return "Missing required field: entities.nbt"
+    entities.add(TemplateEntity(pos: vec3[float64](x, y, z), blockPos: blockPos, nbt: get(nbt)))
+  ""
+
+proc templateFromNbtCompound*(compound: NbtCompound): TemplateResult =
+  let sizeList = getList(compound, "size")
+  if isNone(sizeList):
+    return fail("Missing required field: size")
+  var good = true
+  let size = parseIntTriple(get(sizeList), good)
+  if not good:
+    return fail("Invalid field type for size")
+  var palette: seq[PaletteEntry] = @[]
+  let paletteError = parsePalette(compound, palette)
+  if paletteError.len > 0:
+    return fail(paletteError)
+  var blocks: seq[TemplateBlock] = @[]
+  let blocksError = parseBlocks(compound, palette.len, blocks)
+  if blocksError.len > 0:
+    return fail(blocksError)
+  # `parse_entities(compound).unwrap_or_default()`
+  var entities: seq[TemplateEntity] = @[]
+  if parseEntities(compound, entities).len > 0:
+    entities = @[]
+  var jigsawPalette = newSeq[bool](palette.len)
+  for i in 0 ..< palette.len:
+    jigsawPalette[i] = palette[i].name == "minecraft:jigsaw"
+  var jigsawBlocks: seq[int] = @[]
+  for i in 0 ..< blocks.len:
+    if jigsawPalette[int(blocks[i].state)]:
+      jigsawBlocks.add(i)
+  TemplateResult(ok: true, error: "", value: StructureTemplate(size: size, palette: palette, blocks: blocks,
+    entities: entities, jigsawBlocks: jigsawBlocks))
+
+proc templateFromNbtBytes*(bytes: seq[byte]): TemplateResult =
+  let compound = readGzipCompoundTag(bytes)
+  if not compound.isOk:
+    return fail("Failed to decompress NBT")
+  templateFromNbtCompound(compound.value)
+
+proc blockCount*(t: StructureTemplate): int {.inline.} = t.blocks.len
+
+proc hasBlockEntities*(t: StructureTemplate): bool =
+  for i in 0 ..< t.blocks.len:
+    if t.blocks[i].hasNbt:
+      return true
+  false
+
+proc hasEntities*(t: StructureTemplate): bool {.inline.} = t.entities.len > 0

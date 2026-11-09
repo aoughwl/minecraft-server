@@ -1,0 +1,189 @@
+## NBT structure template placement.
+## Port of pumpkin-world/src/generation/structure/template/mod.rs
+##
+## Rotation resolving is memoized per palette entry for one call: a template's blocks far outnumber its palette, and
+## this runs once per chunk a piece touches. The bounding check runs before resolving; resolving has no side effects.
+
+{.feature: "lenientnils".}
+
+import std/options
+import ../../../blockstates
+import ../../../../nbt/tag
+import ../../../../util/vector3
+import ../../../../util/math/block_box
+import ../../../../util/legacy_rand
+import ../../../../data/block_rotation
+import ../../protochunkbase
+import block_state_resolver
+import cache
+import processor
+import structure_template
+
+export block_state_resolver, cache, processor, structure_template
+
+let WaterBlock = blockIdByName("water")[1]
+let AirBlock = blockIdByName("air")[1]
+
+proc getBlockEntityId*(blockName: string): (bool, string) =
+  ## `get_block_entity_id`
+  case blockName
+  of "minecraft:furnace", "minecraft:chest", "minecraft:trapped_chest", "minecraft:barrel", "minecraft:hopper",
+      "minecraft:dropper", "minecraft:dispenser", "minecraft:brewing_stand", "minecraft:blast_furnace",
+      "minecraft:smoker", "minecraft:shulker_box", "minecraft:bed", "minecraft:hanging_sign":
+    (true, blockName)
+  of "minecraft:sign", "minecraft:oak_sign", "minecraft:spruce_sign", "minecraft:birch_sign", "minecraft:jungle_sign",
+      "minecraft:acacia_sign", "minecraft:dark_oak_sign", "minecraft:mangrove_sign", "minecraft:cherry_sign",
+      "minecraft:bamboo_sign", "minecraft:crimson_sign", "minecraft:warped_sign":
+    (true, "minecraft:sign")
+  else:
+    (false, "")
+
+proc copyTemplateNbt*(placed: var NbtCompound, templateNbt: NbtCompound) =
+  ## The copy of a template block's tags past `x`, `y`, `z` and `id`.
+  for i in 0 ..< templateNbt.names.len:
+    let key = templateNbt.names[i]
+    if key != "x" and key != "y" and key != "z" and key != "id":
+      insert(placed, key, templateNbt.values[i])
+
+proc placeTemplate*(placer: BlockPlacer, t: StructureTemplate, origin: Vector3[int32], offset: (int32, int32),
+                    rotation: Rotation, skipAir, applyWaterlogging: bool, processors: openArray[StructureProcessor],
+                    hasChunkBox: bool, chunkBox: BlockBox) =
+  ## `place_template`. `chunk_box` is an `Option` upstream.
+  let (rotatedOx, rotatedOz) = rotateOffset(rotation, offset[0], offset[1])
+  let worldX = origin.x + rotatedOx
+  let worldZ = origin.z + rotatedOz
+
+  var memoReady = newSeq[bool](t.palette.len)
+  var memoFound = newSeq[bool](t.palette.len)
+  var memoState = newSeq[BlockStateId](t.palette.len)
+
+  for bi in 0 ..< t.blocks.len:
+    let stateIndex = int(t.blocks[bi].state)
+    if t.palette[stateIndex].name == "minecraft:structure_void" or t.palette[stateIndex].name == "minecraft:structure_block":
+      continue
+
+    # Rotate block position within template bounds
+    let localPos = transformPos(rotation, t.blocks[bi].pos, t.size)
+    let wx = worldX + localPos.x
+    let wy = origin.y + localPos.y
+    let wz = worldZ + localPos.z
+    if hasChunkBox and (wx < chunkBox.min.x or wx > chunkBox.max.x or wy < chunkBox.min.y or wy > chunkBox.max.y or
+        wz < chunkBox.min.z or wz > chunkBox.max.z):
+      continue
+
+    let isJigsaw = t.palette[stateIndex].name == "minecraft:jigsaw"
+    var hasBlockEntityNbt = t.blocks[bi].hasNbt
+    var placedEntry = t.palette[stateIndex]
+    if isJigsaw:
+      var finalState = "minecraft:air"
+      if hasBlockEntityNbt:
+        let named = getString(t.blocks[bi].nbt, "final_state")
+        if isSome(named):
+          finalState = get(named)
+      placedEntry = paletteEntryFromString(finalState)
+      hasBlockEntityNbt = false
+
+    var state = 0'u32
+    if isJigsaw:
+      let (found, resolved) = resolve(placedEntry, rotation, Mirror.None)
+      if not found:
+        continue
+      state = resolved
+    else:
+      if not memoReady[stateIndex]:
+        memoReady[stateIndex] = true
+        let (found, resolved) = resolve(placedEntry, rotation, Mirror.None)
+        memoFound[stateIndex] = found
+        memoState[stateIndex] = resolved
+      if not memoFound[stateIndex]:
+        continue
+      state = memoState[stateIndex]
+
+    let worldPos = vec3[int32](wx, wy, wz)
+
+    if applyWaterlogging and blockIdOf(getState(placer, worldPos)) == WaterBlock:
+      var hasProperty = false
+      for pi in 0 ..< placedEntry.properties.len:
+        if not hasProperty and placedEntry.properties[pi][0] == "waterlogged":
+          placedEntry.properties[pi][1] = "true"
+          hasProperty = true
+      if hasProperty:
+        let (found, resolved) = resolve(placedEntry, rotation, Mirror.None)
+        if found:
+          state = resolved
+
+    var shouldPlace = true
+    for pi in 0 ..< processors.len:
+      let (keep, processed) = process(processors[pi], placer, worldPos, state)
+      if not keep:
+        shouldPlace = false
+        break
+      state = processed
+    if not shouldPlace:
+      continue
+    if skipAir and blockIdOf(state) == AirBlock:
+      continue
+
+    setState(placer, worldPos, state)
+
+    let (hasEntityId, entityId) = getBlockEntityId(placedEntry.name)
+    if hasBlockEntityNbt or hasEntityId:
+      var placedNbt = newCompound()
+      putString(placedNbt, "id", if hasEntityId: entityId else: placedEntry.name)
+      putInt(placedNbt, "x", wx)
+      putInt(placedNbt, "y", wy)
+      putInt(placedNbt, "z", wz)
+      if hasBlockEntityNbt:
+        copyTemplateNbt(placedNbt, t.blocks[bi].nbt)
+      if isSome(getString(placedNbt, "LootTable")) and isNone(getLong(placedNbt, "LootTableSeed")):
+        var random = legacy_rand.fromSeed(cast[uint64](hashBlockPos(wx, wy, wz)))
+        putLong(placedNbt, "LootTableSeed", nextI64(random))
+      addEntity(placer, placedNbt)
+
+proc placeTemplateIn*(chunk: ProtoChunk, t: StructureTemplate, origin: Vector3[int32], offset: (int32, int32),
+                      rotation: Rotation, skipAir, applyWaterlogging: bool, chunkBox: BlockBox) =
+  ## `place_template(chunk, .., &[], Some(chunk_box))`, what the single-template structures call.
+  let placer = protoChunkPlacer(chunk)
+  let none: seq[StructureProcessor] = @[]
+  placeTemplate(placer, t, origin, offset, rotation, skipAir, applyWaterlogging, none, true, chunkBox)
+
+proc placeTemplateEntities*(chunk: ProtoChunk, t: StructureTemplate, origin: Vector3[int32], rotation: Rotation,
+                            chunkBox: BlockBox) =
+  ## `place_template_entities`
+  for ei in 0 ..< t.entities.len:
+    let blockPos = transformPos(rotation, t.entities[ei].blockPos, t.size)
+    let worldBlockPos = vec3[int32](origin.x + blockPos.x, origin.y + blockPos.y, origin.z + blockPos.z)
+    if not containsPos(chunkBox, worldBlockPos):
+      continue
+    let e = t.entities[ei].pos
+    var px = e.x
+    var pz = e.z
+    case rotation
+    of Rotation.None:
+      discard
+    of Rotation.Clockwise90:
+      px = float64(t.size.z) - e.z
+      pz = e.x
+    of Rotation.Rotate180:
+      px = float64(t.size.x) - e.x
+      pz = float64(t.size.z) - e.z
+    of Rotation.CounterClockwise90:
+      px = e.z
+      pz = float64(t.size.x) - e.x
+    var nbt = t.entities[ei].nbt
+    let posList = @[nbtTag(float64(origin.x) + px), nbtTag(float64(origin.y) + e.y), nbtTag(float64(origin.z) + pz)]
+    put(nbt, "Pos", NbtTag(kind: ntkList, listVal: posList))
+    discard remove(nbt, "UUID")
+    let rotationNbt = getList(nbt, "Rotation")
+    if isSome(rotationNbt) and get(rotationNbt).len == 2:
+      let list = get(rotationNbt)
+      let yaw0 = if list[0].kind == ntkFloat: list[0].floatVal else: 0.0'f32
+      let pitch = if list[1].kind == ntkFloat: list[1].floatVal else: 0.0'f32
+      let delta =
+        case rotation
+        of Rotation.None: 0.0'f32
+        of Rotation.Clockwise90: 90.0'f32
+        of Rotation.Rotate180: 180.0'f32
+        of Rotation.CounterClockwise90: 270.0'f32
+      put(nbt, "Rotation", NbtTag(kind: ntkList, listVal: @[nbtTag(yaw0 + delta), nbtTag(pitch)]))
+    addStructureEntity(chunk, nbt)

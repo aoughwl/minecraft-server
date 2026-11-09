@@ -1,0 +1,394 @@
+## Pieces, their collector, and what a structure generator is given.
+## Port of pumpkin-world/src/generation/structure/structures/mod.rs
+##
+## The name is not structures.aowl because generated/structures is imported beside it. `StructurePieceBase` becomes a
+## ref object with a proc pointer for its `place`, set when a piece is built: the concrete pieces derive from it and
+## cast back. `fill_openings` and `fill_openings_nether` belong to the stronghold's and fortress's own base types.
+## Upstream's `Option<StructurePosition>`, `Option<Box<dyn StructurePieceBase>>` and a sampler's `Option` are nil here.
+
+{.feature: "lenientnils".}
+
+import std/assertions
+import ../../../blockstates
+import ../../../tick
+import ../../../world
+import ../../../../nbt/tag
+import ../../../../generated/structures
+import ../../../../util/utillib
+import ../../../../util/vector3
+import ../../../../util/math/block_box
+import ../../../../util/random/random
+import ../../../../util/random/rustnum
+import ../../../../util/legacy_rand
+import ../../../../data/block_rotation
+import ../../protochunkbase
+import ../../positions
+import ../piece
+
+export piece, block_box, block_rotation, world, tag, protochunkbase, positions, utillib, vector3, random, tick
+export blockstates
+
+type
+  StructurePiece* = object
+    structureType*: StructurePieceType
+    boundingBox*: BlockBox
+    hasFacing*: bool     ## `facing` is an `Option` upstream.
+    facing*: BlockDirection
+    mirror*: Mirror
+    rotation*: Rotation
+    chainLength*: uint32
+
+  StructurePieceBase* = ref object of RootObj
+    ## `trait StructurePieceBase`
+    piece*: StructurePiece
+    placeFn*: PiecePlaceFn
+    isPoolElement*: bool  ## What `as_any().downcast_ref::<PoolElementStructurePiece>()` asks.
+
+  PiecePlaceFn* = proc(self: StructurePieceBase, chunk: ProtoChunk, blockRegistry: WorldPortalExt,
+                       random: var RandomGenerator, seed: int64, chunkBox: BlockBox) {.nimcall.}
+
+  BlockRandomizerFn* = proc(rng: var RandomGenerator, isBorder: bool): BlockStateId {.nimcall.}
+    ## `trait BlockRandomizer`
+
+  StructurePiecesCollector* = ref object
+    pieces*: seq[StructurePieceBase]
+    hasCachedBox: bool
+    cachedBox: BlockBox
+
+  StructurePosition* = ref object
+    startPos*: BlockPos
+    collector*: StructurePiecesCollector
+
+  HeightSampler* = ref object of RootObj
+    ## `trait HeightSampler`
+    estimateFn*: proc(self: HeightSampler, blockX, blockZ: int32): int32 {.nimcall.}
+
+  StructureGeneratorContext* = object
+    seed*: int64
+    chunkX*, chunkZ*: int32
+    random*: RandomGenerator
+    seaLevel*: int32
+    minY*: int32
+    heightSampler*: HeightSampler  ## nil for upstream's None.
+    hasStructureKey*: bool
+    structureKey*: StructureKeys
+
+  StructureInstanceData* = ref object of StructureInstance
+    ## `enum StructureInstance`: `Start` when `isStart`, else `Reference`.
+    isStart*: bool
+    position*: StructurePosition  ## `Start`'s.
+    collector*: StructurePiecesCollector
+
+proc estimateHeight*(s: HeightSampler, blockX, blockZ: int32): int32 =
+  let f = s.estimateFn
+  f(s, blockX, blockZ)
+
+proc newStructureInstanceStart*(position: StructurePosition): StructureInstanceData =
+  StructureInstanceData(isStart: true, position: position, collector: position.collector)
+
+proc newStructureInstanceReference*(collector: StructurePiecesCollector): StructureInstanceData =
+  StructureInstanceData(isStart: false, position: nil, collector: collector)
+
+proc instanceData*(instance: StructureInstance): StructureInstanceData {.inline.} =
+  cast[StructureInstanceData](instance)
+
+proc midpointI32*(a, b: int32): int32 {.inline.} =
+  ## `i32::midpoint`, which rounds towards zero.
+  int32((int64(a) + int64(b)) div 2'i64)
+
+proc blockState*(name: string): BlockStateId =
+  ## `Block::<NAME>.default_state`
+  let (ok, id) = defaultStateByName(name)
+  assert ok, name
+  id
+
+proc blockIdNamed*(name: string): int =
+  ## `Block::<NAME>.id`
+  let (ok, id) = blockIdByName(name)
+  assert ok, name
+  id
+
+let
+  AirStateId* = blockState("air")
+  CaveAirStateId* = blockState("cave_air")
+  ChestStateId* = blockState("chest")
+  GlowLichenBlockId = blockIdNamed("glow_lichen")
+  SeagrassBlockId = blockIdNamed("seagrass")
+  TallSeagrassBlockId = blockIdNamed("tall_seagrass")
+
+proc stateWith*(name: string, props: openArray[StateProp]): BlockStateId =
+  ## `<Block>LikeProperties::default(&Block::<NAME>)`, these fields set, `to_state_id`.
+  stateIdFromProps(blockIdNamed(name), props)
+
+proc stateWith*(name: string, props: openArray[(string, string)]): BlockStateId =
+  var named = newSeq[StateProp](props.len)
+  for i in 0 ..< props.len:
+    named[i] = (props[i][0], props[i][1])
+  stateIdFromProps(blockIdNamed(name), named)
+
+proc newStructurePiece*(structureType: StructurePieceType, boundingBox: BlockBox, chainLength: uint32): StructurePiece =
+  StructurePiece(structureType: structureType, boundingBox: boundingBox, hasFacing: false, facing: North,
+    mirror: Mirror.None, rotation: Rotation.None, chainLength: chainLength)
+
+proc setFacing*(p: var StructurePiece, facing: BlockDirection) =
+  ## `set_facing(Some(facing))`
+  p.hasFacing = true
+  p.facing = facing
+  case facing
+  of South:
+    p.mirror = Mirror.LeftRight
+    p.rotation = Rotation.None
+  of West:
+    p.mirror = Mirror.LeftRight
+    p.rotation = Rotation.Clockwise90
+  of East:
+    p.mirror = Mirror.None
+    p.rotation = Rotation.Clockwise90
+  else:
+    p.mirror = Mirror.None
+    p.rotation = Rotation.None
+
+proc applyXTransform(p: StructurePiece, x, z: int32): int32 =
+  if not p.hasFacing:
+    return x
+  case p.facing
+  of North, South: p.boundingBox.min.x + x
+  of West: p.boundingBox.max.x - z
+  of East: p.boundingBox.min.x + z
+  else: x
+
+proc applyYTransform(p: StructurePiece, y: int32): int32 =
+  if p.hasFacing: y + p.boundingBox.min.y else: y
+
+proc applyZTransform(p: StructurePiece, x, z: int32): int32 =
+  if not p.hasFacing:
+    return z
+  case p.facing
+  of North: p.boundingBox.max.z - z
+  of South: p.boundingBox.min.z + z
+  of West, East: p.boundingBox.min.z + x
+  else: z
+
+proc offsetPos*(p: StructurePiece, x, y, z: int32): Vector3[int32] =
+  vec3[int32](applyXTransform(p, x, z), applyYTransform(p, y), applyZTransform(p, x, z))
+
+proc addBlock*(p: StructurePiece, world: ProtoChunk, blockState: BlockStateId, x, y, z: int32, boxLimit: BlockBox) =
+  ## `add_block`. Mirror and rotation are commented out upstream.
+  let blockPos = offsetPos(p, x, y, z)
+  if not containsPos(boxLimit, blockPos):
+    return
+  setBlockState(world, blockPos.x, blockPos.y, blockPos.z, blockState)
+
+proc placeBlock*(p: StructurePiece, chunk: ProtoChunk, blockRegistry: WorldPortalExt, blockStateIn: BlockStateId,
+                 x, y, z: int32, chunkBox: BlockBox) =
+  ## `place_block`
+  let pos = offsetPos(p, x, y, z)
+  if contains(chunkBox, pos.x, pos.y, pos.z):
+    var state = blockStateIn
+    let blockId = blockIdOf(state)
+    if p.mirror != Mirror.None:
+      let f = blockRegistry.mirror
+      state = f(blockId, state, ord(p.mirror))
+    if p.rotation != Rotation.None:
+      let f = blockRegistry.rotate
+      state = f(blockId, state, ord(p.rotation))
+    setBlockState(chunk, pos.x, pos.y, pos.z, state)
+
+proc getBlockAt*(p: StructurePiece, chunk: ProtoChunk, x, y, z: int32, boxLimit: BlockBox): BlockStateId =
+  let blockPos = offsetPos(p, x, y, z)
+  if not containsPos(boxLimit, blockPos):
+    return AirStateId
+  getBlockState(chunk, blockPos)
+
+proc fillOutlineRandom*(p: StructurePiece, minX, minY, minZ, maxX, maxY, maxZ: int32, randomizer: BlockRandomizerFn,
+                        chunk: ProtoChunk, cantReplaceAir: bool, rng: var RandomGenerator, boxLimit: BlockBox) =
+  var y = minY
+  while y <= maxY:
+    var x = minX
+    while x <= maxX:
+      var z = minZ
+      while z <= maxZ:
+        if not (cantReplaceAir and isAir(getBlockAt(p, chunk, x, y, z, boxLimit))):
+          let isBorder = x == minX or x == maxX or y == minY or y == maxY or z == minZ or z == maxZ
+          let state = randomizer(rng, isBorder)
+          addBlock(p, chunk, state, x, y, z, boxLimit)
+        inc z
+      inc x
+    inc y
+
+proc fillWithOutline*(p: StructurePiece, chunk: ProtoChunk, boxLimit: BlockBox, cantReplaceAir: bool,
+                      minX, minY, minZ, maxX, maxY, maxZ: int32, outline, inside: BlockStateId) =
+  var y = minY
+  while y <= maxY:
+    var x = minX
+    while x <= maxX:
+      var z = minZ
+      while z <= maxZ:
+        if not (cantReplaceAir and isAir(getBlockAt(p, chunk, x, y, z, boxLimit))):
+          let isBorder = x == minX or x == maxX or y == minY or y == maxY or z == minZ or z == maxZ
+          addBlock(p, chunk, if isBorder: outline else: inside, x, y, z, boxLimit)
+        inc z
+      inc x
+    inc y
+
+proc isUnderSeaLevel*(p: StructurePiece, chunk: ProtoChunk, x, y, z: int32, boxLimit: BlockBox): bool =
+  let blockPos = offsetPos(p, x, y, z)
+  if not containsPos(boxLimit, blockPos):
+    return false
+  blockPos.y < getTopY(chunk, OceanFloorWg, blockPos.x, blockPos.z)
+
+proc fillWithOutlineUnderSeaLevel*(p: StructurePiece, chunk: ProtoChunk, boxLimit: BlockBox, rng: var RandomGenerator,
+                                   blockChance: float32, minX, minY, minZ, maxX, maxY, maxZ: int32,
+                                   outline, inside: BlockStateId, cantReplaceAir, stayBelowSeaLevel: bool) =
+  var y = minY
+  while y <= maxY:
+    var x = minX
+    while x <= maxX:
+      var z = minZ
+      while z <= maxZ:
+        if not (nextF32(rng) > blockChance) and
+            not (cantReplaceAir and isAir(getBlockAt(p, chunk, x, y, z, boxLimit))) and
+            not (stayBelowSeaLevel and not isUnderSeaLevel(p, chunk, x, y, z, boxLimit)):
+          let isBorder = x == minX or x == maxX or y == minY or y == maxY or z == minZ or z == maxZ
+          addBlock(p, chunk, if isBorder: outline else: inside, x, y, z, boxLimit)
+        inc z
+      inc x
+    inc y
+
+proc fill*(p: StructurePiece, chunk: ProtoChunk, boxLimit: BlockBox, minX, minY, minZ, maxX, maxY, maxZ: int32,
+           state: BlockStateId) =
+  var y = minY
+  while y <= maxY:
+    var x = minX
+    while x <= maxX:
+      var z = minZ
+      while z <= maxZ:
+        addBlock(p, chunk, state, x, y, z, boxLimit)
+        inc z
+      inc x
+    inc y
+
+proc isReplaceableByStructures(state: BlockStateId): bool =
+  let b = blockIdOf(state)
+  isAir(state) or isLiquid(state) or b == GlowLichenBlockId or b == SeagrassBlockId or b == TallSeagrassBlockId
+
+proc fillDownwards*(p: StructurePiece, chunk: ProtoChunk, state: BlockStateId, x, y, z: int32, boxLimit: BlockBox) =
+  let worldPos = offsetPos(p, x, y, z)
+  if not containsPos(boxLimit, worldPos):
+    return
+  let minFillY = int32(bottomY(chunk)) + 1
+  var currentY = worldPos.y
+  while currentY > minFillY:
+    let currentState = getBlockState(chunk, vec3[int32](worldPos.x, currentY, worldPos.z))
+    if not isReplaceableByStructures(currentState):
+      break
+    setBlockState(chunk, worldPos.x, currentY, worldPos.z, state)
+    dec currentY
+
+proc addChest*(p: StructurePiece, chunk: ProtoChunk, bb: BlockBox, random: var RandomGenerator, x, y, z: int32,
+               lootTable: string): bool =
+  ## `add_chest`: a chest with a deferred loot table.
+  let worldPos = offsetPos(p, x, y, z)
+  if not containsPos(bb, worldPos):
+    return false
+  setBlockState(chunk, worldPos.x, worldPos.y, worldPos.z, ChestStateId)
+  var nbt = newCompound()
+  putString(nbt, "id", "minecraft:chest")
+  putInt(nbt, "x", worldPos.x)
+  putInt(nbt, "y", worldPos.y)
+  putInt(nbt, "z", worldPos.z)
+  putString(nbt, "LootTable", lootTable)
+  putLong(nbt, "LootTableSeed", nextI64(random))
+  addBlockEntity(chunk, nbt)
+  true
+
+proc boundingBox*(p: StructurePieceBase): BlockBox {.inline.} = p.piece.boundingBox
+
+proc place*(p: StructurePieceBase, chunk: ProtoChunk, blockRegistry: WorldPortalExt, random: var RandomGenerator,
+            seed: int64, chunkBox: BlockBox) =
+  let f = p.placeFn
+  f(p, chunk, blockRegistry, random, seed, chunkBox)
+
+proc placeNothing*(self: StructurePieceBase, chunk: ProtoChunk, blockRegistry: WorldPortalExt,
+                   random: var RandomGenerator, seed: int64, chunkBox: BlockBox) {.nimcall.} =
+  ## `<StructurePiece as StructurePieceBase>::place`
+  discard
+
+proc newStructurePiecesCollector*(): StructurePiecesCollector =
+  StructurePiecesCollector(pieces: @[], hasCachedBox: false)
+
+proc addPiece*(c: StructurePiecesCollector, piece: StructurePieceBase) =
+  c.pieces.add(piece)
+  c.hasCachedBox = false
+
+proc getIntersecting*(c: StructurePiecesCollector, boxToCheck: BlockBox): StructurePieceBase =
+  for i in 0 ..< c.pieces.len:
+    if intersects(c.pieces[i].piece.boundingBox, boxToCheck):
+      return c.pieces[i]
+  nil
+
+proc generateInChunk*(c: StructurePiecesCollector, chunk: ProtoChunk, blockRegistry: WorldPortalExt,
+                      random: var RandomGenerator, seed: int64) =
+  let chunkX = startBlockX(chunk.x)
+  let chunkZ = startBlockZ(chunk.z)
+  let chunkBox = newBlockBox(chunkX, int32(bottomY(chunk)), chunkZ, chunkX + 15,
+    int32(bottomY(chunk)) + int32(height(chunk)) - 1, chunkZ + 15)
+  for i in 0 ..< c.pieces.len:
+    if intersects(c.pieces[i].piece.boundingBox, chunkBox):
+      place(c.pieces[i], chunk, blockRegistry, random, seed, chunkBox)
+
+proc shift*(c: StructurePiecesCollector, yOffset: int32) =
+  for i in 0 ..< c.pieces.len:
+    movePos(c.pieces[i].piece.boundingBox, 0, yOffset, 0)
+  c.hasCachedBox = false
+
+proc getBoundingBox*(c: StructurePiecesCollector): BlockBox =
+  if c.hasCachedBox:
+    return c.cachedBox
+  assert c.pieces.len > 0, "Structure must have at least one piece to calculate a bounding box"
+  var bbox = c.pieces[0].piece.boundingBox
+  for i in 1 ..< c.pieces.len:
+    encompass(bbox, c.pieces[i].piece.boundingBox)
+  c.cachedBox = bbox
+  c.hasCachedBox = true
+  bbox
+
+proc shiftInto*(c: StructurePiecesCollector, topY, bottomY: int32, random: var RandomGenerator, topPenalty: int32): int32 =
+  ## `shift_into`: vanilla's `shiftInto(int topY, int bottomY, Random random, int topPenalty)`.
+  let i = topY - topPenalty
+  let boundingBox = getBoundingBox(c)
+  var j = (boundingBox.max.y - boundingBox.min.y + 1) + bottomY + 1
+  if j < i:
+    j += nextBoundedI32(random, i - j)
+  let k = j - boundingBox.max.y
+  shift(c, k)
+  k
+
+proc isEmpty*(c: StructurePiecesCollector): bool {.inline.} = c.pieces.len == 0
+
+proc clear*(c: StructurePiecesCollector) =
+  c.pieces = @[]
+
+proc getBoundingBox*(p: StructurePosition): BlockBox = getBoundingBox(p.collector)
+
+proc createChunkRandom*(seed: int64, chunkX, chunkZ: int32): RandomGenerator =
+  var seeder = legacy_rand.fromSeed(cast[uint64](seed))
+  let xMultiplier = nextI64(seeder)
+  let zMultiplier = nextI64(seeder)
+  let structureSeed = wrapMul(int64(chunkX), xMultiplier) xor wrapMul(int64(chunkZ), zMultiplier) xor seed
+  toRandomGenerator(legacy_rand.fromSeed(cast[uint64](structureSeed)))
+
+proc newContext*(seed: int64, chunkX, chunkZ, seaLevel, minY: int32, heightSampler: HeightSampler,
+                 key: StructureKeys): StructureGeneratorContext =
+  StructureGeneratorContext(seed: seed, chunkX: chunkX, chunkZ: chunkZ, random: createChunkRandom(seed, chunkX, chunkZ),
+    seaLevel: seaLevel, minY: minY, heightSampler: heightSampler, hasStructureKey: true, structureKey: key)
+
+proc newContextNoKey*(seed: int64, chunkX, chunkZ, seaLevel, minY: int32, heightSampler: HeightSampler): StructureGeneratorContext =
+  StructureGeneratorContext(seed: seed, chunkX: chunkX, chunkZ: chunkZ, random: createChunkRandom(seed, chunkX, chunkZ),
+    seaLevel: seaLevel, minY: minY, heightSampler: heightSampler, hasStructureKey: false)
+
+proc singlePiecePosition*(piece: StructurePieceBase, x, y, z: int32): StructurePosition =
+  ## What most generators end with: one piece in a fresh collector.
+  let collector = newStructurePiecesCollector()
+  addPiece(collector, piece)
+  StructurePosition(startPos: blockPos(x, y, z), collector: collector)

@@ -1,0 +1,395 @@
+## Template pools and jigsaw pieces.
+## Port of pumpkin-world/src/generation/structure/structures/jigsaw.rs
+##
+## `JigsawGenerator` calls `JigsawPlacement::add_pieces`, whose module needs this one's types, so it lives at the end of
+## jigsaw_placement.aowl. `LiquidSettings` is here for the opposite reason: a piece holds one.
+
+{.feature: "lenientnils".}
+
+import std/options
+import std/strutils
+import std/tables
+import std/syncio
+import ../../../../codecs/json_value
+import ../../../../generated/placed_feature
+import ../../structurehooks
+import "../template/templatemod"
+import structuresmod
+
+type
+  LiquidSettings* {.pure.} = enum
+    IgnoreWaterlogDone, ApplyWaterlog
+
+  JigsawProjection* {.pure.} = enum
+    Rigid, TerrainMatching
+
+  PoolElementKindTag* {.pure.} = enum
+    Empty, Single, List, Feature
+
+  ProcessorListRef* = object
+    ## `ProcessorListRef`: `Named` when `named`.
+    named*: bool
+    name*: string
+
+  PoolElementKind* = object
+    ## `enum PoolElementKind`
+    tag*: PoolElementKindTag
+    templateName*: string           ## `Single`
+    processors*: ProcessorListRef   ## `Single`
+    legacy*: bool                   ## `Single`
+    elements*: seq[PoolElementKind] ## `List`
+    feature*: PlacedFeature         ## `Feature`
+
+  PoolElement* = ref object
+    weight*: uint32
+    projection*: JigsawProjection
+    kind*: PoolElementKind
+
+  TemplatePool* = ref object
+    id*: string
+    fallback*: string
+    elements*: seq[PoolElement]
+
+  JigsawJointType* {.pure.} = enum
+    Rollable, Aligned
+
+  JigsawBlock* = object
+    pos*: BlockPos
+    name*: string
+    target*: string
+    pool*: string
+    finalState*: string
+    joint*: JigsawJointType
+    facing*: BlockDirection
+    up*: BlockDirection
+    selectionPriority*: int32
+    placementPriority*: int32
+
+  JigsawJunction* = object
+    sourceX*: int32
+    sourceGroundY*: int32
+    sourceZ*: int32
+    deltaY*: int32
+    projection*: JigsawProjection
+
+  PoolElementStructurePiece* = ref object of StructurePieceBase
+    element*: PoolElement
+    pos*: BlockPos
+    rotation*: Rotation
+    mirror*: Mirror
+    jigsawBlocks*: seq[JigsawBlock]
+    junctions*: seq[JigsawJunction]
+    groundLevelDelta*: int32
+    liquidSettings*: LiquidSettings
+    projection*: JigsawProjection
+
+var poolCache = initTable[string, TemplatePool]()
+
+proc isEmpty*(e: PoolElement): bool {.inline.} = e.kind.tag == PoolElementKindTag.Empty
+
+proc findFirstTemplate(kind: PoolElementKind): StructureTemplate =
+  case kind.tag
+  of PoolElementKindTag.Single:
+    getTemplate(kind.templateName)
+  of PoolElementKindTag.List:
+    for i in 0 ..< kind.elements.len:
+      let t = findFirstTemplate(kind.elements[i])
+      if t != nil:
+        return t
+    nil
+  of PoolElementKindTag.Empty, PoolElementKindTag.Feature:
+    nil
+
+proc firstTemplate*(e: PoolElement): StructureTemplate =
+  findFirstTemplate(e.kind)
+
+type
+  TemplateVisit* = object
+    ## One call of `for_each_template`'s consumer.
+    name*: string
+    processors*: ProcessorListRef
+    legacy*: bool
+    structureTemplate*: StructureTemplate
+
+proc visitTemplates(kind: PoolElementKind, into: var seq[TemplateVisit]) =
+  case kind.tag
+  of PoolElementKindTag.Single:
+    let t = getTemplate(kind.templateName)
+    if t != nil:
+      into.add(TemplateVisit(name: kind.templateName, processors: kind.processors, legacy: kind.legacy, structureTemplate: t))
+  of PoolElementKindTag.List:
+    for i in 0 ..< kind.elements.len:
+      visitTemplates(kind.elements[i], into)
+  of PoolElementKindTag.Empty, PoolElementKindTag.Feature:
+    discard
+
+proc forEachTemplate*(e: PoolElement): seq[TemplateVisit] =
+  ## `for_each_template`, as the list its consumer would have been called with.
+  result = @[]
+  visitTemplates(e.kind, result)
+
+proc field(n: JsonValue, key: string, value: var JsonValue): bool =
+  if n.kind != jvObject:
+    return false
+  let (found, v) = get(n, key)
+  if found:
+    value = v
+  found
+
+proc stringField(n: JsonValue, key: string, value: var string): bool =
+  var v = jsonNull()
+  if field(n, key, v) and v.kind == jvString:
+    value = v.strVal
+    return true
+  false
+
+proc parseProjection(n: JsonValue, valid: var bool): JigsawProjection =
+  var text = ""
+  if stringField(n, "projection", text):
+    case text
+    of "rigid": return JigsawProjection.Rigid
+    of "terrain_matching": return JigsawProjection.TerrainMatching
+    else: discard
+  valid = false
+  JigsawProjection.Rigid
+
+proc parseSingle(n: JsonValue, legacy: bool, valid: var bool): (PoolElementKind, JigsawProjection) =
+  ## `RawPoolElement::single`
+  let projection = parseProjection(n, valid)
+  var location = ""
+  var raw = jsonNull()
+  if not stringField(n, "location", location) or not field(n, "processors", raw):
+    valid = false
+    return (PoolElementKind(tag: PoolElementKindTag.Empty), projection)
+  var processors = ProcessorListRef(named: false, name: "")
+  if raw.kind == jvString:
+    processors = ProcessorListRef(named: true, name: raw.strVal)
+  else:
+    var inner = jsonNull()
+    if not field(raw, "processors", inner) or inner.kind != jvArray:
+      valid = false
+  (PoolElementKind(tag: PoolElementKindTag.Single, templateName: location, processors: processors, legacy: legacy), projection)
+
+proc intoElement(n: JsonValue, valid: var bool): (bool, PoolElementKind, JigsawProjection) =
+  ## `RawPoolElement::into_element`, with serde's checks.
+  var elementType = ""
+  if not stringField(n, "element_type", elementType):
+    valid = false
+    return (false, PoolElementKind(), JigsawProjection.Rigid)
+  case elementType
+  of "minecraft:empty_pool_element":
+    (true, PoolElementKind(tag: PoolElementKindTag.Empty), JigsawProjection.Rigid)
+  of "minecraft:single_pool_element":
+    let (kind, projection) = parseSingle(n, false, valid)
+    (true, kind, projection)
+  of "minecraft:legacy_single_pool_element":
+    let (kind, projection) = parseSingle(n, true, valid)
+    (true, kind, projection)
+  of "minecraft:list_pool_element":
+    let projection = parseProjection(n, valid)
+    var list = jsonNull()
+    if not field(n, "elements", list) or list.kind != jvArray:
+      valid = false
+      return (false, PoolElementKind(), projection)
+    var elements: seq[PoolElementKind] = @[]
+    for i in 0 ..< list.items.len:
+      let (keep, kind, ignored) = intoElement(list.items[i], valid)
+      if keep:
+        elements.add(kind)
+    (true, PoolElementKind(tag: PoolElementKindTag.List, elements: elements), projection)
+  of "minecraft:feature_pool_element":
+    let projection = parseProjection(n, valid)
+    var featureName = ""
+    if not stringField(n, "feature", featureName):
+      valid = false
+      return (false, PoolElementKind(), projection)
+    let (found, feature) = fromName(PlacedFeature, stripMinecraftPrefix(featureName))
+    if found:
+      (true, PoolElementKind(tag: PoolElementKindTag.Feature, feature: feature), projection)
+    else:
+      (false, PoolElementKind(), projection)
+  else:
+    valid = false
+    (false, PoolElementKind(), JigsawProjection.Rigid)
+
+proc parsePool(id, text: string): TemplatePool =
+  let parsed = parseJsonValue(text)
+  var fallback = ""
+  var list = jsonNull()
+  if not parsed.ok or not stringField(parsed.value, "fallback", fallback) or not field(parsed.value, "elements", list) or
+      list.kind != jvArray:
+    echo "Failed to parse template pool ", id
+    return nil
+  var valid = true
+  var elements: seq[PoolElement] = @[]
+  for i in 0 ..< list.items.len:
+    var element = jsonNull()
+    var weight = jsonNull()
+    if not field(list.items[i], "element", element) or not field(list.items[i], "weight", weight) or weight.kind != jvInt:
+      valid = false
+    else:
+      let (keep, kind, projection) = intoElement(element, valid)
+      if keep:
+        elements.add(PoolElement(weight: uint32(weight.intVal), projection: projection, kind: kind))
+  if not valid:
+    echo "Failed to parse template pool ", id
+    return nil
+  TemplatePool(id: id, fallback: fallback, elements: elements)
+
+proc discover*(id: string): TemplatePool =
+  ## `TemplatePool::discover`: nil for an unknown pool.
+  if poolCache.hasKey(id):
+    return poolCache.getOrDefault(id, nil)
+  var pool: TemplatePool = nil
+  if id == "minecraft:empty" or id == "empty":
+    pool = TemplatePool(id: "minecraft:empty", fallback: "minecraft:empty", elements: @[])
+  else:
+    let (hasJson, text) = getTemplatePoolJson(id)
+    if hasJson:
+      pool = parsePool(id, text)
+      if pool == nil:
+        return nil
+    else:
+      let (hasElements, names) = getPoolElements(id)
+      if not hasElements:
+        return nil
+      let projection = if contains(id, "streets"): JigsawProjection.TerrainMatching else: JigsawProjection.Rigid
+      var elements: seq[PoolElement] = @[]
+      for i in 0 ..< names.len:
+        elements.add(PoolElement(weight: 1'u32, projection: projection, kind: PoolElementKind(
+          tag: PoolElementKindTag.Single, templateName: names[i], processors: ProcessorListRef(named: false, name: ""),
+          legacy: false)))
+      pool = TemplatePool(id: id, fallback: "minecraft:empty", elements: elements)
+  poolCache[id] = pool
+  pool
+
+proc getRandomElement*(p: TemplatePool, random: var RandomGenerator): PoolElement =
+  var totalWeight = 0'u32
+  for i in 0 ..< p.elements.len:
+    totalWeight += p.elements[i].weight
+  if totalWeight == 0'u32:
+    return p.elements[0]
+  var r = cast[uint32](nextBoundedI32(random, cast[int32](totalWeight)))
+  for i in 0 ..< p.elements.len:
+    if r < p.elements[i].weight:
+      return p.elements[i]
+    r -= p.elements[i].weight
+  p.elements[0]
+
+proc getShuffledElements*(p: TemplatePool, random: var RandomGenerator): seq[PoolElement] =
+  result = @[]
+  for i in 0 ..< p.elements.len:
+    var n = 0'u32
+    while n < p.elements[i].weight:
+      result.add(p.elements[i])
+      inc n
+  var index = result.len - 1
+  while index >= 1:
+    let other = int(nextBoundedI32(random, int32(index) + 1))
+    let a = result[index]
+    let b = result[other]
+    result[index] = b
+    result[other] = a
+    dec index
+
+proc jointFromStr(s: string): JigsawJointType =
+  if s == "aligned": JigsawJointType.Aligned else: JigsawJointType.Rollable
+
+proc stringOr(nbt: NbtCompound, key: string): string =
+  let v = getString(nbt, key)
+  if isSome(v): get(v) else: ""
+
+proc intOr0(nbt: NbtCompound, key: string): int32 =
+  let v = getInt(nbt, key)
+  if isSome(v): get(v) else: 0'i32
+
+proc jigsawFromTemplateBlock*(b: TemplateBlock, palette: PaletteEntry): (bool, JigsawBlock) =
+  ## `JigsawBlock::from_template_block`
+  if palette.name != "minecraft:jigsaw" or not b.hasNbt:
+    return (false, default(JigsawBlock))
+  var facingStr = "north_up"
+  for i in 0 ..< palette.properties.len:
+    if palette.properties[i][0] == "orientation":
+      facingStr = palette.properties[i][1]
+      break
+  let parts = split(facingStr, '_')
+  let facingPart = if parts.len > 0: parts[0] else: "north"
+  let upPart = if parts.len > 1: parts[1] else: "up"
+  let facing =
+    case facingPart
+    of "south": South
+    of "east": East
+    of "west": West
+    of "up": Up
+    of "down": Down
+    else: North
+  let up =
+    case upPart
+    of "north": North
+    of "south": South
+    of "east": East
+    of "west": West
+    of "down": Down
+    else: Up
+  (true, JigsawBlock(pos: blockPos(b.pos.x, b.pos.y, b.pos.z), name: stringOr(b.nbt, "name"), target: stringOr(b.nbt, "target"),
+    pool: stringOr(b.nbt, "pool"), finalState: stringOr(b.nbt, "final_state"), joint: jointFromStr(stringOr(b.nbt, "joint")),
+    facing: facing, up: up, selectionPriority: intOr0(b.nbt, "selection_priority"),
+    placementPriority: intOr0(b.nbt, "placement_priority")))
+
+proc canAttach*(source: JigsawBlock, targetFacing: BlockDirection, targetName: string): bool =
+  ## `JigsawBlock::can_attach`
+  opposite(source.facing) == targetFacing and source.target == targetName
+
+proc addJunction*(p: PoolElementStructurePiece, junction: JigsawJunction) =
+  p.junctions.add(junction)
+
+proc placePoolElement(self: StructurePieceBase, chunk: ProtoChunk, blockRegistry: WorldPortalExt,
+                      random: var RandomGenerator, seed: int64, chunkBox: BlockBox) {.nimcall.} =
+  let p = cast[PoolElementStructurePiece](self)
+  let originX = p.pos.x
+  let originY = p.pos.y
+  let originZ = p.pos.z
+  let visits = forEachTemplate(p.element)
+  for vi in 0 ..< visits.len:
+    let t = visits[vi].structureTemplate
+    let corner = rotateOffset(p.rotation, max(t.size.x - 1, 0), max(t.size.z - 1, 0))
+    let placementOrigin = vec3[int32](originX + min(corner[0], 0), originY, originZ + min(corner[1], 0))
+    let processors =
+      if visits[vi].processors.named: loadProcessorList(visits[vi].processors.name)
+      else: newSeq[StructureProcessor](0)
+    placeTemplate(protoChunkPlacer(chunk), t, placementOrigin, (0'i32, 0'i32), p.rotation, visits[vi].legacy,
+      p.liquidSettings == LiquidSettings.ApplyWaterlog, processors, true, chunkBox)
+    if startsWith(visits[vi].name, "minecraft:pillager_outpost/"):
+      placeTemplateEntities(chunk, t, placementOrigin, p.rotation, chunkBox)
+  if p.element.kind.tag == PoolElementKindTag.Feature:
+    generatePlacedFeatureInProtoChunk(p.element.kind.feature, chunk, blockRegistry, random, p.pos)
+
+proc placePoolElementTemplates*(p: PoolElementStructurePiece, placer: BlockPlacer, hasChunkBox: bool, chunkBox: BlockBox) =
+  ## `place_pool_element_templates`
+  let visits = forEachTemplate(p.element)
+  for vi in 0 ..< visits.len:
+    let t = visits[vi].structureTemplate
+    let corner = rotateOffset(p.rotation, max(t.size.x - 1, 0), max(t.size.z - 1, 0))
+    let placementOrigin = vec3[int32](p.pos.x + min(corner[0], 0), p.pos.y, p.pos.z + min(corner[1], 0))
+    let processors =
+      if visits[vi].processors.named: loadProcessorList(visits[vi].processors.name)
+      else: newSeq[StructureProcessor](0)
+    placeTemplate(placer, t, placementOrigin, (0'i32, 0'i32), p.rotation, visits[vi].legacy,
+      p.liquidSettings == LiquidSettings.ApplyWaterlog, processors, hasChunkBox, chunkBox)
+
+proc beardifierPieceOf*(p: PoolElementStructurePiece): BeardifierPiece =
+  ## What `step_to_noise` reads through the downcast.
+  var junctions: seq[BeardifierPieceJunction] = @[]
+  for ji in 0 ..< p.junctions.len:
+    junctions.add(BeardifierPieceJunction(sourceX: p.junctions[ji].sourceX, sourceGroundY: p.junctions[ji].sourceGroundY,
+      sourceZ: p.junctions[ji].sourceZ))
+  BeardifierPiece(boundingBox: p.piece.boundingBox, isJigsaw: true, projectionRigid: p.projection == JigsawProjection.Rigid,
+    groundLevelDelta: p.groundLevelDelta, junctions: junctions)
+
+proc newPoolElementStructurePiece*(boundingBox: BlockBox, chainLength: uint32, element: PoolElement, pos: BlockPos,
+                                   rotation: Rotation, jigsawBlocks: seq[JigsawBlock], groundLevelDelta: int32,
+                                   liquidSettings: LiquidSettings, projection: JigsawProjection): PoolElementStructurePiece =
+  PoolElementStructurePiece(piece: newStructurePiece(StructurePieceType.Jigsaw, boundingBox, chainLength),
+    placeFn: placePoolElement, isPoolElement: true, element: element, pos: pos, rotation: rotation, mirror: Mirror.None,
+    jigsawBlocks: jigsawBlocks, junctions: @[], groundLevelDelta: groundLevelDelta, liquidSettings: liquidSettings,
+    projection: projection)

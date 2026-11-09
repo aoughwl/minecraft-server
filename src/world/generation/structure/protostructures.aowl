@@ -1,0 +1,246 @@
+## The structure half of `ProtoChunk`, and the hooks proto_chunk.aowl calls it through.
+## Port of pumpkin-world/src/generation/proto_chunk.rs: `set_structure_starts`, `try_set_structure_start`,
+## `set_structure_references`, `generate_structure_step`, and the piece reading in `step_to_noise`.
+##
+
+{.feature: "lenientnils".}
+
+import std/tables
+import ../../../generated/structures
+import ../../../generated/dimension as dimensiondata
+import ../../../util/math/mathmod
+import ../../../util/random/random
+import ../../../util/worldgen_random as worldgen_random
+import ../structurehooks
+import ../generation
+import ../generator/generator
+import ../noise/multi_noise_sampler
+import ../blender/blender
+import placement
+import height_sampler
+import structuremod
+import structures/structuresmod
+import structures/jigsaw_placement
+
+proc biomeSupplierKindOf(dimension: Dimension): BiomeSupplierKind =
+  if dimension.minecraftName == dimensiondata.THE_END.minecraftName: BiomeSupplierKind.End
+  elif dimension.minecraftName == dimensiondata.THE_NETHER.minecraftName: BiomeSupplierKind.Nether
+  else: BiomeSupplierKind.Overworld
+
+proc trySetStructureStart(c: ProtoChunk, seaLevel: int32, entry: WeightedEntry, randomConfig: GlobalRandomConfig,
+                          heightSampler: HeightSampler): bool =
+  ## `try_set_structure_start`
+  let structure = structures.get(entry.structure)
+  let position = tryGenerateStructure(entry.structure, structure, cast[int64](randomConfig.seed), c, seaLevel, heightSampler)
+  if position != nil:
+    c.structureStarts[entry.structure] = newStructureInstanceStart(position)
+    return true
+  false
+
+proc setStructureStartsBody*(c: ProtoChunk, generator: VanillaGenerator) =
+  ## `ProtoChunk::set_structure_starts`, without the stage change.
+  let randomConfig = generator.randomConfig
+  let settings = generator.settings
+  let globalCache = generator.globalStructureCache
+  let calculator = generator.structureCalculator
+  let seed = randomConfig.seed
+  let heightSampler = newNoiseHeightSampler(generator, startBlockX(c.x), startBlockZ(c.z))
+  for i in 0 ..< ALL_STRUCTURE_SETS.len:
+    let allowedBiomes = generator.structureAllowedBiomes.getOrDefault(i, @[])
+    if not shouldGenerateStructure(ALL_STRUCTURE_SETS[i].placement, calculator, c.x, c.z, globalCache, c, allowedBiomes):
+      continue
+    if ALL_STRUCTURE_SETS[i].structures.len == 1:
+      discard trySetStructureStart(c, settings.seaLevel, ALL_STRUCTURE_SETS[i].structures[0], randomConfig, heightSampler)
+      continue
+    var candidates = ALL_STRUCTURE_SETS[i].structures
+    # The newer tree's seeding, as vanilla has it: `setLargeFeatureSeed` on the legacy generator.
+    var random = createChunkRandom(cast[int64](seed), c.x, c.z)
+    var totalWeight = 0'u32
+    for ci in 0 ..< candidates.len:
+      totalWeight += candidates[ci].weight
+    while candidates.len > 0:
+      var roll = nextBoundedI32(random, cast[int32](totalWeight))
+      var selectedIdx = 0
+      for ci in 0 ..< candidates.len:
+        roll -= cast[int32](candidates[ci].weight)
+        if roll < 0:
+          selectedIdx = ci
+          break
+      if trySetStructureStart(c, settings.seaLevel, candidates[selectedIdx], randomConfig, heightSampler):
+        break
+      totalWeight -= candidates[selectedIdx].weight
+      candidates.delete(selectedIdx)
+
+type
+  ReferenceSampling = ref object
+    ## Upstream builds these for every chunk. They cost more than anything else here and most chunks read neither.
+    generator: VanillaGenerator
+    ready: bool
+    biomeSupplier: BlenderBiomeSupplier
+    multiNoiseSampler: MultiNoiseSampler
+
+proc prepare(s: ReferenceSampling) =
+  if s.ready:
+    return
+  s.ready = true
+  s.biomeSupplier = getBiomeSupplier(emptyBlender(), biomeSupplierKindOf(s.generator.dimension))
+  s.multiNoiseSampler = generateMultiNoiseSampler(s.generator.baseRouter.multiNoise, newMultiNoiseSamplerBuilderOptions(0, 0, 0))
+
+proc setStructureReferencesBody*(c: ProtoChunk, generator: VanillaGenerator) =
+  ## `ProtoChunk::set_structure_references`, without the stage change.
+  let randomConfig = generator.randomConfig
+  let settings = generator.settings
+  let globalCache = generator.globalStructureCache
+  let calculator = generator.structureCalculator
+  let startX = startBlockX(c.x)
+  let startZ = startBlockZ(c.z)
+  let endX = startX + 15
+  let endZ = startZ + 15
+  let seed = cast[int64](randomConfig.seed)
+  let sampling = ReferenceSampling(generator: generator, ready: false)
+  let heightSampler = newNoiseHeightSampler(generator, startX, startZ)
+  var referenceKeys: seq[StructureKeys] = @[]
+  var referenceCollectors: seq[StructurePiecesCollector] = @[]
+  let chunkMinY = int32(bottomY(c))
+
+  for setIndex in 0 ..< ALL_STRUCTURE_SETS.len:
+    let placementType = ALL_STRUCTURE_SETS[setIndex].placement.placementType
+    let salt = ALL_STRUCTURE_SETS[setIndex].placement.salt
+    var candidateChunks: seq[(int32, int32)] = @[]
+    case placementType.kind
+    of StructurePlacementKind.RandomSpread:
+      let spread = placementType.randomSpread
+      # Every region within 8 chunks, the newer tree's range: the pinned tree's one region around misses starts wherever
+      # spacing is below 8, which is all of a mineshaft's.
+      let minRx = floorDiv(c.x - 8, spread.spacing)
+      let maxRx = floorDiv(c.x + 8, spread.spacing)
+      let minRz = floorDiv(c.z - 8, spread.spacing)
+      let maxRz = floorDiv(c.z + 8, spread.spacing)
+      var rx = minRx
+      while rx <= maxRx:
+        var rz = minRz
+        while rz <= maxRz:
+          let candidate = getStructureChunkInRegion(spread, seed, rx, rz, salt)
+          if abs(candidate[0] - c.x) <= 8 and abs(candidate[1] - c.z) <= 8:
+            candidateChunks.add(candidate)
+          inc rz
+        inc rx
+    of StructurePlacementKind.ConcentricRings:
+      let allowedBiomes = getAllowedBiomes(ALL_STRUCTURE_SETS[setIndex])
+      let strongholds = getOrCalculateStrongholds(globalCache, seed, placementType.concentricRings, c, allowedBiomes)
+      for si in 0 ..< strongholds.len:
+        if abs(strongholds[si][0] - c.x) <= 8 and abs(strongholds[si][1] - c.z) <= 8:
+          candidateChunks.add(strongholds[si])
+
+    let setAllowedBiomes = generator.structureAllowedBiomes.getOrDefault(setIndex, @[])
+    for ci in 0 ..< candidateChunks.len:
+      let candidateChunkX = candidateChunks[ci][0]
+      let candidateChunkZ = candidateChunks[ci][1]
+      if not shouldGenerateStructure(ALL_STRUCTURE_SETS[setIndex].placement, calculator, candidateChunkX, candidateChunkZ,
+          globalCache, c, setAllowedBiomes):
+        continue
+      if abs(candidateChunkX - c.x) <= 8 and abs(candidateChunkZ - c.z) <= 8:
+        for ei in 0 ..< ALL_STRUCTURE_SETS[setIndex].structures.len:
+          let entryKey = ALL_STRUCTURE_SETS[setIndex].structures[ei].structure
+          let structure = structures.get(entryKey)
+          # A structure's placement depends only on its start chunk and the world seed, so it is cached: otherwise every
+          # surrounding chunk whose references overlap it would re-run the jigsaw expansion.
+          var startData: StructurePosition = nil
+          if not findStructureStart(globalCache, entryKey, candidateChunkX, candidateChunkZ, startData):
+            prepare(sampling)
+            var context = newContext(seed, candidateChunkX, candidateChunkZ, settings.seaLevel, chunkMinY, heightSampler, entryKey)
+            startData = lazilyGenerateStructure(entryKey, structure, context, sampling.biomeSupplier, sampling.multiNoiseSampler)
+            storeStructureStart(globalCache, entryKey, candidateChunkX, candidateChunkZ, startData)
+          if startData != nil and intersectsRawXz(getBoundingBox(startData), startX, startZ, endX, endZ):
+            referenceKeys.add(entryKey)
+            referenceCollectors.add(startData.collector)
+            break
+
+  for i in 0 ..< referenceKeys.len:
+    if not c.structureStarts.hasKey(referenceKeys[i]):
+      c.structureStarts[referenceKeys[i]] = newStructureInstanceReference(referenceCollectors[i])
+
+proc addTask(tasks: var seq[StructurePiecesCollector], collector: StructurePiecesCollector) =
+  for i in 0 ..< tasks.len:
+    if tasks[i] == collector:
+      return
+  tasks.add(collector)
+
+var stepStructures: array[11, seq[StructureKeys]]
+var stepStructuresReady = false
+
+proc structuresInStep(step: int): seq[StructureKeys] =
+  ## A step's structures in name order, which is the registry order vanilla numbers them in.
+  if not stepStructuresReady:
+    stepStructuresReady = true
+    let names = structureAllNames()
+    for i in 0 ..< names.len:
+      let (found, key) = fromName(StructureKeys, names[i])
+      if found:
+        stepStructures[ordinal(structures.get(key).step)].add(key)
+  stepStructures[step]
+
+proc generateStructureStepBody*(cache: GenerationCache, blockRegistry: WorldPortalExt, step: int, populationSeed: uint64,
+                                worldSeed: int64) =
+  ## `ProtoChunk::generate_structure_step` as the newer tree has it, like vanilla: each structure of the step, in registry
+  ## order, draws from its own seed. The pinned tree shares one generator between them in `FxHashMap` order.
+  let centerChunk = cache.getCenterChunk()
+  let centerX = centerChunk.x
+  let centerZ = centerChunk.z
+  let inStep = structuresInStep(step)
+  for index in 0 ..< inStep.len:
+    let key = inStep[index]
+    var tasks: seq[StructurePiecesCollector] = @[]
+    if centerChunk.structureStarts.hasKey(key):
+      addTask(tasks, instanceData(centerChunk.structureStarts.getOrDefault(key, nil)).collector)
+    let radius = 8'i32
+    var dx = -radius
+    while dx <= radius:
+      var dz = -radius
+      while dz <= radius:
+        if dx != 0 or dz != 0:
+          let neighbor = cache.tryGetProtoChunk(centerX + dx, centerZ + dz)
+          if neighbor != nil:
+            if neighbor.structureStarts.hasKey(key):
+              let data = instanceData(neighbor.structureStarts.getOrDefault(key, nil))
+              if data.isStart:
+                let sx = startBlockX(centerX)
+                let sz = startBlockZ(centerZ)
+                if intersectsRawXz(getBoundingBox(data.position), sx, sz, sx + 15, sz + 15):
+                  addTask(tasks, data.collector)
+              else:
+                addTask(tasks, data.collector)
+        inc dz
+      inc dx
+    if tasks.len > 0:
+      let decoratorSeed = worldgen_random.getDecoratorSeed(populationSeed, uint64(index), uint64(step))
+      var random = toRandomGenerator(worldgen_random.fromSeed(decoratorSeed))
+      for i in 0 ..< tasks.len:
+        generateInChunk(tasks[i], centerChunk, blockRegistry, random, worldSeed)
+
+proc beardifierPiecesBody*(key: StructureKeys, instance: StructureInstance): seq[BeardifierPiece] =
+  ## What `step_to_noise` reads of `instance.collector.pieces`.
+  result = @[]
+  let collector = instanceData(instance).collector
+  for i in 0 ..< collector.pieces.len:
+    let piece = collector.pieces[i]
+    if piece.isPoolElement:
+      result.add(beardifierPieceOf(cast[PoolElementStructurePiece](piece)))
+    else:
+      result.add(BeardifierPiece(boundingBox: piece.piece.boundingBox, isJigsaw: false, projectionRigid: false,
+        groundLevelDelta: 0, junctions: @[]))
+
+proc installStructureHooks*() =
+  ## Fills `structureHooks`' structure fields. `generatePlacedFeature` is generation/feature's.
+  let hooks = structureHooks
+  hooks.setStructureStarts = proc(chunk: ProtoChunk, generator: pointer) {.closure.} =
+    setStructureStartsBody(chunk, cast[VanillaGenerator](generator))
+  hooks.setStructureReferences = proc(chunk: ProtoChunk, generator: pointer) {.closure.} =
+    setStructureReferencesBody(chunk, cast[VanillaGenerator](generator))
+  hooks.beardifierPieces = proc(key: StructureKeys, instance: StructureInstance): seq[BeardifierPiece] {.closure.} =
+    beardifierPiecesBody(key, instance)
+  hooks.generateStructureStep = proc(cache: GenerationCache, registry: WorldPortalExt, step: int, populationSeed: uint64,
+                                     worldSeed: int64) {.closure.} =
+    generateStructureStepBody(cache, registry, step, populationSeed, worldSeed)
+
+installStructureHooks()

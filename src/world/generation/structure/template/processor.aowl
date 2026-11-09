@@ -1,0 +1,282 @@
+## Port of pumpkin-world/src/generation/structure/template/processor.rs
+##
+## `BlockPlacer` is here rather than in template.aowl because a processor reads through one, and template.aowl calls
+## processors. It is a ref object with proc pointers; `ProtoChunk`'s is `protoChunkPlacer`.
+
+{.feature: "lenientnils".}
+
+import std/tables
+import std/syncio
+import ../../../blockstates
+import ../../../../generated/tag
+import ../../../../nbt/tag as nbttag
+import ../../../../util/vector3
+import ../../../../util/legacy_rand
+import ../../protochunkbase
+import ../../../../codecs/json_value
+import cache
+
+type
+  BlockPlacer* = ref object of RootObj
+    ## `trait BlockPlacer`
+    getStateFn*: proc(self: BlockPlacer, pos: Vector3[int32]): BlockStateId {.nimcall.}
+    setStateFn*: proc(self: BlockPlacer, pos: Vector3[int32], state: BlockStateId) {.nimcall.}
+    addEntityFn*: proc(self: BlockPlacer, nbt: NbtCompound) {.nimcall.}
+
+  ProtoChunkPlacer = ref object of BlockPlacer
+    chunk: ProtoChunk
+
+  BlockTag* {.pure.} = enum
+    AncientCityReplaceable, FeaturesCannotReplace, TrailRuinsReplaceable, Doors
+
+  RuleInputKind* {.pure.} = enum
+    Block, Tag
+
+  RuleInput* = object
+    kind*: RuleInputKind
+    blockId*: int
+    tag*: BlockTag
+
+  ProcessorRule* = object
+    input*: RuleInput
+    probability*: float32
+    outputState*: BlockStateId
+
+  StructureProcessorKind* {.pure.} = enum
+    BlockRot, Rules, ProtectedBlocks, Capped
+
+  StructureProcessor* = object
+    kind*: StructureProcessorKind
+    integrity*: float32          ## `BlockRot`
+    hasBlocks*: bool             ## `BlockRot`: `blocks` is an `Option`.
+    blocks*: BlockTag            ## `BlockRot`, `ProtectedBlocks`
+    rules*: seq[ProcessorRule]   ## `Rules`
+    limit*: int32                ## `Capped`
+    delegate*: seq[StructureProcessor]  ## `Capped`: always one, a `Box` upstream.
+
+var
+  tagSets: array[BlockTag, seq[bool]]
+  tagSetsReady: array[BlockTag, bool]
+  processorListCache = initTable[string, seq[StructureProcessor]]()
+
+proc getState*(p: BlockPlacer, pos: Vector3[int32]): BlockStateId =
+  let f = p.getStateFn
+  f(p, pos)
+
+proc setState*(p: BlockPlacer, pos: Vector3[int32], state: BlockStateId) =
+  let f = p.setStateFn
+  f(p, pos, state)
+
+proc addEntity*(p: BlockPlacer, nbt: NbtCompound) =
+  let f = p.addEntityFn
+  f(p, nbt)
+
+proc protoGetState(self: BlockPlacer, pos: Vector3[int32]): BlockStateId {.nimcall.} =
+  getBlockState(cast[ProtoChunkPlacer](self).chunk, pos)
+
+proc protoSetState(self: BlockPlacer, pos: Vector3[int32], state: BlockStateId) {.nimcall.} =
+  setBlockState(cast[ProtoChunkPlacer](self).chunk, pos.x, pos.y, pos.z, state)
+
+proc protoAddEntity(self: BlockPlacer, nbt: NbtCompound) {.nimcall.} =
+  addBlockEntity(cast[ProtoChunkPlacer](self).chunk, nbt)
+
+proc protoChunkPlacer*(chunk: ProtoChunk): BlockPlacer =
+  ## `impl BlockPlacer for ProtoChunk`
+  ProtoChunkPlacer(chunk: chunk, getStateFn: protoGetState, setStateFn: protoSetState, addEntityFn: protoAddEntity)
+
+proc blockTagFromName(name: string): (bool, BlockTag) =
+  case name
+  of "#minecraft:ancient_city_replaceable", "minecraft:ancient_city_replaceable":
+    (true, BlockTag.AncientCityReplaceable)
+  of "#minecraft:features_cannot_replace", "minecraft:features_cannot_replace":
+    (true, BlockTag.FeaturesCannotReplace)
+  of "#minecraft:trail_ruins_replaceable", "minecraft:trail_ruins_replaceable":
+    (true, BlockTag.TrailRuinsReplaceable)
+  of "#minecraft:doors", "minecraft:doors":
+    (true, BlockTag.Doors)
+  else:
+    (false, BlockTag.Doors)
+
+proc tagName(t: BlockTag): string =
+  case t
+  of BlockTag.AncientCityReplaceable: "minecraft:ancient_city_replaceable"
+  of BlockTag.FeaturesCannotReplace: "minecraft:features_cannot_replace"
+  of BlockTag.TrailRuinsReplaceable: "minecraft:trail_ruins_replaceable"
+  of BlockTag.Doors: "minecraft:doors"
+
+proc contains*(t: BlockTag, blockId: int): bool =
+  ## `BlockTag::contains`, over a table per tag: `has_tag` runs per placed block here.
+  if not tagSetsReady[t]:
+    tagSetsReady[t] = true
+    let (found, ids) = getTagIds(rkBlock, tagName(t))
+    var bits = newSeq[bool](65536)
+    if found:
+      for id in ids:
+        bits[int(id)] = true
+    tagSets[t] = bits
+  tagSets[t][blockId]
+
+proc matches(input: RuleInput, blockId: int): bool =
+  case input.kind
+  of RuleInputKind.Block: input.blockId == blockId
+  of RuleInputKind.Tag: contains(input.tag, blockId)
+
+proc process*(p: StructureProcessor, placer: BlockPlacer, pos: Vector3[int32], state: BlockStateId): (bool, BlockStateId) =
+  ## `StructureProcessor::process`: false for `None`, the block is not placed.
+  let inputBlock = blockIdOf(state)
+  case p.kind
+  of StructureProcessorKind.BlockRot:
+    if p.hasBlocks and not contains(p.blocks, inputBlock):
+      return (true, state)
+    var random = legacy_rand.fromSeed(cast[uint64](hashBlockPos(pos.x, pos.y, pos.z)))
+    (nextF32(random) <= p.integrity, state)
+  of StructureProcessorKind.Rules:
+    var random = legacy_rand.fromSeed(cast[uint64](hashBlockPos(pos.x, pos.y, pos.z)))
+    for i in 0 ..< p.rules.len:
+      if matches(p.rules[i].input, inputBlock) and nextF32(random) < p.rules[i].probability:
+        return (true, p.rules[i].outputState)
+    (true, state)
+  of StructureProcessorKind.ProtectedBlocks:
+    let existing = blockIdOf(getState(placer, pos))
+    (not contains(p.blocks, existing), state)
+  of StructureProcessorKind.Capped:
+    process(p.delegate[0], placer, pos, state)
+
+proc field(n: JsonValue, key: string, value: var JsonValue): bool =
+  ## The object member under `key`.
+  if n.kind != jvObject:
+    return false
+  let (found, v) = get(n, key)
+  if found:
+    value = v
+  found
+
+proc stringField(n: JsonValue, key: string, value: var string): bool =
+  var v = jsonNull()
+  if field(n, key, v) and v.kind == jvString:
+    value = v.strVal
+    return true
+  false
+
+proc numberField(n: JsonValue, key: string, value: var float64): bool =
+  var v = jsonNull()
+  if field(n, key, v):
+    if v.kind == jvFloat:
+      value = v.floatVal
+      return true
+    if v.kind == jvInt:
+      value = float64(v.intVal)
+      return true
+  false
+
+proc convertRule(rule: JsonValue, valid: var bool): (bool, ProcessorRule) =
+  ## The `filter_map` body. `valid` turns false where serde would have rejected the whole list.
+  var predicate = jsonNull()
+  var output = jsonNull()
+  var outputName = ""
+  if not field(rule, "input_predicate", predicate) or predicate.kind != jvObject or not field(rule, "output_state", output) or
+      not stringField(output, "Name", outputName):
+    valid = false
+    return (false, default(ProcessorRule))
+  let (hasOutput, outputBlock) = blockIdByName(outputName)
+  if not hasOutput:
+    return (false, default(ProcessorRule))
+  var input = default(RuleInput)
+  var blockName = ""
+  var tagNameValue = ""
+  if stringField(predicate, "block", blockName):
+    let (hasInput, inputBlock) = blockIdByName(blockName)
+    if not hasInput:
+      return (false, default(ProcessorRule))
+    input = RuleInput(kind: RuleInputKind.Block, blockId: inputBlock)
+  elif stringField(predicate, "tag", tagNameValue):
+    let (hasTag, tag) = blockTagFromName(tagNameValue)
+    if not hasTag:
+      return (false, default(ProcessorRule))
+    input = RuleInput(kind: RuleInputKind.Tag, tag: tag)
+  else:
+    return (false, default(ProcessorRule))
+  var probability = 1.0'f64
+  discard numberField(predicate, "probability", probability)
+  (true, ProcessorRule(input: input, probability: float32(probability), outputState: defaultStateOf(outputBlock)))
+
+proc convertRawProcessor(raw: JsonValue, valid: var bool): (bool, StructureProcessor) =
+  ## `convert_raw_processor`, and serde's checks of `RawProcessor` on the way.
+  var processorType = ""
+  if not stringField(raw, "processor_type", processorType):
+    valid = false
+    return (false, default(StructureProcessor))
+  case processorType
+  of "minecraft:block_rot":
+    var integrity = 0.0'f64
+    if not numberField(raw, "integrity", integrity):
+      valid = false
+      return (false, default(StructureProcessor))
+    var rottable = ""
+    if stringField(raw, "rottable_blocks", rottable):
+      let (hasTag, tag) = blockTagFromName(rottable)
+      if not hasTag:
+        return (false, default(StructureProcessor))
+      (true, StructureProcessor(kind: StructureProcessorKind.BlockRot, integrity: float32(integrity), hasBlocks: true, blocks: tag))
+    else:
+      (true, StructureProcessor(kind: StructureProcessorKind.BlockRot, integrity: float32(integrity), hasBlocks: false))
+  of "minecraft:protected_blocks":
+    var value = ""
+    if not stringField(raw, "value", value):
+      valid = false
+      return (false, default(StructureProcessor))
+    let (hasTag, tag) = blockTagFromName(value)
+    if not hasTag:
+      return (false, default(StructureProcessor))
+    (true, StructureProcessor(kind: StructureProcessorKind.ProtectedBlocks, blocks: tag))
+  of "minecraft:rule":
+    var list = jsonNull()
+    if not field(raw, "rules", list) or list.kind != jvArray:
+      valid = false
+      return (false, default(StructureProcessor))
+    var rules: seq[ProcessorRule] = @[]
+    for i in 0 ..< list.items.len:
+      let (keep, rule) = convertRule(list.items[i], valid)
+      if keep:
+        rules.add(rule)
+    (true, StructureProcessor(kind: StructureProcessorKind.Rules, rules: rules))
+  of "minecraft:capped":
+    var limit = 0.0'f64
+    var delegateNode = jsonNull()
+    if not numberField(raw, "limit", limit) or not field(raw, "delegate", delegateNode):
+      valid = false
+      return (false, default(StructureProcessor))
+    let (keep, inner) = convertRawProcessor(delegateNode, valid)
+    if not keep:
+      return (false, default(StructureProcessor))
+    (true, StructureProcessor(kind: StructureProcessorKind.Capped, limit: int32(limit), delegate: @[inner]))
+  else:
+    valid = false
+    (false, default(StructureProcessor))
+
+proc parseProcessorList(name, text: string): seq[StructureProcessor] =
+  result = @[]
+  let parsed = parseJsonValue(text)
+  var list = jsonNull()
+  if not parsed.ok or not field(parsed.value, "processors", list) or list.kind != jvArray:
+    echo "Failed to parse structure processor list ", name
+    return @[]
+  var valid = true
+  for i in 0 ..< list.items.len:
+    let (keep, processor) = convertRawProcessor(list.items[i], valid)
+    if keep:
+      result.add(processor)
+  if not valid:
+    echo "Failed to parse structure processor list ", name
+    return @[]
+
+proc loadProcessorList*(name: string): seq[StructureProcessor] =
+  ## `load_processor_list`. Unlike upstream's, an unknown or broken list is cached too; it stays as it is.
+  if processorListCache.hasKey(name):
+    return processorListCache.getOrDefault(name, @[])
+  let (found, text) = getProcessorListJson(name)
+  if not found:
+    echo "Unknown structure processor list: ", name
+    return @[]
+  result = parseProcessorList(name, text)
+  processorListCache[name] = result

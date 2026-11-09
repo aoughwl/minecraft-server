@@ -1,0 +1,511 @@
+## Jigsaw expansion, and the generator that calls it.
+## Port of pumpkin-world/src/generation/structure/structures/jigsaw_placement.rs, with `JigsawGenerator` from jigsaw.rs.
+
+##
+## PARTIAL: pumpkin-world/src/generation/structure/structures/jigsaw_placement.rs - as the pinned tree has it, which passes its
+## vanilla outpost graph. Pool aliases are upstream's stub, and trial chambers use them: both of the save's start where vanilla's
+## do but expand differently. ../ref/pumpkin has aliases and a reworked queue, not ported.
+
+{.feature: "lenientnils".}
+
+import ../../../../generated/structures
+import "../template/templatemod"
+import structuresmod
+import jigsaw
+
+export jigsaw
+
+const
+  MaxTotalStructureRange* = 128'i32
+  MinDepth* = 0'i32
+  MaxDepth* = 20'i32
+
+type
+  DimensionPadding* = object
+    top*, bottom*: int32
+
+  MaxDistance* = object
+    horizontal*, vertical*: int32
+
+  CollisionSpace = object
+    bounds: BlockBox
+    occupied: seq[BlockBox]
+
+  PieceState = object
+    pieceIdx: int
+    depth: int32
+    priority: int32
+    sequence: int
+    collisionSpace: int
+
+  JigsawGenerator* = object
+    startPool*: string
+    size*: int32
+    hasStartJigsawName*: bool
+    startJigsawName*: string
+    useExpansionHack*: bool
+
+proc newMaxDistance*(horizontal: int32): MaxDistance =
+  MaxDistance(horizontal: horizontal, vertical: 384)
+
+proc poolAliasLookup(id: string): string {.inline.} = id
+  ## `PoolAliasLookup::lookup`: upstream's has no aliases either.
+
+proc rotatePos*(pos: Vector3[int32], rotation: Rotation): Vector3[int32] =
+  let (x, z) = rotateOffset(rotation, pos.x, pos.z)
+  vec3[int32](x, pos.y, z)
+
+proc rotatedBox(origin: BlockPos, size: Vector3[int32], rotation: Rotation): BlockBox =
+  let corner = rotatePos(vec3[int32](size.x - 1, size.y - 1, size.z - 1), rotation)
+  newBlockBox(min(origin.x, origin.x + corner.x), origin.y, min(origin.z, origin.z + corner.z),
+    max(origin.x, origin.x + corner.x), origin.y + corner.y, max(origin.z, origin.z + corner.z))
+
+proc rotateDirection*(dir: BlockDirection, rotation: Rotation): BlockDirection =
+  case rotation
+  of Rotation.None:
+    dir
+  of Rotation.Clockwise90:
+    case dir
+    of North: East
+    of East: South
+    of South: West
+    of West: North
+    else: dir
+  of Rotation.Rotate180:
+    case dir
+    of North: South
+    of South: North
+    of West: East
+    of East: West
+    else: dir
+  of Rotation.CounterClockwise90:
+    case dir
+    of North: West
+    of West: South
+    of South: East
+    of East: North
+    else: dir
+
+proc getJigsawBlocks*(t: StructureTemplate): seq[JigsawBlock] =
+  result = newSeqOfCap[JigsawBlock](t.jigsawBlocks.len)
+  for i in 0 ..< t.jigsawBlocks.len:
+    let b = t.jigsawBlocks[i]
+    let (ok, jigsaw) = jigsawFromTemplateBlock(t.blocks[b], t.palette[int(t.blocks[b].state)])
+    if ok:
+      result.add(jigsaw)
+
+proc sizeForKind(kind: PoolElementKind, size: var Vector3[int32]): bool =
+  case kind.tag
+  of PoolElementKindTag.Empty:
+    false
+  of PoolElementKindTag.Feature:
+    size = vec3[int32](1, 1, 1)
+    true
+  of PoolElementKindTag.Single:
+    let t = getTemplate(kind.templateName)
+    if t == nil:
+      return false
+    size = t.size
+    true
+  of PoolElementKindTag.List:
+    var r = vec3[int32](0, 0, 0)
+    var found = false
+    for i in 0 ..< kind.elements.len:
+      var s = vec3[int32](0, 0, 0)
+      if sizeForKind(kind.elements[i], s):
+        r.x = max(r.x, s.x)
+        r.y = max(r.y, s.y)
+        r.z = max(r.z, s.z)
+        found = true
+    size = r
+    found
+
+proc getElementSize*(element: PoolElement, size: var Vector3[int32]): bool =
+  sizeForKind(element.kind, size)
+
+proc jigsawsForKind(kind: PoolElementKind): seq[JigsawBlock] =
+  result = newSeq[JigsawBlock](0)
+  case kind.tag
+  of PoolElementKindTag.Single:
+    let t = getTemplate(kind.templateName)
+    if t != nil:
+      result = getJigsawBlocks(t)
+  of PoolElementKindTag.List:
+    if kind.elements.len > 0:
+      result = jigsawsForKind(kind.elements[0])
+  of PoolElementKindTag.Feature:
+    result.add(JigsawBlock(pos: blockPos(0, 0, 0), name: "minecraft:bottom", target: "minecraft:empty", pool: "minecraft:empty",
+      finalState: "minecraft:air", joint: JigsawJointType.Rollable, facing: Down, up: South, selectionPriority: 0,
+      placementPriority: 0))
+  of PoolElementKindTag.Empty:
+    discard
+
+proc getElementJigsawBlocks*(element: PoolElement): seq[JigsawBlock] =
+  jigsawsForKind(element.kind)
+
+proc canAttachBlocks(source, target: JigsawBlock, targetRotation: Rotation): bool =
+  if source.target != target.name:
+    return false
+  if opposite(source.facing) != rotateDirection(target.facing, targetRotation):
+    return false
+  if source.joint == JigsawJointType.Aligned:
+    return source.up == rotateDirection(target.up, targetRotation)
+  true
+
+proc getPoolMaxYSize(poolId: string): int32 =
+  let pool = discover(poolId)
+  if pool == nil:
+    return 0
+  var maxY = 0'i32
+  for i in 0 ..< pool.elements.len:
+    if not isEmpty(pool.elements[i]):
+      var size = vec3[int32](0, 0, 0)
+      if getElementSize(pool.elements[i], size):
+        maxY = max(maxY, size.y)
+  maxY
+
+proc isBoxInside(outer, inner: BlockBox): bool =
+  inner.min.x >= outer.min.x and inner.max.x <= outer.max.x and
+    inner.min.y >= outer.min.y and inner.max.y <= outer.max.y and
+    inner.min.z >= outer.min.z and inner.max.z <= outer.max.z
+
+proc boxesIntersect(a, b: BlockBox): bool =
+  a.max.x >= b.min.x and a.min.x <= b.max.x and a.max.y >= b.min.y and a.min.y <= b.max.y and
+    a.max.z >= b.min.z and a.min.z <= b.max.z
+
+proc popBest(heap: var seq[PieceState]): PieceState =
+  ## `BinaryHeap::pop` under `impl Ord for PieceState`: highest priority, then lowest sequence.
+  var best = 0
+  for i in 1 ..< heap.len:
+    if heap[i].priority > heap[best].priority or
+        (heap[i].priority == heap[best].priority and heap[i].sequence < heap[best].sequence):
+      best = i
+  result = heap[best]
+  heap[best] = heap[heap.len - 1]
+  heap.setLen(heap.len - 1)
+
+proc sampleHeight(context: var StructureGeneratorContext, pos: BlockPos): int32 =
+  ## `context.height_sampler.as_mut().map_or(pos.y, |s| s.estimate_height(pos.x, pos.z))`
+  if context.heightSampler == nil: pos.y else: estimateHeight(context.heightSampler, pos.x, pos.z)
+
+proc shuffleJigsaws(random: var RandomGenerator, list: var seq[JigsawBlock]) =
+  var i = list.len - 1
+  while i >= 1:
+    let j = int(nextBoundedI32(random, int32(i) + 1))
+    let a = list[i]
+    let b = list[j]
+    list[i] = b
+    list[j] = a
+    dec i
+
+proc addPieces*(context: var StructureGeneratorContext, startPoolId: string, hasStartJigsaw: bool, startJigsaw: string,
+                maxDepthIn: int32, position: BlockPos, doExpansionHack, projectStartToHeightmap: bool,
+                maxDistanceFromCenter: MaxDistance, dimensionPadding: DimensionPadding,
+                liquidSettings: LiquidSettings): StructurePosition =
+  ## `JigsawPlacement::add_pieces`
+  if maxDistanceFromCenter.horizontal > MaxTotalStructureRange:
+    return nil
+
+  let maxDepth = max(MinDepth, min(maxDepthIn, MaxDepth))
+
+  let pool = discover(poolAliasLookup(startPoolId))
+  if pool == nil:
+    return nil
+  let rotation = fromIndex(Rotation, uint8(nextBoundedI32(context.random, 4)))
+  let element = getRandomElement(pool, context.random)
+  let startTemplate = firstTemplate(element)
+  if startTemplate == nil:
+    return nil
+
+  var anchoredPosition = position
+  if hasStartJigsaw:
+    var foundAnchor = false
+    let jigsaws = getJigsawBlocks(startTemplate)
+    for i in 0 ..< jigsaws.len:
+      if jigsaws[i].name == startJigsaw:
+        let rotatedPos = rotatePos(vec3[int32](jigsaws[i].pos.x, jigsaws[i].pos.y, jigsaws[i].pos.z), rotation)
+        anchoredPosition = blockPos(position.x + rotatedPos.x, position.y + rotatedPos.y, position.z + rotatedPos.z)
+        foundAnchor = true
+        break
+    if not foundAnchor:
+      return nil
+
+  let localAnchorX = anchoredPosition.x - position.x
+  let localAnchorY = anchoredPosition.y - position.y
+  let localAnchorZ = anchoredPosition.z - position.z
+  let adjustedPosition = blockPos(position.x - localAnchorX, position.y - localAnchorY, position.z - localAnchorZ)
+
+  var box = rotatedBox(adjustedPosition, startTemplate.size, rotation)
+
+  let centerX = midpointI32(box.max.x, box.min.x)
+  let centerZ = midpointI32(box.max.z, box.min.z)
+
+  let bottomYValue =
+    if projectStartToHeightmap:
+      if context.heightSampler == nil: adjustedPosition.y else: estimateHeight(context.heightSampler, centerX, centerZ)
+    else:
+      adjustedPosition.y
+
+  let groundLevelDelta = 1'i32
+  let yOffset = bottomYValue - (box.min.y + groundLevelDelta)
+  movePos(box, 0, yOffset, 0)
+  let piecePos = blockPos(adjustedPosition.x, adjustedPosition.y + yOffset, adjustedPosition.z)
+
+  if box.min.y < context.minY + dimensionPadding.bottom or box.max.y > context.minY + 320 - dimensionPadding.top:
+    return nil
+
+  let centerY = bottomYValue + localAnchorY
+
+  let globalBoundingBox = newBlockBox(centerX - maxDistanceFromCenter.horizontal,
+    max(centerY - maxDistanceFromCenter.vertical, context.minY + dimensionPadding.bottom),
+    centerZ - maxDistanceFromCenter.horizontal, centerX + maxDistanceFromCenter.horizontal + 1,
+    min(centerY + maxDistanceFromCenter.vertical + 1, context.minY + 320 - dimensionPadding.top),
+    centerZ + maxDistanceFromCenter.horizontal + 1)
+
+  var jigsawBlocks = getJigsawBlocks(startTemplate)
+  for i in 0 ..< jigsawBlocks.len:
+    let rotatedPos = rotatePos(vec3[int32](jigsawBlocks[i].pos.x, jigsawBlocks[i].pos.y, jigsawBlocks[i].pos.z), rotation)
+    jigsawBlocks[i].pos = blockPos(rotatedPos.x + piecePos.x, rotatedPos.y + piecePos.y, rotatedPos.z + piecePos.z)
+    jigsawBlocks[i].facing = rotateDirection(jigsawBlocks[i].facing, rotation)
+    jigsawBlocks[i].up = rotateDirection(jigsawBlocks[i].up, rotation)
+
+  let firstPiece = newPoolElementStructurePiece(box, 0'u32, element, piecePos, rotation, jigsawBlocks, groundLevelDelta,
+    liquidSettings, element.projection)
+
+  let collector = newStructurePiecesCollector()
+  var pieces: seq[PoolElementStructurePiece] = @[]
+  var pieceCollisionBoxes: seq[BlockBox] = @[]
+  var pieceProjections: seq[JigsawProjection] = @[]
+  var collisionSpaces = @[CollisionSpace(bounds: globalBoundingBox, occupied: @[box])]
+
+  pieces.add(firstPiece)
+  pieceCollisionBoxes.add(box)
+  pieceProjections.add(element.projection)
+
+  if maxDepth > 0:
+    var placing: seq[PieceState] = @[]
+    var sequence = 0
+    placing.add(PieceState(pieceIdx: 0, depth: 0, priority: 0, sequence: sequence, collisionSpace: 0))
+
+    while placing.len > 0:
+      let state = popBest(placing)
+      let depth = state.depth
+      let sourcePieceIdx = state.pieceIdx
+      var sourceJigsaws = pieces[sourcePieceIdx].jigsawBlocks
+      pieces[sourcePieceIdx].jigsawBlocks = @[]
+
+      shuffleJigsaws(context.random, sourceJigsaws)
+      # `sort_by_key(Reverse(selection_priority))`, which is stable.
+      for a in 1 ..< sourceJigsaws.len:
+        let v = sourceJigsaws[a]
+        var b = a - 1
+        while b >= 0 and sourceJigsaws[b].selectionPriority < v.selectionPriority:
+          let moved = sourceJigsaws[b]
+          sourceJigsaws[b + 1] = moved
+          dec b
+        sourceJigsaws[b + 1] = v
+
+      let sourceBox = pieces[sourcePieceIdx].piece.boundingBox
+      let sourceCollisionBox = pieceCollisionBoxes[sourcePieceIdx]
+      let sourceProjection = pieceProjections[sourcePieceIdx]
+      let sourceRigid = sourceProjection == JigsawProjection.Rigid
+      var interiorCollisionSpace = -1
+
+      for sj in 0 ..< sourceJigsaws.len:
+        let sourceJigsaw = sourceJigsaws[sj]
+        if sourceJigsaw.pool == "minecraft:empty" or sourceJigsaw.pool.len == 0:
+          continue
+        let targetPool = discover(poolAliasLookup(sourceJigsaw.pool))
+        if targetPool == nil:
+          continue
+
+        var targetElements: seq[PoolElement] = @[]
+        if depth < maxDepth:
+          targetElements = getShuffledElements(targetPool, context.random)
+        let fallbackPool = discover(poolAliasLookup(targetPool.fallback))
+        if fallbackPool != nil:
+          let fallbackElements = getShuffledElements(fallbackPool, context.random)
+          for i in 0 ..< fallbackElements.len:
+            targetElements.add(fallbackElements[i])
+
+        block jigsawLoop:
+          for ti in 0 ..< targetElements.len:
+            let targetElement = targetElements[ti]
+            if isEmpty(targetElement):
+              break jigsawLoop
+
+            var targetSize = vec3[int32](0, 0, 0)
+            if not getElementSize(targetElement, targetSize):
+              continue
+            let targetProjection = targetElement.projection
+            let targetRigid = targetProjection == JigsawProjection.Rigid
+
+            var rotations = rotationValues()
+            var ri = 3
+            while ri >= 1:
+              let j = int(nextBoundedI32(context.random, int32(ri) + 1))
+              let a = rotations[ri]
+              let b = rotations[j]
+              rotations[ri] = b
+              rotations[j] = a
+              dec ri
+
+            for rotIndex in 0 ..< 4:
+              let targetRotation = rotations[rotIndex]
+              let targetJigsaws = getElementJigsawBlocks(targetElement)
+              var targetJigsawsShuffled = targetJigsaws
+              shuffleJigsaws(context.random, targetJigsawsShuffled)
+
+              for tj in 0 ..< targetJigsawsShuffled.len:
+                let targetJigsaw = targetJigsawsShuffled[tj]
+                if not canAttachBlocks(sourceJigsaw, targetJigsaw, targetRotation):
+                  continue
+
+                let sourceFacing = toVector(sourceJigsaw.facing)
+                let sourceJigsawPos = sourceJigsaw.pos
+                let targetJigsawPos = blockPos(sourceJigsawPos.x + sourceFacing.x, sourceJigsawPos.y + sourceFacing.y,
+                  sourceJigsawPos.z + sourceFacing.z)
+
+                let sourceJigsawLocalY = sourceJigsawPos.y - sourceBox.min.y
+                let targetJigsawLocalPos = rotatePos(vec3[int32](targetJigsaw.pos.x, targetJigsaw.pos.y, targetJigsaw.pos.z), targetRotation)
+                let targetJigsawLocalY = targetJigsawLocalPos.y
+
+                let deltaY = sourceJigsawLocalY - targetJigsawLocalY + sourceFacing.y
+
+                var sourceJigsawBaseHeight = int32.low
+
+                var targetBoxY = 0'i32
+                if sourceRigid and targetRigid:
+                  targetBoxY = sourceBox.min.y + deltaY
+                else:
+                  if sourceJigsawBaseHeight == int32.low:
+                    sourceJigsawBaseHeight = sampleHeight(context, sourceJigsawPos)
+                  targetBoxY = sourceJigsawBaseHeight - targetJigsawLocalY
+
+                let rawTargetX = targetJigsawPos.x - targetJigsawLocalPos.x
+                let rawTargetY = targetJigsawPos.y - targetJigsawLocalPos.y
+                let rawTargetZ = targetJigsawPos.z - targetJigsawLocalPos.z
+                let yOffset2 = targetBoxY - rawTargetY
+
+                let targetPos = blockPos(rawTargetX, rawTargetY + yOffset2, rawTargetZ)
+
+                let targetBox = rotatedBox(targetPos, targetSize, targetRotation)
+                var targetCollisionBox = targetBox
+
+                var expandTo = 0'i32
+                if doExpansionHack and (targetBox.max.y - targetBox.min.y + 1) <= 16:
+                  for hi in 0 ..< targetJigsaws.len:
+                    let tjFacing = rotateDirection(targetJigsaws[hi].facing, targetRotation)
+                    let rotatedTjPos = rotatePos(vec3[int32](targetJigsaws[hi].pos.x, targetJigsaws[hi].pos.y, targetJigsaws[hi].pos.z), targetRotation)
+                    let facingVector = toVector(tjFacing)
+                    let hackBox = rotatedBox(blockPos(0, 0, 0), targetSize, targetRotation)
+                    if contains(hackBox, rotatedTjPos.x + facingVector.x, rotatedTjPos.y + facingVector.y, rotatedTjPos.z + facingVector.z):
+                      let childPoolId = poolAliasLookup(targetJigsaws[hi].pool)
+                      let childPoolMaxY = getPoolMaxYSize(childPoolId)
+                      let cp = discover(childPoolId)
+                      let childFallbackMaxY = if cp != nil: getPoolMaxYSize(poolAliasLookup(cp.fallback)) else: 0'i32
+                      expandTo = max(max(expandTo, childPoolMaxY), childFallbackMaxY)
+
+                if expandTo > 0:
+                  let maxYOffset = max(expandTo + 1, targetCollisionBox.max.y - targetCollisionBox.min.y)
+                  targetCollisionBox.max.y = targetCollisionBox.min.y + maxYOffset
+
+                var collisionSpace = state.collisionSpace
+                if contains(sourceCollisionBox, targetJigsawPos.x, targetJigsawPos.y, targetJigsawPos.z):
+                  if interiorCollisionSpace < 0:
+                    collisionSpaces.add(CollisionSpace(bounds: sourceCollisionBox, occupied: @[]))
+                    interiorCollisionSpace = collisionSpaces.len - 1
+                  collisionSpace = interiorCollisionSpace
+
+                var canPlace = isBoxInside(collisionSpaces[collisionSpace].bounds, targetCollisionBox)
+                if canPlace:
+                  for oi in 0 ..< collisionSpaces[collisionSpace].occupied.len:
+                    if boxesIntersect(collisionSpaces[collisionSpace].occupied[oi], targetCollisionBox):
+                      canPlace = false
+                      break
+
+                if canPlace:
+                  collisionSpaces[collisionSpace].occupied.add(targetCollisionBox)
+                  var childJigsawBlocks = getElementJigsawBlocks(targetElement)
+                  for ci in 0 ..< childJigsawBlocks.len:
+                    let rotatedPos = rotatePos(vec3[int32](childJigsawBlocks[ci].pos.x, childJigsawBlocks[ci].pos.y, childJigsawBlocks[ci].pos.z), targetRotation)
+                    childJigsawBlocks[ci].pos = blockPos(rotatedPos.x + targetPos.x, rotatedPos.y + targetPos.y, rotatedPos.z + targetPos.z)
+                    childJigsawBlocks[ci].facing = rotateDirection(childJigsawBlocks[ci].facing, targetRotation)
+                    childJigsawBlocks[ci].up = rotateDirection(childJigsawBlocks[ci].up, targetRotation)
+
+                  let sourceGroundLevelDelta = pieces[sourcePieceIdx].groundLevelDelta
+                  let targetGroundLevelDelta = if targetRigid: sourceGroundLevelDelta - deltaY else: 1'i32
+
+                  let targetPiece = newPoolElementStructurePiece(targetBox, uint32(depth) + 1'u32, targetElement, targetPos,
+                    targetRotation, childJigsawBlocks, targetGroundLevelDelta, liquidSettings, targetProjection)
+
+                  let targetPieceIdx = pieces.len
+                  pieces.add(targetPiece)
+                  pieceCollisionBoxes.add(targetCollisionBox)
+                  pieceProjections.add(targetProjection)
+
+                  var junctionY = 0'i32
+                  if sourceRigid:
+                    junctionY = sourceBox.min.y + sourceJigsawLocalY
+                  elif targetRigid:
+                    junctionY = targetBoxY + targetJigsawLocalY
+                  else:
+                    if sourceJigsawBaseHeight == int32.low:
+                      sourceJigsawBaseHeight = sampleHeight(context, sourceJigsawPos)
+                    junctionY = sourceJigsawBaseHeight + deltaY div 2
+
+                  addJunction(pieces[sourcePieceIdx], JigsawJunction(sourceX: targetJigsawPos.x,
+                    sourceGroundY: junctionY - sourceJigsawLocalY + sourceGroundLevelDelta, sourceZ: targetJigsawPos.z,
+                    deltaY: deltaY, projection: targetProjection))
+                  addJunction(pieces[targetPieceIdx], JigsawJunction(sourceX: sourceJigsawPos.x,
+                    sourceGroundY: junctionY - targetJigsawLocalY + targetGroundLevelDelta, sourceZ: sourceJigsawPos.z,
+                    deltaY: -deltaY, projection: sourceProjection))
+
+                  inc sequence
+                  if depth < maxDepth:
+                    placing.add(PieceState(pieceIdx: targetPieceIdx, depth: depth + 1,
+                      priority: sourceJigsaw.placementPriority, sequence: sequence, collisionSpace: collisionSpace))
+
+                  break jigsawLoop
+      pieces[sourcePieceIdx].jigsawBlocks = sourceJigsaws
+
+  for i in 0 ..< pieces.len:
+    addPiece(collector, pieces[i])
+
+  StructurePosition(startPos: blockPos(centerX, centerY, centerZ), collector: collector)
+
+proc newJigsawGenerator*(startPool: string, size: int32): JigsawGenerator =
+  JigsawGenerator(startPool: startPool, size: size, hasStartJigsawName: false, startJigsawName: "", useExpansionHack: false)
+
+proc withStartJigsaw*(g: JigsawGenerator, name: string): JigsawGenerator =
+  result = g
+  result.hasStartJigsawName = true
+  result.startJigsawName = name
+
+proc withExpansionHack*(g: JigsawGenerator, useHack: bool): JigsawGenerator =
+  result = g
+  result.useExpansionHack = useHack
+
+proc getStructurePosition*(g: JigsawGenerator, context: var StructureGeneratorContext): StructurePosition =
+  ## `<JigsawGenerator as StructureGenerator>::get_structure_position`
+  var startY = context.seaLevel
+  var projectStartToHeightmap = false
+  var maxDistance = 80'i32
+  var liquidSettings = LiquidSettings.ApplyWaterlog
+  var dimensionPadding = DimensionPadding(top: 0, bottom: 0)
+  if context.hasStructureKey:
+    let s = structures.get(context.structureKey)
+    if s.hasStartHeight:
+      startY = int32(s.startHeight)
+    else:
+      startY = int32(cast[int16](uint16(cast[uint32](context.seaLevel) and 0xFFFF'u32)))
+    projectStartToHeightmap = s.hasProjectStartToHeightmap
+    if s.hasMaxDistanceFromCenter:
+      maxDistance = s.maxDistanceFromCenter
+    if s.hasLiquidSettings and s.liquidSettings == "ignore_waterlogging":
+      liquidSettings = LiquidSettings.IgnoreWaterlogDone
+    if s.hasDimensionPadding:
+      dimensionPadding = DimensionPadding(top: s.dimensionPadding, bottom: s.dimensionPadding)
+  let startPos = blockPos(startBlockX(context.chunkX), startY, startBlockZ(context.chunkZ))
+  addPieces(context, g.startPool, g.hasStartJigsawName, g.startJigsawName, g.size, startPos, g.useExpansionHack,
+    projectStartToHeightmap, newMaxDistance(maxDistance), dimensionPadding, liquidSettings)
