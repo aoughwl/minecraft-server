@@ -1,0 +1,312 @@
+## Port of pumpkin-inventory/src/enchanting/enchanting_screen_handler.rs
+## Port of pumpkin-inventory/src/enchanting/mod.rs
+##
+## `rand::random()` for the next seed is a module-level `Xoroshiro` seeded from the clock: upstream's thread-local
+## generator needs no particular sequence. `can_enchant` and `are_compatible` take the tag lookup as a parameter in
+## generated/enchantment.aowl; `itemTagContains` and `enchantmentTagContains` are it.
+
+import std/[math, options, times]
+import "../data/item_stack/mod" as ds
+import ../generated/enchantment as enchants
+import ../generated/screen
+import ../generated/statistic
+import ../generated/tag as tagdata
+import ../util/legacy_rand
+import ../util/xoroshiro128
+import inventory, screenhandler, slot, window_property
+
+type
+  EnchantingTableScreenHandler* = ref object of ScreenHandler
+    inventory*: Inventory
+    levelRequirements*: array[3, int32]
+    enchantmentId*: array[3, int32]
+    enchantmentLevel*: array[3, int32]
+    enchantmentSeed*: int32
+    bookshelfCount*: int32
+
+  ChosenEnchantment* = object
+    ## Upstream's `(&'static Enchantment, i32)`.
+    enchantment*: Enchantment
+    level*: int32
+
+var gSeedRandom = xoroshiro128.fromSeed(uint64(toUnix(getTime())))
+
+proc isLapis*(stack: ds.ItemStack): bool =
+  stack.item.id == ds.ITEM_LAPIS_LAZULI.id
+
+proc lapisCanInsert(self: Slot; stack: ds.ItemStack): bool = isLapis(stack)
+
+proc newLapisSlot(inventory: Inventory): Slot =
+  result = newNormalSlot(inventory, 1)
+  result.canInsertImpl = lapisCanInsert
+
+proc itemTagContains(tag: string; id: uint16): bool =
+  ## `supported_items.1.contains(&item.id)`.
+  let (found, tagged) = tagdata.isTaggedWith(Taggable(tagKey: rkItem, registryKey: "", registryId: id), tag)
+  found and tagged
+
+proc enchantmentTagContains(tag: string; id: uint16): bool =
+  ## `exclusive_set.1.contains(&other.id)`.
+  let (found, tagged) = tagdata.isTaggedWith(Taggable(tagKey: rkEnchantment, registryKey: "", registryId: id), tag)
+  found and tagged
+
+proc createEnchantmentRandom(self: EnchantingTableScreenHandler; slot: int): LegacyRand =
+  # `self.enchantment_seed.wrapping_add(slot as i32) as u64`: the cast sign-extends.
+  let seed = cast[int32](cast[uint32](self.enchantmentSeed) + uint32(slot))
+  legacy_rand.fromSeed(cast[uint64](int64(seed)))
+
+proc calculateLevelRequirement(self: EnchantingTableScreenHandler; random: var LegacyRand; slot: int;
+    enchantability: int32): int32 =
+  let b = self.bookshelfCount
+  let first = random.nextBoundedI32(8'i32)
+  let second = random.nextBoundedI32(b + 1'i32)
+  let level = first + 1'i32 + (b shr 1) + second
+
+  case slot
+  of 0: max(level div 3'i32, 1'i32)
+  of 1: max(level * 2'i32 div 3'i32 + 7'i32, 1'i32)
+  of 2: max(max(level, b * 2'i32), 1'i32)
+  else: 0'i32
+
+proc getEnchantmentList*(random: var LegacyRand; item: ds.ItemStack; slot: int; level: int32): seq[ChosenEnchantment] =
+  let (hasEnchantable, enchantable) = item.getDataComponent(ds.EnchantableImpl)
+  let enchantability = (if hasEnchantable: enchantable.value else: 0'i32)
+  let firstRoll = random.nextBoundedI32(enchantability div 4'i32 + 1'i32)
+  let secondRoll = random.nextBoundedI32(enchantability div 4'i32 + 1'i32)
+  var enchantLevel = level + 1'i32 + firstRoll + secondRoll
+  let f1 = random.nextF32()
+  let f2 = random.nextF32()
+  let bonus = (f1 + f2 - 1.0'f32) * 0.15'f32
+  enchantLevel = int32(round(float32(enchantLevel) * (1.0'f32 + bonus)))
+  enchantLevel = max(enchantLevel, 1'i32)
+
+  var available: seq[ChosenEnchantment] = @[]
+  for enchant in enchants.gEnchantments:
+    if tagdata.hasTag(uint16(enchant.id), Enchantment_MINECRAFT_IN_ENCHANTING_TABLE) and
+        enchant.canEnchant(item.item.id, itemTagContains):
+      var l = enchant.maxLevel
+      while l >= 1'i32:
+        if enchantLevel >= enchant.minCost.calculate(l) and enchantLevel <= enchant.maxCost.calculate(l):
+          available.add(ChosenEnchantment(enchantment: enchant, level: l))
+          break
+        l -= 1'i32
+
+  if available.len == 0:
+    return @[]
+
+  var totalWeight = 0'i32
+  for a in available:
+    totalWeight += a.enchantment.weight
+  if totalWeight <= 0'i32:
+    return @[]
+
+  var weight = random.nextBoundedI32(totalWeight)
+  var selected = none[ChosenEnchantment]()
+  for a in available:
+    weight -= a.enchantment.weight
+    if weight < 0'i32:
+      selected = some(a)
+      break
+
+  result = @[]
+  if selected.isSome:
+    result.add(selected.unsafeGet)
+
+    # Add more?
+    var currentLevel = enchantLevel
+    while random.nextBoundedI32(50'i32) <= (currentLevel + 1'i32) div 2'i32:
+      var kept: seq[ChosenEnchantment] = @[]
+      for a in available:
+        var compatible = true
+        for s in result:
+          if not a.enchantment.areCompatible(s.enchantment, enchantmentTagContains):
+            compatible = false
+            break
+        if compatible:
+          kept.add(a)
+      available = kept
+
+      if available.len == 0:
+        break
+
+      var total = 0'i32
+      for a in available:
+        total += a.enchantment.weight
+      var w = random.nextBoundedI32(total)
+      for a in available:
+        w -= a.enchantment.weight
+        if w < 0'i32:
+          result.add(a)
+          break
+      currentLevel = currentLevel div 2'i32
+
+proc sendPropertyUpdates(self: EnchantingTableScreenHandler) =
+  let syncHandler = self.behaviour.syncHandler
+  if syncHandler != nil:
+    let syncId = self.behaviour.syncId
+    for i in 0 ..< 3:
+      let requirement = intoTuple(newWindowProperty(
+        EnchantmentTable(kind: etkLevelRequirement, levelReqSlot: uint8(i)),
+        cast[int16](uint16(cast[uint32](self.levelRequirements[i]) and 0xFFFF'u32))))
+      syncHandler.updateProperty(syncId, int32(requirement[0]), int32(requirement[1]))
+
+      let id = intoTuple(newWindowProperty(EnchantmentTable(kind: etkEnchantmentId, enchantIdSlot: uint8(i)),
+        cast[int16](uint16(cast[uint32](self.enchantmentId[i]) and 0xFFFF'u32))))
+      syncHandler.updateProperty(syncId, int32(id[0]), int32(id[1]))
+
+      let level = intoTuple(newWindowProperty(EnchantmentTable(kind: etkEnchantmentLevel, enchantLevelSlot: uint8(i)),
+        cast[int16](uint16(cast[uint32](self.enchantmentLevel[i]) and 0xFFFF'u32))))
+      syncHandler.updateProperty(syncId, int32(level[0]), int32(level[1]))
+
+    let seed = intoTuple(newWindowProperty(EnchantmentTable(kind: etkEnchantmentSeed),
+      cast[int16](uint16(cast[uint32](self.enchantmentSeed) and 0xFFFF'u32))))
+    syncHandler.updateProperty(syncId, int32(seed[0]), int32(seed[1]))
+
+proc updateEnchantments*(self: EnchantingTableScreenHandler; player: InventoryPlayer) =
+  let item = self.inventory.getStack(0)
+
+  if item.isEmpty() or item.hasEnchantments():
+    for i in 0 ..< 3:
+      self.levelRequirements[i] = 0'i32
+      self.enchantmentId[i] = -1'i32
+      self.enchantmentLevel[i] = -1'i32
+  else:
+    let (hasEnchantable, enchantable) = item.getDataComponent(ds.EnchantableImpl)
+    let enchantability = (if hasEnchantable: enchantable.value else: 0'i32)
+
+    if enchantability <= 0'i32:
+      for i in 0 ..< 3:
+        self.levelRequirements[i] = 0'i32
+        self.enchantmentId[i] = -1'i32
+        self.enchantmentLevel[i] = -1'i32
+    else:
+      var random = legacy_rand.fromSeed(cast[uint64](int64(self.enchantmentSeed)))
+
+      for i in 0 ..< 3:
+        self.levelRequirements[i] = self.calculateLevelRequirement(random, i, enchantability)
+
+      for i in 0 ..< 3:
+        if self.levelRequirements[i] > 0'i32:
+          var r = self.createEnchantmentRandom(i)
+          let enchantments = getEnchantmentList(r, item, i, self.levelRequirements[i])
+          if enchantments.len == 0:
+            self.enchantmentId[i] = -1'i32
+            self.enchantmentLevel[i] = -1'i32
+          else:
+            let clue = enchantments[int(r.nextBoundedI32(int32(enchantments.len)))]
+            self.enchantmentId[i] = int32(clue.enchantment.id)
+            self.enchantmentLevel[i] = clue.level
+        else:
+          self.enchantmentId[i] = -1'i32
+          self.enchantmentLevel[i] = -1'i32
+  self.sendPropertyUpdates()
+
+proc enchantingOnClosed(self: ScreenHandler; player: InventoryPlayer) =
+  let e = EnchantingTableScreenHandler(self)
+  self.defaultOnClosed(player)
+  e.inventory.onClose()
+  # Return items to player
+  for i in 0 ..< 2:
+    let stack = e.inventory.removeStack(i)
+    if not stack.isEmpty():
+      offerOrDropStack(player, stack)
+
+proc enchantingOnButtonClick(self: ScreenHandler; player: InventoryPlayer; id: int32): bool =
+  let e = EnchantingTableScreenHandler(self)
+  if id < 0'i32 or id >= 3'i32:
+    return false
+
+  let levelReq = e.levelRequirements[int(id)]
+  if player.experienceLevel() < levelReq and not player.isCreative():
+    return false
+
+  var lapisStack = e.inventory.getStack(1)
+  let lapisCost = uint8(id + 1'i32)
+
+  if not player.isCreative() and (lapisStack.isEmpty() or not isLapis(lapisStack) or lapisStack.itemCount < lapisCost):
+    return false
+
+  # Perform enchantment
+  var itemStack = e.inventory.getStack(0)
+
+  if itemStack.isEmpty() or itemStack.hasEnchantments():
+    return false
+
+  var random = e.createEnchantmentRandom(int(id))
+  let enchantments = getEnchantmentList(random, itemStack, int(id), levelReq)
+
+  if enchantments.len == 0:
+    return false
+
+  if not player.isCreative():
+    player.addExperienceLevels(-(id + 1'i32))
+    lapisStack.decrement(lapisCost)
+    e.inventory.storeStack(1, lapisStack)
+
+  for chosen in enchantments:
+    itemStack.addEnchantment(ds.gEnchantments[int(chosen.enchantment.id)], uint16(chosen.level))
+  e.inventory.storeStack(0, itemStack)
+
+  # Update seed
+  player.setEnchantmentSeed(cast[int32](cast[uint32](gSeedRandom.nextI32())))
+  e.enchantmentSeed = player.enchantmentSeed()
+
+  e.updateEnchantments(player)
+  self.sendContentUpdates()
+
+  player.incrementStat(scCustom, int32(ord(csEnchantItem)), 1'i32)
+
+  true
+
+proc enchantingQuickMove(self: ScreenHandler; player: InventoryPlayer; slotIndex: int32): ItemStack =
+  let e = EnchantingTableScreenHandler(self)
+  var stackLeft = ds.emptyItemStack()
+  let s = self.behaviour.slots[int(slotIndex)]
+
+  if s.hasStack():
+    var slotStackMut = s.getStack()
+    stackLeft = slotStackMut
+
+    if slotIndex < 2'i32:
+      # From enchanting to player
+      if not self.insertItem(slotStackMut, 2'i32, int32(self.behaviour.slots.len), true):
+        return ds.emptyItemStack()
+    else:
+      # From player to enchanting. Lapis check
+      if slotStackMut.item.id == ds.ITEM_LAPIS_LAZULI.id:
+        if not self.insertItem(slotStackMut, 1'i32, 2'i32, false):
+          return ds.emptyItemStack()
+      elif not self.insertItem(slotStackMut, 0'i32, 1'i32, false):
+        return ds.emptyItemStack()
+    s.storeStack(slotStackMut)
+
+    if slotStackMut.isEmpty():
+      s.setStack(ds.emptyItemStack())
+    else:
+      s.markDirty()
+
+    # CRITICAL FIX upstream: Ensure the client is notified when shift-clicking items into the slots
+    e.updateEnchantments(player)
+
+  stackLeft
+
+proc enchantingOnSlotClick(self: ScreenHandler; slotIndex, button: int32; actionType: SlotActionType;
+    player: InventoryPlayer) =
+  self.internalOnSlotClick(slotIndex, button, actionType, player)
+  if slotIndex == 0'i32 or slotIndex == 1'i32:
+    EnchantingTableScreenHandler(self).updateEnchantments(player)
+
+proc newEnchantingTableScreenHandler*(syncId: uint8; playerInventory: PlayerInventory; inventory: Inventory;
+    enchantmentSeed, bookshelfCount: int32): EnchantingTableScreenHandler =
+  result = EnchantingTableScreenHandler(behaviour: newScreenHandlerBehaviour(syncId, some(wtEnchantment)),
+    inventory: inventory, levelRequirements: [0'i32, 0'i32, 0'i32], enchantmentId: [-1'i32, -1'i32, -1'i32],
+    enchantmentLevel: [-1'i32, -1'i32, -1'i32], enchantmentSeed: enchantmentSeed, bookshelfCount: bookshelfCount)
+  result.onClosedImpl = enchantingOnClosed
+  result.onButtonClickImpl = enchantingOnButtonClick
+  result.quickMoveImpl = enchantingQuickMove
+  result.onSlotClickImpl = enchantingOnSlotClick
+
+  # Enchanting slots: 0 is item, 1 is lapis
+  ScreenHandler(result).addSlot(newNormalSlot(inventory, 0))
+  ScreenHandler(result).addSlot(newLapisSlot(inventory))
+  ScreenHandler(result).addPlayerSlots(playerInventory)

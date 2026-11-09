@@ -1,0 +1,377 @@
+## Port of pumpkin-inventory/src/crafting/crafting_screen_handler.rs
+##
+## Upstream's `GenericRecipe` enum dispatches one `recipe_matches`. Here each arm is its own proc, called with the
+## recipe's fields, so the table is not copied for every recipe tried on every grid change.
+##
+## `ResultSlot` is both a `Slot` and a `ScreenHandlerListener` upstream; here the listener is a small object holding
+## the slot. Upstream's `RecipeResult` is `MatchedRecipe`, since generated/recipes.aowl has that name.
+## As upstream, a mirrored shaped recipe indexes rows by `get_height()`, and a dynamic shaped recipe is not mirrored.
+
+import std/options
+import "../data/item_stack/mod"
+import ../generated/recipes as generated
+import ../generated/screen
+import ../generated/statistic
+import ../generated/tag
+import ../protocol/recipe
+import crafting, inventory, recipe_provider, recipes, screenhandler, slot
+
+type
+  MatchedRecipe* = object
+    itemId*: string
+    count*: uint8
+
+  ResultSlot* = ref object of Slot
+    result*: ItemStack  ## The cached result.
+    recipeProvider*: nil RecipeProvider  ## For dynamic recipes.
+
+  ResultSlotListener = ref object of ScreenHandlerListener
+    slot: ResultSlot
+
+  CraftingTableScreenHandler* = ref object of ScreenHandler
+    craftingInventory*: RecipeInputInventory
+
+proc isSymmetricalHorizontally(pattern: seq[string]): bool =
+  let width = (if pattern.len > 0: pattern[0].len else: 0)
+  for row in pattern:
+    if row.len != width:
+      return false
+    for j in 0 ..< width div 2:
+      if row[j] != row[width - j - 1]:
+        return false
+  true
+
+proc patternCellCount(pattern: seq[string]): int =
+  result = 0
+  for row in pattern:
+    for c in row:
+      if c != ' ':
+        inc result
+
+proc shapedMatchesAt(pattern: seq[string]; keyChars: seq[char]; keyIngredients: seq[generated.RecipeIngredient];
+    xOffset, yOffset, rowStride, inputWidth: int; mirrored: bool; inventory: RecipeInputInventory): bool =
+  ## One pass over the pattern. Upstream's `.expect("Crafting recipe used invalid key")` is no match here: a plugin
+  ## can register a dynamic recipe.
+  for y in 0 ..< pattern.len:
+    let rowStr = pattern[y]
+    for x in 0 ..< rowStr.len:
+      let currentKey = rowStr[x]
+      let column = (if mirrored: xOffset + inputWidth - 1 - x else: x + xOffset)
+      let stack = Inventory(inventory).getStack((y + yOffset) * rowStride + column)
+      if currentKey == ' ':
+        if not stack.isEmpty():
+          return false
+        continue
+      var found = false
+      for k in 0 ..< keyChars.len:
+        if keyChars[k] == currentKey:
+          found = true
+          if not keyIngredients[k].matchItem(stack.item):
+            return false
+          break
+      if not found:
+        return false
+  true
+
+proc shapedMatches(r: ShapedRecipe; inputHeight, inputWidth, topX, topY, count: int;
+    inventory: RecipeInputInventory): Option[MatchedRecipe] =
+  if r.pattern.len != inputHeight or r.pattern[0].len != inputWidth:
+    return none[MatchedRecipe]()
+  if count != patternCellCount(r.pattern):
+    return none[MatchedRecipe]()
+
+  var matched = shapedMatchesAt(r.pattern, r.keyChars, r.keyIngredients, topX, topY, inventory.getWidth(),
+    inputWidth, false, inventory)
+  if not matched and not isSymmetricalHorizontally(r.pattern):
+    matched = shapedMatchesAt(r.pattern, r.keyChars, r.keyIngredients, topX, topY, inventory.getHeight(),
+      inputWidth, true, inventory)
+  if matched:
+    some(MatchedRecipe(itemId: r.result.id, count: r.result.count))
+  else:
+    none[MatchedRecipe]()
+
+proc shapelessMatches(r: ShapelessRecipe; count: int; inventory: RecipeInputInventory): Option[MatchedRecipe] =
+  if count != r.ingredients.len:
+    return none[MatchedRecipe]()
+  var ingredientUsed = newSeq[bool](r.ingredients.len)
+  for i in 0 ..< Inventory(inventory).size():
+    let stack = Inventory(inventory).getStack(i)
+    if stack.isEmpty():
+      continue
+    var placed = false
+    for j in 0 ..< r.ingredients.len:
+      if not ingredientUsed[j] and r.ingredients[j].matchItem(stack.item):
+        ingredientUsed[j] = true
+        placed = true
+        break
+    if not placed:
+      return none[MatchedRecipe]()
+  some(MatchedRecipe(itemId: r.result.id, count: r.result.count))
+
+proc transmuteMatches(r: TransmuteRecipe; count: int; inventory: RecipeInputInventory): Option[MatchedRecipe] =
+  if count != 2:
+    return none[MatchedRecipe]()
+  for i in 0 ..< Inventory(inventory).size():
+    let stack = Inventory(inventory).getStack(i)
+    if stack.isEmpty():
+      continue
+    if not r.material.matchItem(stack.item) and not r.input.matchItem(stack.item):
+      return none[MatchedRecipe]()
+  some(MatchedRecipe(itemId: r.result.id, count: r.result.count))
+
+proc decoratedPotMatches(count: int; inventory: RecipeInputInventory): Option[MatchedRecipe] =
+  if count != 4 or inventory.getWidth() != 3 or inventory.getHeight() != 3:
+    return none[MatchedRecipe]()
+  var position = 1
+  while position <= 7:
+    let stack = Inventory(inventory).getStack(position)
+    if stack.isEmpty() or not hasTag(toTaggable(stack.item), Item_MINECRAFT_DECORATED_POT_INGREDIENTS):
+      return none[MatchedRecipe]()
+    position += 2
+  some(MatchedRecipe(itemId: "minecraft:decorated_pot", count: 1'u8))
+
+proc dynamicShapedMatches(r: OwnedCraftingRecipe; inputHeight, inputWidth, topX, topY, count: int;
+    inventory: RecipeInputInventory): Option[MatchedRecipe] =
+  if r.pattern.len != inputHeight or r.pattern[0].len != inputWidth:
+    return none[MatchedRecipe]()
+  if count != patternCellCount(r.pattern):
+    return none[MatchedRecipe]()
+  for y in 0 ..< r.pattern.len:
+    for x in 0 ..< r.pattern[y].len:
+      let currentKey = r.pattern[y][x]
+      let stack = Inventory(inventory).getStack((y + topY) * inventory.getWidth() + (x + topX))
+      if currentKey == ' ':
+        if not stack.isEmpty():
+          return none[MatchedRecipe]()
+        continue
+      var found = false
+      for entry in r.key:
+        if entry.symbol == currentKey:
+          found = true
+          if not entry.ingredient.matchItem(stack.item):
+            return none[MatchedRecipe]()
+          break
+      if not found:
+        return none[MatchedRecipe]()
+  some(MatchedRecipe(itemId: r.result.itemId, count: r.result.count))
+
+proc dynamicShapelessMatches(r: OwnedCraftingRecipe; count: int; inventory: RecipeInputInventory): Option[MatchedRecipe] =
+  if count != r.ingredients.len:
+    return none[MatchedRecipe]()
+  var ingredientUsed = newSeq[bool](r.ingredients.len)
+  for i in 0 ..< Inventory(inventory).size():
+    let stack = Inventory(inventory).getStack(i)
+    if stack.isEmpty():
+      continue
+    var placed = false
+    for j in 0 ..< r.ingredients.len:
+      if not ingredientUsed[j] and r.ingredients[j].matchItem(stack.item):
+        ingredientUsed[j] = true
+        placed = true
+        break
+    if not placed:
+      return none[MatchedRecipe]()
+  some(MatchedRecipe(itemId: r.result.itemId, count: r.result.count))
+
+proc matchRecipe(self: ResultSlot): Option[MatchedRecipe] =
+  let base = self.inventory
+  let inventory = RecipeInputInventory(base)
+  var count = 0
+  let inventoryWidth = inventory.getWidth()
+  var topX = 9
+  var topY = 9
+  var bottomX = 0
+  var bottomY = 0
+  for i in 0 ..< Inventory(inventory).size():
+    let x = i mod inventoryWidth
+    let y = i div inventoryWidth
+    if not Inventory(inventory).getStack(i).isEmpty():
+      topX = min(topX, x)
+      topY = min(topY, y)
+      bottomX = max(bottomX, x)
+      bottomY = max(bottomY, y)
+      inc count
+  if count == 0:
+    return none[MatchedRecipe]()
+  let inputWidth = bottomX + 1 - topX
+  let inputHeight = bottomY + 1 - topY
+
+  for i in 0 ..< RECIPES_CRAFTING.len:
+    var matched = none[MatchedRecipe]()
+    case RECIPES_CRAFTING[i].kind
+    of crkCraftingShaped:
+      matched = shapedMatches(RECIPES_CRAFTING[i].shaped, inputHeight, inputWidth, topX, topY, count, inventory)
+    of crkCraftingShapeless:
+      matched = shapelessMatches(RECIPES_CRAFTING[i].shapeless, count, inventory)
+    of crkCraftingTransmute:
+      matched = transmuteMatches(RECIPES_CRAFTING[i].transmute, count, inventory)
+    of crkCraftingDecoratedPot:
+      matched = decoratedPotMatches(count, inventory)
+    if matched.isSome:
+      return matched
+
+  let provider = self.recipeProvider
+  if provider != nil:
+    let dynamic = provider.getDynamicRecipes()
+    for i in 0 ..< dynamic.len:
+      if dynamic[i].kind == drCrafting:
+        var matched = none[MatchedRecipe]()
+        case dynamic[i].crafting.kind
+        of ocrShaped:
+          matched = dynamicShapedMatches(dynamic[i].crafting, inputHeight, inputWidth, topX, topY, count, inventory)
+        of ocrShapeless:
+          matched = dynamicShapelessMatches(dynamic[i].crafting, count, inventory)
+        if matched.isSome:
+          return matched
+  none[MatchedRecipe]()
+
+proc refillOutput(self: ResultSlot): ItemStack =
+  let matched = self.matchRecipe()
+  if matched.isSome:
+    # `from_registry_key` takes the key with or without `minecraft:`.
+    let found = fromRegistryKey(Item, matched.unsafeGet.itemId)
+    if found != nil:
+      result = newItemStack(matched.unsafeGet.count, found)
+    else:
+      result = newItemStack(matched.unsafeGet.count, ITEM_AIR)
+  else:
+    result = emptyItemStack()
+  self.result = result
+
+proc resultOnQuickMoveCrafted(self: Slot; stack, stackPrev: ItemStack) =
+  let r = ResultSlot(self)
+  discard r.refillOutput()
+
+proc resultOnTakeItem(self: Slot; player: InventoryPlayer; stack: ItemStack) =
+  player.incrementStat(scCrafted, int32(stack.item.id), int32(stack.itemCount))
+  let inv = self.inventory
+  for i in 0 ..< inv.size():
+    var inner = inv.getStack(i)
+    if not inner.isEmpty():
+      inner.itemCount -= 1'u8
+      inv.storeStack(i, inner)
+  self.markDirty()
+
+proc resultCanInsert(self: Slot; stack: ItemStack): bool = false
+
+proc resultGetStack(self: Slot): ItemStack =
+  let r = ResultSlot(self)
+  r.result
+
+proc resultStoreStack(self: Slot; stack: ItemStack) =
+  let r = ResultSlot(self)
+  r.result = stack
+
+proc resultSetStack(self: Slot; stack: ItemStack) =
+  let r = ResultSlot(self)
+  discard r.refillOutput()
+
+proc resultSetStackPrev(self: Slot; stack, previousStack: ItemStack) =
+  let r = ResultSlot(self)
+  discard r.refillOutput()
+
+proc resultGetMaxItemCount(self: Slot): uint8 =
+  result = 255'u8
+  let inv = self.inventory
+  for i in 0 ..< inv.size():
+    let inner = inv.getStack(i)
+    if not inner.isEmpty():
+      result = min(result, inner.itemCount)
+
+proc resultTakeStack(self: Slot; amount: uint8): ItemStack =
+  if self.hasStack():
+    let r = ResultSlot(self)
+    r.result
+  else:
+    emptyItemStack()
+
+proc newResultSlot*(inventory: RecipeInputInventory; provider: nil RecipeProvider): ResultSlot =
+  result = ResultSlot(inventory: inventory, index: 999, id: 0'u8, result: emptyItemStack(), recipeProvider: provider)
+  result.onQuickMoveCraftedImpl = resultOnQuickMoveCrafted
+  result.onTakeItemImpl = resultOnTakeItem
+  result.canInsertImpl = resultCanInsert
+  result.getStackImpl = resultGetStack
+  result.storeStackImpl = resultStoreStack
+  result.setStackImpl = resultSetStack
+  result.setStackPrevImpl = resultSetStackPrev
+  result.getMaxItemCountImpl = resultGetMaxItemCount
+  result.takeStackImpl = resultTakeStack
+
+proc resultListenerOnSlotUpdate(self: ScreenHandlerListener; screenHandler: ScreenHandlerBehaviour; slot: uint8;
+    stack: ItemStack) =
+  let listener = ResultSlotListener(self)
+  let resultSlot = listener.slot
+  let base = resultSlot.inventory
+  let inventory = RecipeInputInventory(base)
+  if int(slot) <= inventory.getWidth() * inventory.getHeight():
+    let output = resultSlot.refillOutput()
+    let nextRev = screenHandler.nextRevision()
+    let syncHandler = screenHandler.syncHandler
+    if syncHandler != nil:
+      syncHandler.updateSlot(screenHandler.syncId, 0, output, nextRev)
+
+proc addRecipeSlots*(h: ScreenHandler; craftingInventory: RecipeInputInventory; provider: nil RecipeProvider) =
+  ## The `CraftingScreenHandler` trait's one method.
+  let resultSlot = newResultSlot(craftingInventory, provider)
+  h.addSlot(resultSlot)
+  let width = craftingInventory.getWidth()
+  let height = craftingInventory.getHeight()
+  for i in 0 ..< width:
+    for j in 0 ..< height:
+      h.addSlot(newNormalSlot(craftingInventory, j + i * width))
+  h.addListener(ResultSlotListener(slot: resultSlot, onSlotUpdateImpl: resultListenerOnSlotUpdate))
+
+proc craftingTableOnClosed(self: ScreenHandler; player: InventoryPlayer) =
+  self.defaultOnClosed(player)
+  let c = CraftingTableScreenHandler(self)
+  self.dropInventory(player, c.craftingInventory)
+
+proc craftingTableQuickMove(self: ScreenHandler; player: InventoryPlayer; slotIndex: int32): ItemStack =
+  let s = self.behaviour.slots[int(slotIndex)]
+  if s.hasStack():
+    var slotStack = s.getStack()
+    let stackPrev = slotStack
+    if slotIndex == 0'i32:
+      if not self.insertItem(slotStack, 10'i32, 46'i32, true):
+        return emptyItemStack()
+    elif slotIndex >= 1'i32 and slotIndex <= 9'i32:
+      if not self.insertItem(slotStack, 10'i32, 46'i32, false):
+        return emptyItemStack()
+    elif slotIndex >= 10'i32 and slotIndex < 46'i32:
+      if not self.insertItem(slotStack, 1'i32, 10'i32, false):
+        if slotIndex < 37'i32:
+          if not self.insertItem(slotStack, 37'i32, 46'i32, false):
+            return emptyItemStack()
+        elif not self.insertItem(slotStack, 10'i32, 37'i32, false):
+          return emptyItemStack()
+    elif not self.insertItem(slotStack, 10'i32, 46'i32, false):
+      return emptyItemStack()
+    s.storeStack(slotStack)
+    let stack = slotStack
+    if stack.isEmpty():
+      s.setStackPrev(emptyItemStack(), stackPrev)
+    else:
+      s.markDirty()
+    if stack.itemCount == stackPrev.itemCount:
+      return emptyItemStack()
+
+    var takenStack = stackPrev
+    takenStack.setCount(stackPrev.itemCount - stack.itemCount)
+    s.onTakeItem(player, takenStack)
+
+    if slotIndex == 0'i32:
+      s.onQuickMoveCrafted(stack, stackPrev)
+      if not stack.isEmpty():
+        player.dropItem(stack, false)
+    return stackPrev
+  emptyItemStack()
+
+proc newCraftingTableScreenHandler*(syncId: uint8; playerInventory: PlayerInventory;
+    provider: nil RecipeProvider): CraftingTableScreenHandler =
+  let craftingInventory = newCraftingInventory(3'u8, 3'u8)
+  result = CraftingTableScreenHandler(behaviour: newScreenHandlerBehaviour(syncId, some(wtCrafting)),
+    craftingInventory: craftingInventory)
+  result.onClosedImpl = craftingTableOnClosed
+  result.quickMoveImpl = craftingTableQuickMove
+  ScreenHandler(result).addRecipeSlots(craftingInventory, provider)
+  ScreenHandler(result).addPlayerSlots(playerInventory)

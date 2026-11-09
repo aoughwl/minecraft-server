@@ -1,37 +1,44 @@
-## Core screen-handler system for container UIs: `ScreenProperty`,
-## `ScreenHandlerBehaviour`, the `ScreenHandler` dispatch interface, and
-## the shared `insertItem` slot-merge algorithm.
-## Port of upstream/pumpkin-inventory/src/screen_handler.rs.
+## Port of pumpkin-inventory/src/screen_handler.rs
 ##
-## SCOPE (same call as `src/server/block/blockbehaviour.aowl`'s): upstream's
-## `ScreenHandler` trait is ~30 methods, most needing `Player`/`World`/the
-## real item-component model (`internal_on_slot_click` alone is 434 lines
-## of click-type dispatch over those). This ports the structural core -
-## properties, slot list/behaviour, `insertItem` (pure slot-merge math,
-## fully self-contained) - and the two methods (`quickMove`, `onClosed`)
-## needed to make a concrete handler like `beaconhandler.aowl` real, not
-## the full click-routing surface. Extending the vtable as more handlers
-## land is mechanical from here, the same note `blockbehaviour.aowl` makes.
+## The `ScreenHandler` trait is a `ref object` whose fields take the handler as `self`, so a concrete handler in
+## any module subclasses it and fills them with plain procs. A field left nil is upstream's default body. A method
+## no handler overrides upstream is a free proc. `InventoryPlayer` is in player_inventory.aowl and exported here.
+##
+## Upstream holds locks across most of `internal_on_slot_click`. Everything here runs on the tick, so the cursor is
+## a plain field of the behaviour, and a stack read from a slot is a copy written back with `storeStack` where
+## upstream changed it through the lock. Where an upstream panic would be reachable from a client packet this
+## returns instead, and says so. Each such place is a deviation; so are the marked guards in the `Throw` branch.
+##
+## Upstream's second `ClickType` enum, here at the end of the file, is `ScreenClickType`; nothing upstream uses it.
+## `MouseClick` is in container_click.aowl, as upstream.
 
-import std/tables
-import itemstub, slot, inventory, window_property
+import std/options
+import "../data/item_stack/mod"
 import ../generated/screen
+import ../generated/statistic
+import ../protocol/itemstackserializer
+import ../protocol/java/server/play/click_container
+import ../util/text/text
+import container_click, inventory, player_inventory, slot, sync_handler, window_property
+
+export player_inventory, click_container, sync_handler, container_click
+
+const SlotIndexOutside = -999'i32
 
 type
   ScreenProperty* = object
-    ## A tracked property for container UI elements (furnace progress
-    ## bars, enchantment levels, etc.), synced server->client.
+    ## A tracked property for container UI elements, synced server to client.
     oldValue: int32
     index: uint8
     value: PropertyDelegate
 
-proc newScreenProperty*(value: PropertyDelegate, index: uint8): ScreenProperty =
+proc newScreenProperty*(value: PropertyDelegate; index: uint8): ScreenProperty =
   ScreenProperty(oldValue: getProperty(value, int32(index)), index: index, value: value)
 
 proc get*(p: ScreenProperty): int32 {.inline.} =
   getProperty(p.value, int32(p.index))
 
-proc `set=`*(p: var ScreenProperty, value: int32) {.inline.} =
+proc set*(p: ScreenProperty; value: int32) {.inline.} =
   setProperty(p.value, int32(p.index), value)
 
 proc hasChanged*(p: var ScreenProperty): bool =
@@ -40,136 +47,664 @@ proc hasChanged*(p: var ScreenProperty): bool =
   p.oldValue = value
 
 type
-  ScreenHandlerBehaviour* = object
-    ## Shared state every concrete screen handler holds: slot list, sync
-    ## id, and the window type shown to the client (`None` for e.g. the
-    ## player's own inventory screen, which has no server-sent window).
-    syncId*: uint8
-    windowType*: (bool, WindowType) ## (hasWindow, kind) - aowlmony has no
-      ## `Option[enum]` convention established yet in this file's imports,
-      ## so this follows the tuple-optional style already used elsewhere
-      ## in this port (e.g. `NbtCompound.get`).
-    slots*: seq[Slot]
+  ScreenHandlerListener* = ref object of RootObj
+    onSlotUpdateImpl*: proc(self: ScreenHandlerListener; screenHandler: ScreenHandlerBehaviour; slot: uint8;
+      stack: ItemStack) {.closure.}  ## default: no-op
+    onPropertyUpdateImpl*: proc(self: ScreenHandlerListener; screenHandler: ScreenHandlerBehaviour; property: uint8;
+      value: int32) {.closure.}  ## default: no-op
+
+  ScreenHandlerBehaviour* = ref object
+    slots*: seq[Slot]  ## Both container and player slots.
+    syncId*: uint8     ## The window id in the protocol.
+    listeners*: seq[ScreenHandlerListener]
+    syncHandler*: nil SyncHandler
+    trackedStacks*: seq[ItemStack]
+    cursorStack*: ItemStack  ## The item held by the cursor.
+    previousTrackedStacks*: seq[TrackedStack]
+    previousCursorStack*: TrackedStack
+    revision*: uint32
+    disableSync*: bool
     properties*: seq[ScreenProperty]
+    trackedPropertyValues*: seq[int32]
+    windowType*: Option[WindowType]
+    dragSlots*: seq[uint32]  ## Slots selected during a drag.
+    allowGrabItems*: bool
+    allowPutItems*: bool
+    containerSlots*: int  ## Slots that belong to the container, not the player inventory.
 
-proc newScreenHandlerBehaviour*(syncId: uint8, windowType: (bool, WindowType)): ScreenHandlerBehaviour =
-  ScreenHandlerBehaviour(syncId: syncId, windowType: windowType, slots: @[], properties: @[])
-
-type
-  ScreenHandler* = ref object
-    ## Manual-vtable interface, same pattern as `Inventory`/`Slot`/
-    ## `EntityBase`/`BlockBehaviour`. KNOWN AOWLMONY COMPILER BUG: a closure
-    ## assigned to a ref-object proc-typed field crashes the compiler
-    ## unless the field's type carries `{.closure.}` - every field below
-    ## has it proactively.
+  ScreenHandler* = ref object of RootObj
     behaviour*: ScreenHandlerBehaviour
-    quickMoveImpl*: proc(player: InventoryPlayer, slotIndex: int32): ItemStack {.closure.}
-    onClosedImpl*: proc(player: InventoryPlayer) {.closure.}
-    onButtonClickImpl*: proc(player: InventoryPlayer, id: int32): bool {.closure.}
-      ## Port of `on_button_click`. Optional (many handlers have no
-      ## buttons); `onButtonClick` below defaults to upstream's own
-      ## default trait-method body (`false`) when unset.
+    canUseImpl*: proc(self: ScreenHandler; player: InventoryPlayer): bool {.closure.}  ## default: true
+    onClosedImpl*: proc(self: ScreenHandler; player: InventoryPlayer) {.closure.}  ## default: defaultOnClosed
+    quickMoveImpl*: proc(self: ScreenHandler; player: InventoryPlayer; slotIndex: int32): ItemStack {.closure.}
+    onButtonClickImpl*: proc(self: ScreenHandler; player: InventoryPlayer; buttonId: int32): bool {.closure.}
+      ## default: false
+    handleSlotClickImpl*: proc(self: ScreenHandler; player: InventoryPlayer; clickType: MouseClick; slot: Slot;
+      slotStack, cursorStack: ItemStack): bool {.closure.}  ## default: false
+    onSlotClickImpl*: proc(self: ScreenHandler; slotIndex, button: int32; actionType: SlotActionType;
+      player: InventoryPlayer) {.closure.}  ## default: internalOnSlotClick
+
+  ScreenHandlerFactory* = ref object of RootObj
+    createScreenHandlerImpl*: proc(self: ScreenHandlerFactory; syncId: uint8; playerInventory: PlayerInventory;
+      player: InventoryPlayer): nil ScreenHandler {.closure.}
+    getDisplayNameImpl*: proc(self: ScreenHandlerFactory): TextComponent {.closure.}
+
+  ScreenClickType* = enum
+    ## Upstream's `ClickType` in this file.
+    sctLeft, sctRight, sctShiftLeft, sctShiftRight, sctMiddle, sctDrop, sctControlDrop, sctDoubleClick,
+    sctNumberKey, sctUnknown
+
+proc createScreenHandler*(f: ScreenHandlerFactory; syncId: uint8; playerInventory: PlayerInventory;
+    player: InventoryPlayer): nil ScreenHandler =
+  let fn = f.createScreenHandlerImpl
+  fn(f, syncId, playerInventory, player)
+
+proc getDisplayName*(f: ScreenHandlerFactory): TextComponent =
+  let fn = f.getDisplayNameImpl
+  fn(f)
+
+proc newScreenHandlerBehaviour*(syncId: uint8; windowType: Option[WindowType]): ScreenHandlerBehaviour =
+  ScreenHandlerBehaviour(slots: @[], syncId: syncId, listeners: @[], syncHandler: nil, trackedStacks: @[],
+    cursorStack: emptyItemStack(), previousTrackedStacks: @[], previousCursorStack: emptyTrackedStack(),
+    revision: 0'u32, disableSync: false, properties: @[], trackedPropertyValues: @[], windowType: windowType,
+    dragSlots: @[], allowGrabItems: true, allowPutItems: true, containerSlots: 0)
+
+proc nextRevision*(b: ScreenHandlerBehaviour): uint32 =
+  ## `fetch_add(1)`, then `fetch_and(32767) & 32767`: `fetch_and` answers the value before the mask.
+  b.revision += 1'u32
+  let previous = b.revision
+  b.revision = b.revision and 32767'u32
+  previous and 32767'u32
+
+proc onSlotUpdate*(l: ScreenHandlerListener; screenHandler: ScreenHandlerBehaviour; slot: uint8; stack: ItemStack) =
+  let f = l.onSlotUpdateImpl
+  if f != nil: f(l, screenHandler, slot, stack)
+
+proc onPropertyUpdate*(l: ScreenHandlerListener; screenHandler: ScreenHandlerBehaviour; property: uint8; value: int32) =
+  let f = l.onPropertyUpdateImpl
+  if f != nil: f(l, screenHandler, property, value)
+
+proc offerOrDropStack*(player: InventoryPlayer; stack: ItemStack) =
+  ## Gives a stack to the player, or drops it if the inventory is full.
+  # TODO upstream: Super weird disconnect logic in vanilla, investigate this later
+  player.getInventory().offerOrDropStack(stack, player)
+
+proc windowType*(h: ScreenHandler): Option[WindowType] {.inline.} = h.behaviour.windowType
+
+proc syncId*(h: ScreenHandler): uint8 {.inline.} = h.behaviour.syncId
 
 proc getBehaviour*(h: ScreenHandler): ScreenHandlerBehaviour {.inline.} = h.behaviour
 
-proc addSlot*(h: ScreenHandler, s: Slot) =
-  setId(s, h.behaviour.slots.len)
-  h.behaviour.slots.add(s)
+proc canUse*(h: ScreenHandler; player: InventoryPlayer): bool =
+  let f = h.canUseImpl
+  if f != nil: f(h, player) else: true
 
-proc addProperty*(h: ScreenHandler, p: ScreenProperty) =
-  h.behaviour.properties.add(p)
+proc addSlot*(h: ScreenHandler; s: Slot) =
+  ## Assigns an id and sets up tracking for the slot. Upstream answers the slot it was given; no caller reads it.
+  let behaviour = h.behaviour
+  s.setId(behaviour.slots.len)
+  behaviour.slots.add(s)
+  behaviour.trackedStacks.add(emptyItemStack())
+  behaviour.previousTrackedStacks.add(emptyTrackedStack())
 
-proc addPlayerHotbarSlots*(h: ScreenHandler, playerInv: Inventory) =
-  ## Slots 0..8 of a player inventory are the hotbar.
+proc addPlayerHotbarSlots*(h: ScreenHandler; playerInventory: Inventory) =
+  ## Slots 0-8 of the player inventory.
   for i in 0 ..< 9:
-    addSlot(h, newNormalSlot(playerInv, i))
+    h.addSlot(newNormalSlot(playerInventory, i))
 
-proc addPlayerInventorySlots*(h: ScreenHandler, playerInv: Inventory) =
-  ## Slots 9..35 of a player inventory are the main (non-hotbar) grid.
-  for i in 9 ..< 36:
-    addSlot(h, newNormalSlot(playerInv, i))
+proc addPlayerInventorySlots*(h: ScreenHandler; playerInventory: Inventory) =
+  ## Slots 9-35 of the player inventory.
+  for i in 0 ..< 3:
+    for j in 0 ..< 9:
+      h.addSlot(newNormalSlot(playerInventory, j + (i + 1) * 9))
 
-proc addPlayerSlots*(h: ScreenHandler, playerInv: Inventory) =
-  addPlayerInventorySlots(h, playerInv)
-  addPlayerHotbarSlots(h, playerInv)
+proc addPlayerSlots*(h: ScreenHandler; playerInventory: Inventory) =
+  ## Main, then hotbar.
+  h.addPlayerInventorySlots(playerInventory)
+  h.addPlayerHotbarSlots(playerInventory)
 
-proc defaultOnClosed*(h: ScreenHandler, player: InventoryPlayer) =
-  ## Port of `default_on_closed`: drops the cursor stack, if any, back to
-  ## the player. TODO: upstream drops via `InventoryPlayer::drop_item`;
-  ## that stub's `dropItemImpl` is a no-op here until a real player type
-  ## exists, so this only clears bookkeeping, it doesn't yet actually
-  ## return the item to the player/world.
-  discard h
-  discard player
+proc setReceivedHash*(h: ScreenHandler; slot: int; hash: OptionalItemStackHash) =
+  ## Records a received hash for a slot. Upstream warns on an index out of range; a click packet's slot list
+  ## reaches here unchecked, so it is ignored either way.
+  let behaviour = h.behaviour
+  if slot < behaviour.previousTrackedStacks.len:
+    behaviour.previousTrackedStacks[slot].setReceivedHash(hash)
 
-proc onClosed*(h: ScreenHandler, player: InventoryPlayer) =
-  h.onClosedImpl(player)
+proc setReceivedStack*(h: ScreenHandler; slot: int; stack: ItemStack) =
+  h.behaviour.previousTrackedStacks[slot].setReceivedStack(stack)
 
-proc quickMove*(h: ScreenHandler, player: InventoryPlayer, slotIndex: int32): ItemStack =
-  h.quickMoveImpl(player, slotIndex)
+proc setReceivedCursorHash*(h: ScreenHandler; hash: OptionalItemStackHash) =
+  h.behaviour.previousCursorStack.setReceivedHash(hash)
 
-proc onButtonClick*(h: ScreenHandler, player: InventoryPlayer, id: int32): bool =
-  if h.onButtonClickImpl == nil:
-    false
+proc addProperty*(h: ScreenHandler; property: ScreenProperty) =
+  let behaviour = h.behaviour
+  behaviour.properties.add(property)
+  behaviour.trackedPropertyValues.add(0'i32)
+
+proc addProperties*(h: ScreenHandler; properties: seq[ScreenProperty]) =
+  for i in 0 ..< properties.len:
+    h.addProperty(properties[i])
+
+proc defaultOnClosed*(h: ScreenHandler; player: InventoryPlayer) =
+  ## Drops the cursor item.
+  let behaviour = h.behaviour
+  if not behaviour.cursorStack.isEmpty():
+    offerOrDropStack(player, behaviour.cursorStack)
+    behaviour.cursorStack = emptyItemStack()
+
+proc onClosed*(h: ScreenHandler; player: InventoryPlayer) =
+  let f = h.onClosedImpl
+  if f != nil:
+    f(h, player)
   else:
-    h.onButtonClickImpl(player, id)
+    h.defaultOnClosed(player)
 
-proc offerOrDropStack*(player: InventoryPlayer, stack: ItemStack) =
-  ## Port of `offer_or_drop_stack`. TODO: upstream gives the stack to the
-  ## player's inventory or drops it in the world if full; neither
-  ## `InventoryPlayer` operation exists yet (it's still an opaque stub -
-  ## see slot.aowl), so this is a documented no-op until a real Player type
-  ## backs it, same status as `defaultOnClosed`'s drop-cursor-stack path.
-  discard player
-  discard stack
+proc dropInventory*(h: ScreenHandler; player: InventoryPlayer; inv: Inventory) =
+  ## Drops all items from an inventory, into the player's inventory first.
+  for i in 0 ..< inv.size():
+    offerOrDropStack(player, inv.removeStack(i))
 
-proc insertItem*(h: ScreenHandler, stack: var ItemStack, startIndex, endIndex: int32, fromLast: bool): bool =
-  ## Port of `ScreenHandler::insert_item`: merges `stack` into existing
-  ## same-item stacks in `[startIndex, endIndex)` first, then into the
-  ## first empty/insertable slot in that range. Pure slot-index/count
-  ## arithmetic - no Player/World dependency, so this is a full,
-  ## faithful port rather than a scoped-down proof case.
-  result = false
-  var currentIndex = if fromLast: endIndex - 1 else: startIndex
+proc copySharedSlots*(h: ScreenHandler; other: ScreenHandler) =
+  ## Copies tracked slot state from another screen handler. As upstream, the table keeps one slot per inventory:
+  ## each `table.insert` replaces the inner map, so only the last slot of each inventory is found.
+  let otherBehaviour = other.behaviour
+  var table: seq[(ComparableInventory, int, int)] = @[]
+  for i in 0 ..< otherBehaviour.slots.len:
+    let otherSlot = otherBehaviour.slots[i]
+    let key = ComparableInventory(inv: otherSlot.getInventory())
+    var replaced = false
+    for t in 0 ..< table.len:
+      if table[t][0] == key:
+        table[t] = (key, otherSlot.getIndex(), i)
+        replaced = true
+    if not replaced:
+      table.add((key, otherSlot.getIndex(), i))
 
-  if isStackable(stack):
-    while not isEmpty(stack) and (if fromLast: currentIndex >= startIndex else: currentIndex < endIndex):
-      let slot = h.behaviour.slots[currentIndex]
-      var slotStack = getStack(slot)
+  for i in 0 ..< h.behaviour.slots.len:
+    let s = h.behaviour.slots[i]
+    let key = ComparableInventory(inv: s.getInventory())
+    for t in 0 ..< table.len:
+      if table[t][0] == key and table[t][1] == s.getIndex():
+        h.behaviour.trackedStacks[i] = otherBehaviour.trackedStacks[table[t][2]]
+        h.behaviour.previousTrackedStacks[i] = otherBehaviour.previousTrackedStacks[table[t][2]]
 
-      if not isEmpty(slotStack) and areItemsAndComponentsEqual(slotStack, stack):
+proc syncState*(h: ScreenHandler) =
+  ## Captures the current state and sends a full update.
+  let behaviour = h.behaviour
+  var previousTrackedStacks: seq[ItemStack] = @[]
+
+  for i in 0 ..< behaviour.slots.len:
+    let stack = behaviour.slots[i].getClonedStack()
+    previousTrackedStacks.add(stack)
+    behaviour.previousTrackedStacks[i].setReceivedStack(stack)
+
+  let cursorStack = behaviour.cursorStack
+  behaviour.previousCursorStack.setReceivedStack(cursorStack)
+
+  for i in 0 ..< behaviour.properties.len:
+    let propertyVal = behaviour.properties[i].get()
+    behaviour.trackedPropertyValues[i] = propertyVal
+
+  let nextRev = behaviour.nextRevision()
+
+  let syncHandler = behaviour.syncHandler
+  if syncHandler != nil:
+    syncHandler.updateState(behaviour.syncId, previousTrackedStacks, cursorStack,
+      behaviour.trackedPropertyValues, nextRev)
+
+proc updateTrackedSlot*(h: ScreenHandler; slot: int; stack: ItemStack) =
+  let behaviour = h.behaviour
+  if not behaviour.trackedStacks[slot].areEqual(stack):
+    behaviour.trackedStacks[slot] = stack
+    for i in 0 ..< behaviour.listeners.len:
+      behaviour.listeners[i].onSlotUpdate(behaviour, uint8(slot and 0xFF), stack)
+
+proc checkSlotUpdates*(h: ScreenHandler; slot: int; stack: ItemStack) =
+  let behaviour = h.behaviour
+  if not behaviour.disableSync:
+    if not behaviour.previousTrackedStacks[slot].isInSync(stack):
+      behaviour.previousTrackedStacks[slot].setReceivedStack(stack)
+      let nextRev = behaviour.nextRevision()
+      let syncHandler = behaviour.syncHandler
+      if syncHandler != nil:
+        syncHandler.updateSlot(behaviour.syncId, slot, stack, nextRev)
+
+proc checkCursorStackUpdates*(h: ScreenHandler) =
+  let behaviour = h.behaviour
+  if not behaviour.disableSync:
+    let cursorStack = behaviour.cursorStack
+    if not behaviour.previousCursorStack.isInSync(cursorStack):
+      behaviour.previousCursorStack.setReceivedStack(cursorStack)
+      let syncHandler = behaviour.syncHandler
+      if syncHandler != nil:
+        syncHandler.updateCursorStack(cursorStack)
+
+proc updateTrackedProperties*(h: ScreenHandler; idx, value: int32) =
+  let behaviour = h.behaviour
+  if int(idx) <= behaviour.trackedPropertyValues.len:
+    behaviour.trackedPropertyValues[int(idx)] = value
+    for i in 0 ..< behaviour.listeners.len:
+      behaviour.listeners[i].onPropertyUpdate(behaviour, uint8(idx and 0xFF'i32), value)
+
+proc checkPropertyUpdates*(h: ScreenHandler; idx, value: int32) =
+  let behaviour = h.behaviour
+  if not behaviour.disableSync and int(idx) < behaviour.trackedPropertyValues.len:
+    let oldValue = behaviour.trackedPropertyValues[int(idx)]
+    if oldValue != value:
+      # `Vec::insert`. Unreachable from here as upstream: `updateTrackedProperties` has already stored `value`.
+      behaviour.trackedPropertyValues.add(value)
+      var i = behaviour.trackedPropertyValues.len - 1
+      while i > int(idx):
+        let moved = behaviour.trackedPropertyValues[i - 1]
+        behaviour.trackedPropertyValues[i] = moved
+        i -= 1
+      behaviour.trackedPropertyValues[int(idx)] = value
+      let syncHandler = behaviour.syncHandler
+      if syncHandler != nil:
+        syncHandler.updateProperty(behaviour.syncId, idx, value)
+
+proc updateChangedProperties(h: ScreenHandler) =
+  ## The property half shared by `updateToClient` and `sendContentUpdates`.
+  let behaviour = h.behaviour
+  var propVec: seq[(int32, int32)] = @[]
+  for idx in 0 ..< behaviour.properties.len:
+    let value = behaviour.properties[idx].get()
+    if behaviour.properties[idx].hasChanged():
+      propVec.add((int32(idx), value))
+  for i in 0 ..< propVec.len:
+    h.updateTrackedProperties(propVec[i][0], propVec[i][1])
+    h.checkPropertyUpdates(propVec[i][0], propVec[i][1])
+
+proc sendContentUpdates*(h: ScreenHandler) =
+  ## All updates to listeners and the sync handler.
+  let slotsLen = h.behaviour.slots.len
+  for i in 0 ..< slotsLen:
+    let stack = h.behaviour.slots[i].getClonedStack()
+    h.updateTrackedSlot(i, stack)
+    h.checkSlotUpdates(i, stack)
+  h.checkCursorStackUpdates()
+  h.updateChangedProperties()
+
+proc addListener*(h: ScreenHandler; listener: ScreenHandlerListener) =
+  h.behaviour.listeners.add(listener)
+  h.sendContentUpdates()
+
+proc updateSyncHandler*(h: ScreenHandler; syncHandler: SyncHandler) =
+  ## Attaches a sync handler and performs the initial sync.
+  h.behaviour.syncHandler = syncHandler
+  h.syncState()
+
+proc updateToClient*(h: ScreenHandler) =
+  for i in 0 ..< h.behaviour.slots.len:
+    let stack = h.behaviour.slots[i].getClonedStack()
+    h.updateTrackedSlot(i, stack)
+  h.updateChangedProperties()
+  h.syncState()
+
+proc isSlotValid*(h: ScreenHandler; slot: int32): bool =
+  slot == -1'i32 or slot == SlotIndexOutside or slot < int32(h.behaviour.slots.len)
+
+proc disableSync*(h: ScreenHandler) =
+  h.behaviour.disableSync = true
+
+proc enableSync*(h: ScreenHandler) =
+  h.behaviour.disableSync = false
+
+proc getSlotIndex*(h: ScreenHandler; inv: Inventory; slot: int): Option[int] =
+  ## The screen handler slot for an inventory slot.
+  for i in 0 ..< h.behaviour.slots.len:
+    let s = h.behaviour.slots[i]
+    if cast[pointer](s.getInventory()) == cast[pointer](inv) and s.getIndex() == slot:
+      return some(i)
+  none[int]()
+
+proc quickMove*(h: ScreenHandler; player: InventoryPlayer; slotIndex: int32): ItemStack =
+  let f = h.quickMoveImpl
+  f(h, player, slotIndex)
+
+proc onButtonClick*(h: ScreenHandler; player: InventoryPlayer; buttonId: int32): bool =
+  let f = h.onButtonClickImpl
+  if f != nil: f(h, player, buttonId) else: false
+
+proc insertItem*(h: ScreenHandler; stack: var ItemStack; startIndex, endIndex: int32; fromLast: bool): bool =
+  ## Inserts into a range of slots: first stacking with what is there, then the first empty slot.
+  var success = false
+  var currentIndex = (if fromLast: endIndex - 1'i32 else: startIndex)
+
+  if stack.isStackable():
+    while not stack.isEmpty() and (if fromLast: currentIndex >= startIndex else: currentIndex < endIndex):
+      let s = h.behaviour.slots[int(currentIndex)]
+      var slotStack = s.getStack()
+
+      if not slotStack.isEmpty() and slotStack.areItemsAndComponentsEqual(stack):
         let combinedCount = slotStack.itemCount + stack.itemCount
-        let maxSlotCount = getMaxItemCountForStack(slot, slotStack)
+        let maxSlotCount = s.getMaxItemCountForStack(slotStack)
         if combinedCount <= maxSlotCount:
-          setCount(stack, 0'u8)
-          setCount(slotStack, combinedCount)
-          setStack(slot, slotStack)
-          result = true
+          stack.setCount(0'u8)
+          slotStack.setCount(combinedCount)
+          s.storeStack(slotStack)
+          s.markDirty()
+          success = true
         elif slotStack.itemCount < maxSlotCount:
-          decrement(stack, maxSlotCount - slotStack.itemCount)
-          setCount(slotStack, maxSlotCount)
-          setStack(slot, slotStack)
-          result = true
+          stack.decrement(maxSlotCount - slotStack.itemCount)
+          slotStack.setCount(maxSlotCount)
+          s.storeStack(slotStack)
+          s.markDirty()
+          success = true
 
       if fromLast:
-        currentIndex -= 1
+        currentIndex -= 1'i32
       else:
-        currentIndex += 1
+        currentIndex += 1'i32
 
-  if not isEmpty(stack):
-    currentIndex = if fromLast: endIndex - 1 else: startIndex
+  if not stack.isEmpty():
+    currentIndex = (if fromLast: endIndex - 1'i32 else: startIndex)
+
     while (if fromLast: currentIndex >= startIndex else: currentIndex < endIndex):
-      let slot = h.behaviour.slots[currentIndex]
-      let slotStack = getStack(slot)
+      let s = h.behaviour.slots[int(currentIndex)]
+      let slotStack = s.getStack()
 
-      if isEmpty(slotStack) and canInsert(slot, stack):
-        let maxCount = getMaxItemCountForStack(slot, stack)
-        setStack(slot, split(stack, min(maxCount, stack.itemCount)))
-        markDirty(slot)
-        result = true
+      if slotStack.isEmpty() and s.canInsert(stack):
+        let maxCount = s.getMaxItemCountForStack(stack)
+        s.setStack(stack.split(min(maxCount, stack.itemCount)))
+        s.markDirty()
+        success = true
         break
 
       if fromLast:
-        currentIndex -= 1
+        currentIndex -= 1'i32
       else:
-        currentIndex += 1
+        currentIndex += 1'i32
+
+  success
+
+proc handleSlotClick*(h: ScreenHandler; player: InventoryPlayer; clickType: MouseClick; s: Slot;
+    slotStack, cursorStack: ItemStack): bool =
+  ## True prevents the default handling. TODO upstream: required for bundle in the future.
+  let f = h.handleSlotClickImpl
+  if f != nil: f(h, player, clickType, s, slotStack, cursorStack) else: false
+
+proc cancel*(h: ScreenHandler) =
+  h.syncState()
+
+proc equipmentSlotOf(stack: ItemStack): EquipmentSlot =
+  ## `get_data_component::<EquippableImpl>().map_or(&EquipmentSlot::MAIN_HAND, |equippable| equippable.slot)`.
+  let (found, equippable) = stack.getDataComponent(EquippableImpl)
+  if found: equippable.slot else: esMainHand
+
+proc internalOnSlotClick*(h: ScreenHandler; slotIndex, button: int32; actionType: SlotActionType;
+    player: InventoryPlayer) =
+  ## Handles all click types: pickup, quick move, swap, throw, drag, clone.
+  let behaviour = h.behaviour
+  if actionType == satPickupAll and button == 0'i32:
+    var toPickUp = behaviour.cursorStack.getMaxStackSize() - behaviour.cursorStack.itemCount
+    for i in 0 ..< behaviour.slots.len:
+      let s = behaviour.slots[i]
+      if toPickUp == 0'u8:
+        break
+      let itemStack = s.getClonedStack()
+      if not itemStack.areItemsAndComponentsEqual(behaviour.cursorStack):
+        continue
+      if not s.allowModification(player):
+        continue
+      let takenStack = s.safeTake(min(itemStack.itemCount, toPickUp),
+        behaviour.cursorStack.getMaxStackSize() - behaviour.cursorStack.itemCount, player)
+      toPickUp -= takenStack.itemCount
+      behaviour.cursorStack.increment(takenStack.itemCount)
+
+  elif actionType == satQuickCraft:
+    let dragType = button and 3'i32
+    let dragButton = (button shr 2) and 3'i32
+    if dragType == 0'i32:
+      behaviour.dragSlots.setLen(0)
+    elif dragType == 1'i32:
+      if slotIndex < 0'i32:
+        return  # Upstream warns: "Invalid slot index for drag action".
+      let s = behaviour.slots[int(slotIndex)]
+      let stack = s.getStack()
+      if not behaviour.cursorStack.isEmpty() and s.canInsert(behaviour.cursorStack) and
+          (stack.areItemsAndComponentsEqual(behaviour.cursorStack) or stack.isEmpty()) and
+          s.getMaxItemCountForStack(stack) > stack.itemCount:
+        behaviour.dragSlots.add(uint32(slotIndex))
+    elif dragType == 2'i32 and behaviour.dragSlots.len > 0:
+      # process drag end
+      if behaviour.dragSlots.len == 1:
+        let single = int32(behaviour.dragSlots[0])
+        behaviour.dragSlots.setLen(0)
+        h.internalOnSlotClick(single, dragButton, satPickup, player)
+        return
+      if dragButton == 2'i32 and not player.hasInfiniteMaterials():
+        return  # Only creative
+
+      let initialCount = behaviour.cursorStack.itemCount
+      # `behaviour.drag_slots.len() as u8`. Upstream divides by it, and panics on a drag of 256 slots.
+      let dragLen = uint8(behaviour.dragSlots.len and 0xFF)
+      for i in 0 ..< behaviour.dragSlots.len:
+        let s = behaviour.slots[int(behaviour.dragSlots[i])]
+        let stack = s.getStack()
+
+        if (stack.areItemsAndComponentsEqual(behaviour.cursorStack) or stack.isEmpty()) and
+            s.canInsert(behaviour.cursorStack):
+          var insertingCount = 0'u8
+          if dragButton == 0'i32:
+            if dragLen != 0'u8:
+              insertingCount = initialCount div dragLen
+          elif dragButton == 1'i32:
+            insertingCount = 1'u8
+          elif dragButton == 2'i32:
+            behaviour.cursorStack.itemCount = behaviour.cursorStack.getMaxStackSize()
+            insertingCount = behaviour.cursorStack.itemCount
+          else:
+            # Upstream panics: "Invalid drag button". A client can send this.
+            return
+          insertingCount = min(min(insertingCount, max(0'u8, s.getMaxItemCountForStack(stack) - stack.itemCount)),
+            behaviour.cursorStack.itemCount)
+          if insertingCount > 0'u8:
+            var stackClone = stack
+            if stackClone.isEmpty():
+              stackClone = behaviour.cursorStack.copyWithCount(0'u8)
+            stackClone.increment(insertingCount)
+            s.setStack(stackClone)
+            if dragButton != 2'i32:
+              behaviour.cursorStack.decrement(insertingCount)
+            if behaviour.cursorStack.isEmpty():
+              behaviour.cursorStack = emptyItemStack()
+              break
+
+      if dragButton == 2'i32:
+        behaviour.cursorStack = emptyItemStack()
+      behaviour.dragSlots.setLen(0)
+
+  elif actionType == satThrow:
+    if slotIndex >= 0'i32 and behaviour.cursorStack.isEmpty():
+      let s = behaviour.slots[int(slotIndex)]
+      let prevStack = s.getClonedStack()
+      if not prevStack.isEmpty():
+        if button == 1'i32:
+          # Throw all
+          while s.getClonedStack().areItemsAndComponentsEqual(prevStack):
+            let before = s.getClonedStack().itemCount
+            let dropStack = s.safeTake(prevStack.itemCount, 255'u8, player)
+            player.dropItem(dropStack, true)
+            # player.handleCreativeModeItemDrop(itemStack);
+            # Upstream spins forever here if the take leaves the slot as it was: a slot refusing the take, or a
+            # result slot, whose `take_stack` clones, dropping new items each pass. Stop instead.
+            if s.getClonedStack().itemCount == before:
+              break
+        else:
+          let dropStack = s.safeTake(1'u8, 255'u8, player)
+          if not dropStack.isEmpty():
+            # As upstream, this is a second `on_take_item` after the one in `safe_take`.
+            s.onTakeItem(player, dropStack)
+            player.dropItem(dropStack, true)
+
+  elif actionType == satClone:
+    if player.hasInfiniteMaterials() and slotIndex >= 0'i32:
+      if not behaviour.cursorStack.isEmpty():
+        return
+      let s = behaviour.slots[int(slotIndex)]
+      let stack = s.getStack()
+      behaviour.cursorStack = stack.copyWithCount(stack.getMaxStackSize())
+
+  elif (actionType == satPickup or actionType == satQuickMove) and (button == 0'i32 or button == 1'i32):
+    let clickType = (if button == 0'i32: mcLeft else: mcRight)
+
+    # Drop item if outside inventory
+    if slotIndex == SlotIndexOutside:
+      if not behaviour.cursorStack.isEmpty():
+        if clickType == mcLeft:
+          player.dropItem(behaviour.cursorStack, true)
+          behaviour.cursorStack = emptyItemStack()
+        else:
+          player.dropItem(behaviour.cursorStack.split(1'u8), true)
+
+    elif actionType == satQuickMove:
+      if slotIndex < 0'i32:
+        return
+
+      let s = behaviour.slots[int(slotIndex)]
+
+      if not s.canTakeItems(player):
+        return
+
+      var movedStack = h.quickMove(player, slotIndex)
+
+      while not movedStack.isEmpty() and s.getClonedStack().areItemsAndComponentsEqual(movedStack):
+        movedStack = h.quickMove(player, slotIndex)
+
+    else:
+      # Pickup
+      if slotIndex < 0'i32:
+        return
+
+      let s = behaviour.slots[int(slotIndex)]
+
+      if clickType == mcLeft:
+        s.onClick(player)
+
+      let slotStack = s.getClonedStack()
+
+      if clickType == mcRight:
+        var intercepted = false
+
+        if not behaviour.cursorStack.isEmpty():
+          var innerSlotStack = s.getStack()
+          let i = innerSlotStack.getDataComponentMut(BundleContentsImpl)
+          if i >= 0:
+            if innerSlotStack.patch[i].data.bundleContents.tryInsert(behaviour.cursorStack):
+              intercepted = true
+            s.storeStack(innerSlotStack)
+
+        if not intercepted and not slotStack.isEmpty():
+          let i = behaviour.cursorStack.getDataComponentMut(BundleContentsImpl)
+          if i >= 0:
+            var innerSlotStack = s.getStack()
+            if behaviour.cursorStack.patch[i].data.bundleContents.tryInsert(innerSlotStack):
+              if innerSlotStack.itemCount == 0'u8:
+                innerSlotStack = emptyItemStack()
+              s.storeStack(innerSlotStack)
+              intercepted = true
+
+        if not intercepted and behaviour.cursorStack.isEmpty():
+          var innerSlotStack = s.getStack()
+          let i = innerSlotStack.getDataComponentMut(BundleContentsImpl)
+          if i >= 0:
+            let extracted = innerSlotStack.patch[i].data.bundleContents.tryExtract()
+            s.storeStack(innerSlotStack)
+            if extracted.isSome:
+              behaviour.cursorStack = extracted.unsafeGet
+              intercepted = true
+
+        if not intercepted and slotStack.isEmpty():
+          let i = behaviour.cursorStack.getDataComponentMut(BundleContentsImpl)
+          if i >= 0:
+            let extracted = behaviour.cursorStack.patch[i].data.bundleContents.tryExtract()
+            if extracted.isSome:
+              s.setStack(extracted.unsafeGet)
+              intercepted = true
+
+        if intercepted:
+          if behaviour.cursorStack.itemCount == 0'u8:
+            behaviour.cursorStack = emptyItemStack()
+          s.markDirty()
+          return
+
+      let equipmentSlot = equipmentSlotOf(behaviour.cursorStack)
+
+      if h.handleSlotClick(player, clickType, s, slotStack, behaviour.cursorStack):
+        return
+
+      if slotStack.isEmpty():
+        if not behaviour.cursorStack.isEmpty():
+          if equipmentSlot.slotType() == etHumanoidArmor and slotIndex >= 5'i32 and slotIndex < 9'i32:
+            player.enqueueEquipmentChange(equipmentSlot, behaviour.cursorStack)
+
+          let transferCount = (if clickType == mcLeft: behaviour.cursorStack.itemCount else: 1'u8)
+          behaviour.cursorStack = s.insertStackCount(behaviour.cursorStack, transferCount)
+      elif s.canTakeItems(player):
+        if behaviour.cursorStack.isEmpty():
+          let takeCount =
+            if clickType == mcLeft: slotStack.itemCount
+            else: uint8((int(slotStack.itemCount) + 1) div 2)
+          let taken = s.tryTakeStackRange(takeCount, 255'u8, player)
+          if taken.isSome:
+            # Reverse order of operations, shouldn't affect anything
+            behaviour.cursorStack = taken.unsafeGet
+            s.onTakeItem(player, taken.unsafeGet)
+
+            if slotIndex >= 5'i32 and slotIndex < 9'i32:
+              player.enqueueEquipmentChange(equipmentSlotOf(behaviour.cursorStack), emptyItemStack())
+        elif s.canInsert(behaviour.cursorStack):
+          if equipmentSlot.slotType() == etHumanoidArmor and slotIndex >= 5'i32 and slotIndex < 9'i32:
+            player.enqueueEquipmentChange(equipmentSlot, behaviour.cursorStack)
+
+          if slotStack.areItemsAndComponentsEqual(behaviour.cursorStack):
+            let insertCount = (if clickType == mcLeft: behaviour.cursorStack.itemCount else: 1'u8)
+            behaviour.cursorStack = s.insertStackCount(behaviour.cursorStack, insertCount)
+          elif behaviour.cursorStack.itemCount <= s.getMaxItemCountForStack(behaviour.cursorStack):
+            let oldCursorStack = behaviour.cursorStack
+            behaviour.cursorStack = slotStack
+            s.setStack(oldCursorStack)
+        elif slotStack.areItemsAndComponentsEqual(behaviour.cursorStack):
+          let room = behaviour.cursorStack.getMaxStackSize()
+          let cursorCount = behaviour.cursorStack.itemCount
+          let taken = s.tryTakeStackRange(slotStack.itemCount, (if room > cursorCount: room - cursorCount else: 0'u8),
+            player)
+          if taken.isSome:
+            behaviour.cursorStack.increment(taken.unsafeGet.itemCount)
+            s.onTakeItem(player, taken.unsafeGet)
+
+      s.markDirty()
+
+  elif (actionType == satSwap and button >= 0'i32 and button < 9'i32) or button == 40'i32:
+    # As upstream, `|| button == 40` is not under the `Swap`: any action reaching here with button 40 swaps.
+    if slotIndex < 0'i32:
+      return
+    let playerInventory = player.getInventory()
+    var buttonStack = Inventory(playerInventory).getStack(int(button))
+    let sourceSlot = behaviour.slots[int(slotIndex)]
+    let sourceStack = sourceSlot.getClonedStack()
+
+    if not buttonStack.isEmpty() or not sourceStack.isEmpty():
+      if buttonStack.isEmpty():
+        if sourceSlot.canTakeItems(player):
+          Inventory(playerInventory).setStack(int(button), sourceStack)
+          sourceSlot.setStack(emptyItemStack())
+          sourceSlot.onTakeItem(player, sourceStack)
+      elif sourceStack.isEmpty() and sourceSlot.canInsert(buttonStack):
+        let maxCount = sourceSlot.getMaxItemCountForStack(buttonStack)
+        if buttonStack.itemCount > maxCount:
+          # As upstream ("button_stack might need to be a ref instead of a clone"), this splits a copy: the
+          # player's slot keeps its full count.
+          sourceSlot.setStack(buttonStack.split(maxCount))
+        else:
+          Inventory(playerInventory).setStack(int(button), emptyItemStack())
+          sourceSlot.setStack(buttonStack)
+
+proc onSlotClick*(h: ScreenHandler; slotIndex, button: int32; actionType: SlotActionType; player: InventoryPlayer) =
+  ## The public entry point. A handler overriding it calls `internalOnSlotClick`.
+  let f = h.onSlotClickImpl
+  if f != nil:
+    f(h, slotIndex, button, actionType, player)
+  else:
+    h.internalOnSlotClick(slotIndex, button, actionType, player)
