@@ -552,3 +552,15 @@ now work again but hasn't been swept.
 | 13 | Two closures in one constructor sharing a captured var breaks init-proof | crashes (false diagnostic) | — | no |
 | 14 | Auto `=dup`/`=destroy` hook for `ref object` derefs nil receiver, no guard | passes, links | segfault at runtime (`entitytest.exe`) | no |
 | 15 | `import std/strutils` crashes nifler on `std/parseutils.aowl` - **REGRESSION** from this session's #1 fix rebuild | crashes (parse) | — | no |
+
+---
+
+## Status, 2026-11-08
+
+Bug 1 above, closures through vtables, is fixed in aowlhexer. It was not one crash but three separate lowering bugs:
+two closure fields in one constructor evaluated out of order (the second moved the shared environment before the
+first duplicated it), a closure field called from a module declaring no closures of its own was left as a call on a
+tuple, and a field key spelled like a captured local was rewritten as a capture.
+
+Still open: a closure inside a returned named tuple (`proc f(): tuple[a: int, b: proc(): int {.closure.}]`) stops
+the hexer with `expected ')'`. Return an object instead.
