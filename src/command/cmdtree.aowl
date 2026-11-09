@@ -1,141 +1,719 @@
-## The brigadier-style command tree: nodes (root/literal/command/argument)
-## and the builders that assemble a tree. Dispatch (walking a
-## `StringReader` against the tree) lives in cmddispatch.aowl - split out
-## as a aowlmony-compiler-crash workaround, see that file's doc comment.
-## Port of upstream/command/src/node/{mod,tree}.rs (~1.5k lines; the
-## 1277-line dispatcher.rs is cmddispatch.aowl).
+## The brigadier tree: nodes, the context a parse builds, and the argument-type interface they all refer to.
+## Port of pumpkin/src/command/node/mod.rs
+## Port of pumpkin/src/command/node/attached.rs
+## Port of pumpkin/src/command/node/detached.rs
+## Port of pumpkin/src/command/node/tree.rs
+## Port of pumpkin/src/command/context/mod.rs
+## Port of pumpkin/src/command/context/command_context.rs
+## Port of pumpkin/src/command/argument_types/argument_type.rs
+## Port of pumpkin/src/command/suggestion/provider.rs
 ##
-## Design decisions (this is the crate's central design pass, flagged as
-## deferred in `lib.aowl` until the `ArgumentType`/`CommandSource` pair was
-## settled - see argtype.aowl/cmdsource.aowl for that half):
+## These upstream modules refer to each other in a cycle, and aowlmony modules cannot, so they share this file.
 ##
-## - Upstream's `Tree` is a slab/arena (`Vec` of nodes addressed by
-##   `NodeId`/`GlobalNodeId` index, not `Rc`/`Arc` parent-child pointers) -
-##   this port keeps that shape exactly (`nodes: seq[CommandNode]`,
-##   `children: seq[int]` per node), which conveniently also sidesteps the
-##   known aowlmony bug where a self-recursive `ref T` field inside a `case`
-##   object of type `T` fails C-codegen despite passing `aowlmony check`
-##   (nodes never hold a `ref CommandNode` to each other, only indices).
-## - `Command<S>` (`Arc<dyn CommandExecutor<S>>`) becomes a `{.closure.}`
-##   proc field, same vtable pattern as `ArgumentType`.
-## - `Requirements<S>`/`Requirement<S>` (a `Vec` of boxed predicates)
-##   becomes a `seq` of `{.closure.}` predicate procs - directly portable,
-##   no trait object needed since aowlmony closures already erase their
-##   environment.
-## - `RedirectModifier`/`Redirection`/forking (multi-source redirects, used
-##   by things like `/execute as @a run ...`) are NOT ported in this pass -
-##   real forking needs a working multi-`CommandSource` execution model
-##   this port doesn't have a design for yet. A node can still `redirect`
-##   to another node by index for the simple single-target case; the
-##   `RedirectModifier::Custom`/fork-to-many path is a documented gap.
-## - Ambiguity detection (`find_ambiguities`/`AmbiguityConsumer`, used to
-##   warn plugin/command authors about overlapping argument-node names at
-##   registration time, not at dispatch time) is skipped - it's a
-##   diagnostic nicety, not required for parse/execute correctness.
-## - Suggestions (tab-complete) are entirely out of scope, matching
-##   argtype.aowl's scope note.
+## What changed in the translation:
+## - `AttachedNode` and the `Detached*` structs are one flat `ref object` each, told apart by `NodeKind`. The typed ids
+##   (`CommandNodeId`, `LiteralNodeId`, ...) are the same `NodeId`, an int that starts at 1 as upstream's does.
+## - `FxHashMap<String, NodeId>` children are an insertion-ordered list that replaces on a repeated key. Upstream's
+##   iteration order is that of its hash; vanilla brigadier's is insertion order (a LinkedHashMap), which is what
+##   this keeps. It only shows where upstream's own order is arbitrary: the order of sibling argument nodes and the
+##   node order in the packet.
+## - `Box<dyn Any>` is `ArgValue`, a `ref object of RootObj` that each argument type derives its value from. A generic
+##   box cannot convert to its non-generic base in this compiler, so the leaf value types are written out.
 
-import string_reader, cmderrors, argtype, cmdsource
+import std/[assertions, options, strutils, tables]
+import ../protocol/java/client/play/commands
+import ../util/text/textbase, ../util/text/text
+import cmderrors, string_range, string_reader, suggestion, cmdsource
 
 type
+  JavaClientArgumentType* = commands.ArgumentType
+
+  NodeId* = int
+  GlobalNodeId* = uint64
+
+  ArgValue* = ref object of RootObj
+    ## `Box<dyn Any + Send + Sync>`.
+
+  BoolValue* = ref object of ArgValue
+    value*: bool
+  IntValue* = ref object of ArgValue
+    value*: int32
+  LongValue* = ref object of ArgValue
+    value*: int64
+  FloatValue* = ref object of ArgValue
+    value*: float32
+  DoubleValue* = ref object of ArgValue
+    value*: float64
+  StringValue* = ref object of ArgValue
+    value*: string
+
+  ParsedArgument* = ref object
+    range*: StringRange
+    result*: ArgValue
+
+  AnyArgumentType* = ref object
+    ## `dyn AnyArgumentType`. `clientParser` is `client_side_parser()`, `overrideSuggestion` is
+    ## `override_suggestion_providers()` and `examples` is `examples()`: constant per instance, so plain fields.
+    ## A nil `parseWithSourceProc` falls back to `parseProc`, a nil `listSuggestionsProc` gives no suggestions.
+    clientParser*: JavaClientArgumentType
+    overrideSuggestion*: Option[SuggestionProviders]
+    examples*: seq[string]
+    parseProc*: proc(r: var StringReader): CmdResult[ArgValue] {.closure.}
+    parseWithSourceProc*: proc(r: var StringReader; source: CommandSource): CmdResult[ArgValue] {.closure.}
+    listSuggestionsProc*: proc(context: CommandContext; builder: SuggestionsBuilder): Suggestions {.closure.}
+
+  CommandExecutor* = proc(context: CommandContext): CmdResult[int32] {.closure.}
+  RedirectModifierExecutor* = proc(context: CommandContext): CmdResult[seq[CommandSource]] {.closure.}
+  Requirement* = proc(source: CommandSource): bool {.closure.}
+  SuggestionProvider* = proc(context: CommandContext; builder: SuggestionsBuilder): Suggestions {.closure.}
+  ResultConsumer* = proc(context: CommandContext; value: ReturnValue) {.closure.}
+
+  RedirectModifier* = object
+    ## `KeepSource` when `custom` is nil, otherwise `Custom`.
+    custom*: RedirectModifierExecutor
+
+  RedirectionKind* = enum
+    rdRoot
+    rdLocal
+    rdGlobal
+
+  Redirection* = object
+    kind*: RedirectionKind
+    local*: NodeId
+    global*: GlobalNodeId
+
   NodeKind* = enum
     nkRoot
-    nkLiteral   ## a non-executable literal (doesn't `Command`) path segment
-    nkCommand   ## a literal path segment that CAN be executed here
+    nkLiteral
+    nkCommand
     nkArgument
 
-  ParsedArg* = object
-    name*: string
-    value*: ArgValue
-
-  CommandNode* = object
+  DetachedNode* = ref object
+    ## `LiteralDetachedNode`, `CommandDetachedNode` or `ArgumentDetachedNode`.
     kind*: NodeKind
-    literal*: string          ## nkLiteral/nkCommand: the exact text to match
-    literalLowercase*: string ## for case-insensitive literal matching
-    argName*: string          ## nkArgument: the name bound in CommandContext
-    argType*: ArgumentType    ## nkArgument only
-    children*: seq[int]       ## indices into the owning Tree's `nodes`
-    requirements*: seq[proc(source: CommandSource): bool {.closure.}]
-    command*: proc(source: CommandSource, args: seq[ParsedArg]): CmdResult[int32] {.closure.} ## nil unless this node is runnable
-    redirect*: int             ## -1 = none; else index to redirect to (simple case only)
+    globalId*: GlobalNodeId
+    requirements*: seq[Requirement]
+    modifier*: RedirectModifier
+    forks*: bool
+    command*: CommandExecutor
+    children*: seq[DetachedNode]
+    hasRedirect*: bool
+    redirect*: Redirection
+    literal*: string
+    literalLowercase*: string
+    description*: string
+    name*: string
+    argumentType*: nil AnyArgumentType
+    suggestionProvider*: SuggestionProvider
 
-  Tree* = object
-    nodes*: seq[CommandNode]  ## nodes[0] is always the root
+  AttachedNode* = ref object
+    kind*: NodeKind
+    globalId*: GlobalNodeId
+    requirements*: seq[Requirement]
+    modifier*: RedirectModifier
+    forks*: bool
+    command*: CommandExecutor
+    childNames*: seq[string]
+    childIds*: seq[NodeId]
+    hasRedirect*: bool
+    redirect*: Redirection
+    literal*: string
+    literalLowercase*: string
+    description*: string
+    name*: string
+    argumentType*: nil AnyArgumentType
+    suggestionProvider*: SuggestionProvider
 
-proc newTree*(): Tree =
-  result = Tree(nodes: @[])
-  result.nodes.add(CommandNode(kind: nkRoot, children: @[], requirements: @[], redirect: -1))
+  Tree* = ref object
+    nodes*: seq[AttachedNode]
+    idsMap*: Table[uint64, NodeId]
+    commandNodeMappings*: Table[string, NodeId]
 
-const RootIndex* = 0
+  AmbiguityConsumer* = proc(tree: Tree; parent, child, sibling: NodeId; inputs: seq[string]) {.closure.}
 
-proc meetsRequirements*(node: CommandNode, source: CommandSource): bool =
-  ## NOTE: written as an indexed `while` rather than `for req in
-  ## node.requirements`, which crashes the aowlmony compiler (internal
-  ## AssertionDefect, `derefs.aowl`'s `checkForDangerousLocations`) when
-  ## iterating a `seq[proc(...) {.closure.}]` field and calling an
-  ## element - filed as feedback; this is the confirmed workaround.
+  Stage* = enum
+    stageModify
+    stageExecute
+
+  ParsedNode* = object
+    node*: NodeId
+    range*: StringRange
+
+  SuggestionContext* = object
+    parent*: NodeId
+    startingPosition*: int
+
+  CommandContext* = ref object
+    source*: CommandSource
+    input*: string
+    argumentNames*: seq[string]
+    argumentValues*: seq[ParsedArgument]
+    tree*: Tree
+    root*: NodeId
+    nodes*: seq[ParsedNode]
+    range*: StringRange
+    child*: nil CommandContext
+    modifier*: RedirectModifier
+    forks*: bool
+    command*: CommandExecutor
+
+  CommandContextBuilder* = ref object
+    tree*: Tree
+    source*: CommandSource
+    argumentNames*: seq[string]
+    argumentValues*: seq[ParsedArgument]
+    root*: NodeId
+    nodes*: seq[ParsedNode]
+    range*: StringRange
+    child*: nil CommandContextBuilder
+    modifier*: RedirectModifier
+    forks*: bool
+    command*: CommandExecutor
+
+  ContextChain* = ref object
+    modifiers*: seq[CommandContext]
+    execute*: CommandContext
+
+const RootNodeId* = NodeId(1)
+
+var nextDetachedNodeId = 1'u64
+
+proc newGlobalNodeId*(): GlobalNodeId =
+  ## `GlobalNodeId::new`.
+  result = nextDetachedNodeId
+  inc nextDetachedNodeId
+
+proc keepSource*(): RedirectModifier = RedirectModifier()
+proc customModifier*(f: RedirectModifierExecutor): RedirectModifier = RedirectModifier(custom: f)
+proc isKeepSource*(m: RedirectModifier): bool = m.custom == nil
+
+proc redirectRoot*(): Redirection = Redirection(kind: rdRoot)
+proc redirectLocal*(id: NodeId): Redirection = Redirection(kind: rdLocal, local: id)
+proc redirectGlobal*(id: GlobalNodeId): Redirection = Redirection(kind: rdGlobal, global: id)
+
+proc sourceHasPerm(s: CommandSource; permission: string): bool = hasPermission(s, permission)
+
+proc permissionRequirement*(permission: string): Requirement =
+  ## `From<String> for Requirement`.
+  result = proc(source: CommandSource): bool {.closure.} = sourceHasPerm(source, permission)
+
+proc evaluateRequirements*(reqs: seq[Requirement]; source: CommandSource): bool =
+  ## `Requirements::evaluate`.
   var i = 0
-  while i < node.requirements.len:
-    let req = node.requirements[i]
-    if req != nil and not req(source):
+  while i < reqs.len:
+    let r = reqs[i]
+    if not r(source):
       return false
     inc i
   true
 
-proc addChild(t: var Tree, parent: int, node: CommandNode): int =
-  let idx = t.nodes.len
-  t.nodes.add(node)
-  t.nodes[parent].children.add(idx)
-  idx
+# ---- ArgValue leaf helpers ----------------------------------------------------------------------------------------
 
-proc addLiteral*(t: var Tree, parent: int, literal: string, executable = false): int =
-  ## Port of `literal(name)` node-builder use: `executable` marks this as
-  ## upstream's `NodeMetadata::Command` (a literal that's also a valid
-  ## command by itself, e.g. `/spawn` with no further arguments) vs.
-  ## `::Literal` (a path segment that must be followed by more nodes,
-  ## e.g. the `gamemode` in `/gamemode survival`).
-  addChild(t, parent, CommandNode(
-    kind: (if executable: nkCommand else: nkLiteral),
-    literal: literal,
-    literalLowercase: toLowerAscii(literal),
-    children: @[],
-    requirements: @[],
-    redirect: -1,
-  ))
+proc boxBool*(v: bool): ArgValue =
+  let a: ArgValue = BoolValue(value: v)
+  a
+proc boxInt*(v: int32): ArgValue =
+  let a: ArgValue = IntValue(value: v)
+  a
+proc boxLong*(v: int64): ArgValue =
+  let a: ArgValue = LongValue(value: v)
+  a
+proc boxFloat*(v: float32): ArgValue =
+  let a: ArgValue = FloatValue(value: v)
+  a
+proc boxDouble*(v: float64): ArgValue =
+  let a: ArgValue = DoubleValue(value: v)
+  a
+proc boxString*(v: string): ArgValue =
+  let a: ArgValue = StringValue(value: v)
+  a
 
-proc addArgument*(t: var Tree, parent: int, name: string, argType: ArgumentType): int =
-  addChild(t, parent, CommandNode(
-    kind: nkArgument,
-    argName: name,
-    argType: argType,
-    children: @[],
-    requirements: @[],
-    redirect: -1,
-  ))
+# ---- CommandContext -----------------------------------------------------------------------------------------------
 
-proc setCommand*(t: var Tree, node: int, executor: proc(source: CommandSource, args: seq[ParsedArg]): CmdResult[int32] {.closure.}) =
-  t.nodes[node].command = executor
-  if t.nodes[node].kind == nkLiteral:
-    t.nodes[node].kind = nkCommand
+proc parsedArgument*(range: StringRange; result0: ArgValue): ParsedArgument =
+  ParsedArgument(range: range, result: result0)
 
-proc addRequirement*(t: var Tree, node: int, req: proc(source: CommandSource): bool {.closure.}) =
-  t.nodes[node].requirements.add(req)
+proc withSource*(c: CommandContext; source: CommandSource): CommandContext =
+  CommandContext(source: source, input: c.input, argumentNames: c.argumentNames, argumentValues: c.argumentValues,
+    tree: c.tree, root: c.root, nodes: c.nodes, range: c.range, child: c.child, modifier: c.modifier,
+    forks: c.forks, command: c.command)
 
-proc setRedirect*(t: var Tree, node: int, target: int) =
-  t.nodes[node].redirect = target
+proc getLastChild*(c: CommandContext): CommandContext =
+  var current = c
+  while true:
+    let next = current.child
+    if next == nil:
+      return current
+    current = next
 
-proc toLowerAscii*(s: string): string =
-  result = newString(s.len)
-  for i, c in s:
-    if c >= 'A' and c <= 'Z':
-      result[i] = char(ord(c) + 32)
+proc argumentOf*(c: CommandContext; name: string; found: var bool): nil ArgValue =
+  found = false
+  var i = 0
+  while i < c.argumentNames.len:
+    if c.argumentNames[i] == name:
+      found = true
+      return c.argumentValues[i].result
+    inc i
+  nil
+
+proc missingArgument*(name: string): CommandSyntaxError =
+  createWithoutContext(dispatcherParseException(), text("Could not find argument with name '" & name & "'"))
+
+proc wrongArgumentType*(name: string): CommandSyntaxError =
+  createWithoutContext(dispatcherParseException(), text("Could not downcast argument '" & name & "'"))
+
+proc getBool*(c: CommandContext; name: string): CmdResult[bool] =
+  ## `get_argument::<bool>`.
+  var found = false
+  let v = argumentOf(c, name, found)
+  if not found:
+    return cmdFail[bool](missingArgument(name))
+  if not (v of BoolValue):
+    return cmdFail[bool](wrongArgumentType(name))
+  let typed = BoolValue(v)
+  cmdOk[bool](typed.value)
+
+proc getInt*(c: CommandContext; name: string): CmdResult[int32] =
+  ## `get_argument::<int32>`.
+  var found = false
+  let v = argumentOf(c, name, found)
+  if not found:
+    return cmdFail[int32](missingArgument(name))
+  if not (v of IntValue):
+    return cmdFail[int32](wrongArgumentType(name))
+  let typed = IntValue(v)
+  cmdOk[int32](typed.value)
+
+proc getLong*(c: CommandContext; name: string): CmdResult[int64] =
+  ## `get_argument::<int64>`.
+  var found = false
+  let v = argumentOf(c, name, found)
+  if not found:
+    return cmdFail[int64](missingArgument(name))
+  if not (v of LongValue):
+    return cmdFail[int64](wrongArgumentType(name))
+  let typed = LongValue(v)
+  cmdOk[int64](typed.value)
+
+proc getFloat*(c: CommandContext; name: string): CmdResult[float32] =
+  ## `get_argument::<float32>`.
+  var found = false
+  let v = argumentOf(c, name, found)
+  if not found:
+    return cmdFail[float32](missingArgument(name))
+  if not (v of FloatValue):
+    return cmdFail[float32](wrongArgumentType(name))
+  let typed = FloatValue(v)
+  cmdOk[float32](typed.value)
+
+proc getDouble*(c: CommandContext; name: string): CmdResult[float64] =
+  ## `get_argument::<float64>`.
+  var found = false
+  let v = argumentOf(c, name, found)
+  if not found:
+    return cmdFail[float64](missingArgument(name))
+  if not (v of DoubleValue):
+    return cmdFail[float64](wrongArgumentType(name))
+  let typed = DoubleValue(v)
+  cmdOk[float64](typed.value)
+
+proc getString*(c: CommandContext; name: string): CmdResult[string] =
+  ## `get_argument::<string>`.
+  var found = false
+  let v = argumentOf(c, name, found)
+  if not found:
+    return cmdFail[string](missingArgument(name))
+  if not (v of StringValue):
+    return cmdFail[string](wrongArgumentType(name))
+  let typed = StringValue(v)
+  cmdOk[string](typed.value)
+
+proc newContextChain*(modifiers: seq[CommandContext]; execute: CommandContext): ContextChain =
+  assert execute.command != nil, "Expected last command in chain to be executable"
+  ContextChain(modifiers: modifiers, execute: execute)
+
+proc tryFlatten*(root: CommandContext): nil ContextChain =
+  ## Upstream pushes `child` where vanilla brigadier pushes `current`, which skips the first context's modifier. Kept
+  ## as upstream has it; brigadiertest.aowl pins the result.
+  var modifiers: seq[CommandContext] = @[]
+  var current = root
+  while true:
+    let child = current.child
+    if child != nil:
+      modifiers.add(child)
+      current = child
     else:
-      result[i] = c
+      if current.command != nil:
+        return newContextChain(modifiers, current)
+      return nil
 
-type
-  DispatchResult* = object
-    ## What a successful walk to an executable node collected along the
-    ## way - upstream's `CommandContext` (minus the parts needing
-    ## `RedirectModifier`/nested-context chaining, out of scope here).
-    args*: seq[ParsedArg]
-    node*: int
+proc runModifier*(modifier: CommandContext; source: CommandSource; resultConsumer: ResultConsumer;
+                  forkedMode: bool): CmdResult[seq[CommandSource]] =
+  if isKeepSource(modifier.modifier):
+    return cmdOk[seq[CommandSource]](@[source])
+  let contextToUse = withSource(modifier, source)
+  let f = modifier.modifier.custom
+  let res = f(contextToUse)
+  if not res.isOk:
+    resultConsumer(contextToUse, returnFailure())
+    if forkedMode:
+      return cmdOk[seq[CommandSource]](@[])
+  res
+
+proc runExecutable*(executable: CommandContext; source: CommandSource; resultConsumer: ResultConsumer;
+                    forkedMode: bool): CmdResult[int32] =
+  let contextToUse = withSource(executable, source)
+  assert executable.command != nil, "Expected `executable` to be executable"
+  let f = executable.command
+  let res = f(contextToUse)
+  if res.isOk:
+    resultConsumer(contextToUse, returnSuccess(res.value))
+    return cmdOk[int32](if forkedMode: 1'i32 else: res.value)
+  resultConsumer(contextToUse, returnFailure())
+  if forkedMode:
+    return cmdOk[int32](0'i32)
+  res
+
+proc executeAll*(chain: ContextChain; source: CommandSource; resultConsumer: ResultConsumer): CmdResult[int32] =
+  if chain.modifiers.len == 0:
+    return runExecutable(chain.execute, source, resultConsumer, false)
+  var forkedMode = false
+  var currentSources: seq[CommandSource] = @[source]
+  for modifier in chain.modifiers:
+    forkedMode = forkedMode or modifier.forks
+    var nextSources: seq[CommandSource] = @[]
+    for src in currentSources:
+      let toAdd = runModifier(modifier, src, resultConsumer, forkedMode)
+      if not toAdd.isOk:
+        return cmdFail[int32](toAdd.error)
+      for s in toAdd.value:
+        nextSources.add(s)
+    if nextSources.len == 0:
+      return cmdOk[int32](0'i32)
+    currentSources = nextSources
+  var res = 0'i32
+  for executionSource in currentSources:
+    let r = runExecutable(chain.execute, executionSource, resultConsumer, forkedMode)
+    if not r.isOk:
+      return cmdFail[int32](r.error)
+    res = cast[int32](cast[uint32](res) + cast[uint32](r.value))
+  cmdOk[int32](res)
+
+proc getStage*(chain: ContextChain): Stage =
+  if chain.modifiers.len == 0: stageExecute else: stageModify
+
+proc getTopContext*(chain: ContextChain): CommandContext =
+  if chain.modifiers.len == 0: chain.execute else: chain.modifiers[0]
+
+proc nextStage*(chain: ContextChain): nil ContextChain =
+  if chain.modifiers.len > 0:
+    return newContextChain(chain.modifiers[1 ..< chain.modifiers.len], chain.execute)
+  nil
+
+# ---- CommandContextBuilder ----------------------------------------------------------------------------------------
+
+proc newCommandContextBuilder*(tree: Tree; source: CommandSource; root: NodeId; start: int): CommandContextBuilder =
+  CommandContextBuilder(tree: tree, source: source, argumentNames: @[], argumentValues: @[], root: root, nodes: @[],
+    range: at(start), child: nil, modifier: keepSource(), forks: false)
+
+proc clone*(b: CommandContextBuilder): CommandContextBuilder =
+  ## `#[derive(Clone)]`: `child` is a `Box`, cloned with it.
+  var childCopy: nil CommandContextBuilder = nil
+  let child = b.child
+  if child != nil:
+    childCopy = clone(child)
+  CommandContextBuilder(tree: b.tree, source: b.source, argumentNames: b.argumentNames,
+    argumentValues: b.argumentValues, root: b.root, nodes: b.nodes, range: b.range, child: childCopy,
+    modifier: b.modifier, forks: b.forks, command: b.command)
+
+proc build*(b: CommandContextBuilder; input: string): CommandContext =
+  var childContext: nil CommandContext = nil
+  let child = b.child
+  if child != nil:
+    childContext = build(child, input)
+  CommandContext(source: b.source, input: input, argumentNames: b.argumentNames, argumentValues: b.argumentValues,
+    tree: b.tree, root: b.root, nodes: b.nodes, range: b.range, child: childContext, modifier: b.modifier,
+    forks: b.forks, command: b.command)
+
+proc withArgument*(b: CommandContextBuilder; name: string; argument: ParsedArgument) =
+  var i = 0
+  while i < b.argumentNames.len:
+    if b.argumentNames[i] == name:
+      b.argumentValues[i] = argument
+      return
+    inc i
+  b.argumentNames.add(name)
+  b.argumentValues.add(argument)
+
+proc withCommand*(b: CommandContextBuilder; command: CommandExecutor) =
+  b.command = command
+
+proc nodeAt*(t: Tree; id: NodeId): AttachedNode {.inline.} =
+  ## `Index<NodeId> for Tree`.
+  t.nodes[id - 1]
+
+proc withNode*(b: CommandContextBuilder; node: NodeId; range: StringRange) =
+  b.nodes.add(ParsedNode(node: node, range: range))
+  b.range = encompass(b.range, range)
+  let n = nodeAt(b.tree, node)
+  b.modifier = n.modifier
+  b.forks = n.forks
+
+proc withChild*(b: CommandContextBuilder; child: CommandContextBuilder) =
+  b.child = child
+
+proc lastChild*(b: CommandContextBuilder): CommandContextBuilder =
+  var current = b
+  while true:
+    let next = current.child
+    if next == nil:
+      return current
+    current = next
+
+proc findSuggestionContext*(b: CommandContextBuilder; cursor: int): SuggestionContext =
+  assert b.range.start <= cursor, "Could not find node before cursor"
+  if b.range.`end` < cursor:
+    let child = b.child
+    if child != nil:
+      return findSuggestionContext(child, cursor)
+    if b.nodes.len > 0:
+      let last = b.nodes[b.nodes.len - 1]
+      return SuggestionContext(parent: last.node, startingPosition: last.range.`end` + 1)
+    return SuggestionContext(parent: b.root, startingPosition: b.range.start)
+  var previous = b.root
+  for node in b.nodes:
+    if cursor >= node.range.start and cursor <= node.range.`end`:
+      return SuggestionContext(parent: previous, startingPosition: node.range.start)
+    previous = node.node
+  SuggestionContext(parent: previous, startingPosition: b.range.start)
+
+# ---- AttachedNode -------------------------------------------------------------------------------------------------
+
+proc nodeName*(n: AttachedNode): string =
+  case n.kind
+  of nkRoot: ""
+  of nkLiteral, nkCommand: n.literal
+  of nkArgument: n.name
+
+proc usageText*(n: AttachedNode): string =
+  case n.kind
+  of nkRoot: ""
+  of nkLiteral, nkCommand: n.literal
+  of nkArgument: "<" & n.name & ">"
+
+proc parseLiteral*(reader: var StringReader; literal: string; endOut: var int): bool =
+  ## `parse_literal`; false for `CouldNotParseLiteral`.
+  let start = cursor(reader)
+  let len = literal.len
+  if canReadBytes(reader, len):
+    let endPos = start + len
+    if reader.str[start ..< endPos] == literal:
+      setCursor(reader, endPos)
+      let p = peek(reader)
+      if p == int32(ord(' ')) or p == NoChar:
+        endOut = endPos
+        return true
+      setCursor(reader, start)
+  false
+
+proc isValidInput*(n: AttachedNode; input: string): bool =
+  case n.kind
+  of nkRoot:
+    false
+  of nkLiteral, nkCommand:
+    var reader = newStringReader(input)
+    var e = 0
+    parseLiteral(reader, n.literal, e)
+  of nkArgument:
+    var reader = newStringReader(input)
+    let at0 = n.argumentType
+    if at0 == nil:
+      return false
+    let parsed = at0.parseProc(reader)
+    if parsed.isOk:
+      let p = peek(reader)
+      p == int32(ord(' ')) or p == NoChar
+    else:
+      false
+
+proc examplesOf*(n: AttachedNode): seq[string] =
+  var res: seq[string] = @[]
+  case n.kind
+  of nkRoot:
+    discard
+  of nkLiteral, nkCommand:
+    res.add(n.literal)
+  of nkArgument:
+    let at0 = n.argumentType
+    if at0 != nil:
+      res = at0.examples
+  res
+
+# ---- Tree ---------------------------------------------------------------------------------------------------------
+
+proc newTree*(): Tree =
+  let root = AttachedNode(kind: nkRoot, globalId: newGlobalNodeId(), requirements: @[], modifier: keepSource(),
+    forks: false, childNames: @[], childIds: @[], hasRedirect: false, argumentType: nil)
+  result = Tree(nodes: @[root], idsMap: initTable[uint64, NodeId](), commandNodeMappings: initTable[string, NodeId]())
+  result.idsMap[root.globalId] = RootNodeId
+
+proc size*(t: Tree): int = t.nodes.len
+
+proc childByName(n: AttachedNode; name: string): NodeId =
+  var i = 0
+  while i < n.childNames.len:
+    if n.childNames[i] == name:
+      return n.childIds[i]
+    inc i
+  0
+
+proc insertChild(n: AttachedNode; name: string; id: NodeId) =
+  var i = 0
+  while i < n.childNames.len:
+    if n.childNames[i] == name:
+      n.childIds[i] = id
+      return
+    inc i
+  n.childNames.add(name)
+  n.childIds.add(id)
+
+proc attach(t: Tree; node: DetachedNode): NodeId =
+  var names: seq[string] = @[]
+  var ids: seq[NodeId] = @[]
+  for child in node.children:
+    let childId = attach(t, child)
+    names.add(if child.kind == nkArgument: child.name else: child.literal)
+    ids.add(childId)
+  let attached = AttachedNode(kind: node.kind, globalId: node.globalId, requirements: node.requirements,
+    modifier: node.modifier, forks: node.forks, command: node.command, childNames: names, childIds: ids,
+    hasRedirect: node.hasRedirect, redirect: node.redirect, literal: node.literal,
+    literalLowercase: node.literalLowercase, description: node.description, name: node.name,
+    argumentType: node.argumentType, suggestionProvider: node.suggestionProvider)
+  let localId = t.nodes.len + 1
+  t.nodes.add(attached)
+  t.idsMap[attached.globalId] = localId
+  localId
+
+proc addAttachedChild(t: Tree; parent, node: NodeId) =
+  assert parent == RootNodeId or nodeAt(t, node).kind != nkCommand,
+    "Cannot add a CommandAttachedNode as a child of a non-root node"
+  let n = nodeAt(t, node)
+  let name = nodeName(n)
+  let existing = childByName(nodeAt(t, parent), name)
+  if existing != 0:
+    # Merge onto the child.
+    if n.command != nil:
+      nodeAt(t, existing).command = n.command
+    for grandchild in n.childIds:
+      addAttachedChild(t, existing, grandchild)
+  else:
+    insertChild(nodeAt(t, parent), name, node)
+
+proc addChildToRoot*(t: Tree; node: DetachedNode): NodeId =
+  assert node.kind == nkCommand, "Only a command node can be added to the root"
+  let name = node.literal
+  let id = attach(t, node)
+  addAttachedChild(t, RootNodeId, id)
+  t.commandNodeMappings[name] = id
+  id
+
+proc canAddChild*(parent: NodeId; node: DetachedNode): bool =
+  parent == RootNodeId or node.kind != nkCommand
+
+proc addChild*(t: Tree; parent: NodeId; node: DetachedNode): NodeId =
+  assert canAddChild(parent, node), "Cannot add a CommandDetachedNode as a child of a non-root node"
+  let id = attach(t, node)
+  addAttachedChild(t, parent, id)
+  id
+
+proc getChildren*(t: Tree; node: NodeId): seq[NodeId] =
+  nodeAt(t, node).childIds
+
+proc getRootChildren*(t: Tree): seq[NodeId] =
+  nodeAt(t, RootNodeId).childIds
+
+proc canUse*(t: Tree; node: NodeId; source: CommandSource): bool =
+  evaluateRequirements(nodeAt(t, node).requirements, source)
+
+proc findAmbiguities*(t: Tree; node: NodeId; consumer: AmbiguityConsumer) =
+  var matches: seq[string] = @[]
+  for child in getChildren(t, node):
+    for sibling in getChildren(t, node):
+      if child == sibling:
+        continue
+      for input in examplesOf(nodeAt(t, child)):
+        if isValidInput(nodeAt(t, sibling), input) and input notin matches:
+          matches.add(input)
+      if matches.len > 0:
+        consumer(t, node, child, sibling, matches)
+        matches = @[]
+    findAmbiguities(t, child, consumer)
+
+proc isCommandNode*(t: Tree; node: NodeId): bool =
+  nodeAt(t, node).kind == nkCommand
+
+proc getRelevantNodes*(t: Tree; reader: var StringReader; node: NodeId): seq[NodeId] =
+  var literals: seq[NodeId] = @[]
+  var commandsL: seq[NodeId] = @[]
+  var arguments: seq[NodeId] = @[]
+  for child in getChildren(t, node):
+    case nodeAt(t, child).kind
+    of nkRoot: discard
+    of nkLiteral: literals.add(child)
+    of nkCommand: commandsL.add(child)
+    of nkArgument: arguments.add(child)
+  # Priority order: 1. Commands > Literals  2. Arguments
+  if literals.len > 0 or commandsL.len > 0:
+    let cur = cursor(reader)
+    readUntilSpace(reader)
+    let newCursor = cursor(reader)
+    setCursor(reader, cur)
+    let word = reader.str[cur ..< newCursor]
+    for c in commandsL:
+      if nodeAt(t, c).literal == word:
+        return @[c]
+    for l in literals:
+      if nodeAt(t, l).literal == word:
+        return @[l]
+  arguments
+
+proc parseNode*(t: Tree; nodeId: NodeId; reader: var StringReader; builder: CommandContextBuilder): CmdVoidResult =
+  ## `Tree::parse`.
+  let n = nodeAt(t, nodeId)
+  case n.kind
+  of nkRoot:
+    discard
+  of nkLiteral, nkCommand:
+    let start = cursor(reader)
+    var e = 0
+    if not parseLiteral(reader, n.literal, e):
+      return cmdFailVoid(create(literalIncorrect(), reader, text(n.literal)))
+    withNode(builder, nodeId, between(start, e))
+  of nkArgument:
+    let start = cursor(reader)
+    let at0 = n.argumentType
+    if at0 == nil:
+      return cmdOkVoid()
+    let parsed =
+      if at0.parseWithSourceProc != nil: at0.parseWithSourceProc(reader, builder.source)
+      else: at0.parseProc(reader)
+    if not parsed.isOk:
+      return cmdFailVoid(parsed.error)
+    let range = between(start, cursor(reader))
+    withArgument(builder, n.name, parsedArgument(range, parsed.value))
+    withNode(builder, nodeId, range)
+  cmdOkVoid()
+
+proc resolve*(t: Tree; redirect: Redirection): NodeId =
+  ## `resolve`; 0 for `None`. `Local` keeps upstream's strict `<`: the newest node in a tree cannot be a local target.
+  case redirect.kind
+  of rdRoot:
+    RootNodeId
+  of rdGlobal:
+    getOrDefault(t.idsMap, redirect.global, 0)
+  of rdLocal:
+    if redirect.local < size(t): redirect.local else: 0
+
+proc getCommand*(t: Tree; name: string): NodeId =
+  ## `Tree::get`; 0 for `None`.
+  getOrDefault(t.commandNodeMappings, name, 0)

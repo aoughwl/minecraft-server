@@ -1,0 +1,116 @@
+## Builds the `CCommands` packet: the fallback dispatcher's trees for this player, then the node dispatcher's tree.
+## Port of pumpkin/src/command/client_suggestions.rs
+## PARTIAL: pumpkin/src/command/client_suggestions.rs - `send_bedrock_commands_packet` and its overload builders are not ported: `pumpkin_protocol::bedrock` has no `CAvailableCommands` here yet.
+##
+## Upstream's `send_c_commands_packet` enqueues the packet; `buildCCommands` returns it and the network code writes it.
+## As upstream does, the node tree goes out in full whatever the player may use (`satisfies_requirements` is always
+## true), and only fallback commands are filtered by permission.
+
+import std/[options, tables]
+import ../protocol/java/client/play/commands
+import ../protocol/varint
+import cmdsource, cmdtree, cmddispatch, fallbackdispatch
+
+type
+  ProtoNodeBuilder = ref object
+    childNodes: seq[ProtoNodeBuilder]
+    nodeType: ProtoNodeType
+
+proc buildInto(b: ProtoNodeBuilder; buffer: var seq[ProtoNode]): int =
+  var children: seq[VarInt] = @[]
+  for node in b.childNodes:
+    children.add(newVarInt(int32(buildInto(node, buffer))))
+  let i = buffer.len
+  buffer.add(ProtoNode(children: children, nodeType: b.nodeType))
+  i
+
+proc nodesToProtoNodeBuilders(sender: CommandSender; nodes: seq[Node]; children: seq[int];
+                              isExecutable: var bool): seq[ProtoNodeBuilder] =
+  var childNodes: seq[ProtoNodeBuilder] = @[]
+  isExecutable = false
+  for i in children:
+    let node = nodes[i]
+    case node.kind
+    of lnArgument:
+      var nodeExecutable = false
+      let nodeChildren = nodesToProtoNodeBuilders(sender, nodes, node.children, nodeExecutable)
+      let consumer = node.consumer
+      childNodes.add(ProtoNodeBuilder(childNodes: nodeChildren, nodeType: ProtoNodeType(kind: pnkArgument,
+        name: node.name, isExecutable: nodeExecutable, redirectTarget: none[int32](), restricted: false,
+        parser: consumer.clientParser, overrideSuggestionType: consumer.overrideSuggestion)))
+    of lnLiteral:
+      var nodeExecutable = false
+      let nodeChildren = nodesToProtoNodeBuilders(sender, nodes, node.children, nodeExecutable)
+      childNodes.add(ProtoNodeBuilder(childNodes: nodeChildren, nodeType: ProtoNodeType(kind: pnkLiteral,
+        name: node.str, isExecutable: nodeExecutable, redirectTarget: none[int32](), restricted: false,
+        parser: ArgumentType(kind: atBool), overrideSuggestionType: none[SuggestionProviders]())))
+    of lnExecuteLeaf:
+      isExecutable = true
+    of lnRequire:
+      let p = node.predicate
+      if p(sender):
+        var nodeExecutable = false
+        let nodeChildren = nodesToProtoNodeBuilders(sender, nodes, node.children, nodeExecutable)
+        if nodeExecutable:
+          isExecutable = true
+        for c in nodeChildren:
+          childNodes.add(c)
+  childNodes
+
+proc resolveNodeId(nodeId: NodeId; nodeIdOffset, rootNodeIndex: int): int =
+  const FirstNonrootId = 2
+  if nodeId == RootNodeId:
+    rootNodeIndex
+  else:
+    nodeIdOffset + nodeId - FirstNonrootId
+
+proc buildCCommands*(sender: CommandSender; server: nil CommandServer; dispatcher: CommandDispatcher): CCommands =
+  var firstLevel: seq[ProtoNodeBuilder] = @[]
+  let fallback = dispatcher.fallbackDispatcher
+  for key in fallback.commandKeys:
+    var tree = newCommandTree([key], "")
+    if not getTree(fallback, key, tree).isOk:
+      continue
+    if not fallback.permissions.hasKey(key):
+      continue
+    if not hasPermission(sender, server, permissionOf(fallback, key)):
+      continue
+    var isExecutable = false
+    let childNodes = nodesToProtoNodeBuilders(sender, tree.nodes, tree.children, isExecutable)
+    firstLevel.add(ProtoNodeBuilder(childNodes: childNodes, nodeType: ProtoNodeType(kind: pnkLiteral, name: key,
+      isExecutable: isExecutable, redirectTarget: none[int32](), restricted: false, parser: ArgumentType(kind: atBool),
+      overrideSuggestionType: none[SuggestionProviders]())))
+  let root = ProtoNodeBuilder(childNodes: firstLevel, nodeType: ProtoNodeType(kind: pnkRoot,
+    redirectTarget: none[int32](), parser: ArgumentType(kind: atBool), overrideSuggestionType: none[SuggestionProviders]()))
+  var protoNodes: seq[ProtoNode] = @[]
+  let rootNodeIndex = buildInto(root, protoNodes)
+  let nodeIdOffset = protoNodes.len
+  var rootNodeChildrenSecond: seq[VarInt] = @[]
+  for node in dispatcher.tree.nodes:
+    var children: seq[VarInt] = @[]
+    for id in node.childIds:
+      children.add(newVarInt(int32(resolveNodeId(id, nodeIdOffset, rootNodeIndex))))
+    var redirectTarget = none[int32]()
+    if node.hasRedirect:
+      let target = resolve(dispatcher.tree, node.redirect)
+      if target != 0:
+        redirectTarget = some(int32(resolveNodeId(target, nodeIdOffset, rootNodeIndex)))
+    case node.kind
+    of nkRoot:
+      rootNodeChildrenSecond = children
+    of nkLiteral, nkCommand:
+      protoNodes.add(ProtoNode(children: children, nodeType: ProtoNodeType(kind: pnkLiteral, name: node.literal,
+        isExecutable: node.command != nil, redirectTarget: redirectTarget, restricted: false,
+        parser: ArgumentType(kind: atBool), overrideSuggestionType: none[SuggestionProviders]())))
+    of nkArgument:
+      let argType = node.argumentType
+      if argType != nil:
+        protoNodes.add(ProtoNode(children: children, nodeType: ProtoNodeType(kind: pnkArgument, name: node.name,
+          isExecutable: node.command != nil, parser: argType.clientParser,
+          overrideSuggestionType:
+            (if node.suggestionProvider != nil: some(spAskServer) else: argType.overrideSuggestion),
+          redirectTarget: redirectTarget, restricted: false)))
+  if rootNodeChildrenSecond.len > 0:
+    for c in rootNodeChildrenSecond:
+      protoNodes[rootNodeIndex].children.add(c)
+  CCommands(nodes: protoNodes, rootNodeIndex: newVarInt(int32(rootNodeIndex)))

@@ -1,0 +1,447 @@
+## The legacy argument consumers.
+## Port of pumpkin/src/command/args/message.rs
+## Port of pumpkin/src/command/args/gamemode.rs
+## Port of pumpkin/src/command/args/simple.rs
+## Port of pumpkin/src/command/args/bool.rs
+## Port of pumpkin/src/command/args/players.rs
+## Port of pumpkin/src/command/args/entities.rs
+## Port of pumpkin/src/command/args/time.rs
+## PARTIAL: pumpkin/src/command/args/entities.rs - `EntityFilter` carries the kinds `from_str` can produce (upstream's own numeric filters are never built); `nbt` is parsed as upstream's `NbtCompound::default()`, so it filters nothing there either.
+##
+## `server.select_players` and `select_entities` are the `selectPlayers` and `selectEntities` hooks.
+
+import std/[math, options, strutils]
+import ../protocol/java/client/play/commands
+import ../util/text/textbase, ../util/text/text
+import ../util/uuid, ../util/gamemode
+import ../generated/[translation, entity_type]
+import cmderrors, string_reader, cmdsource, fallbackdispatch
+
+proc newMsgArgConsumer*(): ArgumentConsumer =
+  ArgumentConsumer(clientParser: ArgumentType(kind: atString, behavior: spGreedyPhrase),
+    overrideSuggestion: none[SuggestionProviders](), defaultName: "msg",
+    consume: proc(sender: CommandSender; server: nil CommandServer; args: var RawArgs; res: var Arg): bool {.closure.} =
+      var word = RawArg()
+      if not popRaw(args, word):
+        return false
+      var msg = word.value
+      while popRaw(args, word):
+        msg.add(' ')
+        msg.add(word.value)
+      res = Arg(kind: akMsg, str: msg)
+      true)
+
+proc parseGamemodeArg(s: string; mode: var GameMode): bool =
+  ## An `i8` id first, then the name.
+  var v = 0'i64
+  var i = 0
+  var neg = false
+  if s.len > 0 and (s[0] == '-' or s[0] == '+'):
+    neg = s[0] == '-'
+    i = 1
+  var numeric = i < s.len
+  while numeric and i < s.len:
+    if s[i] < '0' or s[i] > '9' or v > 128'i64:
+      numeric = false
+    else:
+      v = v * 10'i64 + int64(ord(s[i]) - ord('0'))
+    inc i
+  if numeric:
+    let id = if neg: -v else: v
+    if id == 0'i64:
+      mode = Survival
+      return true
+    if id == 1'i64:
+      mode = Creative
+      return true
+    if id == 2'i64:
+      mode = Adventure
+      return true
+    if id == 3'i64:
+      mode = Spectator
+      return true
+  let (ok, g) = parseGameMode(s)
+  if ok:
+    mode = g
+  ok
+
+proc newGamemodeArgumentConsumer*(): ArgumentConsumer =
+  ArgumentConsumer(clientParser: ArgumentType(kind: atGamemode), overrideSuggestion: none[SuggestionProviders](),
+    defaultName: "gamemode",
+    consume: proc(sender: CommandSender; server: nil CommandServer; args: var RawArgs; res: var Arg): bool {.closure.} =
+      var raw = RawArg()
+      if not popRaw(args, raw):
+        return false
+      var mode = Survival
+      if parseGamemodeArg(raw.value, mode):
+        res = Arg(kind: akGameMode, gameMode: mode)
+        true
+      else:
+        false)
+
+proc newSimpleArgConsumer*(): ArgumentConsumer =
+  ArgumentConsumer(clientParser: ArgumentType(kind: atString, behavior: spSingleWord),
+    overrideSuggestion: none[SuggestionProviders](),
+    consume: proc(sender: CommandSender; server: nil CommandServer; args: var RawArgs; res: var Arg): bool {.closure.} =
+      var raw = RawArg()
+      if not popRaw(args, raw):
+        return false
+      res = Arg(kind: akSimple, str: raw.value)
+      true)
+
+proc newBoolArgConsumer*(): ArgumentConsumer =
+  ArgumentConsumer(clientParser: ArgumentType(kind: atBool), overrideSuggestion: none[SuggestionProviders](),
+    consume: proc(sender: CommandSender; server: nil CommandServer; args: var RawArgs; res: var Arg): bool {.closure.} =
+      var raw = RawArg()
+      if not popRaw(args, raw):
+        return false
+      if raw.value == "false":
+        res = Arg(kind: akBool, boolean: false)
+        true
+      elif raw.value == "true":
+        res = Arg(kind: akBool, boolean: true)
+        true
+      else:
+        false)
+
+proc newTimeArgumentConsumer*(): ArgumentConsumer =
+  ArgumentConsumer(clientParser: ArgumentType(kind: atTime, min: 0'i32), overrideSuggestion: none[SuggestionProviders](),
+    defaultName: "time",
+    consume: proc(sender: CommandSender; server: nil CommandServer; args: var RawArgs; res: var Arg): bool {.closure.} =
+      var raw = RawArg()
+      if not popRaw(args, raw):
+        return false
+      let s = raw.value
+      var pos = -1
+      var i = 0
+      while i < s.len:
+        if (s[i] >= 'a' and s[i] <= 'z') or (s[i] >= 'A' and s[i] <= 'Z'):
+          pos = i
+          break
+        inc i
+      let numStr = if pos >= 0: s[0 ..< pos] else: s
+      let unit = if pos >= 0: s[pos ..< s.len] else: "t"
+      var number = 0.0
+      if not parseF64Checked(numStr, number):
+        return false
+      if float32(number) < 0.0'f32:
+        return false
+      var ticks = float32(number)
+      if unit == "d":
+        ticks = ticks * 24000.0'f32
+      elif unit == "s":
+        ticks = ticks * 20.0'f32
+      elif unit != "t":
+        return false
+      res = Arg(kind: akTime, time: int32(round(ticks)))
+      true)
+
+proc findTime*(args: ConsumedArgs; name: string; res: var int32): bool =
+  var a = Arg()
+  if findArg(args, name, a) and a.kind == akTime:
+    res = a.time
+    return true
+  false
+
+# ---- args/entities.rs ---------------------------------------------------------------------------------------------
+
+type
+  TargetSelectorParseError* = object
+    message*: string
+    cursor*: int
+
+proc entityFilterFromStr(s: string; f: var EntityFilter; err: var string): bool =
+  let eq = s.find('=')
+  if eq < 0:
+    err = "Missing value in entity filter"
+    return false
+  let key = s[0 ..< eq]
+  var value = s[eq + 1 ..< s.len]
+  let negate = value.startsWith("!")
+  if negate:
+    value = value[1 ..< value.len]
+  if key == "type":
+    let name = if value.startsWith("minecraft:"): value[10 ..< value.len] else: value
+    if fromName(EntityType, name).isNone:
+      err = "Invalid entity type " & value
+      return false
+    f = EntityFilter(kind: efkType, negate: negate, value: name)
+  elif key == "limit":
+    var v = 0'u64
+    if value.len == 0:
+      err = "Invalid limit value"
+      return false
+    for c in value:
+      if c < '0' or c > '9':
+        err = "Invalid limit value"
+        return false
+      v = v * 10'u64 + uint64(ord(c) - ord('0'))
+    if negate:
+      err = "Negation of limit is not allowed"
+      return false
+    f = EntityFilter(kind: efkLimit, limit: v)
+  elif key == "sort":
+    var sort = efsArbitrary
+    if value == "arbitrary": sort = efsArbitrary
+    elif value == "nearest": sort = efsNearest
+    elif value == "furthest": sort = efsFurthest
+    elif value == "random": sort = efsRandom
+    else:
+      err = "Invalid sort type " & value
+      return false
+    if negate:
+      err = "Negation of sort is not allowed"
+      return false
+    f = EntityFilter(kind: efkSort, sort: sort)
+  elif key == "name":
+    f = EntityFilter(kind: efkName, negate: negate, value: value)
+  elif key == "tag":
+    f = EntityFilter(kind: efkTag, negate: negate, value: value)
+  elif key == "team":
+    f = EntityFilter(kind: efkTeam, negate: negate, value: value)
+  elif key == "scores":
+    f = EntityFilter(kind: efkScore)
+  elif key == "advancements" or key == "predicate":
+    f = EntityFilter(kind: efkSort, sort: efsArbitrary)
+  elif key == "nbt":
+    f = EntityFilter(kind: efkNbt)
+  else:
+    err = "Unimplemented key: " & key
+    return false
+  true
+
+proc newTargetSelector*(t: EntitySelectorType): TargetSelector =
+  var conditions: seq[EntityFilter] = @[]
+  case t
+  of estSource:
+    conditions.add(EntityFilter(kind: efkLimit, limit: 1'u64))
+  of estNearestPlayer, estNearestEntity:
+    conditions.add(EntityFilter(kind: efkSort, sort: efsNearest))
+    conditions.add(EntityFilter(kind: efkLimit, limit: 1'u64))
+  of estRandomPlayer:
+    conditions.add(EntityFilter(kind: efkSort, sort: efsRandom))
+    conditions.add(EntityFilter(kind: efkLimit, limit: 1'u64))
+  of estNamedPlayer, estUuid:
+    conditions.add(EntityFilter(kind: efkLimit, limit: 1'u64))
+  of estAllPlayers, estAllEntities:
+    discard
+  TargetSelector(selectorType: t, conditions: conditions)
+
+proc includesEntities*(s: TargetSelector): bool =
+  result = s.selectorType == estAllEntities or s.selectorType == estNearestEntity
+  for c in s.conditions:
+    if c.kind == efkType:
+      if not c.negate:
+        result = c.value != "player"
+      elif c.value == "player":
+        result = true
+
+proc getSort*(s: TargetSelector; sort: var EntityFilterSort): bool =
+  var i = s.conditions.len - 1
+  while i >= 0:
+    if s.conditions[i].kind == efkSort:
+      sort = s.conditions[i].sort
+      return true
+    dec i
+  false
+
+proc getLimit*(s: TargetSelector): uint64 =
+  var i = s.conditions.len - 1
+  while i >= 0:
+    if s.conditions[i].kind == efkLimit:
+      return s.conditions[i].limit
+    dec i
+  high(uint64)
+
+proc parseSelectorFilter(selector: var TargetSelector; rawFilter: string; filterOffset: int;
+                         err: var TargetSelectorParseError): bool =
+  let trimmed = strip(rawFilter)
+  if trimmed.len == 0:
+    return true
+  var localStart = 0
+  while localStart < rawFilter.len and rawFilter[localStart] in {' ', '\t', '\n', '\r'}:
+    inc localStart
+  var f = EntityFilter(kind: efkNbt)
+  var message = ""
+  if not entityFilterFromStr(trimmed, f, message):
+    err = TargetSelectorParseError(message: message, cursor: filterOffset + localStart)
+    return false
+  selector.conditions.add(f)
+  true
+
+proc parseTargetSelector*(arg: string; selector: var TargetSelector; err: var TargetSelectorParseError): bool =
+  if not arg.startsWith("@"):
+    let (ok, id) = parseStr(arg)
+    if ok:
+      selector = newTargetSelector(estUuid)
+      selector.uuid = id
+    else:
+      selector = newTargetSelector(estNamedPlayer)
+      selector.name = arg
+    return true
+  let bracket = arg.find('[')
+  let typeEnd = if bracket >= 0: bracket else: arg.len
+  let typeStr = arg[0 ..< typeEnd]
+  var t = estSource
+  if typeStr == "@a": t = estAllPlayers
+  elif typeStr == "@e": t = estAllEntities
+  elif typeStr == "@s": t = estSource
+  elif typeStr == "@p": t = estNearestPlayer
+  elif typeStr == "@r": t = estRandomPlayer
+  elif typeStr == "@n": t = estNearestEntity
+  else:
+    err = TargetSelectorParseError(message: "Invalid target selector type " & typeStr, cursor: max(typeEnd - 1, 0))
+    return false
+  selector = newTargetSelector(t)
+  if typeEnd == arg.len:
+    return true
+  if not arg.endsWith("]"):
+    err = TargetSelectorParseError(message: "Target selector must end with ]", cursor: arg.len)
+    return false
+  let content = arg[typeEnd + 1 ..< arg.len - 1]
+  var filterStart = 0
+  var curlyDepth = 0
+  var i = 0
+  while i < content.len:
+    let c = content[i]
+    if c == '{':
+      inc curlyDepth
+    elif c == '}':
+      dec curlyDepth
+    elif c == ',' and curlyDepth == 0:
+      if not parseSelectorFilter(selector, content[filterStart ..< i], typeEnd + 1 + filterStart, err):
+        return false
+      filterStart = i + 1
+    inc i
+  parseSelectorFilter(selector, content[filterStart ..< content.len], typeEnd + 1 + filterStart, err)
+
+proc syntaxErrorForArgWithCursor(raw: RawArg; message: TextComponent; localCursor: int): CommandSyntaxError =
+  var clamped = min(localCursor, raw.value.len)
+  while clamped > 0 and clamped < raw.value.len and (uint8(raw.value[clamped]) and 0xC0'u8) == 0x80'u8:
+    dec clamped
+  syntaxErrorWith(dispatcherUnknownArgument(), message,
+    CommandSyntaxErrorContext(input: raw.input, cursor: raw.start + clamped))
+
+proc parseTargetSelectorWithContext*(raw: RawArg; selector: var TargetSelector): CmdVoidResult =
+  var err = TargetSelectorParseError()
+  if parseTargetSelector(raw.value, selector, err):
+    return cmdOkVoid()
+  cmdFailVoid(syntaxErrorForArgWithCursor(raw,
+    translateCross(JAVA_ARGUMENT_ENTITY_INVALID, JAVA_ARGUMENT_ENTITY_INVALID), err.cursor))
+
+proc ensurePlayerOnlySelector*(selector: TargetSelector; raw: RawArg): CmdVoidResult =
+  if includesEntities(selector):
+    cmdFailVoid(syntaxErrorForArgWithCursor(raw,
+      translateCross(JAVA_ARGUMENT_PLAYER_ENTITIES, JAVA_ARGUMENT_PLAYER_ENTITIES), 0))
+  else:
+    cmdOkVoid()
+
+proc selectEntitiesOf(server: nil CommandServer; selector: TargetSelector; sender: CommandSender): seq[CommandEntity] =
+  var none0: seq[CommandEntity] = @[]
+  if server != nil and server.selectEntities != nil:
+    return server.selectEntities(selector, sender)
+  none0
+
+proc selectPlayersOf(server: nil CommandServer; selector: TargetSelector; sender: CommandSender): seq[CommandPlayer] =
+  var none0: seq[CommandPlayer] = @[]
+  if server != nil and server.selectPlayers != nil:
+    return server.selectPlayers(selector, sender)
+  none0
+
+proc newEntitiesArgumentConsumer*(): ArgumentConsumer =
+  ArgumentConsumer(clientParser: ArgumentType(kind: atEntity, flags: 0'u8),
+    overrideSuggestion: none[SuggestionProviders](), defaultName: "targets",
+    consume: proc(sender: CommandSender; server: nil CommandServer; args: var RawArgs; res: var Arg): bool {.closure.} =
+      var raw = RawArg()
+      if not popRaw(args, raw):
+        return false
+      var selector = newTargetSelector(estSource)
+      var err = TargetSelectorParseError()
+      if not parseTargetSelector(raw.value, selector, err):
+        return false
+      res = Arg(kind: akEntities, entities: selectEntitiesOf(server, selector, sender))
+      true,
+    consumeWithSyntax: proc(sender: CommandSender; server: nil CommandServer; args: var RawArgs; res: var Arg;
+                            found: var bool): CmdVoidResult {.closure.} =
+      var raw = RawArg()
+      found = false
+      if not popRaw(args, raw):
+        return cmdOkVoid()
+      var selector = newTargetSelector(estSource)
+      let p = parseTargetSelectorWithContext(raw, selector)
+      if not p.isOk:
+        return p
+      res = Arg(kind: akEntities, entities: selectEntitiesOf(server, selector, sender))
+      found = true
+      cmdOkVoid())
+
+proc newPlayersArgumentConsumer*(): ArgumentConsumer =
+  ArgumentConsumer(clientParser: ArgumentType(kind: atEntity, flags: EntityFlagPlayersOnly),
+    overrideSuggestion: none[SuggestionProviders](), defaultName: "target",
+    consume: proc(sender: CommandSender; server: nil CommandServer; args: var RawArgs; res: var Arg): bool {.closure.} =
+      var raw = RawArg()
+      if not popRaw(args, raw):
+        return false
+      let s = raw.value
+      var players: seq[CommandPlayer] = @[]
+      if s == "@s" or s == "@n" or s == "@p":
+        if sender.kind == cskPlayer:
+          players.add(sender.player)
+          res = Arg(kind: akPlayers, players: players)
+          return true
+      if server == nil:
+        return false
+      if s == "@r":
+        if server.getRandomPlayer != nil:
+          let p = server.getRandomPlayer()
+          if p != nil:
+            players.add(p)
+      elif s == "@a" or s == "@e":
+        if server.getAllPlayers != nil:
+          players = server.getAllPlayers()
+      else:
+        if server.getPlayerByName == nil:
+          return false
+        let p = server.getPlayerByName(s)
+        if p == nil:
+          return false
+        players.add(p)
+      res = Arg(kind: akPlayers, players: players)
+      true,
+    consumeWithSyntax: proc(sender: CommandSender; server: nil CommandServer; args: var RawArgs; res: var Arg;
+                            found: var bool): CmdVoidResult {.closure.} =
+      var raw = RawArg()
+      found = false
+      if not popRaw(args, raw):
+        return cmdOkVoid()
+      var selector = newTargetSelector(estSource)
+      let p = parseTargetSelectorWithContext(raw, selector)
+      if not p.isOk:
+        return p
+      let only = ensurePlayerOnlySelector(selector, raw)
+      if not only.isOk:
+        return only
+      res = Arg(kind: akPlayers, players: selectPlayersOf(server, selector, sender))
+      found = true
+      cmdOkVoid())
+
+proc findMsg*(args: ConsumedArgs; name: string; res: var string): bool =
+  var a = Arg()
+  if findArg(args, name, a) and a.kind == akMsg:
+    res = a.str
+    return true
+  false
+
+proc findGameMode*(args: ConsumedArgs; name: string; res: var GameMode): bool =
+  var a = Arg()
+  if findArg(args, name, a) and a.kind == akGameMode:
+    res = a.gameMode
+    return true
+  false
+
+proc findPlayers*(args: ConsumedArgs; name: string; res: var seq[CommandPlayer]): bool =
+  var a = Arg()
+  if findArg(args, name, a) and a.kind == akPlayers:
+    res = a.players
+    return true
+  false

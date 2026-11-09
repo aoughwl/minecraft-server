@@ -1,0 +1,327 @@
+## Tab-completion: a single suggestion, a set of them, and the builder argument types fill in.
+## Port of pumpkin/src/command/suggestion/mod.rs
+## Port of pumpkin/src/command/suggestion/suggestions.rs
+##
+## `suggestion/provider.rs`'s trait is a closure type in cmdtree.aowl, because it takes a `CommandContext`.
+## Upstream builders are moved by value; here `suggest` returns the changed copy, so the chained calls read the same.
+
+import std/[algorithm, assertions, options, strutils]
+import ../util/text/textbase
+import string_range
+
+type
+  SuggestionText* = object
+    ## `Text(String)` or `Integer { cached_text, value }`. Equality looks only at the text, as upstream's does.
+    cachedText*: string
+    isInteger*: bool
+    value*: int32
+
+  Suggestion* = object
+    range*: StringRange
+    text*: SuggestionText
+    tooltip*: Option[TextComponent]
+
+  Suggestions* = object
+    range*: StringRange
+    suggestions*: seq[Suggestion]
+
+  SuggestionsBuilder* = object
+    start*: int
+    input*: string
+    inputLowercase*: string
+    result*: seq[Suggestion]
+
+  TextCoordinates* = enum
+    tcLocal
+    tcGlobal
+
+proc suggestionText*(s: string): SuggestionText =
+  ## `From<String>`: an integer only when it prints back as the same text.
+  var neg = s.len > 0 and s[0] == '-'
+  var i = if neg: 1 else: 0
+  var ok = i < s.len
+  var acc = 0'i64
+  while ok and i < s.len:
+    if s[i] < '0' or s[i] > '9' or acc > 3000000000'i64:
+      ok = false
+    else:
+      acc = acc * 10'i64 + int64(ord(s[i]) - ord('0'))
+    inc i
+  if ok:
+    let v = if neg: -acc else: acc
+    if v >= int64(int32.low) and v <= int64(int32.high) and $v == s:
+      return SuggestionText(cachedText: s, isInteger: true, value: int32(v))
+  SuggestionText(cachedText: s, isInteger: false)
+
+proc suggestionText*(v: int32): SuggestionText =
+  SuggestionText(cachedText: $v, isInteger: true, value: v)
+
+proc `==`*(a, b: SuggestionText): bool = a.cachedText == b.cachedText
+
+proc `==`*(a, b: Option[TextComponent]): bool =
+  if a.isSome != b.isSome:
+    return false
+  if a.isNone:
+    return true
+  a.unsafeGet == b.unsafeGet
+
+proc `==`*(a, b: Suggestion): bool =
+  a.range == b.range and a.text == b.text and a.tooltip == b.tooltip
+
+proc withoutTooltip*(range: StringRange; text: SuggestionText): Suggestion =
+  Suggestion(range: range, text: text, tooltip: none[TextComponent]())
+proc withoutTooltip*(range: StringRange; text: string): Suggestion =
+  withoutTooltip(range, suggestionText(text))
+proc withTooltip*(range: StringRange; text: SuggestionText; tooltip: TextComponent): Suggestion =
+  Suggestion(range: range, text: text, tooltip: some(tooltip))
+
+proc textAsString*(s: Suggestion): string = s.text.cachedText
+
+proc apply*(s: Suggestion; input: string): string =
+  let t = s.text.cachedText
+  if s.range.start == 0 and s.range.`end` == input.len:
+    return t
+  result = input[0 ..< s.range.start]
+  result.add(t)
+  if s.range.`end` < input.len:
+    result.add(input[s.range.`end` ..< input.len])
+
+proc expand*(s: Suggestion; command: string; range: StringRange): Suggestion =
+  if s.range == range:
+    return Suggestion(range: s.range, text: s.text, tooltip: s.tooltip)
+  var res = ""
+  if range.start < s.range.start:
+    res.add(command[range.start ..< s.range.start])
+  res.add(s.text.cachedText)
+  if range.`end` > s.range.`end`:
+    res.add(command[s.range.`end` ..< range.`end`])
+  Suggestion(range: range, text: suggestionText(res), tooltip: s.tooltip)
+
+proc newSuggestions*(range: StringRange; suggestions: seq[Suggestion]): Suggestions =
+  Suggestions(range: range, suggestions: suggestions)
+
+proc emptySuggestions*(): Suggestions =
+  newSuggestions(at(0), @[])
+
+proc isEmpty*(s: Suggestions): bool = s.suggestions.len == 0
+
+proc `==`*(a, b: seq[Suggestion]): bool =
+  ## Written out: the generic seq comparison demands a side-effect-free element comparison, and TextComponent's is not.
+  if a.len != b.len:
+    return false
+  var i = 0
+  while i < a.len:
+    if not (a[i] == b[i]):
+      return false
+    inc i
+  true
+
+proc `==`*(a, b: Suggestions): bool =
+  a.range == b.range and a.suggestions == b.suggestions
+
+proc cmpBytes(a, b: string): int =
+  ## `str::cmp`: byte order, which is what `Ord` for str is on UTF-8.
+  var i = 0
+  while i < a.len and i < b.len:
+    if a[i] != b[i]:
+      return (if uint8(a[i]) < uint8(b[i]): -1 else: 1)
+    inc i
+  if a.len < b.len: -1 elif a.len > b.len: 1 else: 0
+
+proc sortSuggestions(suggestions: seq[Suggestion]): seq[Suggestion] =
+  var texts: seq[(string, Suggestion)] = @[]
+  var ints: seq[Suggestion] = @[]
+  for s in suggestions:
+    if s.text.isInteger:
+      ints.add(s)
+    else:
+      texts.add((toLowerAscii(s.text.cachedText), s))
+  # Both sorts are stable here. Upstream's integer sort is unstable, but the texts are unique by then.
+  sort(texts, proc(a, b: (string, Suggestion)): int = cmpBytes(a[0], b[0]))
+  sort(ints, proc(a, b: Suggestion): int =
+    if a.text.value < b.text.value: -1 elif a.text.value > b.text.value: 1 else: 0)
+  result = @[]
+  var ti = 0
+  var ii = 0
+  while ti < texts.len or ii < ints.len:
+    if ti < texts.len and ii < ints.len:
+      # The merge compares the original text with the integer's text, not the lowercase key.
+      if cmpBytes(texts[ti][1].text.cachedText, ints[ii].text.cachedText) <= 0:
+        result.add(texts[ti][1])
+        inc ti
+      else:
+        result.add(ints[ii])
+        inc ii
+    elif ti < texts.len:
+      result.add(texts[ti][1])
+      inc ti
+    else:
+      result.add(ints[ii])
+      inc ii
+
+proc containsSuggestion(list: seq[Suggestion]; s: Suggestion): bool =
+  for x in list:
+    if x == s:
+      return true
+  false
+
+proc createSuggestions*(command: string; suggestions: seq[Suggestion]): Suggestions =
+  if suggestions.len == 0:
+    return emptySuggestions()
+  var range = suggestions[0].range
+  var i = 1
+  while i < suggestions.len:
+    range = encompass(range, suggestions[i].range)
+    inc i
+  var texts: seq[Suggestion] = @[]
+  for s in suggestions:
+    let e = expand(s, command, range)
+    if not containsSuggestion(texts, e):
+      texts.add(e)
+  newSuggestions(range, sortSuggestions(texts))
+
+proc mergeSuggestions*(command: string; input: seq[Suggestions]): Suggestions =
+  if input.len == 0:
+    return emptySuggestions()
+  if input.len == 1:
+    return input[0]
+  var texts: seq[Suggestion] = @[]
+  for group in input:
+    for s in group.suggestions:
+      if not containsSuggestion(texts, s):
+        texts.add(s)
+  createSuggestions(command, texts)
+
+proc coordinate*(t: TextCoordinates): string =
+  case t
+  of tcLocal: "^"
+  of tcGlobal: "~"
+
+proc newSuggestionsBuilder*(input: string; start: int): SuggestionsBuilder =
+  SuggestionsBuilder(start: start, input: input, inputLowercase: toLowerAscii(input), result: @[])
+
+proc remaining*(b: SuggestionsBuilder): string =
+  b.input[min(b.start, b.input.len) ..< b.input.len]
+
+proc remainingLowercase*(b: SuggestionsBuilder): string =
+  b.inputLowercase[min(b.start, b.inputLowercase.len) ..< b.inputLowercase.len]
+
+proc build*(b: SuggestionsBuilder): Suggestions =
+  createSuggestions(b.input, b.result)
+
+proc suggest*(b: SuggestionsBuilder; text: SuggestionText): SuggestionsBuilder =
+  result = b
+  if text.cachedText != remaining(b):
+    result.result.add(withoutTooltip(between(b.start, b.input.len), text))
+
+proc suggest*(b: SuggestionsBuilder; text: string): SuggestionsBuilder =
+  suggest(b, suggestionText(text))
+
+proc suggest*(b: SuggestionsBuilder; value: int32): SuggestionsBuilder =
+  suggest(b, suggestionText(value))
+
+proc suggestWithTooltip*(b: SuggestionsBuilder; text: SuggestionText; tooltip: TextComponent): SuggestionsBuilder =
+  result = b
+  if text.cachedText != remaining(b):
+    result.result.add(withTooltip(between(b.start, b.input.len), text, tooltip))
+
+proc suggestWithTooltip*(b: SuggestionsBuilder; text: string; tooltip: TextComponent): SuggestionsBuilder =
+  suggestWithTooltip(b, suggestionText(text), tooltip)
+
+proc append*(b, other: SuggestionsBuilder): SuggestionsBuilder =
+  result = b
+  for s in other.result:
+    result.result.add(s)
+
+proc createOffset*(b: SuggestionsBuilder; start: int): SuggestionsBuilder =
+  SuggestionsBuilder(start: start, input: b.input, inputLowercase: b.inputLowercase, result: @[])
+
+proc matchesSubstr*(pattern, input: string): bool =
+  var current = input
+  while not current.startsWith(pattern):
+    var pos = -1
+    var i = 0
+    while i < current.len:
+      if current[i] == '.' or current[i] == '_' or current[i] == '/':
+        pos = i
+        break
+      inc i
+    if pos < 0:
+      return false
+    current = current[pos + 1 ..< current.len]
+  true
+
+proc filterAndSuggestOne*(b: SuggestionsBuilder; value: SuggestionText): SuggestionsBuilder =
+  result = b
+  if matchesSubstr(remainingLowercase(b), toLowerAscii(value.cachedText)):
+    result = suggest(b, value)
+
+proc filterAndSuggestOne*(b: SuggestionsBuilder; value: string): SuggestionsBuilder =
+  filterAndSuggestOne(b, suggestionText(value))
+
+proc filterAndSuggest*(b: SuggestionsBuilder; values: openArray[string]): SuggestionsBuilder =
+  ## `filter_and_suggest` and `filter_and_suggest_iter`.
+  result = b
+  for v in values:
+    result = filterAndSuggestOne(result, v)
+
+proc filterAndSuggestLowercase*(b: SuggestionsBuilder; values: seq[string]): SuggestionsBuilder =
+  ## The values are already lowercase, so they are compared as they are.
+  result = b
+  for v in values:
+    if matchesSubstr(remainingLowercase(result), v):
+      result = suggest(result, v)
+
+proc splitSpace(s: string): seq[string] =
+  ## `str::split(' ')`, which keeps empty parts.
+  result = @[]
+  var cur = ""
+  for c in s:
+    if c == ' ':
+      result.add(cur)
+      cur = ""
+    else:
+      cur.add(c)
+  result.add(cur)
+
+proc suggest3dCoordinates*(b: SuggestionsBuilder; suggestions: TextCoordinates;
+                           validator: proc(s: string): bool {.closure.}): Suggestions =
+  var self = b
+  let input = remaining(b)
+  let coord = coordinate(suggestions)
+  if input.len == 0:
+    let full = coord & " " & coord & " " & coord
+    if validator(full):
+      self = filterAndSuggestOne(self, coord)
+      self = filterAndSuggestOne(self, coord & " " & coord)
+      self = filterAndSuggestOne(self, full)
+  else:
+    let parts = splitSpace(input)
+    if parts.len == 1:
+      let full = parts[0] & " " & coord & " " & coord
+      if validator(full):
+        self = filterAndSuggestOne(self, parts[0] & " " & coord)
+        self = filterAndSuggestOne(self, full)
+    elif parts.len == 2:
+      let full = parts[0] & " " & parts[1] & " " & coord
+      if validator(full):
+        self = filterAndSuggestOne(self, full)
+  build(self)
+
+proc suggest2dCoordinates*(b: SuggestionsBuilder; suggestions: TextCoordinates;
+                           validator: proc(s: string): bool {.closure.}): Suggestions =
+  var self = b
+  let input = remaining(b)
+  let coord = coordinate(suggestions)
+  if input.len == 0:
+    let full = coord & " " & coord
+    if validator(full):
+      self = filterAndSuggestOne(self, coord)
+      self = filterAndSuggestOne(self, full)
+  else:
+    let parts = splitSpace(input)
+    if parts.len == 1:
+      let full = parts[0] & " " & coord
+      if validator(full):
+        self = filterAndSuggestOne(self, full)
+  build(self)

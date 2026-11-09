@@ -1,0 +1,778 @@
+## The older command system most commands still use: its tree, its argument consumers and its dispatcher.
+## Port of pumpkin/src/command/dispatcher.rs
+## Port of pumpkin/src/command/tree/mod.rs
+## Port of pumpkin/src/command/tree/builder.rs
+## Port of pumpkin/src/command/tree/format.rs
+## Port of pumpkin/src/command/args/mod.rs
+##
+## Upstream calls this `CommandDispatcher` too and keeps it as the node dispatcher's `fallback_dispatcher`; here it
+## is `FallbackDispatcher`, because the new one's type needs the name.
+## `FxHashMap` of commands keeps insertion order, as in cmdtree.aowl. `ConsumedArgs` is a list of (name, Arg);
+## `Arg` is flat, since a case object cannot repeat a field across branches and several variants share a type.
+
+import std/[algorithm, assertions, options, tables]
+import ../protocol/java/client/play/commands
+import ../util/text/textbase, ../util/text/text, ../util/text/color, ../util/text/click
+import ../util/vector2, ../util/vector3, ../util/gamemode, ../util/difficulty
+import ../util/math/position
+import ../generated/translation
+import cmderrors, string_reader, cmdsource
+
+type
+  RawArg* = object
+    value*: string
+    start*: int
+    `end`*: int
+    input*: string
+
+  RawArgs* = seq[RawArg]
+
+  ArgKind* = enum
+    akEntities
+    akEntity
+    akPlayers
+    akGameProfiles
+    akBlockPos
+    akPos3D
+    akPos2D
+    akRotation
+    akGameMode
+    akDifficulty
+    akCommandTree
+    akItem
+    akItemPredicate
+    akResourceLocation
+    akBlock
+    akBlockPredicate
+    akBossbarColor
+    akBossbarStyle
+    akParticle
+    akMsg
+    akTextComponent
+    akTime
+    akNum
+    akBool
+    akSimple
+    akSoundCategory
+    akDamageType
+    akEffect
+    akEnchantment
+    akAdvancement
+    akEntityAnchor
+    akSlot
+    akSlots
+
+  NumberKind* = enum
+    nkF64
+    nkF32
+    nkI32
+    nkI64
+
+  Number* = object
+    kind*: NumberKind
+    f64*: float64
+    f32*: float32
+    i32*: int32
+    i64*: int64
+
+  Arg* = object
+    ## Each kind uses the field(s) its upstream variant holds. String-holding variants (`Item`, `Block`,
+    ## `ResourceLocation`, `Msg`, `Simple`, `Particle`, `DamageType`, `Effect`, `Enchantment`, `Advancement`,
+    ## `BossbarColor`, `BossbarStyle`, `SoundCategory`) carry the id in `str`; their typed lookups live with the
+    ## data the owner of that registry provides.
+    kind*: ArgKind
+    entities*: seq[CommandEntity]
+    players*: seq[CommandPlayer]
+    gameProfiles*: seq[CmdGameProfile]
+    blockPos*: BlockPos
+    pos3D*: Vector3[float64]
+    pos2D*: Vector2[float64]
+    yaw*: float32
+    yawRelative*: bool
+    pitch*: float32
+    pitchRelative*: bool
+    gameMode*: GameMode
+    difficulty*: Difficulty
+    commandTree*: nil CommandTree
+    str*: string
+    textComponent*: TextComponent
+    time*: int32
+    numInBounds*: bool ## `Num(Err(NotInBounds))` is false.
+    numOverflowLow*: bool
+    num*: Number
+    boolean*: bool
+    anchor*: EntityAnchor
+    slot*: int
+    slots*: seq[int]
+
+  ConsumedArg* = object
+    name*: string
+    arg*: Arg
+
+  ConsumedArgs* = seq[ConsumedArg]
+
+  CommandSuggestionOut* = object
+    ## `pumpkin_protocol::java::client::play::CommandSuggestion`.
+    suggestion*: string
+    tooltip*: Option[TextComponent]
+
+  ArgumentConsumer* = ref object
+    ## `dyn ArgumentConsumer + GetClientSideArgParser`. `consumeWithSyntax` nil means upstream's default, which wraps
+    ## `consume`; `suggestProc` nil gives `Ok(None)`. `suggestProc` returning false means `Ok(None)`.
+    clientParser*: ArgumentType
+    overrideSuggestion*: Option[SuggestionProviders]
+    defaultName*: string
+    consume*: proc(sender: CommandSender; server: nil CommandServer; args: var RawArgs; res: var Arg): bool {.closure.}
+    consumeWithSyntax*: proc(sender: CommandSender; server: nil CommandServer; args: var RawArgs; res: var Arg;
+                             found: var bool): CmdVoidResult {.closure.}
+    suggestProc*: proc(sender: CommandSender; server: nil CommandServer; input: string;
+                       res: var seq[CommandSuggestionOut]): bool {.closure.}
+
+  CommandErrorKind* = enum
+    ceInvalidConsumption
+    ceInvalidRequirement
+    cePermissionDenied
+    ceCommandFailed
+    ceSyntaxError
+
+  CommandError* = object
+    kind*: CommandErrorKind
+    consumption*: Option[string]
+    failed*: TextComponent
+    syntax*: CommandSyntaxError
+
+  CommandResult* = object
+    ## `Result<i32, CommandError>`.
+    isOk*: bool
+    value*: int32
+    error*: CommandError
+
+  FallbackExecutor* = proc(sender: CommandSender; server: nil CommandServer; args: ConsumedArgs): CommandResult {.closure.}
+
+  LegacyNodeKind* = enum
+    lnExecuteLeaf
+    lnLiteral
+    lnArgument
+    lnRequire
+
+  Node* = object
+    children*: seq[int]
+    case kind*: LegacyNodeKind
+    of lnExecuteLeaf:
+      executor*: FallbackExecutor
+    of lnLiteral:
+      str*: string
+    of lnArgument:
+      name*: string
+      consumer*: ArgumentConsumer
+    of lnRequire:
+      predicate*: proc(sender: CommandSender): bool {.closure.}
+
+  CommandTree* = ref object
+    nodes*: seq[Node]
+    children*: seq[int]
+    names*: seq[string]
+    description*: string
+    source*: Option[string]
+
+  LegacyCommand* = object
+    ## `Tree(CommandTree)` or `Alias(String)`.
+    case isAlias*: bool
+    of true:
+      alias*: string
+    of false:
+      tree*: CommandTree
+
+  FallbackDispatcher* = ref object
+    commandKeys*: seq[string]
+    commands*: seq[LegacyCommand]  ## Parallel to `commandKeys`.
+    permissions*: Table[string, string]
+
+  NonLeafNodeBuilder* = ref object
+    node*: Node
+    childNodes*: seq[NonLeafNodeBuilder]
+    leafNodes*: seq[Node]
+
+  PathParsingFailure* = object
+    cursor*: int
+    consumedTokens*: int
+    matchedAnyNode*: bool
+    hasSyntaxError*: bool
+    syntaxError*: CommandSyntaxError
+
+proc cmdSuccess*(value: int32): CommandResult = CommandResult(isOk: true, value: value)
+proc cmdFailed*(message: TextComponent): CommandResult =
+  CommandResult(isOk: false, error: CommandError(kind: ceCommandFailed, failed: message))
+proc cmdSyntaxError*(e: CommandSyntaxError): CommandResult =
+  CommandResult(isOk: false, error: CommandError(kind: ceSyntaxError, syntax: e))
+proc cmdInvalidConsumption*(s: Option[string]): CommandResult =
+  CommandResult(isOk: false, error: CommandError(kind: ceInvalidConsumption, consumption: s))
+proc cmdInvalidRequirement*(): CommandResult =
+  CommandResult(isOk: false, error: CommandError(kind: ceInvalidRequirement))
+proc cmdPermissionDenied*(): CommandResult =
+  CommandResult(isOk: false, error: CommandError(kind: cePermissionDenied))
+
+# ---- args/mod.rs --------------------------------------------------------------------------------------------------
+
+proc findArg*(args: ConsumedArgs; name: string; res: var Arg): bool =
+  for a in args:
+    if a.name == name:
+      res = a.arg
+      return true
+  false
+
+proc splitSingleWhitespaceIncludingEmptyParts*(s: string): seq[string] =
+  ## `split_single_whitespace_including_empty_parts`, on the ASCII spaces commands use.
+  result = @[]
+  var cur = ""
+  for c in s:
+    if c == ' ' or (c >= '\t' and c <= '\r'):
+      result.add(cur)
+      cur = ""
+    else:
+      cur.add(c)
+  result.add(cur)
+
+proc popRaw*(args: var RawArgs; arg: var RawArg): bool =
+  ## `args.pop()`: the list holds the next token last.
+  if args.len == 0:
+    return false
+  arg = args[args.len - 1]
+  args.setLen(args.len - 1)
+  true
+
+# ---- tree/builder.rs ----------------------------------------------------------------------------------------------
+
+proc newCommandTree*(names: openArray[string]; description: string): CommandTree =
+  var ns: seq[string] = @[]
+  for n in names:
+    ns.add(n)
+  CommandTree(nodes: @[], children: @[], names: ns, description: description, source: none[string]())
+
+proc buildNode(b: NonLeafNodeBuilder; tree: CommandTree): Node =
+  var childIndices: seq[int] = @[]
+  for nb in b.childNodes:
+    let node = buildNode(nb, tree)
+    childIndices.add(tree.nodes.len)
+    tree.nodes.add(node)
+  for leaf in b.leafNodes:
+    childIndices.add(tree.nodes.len)
+    tree.nodes.add(leaf)
+  result = b.node
+  result.children = childIndices
+
+proc then*(t: CommandTree; child: NonLeafNodeBuilder): CommandTree =
+  let node = buildNode(child, t)
+  t.children.add(t.nodes.len)
+  t.nodes.add(node)
+  t
+
+proc execute*(t: CommandTree; executor: FallbackExecutor): CommandTree =
+  t.children.add(t.nodes.len)
+  t.nodes.add(Node(children: @[], kind: lnExecuteLeaf, executor: executor))
+  t
+
+proc then*(b, child: NonLeafNodeBuilder): NonLeafNodeBuilder =
+  b.childNodes.add(child)
+  b
+
+proc execute*(b: NonLeafNodeBuilder; executor: FallbackExecutor): NonLeafNodeBuilder =
+  b.leafNodes.add(Node(children: @[], kind: lnExecuteLeaf, executor: executor))
+  b
+
+proc newNonLeaf(node: Node): NonLeafNodeBuilder =
+  NonLeafNodeBuilder(node: node, childNodes: @[], leafNodes: @[])
+
+proc literal*(s: string): NonLeafNodeBuilder =
+  newNonLeaf(Node(children: @[], kind: lnLiteral, str: s))
+
+proc argument*(name: string; consumer: ArgumentConsumer): NonLeafNodeBuilder =
+  newNonLeaf(Node(children: @[], kind: lnArgument, name: name, consumer: consumer))
+
+proc argumentDefaultName*(consumer: ArgumentConsumer): NonLeafNodeBuilder =
+  argument(consumer.defaultName, consumer)
+
+proc require*(predicate: proc(sender: CommandSender): bool {.closure.}): NonLeafNodeBuilder =
+  newNonLeaf(Node(children: @[], kind: lnRequire, predicate: predicate))
+
+# ---- tree/mod.rs: iter_paths --------------------------------------------------------------------------------------
+
+proc walkPaths(t: CommandTree; depth, i: int; path: var seq[int]; paths: var seq[seq[int]]) =
+  while path.len > depth:
+    path.setLen(path.len - 1)
+  path.add(i)
+  if t.nodes[i].kind == lnExecuteLeaf:
+    paths.add(path)
+  for c in t.nodes[i].children:
+    walkPaths(t, depth + 1, c, path, paths)
+
+proc iterPaths*(t: CommandTree): seq[seq[int]] =
+  ## `TraverseAllPathsIter`: depth first, one path for every execute leaf.
+  var paths: seq[seq[int]] = @[]
+  var path: seq[int] = @[]
+  for i in t.children:
+    walkPaths(t, 0, i, path, paths)
+  paths
+
+# ---- tree/format.rs -----------------------------------------------------------------------------------------------
+
+proc isVisible(n: Node): bool = n.kind == lnLiteral or n.kind == lnArgument
+
+proc nodeDisplay(n: Node): string =
+  case n.kind
+  of lnLiteral: n.str
+  of lnArgument: "<" & n.name & ">"
+  else: ""
+
+proc flattenRequireNodes(nodes: seq[Node]; children: seq[int]): seq[int] =
+  result = @[]
+  for i in children:
+    if nodes[i].kind == lnRequire:
+      for c in flattenRequireNodes(nodes, nodes[i].children):
+        result.add(c)
+    else:
+      result.add(i)
+
+proc writeTree(f: var string; nodes: seq[Node]; children: seq[int]) =
+  var optional = false
+  var visible: seq[int] = @[]
+  for idx in children:
+    if nodes[idx].kind == lnExecuteLeaf:
+      optional = true
+    if isVisible(nodes[idx]):
+      visible.add(idx)
+  if visible.len == 0:
+    return
+  let multiple = visible.len > 1
+  f.add(" ")
+  if optional:
+    f.add("[")
+  if multiple:
+    f.add("(")
+  var i = 0
+  while i < visible.len:
+    f.add(nodeDisplay(nodes[visible[i]]))
+    writeTree(f, nodes, nodes[visible[i]].children)
+    if multiple and i != visible.len - 1:
+      f.add(" | ")
+    inc i
+  if multiple:
+    f.add(")")
+  if optional:
+    f.add("]")
+
+proc `$`*(t: CommandTree): string =
+  result = "/" & t.names[0]
+  writeTree(result, t.nodes, flattenRequireNodes(t.nodes, t.children))
+
+# ---- dispatcher.rs ------------------------------------------------------------------------------------------------
+
+proc clampCursorToCharBoundary(input: string; cursor: int): int =
+  result = min(cursor, input.len)
+  while result > 0 and result < input.len and (uint8(input[result]) and 0xC0'u8) == 0x80'u8:
+    dec result
+
+proc lastNCharStart(input: string; cursor, charCount: int): int =
+  var start = cursor
+  var seen = 0
+  var i = cursor - 1
+  while i >= 0:
+    if (uint8(input[i]) and 0xC0'u8) != 0x80'u8:
+      start = i
+      inc seen
+      if seen == charCount:
+        break
+    dec i
+  if seen < charCount: 0 else: start
+
+proc renderSyntaxErrorMessages*(e: CommandSyntaxError): seq[TextComponent] =
+  if not e.hasContext:
+    return @[e.message]
+  let input = e.context.input
+  let cursor = clampCursorToCharBoundary(input, e.context.cursor)
+  let contextStart = lastNCharStart(input, cursor, 10)
+  let beforeCursor = input[contextStart ..< cursor]
+  let remainingInput = input[cursor ..< input.len]
+  var msg = clickEvent(colorNamed(text(""), ncGray), suggestCommand("/" & input))
+  if contextStart > 0:
+    msg = addChild(msg, text("..."))
+  msg = addChild(msg, text(beforeCursor))
+  if remainingInput.len > 0:
+    msg = addChild(msg, underlined(colorNamed(text(remainingInput), ncRed)))
+  msg = addChild(msg, italic(colorNamed(translateCross(JAVA_COMMAND_CONTEXT_HERE, JAVA_COMMAND_CONTEXT_HERE), ncRed)))
+  @[e.message, msg]
+
+proc intoMessages*(e: CommandError; cmd: string): seq[TextComponent] =
+  case e.kind
+  of ceInvalidConsumption, ceInvalidRequirement:
+    @[text("Internal error (See logs for details)")]
+  of cePermissionDenied:
+    @[text("I'm sorry, but you do not have permission to perform this command. Please contact the server administrator if you believe this is an error.")]
+  of ceCommandFailed:
+    @[e.failed]
+  of ceSyntaxError:
+    renderSyntaxErrorMessages(e.syntax)
+
+proc unknownCommandSyntaxError*(input: string; cursor: int): CommandSyntaxError =
+  create(dispatcherUnknownCommand(), CommandSyntaxErrorContext(input: input, cursor: clampCursorToCharBoundary(input, cursor)))
+
+proc unknownArgumentSyntaxError*(input: string; cursor: int): CommandSyntaxError =
+  create(dispatcherUnknownArgument(), CommandSyntaxErrorContext(input: input, cursor: clampCursorToCharBoundary(input, cursor)))
+
+proc selectParseError*(input: string; failures: seq[PathParsingFailure]; knownCommand: bool): CommandSyntaxError =
+  if failures.len == 0:
+    return if knownCommand: unknownArgumentSyntaxError(input, input.len) else: unknownCommandSyntaxError(input, input.len)
+  var farthest = failures[0].cursor
+  for f in failures:
+    farthest = max(farthest, f.cursor)
+  var bestProgress = 0
+  for f in failures:
+    if f.cursor == farthest:
+      bestProgress = max(bestProgress, f.consumedTokens)
+  var matchedAnyNode = false
+  var syntaxErrors: seq[CommandSyntaxError] = @[]
+  for f in failures:
+    if f.cursor == farthest and f.consumedTokens == bestProgress:
+      matchedAnyNode = matchedAnyNode or f.matchedAnyNode
+      if f.hasSyntaxError:
+        syntaxErrors.add(f.syntaxError)
+  if syntaxErrors.len == 1:
+    return syntaxErrors[0]
+  if matchedAnyNode or knownCommand:
+    unknownArgumentSyntaxError(input, farthest)
+  else:
+    unknownCommandSyntaxError(input, farthest)
+
+proc nextUnreadCursor(rawArgs: RawArgs; inputLen: int): int =
+  if rawArgs.len > 0: rawArgs[rawArgs.len - 1].start else: inputLen
+
+proc pathFailure(rawArgs: RawArgs; totalArgs, inputLen: int; matchedAnyNode: bool; hasError: bool;
+                 err: CommandSyntaxError): PathParsingFailure =
+  let c = if hasError and err.hasContext: err.context.cursor else: nextUnreadCursor(rawArgs, inputLen)
+  PathParsingFailure(cursor: c, consumedTokens: max(totalArgs - rawArgs.len, 0), matchedAnyNode: matchedAnyNode,
+    hasSyntaxError: hasError, syntaxError: err)
+
+proc newFallbackDispatcher*(): FallbackDispatcher =
+  FallbackDispatcher(commandKeys: @[], commands: @[], permissions: initTable[string, string]())
+
+proc commandIndex(d: FallbackDispatcher; key: string): int =
+  var i = 0
+  while i < d.commandKeys.len:
+    if d.commandKeys[i] == key:
+      return i
+    inc i
+  -1
+
+proc putCommand(d: FallbackDispatcher; key: string; c: LegacyCommand) =
+  let i = commandIndex(d, key)
+  if i >= 0:
+    d.commands[i] = c
+  else:
+    d.commandKeys.add(key)
+    d.commands.add(c)
+
+proc splitParts*(cmd: string; key: var string; args: var RawArgs): CommandResult =
+  if cmd.len == 0:
+    return cmdFailed(text("Empty Command"))
+  var parts: RawArgs = @[]
+  var currentArgStart = 0
+  var inSingleQuotes = false
+  var inDoubleQuotes = false
+  var inBraces = 0'u32
+  var inBrackets = 0'u32
+  var isEscaping = false
+  var i = 0
+  while i < cmd.len:
+    let c = cmd[i]
+    if c == '\\':
+      isEscaping = not isEscaping
+      inc i
+      continue
+    if isEscaping:
+      isEscaping = false
+      inc i
+      continue
+    let unquoted = not inSingleQuotes and not inDoubleQuotes
+    if c == '{' and unquoted:
+      inc inBraces
+    elif c == '}' and unquoted:
+      if inBraces == 0'u32:
+        return cmdFailed(text("Unmatched braces"))
+      dec inBraces
+    elif c == '[' and unquoted:
+      inc inBrackets
+    elif c == ']' and unquoted:
+      if inBrackets == 0'u32:
+        return cmdFailed(text("Unmatched brackets"))
+      dec inBrackets
+    elif c == '\'' and not inDoubleQuotes:
+      inSingleQuotes = not inSingleQuotes
+    elif c == '"' and not inSingleQuotes:
+      inDoubleQuotes = not inDoubleQuotes
+    elif c == ' ' and unquoted and inBraces == 0'u32 and inBrackets == 0'u32:
+      if currentArgStart != i:
+        parts.add(RawArg(value: cmd[currentArgStart ..< i], start: currentArgStart, `end`: i, input: cmd))
+      currentArgStart = i + 1
+    inc i
+  if currentArgStart != cmd.len:
+    parts.add(RawArg(value: cmd[currentArgStart ..< cmd.len], start: currentArgStart, `end`: cmd.len, input: cmd))
+  if inSingleQuotes or inDoubleQuotes:
+    return cmdFailed(text("Unmatched quotes at the end"))
+  if inBraces != 0'u32:
+    return cmdFailed(text("Unmatched braces at the end"))
+  if inBrackets != 0'u32:
+    return cmdFailed(text("Unmatched brackets at the end"))
+  if parts.len == 0:
+    return cmdFailed(text("Empty Command"))
+  key = parts[0].value
+  args = @[]
+  var k = parts.len - 1
+  while k >= 1:
+    args.add(parts[k])
+    dec k
+  cmdSuccess(0'i32)
+
+proc getTree*(d: FallbackDispatcher; key: string; tree: var CommandTree): CommandResult =
+  let idx = commandIndex(d, key)
+  if idx < 0:
+    return cmdFailed(text("Command not found"))
+  let command = d.commands[idx]
+  if command.isAlias:
+    let targetIdx = commandIndex(d, command.alias)
+    if targetIdx >= 0:
+      let target = d.commands[targetIdx]
+      if not target.isAlias:
+        tree = target.tree
+        return cmdSuccess(0'i32)
+    return cmdFailed(text("Internal Error (See logs for details)"))
+  tree = command.tree
+  cmdSuccess(0'i32)
+
+proc consumeSyntax(c: ArgumentConsumer; src: CommandSender; server: nil CommandServer; args: var RawArgs; res: var Arg;
+                   found: var bool): CmdVoidResult =
+  if c.consumeWithSyntax != nil:
+    return c.consumeWithSyntax(src, server, args, res, found)
+  found = c.consume(src, server, args, res)
+  cmdOkVoid()
+
+proc tryIsFittingPath(src: CommandSender; server: nil CommandServer; path: seq[int]; tree: CommandTree; rawArgs: var RawArgs;
+                      input: string; failure: var PathParsingFailure; matched: var bool): CommandResult =
+  ## The `Ok(PathResult)` of upstream sets `matched` or `failure`; an `Err` comes back as the result.
+  var parsedArgs: ConsumedArgs = @[]
+  let totalArgs = rawArgs.len
+  var matchedAnyNode = false
+  let inputLen = input.len
+  let noError = createWithoutContext(dispatcherUnknownCommand())
+  for i in path:
+    let node = tree.nodes[i]
+    case node.kind
+    of lnExecuteLeaf:
+      if rawArgs.len == 0:
+        let f = node.executor
+        let r = f(src, server, parsedArgs)
+        if not r.isOk:
+          return r
+        matched = true
+      else:
+        matched = false
+        failure = pathFailure(rawArgs, totalArgs, inputLen, matchedAnyNode, false, noError)
+      return cmdSuccess(0'i32)
+    of lnLiteral:
+      if rawArgs.len == 0 or rawArgs[rawArgs.len - 1].value != node.str:
+        matched = false
+        failure = pathFailure(rawArgs, totalArgs, inputLen, matchedAnyNode, false, noError)
+        return cmdSuccess(0'i32)
+      rawArgs.setLen(rawArgs.len - 1)
+      matchedAnyNode = true
+    of lnArgument:
+      var consumed = Arg()
+      var found = false
+      let r = consumeSyntax(node.consumer, src, server, rawArgs, consumed, found)
+      if not r.isOk:
+        matched = false
+        failure = pathFailure(rawArgs, totalArgs, inputLen, matchedAnyNode, true, r.error)
+        return cmdSuccess(0'i32)
+      if found:
+        var replaced = false
+        var k = 0
+        while k < parsedArgs.len:
+          if parsedArgs[k].name == node.name:
+            parsedArgs[k].arg = consumed
+            replaced = true
+          inc k
+        if not replaced:
+          parsedArgs.add(ConsumedArg(name: node.name, arg: consumed))
+        matchedAnyNode = true
+      else:
+        matched = false
+        failure = pathFailure(rawArgs, totalArgs, inputLen, matchedAnyNode, false, noError)
+        return cmdSuccess(0'i32)
+    of lnRequire:
+      let p = node.predicate
+      if not p(src):
+        matched = false
+        failure = pathFailure(rawArgs, totalArgs, inputLen, matchedAnyNode, false, noError)
+        return cmdSuccess(0'i32)
+      matchedAnyNode = true
+  matched = false
+  failure = pathFailure(rawArgs, totalArgs, inputLen, matchedAnyNode, false, noError)
+  cmdSuccess(0'i32)
+
+proc dispatch*(d: FallbackDispatcher; src: CommandSender; server: nil CommandServer; cmd: string): CommandResult =
+  var key = ""
+  var rawArgs: RawArgs = @[]
+  let sp = splitParts(cmd, key, rawArgs)
+  if not sp.isOk:
+    return sp
+  if commandIndex(d, key) < 0:
+    return cmdSyntaxError(unknownCommandSyntaxError(cmd, 0))
+  if not d.permissions.hasKey(key):
+    return cmdFailed(text("Permission for Command not found"))
+  if not hasPermission(src, server, getOrDefault(d.permissions, key, "")):
+    return cmdPermissionDenied()
+  var tree: CommandTree = CommandTree(nodes: @[], children: @[], names: @[], description: "", source: none[string]())
+  let t = getTree(d, key, tree)
+  if not t.isOk:
+    return t
+  var pathFailures: seq[PathParsingFailure] = @[]
+  for path in iterPaths(tree):
+    var args = rawArgs
+    var failure = PathParsingFailure(syntaxError: createWithoutContext(dispatcherUnknownCommand()))
+    var matched = false
+    let r = tryIsFittingPath(src, server, path, tree, args, cmd, failure, matched)
+    if not r.isOk:
+      return r
+    if matched:
+      return cmdSuccess(0'i32)
+    pathFailures.add(failure)
+  cmdSyntaxError(selectParseError(cmd, pathFailures, true))
+
+proc handleCommand*(d: FallbackDispatcher; sender: CommandSender; server: nil CommandServer; cmd: string) =
+  let res = dispatch(d, sender, server, cmd)
+  setSuccessCount(sender, if res.isOk: 1'u32 else: 0'u32)
+  if not res.isOk:
+    for t in intoMessages(res.error, cmd):
+      sendMessage(sender, colorNamed(addChild(text(""), t), ncRed))
+
+proc tryFindSuggestionsOnPath(src: CommandSender; server: nil CommandServer; path: seq[int]; tree: CommandTree;
+                              rawArgs: var RawArgs; input: string; suggestions: var seq[CommandSuggestionOut]): bool =
+  ## True when the path gave `Ok(Some(..))`. `consume` errors and `Ok(None)` come back as false, as upstream's do.
+  for i in path:
+    let node = tree.nodes[i]
+    case node.kind
+    of lnExecuteLeaf:
+      return false
+    of lnLiteral:
+      var raw = RawArg()
+      if not popRaw(rawArgs, raw) or raw.value != node.str:
+        return false
+    of lnArgument:
+      var consumed = Arg()
+      var found = false
+      let r = consumeSyntax(node.consumer, src, server, rawArgs, consumed, found)
+      if not r.isOk:
+        return false
+      if not found:
+        if rawArgs.len == 0 and node.consumer.suggestProc != nil:
+          let sp = node.consumer.suggestProc
+          return sp(src, server, input, suggestions)
+        return false
+    of lnRequire:
+      let p = node.predicate
+      if not p(src):
+        return false
+  false
+
+proc splitWhitespaceRust(cmd: string): seq[string] =
+  ## `str::split_whitespace`, which drops empty parts.
+  result = @[]
+  for part in splitSingleWhitespaceIncludingEmptyParts(cmd):
+    if part.len > 0:
+      result.add(part)
+
+proc findSuggestions*(d: FallbackDispatcher; src: CommandSender; server: nil CommandServer; cmd: string): seq[CommandSuggestionOut] =
+  result = @[]
+  let parts = splitWhitespaceRust(cmd)
+  if parts.len == 0:
+    return
+  let key = parts[0]
+  var rawArgs: RawArgs = @[]
+  var i = parts.len - 1
+  while i >= 1:
+    rawArgs.add(RawArg(value: parts[i], start: 0, `end`: 0, input: cmd))
+    dec i
+  var tree: CommandTree = CommandTree(nodes: @[], children: @[], names: @[], description: "", source: none[string]())
+  if not getTree(d, key, tree).isOk:
+    return
+  if not d.permissions.hasKey(key) or not hasPermission(src, server, getOrDefault(d.permissions, key, "")):
+    return
+  var collected: seq[CommandSuggestionOut] = @[]
+  for path in iterPaths(tree):
+    # Upstream shares one `raw_args` across paths, so a path sees what the last one left. Kept.
+    var fromPath: seq[CommandSuggestionOut] = @[]
+    if tryFindSuggestionsOnPath(src, server, path, tree, rawArgs, cmd, fromPath):
+      for s in fromPath:
+        var dup = false
+        for c in collected:
+          if c.suggestion == s.suggestion and c.tooltip.isSome == s.tooltip.isSome:
+            dup = true
+        if not dup:
+          collected.add(s)
+  sort(collected, proc(a, b: CommandSuggestionOut): int = cmp(a.suggestion, b.suggestion))
+  collected
+
+proc register*(d: FallbackDispatcher; tree: CommandTree; permission: string) =
+  assert tree.names.len > 0, "at least one name must be provided"
+  let primaryName = tree.names[0]
+  var i = 1
+  while i < tree.names.len:
+    let name = tree.names[i]
+    putCommand(d, name, LegacyCommand(isAlias: true, alias: primaryName))
+    d.permissions[name] = permission
+    inc i
+  d.permissions[primaryName] = permission
+  putCommand(d, primaryName, LegacyCommand(isAlias: false, tree: tree))
+
+proc unregister*(d: FallbackDispatcher; name: string) =
+  var keptKeys: seq[string] = @[]
+  var kept: seq[LegacyCommand] = @[]
+  var i = 0
+  while i < d.commandKeys.len:
+    let key = d.commandKeys[i]
+    let value = d.commands[i]
+    if key == name or (value.isAlias and value.alias == name):
+      d.permissions.del(key)
+    else:
+      keptKeys.add(key)
+      kept.add(value)
+    inc i
+  d.commandKeys = keptKeys
+  d.commands = kept
+
+proc permissionOf*(d: FallbackDispatcher; key: string): string =
+  ## Empty when unset; `has_permission` on an empty node is what upstream's `else` branch would refuse.
+  getOrDefault(d.permissions, key, "")
+
+proc commandTrees*(d: FallbackDispatcher): seq[(seq[string], string, string)] =
+  ## Each `Command::Tree` as (names, description, usage).
+  result = @[]
+  for c in d.commands:
+    if not c.isAlias:
+      result.add((c.tree.names, c.tree.description, $c.tree))
+
+proc treesBySource*(d: FallbackDispatcher; sourceName: string): seq[(seq[string], string, string)] =
+  result = @[]
+  for c in d.commands:
+    if not c.isAlias:
+      let src = c.tree.source
+      if src.isSome and src.unsafeGet == sourceName:
+        result.add((c.tree.names, c.tree.description, $c.tree))
+
+proc treeInfo*(d: FallbackDispatcher; command: string; names: var seq[string]; description, usage: var string): bool =
+  var tree: CommandTree = CommandTree(nodes: @[], children: @[], names: @[], description: "", source: none[string]())
+  if not getTree(d, command, tree).isOk:
+    return false
+  names = tree.names
+  description = tree.description
+  usage = $tree
+  true

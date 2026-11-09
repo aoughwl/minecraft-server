@@ -1,127 +1,412 @@
-## Command-tree dispatch: walks a `StringReader` against a `Tree`
-## (cmdtree.aowl) and, on success, runs the matched node's command.
-## Port of upstream/command/src/node/dispatcher.rs (~1277 lines).
+## The brigadier dispatcher: register, parse, execute, suggest, usage.
+## Port of pumpkin/src/command/node/dispatcher.rs
 ##
-## In its own module mostly for size/organization, not strictly required:
-## while isolating a aowlmony compiler crash that surfaced while writing
-## this file (internal AssertionDefect, `derefs.aowl`
-## `checkForDangerousLocations`, `fnType.isParamsTag`), splitting the
-## dispatch procs out of cmdtree.aowl was one of several changes tried
-## together and the crash appeared gone afterward - but the real,
-## minimally-reproduced cause (filed as feedback) turned out to be
-## `cmdtree.aowl`'s `meetsRequirements` iterating a `seq[proc(...)
-## {.closure.}]` field with `for req in ...: req(source)`, which crashes
-## the compiler regardless of which module it's in; rewriting it as an
-## indexed `while` loop (see `cmdtree.aowl`) was the actual fix. The split
-## is harmless and kept for file-size hygiene, but isn't load-bearing.
-##
-## Dispatch algorithm: upstream's Brigadier-derived `parse`/`execute` does
-## real backtracking - if a child matches syntactically but a *later*
-## sibling further down the string fails to parse, try the next matching
-## child at this level before giving up (this is what lets literal and
-## argument children coexist at one branch point, e.g. `/data get
-## <literal:block>` vs `/data get <argument:entity>`). This port
-## reproduces that: `parseNode` tries every child in order, on a child's
-## failure resets the reader to before that child was tried and moves on,
-## and only fails the whole branch if every child fails.
+## Parsing mirrors upstream's `parse_nodes`: a clone of the reader and context per relevant child, the error stored
+## by child, redirects restarting at the target with a child context, and the best potential picked by
+## `(reader remaining, has errors)` with the earliest kept on a tie, as `Iterator::min_by` does.
+## `handle_command` falls through to the legacy dispatcher on an unknown command, as upstream's temporary setup does.
 
-import string_reader, cmderrors, argtype, cmdsource, cmdtree
+import std/[algorithm, assertions, options, strutils, tables]
+import ../util/text/textbase, ../util/text/text, ../util/text/color, ../util/text/click
+import ../generated/translation
+import cmderrors, string_range, string_reader, suggestion, cmdsource, cmdtree, argument_builder, fallbackdispatch
 
-proc findArgSeq*(args: seq[ParsedArg], name: string): (bool, ArgValue) =
-  for a in args:
-    if a.name == name:
-      return (true, a.value)
-  (false, ArgValue(kind: avkString, stringVal: ""))
+const
+  ArgSeparator* = " "
+  ArgSeparatorChar* = ' '
+  UsageOptionalOpen* = "["
+  UsageOptionalClose* = "]"
+  UsageRequiredOpen* = "("
+  UsageRequiredClose* = ")"
+  UsageOr* = "|"
 
-proc findArg*(d: DispatchResult, name: string): (bool, ArgValue) =
-  findArgSeq(d.args, name)
+type
+  ParsingResult* = object
+    context*: CommandContextBuilder
+    errorIds*: seq[NodeId]
+    errorValues*: seq[CommandSyntaxError]
+    reader*: StringReader
 
-proc parseNode(t: Tree, nodeIdx: int, r: var StringReader, source: CommandSource,
-               argsSoFar: seq[ParsedArg]): CmdResult[DispatchResult] =
-  let node = t.nodes[nodeIdx]
-  var target = nodeIdx
-  if node.redirect >= 0:
-    target = node.redirect
+  CommandDispatcher* = ref object
+    tree*: Tree
+    consumer*: ResultConsumer
+    fallbackDispatcher*: FallbackDispatcher
 
-  # A node with children and no command of its own must consume a
-  # separator space before trying to match a child (matches upstream's
-  # `StringReader::skip` between path segments); the root has no leading
-  # separator to skip.
-  if nodeIdx != RootIndex:
-    let (peekHas, peekChar) = peek(r)
-    if peekHas and peekChar == ' ':
-      skip(r)
-    elif t.nodes[target].children.len > 0 and canReadByte(r):
-      # A non-space character where a separator was expected: this
-      # branch cannot continue (e.g. "gamemodesurvival" instead of
-      # "gamemode survival").
-      return cmdErr[DispatchResult](cekExpectedSymbol, "Expected whitespace to end one argument, but found trailing data")
+  CommandUsage* = object
+    name*: string
+    description*: string
+    usage*: string
 
-  if not canReadByte(r):
-    # End of input at this node: if it's executable, we're done;
-    # otherwise this branch fails (a literal/argument requires more).
-    if t.nodes[target].command != nil and meetsRequirements(t.nodes[target], source):
-      return cmdOk[DispatchResult](DispatchResult(args: argsSoFar, node: target))
-    return cmdErr[DispatchResult](cekExpectedSymbol, "Incomplete command")
+proc unresolvedRedirect*(): CommandErrorType = literalErrorType("Could not resolve redirect to node")
 
-  for childIdx in t.nodes[target].children:
-    let child = t.nodes[childIdx]
-    if not meetsRequirements(child, source):
+proc emptyConsumerImpl(context: CommandContext; value: ReturnValue) =
+  discard
+
+proc resultDeferrerImpl(context: CommandContext; value: ReturnValue) =
+  call(context.source.commandResultTaker, value)
+
+proc emptyConsumer*(): ResultConsumer =
+  ## `EmptyResultConsumer`.
+  emptyConsumerImpl
+
+proc resultDeferrer*(): ResultConsumer =
+  ## `ResultDeferrer`.
+  resultDeferrerImpl
+
+proc fromExistingTree*(tree: Tree): CommandDispatcher =
+  CommandDispatcher(tree: tree, consumer: resultDeferrer(), fallbackDispatcher: newFallbackDispatcher())
+
+proc newCommandDispatcher*(): CommandDispatcher =
+  fromExistingTree(newTree())
+
+proc register*(d: CommandDispatcher; node: ArgumentBuilder): NodeId =
+  addChildToRoot(d.tree, build(node))
+
+proc registerWithAliases*(d: CommandDispatcher; node: ArgumentBuilder; aliases: openArray[string]): NodeId =
+  let mainNodeId = register(d, node)
+  let mainNode = nodeAt(d.tree, mainNodeId)
+  var built: seq[ArgumentBuilder] = @[]
+  for aliasName in aliases:
+    var alias = command(aliasName, mainNode.description)
+    # An executor is cloned along with its requirements, or an alias of `/stop` would let anyone stop the server.
+    if mainNode.command != nil:
+      alias = executes(alias, mainNode.command)
+      alias = overwriteRequirements(alias, mainNode.requirements)
+    alias = redirect(alias, redirectLocal(mainNodeId))
+    built.add(alias)
+  for alias in built:
+    discard register(d, alias)
+  mainNodeId
+
+proc storeError(errorIds: var seq[NodeId]; errorValues: var seq[CommandSyntaxError]; id: NodeId; e: CommandSyntaxError) =
+  var i = 0
+  while i < errorIds.len:
+    if errorIds[i] == id:
+      errorValues[i] = e
+      return
+    inc i
+  errorIds.add(id)
+  errorValues.add(e)
+
+proc better(a, b: ParsingResult): bool =
+  ## `a < b` by `(reader remaining, has errors)`.
+  let ar = peek(a.reader) != NoChar
+  let br = peek(b.reader) != NoChar
+  if ar != br:
+    return not ar
+  let ae = a.errorIds.len > 0
+  let be = b.errorIds.len > 0
+  (not ae) and be
+
+proc parseNodes(d: CommandDispatcher; node: NodeId; originalReader: var StringReader;
+                contextSoFar: CommandContextBuilder): ParsingResult =
+  let source = contextSoFar.source
+  var errorIds: seq[NodeId] = @[]
+  var errorValues: seq[CommandSyntaxError] = @[]
+  var potentials: seq[ParsingResult] = @[]
+  let cur = cursor(originalReader)
+  for child in getRelevantNodes(d.tree, originalReader, node):
+    if not canUse(d.tree, child, source):
       continue
-    let startCursor = r.cursor()
-    case child.kind
-    of nkLiteral, nkCommand:
-      let word = readUnquotedString(r)
-      if word.len == 0 or toLowerAscii(word) != child.literalLowercase:
-        r.setCursor(startCursor)
-        continue
-      let sub = parseNode(t, childIdx, r, source, argsSoFar)
-      if sub.isOk:
-        return sub
-      r.setCursor(startCursor)
-    of nkArgument:
-      let pr = parse(child.argType, r)
-      if not pr.isOk:
-        r.setCursor(startCursor)
-        continue
-      var nextArgs = argsSoFar
-      nextArgs.add(ParsedArg(name: child.argName, value: pr.value))
-      let sub = parseNode(t, childIdx, r, source, nextArgs)
-      if sub.isOk:
-        return sub
-      r.setCursor(startCursor)
+    let context = clone(contextSoFar)
+    var reader = originalReader
+    var parseResult = parseNode(d.tree, child, reader, context)
+    if parseResult.isOk:
+      let p = peek(reader)
+      if p != NoChar and p != int32(ord(ArgSeparatorChar)):
+        parseResult = cmdFailVoid(create(dispatcherExpectedArgumentSeparator(), reader))
+    if not parseResult.isOk:
+      storeError(errorIds, errorValues, child, parseResult.error)
+      setCursor(reader, cur)
+      continue
+    let childNode = nodeAt(d.tree, child)
+    withCommand(context, childNode.command)
+    let hasRedirect = childNode.hasRedirect
+    if canReadChars(reader, if hasRedirect: 2 else: 1):
+      skip(reader)
+      if hasRedirect:
+        let target = resolve(d.tree, childNode.redirect)
+        if target == 0:
+          storeError(errorIds, errorValues, child, create(unresolvedRedirect(), reader))
+          setCursor(reader, cur)
+          continue
+        let childContext = newCommandContextBuilder(d.tree, source, target, cursor(reader))
+        let parsed = parseNodes(d, target, reader, childContext)
+        withChild(context, parsed.context)
+        return ParsingResult(context: context, errorIds: parsed.errorIds, errorValues: parsed.errorValues,
+          reader: parsed.reader)
+      potentials.add(parseNodes(d, child, reader, context))
+    else:
+      potentials.add(ParsingResult(context: context, errorIds: @[], errorValues: @[], reader: reader))
+  if potentials.len == 0:
+    return ParsingResult(context: clone(contextSoFar), errorIds: errorIds, errorValues: errorValues,
+      reader: originalReader)
+  var best = 0
+  var i = 1
+  while i < potentials.len:
+    if better(potentials[i], potentials[best]):
+      best = i
+    inc i
+  potentials[best]
+
+proc parse*(d: CommandDispatcher; reader: var StringReader; source: CommandSource): ParsingResult =
+  let context = newCommandContextBuilder(d.tree, source, RootNodeId, cursor(reader))
+  parseNodes(d, RootNodeId, reader, context)
+
+proc parseInput*(d: CommandDispatcher; command: string; source: CommandSource): ParsingResult =
+  var reader = newStringReader(command)
+  parse(d, reader, source)
+
+proc execute*(d: CommandDispatcher; parsed: ParsingResult): CmdResult[int32] =
+  if peek(parsed.reader) != NoChar:
+    if parsed.errorIds.len == 1:
+      return cmdFail[int32](parsed.errorValues[0])
+    if isEmpty(parsed.context.range):
+      return cmdFail[int32](create(dispatcherUnknownCommand(), parsed.reader))
+    return cmdFail[int32](create(dispatcherUnknownArgument(), parsed.reader))
+  let originalContext = build(parsed.context, parsed.reader.str)
+  let flatContext = tryFlatten(originalContext)
+  if flatContext == nil:
+    let consumer = d.consumer
+    consumer(originalContext, returnFailure())
+    return cmdFail[int32](create(dispatcherUnknownCommand(), parsed.reader))
+  executeAll(flatContext, originalContext.source, d.consumer)
+
+proc executeReader*(d: CommandDispatcher; reader: var StringReader; source: CommandSource): CmdResult[int32] =
+  execute(d, parse(d, reader, source))
+
+proc executeInput*(d: CommandDispatcher; input: string; source: CommandSource): CmdResult[int32] =
+  var reader = newStringReader(input)
+  executeReader(d, reader, source)
+
+proc sendErrorToSource*(source: CommandSource; error: CommandSyntaxError; command: string) =
+  sendMessage(source, color(error.message, colorNamed(ncRed)))
+  if error.hasContext:
+    let input = error.context.input
+    let i = min(input.len, error.context.cursor)
+    var errorText = clickEvent(colorNamed(empty(), ncGray), suggestCommand("/" & command))
+    if i > 10:
+      errorText = addText(errorText, "...")
+    let start = max(i - 10, 0)
+    errorText = addText(errorText, input[start ..< i])
+    if i < input.len:
+      errorText = addChild(errorText, underlined(colorNamed(text(input[i ..< input.len]), ncRed)))
+    errorText = addChild(errorText, italic(colorNamed(translateCross(JAVA_COMMAND_CONTEXT_HERE, JAVA_COMMAND_CONTEXT_HERE), ncRed)))
+    sendError(source, errorText)
+
+proc handleCommand*(d: CommandDispatcher; source: CommandSource; inputArg: string) =
+  assert source.server != nil, "Source provided to this command was a dummy source"
+  var input = inputArg
+  if input.startsWith("/"):
+    input = input[1 ..< input.len]
+  let output = executeInput(d, input, source)
+  if not output.isOk:
+    # 'Permission denied' also lands here, as no executable node could be found.
+    if output.error.isType(dispatcherUnknownCommand()):
+      handleCommand(d.fallbackDispatcher, source.output, source.server, input)
+    else:
+      sendErrorToSource(source, output.error, input)
+
+proc getCompletionSuggestions*(d: CommandDispatcher; parsing: ParsingResult; cursorAt: int): Suggestions =
+  let sc = findSuggestionContext(parsing.context, cursorAt)
+  let parent = sc.parent
+  let start = min(sc.startingPosition, cursorAt)
+  let fullInput = parsing.reader.str
+  let truncatedInput = fullInput[0 ..< min(cursorAt, fullInput.len)]
+  let children = getChildren(d.tree, parent)
+  let context = build(parsing.context, truncatedInput)
+  var collected: seq[Suggestions] = @[]
+  var provided: seq[Suggestions] = @[]
+  for child in children:
+    let builder = newSuggestionsBuilder(truncatedInput, start)
+    let node = nodeAt(d.tree, child)
+    case node.kind
     of nkRoot:
-      discard # a root never appears as a child
+      collected.add(emptySuggestions())
+    of nkLiteral, nkCommand:
+      if node.literalLowercase.startsWith(remainingLowercase(builder)):
+        collected.add(build(suggest(builder, node.literal)))
+      else:
+        collected.add(emptySuggestions())
+    of nkArgument:
+      if node.suggestionProvider != nil:
+        let provider = node.suggestionProvider
+        provided.add(provider(context, builder))
+      else:
+        let at0 = node.argumentType
+        if at0 != nil and at0.listSuggestionsProc != nil:
+          provided.add(at0.listSuggestionsProc(context, builder))
+        else:
+          provided.add(emptySuggestions())
+  for p in provided:
+    collected.add(p)
+  mergeSuggestions(fullInput, collected)
 
-  # No child matched. If this node itself is executable and there's
-  # nothing left unconsumed that a child needed, upstream would already
-  # have returned above (canReadByte was true, so there IS trailing
-  # input) - so this is a genuine failure.
-  cmdErr[DispatchResult](cekExpectedSymbol, "Incorrect argument for command")
+proc getCompletionSuggestionsAtEnd*(d: CommandDispatcher; parsing: ParsingResult): Suggestions =
+  getCompletionSuggestions(d, parsing, totalLength(parsing.reader))
 
-proc dispatch*(t: Tree, input: string, source: CommandSource): CmdResult[DispatchResult] =
-  ## Parses `input` against the tree starting at the root and, on success,
-  ## runs the matched node's `command` (upstream's `parse` + `execute`
-  ## combined, since this port has no separate "parse now, execute later"
-  ## consumer). Returns the executor's own `CmdResult[int32]` result value
-  ## wrapped back into a `DispatchResult` isn't quite right for a direct
-  ## return type match, so this returns the parse result; call
-  ## `executeCommand` for the run-it convenience wrapper below.
-  var r = newStringReader(input)
-  parseNode(t, RootIndex, r, source, @[])
+proc suggest*(d: CommandDispatcher; input: string; source: CommandSource): seq[CommandSuggestionOut] =
+  result = @[]
+  let parsed = parseInput(d, input, source)
+  for s in getCompletionSuggestionsAtEnd(d, parsed).suggestions:
+    result.add(CommandSuggestionOut(suggestion: s.text.cachedText, tooltip: s.tooltip))
+  for s in findSuggestions(d.fallbackDispatcher, source.output, source.server, input):
+    result.add(CommandSuggestionOut(suggestion: s.suggestion, tooltip: s.tooltip))
 
-proc executeCommand*(t: Tree, input: string, source: CommandSource): CmdResult[int32] =
-  let pr = dispatch(t, input, source)
-  if not pr.isOk:
-    return cmdErr[int32](pr.error.kind, pr.error.message)
-  let node = t.nodes[pr.value.node]
-  if node.command == nil:
-    return cmdErr[int32](cekExpectedSymbol, "Node has no command to execute")
-  let execResult = node.command(source, pr.value.args)
-  var rv: ReturnValue
-  if execResult.isOk:
-    rv = ReturnValue(kind: rvkSuccess, successValue: execResult.value)
+proc getUsageRecursive(d: CommandDispatcher; node: NodeId; source: CommandSource; isOptional, deep: bool;
+                       redirectorUsage: Option[string]; usage: var string): bool =
+  ## False for `None`.
+  if not canUse(d.tree, node, source):
+    return false
+  let n = nodeAt(d.tree, node)
+  var usageText = ""
+  if redirectorUsage.isSome:
+    usageText = redirectorUsage.unsafeGet
   else:
-    rv = ReturnValue(kind: rvkFailure)
-  callResult(source, rv)
-  execResult
+    usageText = usageText(n)
+    if isOptional:
+      usageText = UsageOptionalOpen & usageText & UsageOptionalClose
+  let childOptional = n.command != nil
+  if not deep:
+    if n.hasRedirect:
+      let target = resolve(d.tree, n.redirect)
+      if target != 0:
+        var targetUsage = ""
+        if target == node:
+          targetUsage = "..."
+        elif isCommandNode(d.tree, node) and isCommandNode(d.tree, target):
+          # So /? shows `/? [<commandOrPage>]` rather than `/? -> help`.
+          return getUsageRecursive(d, target, source, isOptional, deep, some(usageText), usage)
+        else:
+          targetUsage = "-> " & usageText(nodeAt(d.tree, target))
+        usage = usageText & ArgSeparator & targetUsage
+        return true
+    else:
+      var children: seq[NodeId] = @[]
+      for child in getChildren(d.tree, node):
+        if canUse(d.tree, child, source):
+          children.add(child)
+      if children.len == 1:
+        var childUsage = ""
+        if getUsageRecursive(d, children[0], source, childOptional, true, none[string](), childUsage):
+          usage = usageText & ArgSeparator & childUsage
+          return true
+      elif children.len > 0:
+        var childUsages: seq[string] = @[]
+        for child in children:
+          var childUsage = ""
+          if getUsageRecursive(d, child, source, childOptional, true, none[string](), childUsage) and
+              childUsage notin childUsages:
+            childUsages.add(childUsage)
+        if childUsages.len == 1:
+          var childUsage = childUsages[0]
+          if isOptional:
+            childUsage = UsageOptionalOpen & childUsage & UsageOptionalClose
+          usage = usageText & ArgSeparator & childUsage
+          return true
+        elif childUsages.len > 0:
+          let open = if childOptional: UsageOptionalOpen else: UsageRequiredOpen
+          let close = if childOptional: UsageOptionalClose else: UsageRequiredClose
+          var res = usageText & ArgSeparator & open
+          var first = true
+          for childUsage in childUsages:
+            if not first:
+              res.add(UsageOr)
+            res.add(childUsage)
+            first = false
+          res.add(close)
+          usage = res
+          return true
+  usage = usageText
+  true
+
+proc getUsageOfCommand*(d: CommandDispatcher; commandNode: NodeId; source: CommandSource; usage: var string): bool =
+  var u = ""
+  if getUsageRecursive(d, commandNode, source, false, false, none[string](), u):
+    usage = "/" & u
+    return true
+  false
+
+proc getUsageOfChildren*(d: CommandDispatcher; node: NodeId; source: CommandSource): seq[(NodeId, string)] =
+  result = @[]
+  let isOptional = nodeAt(d.tree, node).command != nil
+  for child in getChildren(d.tree, node):
+    var u = ""
+    if getUsageRecursive(d, child, source, isOptional, false, none[string](), u):
+      result.add((child, u))
+
+proc getUsageOfCommands*(d: CommandDispatcher; source: CommandSource): seq[(NodeId, string)] =
+  result = @[]
+  for (k, v) in getUsageOfChildren(d, RootNodeId, source):
+    result.add((k, "/" & v))
+
+proc cmpUsage(a, b: CommandUsage): int = cmp(a.name, b.name)
+
+proc putCommand(list: var seq[CommandUsage]; entry: CommandUsage) =
+  ## `BTreeMap::insert`: a later entry replaces one with the same name.
+  var i = 0
+  while i < list.len:
+    if list[i].name == entry.name:
+      list[i] = entry
+      return
+    inc i
+  list.add(entry)
+
+proc getAllCommands*(d: CommandDispatcher): seq[CommandUsage] =
+  ## Sorted by name. `usage` is empty.
+  result = @[]
+  for command in getRootChildren(d.tree):
+    let n = nodeAt(d.tree, command)
+    putCommand(result, CommandUsage(name: n.literalLowercase, description: n.description))
+  for (names, description, usage) in commandTrees(d.fallbackDispatcher):
+    for name in names:
+      putCommand(result, CommandUsage(name: name, description: description))
+  sort(result, cmpUsage)
+
+proc getAllPermittedCommands*(d: CommandDispatcher; source: CommandSource): seq[CommandUsage] =
+  result = @[]
+  for command in getRootChildren(d.tree):
+    if canUse(d.tree, command, source):
+      let n = nodeAt(d.tree, command)
+      putCommand(result, CommandUsage(name: n.literalLowercase, description: n.description))
+  for (names, description, usage) in commandTrees(d.fallbackDispatcher):
+    if hasPermission(source, permissionOf(d.fallbackDispatcher, names[0])):
+      for name in names:
+        putCommand(result, CommandUsage(name: name, description: description))
+  sort(result, cmpUsage)
+
+proc getAllPermittedCommandsUsage*(d: CommandDispatcher; source: CommandSource): seq[CommandUsage] =
+  result = @[]
+  for (id, usage) in getUsageOfCommands(d, source):
+    let n = nodeAt(d.tree, id)
+    putCommand(result, CommandUsage(name: n.literal, description: n.description, usage: usage))
+  for (names, description, usage) in commandTrees(d.fallbackDispatcher):
+    if hasPermission(source, permissionOf(d.fallbackDispatcher, names[0])):
+      for name in names:
+        putCommand(result, CommandUsage(name: name, description: description, usage: usage))
+  sort(result, cmpUsage)
+
+proc getAllPermittedCommandsUsageByPlugin*(d: CommandDispatcher; source: CommandSource; pluginName: string): seq[CommandUsage] =
+  result = @[]
+  for t in treesBySource(d.fallbackDispatcher, pluginName):
+    if hasPermission(source, permissionOf(d.fallbackDispatcher, t[0][0])):
+      for name in t[0]:
+        putCommand(result, CommandUsage(name: name, description: t[1], usage: t[2]))
+  sort(result, cmpUsage)
+
+proc getPermittedCommandUsage*(d: CommandDispatcher; source: CommandSource; command: string; res: var CommandUsage): bool =
+  let id = getCommand(d.tree, command)
+  if id != 0:
+    var usage = ""
+    if getUsageOfCommand(d, id, source, usage):
+      let n = nodeAt(d.tree, id)
+      res = CommandUsage(name: command, description: n.description, usage: usage)
+      return true
+  var names: seq[string] = @[]
+  var description = ""
+  var usage = ""
+  if treeInfo(d.fallbackDispatcher, command, names, description, usage) and
+      hasPermission(source, permissionOf(d.fallbackDispatcher, names[0])):
+    res = CommandUsage(name: command, description: description, usage: usage)
+    return true
+  false
