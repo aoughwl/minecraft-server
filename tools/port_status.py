@@ -16,12 +16,12 @@ import sys
 
 here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 args = [a for a in sys.argv[1:] if not a.startswith('--')]
-upstream = args[0] if args else os.path.join(os.path.dirname(here), 'ref', 'pumpkin')
+upstream = args[0] if args else os.path.join(os.path.dirname(here), 'ref', 'pumpkin-1.21.11')
 only = sys.argv[sys.argv.index('--missing') + 1] if '--missing' in sys.argv else ''
 if only in args: args.remove(only)
 
-rs = subprocess.run(['git', '-C', upstream, 'ls-files', 'crates/*.rs'], capture_output=True, text=True).stdout.splitlines()
-rs = [p for p in rs if '/generated/' not in p]
+rs = subprocess.run(['git', '-C', upstream, 'ls-files', '*.rs'], capture_output=True, text=True).stdout.splitlines()
+rs = [p for p in rs if '/generated/' not in p and '/src/' in p]
 
 text = []
 for root, _, names in os.walk(os.path.join(here, 'src')):
@@ -40,7 +40,7 @@ partial = set(re.findall(r'## PARTIAL: ([\w\-./]+\.rs)', blob))
 rows = {}
 missing = []
 for p in rs:
-    crate = p.split('/')[1]
+    crate = p[len('crates/'):].split('/')[0] if p.startswith('crates/') else p.split('/')[0]
     tail = p.split('/src/', 1)[-1]
     lines = sum(1 for _ in open(os.path.join(upstream, p), 'rb'))
     r = rows.setdefault(crate, [0, 0, 0, 0])
