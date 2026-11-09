@@ -1,117 +1,218 @@
-## Generates src/generated/registry_data.aowl: NBT-encoded byte blobs for
-## every entry of every "synced registry" (the data Java Edition's
-## `minecraft:registry_data` config packet sends to clients - see
-## src/protocol/configpackets.aowl's `CRegistryData`).
-## Port of tools/pumpkin-codegen/src/registry.rs.
+## Port of pumpkin-codegen/src/registry.rs (registry.rs).
 ##
-## Upstream builds a `TokenStream` embedding each entry's NBT bytes as a
-## Rust byte-string literal (`b"..."`) inside a `static` table, keyed by
-## version (only one version, V_26_3, is actually populated - `get_synced`
-## always reads `REGISTRY_V_26_3` regardless of the version argument, so
-## this generator does the same: one flat table, no per-version branching).
-## This generator does the equivalent for aowlmony: walks the same ~31
-## `assets/datapack/data/minecraft/<registry>/*.json` directories, converts
-## each entry to NBT via jsontonbt.aowl, and emits a `seq[byte]` literal per
-## entry in a plain aowlmony data table.
+## Writes two modules from assets/registry/*_synced_registries.json:
 ##
-## Run with `aowlmony c -r src/data_codegen/gen_registry.aowl` from the repo
-## root.
+##   src/generated/registry_data.aowl  1.21.11's table, the wire target's: `registries*`, decoded at load.
+##   src/generated/registry.aowl       every version's table and `getSynced(version)`, decoded on first use.
+##
+## One string constant per asset file holds, in JSON order, each registry and for each entry its
+## unnamed NBT bytes (see jsontonbt.aowl). Layout, with `u` a LEB128 count and `s` a `u` plus bytes:
+## `u` registries; per registry `s` id and `u` entries; per entry `s` name and `s` data.
+##
+## Upstream's "raw" chat type: registry.rs injects it into `data.get_mut("minecraft:chat_type")`, but
+## the assets key that registry as plain `chat_type`, so the injection never fires and the checked-in
+## registry.rs has no raw entry in any version. This port keeps the same lookup, so the bytes match.
+## Run from the repo root: `aowlmony c -r -p:src src/data_codegen/gen_registry.aowl`
 
-import std/[syncio, json, paths, dirs]
-import jsontonbt
+import std/[json, syncio]
 import codegenutil
-import "../nbt/tag"
-import "../nbt/nbtbase"
-import "../nbt/nbtdoc"
-import "../nbt/serializer"
+import jsontonbt
+import codegenversion
 
-const SyncedRegistries = [
-  "worldgen/biome", "chat_type", "trim_pattern", "trim_material",
-  "wolf_variant", "wolf_sound_variant", "pig_variant", "pig_sound_variant",
-  "frog_variant", "cat_variant", "cat_sound_variant", "cow_variant",
-  "cow_sound_variant", "chicken_variant", "chicken_sound_variant",
-  "zombie_nautilus_variant", "painting_variant", "dimension_type",
-  "damage_type", "jukebox_song", "banner_pattern", "instrument",
-  "enchantment", "timeline", "dialog", "world_clock", "test_environment",
-  "test_instance", "sulfur_cube_archetype", "decorated_pot_pattern",
-  "block_transformer", "worldgen/block_state_provider",
-]
+const
+  DataOut = "src/generated/registry_data.aowl"
+  FullOut = "src/generated/registry.aowl"
+  LatestVersion = jmvV26_2
+  WireVersion = jmvV1_21_11
 
-const AssetsRoot = "../upstream-ref/assets/datapack/data/minecraft"
+type
+  Asset = object
+    version: JavaMinecraftVersion
+    file: string
 
-proc bytesToNimLiteral(b: seq[byte]): string =
-  ## Emits `@[1'u8, 2'u8, ...]` - aowlmony has no raw byte-string literal
-  ## syntax matching Rust's `b"..."`, so this is the direct equivalent.
-  result = "@["
-  for i, x in b:
-    if i > 0: result.add(", ")
-    result.add($x)
-    result.add("'u8")
-  result.add(']')
+proc assets(): seq[Asset] =
+  ## Upstream's `assets` array.
+  @[
+    Asset(version: jmvV1_20_5, file: "1_21_synced_registries.json"),
+    Asset(version: jmvV1_21, file: "1_21_synced_registries.json"),
+    Asset(version: jmvV1_21_2, file: "1_21_2_synced_registries.json"),
+    Asset(version: jmvV1_21_4, file: "1_21_4_synced_registries.json"),
+    Asset(version: jmvV1_21_5, file: "1_21_5_synced_registries.json"),
+    Asset(version: jmvV1_21_6, file: "1_21_6_synced_registries.json"),
+    Asset(version: jmvV1_21_7, file: "1_21_7_synced_registries.json"),
+    Asset(version: jmvV1_21_9, file: "1_21_9_synced_registries.json"),
+    Asset(version: jmvV1_21_11, file: "1_21_11_synced_registries.json"),
+    Asset(version: jmvV26_1, file: "26_1_synced_registries.json"),
+    Asset(version: jmvV26_2, file: "26_2_synced_registries.json")
+  ]
 
-proc entryBytes(node: JsonNode): seq[byte] =
-  ## Mirrors registry.rs: a compound gets written unnamed via Nbt.write;
-  ## any other top-level shape (upstream's `other` branch) is serialized
-  ## as bare payload data with no type-id/name prefix. Every real registry
-  ## entry file here is a JSON object, so the compound path is what always
-  ## actually runs; the other branch exists for parity with upstream's
-  ## exhaustive match, not because it's expected to fire.
-  let tag = jsonToNbtTag(node)
-  if tag.kind == ntkCompound:
-    let doc = newNbt("", tag.compoundVal)
-    writeUnnamed(doc, nwmJava)
-  else:
-    var w = newNbtWriter(nwmJava)
-    discard serializeData(tag, w)
-    w.buf
+proc putCount(blob: var string; n: int) =
+  var v = n
+  while v >= 128:
+    blob.add(char((v and 127) or 128))
+    v = v shr 7
+  blob.add(char(v))
 
-proc rawChatTypeEntry(): JsonNode =
-  ## Upstream injects a hardcoded "raw" chat_type entry for vanilla parity
-  ## (registry.rs lines 87-92) - not present in any assets/ JSON file.
-  var tree = parseJson("""{
-    "chat": {"translation_key": "%s", "parameters": ["content"]},
-    "narration": {"translation_key": "%s says %s", "parameters": ["sender", "content"]}
-  }""")
-  root(tree)
+proc putStr(blob: var string; s: string) =
+  blob.putCount(s.len)
+  blob.add(s)
+
+proc putData(blob: var string; b: seq[byte]) =
+  blob.putCount(b.len)
+  for x in b:
+    blob.add(char(x))
+
+proc rawChatTypeBytes(): seq[byte] =
+  jsonTextToNbtBytes("""{"chat":{"translation_key":"%s","parameters":["content"]},"narration":{"translation_key":"%s says %s","parameters":["sender","content"]}}""")
+
+proc processFile(file: string): string =
+  ## Upstream's `process_version`.
+  let text = readAsset("registry/" & file)
+  var floats = FloatCursor(values: scanFloats(text), next: 0)
+  var tree = parseJson(text)
+  let data = root(tree)
+  result = ""
+  result.putCount(data.len)
+  for regName, entries in data.pairs():
+    result.putStr(regName)
+    let inject = regName == "minecraft:chat_type"
+    var count = entries.len
+    var hasRaw = false
+    for entryName, entryData in entries.pairs():
+      if entryName == "raw": hasRaw = true
+    if inject and not hasRaw: inc count
+    result.putCount(count)
+    for entryName, entryData in entries.pairs():
+      result.putStr(entryName)
+      if inject and entryName == "raw":
+        result.putData(rawChatTypeBytes())
+      else:
+        result.putData(jsonToNbtBytes(entryData, floats))
+    if inject and not hasRaw:
+      result.putStr("raw")
+      result.putData(rawChatTypeBytes())
+
+proc dataModule(blob: string): string =
+  result = "## GENERATED by src/data_codegen/gen_registry.aowl from assets/registry/1_21_11_synced_registries.json - do not edit by hand.\n"
+  result.add("## NBT-encoded entries of every synced registry for the wire target, 1.21.11, for the\n")
+  result.add("## minecraft:registry_data config packet. Other versions: registry.aowl's getSynced.\n\n")
+  result.add("type\n")
+  result.add("  RegistryEntry* = object\n")
+  result.add("    name*: string\n")
+  result.add("    data*: seq[byte]\n\n")
+  result.add("  RegistryTable* = object\n")
+  result.add("    registryId*: string\n")
+  result.add("    entries*: seq[RegistryEntry]\n\n")
+  result.add("proc getCount(s: string; pos: var int): int =\n")
+  result.add("  result = 0\n")
+  result.add("  var shift = 0\n")
+  result.add("  while true:\n")
+  result.add("    let b = int(ord(s[pos]))\n")
+  result.add("    inc pos\n")
+  result.add("    result = result or ((b and 127) shl shift)\n")
+  result.add("    if b < 128: break\n")
+  result.add("    shift += 7\n\n")
+  result.add("proc getStr(s: string; pos: var int): string =\n")
+  result.add("  let n = getCount(s, pos)\n")
+  result.add("  result = substr(s, pos, pos + n - 1)\n")
+  result.add("  pos += n\n\n")
+  result.add("proc decodeRegistries*(s: string): seq[RegistryTable] =\n")
+  result.add("  ## Undoes the layout gen_registry.aowl writes.\n")
+  result.add("  result = @[]\n")
+  result.add("  var pos = 0\n")
+  result.add("  let regs = getCount(s, pos)\n")
+  result.add("  for r in 0 ..< regs:\n")
+  result.add("    let id = getStr(s, pos)\n")
+  result.add("    let n = getCount(s, pos)\n")
+  result.add("    var entries = newSeqOfCap[RegistryEntry](n)\n")
+  result.add("    for e in 0 ..< n:\n")
+  result.add("      let name = getStr(s, pos)\n")
+  result.add("      let len = getCount(s, pos)\n")
+  result.add("      var data = newSeq[byte](len)\n")
+  result.add("      for i in 0 ..< len:\n")
+  result.add("        data[i] = byte(ord(s[pos + i]))\n")
+  result.add("      pos += len\n")
+  result.add("      entries.add(RegistryEntry(name: name, data: data))\n")
+  result.add("    result.add(RegistryTable(registryId: id, entries: entries))\n\n")
+  result.add("const RegistryBlob_1_21_11* = " & aowlStr(blob) & "\n\n")
+  result.add("let registries*: seq[RegistryTable] = decodeRegistries(RegistryBlob_1_21_11)\n")
+
+proc fullModule(files: seq[string]; blobs: seq[string]): string =
+  result = "## GENERATED by src/data_codegen/gen_registry.aowl from assets/registry/*_synced_registries.json - do not edit by hand.\n"
+  result.add("## Port of the output of pumpkin-codegen/src/registry.rs: every version's synced registries.\n")
+  result.add("## A version's table decodes on first use and stays cached. Not synchronised: call from one thread,\n")
+  result.add("## or call once per version at startup.\n\n")
+  result.add("import ../util/javaversion\n")
+  result.add("import registry_data\n")
+  result.add("export registry_data\n\n")
+  result.add("type\n")
+  result.add("  RegistryEntryData* = object\n")
+  result.add("    ## `RegistryEntryData`; `hasData` and `data` are upstream's `Option<Box<[u8]>>`.\n")
+  result.add("    entryId*: string\n")
+  result.add("    hasData*: bool\n")
+  result.add("    data*: seq[byte]\n\n")
+  result.add("  Registry* = object\n")
+  result.add("    registryId*: string\n")
+  result.add("    registryEntries*: seq[RegistryEntryData]\n\n")
+  for i in 0 ..< files.len:
+    if files[i] != "1_21_11_synced_registries.json":
+      result.add("const Blob" & $i & " = " & aowlStr(blobs[i]) & " ## " & files[i] & "\n\n")
+  result.add("var cache: array[" & $files.len & ", seq[RegistryTable]]\n")
+  result.add("var loaded: array[" & $files.len & ", bool]\n\n")
+  result.add("proc fileIndex(version: JavaMinecraftVersion): int =\n  case version\n")
+  var latestIdx = 0
+  let allAssets = assets()
+  for a in allAssets:
+    for i in 0 ..< files.len:
+      if files[i] == a.file:
+        result.add("  of " & versionEnumName(a.version) & ": " & $i & "\n")
+        if a.version == LatestVersion: latestIdx = i
+  result.add("  else: " & $latestIdx & " ## upstream's `_ => " & "REGISTRY_" & versionDebugName(LatestVersion) & "`\n\n")
+  result.add("proc staticRegistries*(version: JavaMinecraftVersion): seq[RegistryTable] =\n")
+  result.add("  ## `REGISTRY_V_x` for this version, names without the `minecraft:` prefix.\n")
+  result.add("  let i = fileIndex(version)\n")
+  result.add("  if not loaded[i]:\n")
+  result.add("    case i\n")
+  for i in 0 ..< files.len:
+    if files[i] == "1_21_11_synced_registries.json":
+      result.add("    of " & $i & ": cache[i] = registries\n")
+    else:
+      result.add("    of " & $i & ": cache[i] = decodeRegistries(Blob" & $i & ")\n")
+  result.add("    else: discard\n")
+  result.add("    loaded[i] = true\n")
+  result.add("  cache[i]\n\n")
+  result.add("proc hasColon(s: string): bool =\n")
+  result.add("  for c in s:\n")
+  result.add("    if c == ':': return true\n")
+  result.add("  false\n\n")
+  result.add("proc getSynced*(version: JavaMinecraftVersion): seq[Registry] =\n")
+  result.add("  ## `Registry::get_synced`.\n")
+  result.add("  result = @[]\n")
+  result.add("  let regs = staticRegistries(version)\n")
+  result.add("  for reg in regs:\n")
+  result.add("    ## Not named `entries`: a local of that name next to `reg.entries` breaks the C stage.\n")
+  result.add("    var synced = newSeqOfCap[RegistryEntryData](reg.entries.len)\n")
+  result.add("    for entry in reg.entries:\n")
+  result.add("      synced.add(RegistryEntryData(entryId: \"minecraft:\" & entry.name, hasData: true, data: entry.data))\n")
+  result.add("    let id = if hasColon(reg.registryId): reg.registryId else: \"minecraft:\" & reg.registryId\n")
+  result.add("    result.add(Registry(registryId: id, registryEntries: synced))\n")
 
 proc main() =
-  var output = "## Generated by src/data_codegen/gen_registry.aowl - do not edit by hand.\n"
-  output.add("## NBT-encoded registry entries for the minecraft:registry_data config packet.\n\n")
-  output.add("type\n")
-  output.add("  RegistryEntry* = object\n")
-  output.add("    name*: string\n")
-  output.add("    data*: seq[byte]\n\n")
-  output.add("  RegistryTable* = object\n")
-  output.add("    registryId*: string\n")
-  output.add("    entries*: seq[RegistryEntry]\n\n")
-
-  var regCount = 0
-  var entryCount = 0
-  output.add("let registries*: seq[RegistryTable] = @[\n")
-  for regName in SyncedRegistries:
-    let dir = path(AssetsRoot & "/" & regName)
-    let stems = listJsonStems(dir)
-    if stems.len == 0 and regName != "chat_type":
-      continue
-    inc regCount
-    output.add("  RegistryTable(registryId: \"" & regName & "\", entries: @[\n")
-    for (stem, path) in stems:
-      var tree = parseFile($path)
-      let node = root(tree)
-      let data = entryBytes(node)
-      output.add("    RegistryEntry(name: \"" & stem & "\", data: " & bytesToNimLiteral(data) & "),\n")
-      inc entryCount
-    if regName == "chat_type":
-      let data = entryBytes(rawChatTypeEntry())
-      output.add("    RegistryEntry(name: \"raw\", data: " & bytesToNimLiteral(data) & "),\n")
-      inc entryCount
-    output.add("  ]),\n")
-  output.add("]\n")
-
-  try:
-    writeFile("src/generated/registry_data.aowl", output)
-    echo "wrote src/generated/registry_data.aowl: ", regCount, " registries, ", entryCount, " entries"
-  except ErrorCode as e:
-    echo "write failed: " & $e
+  var files: seq[string] = @[]
+  var blobs: seq[string] = @[]
+  let allAssets = assets()
+  for a in allAssets:
+    var seen = false
+    for f in files:
+      if f == a.file: seen = true
+    if not seen:
+      files.add(a.file)
+      blobs.add(processFile(a.file))
+  var wire = ""
+  for i in 0 ..< files.len:
+    if files[i] == "1_21_11_synced_registries.json":
+      wire = blobs[i]
+  writeGenerated(DataOut, dataModule(wire))
+  writeGenerated(FullOut, fullModule(files, blobs))
 
 main()

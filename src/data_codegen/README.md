@@ -1,5 +1,22 @@
 # data codegen port
 
+The inputs are the pinned upstream tree at `../ref/pumpkin-1.21.11` (commit `b7ccef5b2`), read through
+`codegenutil.AssetsDir`. `assets/` there is 26.2 data, with per-version files under `registry/`, `tags/`,
+`tracked_data/`, `meta_data_type/` and `packet/`. Each `gen_<name>.aowl` writes modules under `src/generated`.
+Upstream's own output, checked in at `pumpkin-data/src/generated/*.rs`, is the oracle to compare values against.
+
+Regenerate from the repo root, with gcc on PATH or in `AOWLMONY_GCC_DIR`:
+
+    python src/data_codegen/regen_all.py --compiler <aowlmony binary> --cache <dir> [name ...]
+
+The compiler and cache also come from `AOWLMONY_BIN` and `AOWLMONY_CACHE`. Without names it runs every generator
+except those whose inputs are not in the pinned tree: `wit`, `decorated_pot_pattern`, `dye_color`, `map_color`,
+`map_decoration`, `context_provider`, `template_bytes`, `test_instance`, and anything still reading
+`assets/datapack`. Their outputs stay as they were, since running one with no input would empty its table.
+
+The rest of this file predates the pin and describes the generators' history. Paths in it such as `tools/codegen`
+and `assets/datapack` belong to the newer tree they were first written against.
+
 ## Audit: JsonNode missing-key crash (`{}` operator vs. `pairs()`)
 
 A generator (`noise_parameter.rs`'s port) found that aowlmony's `std/json`
@@ -142,7 +159,7 @@ That's 34/90 submodules done (33 in `src/data_codegen/`/`src/generated/` + 1 dir
 
 - `gen_registry.aowl` → `src/generated/registry_data.aowl` (**`registry.rs`, 234
   lines, now done** - previously flagged as "investigated but deferred").
-  Ported `jsontonbt.aowl` (`jsonToNbtTag`, a generic recursive `JsonNode ->
+  Ported `jsontonbt.aowl` (`jsonToNbtTag` then, since replaced by `jsonToNbtBytes`, a generic recursive `JsonNode ->
   NbtTag` converter mirroring `registry.rs`'s local `json_to_nbt_tag`
   closure exactly, 6-way match on JSON value kind) as a standalone reusable
   module, then the generator itself: walks all 32 `SYNCED_REGISTRIES`

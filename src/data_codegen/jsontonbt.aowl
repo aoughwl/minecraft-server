@@ -1,39 +1,172 @@
-## Generic JSON -> NBT value converter, used by gen_registry.aowl.
-## Port of registry.rs's local `json_to_nbt_tag` closure.
+## Writes one parsed JSON value as unnamed Java NBT bytes, the way upstream's
+## `pumpkin_nbt::serializer::to_bytes_unnamed(&serde_json::Value, ...)` does in registry.rs.
+## Port of the path through pumpkin-nbt/src/serializer.rs that a serde_json::Value takes:
 ##
-## Rust matches on `serde_json::Value`'s 6 variants directly. aowlmony's
-## `std/json` JsonNode has the same shape (JNull/JBool/JInt/JFloat/JString/
-## JArray/JObject - note JInt/JFloat are split where serde_json's Number
-## is one variant tested with `as_i64`/`as_f64`), so this is a close
-## structural match, not a reinterpretation.
+## - every JSON integer is `serialize_u64`/`serialize_i64`, so a Long, whatever its size;
+## - every JSON float is `serialize_f64`, so a Double; bools are Bytes. Its value comes from serde_json's
+##   default float parser, which is not correctly rounded: the digits go into a u64, that converts to a
+##   float, and one float division or multiplication by a power of ten follows. With 16 or more digits that
+##   can land one bit from the true value, and 26.2's sulfur_cube_archetype does, so the literal's text is
+##   needed: `scanFloats` collects it in document order, since std/json keeps only its own parse;
+## - null is `serialize_unit`: nothing at all, not even a name;
+## - an object is `serialize_map`, keys in file order (the codegen crate enables serde_json's
+##   `preserve_order`), closed by End;
+## - an array is `serialize_seq`, a plain List. Only the first element writes the element
+##   tag and length; later ones write bare payloads without a type check, as State::ListElement
+##   does. An empty array is End with length 0;
+## - the root must be a compound, with no name. Anything else is upstream's `unwrap()` panic.
 
-import std/json
-import "../nbt/tag"
+import std/[json, syncio]
 import "../nbt/nbtbase"
+import "../nbt/serializer"
 
-proc jsonToNbtTag*(v: JsonNode): NbtTag =
+type
+  HeadKind = enum
+    hkRoot       ## State::Root(None)
+    hkNamed      ## State::Named
+    hkFirstElem  ## State::FirstListElement
+    hkElem       ## State::ListElement
+
+proc fail(msg: string) =
+  echo "jsontonbt: " & msg
+  quit(1)
+
+proc putStr(w: var NbtWriter; s: string) =
+  let res = w.writeString(s)
+  if not res.isOk: fail("string too long: " & s)
+
+proc head(w: var NbtWriter; tag: uint8; kind: HeadKind; name: string; listLen: int) =
+  ## `Serializer::parse_state`.
+  case kind
+  of hkRoot:
+    if tag != CompoundId: fail("root is not a compound")
+    w.writeU8(tag)
+  of hkNamed:
+    w.writeU8(tag)
+    w.putStr(name)
+  of hkFirstElem:
+    w.writeU8(tag)
+    w.writeI32(int32(listLen))
+  of hkElem:
+    discard
+
+proc serdeFloat(text: string): float64 =
+  ## serde_json's `f64_from_parts` over `parse_number`'s significand and exponent.
+  var pos = 0
+  var negative = false
+  if text[0] == '-':
+    negative = true
+    inc pos
+  var significand = 0'u64
+  var exponent = 0
+  var seenDot = false
+  while pos < text.len and text[pos] != 'e' and text[pos] != 'E':
+    if text[pos] == '.':
+      seenDot = true
+    else:
+      if significand > 1_000_000_000_000_000_000'u64:
+        fail("float literal too long for this port of serde_json's parser: " & text)
+      significand = significand * 10'u64 + uint64(ord(text[pos]) - ord('0'))
+      if seenDot: dec exponent
+    inc pos
+  if pos < text.len:
+    inc pos
+    var expNegative = false
+    if text[pos] == '-':
+      expNegative = true
+      inc pos
+    elif text[pos] == '+':
+      inc pos
+    var e = 0
+    while pos < text.len:
+      e = e * 10 + (ord(text[pos]) - ord('0'))
+      inc pos
+    exponent += (if expNegative: -e else: e)
+  let magnitude = abs(exponent)
+  if magnitude > 22:
+    fail("float exponent outside the exact powers of ten: " & text)
+  var power = 1.0
+  for i in 0 ..< magnitude:
+    power = power * 10.0
+  var f = float64(significand)
+  if exponent >= 0: f = f * power else: f = f / power
+  if negative: -f else: f
+
+proc scanFloats*(text: string): seq[float64] =
+  ## The value of each JSON float literal in `text`, in document order.
+  result = @[]
+  var i = 0
+  let n = text.len
+  while i < n:
+    let c = text[i]
+    if c == '"':
+      inc i
+      while i < n and text[i] != '"':
+        if text[i] == '\\': inc i
+        inc i
+      inc i
+    elif c == '-' or (c >= '0' and c <= '9'):
+      let start = i
+      var isFloat = false
+      while i < n and (text[i] == '-' or text[i] == '+' or text[i] == '.' or text[i] == 'e' or
+                       text[i] == 'E' or (text[i] >= '0' and text[i] <= '9')):
+        if text[i] == '.' or text[i] == 'e' or text[i] == 'E': isFloat = true
+        inc i
+      if isFloat:
+        result.add(serdeFloat(substr(text, start, i - 1)))
+    else:
+      inc i
+
+type
+  FloatCursor* = object
+    ## The `scanFloats` list and how far the document walk has read it.
+    values*: seq[float64]
+    next*: int
+
+proc emit(w: var NbtWriter; v: JsonNode; kind: HeadKind; name: string; listLen: int; floats: var FloatCursor) =
   case v.kind
   of JNull:
-    NbtTag(kind: ntkEnd)
+    discard
   of JBool:
-    NbtTag(kind: ntkByte, byteVal: (if v.getBool(): 1'i8 else: 0'i8))
+    w.head(ByteId, kind, name, listLen)
+    w.writeI8(if v.getBool(): 1'i8 else: 0'i8)
   of JInt:
-    let i = v.getInt()
-    if i >= int64(int32.low) and i <= int64(int32.high):
-      NbtTag(kind: ntkInt, intVal: int32(i))
-    else:
-      NbtTag(kind: ntkLong, longVal: i)
+    w.head(LongId, kind, name, listLen)
+    w.writeI64(v.getInt())
   of JFloat:
-    NbtTag(kind: ntkDouble, doubleVal: v.getFloat())
+    w.head(DoubleId, kind, name, listLen)
+    if floats.next >= floats.values.len: fail("fewer float literals than JSON floats")
+    w.writeF64(floats.values[floats.next])
+    inc floats.next
   of JString:
-    NbtTag(kind: ntkString, stringVal: v.getStr())
+    w.head(StringId, kind, name, listLen)
+    w.putStr(v.getStr())
   of JArray:
-    var list: seq[NbtTag] = @[]
-    for item in v.items:
-      list.add(jsonToNbtTag(item))
-    NbtTag(kind: ntkList, listVal: list)
+    w.head(ListId, kind, name, listLen)
+    let n = v.len
+    if n == 0:
+      w.writeU8(EndId)
+      w.writeI32(0'i32)
+    else:
+      var i = 0
+      for item in v.items:
+        w.emit(item, (if i == 0: hkFirstElem else: hkElem), "", n, floats)
+        inc i
   of JObject:
-    var compound = newCompound()
+    w.head(CompoundId, kind, name, listLen)
     for key, val in v.pairs():
-      put(compound, key, jsonToNbtTag(val))
-    NbtTag(kind: ntkCompound, compoundVal: compound)
+      w.emit(val, hkNamed, key, 0, floats)
+    w.writeU8(EndId)
+
+proc jsonToNbtBytes*(v: JsonNode; floats: var FloatCursor): seq[byte] =
+  ## `to_bytes_unnamed(value, &mut bytes)`. Entries of one document must be converted in document
+  ## order, since `floats` is consumed along the way.
+  var w = newNbtWriter(nwmJava)
+  w.emit(v, hkRoot, "", 0, floats)
+  w.buf
+
+proc jsonTextToNbtBytes*(text: string): seq[byte] =
+  ## A whole JSON document holding one compound.
+  var tree = parseJson(text)
+  var floats = FloatCursor(values: scanFloats(text), next: 0)
+  jsonToNbtBytes(root(tree), floats)

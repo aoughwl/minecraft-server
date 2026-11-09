@@ -1,145 +1,430 @@
-## Generates src/generated/biome.aowl from the upstream reference's biome
-## datapack JSON files.
-## Port of upstream/tools/pumpkin-codegen/src/biome.rs
+## Port of pumpkin-codegen/src/biome.rs (biome.rs)
 ##
-## Scope note: upstream's `Biome` also carries `spawners`/`spawn_costs`
-## (natural mob-spawn tables, themselves sometimes nested inside an
-## `attributes."minecraft:gameplay/natural_mob_spawns"` override - see
-## `apply_natural_mob_spawns` in biome.rs), the full `attributes` map
-## (cosmetic/gameplay overrides keyed by tag, values of arbitrary shape),
-## and `effects` (water/sky/fog color etc., client-rendering data). All of
-## that is real work with its own edge cases (a `count` field that's either
-## a bare int or a `{type, min_inclusive, max_inclusive}` uniform-provider
-## object, same shape dimension.rs's `monster_spawn_light_level` has) and
-## isn't needed for src/world/biomeparam.aowl's climate-parameter math, so
-## it's deferred here - this generator ports has_precipitation/temperature/
-## downfall/temperature_modifier/carvers/features only. There is no `id`
-## field in the source JSON (registry ids come from registry.rs's ordering,
-## already captured separately in src/generated/registry_data.aowl's
-## `worldgen/biome` entries) - biomeFromName below is name-keyed, not
-## id-keyed, matching what biomeparam.aowl actually needs (a biome's climate
-## data by name, not a numeric id).
+## Reads `assets/biome.json`, `assets/multi_noise_biome_tree.json` and `assets/bedrock/biomes.json`
+## and writes src/generated/biome.aowl. Upstream emits 18 MB of constants; this is string tables
+## decoded when the module loads.
+##
+## `BiomeTree` is an arena: children sit next to each other, a node holds the range. `Biome` stays
+## a `ref object`, one per biome, because upstream hands out `&'static Biome`.
+##
+## Weather and TemperatureModifier are from pumpkin-util/src/biome.rs, which has no port yet; the
+## data shape is defined in the generated module, the climate logic is not ported.
+## PARTIAL: pumpkin-codegen/src/biome.rs - `Taggable` for Biome is not emitted: it needs pumpkin-data's tag module port
 
-import std/[json, paths, strutils, syncio]
-import codegenutil
+import std/[json, strutils, syncio]
+import codegenutil, worldgenutil
 
-type BiomeEntry = object
-  name: string
-  hasPrecipitation: bool
-  temperature: float
-  downfall: float
-  temperatureModifier: string
-  carvers: seq[string]
-  features: seq[string]
+const OutPath = "src/generated/biome.aowl"
 
-proc readCarvers(root: JsonNode): seq[string] =
-  ## Port of biome.rs's `deserialize_carvers`: the JSON value is either a
-  ## bare string or a list of strings; absent -> empty.
+proc die(msg: string) =
+  echo "gen_biome: " & msg
+  quit(1)
+
+proc spawnerGroup(spawners: JsonNode; group: string): string =
+  ## `type=min=max` joined by commas. The type holds a colon, so that cannot separate them.
+  result = ""
+  let (ok, list) = fieldOf(spawners, group)
+  if not ok:
+    die("no spawner group " & group)
+  for e in items(list):
+    if result.len > 0: result.add(",")
+    result.add(strAt(e, "type") & "=" & $intAt(e, "minCount") & "=" & $intAt(e, "maxCount"))
+
+type
+  TreeRow = object
+    biome: int
+    first: int
+    count: int
+    params: string
+
+proc paramText(n: JsonNode): string =
+  ## The seven ranges, `min,max,...`.
+  result = ""
+  let (_, params) = fieldOf(n, "parameters")
+  var count = 0
+  for p in items(params):
+    if count > 0: result.add(",")
+    result.add($intAt(p, "min") & "," & $intAt(p, "max"))
+    inc count
+  if count != 7:
+    die("a tree node has " & $count & " parameters")
+
+proc biomeIdOf(names: seq[string]; ids: seq[int]; name: string): int =
+  var i = 0
+  while i < names.len:
+    if names[i] == name:
+      return ids[i]
+    inc i
+  die("unknown biome " & name)
+  -1
+
+proc flatten(root: JsonNode; names: seq[string]; ids: seq[int]): string =
+  ## Breadth-first, so a branch's children are contiguous. Row 0 is the root.
+  var queue: seq[JsonNode] = @[root]
+  var rows: seq[TreeRow] = @[]
+  var head = 0
+  while head < queue.len:
+    let n = queue[head]
+    var row = TreeRow(biome: -1, first: 0, count: 0, params: paramText(n))
+    case strAt(n, "_type")
+    of "leaf":
+      row.biome = biomeIdOf(names, ids, stripMc(strAt(n, "biome")))
+    of "branch":
+      let (_, sub) = fieldOf(n, "subTree")
+      row.first = queue.len
+      for c in items(sub):
+        queue.add(c)
+        inc row.count
+    else:
+      die("unknown tree node " & strAt(n, "_type"))
+    rows.add(row)
+    inc head
+  result = newStringOfCap(rows.len * 60)
+  var i = 0
+  while i < rows.len:
+    result.add($rows[i].biome & "," & $rows[i].first & "," & $rows[i].count & "," & rows[i].params & "\n")
+    inc i
+
+const Types = """
+import std/hashes
+import gendecode
+import placed_feature
+export placed_feature
+
+type
+  TemperatureModifier* {.pure.} = enum
+    ## pumpkin-util/src/biome.rs.
+    None, Frozen
+
+  Weather* = object
+    ## pumpkin-util/src/biome.rs: the data only. `compute_temperature` waits on that file's port.
+    hasPrecipitation*: bool
+    temperature*: float32
+    temperatureModifier*: TemperatureModifier
+    downfall*: float32
+
+  Spawner* = object
+    `type`*: string
+    minCount*: int32
+    maxCount*: int32
+
+  SpawnGroups* = object
+    monster*: seq[Spawner]
+    ambient*: seq[Spawner]
+    axolotls*: seq[Spawner]
+    creature*: seq[Spawner]
+    misc*: seq[Spawner]
+    undergroundWaterCreature*: seq[Spawner]
+    waterAmbient*: seq[Spawner]
+    waterCreature*: seq[Spawner]
+
+  SpawnCosts* = object
+    energyBudget*: float64
+    charge*: float64
+
+  SpawnCostEntry* = object
+    ## One entry of upstream's `phf::Map`, keyed by the bare entity name.
+    entity*: string
+    costs*: SpawnCosts
+
+  Biome* = ref object
+    id*: uint8
+    registryId*: string
+    beNetworkId*: uint8
+    weather*: Weather
+    features*: seq[seq[PlacedFeature]]
+    creatureSpawnProbability*: float32
+    spawners*: SpawnGroups
+    spawnCosts*: seq[SpawnCostEntry]
+
+  ParameterRange* = object
+    min*: int64
+    max*: int64
+
+  BiomeTreeNode* = object
+    ## `BiomeTree::Leaf` when `biome >= 0`, else `BiomeTree::Branch`.
+    parameters*: array[7, ParameterRange]
+    biome*: int16
+    firstChild*: int32
+    childCount*: int32
+
+  BiomeTree* = ref object
+    nodes*: seq[BiomeTreeNode]  ## Row 0 is the root.
+
+proc `==`*(a: Biome; other: uint8): bool {.inline.} = a.id == other
+proc `==`*(other: uint8; a: Biome): bool {.inline.} = other == a.id
+proc hash*(a: Biome): Hash = hash(int(a.id))
+
+proc spawnCost*(b: Biome; entity: string): (bool, SpawnCosts) =
+  ## The `spawn_costs` map's `get`.
+  for e in b.spawnCosts:
+    if e.entity == entity:
+      return (true, e.costs)
+  (false, SpawnCosts())
+
+proc decodeSpawners(s: string; pos: var int; sep: char): seq[Spawner] =
   result = @[]
-  for k, v in root.pairs():
-    if k == "carvers":
-      case v.kind
-      of JString:
-        result.add(v.getStr())
-      of JArray:
-        for item in v.items():
-          result.add(item.getStr())
-      else:
-        discard
+  while pos < s.len and s[pos] != sep:
+    let t = fieldStr(s, pos, '=')
+    skipSep(s, pos)
+    let minCount = int32(fieldInt(s, pos, '='))
+    skipSep(s, pos)
+    let maxCount = int32(fieldInt(s, pos, ',', sep))
+    if s[pos] == ',':
+      inc pos
+    result.add(Spawner(`type`: t, minCount: minCount, maxCount: maxCount))
+  skipSep(s, pos)
 
-proc readFeatures(root: JsonNode): seq[string] =
-  ## Upstream's `features: Vec<Vec<String>>` is a list of per-step feature
-  ## lists; flattened here (step boundaries aren't needed for climate math,
-  ## and preserving them would need a seq[seq[string]] literal, itself a
-  ## `const`-fold risk already hit elsewhere in this port with large seqs).
+proc decodeBiomes(d: string): seq[Biome] =
+  ## One line per biome, in `Biome::ALL` order, which is by name.
   result = @[]
-  for k, v in root.pairs():
-    if k == "features":
-      for step in v.items():
-        for item in step.items():
-          result.add(item.getStr())
+  var pos = 0
+  while pos < d.len:
+    let id = uint8(fieldInt(d, pos, '|')); skipSep(d, pos)
+    let name = fieldStr(d, pos, '|'); skipSep(d, pos)
+    let beId = uint8(fieldInt(d, pos, '|')); skipSep(d, pos)
+    let precipitation = d[pos] == '1'; pos += 2
+    let temperature = fieldF32Bits(d, pos, '|'); skipSep(d, pos)
+    let modifier = if d[pos] == '1': TemperatureModifier.Frozen else: TemperatureModifier.None
+    pos += 2
+    let downfall = fieldF32Bits(d, pos, '|'); skipSep(d, pos)
+    let probability = fieldF32Bits(d, pos, '|'); skipSep(d, pos)
 
-proc loadBiome(name: string, path: Path): BiomeEntry {.noinit.} =
-  var tree = parseFile($path)
-  let root = root(tree)
-  result = BiomeEntry(name: "minecraft:" & name, temperatureModifier: "")
-  for key, val in root.pairs():
-    case key
-    of "has_precipitation": result.hasPrecipitation = val.getBool()
-    of "temperature": result.temperature = val.getFloat()
-    of "downfall": result.downfall = val.getFloat()
-    of "temperature_modifier": result.temperatureModifier = val.getStr()
-    else: discard
-  result.carvers = readCarvers(root)
-  result.features = readFeatures(root)
+    # `<step count>:` then the steps' ordinals, `,` inside a step and `;` between steps.
+    let stepCount = fieldInt(d, pos, ':'); skipSep(d, pos)
+    let stepText = fieldStr(d, pos, '|'); skipSep(d, pos)
+    var features = newSeq[seq[PlacedFeature]](stepCount)
+    var stepPos = 0
+    var step = 0
+    while step < stepCount:
+      var inStep: seq[PlacedFeature] = @[]
+      while stepPos < stepText.len and stepText[stepPos] != ';':
+        inStep.add(PlacedFeature(fieldInt(stepText, stepPos, ',', ';')))
+        if stepPos < stepText.len and stepText[stepPos] == ',':
+          inc stepPos
+      skipSep(stepText, stepPos)
+      features[step] = inStep
+      inc step
 
-proc escapeNim(s: string): string =
-  result = "\""
-  for c in s:
-    case c
-    of '"': result.add("\\\"")
-    of '\\': result.add("\\\\")
-    of '\n': result.add("\\n")
-    else: result.add(c)
-  result.add("\"")
+    let monster = decodeSpawners(d, pos, '/')
+    let ambient = decodeSpawners(d, pos, '/')
+    let axolotls = decodeSpawners(d, pos, '/')
+    let creature = decodeSpawners(d, pos, '/')
+    let misc = decodeSpawners(d, pos, '/')
+    let undergroundWaterCreature = decodeSpawners(d, pos, '/')
+    let waterAmbient = decodeSpawners(d, pos, '/')
+    let waterCreature = decodeSpawners(d, pos, '|')
 
-proc seqLit(items: seq[string]): string =
-  result = "@["
-  for i, it in items:
-    if i > 0: result.add(", ")
-    result.add(escapeNim(it))
-  result.add("]")
+    var costs: seq[SpawnCostEntry] = @[]
+    while pos < d.len and d[pos] != '\n':
+      let entity = fieldStr(d, pos, '=')
+      skipSep(d, pos)
+      let energy = fieldF64Bits(d, pos, '=')
+      skipSep(d, pos)
+      let charge = fieldF64Bits(d, pos, ',')
+      if pos < d.len and d[pos] == ',':
+        inc pos
+      costs.add(SpawnCostEntry(entity: entity, costs: SpawnCosts(energyBudget: energy, charge: charge)))
+    skipSep(d, pos)
+
+    result.add(Biome(id: id, registryId: name, beNetworkId: beId,
+      weather: Weather(hasPrecipitation: precipitation, temperature: temperature,
+        temperatureModifier: modifier, downfall: downfall),
+      features: features, creatureSpawnProbability: probability,
+      spawners: SpawnGroups(monster: monster, ambient: ambient, axolotls: axolotls, creature: creature,
+        misc: misc, undergroundWaterCreature: undergroundWaterCreature, waterAmbient: waterAmbient,
+        waterCreature: waterCreature),
+      spawnCosts: costs))
+
+proc decodeTree(d: string): BiomeTree =
+  var nodes: seq[BiomeTreeNode] = @[]
+  var pos = 0
+  while pos < d.len:
+    var n = BiomeTreeNode()
+    n.biome = int16(fieldInt(d, pos, ',')); skipSep(d, pos)
+    n.firstChild = int32(fieldInt(d, pos, ',')); skipSep(d, pos)
+    n.childCount = int32(fieldInt(d, pos, ',')); skipSep(d, pos)
+    for i in 0 ..< 7:
+      let lo = int64(fieldInt(d, pos, ',')); skipSep(d, pos)
+      let hi = int64(fieldInt(d, pos, ',')); skipSep(d, pos)
+      n.parameters[i] = ParameterRange(min: lo, max: hi)
+    nodes.add(n)
+  BiomeTree(nodes: nodes)
+
+proc calcDistance*(self: ParameterRange; noise: int64): int64 {.inline.} =
+  if noise > self.max:
+    noise - self.max
+  elif noise < self.min:
+    self.min - noise
+  else:
+    0'i64
+
+proc getSquaredDistance(self: BiomeTree; index: int32; p: array[7, int64]): int64 =
+  template params(i: int): ParameterRange = self.nodes[int(index)].parameters[i]
+  calcDistance(params(0), p[0]) + calcDistance(params(1), p[1]) + calcDistance(params(2), p[2]) +
+    calcDistance(params(3), p[3]) + calcDistance(params(4), p[4]) + calcDistance(params(5), p[5]) +
+    calcDistance(params(6), p[6])
+
+proc search(self: BiomeTree; index: int32; point: array[7, int64]; bestDist: var int64; bestNode: var int32) =
+  let dist = getSquaredDistance(self, index, point)
+  # A branch or leaf further than the best has nothing better under it.
+  if dist >= bestDist:
+    return
+  if self.nodes[int(index)].biome >= 0:
+    bestDist = dist
+    bestNode = index
+  else:
+    let first = self.nodes[int(index)].firstChild
+    let count = self.nodes[int(index)].childCount
+    var i = 0'i32
+    while i < count:
+      search(self, first + i, point, bestDist, bestNode)
+      inc i
+
+"""
+
+const Tail = """
+proc fromName*(T: typedesc[Biome]; name: string): nil Biome =
+  ## Upstream's `from_name`: the bare name.
+  for b in ALL:
+    if b.registryId == name:
+      return b
+  return nil
+
+proc fromId*(T: typedesc[Biome]; id: uint8): nil Biome =
+  for b in ALL:
+    if b.id == id:
+      return b
+  return nil
+
+proc deserializeBiome*(value: string): nil Biome =
+  ## Upstream's `Deserialize for &'static Biome`: strips `minecraft:` first.
+  if value.len > 10 and substr(value, 0, 9) == "minecraft:":
+    return Biome.fromName(substr(value, 10))
+  Biome.fromName(value)
+
+proc get*(self: BiomeTree; pointList: array[7, int64]; previousResultNode: var int32): Biome =
+  ## `BiomeTree::get`. `previousResultNode` is upstream's `Option<&BiomeTree>` as a node index,
+  ## -1 for None; pass the same variable back for the spatial coherence it gives.
+  var bestDist = high(int64)
+  var bestNode = 0'i32
+  if previousResultNode >= 0:
+    bestNode = previousResultNode
+    bestDist = getSquaredDistance(self, previousResultNode, pointList)
+  search(self, 0'i32, pointList, bestDist, bestNode)
+  previousResultNode = bestNode
+  let id = self.nodes[int(bestNode)].biome
+  if id < 0:
+    # Should not happen with valid tree data
+    genPanic("Biome search failed to find a leaf")
+  let found = Biome.fromId(uint8(id))
+  if found == nil:
+    genPanic("Biome search reached an unknown biome id")
+  return found
+"""
 
 proc main() =
-  let dir = path("../upstream-ref/assets/datapack/data/minecraft/worldgen/biome")
-  let stems = listJsonStems(dir)
-  var entries: seq[BiomeEntry] = @[]
-  for i in 0 ..< stems.len:
-    entries.add(loadBiome(stems[i][0], stems[i][1]))
+  let biomeText = readAsset("biome.json")
+  var biomeTree = parseJson(biomeText)
+  let biomes = sortedPairs(root(biomeTree))
+  let treeText = readAsset("multi_noise_biome_tree.json")
+  var treeTree = parseJson(treeText)
+  let treeRoot = root(treeTree)
+  let bedrockText = readAsset("bedrock/biomes.json")
+  var bedrockTree = parseJson(bedrockText)
+  let bedrockRoot = root(bedrockTree)
 
-  var src = "## Generated from upstream's worldgen/biome datapack JSON.\n"
-  src.add("## Port of upstream/tools/pumpkin-codegen/src/biome.rs (climate fields only - see gen_biome.aowl).\n\n")
-  src.add("type Biome* = object\n")
-  src.add("  name*: string\n")
-  src.add("  hasPrecipitation*: bool\n")
-  src.add("  temperature*: float32\n")
-  src.add("  downfall*: float32\n")
-  src.add("  temperatureModifier*: string\n")
-  src.add("  carvers*: seq[string]\n")
-  src.add("  features*: seq[string]\n\n")
+  # The PlacedFeature ordinals: the same sort as gen_placed_feature's enum.
+  let placedText = readAsset("placed_feature.json")
+  var placedTree = parseJson(placedText)
+  let placed = sortedPairs(root(placedTree))
+  var placedNames: seq[string] = @[]
+  var i = 0
+  while i < placed.len:
+    placedNames.add(placed[i][0])
+    inc i
 
-  proc constNameOf(e: BiomeEntry): string =
-    toShoutySnakeCase(e.name.split(':')[^1])
+  var names: seq[string] = @[]
+  var ids: seq[int] = @[]
+  i = 0
+  while i < biomes.len:
+    names.add(biomes[i][0])
+    ids.add(intAt(biomes[i][1], "id"))
+    inc i
 
-  for e in entries:
-    src.add("let " & constNameOf(e) & "* = Biome(\n")
-    src.add("  name: " & escapeNim(e.name) & ",\n")
-    src.add("  hasPrecipitation: " & $e.hasPrecipitation & ",\n")
-    src.add("  temperature: " & $e.temperature & "'f32,\n")
-    src.add("  downfall: " & $e.downfall & "'f32,\n")
-    src.add("  temperatureModifier: " & escapeNim(e.temperatureModifier) & ",\n")
-    src.add("  carvers: " & seqLit(e.carvers) & ",\n")
-    src.add("  features: " & seqLit(e.features) & ",\n")
-    src.add(")\n\n")
+  var rows = ""
+  i = 0
+  while i < biomes.len:
+    let name = biomes[i][0]
+    let b = biomes[i][1]
+    let (hasBe, be) = fieldOf(bedrockRoot, "minecraft:" & name)
+    let beId = if hasBe: intAt(be, "bedrock_id") else: 1
+    let frozen = strAt(b, "temperature_modifier") == "frozen"
+    rows.add($intAt(b, "id") & "|" & name & "|" & $beId & "|" & (if boolAt(b, "has_precipitation"): "1" else: "0") &
+      "|" & hexBits32(numAt(b, "temperature")) & "|" & (if frozen: "1" else: "0") & "|" &
+      hexBits32(numAt(b, "downfall")) & "|" & hexBits32(numAt(b, "creature_spawn_probability", 0.1)) & "|")
 
-  src.add("proc allBiomes*(): seq[Biome] =\n")
-  src.add("  @[\n")
-  for e in entries:
-    src.add("    " & constNameOf(e) & ",\n")
-  src.add("  ]\n\n")
+    let (_, features) = fieldOf(b, "features")
+    var steps = 0
+    var stepText = ""
+    for step in items(features):
+      if steps > 0: stepText.add(";")
+      var inner = 0
+      for f in items(step):
+        let fname = stripMc(getStr(f))
+        var ord = -1
+        var lo = 0
+        var hi = placedNames.len - 1
+        while lo <= hi:
+          let mid = (lo + hi) div 2
+          if placedNames[mid] == fname:
+            ord = mid
+            break
+          if placedNames[mid] < fname: lo = mid + 1 else: hi = mid - 1
+        if ord < 0:
+          die("unknown placed feature " & fname)
+        if inner > 0: stepText.add(",")
+        stepText.add($ord)
+        inc inner
+      inc steps
+    rows.add($steps & ":" & stepText & "|")
 
-  src.add("proc biomeFromName*(name: string): (bool, Biome) =\n")
-  src.add("  case name\n")
-  for e in entries:
-    src.add("  of " & escapeNim(e.name) & ", " & escapeNim(e.name.split(':')[^1]) & ":\n")
-    src.add("    (true, " & constNameOf(e) & ")\n")
-  src.add("  else:\n")
-  src.add("    (false, Biome())\n")
+    let (_, sp) = fieldOf(b, "spawners")
+    rows.add(spawnerGroup(sp, "monster") & "/" & spawnerGroup(sp, "ambient") & "/" & spawnerGroup(sp, "axolotls") &
+      "/" & spawnerGroup(sp, "creature") & "/" & spawnerGroup(sp, "misc") & "/" &
+      spawnerGroup(sp, "underground_water_creature") & "/" & spawnerGroup(sp, "water_ambient") & "/" &
+      spawnerGroup(sp, "water_creature") & "|")
 
-  try:
-    writeFile("src/generated/biome.aowl", src)
-  except ErrorCode as e:
-    echo "write failed: " & $e
-  echo "wrote src/generated/biome.aowl (", entries.len, " biomes)"
+    let (hasCosts, costs) = fieldOf(b, "spawn_costs")
+    if hasCosts:
+      let costEntries = sortedPairs(costs)
+      var c = 0
+      while c < costEntries.len:
+        if c > 0: rows.add(",")
+        rows.add(stripMc(costEntries[c][0]) & "=" & hexBits64(numAt(costEntries[c][1], "energy_budget")) & "=" &
+          hexBits64(numAt(costEntries[c][1], "charge")))
+        inc c
+    rows.add("\n")
+    inc i
+
+  let (_, overworld) = fieldOf(treeRoot, "overworld")
+  let (_, nether) = fieldOf(treeRoot, "nether")
+
+  var s = "## GENERATED by src/data_codegen/gen_biome.aowl - do not edit by hand.\n"
+  s.add("## Port of pumpkin-data/src/generated/biome.rs in compact form: see the generator.\n\n")
+  s.add(Types)
+  s.add("const BiomeRows = " & aowlStr(rows) & "\n\n")
+  s.add("const OverworldTreeRows = " & aowlStr(flatten(overworld, names, ids)) & "\n\n")
+  s.add("const NetherTreeRows = " & aowlStr(flatten(nether, names, ids)) & "\n\n")
+  s.add("let ALL*: seq[Biome] = decodeBiomes(BiomeRows)\n")
+  s.add("  ## Upstream's `Biome::ALL`: by name, not by id.\n\n")
+  i = 0
+  while i < names.len:
+    s.add("let " & shouty(names[i]) & "*: Biome = ALL[" & $i & "]\n")
+    inc i
+  s.add("\nlet OVERWORLD_BIOME_SOURCE*: BiomeTree = decodeTree(OverworldTreeRows)\n")
+  s.add("let NETHER_BIOME_SOURCE*: BiomeTree = decodeTree(NetherTreeRows)\n\n")
+  s.add(Tail)
+  writeGenerated(OutPath, s)
 
 main()

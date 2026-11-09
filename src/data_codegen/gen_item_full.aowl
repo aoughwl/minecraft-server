@@ -1,0 +1,558 @@
+## Port of pumpkin-codegen/src/item.rs (item.rs), the whole of what it emits.
+##
+## Writes two modules:
+##   src/generated/item_refs.aowl  the id and name of each enchantment, status effect and potion, which the
+##                                 component modules need and nothing under src/generated has yet
+##   src/generated/item_full.aowl  every `Item` with its typed components, every `BedrockItem`, and the
+##                                 Java to Bedrock item mapping
+##
+## Upstream's `const X: Self = Self { .. }` struct literals become one string constant per table, decoded when
+## item_full.aowl loads by src/data/data_component_impl/item_decode.aowl. A line per item, its components in
+## `ItemComponents::to_tokens`'s order; the fields are documented on the decoder.
+##
+## Ids are upstream's own: assets/items.json is 26.2 data. Sending one to a 1.21.11 client needs
+## item_id_remap.aowl's `remapItemIdForVersion`, as upstream does.
+##
+## `BedrockRemapEntry`'s tool_type, armor_type, protection_value, is_entity_placer, is_edible and
+## block_runtime_id_range are computed upstream and then never emitted, so they are not ported, nor are the
+## assets they read (blocks.json for that purpose, spawn_egg.json). Upstream's `pub const` per `BedrockItem`
+## becomes `bedrockItemByKey`: its callers name few of them and the names carry no data.
+
+import std/[json, syncio, tables, strutils, algorithm]
+import codegenutil
+import "../nbt/tag"
+import "../nbt/nbtbase"
+import "../nbt/nbtdoc"
+import "../nbt/deserializer"
+import "../nbt/serializer"
+import inflate
+
+const Separators = "\t\n|,;~^!"
+
+proc fail(msg: string) =
+  echo "gen_item_full: " & msg
+  quit(1)
+
+proc clean(s: string): string =
+  ## A string going into the table; no separator may be inside it.
+  for ch in s:
+    if ch in Separators:
+      fail("separator in data: " & s)
+  s
+
+proc field(node: JsonNode; key: string): (bool, JsonNode) =
+  for k, v in node.pairs():
+    if k == key:
+      return (true, v)
+  (false, node)
+
+proc fmt1(raw: float): string =
+  ## Rust's `format!("{:.1}", x as f32)`, which upstream writes these fields through: the exact decimal
+  ## expansion of the f32, rounded half to even. A f32 times 10 is exact in a f64.
+  let scaled = float(float32(raw)) * 10.0
+  let negative = scaled < 0.0
+  let mag = if negative: -scaled else: scaled
+  var whole = int64(mag)
+  let diff = mag - float(whole)
+  if diff > 0.5 or (diff == 0.5 and (whole and 1'i64) == 1'i64):
+    inc whole
+  result = (if negative: "-" else: "") & $(whole div 10'i64) & "." & $(whole mod 10'i64)
+
+proc boolBit(b: bool): string = (if b: "1" else: "0")
+
+proc boolField(node: JsonNode; key: string; default: bool): bool =
+  let (found, v) = field(node, key)
+  if found: v.getBool() else: default
+
+proc strField(node: JsonNode; key: string): string =
+  ## Empty for an absent `Option<String>`.
+  let (found, v) = field(node, key)
+  if found: clean(v.getStr()) else: ""
+
+proc stripNs(s: string): string =
+  if s.startsWith("minecraft:"): s[10 .. ^1] else: s
+
+var gBlockIds = initTable[string, int]()
+var gEntityIds = initTable[string, int]()
+var gEffectIds = initTable[string, int]()
+
+proc lookup(t: Table[string, int]; key, what: string): int =
+  result = t.getOrDefault(key, -1)
+  if result < 0:
+    fail("unknown " & what & ": " & key)
+
+proc readLookups() =
+  var blocks = parseJson(readAsset("blocks.json"))
+  for k, v in blocks.root().pairs():
+    if k == "blocks":
+      for b in v.items():
+        let (_, name) = field(b, "name")
+        let (_, id) = field(b, "id")
+        gBlockIds[name.getStr()] = int(id.getInt())
+  var entities = parseJson(readAsset("entities.json"))
+  for k, v in entities.root().pairs():
+    let (_, id) = field(v, "id")
+    gEntityIds[k] = int(id.getInt())
+  var effects = parseJson(readAsset("effect.json"))
+  for k, v in effects.root().pairs():
+    let (_, id) = field(v, "id")
+    gEffectIds[k] = int(id.getInt())
+
+proc rulesText(tool: JsonNode): string =
+  ## `blocks~speed~correct` per rule; blocks is `t<tag>` or `i<id>.<id>`.
+  result = ""
+  let (_, rules) = field(tool, "rules")
+  var first = true
+  for rule in rules.items():
+    if not first: result.add(";")
+    first = false
+    let (_, blocks) = field(rule, "blocks")
+    if blocks.kind == JString:
+      let name = blocks.getStr()
+      if name.startsWith("#"):
+        result.add("t" & clean(name[1 .. ^1]))
+      else:
+        result.add("i" & $lookup(gBlockIds, stripNs(name), "block"))
+    else:
+      result.add("i")
+      var firstId = true
+      for b in blocks.items():
+        if not firstId: result.add(".")
+        firstId = false
+        result.add($lookup(gBlockIds, stripNs(b.getStr()), "block"))
+    result.add("~")
+    let (hasSpeed, speed) = field(rule, "speed")
+    if hasSpeed: result.add(numText(speed))
+    result.add("~")
+    let (hasCorrect, correct) = field(rule, "correct_for_drops")
+    if hasCorrect: result.add(boolBit(correct.getBool()))
+
+proc effectsText(consumable: JsonNode): string =
+  ## One `kind~...` per effect, `kind` being `ConsumeEffect::registry_id`.
+  result = ""
+  let (hasEffects, effects) = field(consumable, "on_consume_effects")
+  if not hasEffects:
+    return
+  var first = true
+  for effect in effects.items():
+    let (_, kindNode) = field(effect, "type")
+    var text = ""
+    case kindNode.getStr()
+    of "minecraft:clear_all_effects":
+      text = "2"
+    of "minecraft:teleport_randomly":
+      let (hasDiameter, diameter) = field(effect, "diameter")
+      text = "3~" & (if hasDiameter: numText(diameter) else: "16.0")
+    of "minecraft:play_sound":
+      text = "4~" & clean(stripNs(strField(effect, "sound")))
+    of "minecraft:apply_effects":
+      let (hasProb, prob) = field(effect, "probability")
+      text = "0~" & (if hasProb: numText(prob) else: "1.0") & "~"
+      let (_, list) = field(effect, "effects")
+      var firstInst = true
+      for status in list.items():
+        if not firstInst: text.add("^")
+        firstInst = false
+        let (hasAmp, amp) = field(status, "amplifier")
+        let (hasDur, dur) = field(status, "duration")
+        text.add(strField(status, "id") & "!" &
+          (if hasAmp: $amp.getInt() else: "0") & "!" &
+          (if hasDur: $dur.getInt() else: "1") & "!" &
+          boolBit(boolField(status, "ambient", false)) & "!" &
+          boolBit(boolField(status, "show_particles", true)) & "!" &
+          boolBit(boolField(status, "show_icon", true)))
+    of "minecraft:remove_effects":
+      let (_, list) = field(effect, "effects")
+      text = "1~" & $lookup(gEffectIds, stripNs(list.getStr()), "effect")
+    else:
+      echo "Unknown CustomEffect type: " & kindNode.getStr()
+      continue
+    if not first: result.add(";")
+    first = false
+    result.add(text)
+
+proc allowedText(equippable: JsonNode): string =
+  ## Empty for `None`, else `t<tag>` or `i<id>.<id>`.
+  let (found, allowed) = field(equippable, "allowed_entities")
+  if not found:
+    return ""
+  if allowed.kind == JString:
+    let name = allowed.getStr()
+    if name.startsWith("#minecraft:"):
+      return "t" & clean(name[11 .. ^1])
+    return "i" & $lookup(gEntityIds, stripNs(name), "entity")
+  result = "i"
+  var first = true
+  for x in allowed.items():
+    if not first: result.add(".")
+    first = false
+    result.add($lookup(gEntityIds, stripNs(x.getStr()), "entity"))
+
+proc cHas(c: JsonNode; key: string): bool =
+  let (found, _) = field(c, "minecraft:" & key)
+  found
+
+proc cNode(c: JsonNode; key: string): JsonNode =
+  let (_, v) = field(c, "minecraft:" & key)
+  v
+
+proc cNum(c: JsonNode; key: string): int =
+  int(cNode(c, key).getInt())
+
+proc addC(parts: var seq[string]; name, payload: string) =
+  ## The decoder keys on the component's name, without `minecraft:`.
+  parts.add(name & ":" & payload)
+
+proc componentsText(c: JsonNode): string =
+  ## `ItemComponents::to_tokens`: which components an item has, and what upstream keeps of each.
+  var parts: seq[string] = @[]
+  addC(parts, "max_stack_size", $cNum(c, "max_stack_size"))
+  if cHas(c, "use_cooldown"):
+    let (_, seconds) = field(cNode(c, "use_cooldown"), "seconds")
+    addC(parts, "use_cooldown", fmt1(seconds.getFloat()) & "," & strField(cNode(c, "use_cooldown"), "cooldown_group"))
+  if cHas(c, "jukebox_playable"):
+    addC(parts, "jukebox_playable", clean(cNode(c, "jukebox_playable").getStr()))
+  let (_, translate) = field(cNode(c, "item_name"), "translate")
+  addC(parts, "item_name", clean(translate.getStr()))
+  if cHas(c, "damage"):
+    addC(parts, "damage", $cNum(c, "damage"))
+  if cHas(c, "max_damage"):
+    addC(parts, "max_damage", $cNum(c, "max_damage"))
+  if cHas(c, "attribute_modifiers"):
+    var mods = ""
+    var first = true
+    for m in cNode(c, "attribute_modifiers").items():
+      if not first: mods.add(";")
+      first = false
+      let (_, amount) = field(m, "amount")
+      mods.add(strField(m, "type") & "~" & strField(m, "id") & "~" & numText(amount) & "~" &
+        strField(m, "operation") & "~" & strField(m, "slot"))
+    addC(parts, "attribute_modifiers", mods)
+  if cHas(c, "tool"):
+    let tool = cNode(c, "tool")
+    let (hasSpeed, speed) = field(tool, "default_mining_speed")
+    let (hasDamage, damage) = field(tool, "damage_per_block")
+    addC(parts, "tool", fmt1(if hasSpeed: speed.getFloat() else: 1.0) & "," &
+      (if hasDamage: $damage.getInt() else: "1") & "," &
+      boolBit(boolField(tool, "can_destroy_blocks_in_creative", true)) & "," & rulesText(tool))
+  if cHas(c, "food"):
+    let food = cNode(c, "food")
+    let (_, nutrition) = field(food, "nutrition")
+    let (_, saturation) = field(food, "saturation")
+    addC(parts, "food", $nutrition.getInt() & "," & fmt1(saturation.getFloat()) & "," &
+      boolBit(boolField(food, "can_always_eat", false)))
+  if cHas(c, "consumable"):
+    let consumable = cNode(c, "consumable")
+    let (hasSeconds, seconds) = field(consumable, "consume_seconds")
+    let animation = strField(consumable, "animation")
+    let sound = strField(consumable, "sound")
+    addC(parts, "consumable", fmt1(if hasSeconds: seconds.getFloat() else: 1.6) & "," &
+      (if animation.len > 0: animation else: "eat") & "," &
+      (if sound.len > 0: stripNs(sound) else: "entity.generic.eat") & "," &
+      boolBit(boolField(consumable, "has_consume_particles", true)) & "," & effectsText(consumable))
+  if cHas(c, "blocks_attacks"):
+    addC(parts, "blocks_attacks", "")
+  if cHas(c, "death_protection"):
+    addC(parts, "death_protection", "")
+  if cHas(c, "weapon"):
+    let (found, v) = field(cNode(c, "weapon"), "item_damage_per_attack")
+    addC(parts, "weapon", (if found: $v.getInt() else: "1"))
+  if cHas(c, "damage_resistant"):
+    addC(parts, "damage_resistant", strField(cNode(c, "damage_resistant"), "types"))
+  if cHas(c, "equippable"):
+    let e = cNode(c, "equippable")
+    let equipSound = strField(e, "equip_sound")
+    let shearingSound = strField(e, "shearing_sound")
+    addC(parts, "equippable", strField(e, "slot") & "," &
+      (if equipSound.len > 0: stripNs(equipSound) else: "item.armor.equip_generic") & "," &
+      strField(e, "asset_id") & "," & strField(e, "camera_overlay") & "," & allowedText(e) & "," &
+      boolBit(boolField(e, "dispensable", true)) & "," & boolBit(boolField(e, "swappable", true)) & "," &
+      boolBit(boolField(e, "damage_on_hurt", true)) & "," & boolBit(boolField(e, "equip_on_interact", false)) & "," &
+      boolBit(boolField(e, "can_be_sheared", false)) & "," &
+      (if shearingSound.len > 0: stripNs(shearingSound) else: "item.shears.snip"))
+  if cHas(c, "enchantable"):
+    let (_, v) = field(cNode(c, "enchantable"), "value")
+    addC(parts, "enchantable", $v.getInt())
+  for key in ["attack_range", "banner_patterns", "bees"]:
+    if cHas(c, key): addC(parts, key, "")
+  if cHas(c, "block_state"):
+    # A serde_json object iterates in key order.
+    var keys: seq[string] = @[]
+    let state = cNode(c, "block_state")
+    for k, v in state.pairs():
+      keys.add(k)
+    keys.sort(proc (a, b: string): int = cmp(a, b))
+    var text = ""
+    for i, k in keys:
+      if i > 0: text.add(";")
+      let (_, v) = field(state, k)
+      text.add(clean(k) & "~" & clean(if v.kind == JString: v.getStr() elif v.kind == JBool: $v.getBool() else: numText(v)))
+    addC(parts, "block_state", text)
+  for key in ["break_sound", "bucket_entity_data", "bundle_contents", "charged_projectiles"]:
+    if cHas(c, key): addC(parts, key, "")
+  if cHas(c, "chicken/variant"):
+    addC(parts, "chicken/variant", clean(cNode(c, "chicken/variant").getStr()))
+  for key in ["container", "damage_type", "debug_stick_state", "dye", "enchantment_glint_override",
+              "enchantments", "entity_data"]:
+    if cHas(c, key): addC(parts, key, "")
+  if cHas(c, "fireworks"):
+    let (found, v) = field(cNode(c, "fireworks"), "flight_duration")
+    addC(parts, "fireworks", (if found: $v.getInt() else: "1"))
+  for key in ["glider", "instrument"]:
+    if cHas(c, key): addC(parts, key, "")
+  if cHas(c, "item_model"):
+    addC(parts, "item_model", clean(cNode(c, "item_model").getStr()))
+  for key in ["kinetic_weapon", "lore", "map_color", "map_decorations", "minimum_attack_charge"]:
+    if cHas(c, key): addC(parts, key, "")
+  if cHas(c, "ominous_bottle_amplifier"):
+    addC(parts, "ominous_bottle_amplifier", $cNum(c, "ominous_bottle_amplifier"))
+  for key in ["piercing_weapon", "pot_decorations", "potion_contents", "potion_duration_scale",
+              "provides_banner_patterns", "provides_trim_material", "rarity", "recipes", "repair_cost",
+              "repairable", "stored_enchantments", "suspicious_stew_effects", "swing_animation",
+              "tooltip_display", "use_effects", "use_remainder", "writable_book_content"]:
+    if cHas(c, key): addC(parts, key, "")
+  result = ""
+  for i, p in parts:
+    if i > 0: result.add("|")
+    result.add(p)
+
+proc bedrockIdentifier(name: string): string =
+  ## The name match in upstream's `build`.
+  let mapped =
+    case name
+    of "bricks": "brick_block"
+    of "cobblestone_stairs": "stone_stairs"
+    of "cobweb": "web"
+    of "dead_bush": "deadbush"
+    of "debug_stick": "stick"
+    of "dirt_path": "grass_path"
+    of "end_stone_bricks": "end_bricks"
+    of "end_stone_brick_stairs": "end_brick_stairs"
+    of "flowering_azalea_leaves": "azalea_leaves_flowered"
+    of "frogspawn": "frog_spawn"
+    of "furnace_minecart": "hopper_minecart"
+    of "glow_item_frame": "glow_frame"
+    of "item_frame": "frame"
+    of "jack_o_lantern": "lit_pumpkin"
+    of "light": "light_block"
+    of "light_gray_glazed_terracotta": "silver_glazed_terracotta"
+    of "lily_pad": "waterlily"
+    of "knowledge_book": "book"
+    of "magma_block": "magma"
+    of "map": "empty_map"
+    of "melon": "melon_block"
+    of "music_disc_bounce": "music_disc_13"
+    of "nether_brick": "netherbrick"
+    of "nether_bricks": "nether_brick"
+    of "nether_quartz_ore": "quartz_ore"
+    of "note_block": "noteblock"
+    of "oak_button": "wooden_button"
+    of "oak_door": "wooden_door"
+    of "oak_fence_gate": "fence_gate"
+    of "oak_pressure_plate": "wooden_pressure_plate"
+    of "oak_trapdoor": "trapdoor"
+    of "powered_rail": "golden_rail"
+    of "prismarine_brick_stairs": "prismarine_bricks_stairs"
+    of "red_nether_bricks": "red_nether_brick"
+    of "rooted_dirt": "dirt_with_roots"
+    of "scute": "turtle_scute"
+    of "shulker_box": "undyed_shulker_box"
+    of "slime_block": "slime"
+    of "small_dripleaf": "small_dripleaf_block"
+    of "snow": "snow_layer"
+    of "snow_block": "snow"
+    of "spawner": "mob_spawner"
+    of "stonecutter": "stonecutter_block"
+    of "stone_stairs": "normal_stone_stairs"
+    of "terracotta": "hardened_clay"
+    of "test_block": "unknown"
+    of "test_instance_block": "unknown"
+    of "tipped_arrow", "spectral_arrow": "arrow"
+    of "waxed_copper_block": "waxed_copper"
+    of "zombified_piglin_spawn_egg": "zombie_pigman_spawn_egg"
+    else:
+      if name.contains("sulfur"): "unknown"
+      elif name.endsWith("banner"): "banner"
+      elif name.endsWith("bed"): "bed"
+      elif name.startsWith("stone_slab"): name.replace("stone_slab", "stone_block_slab")
+      elif name.startsWith("double_stone_slab"): name.replace("double_stone_slab", "stone_block_slab")
+      else: name
+  "minecraft:" & mapped
+
+proc assetBytes(rel: string): seq[byte] =
+  let text = readAsset(rel)
+  result = newSeq[byte](text.len)
+  for i in 0 ..< text.len:
+    result[i] = byte(ord(text[i]))
+
+proc hexText(bytes: seq[byte]): string =
+  const Hex = "0123456789abcdef"
+  result = newStringOfCap(bytes.len * 2)
+  for b in bytes:
+    result.add(Hex[int(b shr 4)])
+    result.add(Hex[int(b and 15'u8)])
+
+proc bedrockComponents(): (seq[string], seq[NbtCompound]) =
+  ## `be_item_components`: only items whose entry has a `components` compound.
+  var names: seq[string] = @[]
+  var compounds: seq[NbtCompound] = @[]
+  let (ok, raw) = gunzip(assetBytes("bedrock/item_components.nbt"))
+  if not ok:
+    fail("bedrock/item_components.nbt did not inflate")
+  var reader = newNbtReader(nrmJava, raw)
+  let doc = read(reader)
+  if not doc.isOk:
+    fail("bedrock/item_components.nbt: " & $doc.error)
+  let root = doc.value.rootTag
+  for i in 0 ..< root.names.len:
+    let entry = root.values[i]
+    if entry.kind == ntkCompound:
+      let (found, components) = entry.compoundVal.get("components")
+      if found and components.kind == ntkCompound:
+        names.add(root.names[i])
+        compounds.add(components.compoundVal)
+  (names, compounds)
+
+proc itemRefsModule(): string =
+  ## src/generated/item_refs.aowl.
+  result = "## GENERATED by src/data_codegen/gen_item_full.aowl from assets/enchantments.json, effect.json and potion.json. Do not edit.\n"
+  result.add("## What the item components need of `Enchantment`, `StatusEffect` and `Potion`: id and name.\n\n")
+  result.add("type\n  EnchantmentRef* = object\n    id*: uint8\n    name*: string\n\n")
+  # enchantments.json
+  var enchants: seq[(string, int)] = @[]
+  var enchantTree = parseJson(readAsset("enchantments.json"))
+  for k, v in enchantTree.root().pairs():
+    let (_, id) = field(v, "id")
+    enchants.add((k, int(id.getInt())))
+  enchants.sort(proc (a, b: (string, int)): int = cmp(a[0], b[0]))
+  result.add("let gEnchantments*: seq[EnchantmentRef] = @[\n")
+  for e in enchants:
+    result.add("  EnchantmentRef(id: " & $e[1] & "'u8, name: " & aowlStr(e[0]) & "),\n")
+  result.add("]\n\n")
+  for i, e in enchants:
+    result.add("let ENCHANTMENT_" & toUpperAscii(stripNs(e[0])) & "*: EnchantmentRef = gEnchantments[" & $i & "]\n")
+  result.add("\nproc enchantmentFromName*(name: string): (bool, EnchantmentRef) =\n")
+  result.add("  ## `Enchantment::from_name`: the full `minecraft:` name.\n")
+  result.add("  for e in gEnchantments:\n    if e.name == name: return (true, e)\n")
+  result.add("  (false, EnchantmentRef(id: 0'u8, name: \"\"))\n\n")
+  result.add("proc enchantmentFromId*(id: uint8): (bool, EnchantmentRef) =\n")
+  result.add("  for e in gEnchantments:\n    if e.id == id: return (true, e)\n")
+  result.add("  (false, EnchantmentRef(id: 0'u8, name: \"\"))\n\n")
+  # effect.json; `minecraft_name` is `minecraft:` + the key.
+  var effects: seq[(string, int)] = @[]
+  for k, v in gEffectIds.pairs():
+    effects.add((k, v))
+  effects.sort(proc (a, b: (string, int)): int = cmp(a[0], b[0]))
+  result.add("const StatusEffectNames: array[" & $effects.len & ", (string, uint8)] = [\n")
+  for e in effects:
+    result.add("  (" & aowlStr("minecraft:" & e[0]) & ", " & $e[1] & "'u8),\n")
+  result.add("]\n\n")
+  result.add("proc statusEffectIdFromMinecraftName*(name: string): (bool, uint8) =\n")
+  result.add("  ## `StatusEffect::from_minecraft_name`.\n")
+  result.add("  for e in StatusEffectNames:\n    if e[0] == name: return (true, e[1])\n  (false, 0'u8)\n\n")
+  result.add("proc statusEffectMinecraftName*(id: uint8): string =\n")
+  result.add("  for e in StatusEffectNames:\n    if e[1] == id: return e[0]\n  \"\"\n\n")
+  # potion.json
+  var potions: seq[(string, int)] = @[]
+  var potionTree = parseJson(readAsset("potion.json"))
+  for k, v in potionTree.root().pairs():
+    let (_, id) = field(v, "id")
+    potions.add((k, int(id.getInt())))
+  potions.sort(proc (a, b: (string, int)): int = cmp(a[0], b[0]))
+  result.add("const PotionNames: array[" & $potions.len & ", (string, uint8)] = [\n")
+  for p in potions:
+    result.add("  (" & aowlStr(p[0]) & ", " & $p[1] & "'u8),\n")
+  result.add("]\n\n")
+  result.add("proc potionIdFromName*(name: string): (bool, uint8) =\n")
+  result.add("  ## `Potion::from_name`.\n")
+  result.add("  for p in PotionNames:\n    if p[0] == name: return (true, p[1])\n  (false, 0'u8)\n")
+
+proc main() =
+  readLookups()
+  writeGenerated("src/generated/item_refs.aowl", itemRefsModule())
+
+  type ItemRow = object
+    id: int
+    name: string
+    text: string
+  var rows: seq[ItemRow] = @[]
+  var itemsTree = parseJson(readAsset("items.json"))
+  for name, item in itemsTree.root().pairs():
+    let (_, id) = field(item, "id")
+    let (_, components) = field(item, "components")
+    rows.add(ItemRow(id: int(id.getInt()), name: name, text: componentsText(components)))
+  rows.sort(proc (a, b: ItemRow): int = cmp(a.id, b.id))
+
+  var itemData = newStringOfCap(400000)
+  for i, row in rows:
+    if row.id != i:
+      fail("item ids are not contiguous at " & row.name)
+    itemData.add(clean(row.name) & "\t" & row.text & "\n")
+
+  # Bedrock items, in runtime_item_states.json's order.
+  let (compNames, compounds) = bedrockComponents()
+  var compIndex = initTable[string, int]()
+  for i, n in compNames:
+    compIndex[n] = i
+  var bedrockData = newStringOfCap(100000)
+  var bedrockIds = initTable[string, int]()
+  var statesTree = parseJson(readAsset("bedrock/runtime_item_states.json"))
+  var bedrockCount = 0
+  for state in statesTree.root().items():
+    let (_, nameNode) = field(state, "name")
+    let (_, idNode) = field(state, "id")
+    let (_, versionNode) = field(state, "version")
+    let name = nameNode.getStr()
+    let i = compIndex.getOrDefault(name, -1)
+    var doc = newNbt("", (if i >= 0: compounds[i] else: newCompound()))
+    bedrockData.add($idNode.getInt() & "\t" & clean(name) & "\t" & $versionNode.getInt() & "\t" &
+      boolBit(boolField(state, "componentBased", false)) & "\t" & hexText(writeBedrock(doc)) & "\n")
+    bedrockIds[name] = int(idNode.getInt())
+    inc bedrockCount
+
+  # The mapping, in BTreeMap<String, _> name order.
+  var overrides = initTable[string, int]()
+  var overridesTree = parseJson(readAsset("bedrock/item_data_overrides.json"))
+  for k, v in overridesTree.root().pairs():
+    overrides[k] = int(v.getInt())
+  var byName = rows
+  byName.sort(proc (a, b: ItemRow): int = cmp(a.name, b.name))
+  var mappingData = newStringOfCap(30000)
+  for row in byName:
+    let identifier = bedrockIdentifier(row.name)
+    let bedrockId = bedrockIds.getOrDefault(identifier, 100000)
+    if bedrockId == 100000:
+      fail("Invalid Bedrock identifier `" & identifier & "`. From Java name `" & row.name & "`")
+    mappingData.add($row.id & "\t" & $bedrockId & "\t" & $overrides.getOrDefault(row.name, 0) & "\n")
+
+  var s = "## GENERATED by src/data_codegen/gen_item_full.aowl from assets/items.json and assets/bedrock. Do not edit.\n"
+  s.add("## Upstream's generated item.rs, as compact tables decoded on load. Ids are 26.2's, as in upstream.\n\n")
+  s.add("import ../data/data_component_impl/item_decode\n\nexport item_decode\n\n")
+  s.add("const ItemData = " & aowlStr(itemData) & "\n\n")
+  s.add("let gItems*: seq[Item] = decodeItems(ItemData)\n")
+  s.add("  ## Every item, indexed by id.\n\n")
+  s.add("let gItemsByName = indexItems(gItems)\n\n")
+  s.add("proc fromRegistryKey*(_: typedesc[Item]; name: string): nil Item =\n")
+  s.add("  ## Try to parse an item from a resource location string.\n")
+  s.add("  lookupItem(gItems, gItemsByName, name)\n\n")
+  s.add("proc fromId*(_: typedesc[Item]; id: uint16): nil Item =\n")
+  s.add("  ## Try to parse an item from a raw id.\n")
+  s.add("  if int(id) >= gItems.len:\n    return nil\n  return gItems[int(id)]\n\n")
+  s.add("const ITEM_COUNT* = " & $rows.len & "\n\n")
+  for row in rows:
+    s.add("let ITEM_" & toUpperAscii(row.name) & "*: Item = gItems[" & $row.id & "]\n")
+  s.add("\nconst BedrockItemData = " & aowlStr(bedrockData) & "\n\n")
+  s.add("let ALL_BEDROCK_ITEMS*: seq[BedrockItem] = decodeBedrockItems(BedrockItemData)\n\n")
+  s.add("const BedrockMappingData = " & aowlStr(mappingData) & "\n\n")
+  s.add("let gBedrockTables = decodeBedrockMappings(BedrockMappingData, ALL_BEDROCK_ITEMS, gItems)\n\n")
+  s.add("proc bedrockItemByKey*(key: string): nil BedrockItem =\n")
+  s.add("  ## `BedrockItem::X` by its registry key, such as `minecraft:stick`.\n")
+  s.add("  lookupBedrockItem(gBedrockTables, ALL_BEDROCK_ITEMS, key)\n\n")
+  s.add("proc fromJavaItemId*(_: typedesc[JavaToBedrockItemMapping]; itemId: uint16): nil JavaToBedrockItemMapping =\n")
+  s.add("  mappingFromJava(gBedrockTables, itemId)\n\n")
+  s.add("proc fromBedrock*(_: typedesc[JavaToBedrockItemMapping]; bedrockId: int16; bedrockData: uint32): nil JavaToBedrockItemMapping =\n")
+  s.add("  mappingFromBedrock(gBedrockTables, bedrockId, bedrockData)\n")
+  writeGenerated("src/generated/item_full.aowl", s)
+  echo "items " & $rows.len & ", bedrock items " & $bedrockCount
+
+main()

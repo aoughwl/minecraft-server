@@ -1,0 +1,527 @@
+## Port of pumpkin-codegen/src/advancement.rs (advancement.rs)
+## PARTIAL: pumpkin-codegen/src/advancement.rs - `Advancement::option_name` and `name` are not generated: they call `AdvancementDisplay::get_title`, `FrameType::get_color` from pumpkin-data/src/advancement_data.rs, which imports this module and cannot be imported back; they belong beside those methods.
+##
+## assets/advancements.json into src/generated/advancement.aowl. The tree is built and laid out here
+## with upstream's Reingold-Tilford port, f32 for f32, and the output holds the positions it found.
+##
+## In upstream `AdvancementDisplay`, `FrameType`, `AdvancementReward`, `AdvancementNode` and
+## `AdvancementTree` live in advancement_data.rs while `Advancement` and `ADVANCEMENT_TREE` are generated
+## and each names the other. Imports may not cycle here, so the generated module defines those types with
+## upstream's field names and advancement_data's methods sit on top of it. `item_icon` keeps the bare
+## item name: upstream wraps it as `ItemStack::static_new_java(1, &Item::X)`, count 1 always.
+## `AdvancementReward.recipes` is empty as upstream's is: its generator drops the asset's reward recipes
+## with a TODO. Run from the repo root.
+
+import std/[algorithm, json, strutils, syncio]
+import codegenutil
+
+const
+  OutPath = "src/generated/advancement.aowl"
+  Unit = "\x1f"
+  Group = "\x1e"
+
+type
+  AdvDisplay = object
+    present: bool
+    title: string
+    description: string
+    icon: string
+    frame: int
+    background: string
+    hasBackground: bool
+    showToast: bool
+    hidden: bool
+    announceToChat: bool
+    x: float32
+    y: float32
+
+  AdvNode = object
+    id: string          ## The asset key, `minecraft:story/root`.
+    parentId: string
+    parent: int
+    children: seq[int]
+    telemetry: bool
+    display: AdvDisplay
+    experience: int
+    requirements: seq[seq[string]]
+    criteria: seq[string]
+
+  TreeNodePosition = object
+    node: int
+    parent: int
+    previousSibling: int
+    childIndex: int
+    children: seq[int]
+    ancestor: int
+    thread: int
+    x: int32
+    y: float32
+    modField: float32
+    change: float32
+    shift: float32
+
+# Module-level state: `var seq` and `var Table` parameters are a known data-loss trap (compiler bug 12).
+var gTree: seq[AdvNode] = @[]
+var gNodes: seq[TreeNodePosition] = @[]
+
+proc pick(obj: JsonNode; key: string): (bool, JsonNode) =
+  for k, v in obj.pairs():
+    if k == key: return (true, v)
+  (false, obj)
+
+proc translateOf(v: JsonNode): string =
+  let (has, t) = pick(v, "translate")
+  if not has:
+    echo "expected a translatable text component for advancement display"
+    quit(1)
+  t.getStr()
+
+proc readAdvancement(id: string; v: JsonNode): AdvNode =
+  result = AdvNode(id: id, parentId: "", parent: -1, children: @[], telemetry: false,
+    display: AdvDisplay(present: false, title: "", description: "", icon: "", frame: 0, background: "",
+      hasBackground: false, showToast: true, hidden: false, announceToChat: true, x: 0.0'f32, y: 0.0'f32),
+    experience: 0, requirements: @[], criteria: @[])
+  for k, x in v.pairs():
+    case k
+    of "parent": result.parentId = x.getStr()
+    of "sends_telemetry_event": result.telemetry = x.getBool()
+    of "rewards":
+      let (hasExp, exp) = pick(x, "experience")
+      if hasExp: result.experience = int(exp.getInt())
+    of "requirements":
+      for group in x.items():
+        var inner: seq[string] = @[]
+        for item in group.items(): inner.add(item.getStr())
+        result.requirements.add(inner)
+    of "criteria":
+      for name, crit in x.pairs(): result.criteria.add(name)
+    of "display":
+      result.display.present = true
+      for dk, dv in x.pairs():
+        case dk
+        of "title": result.display.title = translateOf(dv)
+        of "description": result.display.description = translateOf(dv)
+        of "icon":
+          let (_, iconId) = pick(dv, "id")
+          result.display.icon = iconId.getStr()
+        of "frame":
+          case dv.getStr()
+          of "challenge": result.display.frame = 1
+          of "goal": result.display.frame = 2
+          else: result.display.frame = 0
+        of "background":
+          result.display.background = dv.getStr()
+          result.display.hasBackground = true
+        of "show_toast": result.display.showToast = dv.getBool()
+        of "hidden": result.display.hidden = dv.getBool()
+        of "announce_to_chat": result.display.announceToChat = dv.getBool()
+        else: discard
+    else: discard
+  result.criteria.sort(proc(a, b: string): int = cmp(a, b))
+
+proc indexOfId(id: string): int =
+  result = -1
+  for i in 0 ..< gTree.len:
+    if gTree[i].id == id: return i
+
+proc addAll(advancements: seq[AdvNode]) =
+  ## `AdvancementTree::add_all`: passes over the list until nothing more can be inserted.
+  var toAdd = advancements
+  while toAdd.len > 0:
+    let before = toAdd.len
+    var rest: seq[AdvNode] = @[]
+    for a in toAdd:
+      if a.parentId.len == 0:
+        gTree.add(a)
+      else:
+        let parentIdx = indexOfId(a.parentId)
+        if parentIdx < 0:
+          rest.add(a)
+        else:
+          var node = a
+          node.parent = parentIdx
+          let nodeIdx = gTree.len
+          gTree[parentIdx].children.add(nodeIdx)
+          gTree.add(node)
+    toAdd = rest
+    if toAdd.len == before:
+      echo "Couldn't load advancements"
+      quit(1)
+
+# ---------------------------------------------------------------------------
+# TreeNodePosition: upstream's Reingold-Tilford. -1 stands for `None`.
+# ---------------------------------------------------------------------------
+
+proc addChild(parentIdx, advNodeIdx, previousIn: int): int =
+  var previousIdx = previousIn
+  if advNodeIdx >= gTree.len: return -1
+  if gTree[advNodeIdx].display.present:
+    let childIdx = gNodes.len
+    let nextChildIndex = gNodes[parentIdx].children.len + 1
+    let depth = gNodes[parentIdx].x + 1'i32
+    gNodes[parentIdx].children.add(childIdx)
+    gNodes.add(TreeNodePosition(node: advNodeIdx, parent: parentIdx, previousSibling: previousIdx,
+      childIndex: nextChildIndex, children: @[], ancestor: childIdx, thread: -1, x: depth, y: -1.0'f32,
+      modField: 0.0'f32, change: 0.0'f32, shift: 0.0'f32))
+    var childPrev = -1
+    let kids = gTree[advNodeIdx].children
+    for child in kids:
+      childPrev = addChild(childIdx, child, childPrev)
+    return childIdx
+  else:
+    let kids = gTree[advNodeIdx].children
+    for grandchild in kids:
+      previousIdx = addChild(parentIdx, grandchild, previousIdx)
+    return previousIdx
+
+proc previousOrThread(idx: int): int =
+  if gNodes[idx].thread >= 0: return gNodes[idx].thread
+  if gNodes[idx].children.len > 0: return gNodes[idx].children[0]
+  -1
+
+proc nextOrThread(idx: int): int =
+  if gNodes[idx].thread >= 0: return gNodes[idx].thread
+  if gNodes[idx].children.len > 0: return gNodes[idx].children[gNodes[idx].children.len - 1]
+  -1
+
+proc moveSubtree(left, right: int; shift: float32) =
+  let subtrees = float32(gNodes[right].childIndex) - float32(gNodes[left].childIndex)
+  if subtrees != 0.0'f32:
+    gNodes[right].change = gNodes[right].change - shift / subtrees
+    gNodes[left].change = gNodes[left].change + shift / subtrees
+  gNodes[right].shift = gNodes[right].shift + shift
+  gNodes[right].y = gNodes[right].y + shift
+  gNodes[right].modField = gNodes[right].modField + shift
+
+proc getAncestor(idx, other, defaultAncestor: int): int =
+  let ancestor = gNodes[idx].ancestor
+  let parentIdx = gNodes[other].parent
+  if ancestor in gNodes[parentIdx].children: ancestor else: defaultAncestor
+
+proc apportion(idx, defaultIn: int): int =
+  var defaultAncestor = defaultIn
+  let prevSib = gNodes[idx].previousSibling
+  if prevSib < 0: return defaultAncestor
+  let parentIdx = gNodes[idx].parent
+  var innerRight = idx
+  var outerRight = idx
+  var innerLeft = prevSib
+  var outerLeft = gNodes[parentIdx].children[0]
+
+  let modField = gNodes[idx].modField
+  var shiftInnerRight = modField
+  var shiftOuterRight = modField
+  var shiftInnerLeft = gNodes[innerLeft].modField
+  var shiftOuterLeft = gNodes[outerLeft].modField
+  while nextOrThread(innerLeft) >= 0 and previousOrThread(innerRight) >= 0:
+    innerLeft = nextOrThread(innerLeft)
+    innerRight = previousOrThread(innerRight)
+    outerLeft = previousOrThread(outerLeft)
+    outerRight = nextOrThread(outerRight)
+
+    gNodes[outerRight].ancestor = idx
+
+    let shift = (gNodes[innerLeft].y + shiftInnerLeft) - (gNodes[innerRight].y + shiftInnerRight) + 1.0'f32
+    if shift > 0.0'f32:
+      let ancestorIdx = getAncestor(innerLeft, idx, defaultAncestor)
+      moveSubtree(ancestorIdx, idx, shift)
+      shiftInnerRight = shiftInnerRight + shift
+      shiftOuterRight = shiftOuterRight + shift
+
+    shiftInnerLeft = shiftInnerLeft + gNodes[innerLeft].modField
+    shiftInnerRight = shiftInnerRight + gNodes[innerRight].modField
+    shiftOuterLeft = shiftOuterLeft + gNodes[outerLeft].modField
+
+  let nextInnerLeft = nextOrThread(innerLeft)
+  if nextInnerLeft >= 0 and nextOrThread(outerRight) < 0:
+    gNodes[outerRight].thread = nextInnerLeft
+    gNodes[outerRight].modField = gNodes[outerRight].modField + (shiftInnerLeft - shiftOuterRight)
+  else:
+    let nextInnerRight = previousOrThread(innerRight)
+    if nextInnerRight >= 0 and previousOrThread(outerLeft) < 0:
+      gNodes[outerLeft].thread = nextInnerRight
+      gNodes[outerLeft].modField = gNodes[outerLeft].modField + (shiftInnerRight - shiftOuterLeft)
+    defaultAncestor = idx
+  defaultAncestor
+
+proc executeShifts(idx: int) =
+  var shift = 0.0'f32
+  var change = 0.0'f32
+  var i = gNodes[idx].children.len - 1
+  while i >= 0:
+    let childIdx = gNodes[idx].children[i]
+    gNodes[childIdx].y = gNodes[childIdx].y + shift
+    gNodes[childIdx].modField = gNodes[childIdx].modField + shift
+    change = change + gNodes[childIdx].change
+    shift = shift + gNodes[childIdx].shift + change
+    dec i
+
+proc firstWalk(idx: int) =
+  let numChildren = gNodes[idx].children.len
+  if numChildren == 0:
+    let prevSib = gNodes[idx].previousSibling
+    if prevSib >= 0:
+      gNodes[idx].y = gNodes[prevSib].y + 1.0'f32
+    else:
+      gNodes[idx].y = 0.0'f32
+  else:
+    var defaultAncestor = -1
+    for i in 0 ..< numChildren:
+      let childIdx = gNodes[idx].children[i]
+      firstWalk(childIdx)
+      let argAncestor = if defaultAncestor >= 0: defaultAncestor else: childIdx
+      defaultAncestor = apportion(childIdx, argAncestor)
+
+    executeShifts(idx)
+
+    let firstChildIdx = gNodes[idx].children[0]
+    let lastChildIdx = gNodes[idx].children[numChildren - 1]
+    let midpoint = (gNodes[firstChildIdx].y + gNodes[lastChildIdx].y) / 2.0'f32
+    let prevSib = gNodes[idx].previousSibling
+    if prevSib >= 0:
+      gNodes[idx].y = gNodes[prevSib].y + 1.0'f32
+      gNodes[idx].modField = gNodes[idx].y - midpoint
+    else:
+      gNodes[idx].y = midpoint
+
+proc secondWalk(idx: int; modSum: float32; depth: int32; minIn: float32): float32 =
+  var minY = minIn
+  gNodes[idx].y = gNodes[idx].y + modSum
+  gNodes[idx].x = depth
+  if gNodes[idx].y < minY:
+    minY = gNodes[idx].y
+  let numChildren = gNodes[idx].children.len
+  let currentMod = gNodes[idx].modField
+  for i in 0 ..< numChildren:
+    let childIdx = gNodes[idx].children[i]
+    minY = secondWalk(childIdx, modSum + currentMod, depth + 1'i32, minY)
+  minY
+
+proc finalizePosition(idx: int) =
+  let n = gNodes[idx].node
+  if gTree[n].display.present:
+    gTree[n].display.x = float32(gNodes[idx].x)
+    gTree[n].display.y = gNodes[idx].y
+  let kids = gNodes[idx].children
+  for child in kids:
+    finalizePosition(child)
+
+proc runLayout(rootIndex: int) =
+  gNodes = @[]
+  gNodes.add(TreeNodePosition(node: rootIndex, parent: -1, previousSibling: -1, childIndex: 1, children: @[],
+    ancestor: 0, thread: -1, x: 0'i32, y: -1.0'f32, modField: 0.0'f32, change: 0.0'f32, shift: 0.0'f32))
+  var previousIdx = -1
+  let kids = gTree[rootIndex].children
+  for child in kids:
+    previousIdx = addChild(0, child, previousIdx)
+  firstWalk(0)
+  let rootY = gNodes[0].y
+  let minY = secondWalk(0, 0.0'f32, 0'i32, rootY)
+  if minY < 0.0'f32:
+    for i in 0 ..< gNodes.len:
+      gNodes[i].y = gNodes[i].y + (-minY)
+  finalizePosition(0)
+
+proc flag(b: bool): string = (if b: "1" else: "0")
+
+proc shoutyPath(path: string): string =
+  ## heck's `to_shouty_snake_case`: anything not alphanumeric separates words.
+  result = ""
+  for ch in path:
+    if isAlphaNumeric(ch): result.add(toUpperAscii(ch)) else: result.add('_')
+
+proc main() =
+  var tree = parseJson(readAsset("advancements.json"))
+  let r = root(tree)
+  var ids: seq[string] = @[]
+  for k, v in r.pairs(): ids.add(k)
+  ids.sort(proc(a, b: string): int = cmp(a, b))
+  var list: seq[AdvNode] = @[]
+  for id in ids:
+    let (_, v) = pick(r, id)
+    list.add(readAdvancement(id, v))
+  addAll(list)
+  for i in 0 ..< gTree.len:
+    if gTree[i].parent < 0 and gTree[i].display.present:
+      runLayout(i)
+
+  var text = ""
+  var accessors = ""
+  for i in 0 ..< gTree.len:
+    let n = gTree[i]
+    let d = n.display
+    var requirementText = ""
+    for gi, g in n.requirements:
+      if gi > 0: requirementText.add(Group)
+      for ii, item in g:
+        if ii > 0: requirementText.add(Unit)
+        requirementText.add(item)
+    var criteriaText = ""
+    for ci, c in n.criteria:
+      if ci > 0: criteriaText.add(Unit)
+      criteriaText.add(c)
+    let raw = n.id[10 .. ^1]
+    text.add(raw & "\t" & $n.parent & "\t" & flag(n.telemetry) & "\t" & flag(d.present) & "\t" & d.title & "\t" &
+      d.description & "\t" & (if d.icon.startsWith("minecraft:"): d.icon[10 .. ^1] else: d.icon) & "\t" & $d.frame & "\t" &
+      d.background & "\t" & flag(d.hasBackground) & "\t" & flag(d.showToast) & "\t" & flag(d.hidden) & "\t" &
+      flag(d.announceToChat) & "\t" & $float(d.x) & "\t" & $float(d.y) & "\t" & $n.experience & "\t" &
+      requirementText & "\t" & criteriaText & "\n")
+    accessors.add("template " & shoutyPath(raw) & "*(T: typedesc[Advancement]): Advancement = gAdvancements[" & $i & "]\n")
+
+  var o = "## Generated by src/data_codegen/gen_advancement.aowl from assets/advancements.json. Do not edit.\n"
+  o.add("## Types that advancement_data.rs holds upstream are defined here: see the generator's header.\n\n")
+  o.add("import std/[hashes, options, tables]\nimport gendecode\nimport ../util/identifier\nexport identifier\n\n")
+  o.add("const AdvancementText = " & aowlStr(text) & "\n\n")
+  o.add("""type
+  FrameType* {.pure.} = enum
+    Task = 0, Challenge = 1, Goal = 2
+
+  AdvancementDisplay* = object
+    title*: string
+    description*: string
+    itemIcon*: string
+    frameType*: FrameType
+    backgroundTexture*: Option[string]
+    showToast*: bool
+    hidden*: bool
+    announceToChat*: bool
+    x*: float32
+    y*: float32
+
+  AdvancementReward* = object
+    experience*: int32
+    recipes*: seq[string]
+
+  Advancement* = ref object
+    id*: Identifier
+    parent*: Option[Identifier]
+    sendTelemetry*: bool
+    display*: Option[AdvancementDisplay]
+    reward*: AdvancementReward
+    requirements*: seq[seq[string]]
+    criteria*: seq[string]
+
+  AdvancementNode* = object
+    children*: seq[int]
+    parent*: Option[int]
+    value*: Advancement
+
+  AdvancementTree* = object
+    nodes*: Table[Identifier, int]
+    nodesVector*: seq[AdvancementNode]
+    roots*: seq[int]
+    tasks*: seq[int]
+
+proc `==`*(a, b: Advancement): bool = a.id == b.id
+proc hash*(a: Advancement): Hash = hash(a.id)
+proc `$`*(a: Advancement): string = a.id.namespace & ":" & a.id.path
+proc isRoot*(self: Advancement): bool = self.parent.isNone
+
+proc splitOn(s: string; sep: char): seq[string] =
+  result = @[]
+  if s.len == 0: return
+  var pos = 0
+  while true:
+    result.add(fieldStr(s, pos, sep))
+    if pos >= s.len: break
+    inc pos
+
+var gAdvancements*: seq[Advancement] = @[]
+var ADVANCEMENT_TREE*: AdvancementTree = AdvancementTree(nodes: initTable[Identifier, int](),
+  nodesVector: @[], roots: @[], tasks: @[])
+
+proc loadAdvancements() =
+  let s = AdvancementText
+  var pos = 0
+  template str(): string =
+    let v = fieldStr(s, pos, '\t')
+    skipSep(s, pos)
+    v
+  template num(): int =
+    let v = fieldInt(s, pos, '\t')
+    skipSep(s, pos)
+    v
+  template flag(): bool = num() != 0
+  template real(): float =
+    let v = fieldFloat(s, pos, '\t')
+    skipSep(s, pos)
+    v
+  while not atEnd(s, pos):
+    let raw = str()
+    let parentIdx = num()
+    let telemetry = flag()
+    let hasDisplay = flag()
+    let title = str()
+    let description = str()
+    let icon = str()
+    let frame = num()
+    let background = str()
+    let hasBackground = flag()
+    let showToast = flag()
+    let hidden = flag()
+    let announce = flag()
+    let x = real()
+    let y = real()
+    let experience = num()
+    let requirements = str()
+    let criteria = str()
+    var requirementGroups: seq[seq[string]] = @[]
+    let groups = splitOn(requirements, '\x1e')
+    for g in groups: requirementGroups.add(splitOn(g, '\x1f'))
+    var display = none[AdvancementDisplay]()
+    if hasDisplay:
+      let frameType = case frame
+        of 1: FrameType.Challenge
+        of 2: FrameType.Goal
+        else: FrameType.Task
+      display = some(AdvancementDisplay(title: title, description: description, itemIcon: icon,
+        frameType: frameType, backgroundTexture: if hasBackground: some(background) else: none[string](),
+        showToast: showToast, hidden: hidden, announceToChat: announce, x: float32(x), y: float32(y)))
+    let idx = gAdvancements.len
+    var parentId = none[Identifier]()
+    if parentIdx >= 0:
+      parentId = some(gAdvancements[parentIdx].id)
+    let adv = Advancement(id: vanillaStatic(raw), parent: parentId, sendTelemetry: telemetry, display: display,
+      reward: AdvancementReward(experience: int32(experience), recipes: @[]),
+      requirements: requirementGroups, criteria: splitOn(criteria, '\x1f'))
+    gAdvancements.add(adv)
+    ADVANCEMENT_TREE.nodes[adv.id] = idx
+    ADVANCEMENT_TREE.nodesVector.add(AdvancementNode(children: @[],
+      parent: if parentIdx >= 0: some(parentIdx) else: none[int](), value: adv))
+    if parentIdx >= 0:
+      ADVANCEMENT_TREE.nodesVector[parentIdx].children.add(idx)
+      ADVANCEMENT_TREE.tasks.add(idx)
+    else:
+      ADVANCEMENT_TREE.roots.add(idx)
+
+loadAdvancements()
+
+proc buildNames(): Table[string, int] =
+  result = initTable[string, int]()
+  for i, a in gAdvancements:
+    result[a.id.path] = i
+
+let gAdvancementNames: Table[string, int] = buildNames()
+
+proc fromName*(T: typedesc[Advancement]; name: string): Option[Advancement] =
+  ## By bare path, such as `story/root`.
+  let i = gAdvancementNames.getOrDefault(name, -1)
+  if i < 0: none[Advancement]() else: some(gAdvancements[i])
+
+proc fromMinecraftName*(T: typedesc[Advancement]; name: string): Option[Advancement] =
+  ## By full name, such as `minecraft:story/root`.
+  if name.len <= 10 or substr(name, 0, 9) != "minecraft:": return none[Advancement]()
+  Advancement.fromName(substr(name, 10, name.len - 1))
+
+proc getAdvancementsList*(T: typedesc[Advancement]): seq[Advancement] = gAdvancements
+
+proc getIdentifierList*(T: typedesc[Advancement]): seq[Identifier] =
+  result = @[]
+  for a in gAdvancements: result.add(a.id)
+
+""")
+  o.add(accessors)
+  writeGenerated(OutPath, o)
+
+when isMainModule:
+  main()

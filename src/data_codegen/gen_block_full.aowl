@@ -1,0 +1,809 @@
+## Port of pumpkin-codegen/src/block.rs (block.rs), the whole of it.
+##
+## Writes two modules:
+##   src/generated/block_enums.aowl  the property enums, which the hand-written
+##                                   src/data block modules need first
+##   src/generated/block_properties.aowl        collision shapes, every block and state,
+##                                   the bedrock state map and the typed
+##                                   property structs
+##
+## Upstream's `Block { .. }`/`BlockState { .. }` struct literals become string
+## tables decoded when block.aowl loads. 32366 states collapse to about 4200
+## distinct tuples, so a state id indexes a tuple through a hex-packed u16 table.
+## `Box<dyn BlockProperties>` becomes src/data/block_ext.aowl's table-driven
+## `DynBlockProperties`.
+##
+## `loot_table` lives in src/generated/block_loot.aowl (gen_loot.aowl) rather
+## than on Block, since its types depend on the loot port.
+##
+## Ids here are upstream's own: assets/blocks.json is 26.2 data, so a state id
+## is a 26.2 state id. Sending one to a 1.21.11 client needs
+## block_state_remap.aowl's `remapBlockStateForVersion`, as upstream does.
+
+import std/[json, syncio, tables, strutils, algorithm]
+import codegenutil
+import "../nbt/tag"
+import "../nbt/nbtbase"
+import "../nbt/nbtdoc"
+import "../nbt/deserializer"
+import inflate
+
+type
+  PropKind = enum
+    pkBool, pkInt, pkEnum
+
+  GenProp = object
+    hashKey: int
+    enumName: string
+    serializedName: string
+    kind: PropKind
+    minV: int
+    maxV: int
+    values: seq[string]
+
+  BeVariant = object
+    id: int
+    keys: seq[string]
+    vals: seq[string]
+
+var gProps: seq[GenProp] = @[]
+var gPropIndex = initTable[int, int]()
+
+proc readProperties() =
+  var tree = parseJson(readAsset("properties.json"))
+  for elem in items(tree.root()):
+    var p = GenProp(hashKey: 0, enumName: "", serializedName: "", kind: pkBool,
+                    minV: 0, maxV: 0, values: @[])
+    for k, v in elem.pairs():
+      case k
+      of "hash_key": p.hashKey = int(v.getInt())
+      of "enum_name": p.enumName = v.getStr()
+      of "serialized_name": p.serializedName = v.getStr()
+      of "type":
+        case v.getStr()
+        of "int": p.kind = pkInt
+        of "enum": p.kind = pkEnum
+        else: p.kind = pkBool
+      of "min": p.minV = int(v.getInt())
+      of "max": p.maxV = int(v.getInt())
+      of "values":
+        for it in items(v): p.values.add(it.getStr())
+      else: discard
+    gPropIndex[p.hashKey] = gProps.len
+    gProps.add(p)
+
+proc variantCount(p: GenProp): int =
+  case p.kind
+  of pkBool: 2
+  of pkInt: p.maxV - p.minV + 1
+  of pkEnum: p.values.len
+
+proc enumIdent(p: GenProp): string = toPascalCase(p.enumName)
+
+proc isNumberValues(values: seq[string]): bool =
+  ## `is_number_values` in block.rs: an enum spelling numbers as L1, L2, ...
+  var anyL1 = false
+  for v in values:
+    if v.len == 0 or v[0] != 'L': return false
+    if v == "L1": anyL1 = true
+  anyL1
+
+proc literalOf(values: seq[string], v: string): string =
+  if isNumberValues(values): substr(v, 1) else: v
+
+const EnumExtras = """
+proc opposite*(self: Facing): Facing =
+  case self
+  of Facing.North: Facing.South
+  of Facing.South: Facing.North
+  of Facing.East: Facing.West
+  of Facing.West: Facing.East
+  of Facing.Up: Facing.Down
+  of Facing.Down: Facing.Up
+
+proc horizontalFacingAll*(): array[4, HorizontalFacing] =
+  [HorizontalFacing.North, HorizontalFacing.South, HorizontalFacing.West, HorizontalFacing.East]
+
+proc toOffset*(self: HorizontalFacing): Vector3[int32] =
+  case self
+  of HorizontalFacing.North: vec3(0'i32, 0'i32, -1'i32)
+  of HorizontalFacing.South: vec3(0'i32, 0'i32, 1'i32)
+  of HorizontalFacing.West: vec3(-1'i32, 0'i32, 0'i32)
+  of HorizontalFacing.East: vec3(1'i32, 0'i32, 0'i32)
+
+proc toAxis*(self: HorizontalFacing): HorizontalAxis =
+  case self
+  of HorizontalFacing.North, HorizontalFacing.South: HorizontalAxis.Z
+  of HorizontalFacing.West, HorizontalFacing.East: HorizontalAxis.X
+
+proc toFacing*(self: HorizontalFacing): HorizontalFacing = self
+
+proc opposite*(self: HorizontalFacing): HorizontalFacing =
+  case self
+  of HorizontalFacing.North: HorizontalFacing.South
+  of HorizontalFacing.South: HorizontalFacing.North
+  of HorizontalFacing.West: HorizontalFacing.East
+  of HorizontalFacing.East: HorizontalFacing.West
+
+proc rotateClockwise*(self: HorizontalFacing): HorizontalFacing =
+  case self
+  of HorizontalFacing.North: HorizontalFacing.East
+  of HorizontalFacing.South: HorizontalFacing.West
+  of HorizontalFacing.West: HorizontalFacing.North
+  of HorizontalFacing.East: HorizontalFacing.South
+
+proc rotateCounterClockwise*(self: HorizontalFacing): HorizontalFacing =
+  case self
+  of HorizontalFacing.North: HorizontalFacing.West
+  of HorizontalFacing.South: HorizontalFacing.East
+  of HorizontalFacing.West: HorizontalFacing.South
+  of HorizontalFacing.East: HorizontalFacing.North
+
+proc isAscending*(self: RailShape): bool =
+  self == RailShape.AscendingEast or self == RailShape.AscendingWest or
+    self == RailShape.AscendingNorth or self == RailShape.AscendingSouth
+
+proc isAscending*(self: RailShapeStraight): bool =
+  self == RailShapeStraight.AscendingEast or self == RailShapeStraight.AscendingWest or
+    self == RailShapeStraight.AscendingNorth or self == RailShapeStraight.AscendingSouth
+"""
+
+proc emitEnums(): string =
+  var names: seq[string] = @[]
+  var firstOf = initTable[string, int]()
+  for i, p in gProps:
+    if p.kind == pkEnum and not firstOf.hasKey(enumIdent(p)):
+      firstOf[enumIdent(p)] = i
+      names.add(enumIdent(p))
+  names.sort(proc(a, b: string): int = cmp(a, b))
+
+  var s = "## Generated by src/data_codegen/gen_block_full.aowl from assets/properties.json - do not edit by hand.\n"
+  s.add("## Port of the property enums of pumpkin-data/src/generated/block.rs.\n\n")
+  s.add("import gendecode\nimport \"../util/vector3\"\n\n")
+  for name in names:
+    let p = gProps[firstOf.getOrDefault(name)]
+    s.add("type\n  " & name & "* {.pure.} = enum\n")
+    for v in p.values:
+      s.add("    " & toPascalCase(v) & "\n")
+    s.add("\nproc variantCount*(T: typedesc[" & name & "]): uint16 {.inline.} = " & $p.values.len & "'u16\n")
+    s.add("proc toIndex*(self: " & name & "): uint16 {.inline.} = uint16(ord(self))\n")
+    s.add("proc fromIndex*(T: typedesc[" & name & "]; index: uint16): " & name & " =\n")
+    s.add("  if int(index) >= " & $p.values.len & ":\n")
+    s.add("    genPanic(\"Invalid index: \" & $index)\n")
+    s.add("  " & name & "(index)\n")
+    s.add("proc toValue*(self: " & name & "): string =\n  case self\n")
+    for v in p.values:
+      s.add("  of " & name & "." & toPascalCase(v) & ": " & aowlStr(literalOf(p.values, v)) & "\n")
+    s.add("proc fromValue*(T: typedesc[" & name & "]; value: string): " & name & " =\n  case value\n")
+    for v in p.values:
+      s.add("  of " & aowlStr(literalOf(p.values, v)) & ": " & name & "." & toPascalCase(v) & "\n")
+    s.add("  else:\n    genPanic(\"Invalid value: \" & value)\n    " & name & "(0)\n\n")
+  s.add(EnumExtras)
+  s
+
+proc tagText(val: NbtTag): string =
+  ## The Byte/Int/String unpacking shared by get_be_data_from_nbt and
+  ## parse_geyser_entry in block.rs.
+  case val.kind
+  of ntkByte: (if val.byteVal == 1'i8: "true" else: "false")
+  of ntkInt: $val.intVal
+  of ntkString: val.stringVal
+  else:
+    echo "Unexpected NBT type in bedrock state"
+    quit(1)
+    ""
+
+proc stripMc(s: string): string =
+  if s.startsWith("minecraft:"): substr(s, 10) else: s
+
+proc fileBytes(rel: string): seq[byte] =
+  let text = readAsset(rel)
+  result = newSeq[byte](text.len)
+  for i in 0 ..< text.len:
+    result[i] = byte(text[i])
+
+var gBeBlocks = initTable[string, seq[BeVariant]]()
+
+proc readBeBlocks() =
+  ## get_be_data_from_nbt: consecutive named compounds, little-endian bedrock
+  ## NBT, the position in the file being the bedrock network id.
+  var reader = newNbtReader(nrmBedrock, fileBytes("bedrock/block_states.nbt"))
+  var currentId = 0
+  while reader.pos < reader.data.len:
+    let doc = read(reader)
+    if not doc.isOk:
+      echo "bedrock block_states.nbt: read failed at " & $reader.pos
+      quit(1)
+    let root = doc.value.rootTag
+    let (hasName, nameTag) = root.get("name")
+    let blockName = if hasName: stripMc(nameTag.stringVal) else: ""
+    var variant = BeVariant(id: currentId, keys: @[], vals: @[])
+    let (hasStates, statesTag) = root.get("states")
+    if hasStates:
+      let c = statesTag.compoundVal
+      for i in 0 ..< c.names.len:
+        variant.keys.add(c.names[i])
+        variant.vals.add(tagText(c.values[i]))
+    if blockName.len > 0:
+      var list = gBeBlocks.getOrDefault(blockName)
+      list.add(variant)
+      gBeBlocks[blockName] = list
+    inc currentId
+
+proc beHas(variant: BeVariant, key, val: string): bool =
+  for i in 0 ..< variant.keys.len:
+    if variant.keys[i] == key:
+      return variant.vals[i] == val
+  false
+
+proc firstVariantId(name: string): int =
+  let variants = gBeBlocks.getOrDefault(name)
+  if variants.len > 0: variants[0].id else: 1
+
+proc bedrockIdFor(geyser: seq[NbtTag], stateId: int, blockName: string): int =
+  ## The `matched_be_id` block of block.rs's build().
+  result = 1
+  if stateId < geyser.len:
+    let compound = geyser[stateId].compoundVal
+    let (hasIdent, identTag) = compound.get("bedrock_identifier")
+    var raw = blockName
+    if hasIdent and identTag.stringVal.len > 0:
+      raw = identTag.stringVal
+    let bedrockName = stripMc(raw)
+    var keys: seq[string] = @[]
+    var vals: seq[string] = @[]
+    let (hasState, stateTag) = compound.get("state")
+    if hasState:
+      let c = stateTag.compoundVal
+      for i in 0 ..< c.names.len:
+        keys.add(c.names[i])
+        vals.add(tagText(c.values[i]))
+    if gBeBlocks.hasKey(bedrockName):
+      let variants = gBeBlocks.getOrDefault(bedrockName)
+      for variant in variants:
+        var all = true
+        for i in 0 ..< keys.len:
+          if not beHas(variant, keys[i], vals[i]):
+            all = false
+            break
+        if all:
+          return variant.id
+      return firstVariantId(bedrockName)
+    elif gBeBlocks.hasKey(blockName):
+      return firstVariantId(blockName)
+  elif gBeBlocks.hasKey(blockName):
+    return firstVariantId(blockName)
+
+const Keywords = ["type", "in", "end", "of", "is", "out", "ref", "var", "let", "const", "from", "to", "block", "static", "bind", "mod", "div", "and", "or", "not", "as", "enum", "object", "tuple", "for", "if", "when", "case"]
+
+proc fieldIdent(serialized: string): string =
+  let c = toLowerCamel(serialized)
+  for k in Keywords:
+    if k == c: return "`" & c & "`"
+  c
+
+proc emitGroups(groups: seq[seq[int]], groupNames: seq[string]): string =
+  ## One struct per property group, in the shape of BlockPropertyStruct's
+  ## ToTokens impl. `groups[g]` is its property indexes in declaration order.
+  result = ""
+  for g in 0 ..< groups.len:
+    let name = groupNames[g]
+    let props = groups[g]
+    var s = "type\n  " & name & "* = object\n"
+    for pi in props:
+      let p = gProps[pi]
+      var ty = "bool"
+      case p.kind
+      of pkBool: ty = "bool"
+      of pkInt: ty = "uint8"
+      of pkEnum: ty = enumIdent(p)
+      s.add("    " & fieldIdent(p.serializedName) & "*: " & ty & "\n")
+    s.add("\nproc toIndex*(self: " & name & "): uint16 =\n  var mul = 1'u16\n  result = 0'u16\n")
+    var i = props.len - 1
+    while i >= 0:
+      let p = gProps[props[i]]
+      let f = "self." & fieldIdent(p.serializedName)
+      let cnt = $variantCount(p) & "'u16"
+      case p.kind
+      of pkBool:
+        s.add("  result += (if " & f & ": 0'u16 else: 1'u16) * mul\n")
+      of pkInt:
+        s.add("  result += uint16(" & f & " - " & $p.minV & "'u8) * mul\n")
+      of pkEnum:
+        s.add("  result += toIndex(" & f & ") * mul\n")
+      s.add("  mul *= " & cnt & "\n")
+      dec i
+    s.add("\nproc fromIndex*(T: typedesc[" & name & "]; idx: uint16): " & name & " =\n")
+    s.add("  var index = idx\n  result = " & name & "()\n")
+    i = props.len - 1
+    while i >= 0:
+      let p = gProps[props[i]]
+      let f = "result." & fieldIdent(p.serializedName)
+      let cnt = $variantCount(p) & "'u16"
+      case p.kind
+      of pkBool:
+        s.add("  " & f & " = index mod 2'u16 == 0'u16\n")
+      of pkInt:
+        s.add("  " & f & " = uint8(index mod " & cnt & ") + " & $p.minV & "'u8\n")
+      of pkEnum:
+        s.add("  " & f & " = " & enumIdent(p) & ".fromIndex(index mod " & cnt & ")\n")
+      s.add("  index = index div " & cnt & "\n")
+      dec i
+    s.add("\nproc handlesBlockId*(T: typedesc[" & name & "]; blockId: BlockId): bool =\n")
+    s.add("  blockGroupOf(blockId) == " & $g & "\n\n")
+    s.add("proc toStateId*(self: " & name & "; b: Block): BlockStateId =\n")
+    s.add("  if not " & name & ".handlesBlockId(b.id):\n")
+    s.add("    genPanic(b.name & \" is not a valid block for " & name & "\")\n")
+    s.add("  b.states[int(toIndex(self))].id\n\n")
+    s.add("proc fromStateId*(T: typedesc[" & name & "]; id: BlockStateId; b: Block): " & name & " =\n")
+    s.add("  let minId = asU16(b.states[0].id)\n")
+    s.add("  let maxId = asU16(b.states[b.states.len - 1].id)\n")
+    s.add("  if asU16(id) >= minId and asU16(id) <= maxId:\n")
+    s.add("    " & name & ".fromIndex(asU16(id) - minId)\n")
+    s.add("  else:\n    " & name & ".fromIndex(0'u16)\n\n")
+    s.add("proc defaultFor*(T: typedesc[" & name & "]; b: Block): " & name & " =\n")
+    s.add("  if not " & name & ".handlesBlockId(b.id):\n")
+    s.add("    genPanic(b.name & \" is not a valid block for " & name & "\")\n")
+    s.add("  " & name & ".fromStateId(b.defaultState.id, b)\n\n")
+    s.add("proc toProps*(self: " & name & "): seq[(string, string)] =\n  result = @[]\n")
+    for pi in props:
+      let p = gProps[pi]
+      let f = "self." & fieldIdent(p.serializedName)
+      case p.kind
+      of pkBool:
+        s.add("  result.add((" & aowlStr(p.serializedName) & ", (if " & f & ": \"true\" else: \"false\")))\n")
+      of pkInt:
+        s.add("  result.add((" & aowlStr(p.serializedName) & ", $" & f & "))\n")
+      of pkEnum:
+        s.add("  result.add((" & aowlStr(p.serializedName) & ", toValue(" & f & ")))\n")
+    s.add("\nproc fromProps*(T: typedesc[" & name & "]; props: openArray[(string, string)]; b: Block): " & name & " =\n")
+    s.add("  result = " & name & ".defaultFor(b)\n")
+    s.add("  for prop in props:\n    case prop[0]\n")
+    for pi in props:
+      let p = gProps[pi]
+      let f = "result." & fieldIdent(p.serializedName)
+      s.add("    of " & aowlStr(p.serializedName) & ":\n")
+      case p.kind
+      of pkBool:
+        s.add("      " & f & " = prop[1] == \"true\"\n")
+      of pkInt:
+        s.add("      " & f & " = uint8(propIntOr(prop[1], " & $p.minV & ", " & $p.maxV & "))\n")
+      of pkEnum:
+        s.add("      " & f & " = " & enumIdent(p) & ".fromValue(prop[1])\n")
+    s.add("    else: discard\n\n")
+    result.add(s)
+
+proc pistonIndex(s: string): int =
+  case s
+  of "NORMAL": 0
+  of "DESTROY": 1
+  of "BLOCK": 2
+  of "IGNORE": 3
+  of "PUSH_ONLY": 4
+  else: 0
+
+proc joinInts(v: seq[int], sep: string): string =
+  result = ""
+  for i, x in v:
+    if i > 0: result.add(sep)
+    result.add($x)
+
+proc instrumentIndex(noteValues: seq[string], s: string): int =
+  for i, v in noteValues:
+    if v == s: return i
+  echo "unknown instrument " & s
+  quit(1)
+  0
+
+const RuntimePart = """
+type
+  BlockProperty* = object
+    name*: string
+    values*: seq[string]
+
+proc propIntOr(value: string; minV, maxV: int): int =
+  ## The `match *value { "1" => 1, .., _ => min }` arms of `from_props`.
+  result = minV
+  var pos = 0
+  if value.len == 0 or value[0] < '0' or value[0] > '9': return
+  let v = fieldInt(value, pos, ' ')
+  if v >= minV and v <= maxV: result = v
+
+proc loadShapes(): seq[ShapeBox] =
+  result = @[]
+  var pos = 0
+  while pos < ShapeData.len:
+    var b = ShapeBox()
+    b.minX = fieldFloat(ShapeData, pos, ','); skipSep(ShapeData, pos)
+    b.minY = fieldFloat(ShapeData, pos, ','); skipSep(ShapeData, pos)
+    b.minZ = fieldFloat(ShapeData, pos, ','); skipSep(ShapeData, pos)
+    b.maxX = fieldFloat(ShapeData, pos, ','); skipSep(ShapeData, pos)
+    b.maxY = fieldFloat(ShapeData, pos, ','); skipSep(ShapeData, pos)
+    b.maxZ = fieldFloat(ShapeData, pos, ','); skipSep(ShapeData, pos)
+    skipSep(ShapeData, pos)
+    result.add(b)
+
+let COLLISION_SHAPES*: seq[ShapeBox] = loadShapes()
+
+proc loadBlockEntityTypes(): seq[string] =
+  result = @[]
+  var pos = 0
+  while pos < BlockEntityTypeData.len:
+    result.add(fieldStr(BlockEntityTypeData, pos, '\n'))
+    skipSep(BlockEntityTypeData, pos)
+
+let BLOCK_ENTITY_TYPES*: seq[string] = loadBlockEntityTypes()
+
+proc loadTuples(): seq[BlockState] =
+  result = @[]
+  var pos = 0
+  let d = StateTupleData
+  while pos < d.len:
+    var st = BlockState()
+    st.stateFlags = uint16(fieldInt(d, pos, ',')); skipSep(d, pos)
+    st.sideFlags = uint8(fieldInt(d, pos, ',')); skipSep(d, pos)
+    st.instrument = NoteblockInstrument(fieldInt(d, pos, ',')); skipSep(d, pos)
+    st.luminance = uint8(fieldInt(d, pos, ',')); skipSep(d, pos)
+    st.pistonBehavior = PistonBehavior(fieldInt(d, pos, ',')); skipSep(d, pos)
+    st.hardness = float32(fieldFloat(d, pos, ',')); skipSep(d, pos)
+    st.opacity = uint8(fieldInt(d, pos, ',')); skipSep(d, pos)
+    st.blockEntityType = uint16(fieldInt(d, pos, ',')); skipSep(d, pos)
+    st.collisionShapes = intList(fieldStr(d, pos, ','), '.'); skipSep(d, pos)
+    st.outlineShapes = intList(fieldStr(d, pos, ','), '.'); skipSep(d, pos)
+    result.add(st)
+
+proc loadStates(): seq[BlockState] =
+  let tuples = loadTuples()
+  let n = StateTupleIndex.len div 4
+  result = newSeq[BlockState](n)
+  for i in 0 ..< n:
+    result[i] = tuples[int(hexU16At(StateTupleIndex, i))]
+    result[i].id = newBlockStateIdUnchecked(uint16(i))
+
+let gStates*: seq[BlockState] = loadStates()
+let gStateToBedrock: seq[uint16] = hexU16Seq(StateBedrockData)
+
+var gBlockGroups: seq[int16] = @[]
+var gBlockFromState: seq[uint16] = newSeq[uint16](gStates.len)
+var gBlockByName = initTable[string, int]()
+var gBlockFromItem = initTable[int, int]()
+
+proc loadBlocks(): seq[Block] =
+  result = @[]
+  var pos = 0
+  let d = BlockRowData
+  while pos < d.len:
+    let id = uint16(fieldInt(d, pos, '|')); skipSep(d, pos)
+    let name = fieldStr(d, pos, '|'); skipSep(d, pos)
+    let hardness = float32(fieldFloat(d, pos, '|')); skipSep(d, pos)
+    let blast = float32(fieldFloat(d, pos, '|')); skipSep(d, pos)
+    let mapColor = uint8(fieldInt(d, pos, '|')); skipSep(d, pos)
+    let slip = float32(fieldFloat(d, pos, '|')); skipSep(d, pos)
+    let vel = float32(fieldFloat(d, pos, '|')); skipSep(d, pos)
+    let jump = float32(fieldFloat(d, pos, '|')); skipSep(d, pos)
+    let itemId = uint16(fieldInt(d, pos, '|')); skipSep(d, pos)
+    let defaultState = fieldInt(d, pos, '|'); skipSep(d, pos)
+    let firstState = fieldInt(d, pos, '|'); skipSep(d, pos)
+    let stateCount = fieldInt(d, pos, '|'); skipSep(d, pos)
+    let spread = fieldInt(d, pos, '|'); skipSep(d, pos)
+    let burn = fieldInt(d, pos, '|'); skipSep(d, pos)
+    let expMin = fieldInt(d, pos, '|'); skipSep(d, pos)
+    let expMax = fieldInt(d, pos, '|'); skipSep(d, pos)
+    let group = fieldInt(d, pos, '|'); skipSep(d, pos)
+    var states = newSeq[BlockState](stateCount)
+    for i in 0 ..< stateCount:
+      states[i] = gStates[firstState + i]
+      gBlockFromState[firstState + i] = id
+    result.add(Block(id: newBlockIdUnchecked(id), name: name, hardness: hardness,
+      blastResistance: blast, mapColor: mapColor, slipperiness: slip,
+      velocityMultiplier: vel, jumpVelocityMultiplier: jump, itemId: itemId,
+      defaultState: gStates[defaultState], states: states,
+      hasFlammable: spread >= 0,
+      flammable: Flammable(spreadChance: uint8(max(spread, 0)), burnChance: uint8(max(burn, 0))),
+      hasExperience: expMin >= 0, experienceMin: int32(expMin), experienceMax: int32(expMax)))
+    gBlockGroups.add(int16(group))
+    gBlockByName[name] = int(id)
+    if not gBlockFromItem.hasKey(int(itemId)):
+      gBlockFromItem[int(itemId)] = int(id)
+
+let gBlocks*: seq[Block] = loadBlocks()
+
+proc blockGroupOf*(id: BlockId): int {.inline.} =
+  ## Which property struct covers this block, -1 for a block with no properties.
+  int(gBlockGroups[int(asU16(id))])
+
+proc fromId*(T: typedesc[BlockState]; id: BlockStateId): BlockState {.inline.} =
+  ## `BlockState::from_id`.
+  gStates[int(asU16(id))]
+
+proc toBeNetworkId*(id: BlockStateId): uint16 {.inline.} =
+  ## `BlockState::to_be_network_id`.
+  gStateToBedrock[int(asU16(id))]
+
+proc fromRegistryKey*(T: typedesc[Block]; name: string): nil Block =
+  ## `Block::from_registry_key`: a resource path without its namespace.
+  let i = gBlockByName.getOrDefault(name, -1)
+  if i < 0: return nil
+  return gBlocks[i]
+
+proc fromName*(T: typedesc[Block]; name: string): nil Block =
+  ## `Block::from_name`: a name with or without `minecraft:`.
+  var key = name
+  if key.len > 10 and substr(key, 0, 9) == "minecraft:":
+    key = substr(key, 10)
+  let i = gBlockByName.getOrDefault(key, -1)
+  if i < 0: return nil
+  return gBlocks[i]
+
+proc fromId*(T: typedesc[Block]; id: BlockId): Block {.inline.} =
+  ## `Block::from_id`.
+  gBlocks[int(asU16(id))]
+
+proc fromStateId*(T: typedesc[BlockId]; id: BlockStateId): BlockId {.inline.} =
+  ## `BlockId::from_state_id`.
+  newBlockIdUnchecked(gBlockFromState[int(asU16(id))])
+
+proc fromStateId*(T: typedesc[Block]; id: BlockStateId): Block {.inline.} =
+  ## `Block::from_state_id`.
+  gBlocks[int(gBlockFromState[int(asU16(id))])]
+
+proc fromItemId*(T: typedesc[Block]; id: uint16): nil Block =
+  ## `Block::from_item_id`: the first block declaring this item.
+  let i = gBlockFromItem.getOrDefault(int(id), -1)
+  if i < 0: return nil
+  return gBlocks[i]
+
+proc newBlockId*(inner: uint16): (bool, BlockId) =
+  ## `BlockId::new`; false when out of range.
+  if inner < BLOCK_COUNT: (true, newBlockIdUnchecked(inner))
+  else: (false, newBlockIdUnchecked(0'u16))
+
+proc newBlockIdOrAir*(inner: uint16): BlockId =
+  ## `BlockId::new_or_air`.
+  if inner < BLOCK_COUNT: newBlockIdUnchecked(inner) else: newBlockIdUnchecked(0'u16)
+
+proc newBlockStateId*(inner: uint16): (bool, BlockStateId) =
+  ## `BlockStateId::new`; false when out of range.
+  if inner < STATE_COUNT: (true, newBlockStateIdUnchecked(inner))
+  else: (false, newBlockStateIdUnchecked(0'u16))
+
+proc newBlockStateIdOrAir*(inner: uint16): BlockStateId =
+  ## `BlockStateId::new_or_air`.
+  if inner < STATE_COUNT: newBlockStateIdUnchecked(inner) else: blockStateIdAir
+
+proc toBlock*(id: BlockId): Block {.inline.} = gBlocks[int(asU16(id))]
+proc toState*(id: BlockStateId): BlockState {.inline.} = gStates[int(asU16(id))]
+proc toBlockId*(id: BlockStateId): BlockId {.inline.} = BlockId.fromStateId(id)
+proc toBlock*(id: BlockStateId): Block {.inline.} = Block.fromStateId(id)
+
+proc isAir*(id: BlockStateId): bool {.inline.} = gStates[int(asU16(id))].isAir
+proc isLiquid*(id: BlockStateId): bool {.inline.} = gStates[int(asU16(id))].isLiquid
+proc hasRandomTicks*(id: BlockStateId): bool {.inline.} = gStates[int(asU16(id))].hasRandomTicks
+
+"""
+
+proc main() =
+  readProperties()
+  readBeBlocks()
+  let (gunzipped, geyserBytes) = gunzip(fileBytes("bedrock/blocks.nbt"))
+  var geyserReader = newNbtReader(nrmJava, geyserBytes)
+  let geyserRoot = read(geyserReader)
+  if not gunzipped or not geyserRoot.isOk:
+    echo "bedrock blocks.nbt: read failed"
+    quit(1)
+  let (hasGeyser, geyserTag) = geyserRoot.value.rootTag.get("bedrock_mappings")
+  if not hasGeyser:
+    echo "Missing bedrock_mappings list in Geyser blocks.nbt"
+    quit(1)
+  let geyser = geyserTag.listVal
+
+  var noteValues: seq[string] = @[]
+  for p in gProps:
+    if p.enumName == "noteblock_instrument":
+      noteValues = p.values
+
+  var tree = parseJson(readAsset("blocks.json"))
+  var shapeRows = ""
+  var shapeCount = 0
+  var beTypes = ""
+  var tupleIndex = initTable[string, int]()
+  var tupleRows = ""
+  var stateTuple: seq[int] = @[]
+  var stateBedrock: seq[int] = @[]
+  var blockRows = ""
+  var blockCount = 0
+  var constants = ""
+  var groupKeyIndex = initTable[string, int]()
+  var groups: seq[seq[int]] = @[]
+  var groupNames: seq[string] = @[]
+
+  for topKey, topVal in tree.root().pairs():
+    case topKey
+    of "shapes":
+      for shape in items(topVal):
+        # "min" then "max", three numbers each.
+        for key in ["min", "max"]:
+          for k, v in shape.pairs():
+            if k == key:
+              for c in items(v):
+                shapeRows.add(numText(c))
+                shapeRows.add(',')
+        shapeRows.add('\n')
+        inc shapeCount
+    of "block_entity_types":
+      for t in items(topVal):
+        beTypes.add(t.getStr())
+        beTypes.add('\n')
+    of "blocks":
+      for elem in items(topVal):
+        var id = 0
+        var name = ""
+        var hardness = "0"
+        var blast = "0"
+        var mapColor = 0
+        var itemId = 0
+        var slip = "0"
+        var vel = "0"
+        var jump = "0"
+        var defaultState = 0
+        var spread = -1
+        var burn = -1
+        var expMin = -1
+        var expMax = -1
+        var propHashes: seq[int] = @[]
+        var firstState = -1
+        var stateCount = 0
+        for k, v in elem.pairs():
+          case k
+          of "id": id = int(v.getInt())
+          of "name": name = v.getStr()
+          of "hardness": hardness = numText(v)
+          of "blast_resistance": blast = numText(v)
+          of "map_color": mapColor = int(v.getInt())
+          of "item_id": itemId = int(v.getInt())
+          of "slipperiness": slip = numText(v)
+          of "velocity_multiplier": vel = numText(v)
+          of "jump_velocity_multiplier": jump = numText(v)
+          of "default_state_id": defaultState = int(v.getInt())
+          of "flammable":
+            for fk, fv in v.pairs():
+              if fk == "spread_chance": spread = int(fv.getInt())
+              elif fk == "burn_chance": burn = int(fv.getInt())
+          of "experience":
+            for ek, ev in v.pairs():
+              if ek == "experience":
+                if ev.kind == JInt:
+                  expMin = int(ev.getInt())
+                  expMax = expMin
+                else:
+                  for ik, iv in ev.pairs():
+                    if ik == "min_inclusive": expMin = int(iv.getInt())
+                    elif ik == "max_inclusive": expMax = int(iv.getInt())
+          of "properties":
+            for it in items(v): propHashes.add(int(it.getInt()))
+          else: discard
+        # States in a second pass: the bedrock match needs the block's name,
+        # and JSON key order is whatever the asset has.
+        for k, v in elem.pairs():
+          if k != "states": continue
+          for st in items(v):
+            var sid = 0
+            var flags = 0
+            var side = 0
+            var instrument = 0
+            var lum = 0
+            var piston = 0
+            var hard = "0"
+            var opacity = 0
+            var bet = 65535
+            var coll: seq[int] = @[]
+            var outl: seq[int] = @[]
+            for sk, sv in st.pairs():
+              case sk
+              of "id": sid = int(sv.getInt())
+              of "state_flags": flags = int(sv.getInt())
+              of "side_flags": side = int(sv.getInt())
+              of "instrument": instrument = instrumentIndex(noteValues, sv.getStr())
+              of "luminance": lum = int(sv.getInt())
+              of "piston_behavior": piston = pistonIndex(sv.getStr())
+              of "hardness": hard = numText(sv)
+              of "opacity": opacity = int(sv.getInt())
+              of "block_entity_type": bet = int(sv.getInt())
+              of "collision_shapes":
+                for c in items(sv): coll.add(int(c.getInt()))
+              of "outline_shapes":
+                for c in items(sv): outl.add(int(c.getInt()))
+              else: discard
+            let row = $flags & "," & $side & "," & $instrument & "," & $lum & "," &
+              $piston & "," & hard & "," & $opacity & "," & $bet & "," &
+              joinInts(coll, ".") & "," & joinInts(outl, ".")
+            var ti = tupleIndex.getOrDefault(row, -1)
+            if ti < 0:
+              ti = tupleIndex.len
+              tupleIndex[row] = ti
+              tupleRows.add(row)
+              tupleRows.add('\n')
+            if sid != stateTuple.len:
+              echo "state ids are not contiguous at " & $sid
+              quit(1)
+            stateTuple.add(ti)
+            stateBedrock.add(bedrockIdFor(geyser, sid, name))
+            if firstState < 0: firstState = sid
+            inc stateCount
+        var group = -1
+        if propHashes.len > 0:
+          var sortedHashes = propHashes
+          sortedHashes.sort(proc(a, b: int): int = cmp(a, b))
+          let key = joinInts(sortedHashes, ",")
+          group = groupKeyIndex.getOrDefault(key, -1)
+          if group < 0:
+            group = groups.len
+            groupKeyIndex[key] = group
+            var order: seq[int] = @[]
+            for h in propHashes:
+              order.add(gPropIndex.getOrDefault(h))
+            groups.add(order)
+            groupNames.add(toPascalCase(name & "_like_properties"))
+        blockRows.add($id & "|" & name & "|" & hardness & "|" & blast & "|" & $mapColor &
+          "|" & slip & "|" & vel & "|" & jump & "|" & $itemId & "|" & $defaultState &
+          "|" & $firstState & "|" & $stateCount & "|" & $spread & "|" & $burn & "|" &
+          $expMin & "|" & $expMax & "|" & $group & "\n")
+        let pascal = toPascalCase(name)
+        constants.add("const blockId" & pascal & "* = BlockId(" & $id & "'u16)\n")
+        constants.add("template block" & pascal & "*(): Block = gBlocks[" & $id & "]\n")
+        inc blockCount
+    else: discard
+
+  var propTable = ""
+  for g in 0 ..< groups.len:
+    var parts: seq[string] = @[]
+    for pi in groups[g]:
+      let p = gProps[pi]
+      var values = ""
+      case p.kind
+      of pkBool: values = "true,false"
+      of pkInt:
+        var v = p.minV
+        while v <= p.maxV:
+          if values.len > 0: values.add(',')
+          values.add($v)
+          inc v
+      of pkEnum:
+        for i, v in p.values:
+          if i > 0: values.add(',')
+          values.add(literalOf(p.values, v))
+      parts.add(p.serializedName & "=" & values)
+    for i, part in parts:
+      if i > 0: propTable.add(';')
+      propTable.add(part)
+    propTable.add('\n')
+
+  writeGenerated("src/generated/block_enums.aowl", emitEnums())
+
+  var s = "## Generated by src/data_codegen/gen_block_full.aowl from assets/blocks.json,\n"
+  s.add("## assets/properties.json and assets/bedrock/{block_states,blocks}.nbt - do not edit by hand.\n")
+  s.add("## Port of pumpkin-data/src/generated/block.rs in compact form: see the generator.\n")
+  s.add("## State and block ids are 26.2's: see block_state_remap.aowl for the wire ids of 1.21.11.\n\n")
+  s.add("import std/tables\nimport gendecode\nimport block_enums\nimport \"../data/block_state\"\nimport \"../data/blocks\"\n")
+  s.add("export block_enums, block_state, blocks\n\n")
+  s.add("const ShapeData = " & aowlStr(shapeRows) & "\n")
+  s.add("const BlockEntityTypeData = " & aowlStr(beTypes) & "\n")
+  s.add("const StateTupleData = " & aowlStr(tupleRows) & "\n")
+  s.add("const StateTupleIndex = " & aowlStr(hexU16Table(stateTuple)) & "\n")
+  s.add("const StateBedrockData = " & aowlStr(hexU16Table(stateBedrock)) & "\n")
+  s.add("const BlockRowData = " & aowlStr(blockRows) & "\n")
+  s.add("const PropertyGroupData* = " & aowlStr(propTable) & "\n\n")
+  s.add("const STATE_COUNT* = " & $stateTuple.len & "'u16\n")
+  s.add("const BLOCK_COUNT* = " & $blockCount & "'u16\n\n")
+  s.add(RuntimePart)
+  s.add(constants)
+  s.add("\n")
+  s.add("proc blocksMovement*(blockState: BlockState; id: BlockId): bool =\n")
+  s.add("  ## `blocks_movement`.\n")
+  s.add("  blockState.isSolid and id != blockIdCobweb and id != blockIdBambooSapling\n\n")
+  s.add(emitGroups(groups, groupNames))
+  writeGenerated("src/generated/block_properties.aowl", s)
+  echo "blocks " & $blockCount & ", states " & $stateTuple.len & ", tuples " & $tupleIndex.len &
+    ", shapes " & $shapeCount & ", groups " & $groups.len
+
+main()

@@ -1,0 +1,402 @@
+## Port of pumpkin-codegen/src/loot.rs (loot.rs)
+##
+## Hand-written, unlike its neighbours. `decodeLootTable` is what `loot.rs`'s `Deserialize` + `ToTokens`
+## pair does at build time: upstream turns one asset JSON into one Rust literal; this port keeps the asset
+## JSON minified in a string constant (see gen_loot.aowl, gen_entity_type.aowl) and turns it into
+## src/util/loot_table.aowl's objects the first time a table is asked for, keeping the same fields and
+## dropping the same ones, so the two agree value for value.
+
+import std/[json, options, syncio]
+import gendecode
+import ../util/loot_table
+export loot_table
+
+type
+  LootTableRef* = ref LootTable
+    ## What the lazy lookups hand out, so a table is decoded and held once.
+
+# ---------------------------------------------------------------------------
+# Decoding: the serde shapes of pumpkin-codegen/src/loot.rs
+# ---------------------------------------------------------------------------
+
+proc lootBad(what, value: string) =
+  ## serde would have failed the upstream build on this asset.
+  genPanic("loot table: unknown " & what & " " & value)
+
+proc jf(v: JsonNode): float32 =
+  if v.kind == JInt: float32(v.getInt()) else: float32(v.getFloat())
+
+proc f32List(v: JsonNode): seq[float32] =
+  result = @[]
+  for x in v.items(): result.add(jf(x))
+
+proc stringList(v: JsonNode): seq[string] =
+  result = @[]
+  for x in v.items(): result.add(x.getStr())
+
+proc stringOrVec(v: JsonNode): seq[string] =
+  ## `StringOrVec`, flattened: one string is a one-element list.
+  if v.kind == JString: @[v.getStr()] else: stringList(v)
+
+proc firstOf(v: JsonNode): Option[string] =
+  ## `StringOrVec` read the way `to_tokens` does: `Some(s)`, or the first of a list if any.
+  let items = stringOrVec(v)
+  if items.len > 0: some(items[0]) else: none[string]()
+
+proc decodeNumberProvider(v: JsonNode): LootFunctionNumberProvider =
+  ## `LootFunctionNumberProviderStruct`: tagged by `type`, or an untagged bare number.
+  if v.kind != JObject:
+    return LootFunctionNumberProvider(kind: lfnConstant, value: jf(v))
+  var ty = ""
+  var a = 0.0'f32
+  var b = 0.0'f32
+  var n = 0.0'f32
+  var p = 0.0'f32
+  for k, x in v.pairs():
+    case k
+    of "type": ty = x.getStr()
+    of "min": a = jf(x)
+    of "max": b = jf(x)
+    of "n": n = jf(x)
+    of "p": p = jf(x)
+    else: discard
+  case ty
+  of "minecraft:uniform": LootFunctionNumberProvider(kind: lfnUniform, min: a, max: b)
+  of "minecraft:binomial": LootFunctionNumberProvider(kind: lfnBinomial, n: n, p: p)
+  else:
+    lootBad("number provider", ty)
+    LootFunctionNumberProvider(kind: lfnConstant, value: 0.0'f32)
+
+proc decodeRolls(v: JsonNode): LootNumberProviderTypes =
+  ## `LootNumberProviderTypes`: `Object(Uniform)` or `Constant`.
+  if v.kind != JObject:
+    return constantProvider(jf(v))
+  var a = 0.0'f32
+  var b = 0.0'f32
+  for k, x in v.pairs():
+    case k
+    of "type":
+      if x.getStr() != "minecraft:uniform": lootBad("rolls provider", x.getStr())
+    of "min": a = jf(x)
+    of "max": b = jf(x)
+    else: discard
+  uniformProvider(a, b)
+
+proc decodeRange(v: JsonNode): FloatRange =
+  ## `LootFunctionLimitCountStruct`.
+  var lo = none[float32]()
+  var hi = none[float32]()
+  for k, x in v.pairs():
+    case k
+    of "min": lo = some(jf(x))
+    of "max": hi = some(jf(x))
+    else: discard
+  (lo, hi)
+
+proc field(v: JsonNode; key: string): (bool, JsonNode) =
+  ## One object field, without std/json's `{}` trap on a missing key (compiler bug 6).
+  if v.kind == JObject:
+    for k, x in v.pairs():
+      if k == key: return (true, x)
+  (false, v)
+
+proc entityTypeOf(predicate: JsonNode): Option[string] =
+  ## `EntityPredicateStruct.entity_type` as `to_tokens` reads it.
+  let (has, node) = field(predicate, "minecraft:entity_type")
+  if has: firstOf(node) else: none[string]()
+
+proc mainhandTagOf(predicate: JsonNode): Option[string] =
+  ## equipment.mainhand.predicates."minecraft:enchantments"[0].enchantments, first of.
+  result = none[string]()
+  let (a, equipment) = field(predicate, "minecraft:equipment")
+  if not a: return
+  let (b, mainhand) = field(equipment, "mainhand")
+  if not b: return
+  let (c, predicates) = field(mainhand, "predicates")
+  if not c: return
+  let (d, enchantments) = field(predicates, "minecraft:enchantments")
+  if not d: return
+  for first in enchantments.items():
+    let (e, ench) = field(first, "enchantments")
+    if e: result = firstOf(ench)
+    return
+
+proc decodeCondition(v: JsonNode): LootCondition
+
+proc decodeConditions(v: JsonNode): seq[LootCondition] =
+  result = @[]
+  for x in v.items(): result.add(decodeCondition(x))
+
+proc sortPairs(p: var seq[(string, string)]) =
+  ## `BTreeMap<String, String>` order. Insertion sort: compiler bug 5 and small inputs.
+  var i = 1
+  while i < p.len:
+    let cur = p[i]
+    var j = i - 1
+    while j >= 0 and p[j][0] > cur[0]:
+      p[j + 1] = p[j]
+      dec j
+    p[j + 1] = cur
+    inc i
+
+proc decodeCondition(v: JsonNode): LootCondition =
+  let (hasName, nameNode) = field(v, "condition")
+  let tag = if hasName: nameNode.getStr() else: ""
+  case tag
+  of "minecraft:inverted":
+    let (_, term) = field(v, "term")
+    LootCondition(kind: lcInverted, inverted: @[decodeCondition(term)])
+  of "minecraft:any_of":
+    let (_, terms) = field(v, "terms")
+    LootCondition(kind: lcAnyOf, anyOf: decodeConditions(terms))
+  of "minecraft:all_of":
+    let (_, terms) = field(v, "terms")
+    LootCondition(kind: lcAllOf, allOf: decodeConditions(terms))
+  of "minecraft:random_chance":
+    let (_, chance) = field(v, "chance")
+    LootCondition(kind: lcRandomChance, chance: jf(chance))
+  of "minecraft:random_chance_with_enchanted_bonus":
+    let (_, ench) = field(v, "enchantment")
+    let (hasChances, chances) = field(v, "chances")
+    LootCondition(kind: lcRandomChanceWithEnchantedBonus, bonusEnchantment: ench.getStr(),
+      bonusChances: if hasChances: some(f32List(chances)) else: none[seq[float32]]())
+  of "minecraft:entity_properties":
+    let (hasEntity, entity) = field(v, "entity")
+    let (hasPredicate, predicate) = field(v, "predicate")
+    var expected = none[string]()
+    var onFire = none[bool]()
+    var mainhand = none[string]()
+    if hasPredicate:
+      expected = entityTypeOf(predicate)
+      let (hasFlags, flags) = field(predicate, "minecraft:flags")
+      if hasFlags:
+        let (hasFire, fire) = field(flags, "is_on_fire")
+        if hasFire: onFire = some(fire.getBool())
+      mainhand = mainhandTagOf(predicate)
+    LootCondition(kind: lcEntityProperties,
+      entity: if hasEntity: entity.getStr() else: "this",
+      expectedType: expected, isOnFire: onFire, mainhandEnchantmentTag: mainhand)
+  of "minecraft:killed_by_player":
+    LootCondition(kind: lcKilledByPlayer)
+  of "minecraft:entity_scores":
+    let (hasEntity, entity) = field(v, "entity")
+    LootCondition(kind: lcEntityScores, scoresEntity: if hasEntity: entity.getStr() else: "this")
+  of "minecraft:block_state_property":
+    let (_, blockName) = field(v, "block")
+    let (_, props) = field(v, "properties")
+    var pairList: seq[(string, string)] = @[]
+    for k, x in props.pairs():
+      pairList.add((k, x.getStr()))
+    sortPairs(pairList)
+    LootCondition(kind: lcBlockStateProperty, blockName: blockName.getStr(), properties: pairList)
+  of "minecraft:match_tool":
+    var items = none[seq[string]]()
+    let (hasPredicate, predicate) = field(v, "predicate")
+    if hasPredicate:
+      let (hasItems, itemNode) = field(predicate, "items")
+      if hasItems: items = some(stringOrVec(itemNode))
+    LootCondition(kind: lcMatchTool, items: items)
+  of "minecraft:table_bonus":
+    let (_, ench) = field(v, "enchantment")
+    let (_, chances) = field(v, "chances")
+    LootCondition(kind: lcTableBonus, enchantment: ench.getStr(), chances: f32List(chances))
+  of "minecraft:survives_explosion":
+    LootCondition(kind: lcSurvivesExplosion)
+  of "minecraft:damage_source_properties":
+    var src = none[string]()
+    var direct = none[string]()
+    let (hasPredicate, predicate) = field(v, "predicate")
+    if hasPredicate:
+      let (hasSource, source) = field(predicate, "source_entity")
+      if hasSource: src = entityTypeOf(source)
+      let (hasDirect, directNode) = field(predicate, "direct_entity")
+      if hasDirect: direct = entityTypeOf(directNode)
+    LootCondition(kind: lcDamageSourceProperties, expectedSourceType: src, expectedDirectType: direct)
+  of "minecraft:location_check":
+    var biome = none[string]()
+    let (hasPredicate, predicate) = field(v, "predicate")
+    if hasPredicate:
+      let (hasBiome, biomeNode) = field(predicate, "biome")
+      if hasBiome: biome = firstOf(biomeNode)
+    let (hasX, ox) = field(v, "offsetX")
+    let (hasY, oy) = field(v, "offsetY")
+    let (hasZ, oz) = field(v, "offsetZ")
+    LootCondition(kind: lcLocationCheck,
+      offsetX: if hasX: int32(ox.getInt()) else: 0'i32,
+      offsetY: if hasY: int32(oy.getInt()) else: 0'i32,
+      offsetZ: if hasZ: int32(oz.getInt()) else: 0'i32,
+      expectedBiome: biome)
+  of "minecraft:weather_check":
+    let (hasRain, rain) = field(v, "raining")
+    let (hasThunder, thunder) = field(v, "thundering")
+    LootCondition(kind: lcWeatherCheck,
+      raining: if hasRain: some(rain.getBool()) else: none[bool](),
+      thundering: if hasThunder: some(thunder.getBool()) else: none[bool]())
+  of "minecraft:reference":
+    let (_, refName) = field(v, "name")
+    LootCondition(kind: lcReference, name: refName.getStr())
+  of "minecraft:time_check":
+    let (_, rangeNode) = field(v, "value")
+    let (hasPeriod, period) = field(v, "period")
+    LootCondition(kind: lcTimeCheck, timeRange: decodeRange(rangeNode),
+      period: if hasPeriod: some(uint64(period.getInt())) else: none[uint64]())
+  of "minecraft:value_check":
+    let (_, value) = field(v, "value")
+    let (_, rangeNode) = field(v, "range")
+    LootCondition(kind: lcValueCheck, checkValue: decodeRolls(value), valueRange: decodeRange(rangeNode))
+  of "minecraft:enchantment_active_check":
+    let (_, active) = field(v, "active")
+    LootCondition(kind: lcEnchantmentActiveCheck, active: active.getBool())
+  else:
+    lootBad("condition", tag)
+    LootCondition(kind: lcKilledByPlayer)
+
+proc decodeFunctionContent(v: JsonNode): LootFunctionTypes =
+  let (_, nameNode) = field(v, "function")
+  let tag = nameNode.getStr()
+  case tag
+  of "minecraft:set_count":
+    let (_, count) = field(v, "count")
+    let (hasAdd, addNode) = field(v, "add")
+    LootFunctionTypes(kind: lftSetCount, setCount: decodeNumberProvider(count),
+      add: if hasAdd: addNode.getBool() else: false)
+  of "minecraft:enchanted_count_increase":
+    let (_, ench) = field(v, "enchantment")
+    let (_, count) = field(v, "count")
+    let (hasLimit, limitNode) = field(v, "limit")
+    LootFunctionTypes(kind: lftEnchantedCountIncrease, increaseEnchantment: ench.getStr(),
+      increaseCount: decodeNumberProvider(count),
+      limit: if hasLimit: some(jf(limitNode)) else: none[float32]())
+  of "minecraft:furnace_smelt":
+    LootFunctionTypes(kind: lftFurnaceSmelt)
+  of "minecraft:set_potion":
+    let (_, id) = field(v, "id")
+    LootFunctionTypes(kind: lftSetPotion, id: id.getStr())
+  of "minecraft:set_ominous_bottle_amplifier":
+    LootFunctionTypes(kind: lftSetOminousBottleAmplifier)
+  of "minecraft:limit_count":
+    let (_, limitNode) = field(v, "limit")
+    let r = decodeRange(limitNode)
+    LootFunctionTypes(kind: lftLimitCount, limitMin: r[0], limitMax: r[1])
+  of "minecraft:apply_bonus":
+    let (_, ench) = field(v, "enchantment")
+    let (_, formula) = field(v, "formula")
+    var params = none[LootFunctionBonusParameter]()
+    let (hasParams, paramNode) = field(v, "parameters")
+    if hasParams:
+      let (hasMultiplier, multiplier) = field(paramNode, "bonusMultiplier")
+      if hasMultiplier:
+        params = some(LootFunctionBonusParameter(kind: lfbMultiplier, bonusMultiplier: int32(multiplier.getInt())))
+      else:
+        let (_, extra) = field(paramNode, "extra")
+        let (_, probability) = field(paramNode, "probability")
+        params = some(LootFunctionBonusParameter(kind: lfbProbability, extra: int32(extra.getInt()), probability: jf(probability)))
+    LootFunctionTypes(kind: lftApplyBonus, bonusEnchantmentName: ench.getStr(), formula: formula.getStr(), parameters: params)
+  of "minecraft:copy_components":
+    let (_, source) = field(v, "source")
+    let (_, included) = field(v, "include")
+    LootFunctionTypes(kind: lftCopyComponents, source: source.getStr(), includes: stringList(included))
+  of "minecraft:copy_state":
+    let (_, blockName) = field(v, "block")
+    let (_, props) = field(v, "properties")
+    LootFunctionTypes(kind: lftCopyState, stateBlock: blockName.getStr(), stateProperties: stringList(props))
+  of "minecraft:explosion_decay":
+    LootFunctionTypes(kind: lftExplosionDecay)
+  else:
+    lootBad("function", tag)
+    LootFunctionTypes(kind: lftExplosionDecay)
+
+proc optConditions(v: JsonNode): Option[seq[LootCondition]] =
+  let (has, node) = field(v, "conditions")
+  if has: some(decodeConditions(node)) else: none[seq[LootCondition]]()
+
+proc decodeFunction(v: JsonNode): LootFunction =
+  LootFunction(content: decodeFunctionContent(v), conditions: optConditions(v))
+
+proc optFunctions(v: JsonNode): Option[seq[LootFunction]] =
+  let (has, node) = field(v, "functions")
+  if not has: return none[seq[LootFunction]]()
+  var list: seq[LootFunction] = @[]
+  for x in node.items(): list.add(decodeFunction(x))
+  some(list)
+
+proc decodeEntry(v: JsonNode): LootPoolEntry
+
+proc decodeChildren(v: JsonNode): seq[LootPoolEntry] =
+  result = @[]
+  let (has, node) = field(v, "children")
+  if has:
+    for x in node.items(): result.add(decodeEntry(x))
+
+proc decodeEntryContent(v: JsonNode): LootPoolEntryTypes =
+  let (_, tagNode) = field(v, "type")
+  let tag = tagNode.getStr()
+  case tag
+  of "minecraft:empty":
+    LootPoolEntryTypes(kind: lpeEmpty)
+  of "minecraft:item":
+    let (_, n) = field(v, "name")
+    LootPoolEntryTypes(kind: lpeItem, item: ItemEntry(name: n.getStr()))
+  of "minecraft:loot_table":
+    let (_, n) = field(v, "value")
+    LootPoolEntryTypes(kind: lpeLootTable, lootTable: LootTableEntry(value: n.getStr()))
+  of "minecraft:dynamic":
+    let (_, n) = field(v, "name")
+    LootPoolEntryTypes(kind: lpeDynamic, dynamic: DynamicEntry(name: n.getStr()))
+  of "minecraft:tag":
+    let (_, n) = field(v, "name")
+    let (hasExpand, expand) = field(v, "expand")
+    LootPoolEntryTypes(kind: lpeTag, tag: TagEntry(name: n.getStr(), expand: if hasExpand: expand.getBool() else: false))
+  of "minecraft:alternatives":
+    LootPoolEntryTypes(kind: lpeAlternatives, children: decodeChildren(v))
+  of "minecraft:sequence":
+    LootPoolEntryTypes(kind: lpeSequence, children: decodeChildren(v))
+  of "minecraft:group":
+    LootPoolEntryTypes(kind: lpeGroup, children: decodeChildren(v))
+  else:
+    lootBad("entry", tag)
+    LootPoolEntryTypes(kind: lpeEmpty)
+
+proc decodeEntry(v: JsonNode): LootPoolEntry =
+  let (hasWeight, weight) = field(v, "weight")
+  let (hasQuality, quality) = field(v, "quality")
+  LootPoolEntry(content: decodeEntryContent(v),
+    weight: if hasWeight: int32(weight.getInt()) else: 1'i32,
+    quality: if hasQuality: int32(quality.getInt()) else: 0'i32,
+    conditions: optConditions(v), functions: optFunctions(v))
+
+proc decodePool(v: JsonNode): LootPool =
+  var entries: seq[LootPoolEntry] = @[]
+  let (_, entryNode) = field(v, "entries")
+  for x in entryNode.items(): entries.add(decodeEntry(x))
+  let (_, rolls) = field(v, "rolls")
+  let (hasBonus, bonus) = field(v, "bonus_rolls")
+  LootPool(entries: entries, rolls: decodeRolls(rolls),
+    bonusRolls: if hasBonus: decodeRolls(bonus) else: constantProvider(0.0'f32),
+    conditions: optConditions(v), functions: optFunctions(v))
+
+proc decodeLootTable*(v: JsonNode): LootTable =
+  ## One `LootTableStruct` value.
+  result = LootTable(`type`: lttEmpty, randomSequence: none[string](), pools: none[seq[LootPool]]())
+  for k, x in v.pairs():
+    case k
+    of "type":
+      case x.getStr()
+      of "minecraft:empty": result.`type` = lttEmpty
+      of "minecraft:entity": result.`type` = lttEntity
+      of "minecraft:block": result.`type` = lttBlock
+      of "minecraft:chest": result.`type` = lttChest
+      else: lootBad("table type", x.getStr())
+    of "random_sequence": result.randomSequence = some(x.getStr())
+    of "pools":
+      var pools: seq[LootPool] = @[]
+      for p in x.items(): pools.add(decodePool(p))
+      result.pools = some(pools)
+    else: discard
+
+proc decodeLootTableText*(text: string): LootTableRef =
+  ## One minified `LootTableStruct`, as the generated modules carry them.
+  var tree = parseJson(text)
+  let r = root(tree)
+  let t = decodeLootTable(r)
+  LootTableRef(`type`: t.`type`, randomSequence: t.randomSequence, pools: t.pools)

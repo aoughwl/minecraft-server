@@ -1,0 +1,404 @@
+## Port of pumpkin-codegen/src/chunk_gen_settings.rs (chunk_gen_settings.rs)
+##
+## Reads `assets/chunk_gen_settings.json` and writes src/generated/chunk_gen_settings.aowl. Surface
+## rules are nested upstream; here they live in per-settings arenas, indexed, since a
+## self-recursive ref in a case object does not compile (COMPILER-BUGS.md bug 4).
+##
+## A block state is upstream's `crate::Block::X.default_state` as its `BlockStateId`, read from the
+## `default_state_id` in assets/blocks.json: 26.2's ids, the same space as upstream's
+## and block_properties.aowl's. A rule's `Properties` are ignored, as upstream's "TODO: use props"
+## ignores them. A biome is its id, and a noise its `NoiseParameters` index.
+
+import std/[json, strutils, syncio]
+import codegenutil, worldgenutil
+
+const OutPath = "src/generated/chunk_gen_settings.aowl"
+
+proc die(msg: string) =
+  echo "gen_chunk_gen_settings: " & msg
+  quit(1)
+
+type
+  Lookups = ref object
+    blockNames: seq[string]
+    blockDefaults: seq[int]
+    biomeNames: seq[string]
+    biomeIds: seq[int]
+    noiseNames: seq[string]
+
+  Arena = ref object
+    rules: seq[string]
+    conditions: seq[string]
+
+proc stateOf(t: Lookups; v: JsonNode): int =
+  let name = stripMc(strAt(v, "Name"))
+  var i = 0
+  while i < t.blockNames.len:
+    if t.blockNames[i] == name:
+      return t.blockDefaults[i]
+    inc i
+  die("unknown block " & name)
+  0
+
+proc yOffsetText(v: JsonNode): string =
+  ## `YOffsetStruct` is untagged: first match wins.
+  let (hasAbs, abs) = fieldOf(v, "absolute")
+  if hasAbs: return "a" & $getInt(abs)
+  let (hasAb, ab) = fieldOf(v, "above_bottom")
+  if hasAb: return "b" & $getInt(ab)
+  let (hasBt, bt) = fieldOf(v, "below_top")
+  if hasBt: return "t" & $getInt(bt)
+  die("bad y offset")
+  ""
+
+proc reqField(v: JsonNode; key: string): JsonNode =
+  let (ok, n) = fieldOf(v, key)
+  if not ok:
+    die("missing field " & key)
+  n
+
+proc flag(b: bool): string =
+  if b: "1" else: "0"
+
+proc addCondition(t: Lookups; a: Arena; v: JsonNode): int =
+  ## Children first, so an index in a row always refers to an earlier row.
+  var row = ""
+  case strAt(v, "type")
+  of "minecraft:biome":
+    let isNode = reqField(v, "biome_is")
+    var names: seq[string] = @[]
+    if kind(isNode) == JString:
+      names.add(getStr(isNode))
+    else:
+      for b in items(isNode):
+        names.add(getStr(b))
+    row = "b|"
+    var i = 0
+    while i < names.len:
+      let bare = stripMc(names[i])
+      var found = -1
+      var j = 0
+      while j < t.biomeNames.len:
+        if t.biomeNames[j] == bare:
+          found = t.biomeIds[j]
+          break
+        inc j
+      if found < 0:
+        die("unknown biome " & bare)
+      if i > 0: row.add(",")
+      row.add($found)
+      inc i
+  of "minecraft:noise_threshold":
+    let noise = stripMc(strAt(v, "noise")).replace("/", "_")
+    var found = -1
+    var j = 0
+    while j < t.noiseNames.len:
+      if t.noiseNames[j] == noise:
+        found = j
+        break
+      inc j
+    if found < 0:
+      die("unknown noise " & noise)
+    row = "n|" & $found & "|" & hexBits64(numAt(v, "min_threshold")) & "|" & hexBits64(numAt(v, "max_threshold"))
+  of "minecraft:vertical_gradient":
+    let (lo, hi) = md5LoHi(strAt(v, "random_name"))
+    row = "v|" & hexBits64(cast[float64](lo)) & "|" & hexBits64(cast[float64](hi)) & "|" &
+      yOffsetText(reqField(v, "true_at_and_below")) & "|" & yOffsetText(reqField(v, "false_at_and_above"))
+  of "minecraft:y_above":
+    row = "y|" & yOffsetText(reqField(v, "anchor")) & "|" & $intAt(v, "surface_depth_multiplier") & "|" &
+      flag(boolAt(v, "add_stone_depth"))
+  of "minecraft:water":
+    row = "w|" & $intAt(v, "offset") & "|" & $intAt(v, "surface_depth_multiplier") & "|" &
+      flag(boolAt(v, "add_stone_depth"))
+  of "minecraft:temperature":
+    row = "T"
+  of "minecraft:steep":
+    row = "s"
+  of "minecraft:not":
+    row = "N|" & $addCondition(t, a, reqField(v, "invert"))
+  of "minecraft:hole":
+    row = "h"
+  of "minecraft:above_preliminary_surface":
+    row = "p"
+  of "minecraft:stone_depth":
+    let surfaceType = strAt(v, "surface_type")
+    if surfaceType != "ceiling" and surfaceType != "floor":
+      die("Unknown surface type " & surfaceType)
+    row = "d|" & $intAt(v, "offset") & "|" & flag(boolAt(v, "add_surface_depth")) & "|" &
+      $intAt(v, "secondary_depth_range") & "|" & (if surfaceType == "ceiling": "c" else: "f")
+  else:
+    die("unknown condition " & strAt(v, "type"))
+  a.conditions.add(row)
+  a.conditions.len - 1
+
+proc addRule(t: Lookups; a: Arena; v: JsonNode): int =
+  var row = ""
+  case strAt(v, "type")
+  of "minecraft:block":
+    row = "B|" & $stateOf(t, reqField(v, "result_state"))
+  of "minecraft:sequence":
+    row = "S|"
+    var i = 0
+    for r in items(reqField(v, "sequence")):
+      let child = addRule(t, a, r)
+      if i > 0: row.add(",")
+      row.add($child)
+      inc i
+  of "minecraft:condition":
+    let cond = addCondition(t, a, reqField(v, "if_true"))
+    let then = addRule(t, a, reqField(v, "then_run"))
+    row = "C|" & $cond & "|" & $then
+  of "minecraft:bandlands":
+    row = "D"
+  else:
+    die("unknown rule " & strAt(v, "type"))
+  a.rules.add(row)
+  a.rules.len - 1
+
+proc joinLines(rows: seq[string]): string =
+  result = ""
+  var i = 0
+  while i < rows.len:
+    result.add(rows[i] & "\n")
+    inc i
+
+const Types = """
+import gendecode
+import ../data/block_state
+import ../util/y_offset
+import ../util/vertical_surface_type
+import dimension
+export block_state, y_offset, vertical_surface_type
+
+type
+  GenerationShapeConfig* = object
+    minY*: int8
+    height*: uint16
+    sizeHorizontal*: uint8
+    sizeVertical*: uint8
+
+  MaterialRuleKind* = enum
+    mrBlock, mrSequence, mrCondition, mrBadlands
+
+  MaterialRule* = object
+    kind*: MaterialRuleKind
+    resultState*: BlockStateId  ## mrBlock.
+    sequence*: seq[int32]       ## mrSequence: indices into `surfaceRules`.
+    ifTrue*: int32              ## mrCondition: index into `surfaceConditions`.
+    thenRun*: int32             ## mrCondition: index into `surfaceRules`.
+
+  MaterialConditionKind* = enum
+    mcBiome, mcNoiseThreshold, mcVerticalGradient, mcYAbove, mcWater, mcTemperature, mcSteep, mcNot,
+    mcHole, mcAbovePreliminarySurface, mcStoneDepth
+
+  MaterialCondition* = object
+    kind*: MaterialConditionKind
+    biomeIs*: seq[uint8]            ## mcBiome: biome ids.
+    noise*: int32                   ## mcNoiseThreshold: index into noise_parameter's `NoiseParameters`.
+    minThreshold*: float64          ## mcNoiseThreshold.
+    maxThreshold*: float64          ## mcNoiseThreshold.
+    randomLo*: uint64               ## mcVerticalGradient.
+    randomHi*: uint64               ## mcVerticalGradient.
+    trueAtAndBelow*: YOffset        ## mcVerticalGradient.
+    falseAtAndAbove*: YOffset       ## mcVerticalGradient.
+    anchor*: YOffset                ## mcYAbove.
+    surfaceDepthMultiplier*: int32  ## mcYAbove, mcWater.
+    addStoneDepth*: bool            ## mcYAbove, mcWater.
+    offset*: int32                  ## mcWater, mcStoneDepth.
+    invert*: int32                  ## mcNot: index into `surfaceConditions`.
+    addSurfaceDepth*: bool          ## mcStoneDepth.
+    secondaryDepthRange*: int32     ## mcStoneDepth.
+    surfaceType*: VerticalSurfaceType  ## mcStoneDepth.
+
+  GenerationSettings* = ref object
+    aquifersEnabled*: bool
+    oreVeinsEnabled*: bool
+    legacyRandomSource*: bool
+    seaLevel*: int32
+    defaultFluid*: BlockStateId
+    shape*: GenerationShapeConfig
+    surfaceRule*: int32  ## The root: an index into `surfaceRules`.
+    surfaceRules*: seq[MaterialRule]
+    surfaceConditions*: seq[MaterialCondition]
+    defaultBlock*: BlockStateId
+
+proc verticalCellBlockCount*(self: GenerationShapeConfig): uint8 {.inline.} =
+  self.sizeVertical shl 2
+
+proc horizontalCellBlockCount*(self: GenerationShapeConfig): uint8 {.inline.} =
+  self.sizeHorizontal shl 2
+
+proc maxY*(self: GenerationShapeConfig): uint16 =
+  if self.minY >= 0'i8:
+    self.height + uint16(self.minY)
+  else:
+    uint16(int32(self.height) + int32(self.minY))
+
+proc unsignedAbs(v: int8): uint16 {.inline.} =
+  uint16(if v < 0'i8: -int32(v) else: int32(v))
+
+proc trimHeight*(self: GenerationShapeConfig; bottomY: int8; topY: uint16): GenerationShapeConfig =
+  let newMin = max(self.minY, bottomY)
+  let thisTop = if self.minY >= 0'i8: self.height + uint16(self.minY)
+                else: self.height - unsignedAbs(self.minY)
+  let newTop = min(thisTop, topY)
+  let newHeight = if newMin >= 0'i8: newTop - uint16(newMin)
+                  else: newTop + unsignedAbs(newMin)
+  GenerationShapeConfig(minY: newMin, height: newHeight, sizeHorizontal: self.sizeHorizontal,
+    sizeVertical: self.sizeVertical)
+
+proc readYOffset(s: string; pos: var int): YOffset =
+  let tag = s[pos]
+  inc pos
+  let v = fieldInt(s, pos, '|')
+  case tag
+  of 'a': YOffset(kind: yokAbsolute, absolute: int16(v))
+  of 'b': YOffset(kind: yokAboveBottom, aboveBottom: int8(v))
+  else: YOffset(kind: yokBelowTop, belowTop: int8(v))
+
+proc decodeRules(s: string): seq[MaterialRule] =
+  result = @[]
+  var pos = 0
+  while pos < s.len:
+    let tag = s[pos]
+    inc pos
+    if pos < s.len and s[pos] == '|': inc pos
+    case tag
+    of 'B':
+      result.add(MaterialRule(kind: mrBlock,
+        resultState: newBlockStateIdUnchecked(uint16(fieldInt(s, pos, '|')))))
+    of 'S':
+      var children: seq[int32] = @[]
+      while pos < s.len and s[pos] != '\n':
+        children.add(int32(fieldInt(s, pos, ',')))
+        if s[pos] == ',': inc pos
+      result.add(MaterialRule(kind: mrSequence, sequence: children))
+    of 'C':
+      let cond = int32(fieldInt(s, pos, '|')); skipSep(s, pos)
+      let then = int32(fieldInt(s, pos, '|'))
+      result.add(MaterialRule(kind: mrCondition, ifTrue: cond, thenRun: then))
+    else:
+      result.add(MaterialRule(kind: mrBadlands))
+    skipSep(s, pos)
+
+proc decodeConditions(s: string): seq[MaterialCondition] =
+  result = @[]
+  var pos = 0
+  while pos < s.len:
+    let tag = s[pos]
+    inc pos
+    if pos < s.len and s[pos] == '|': inc pos
+    var c = MaterialCondition()
+    case tag
+    of 'b':
+      c.kind = mcBiome
+      c.biomeIs = @[]
+      while pos < s.len and s[pos] != '\n':
+        c.biomeIs.add(uint8(fieldInt(s, pos, ',')))
+        if s[pos] == ',': inc pos
+    of 'n':
+      c.kind = mcNoiseThreshold
+      c.noise = int32(fieldInt(s, pos, '|')); skipSep(s, pos)
+      c.minThreshold = fieldF64Bits(s, pos, '|'); skipSep(s, pos)
+      c.maxThreshold = fieldF64Bits(s, pos, '|')
+    of 'v':
+      c.kind = mcVerticalGradient
+      c.randomLo = fieldHexU64(s, pos, '|'); skipSep(s, pos)
+      c.randomHi = fieldHexU64(s, pos, '|'); skipSep(s, pos)
+      c.trueAtAndBelow = readYOffset(s, pos); skipSep(s, pos)
+      c.falseAtAndAbove = readYOffset(s, pos)
+    of 'y':
+      c.kind = mcYAbove
+      c.anchor = readYOffset(s, pos); skipSep(s, pos)
+      c.surfaceDepthMultiplier = int32(fieldInt(s, pos, '|')); skipSep(s, pos)
+      c.addStoneDepth = s[pos] == '1'
+      inc pos
+    of 'w':
+      c.kind = mcWater
+      c.offset = int32(fieldInt(s, pos, '|')); skipSep(s, pos)
+      c.surfaceDepthMultiplier = int32(fieldInt(s, pos, '|')); skipSep(s, pos)
+      c.addStoneDepth = s[pos] == '1'
+      inc pos
+    of 'T': c.kind = mcTemperature
+    of 's': c.kind = mcSteep
+    of 'N':
+      c.kind = mcNot
+      c.invert = int32(fieldInt(s, pos, '|'))
+    of 'h': c.kind = mcHole
+    of 'p': c.kind = mcAbovePreliminarySurface
+    else:
+      c.kind = mcStoneDepth
+      c.offset = int32(fieldInt(s, pos, '|')); skipSep(s, pos)
+      c.addSurfaceDepth = s[pos] == '1'
+      pos += 2
+      c.secondaryDepthRange = int32(fieldInt(s, pos, '|')); skipSep(s, pos)
+      c.surfaceType = if s[pos] == 'c': vstCeiling else: vstFloor
+      inc pos
+    result.add(c)
+    skipSep(s, pos)
+
+"""
+
+proc main() =
+  let settingsText = readAsset("chunk_gen_settings.json")
+  var settingsTree = parseJson(settingsText)
+  let settings = sortedPairs(root(settingsTree))
+
+  let blocksText = readAsset("blocks.json")
+  var blocksTree = parseJson(blocksText)
+  let (_, blockList) = fieldOf(root(blocksTree), "blocks")
+  let biomeText = readAsset("biome.json")
+  var biomeTree = parseJson(biomeText)
+  let biomes = sortedPairs(root(biomeTree))
+  let noiseText = readAsset("noise_parameters.json")
+  var noiseTree = parseJson(noiseText)
+  let noises = sortedPairs(root(noiseTree))
+
+  let t = Lookups(blockNames: @[], blockDefaults: @[], biomeNames: @[], biomeIds: @[], noiseNames: @[])
+  for b in items(blockList):
+    t.blockNames.add(strAt(b, "name"))
+    t.blockDefaults.add(intAt(b, "default_state_id"))
+  var i = 0
+  while i < biomes.len:
+    t.biomeNames.add(biomes[i][0])
+    t.biomeIds.add(intAt(biomes[i][1], "id"))
+    inc i
+  i = 0
+  while i < noises.len:
+    t.noiseNames.add(stripMc(noises[i][0]).replace("/", "_"))
+    inc i
+
+  var s = "## GENERATED by src/data_codegen/gen_chunk_gen_settings.aowl - do not edit by hand.\n"
+  s.add("## Port of pumpkin-data/src/generated/chunk_gen_settings.rs in compact form: see the generator.\n\n")
+  s.add(Types)
+
+  i = 0
+  while i < settings.len:
+    let v = settings[i][1]
+    let shape = reqField(v, "noise")
+    let a = Arena(rules: @[], conditions: @[])
+    let rootRule = addRule(t, a, reqField(v, "surface_rule"))
+    s.add("let " & shouty(settings[i][0]) & "* = GenerationSettings(\n")
+    s.add("  aquifersEnabled: " & boolLit(boolAt(v, "aquifers_enabled")) & ",\n")
+    s.add("  oreVeinsEnabled: " & boolLit(boolAt(v, "ore_veins_enabled")) & ",\n")
+    s.add("  legacyRandomSource: " & boolLit(boolAt(v, "legacy_random_source")) & ",\n")
+    s.add("  seaLevel: " & $intAt(v, "sea_level") & "'i32,\n")
+    s.add("  defaultFluid: newBlockStateIdUnchecked(" & $stateOf(t, reqField(v, "default_fluid")) & "'u16),\n")
+    s.add("  shape: GenerationShapeConfig(minY: " & $intAt(shape, "min_y") & "'i8, height: " &
+      $intAt(shape, "height") & "'u16, sizeHorizontal: " & $intAt(shape, "size_horizontal") &
+      "'u8, sizeVertical: " & $intAt(shape, "size_vertical") & "'u8),\n")
+    s.add("  surfaceRule: " & $rootRule & "'i32,\n")
+    s.add("  surfaceRules: decodeRules(" & aowlStr(joinLines(a.rules)) & "),\n")
+    s.add("  surfaceConditions: decodeConditions(" & aowlStr(joinLines(a.conditions)) & "),\n")
+    s.add("  defaultBlock: newBlockStateIdUnchecked(" & $stateOf(t, reqField(v, "default_block")) & "'u16),\n")
+    s.add(")\n\n")
+    inc i
+
+  s.add("proc fromDimension*(dim: Dimension): GenerationSettings =\n")
+  s.add("  ## `GenerationSettings::from_dimension`.\n")
+  s.add("  if dim == dimension.OVERWORLD:\n    OVERWORLD\n")
+  s.add("  elif dim == dimension.THE_NETHER:\n    NETHER\n")
+  s.add("  else:\n    END\n")
+  writeGenerated(OutPath, s)
+
+main()

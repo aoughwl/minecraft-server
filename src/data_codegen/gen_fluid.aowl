@@ -1,0 +1,416 @@
+## Port of pumpkin-codegen/src/fluid.rs (fluid.rs)
+##
+## assets/fluids.json into src/generated/fluid.aowl. Five fluids, so plain literals. The block state ids
+## are 26.2's, as is everything in blocks.json; upstream sends them to older clients through
+## block_state_remap. Run from the repo root.
+##
+## `dyn FluidProperties` becomes `FluidPropertiesRef`, a ref of closures (PORTING.md). Per-property
+## enums and per-group structs are generated from the asset, with upstream's derived names.
+
+import std/[json, strutils, syncio]
+import codegenutil
+
+const OutPath = "src/generated/fluid.aowl"
+
+type
+  StateRow = object
+    height: float32
+    level: int
+    isEmpty: bool
+    blastResistance: float32
+    blockStateId: int
+    isStill: bool
+
+  PropertyRow = object
+    name: string
+    values: seq[string]
+
+  FluidRow = object
+    name: string
+    id: int
+    properties: seq[PropertyRow]
+    defaultStateIndex: int
+    states: seq[StateRow]
+    flowSpeed: int
+    flowDistance: int
+    canConvertToSource: bool
+
+  Group = object
+    key: string              ## The sorted property names, upstream's map key.
+    mappings: seq[PropertyRow]
+    fluidNames: seq[string]
+
+proc fl(v: JsonNode): float32 =
+  if v.kind == JInt: float32(v.getInt()) else: float32(v.getFloat())
+
+proc readFluids(): seq[FluidRow] =
+  var tree = parseJson(readAsset("fluids.json"))
+  let r = root(tree)
+  result = @[]
+  for f in r.items():
+    var row = FluidRow(name: "", id: 0, properties: @[], defaultStateIndex: 0, states: @[],
+      flowSpeed: 5, flowDistance: 4, canConvertToSource: false)
+    for k, v in f.pairs():
+      case k
+      of "name": row.name = v.getStr()
+      of "id": row.id = int(v.getInt())
+      of "default_state_index": row.defaultStateIndex = int(v.getInt())
+      of "flow_speed": row.flowSpeed = int(v.getInt())
+      of "flow_distance": row.flowDistance = int(v.getInt())
+      of "can_convert_to_source": row.canConvertToSource = v.getBool()
+      of "properties":
+        for p in v.items():
+          var prop = PropertyRow(name: "", values: @[])
+          for pk, pv in p.pairs():
+            if pk == "name": prop.name = pv.getStr()
+            elif pk == "values":
+              for x in pv.items(): prop.values.add(x.getStr())
+          row.properties.add(prop)
+      of "states":
+        for s in v.items():
+          var st = StateRow(height: 0.0'f32, level: 0, isEmpty: false, blastResistance: 0.0'f32, blockStateId: 0, isStill: false)
+          for sk, sv in s.pairs():
+            case sk
+            of "height": st.height = fl(sv)
+            of "level": st.level = int(sv.getInt())
+            of "is_empty": st.isEmpty = sv.getBool()
+            of "blast_resistance": st.blastResistance = fl(sv)
+            of "block_state_id": st.blockStateId = int(sv.getInt())
+            of "is_still": st.isStill = sv.getBool()
+            else: discard
+          row.states.add(st)
+      else: discard
+    result.add(row)
+
+proc f32Text(x: float32): string = $float(x) & "'f32"
+
+proc stateFields(s: StateRow): string =
+  "height: " & f32Text(s.height) & ", level: " & $s.level & "'i16, isEmpty: " & $s.isEmpty &
+    ", blastResistance: " & f32Text(s.blastResistance) & ", blockStateId: BlockStateId(" & $s.blockStateId &
+    "'u16), isStill: " & $s.isStill & ", isSource: " & $s.isStill & ", falling: false"
+
+proc variantIdent(value: string): string =
+  var numeric = value.len > 0
+  for ch in value:
+    if not isAsciiDigit(ch): numeric = false
+  if numeric: "L" & value else: toPascalCase(value)
+
+proc emitEnum(p: PropertyRow; o: var string) =
+  let name = toPascalCase(p.name)
+  o.add("type " & name & "* {.pure.} = enum\n  ")
+  for i, v in p.values:
+    if i > 0: o.add(", ")
+    o.add(variantIdent(v))
+  o.add("\n\n")
+  o.add("proc variantCount*(T: typedesc[" & name & "]): uint16 = " & $p.values.len & "'u16\n")
+  o.add("proc toIndex*(self: " & name & "): uint16 = uint16(ord(self))\n")
+  o.add("proc fromIndex*(T: typedesc[" & name & "]; index: uint16): " & name & " =\n  case index\n")
+  for i, v in p.values:
+    o.add("  of " & $i & "'u16: " & name & "." & variantIdent(v) & "\n")
+  o.add("  else:\n    genPanic(\"Invalid index: \" & $index)\n    " & name & "." & variantIdent(p.values[0]) & "\n")
+  o.add("proc toValue*(self: " & name & "): string =\n  case self\n")
+  for v in p.values:
+    o.add("  of " & name & "." & variantIdent(v) & ": " & aowlStr(v) & "\n")
+  o.add("proc fromValue*(T: typedesc[" & name & "]; value: string): " & name & " =\n  case value\n")
+  for v in p.values:
+    o.add("  of " & aowlStr(v) & ": " & name & "." & variantIdent(v) & "\n")
+  o.add("  else:\n    genPanic(\"Invalid value: \" & value)\n    " & name & "." & variantIdent(p.values[0]) & "\n\n")
+
+proc emitGroup(g: Group; o: var string) =
+  let structName = toPascalCase(g.fluidNames[0] & "_like_fluid_properties")
+  var names = "@["
+  for i, n in g.fluidNames:
+    if i > 0: names.add(", ")
+    names.add(aowlStr(n))
+  names.add("]")
+  let check = "  if fluid.name notin " & names & ":\n    genPanic(fluid.name & \" is not a valid fluid for " & structName & "\")\n"
+  o.add("type " & structName & "* = object\n")
+  for m in g.mappings:
+    o.add("  " & toLowerCamel(m.name) & "*: " & toPascalCase(m.name) & "\n")
+  o.add("\n")
+  o.add("proc toIndex*(self: " & structName & "): uint16 =\n  var index = 0'u16\n  var multiplier = 1'u16\n")
+  var i = g.mappings.len - 1
+  while i >= 0:
+    let m = g.mappings[i]
+    o.add("  index += self." & toLowerCamel(m.name) & ".toIndex() * multiplier\n")
+    o.add("  multiplier *= " & toPascalCase(m.name) & ".variantCount()\n")
+    dec i
+  o.add("  discard multiplier\n  index\n\n")
+  o.add("proc fromIndex*(T: typedesc[" & structName & "]; index: uint16): " & structName & " =\n  var rest = index\n")
+  i = g.mappings.len - 1
+  while i >= 0:
+    let m = g.mappings[i]
+    let ty = toPascalCase(m.name)
+    let field = toLowerCamel(m.name)
+    o.add("  let " & field & "Index = rest mod " & ty & ".variantCount()\n")
+    o.add("  rest = rest div " & ty & ".variantCount()\n")
+    dec i
+  o.add("  discard rest\n  " & structName & "(")
+  for j, m in g.mappings:
+    if j > 0: o.add(", ")
+    let field = toLowerCamel(m.name)
+    o.add(field & ": " & toPascalCase(m.name) & ".fromIndex(" & field & "Index)")
+  o.add(")\n\n")
+  o.add("proc toStateId*(self: " & structName & "; fluid: Fluid): BlockStateId =\n" & check)
+  o.add("  let propIndex = self.toIndex()\n  if propIndex < uint16(fluid.states.len):\n    fluid.states[int(propIndex)].blockStateId\n  else:\n    fluid.states[int(fluid.defaultStateIndex)].blockStateId\n\n")
+  o.add("proc fromStateId*(T: typedesc[" & structName & "]; id: BlockStateId; fluid: Fluid): " & structName & " =\n" & check)
+  o.add("  for idx, state in fluid.states:\n    if state.blockStateId == id:\n      return " & structName & ".fromIndex(uint16(idx))\n")
+  o.add("  " & structName & ".fromIndex(fluid.defaultStateIndex)\n\n")
+  o.add("proc default*(T: typedesc[" & structName & "]; fluid: Fluid): " & structName & " =\n" & check)
+  o.add("  " & structName & ".fromIndex(fluid.defaultStateIndex)\n\n")
+  o.add("proc toProps*(self: " & structName & "): seq[(string, string)] =\n  @[")
+  for j, m in g.mappings:
+    if j > 0: o.add(", ")
+    o.add("(" & aowlStr(m.name) & ", self." & toLowerCamel(m.name) & ".toValue())")
+  o.add("]\n\n")
+  o.add("proc fromProps*(T: typedesc[" & structName & "]; props: seq[(string, string)]; fluid: Fluid): " & structName & " =\n" & check)
+  o.add("  result = " & structName & ".default(fluid)\n  for i in 0 ..< props.len:\n    let key = props[i][0]\n    let value = props[i][1]\n    case key\n")
+  for m in g.mappings:
+    o.add("    of " & aowlStr(m.name) & ": result." & toLowerCamel(m.name) & " = " & toPascalCase(m.name) & ".fromValue(value)\n")
+  o.add("    else: genPanic(\"Invalid key: \" & key)\n\n")
+  o.add("proc boxed(self: " & structName & "): FluidPropertiesRef =\n  let s = self\n  FluidPropertiesRef(\n")
+  o.add("    toIndex: proc(): uint16 {.closure.} = s.toIndex(),\n")
+  o.add("    toStateId: proc(fluid: Fluid): BlockStateId {.closure.} = s.toStateId(fluid),\n")
+  o.add("    toProps: proc(): seq[(string, string)] {.closure.} = s.toProps())\n\n")
+
+proc main() =
+  let fluids = readFluids()
+  var o = "## Generated by src/data_codegen/gen_fluid.aowl from assets/fluids.json. Do not edit.\n"
+  o.add("## Block state ids are 26.2's, as upstream's are.\n\n")
+  o.add("import std/[hashes, options]\nimport gendecode\nimport ../data/block_state\nexport block_state.BlockStateId\n\n")
+  o.add("""type
+  PartialFluidState* = object
+    height*: float32
+    level*: int16
+    isEmpty*: bool
+    blastResistance*: float32
+    blockStateId*: BlockStateId
+    isStill*: bool
+    isSource*: bool
+    falling*: bool
+
+  FluidState* = object
+    height*: float32
+    level*: int16
+    isEmpty*: bool
+    blastResistance*: float32
+    blockStateId*: BlockStateId
+    isStill*: bool
+    isSource*: bool
+    falling*: bool
+
+  FluidStateRef* = object
+    id*: uint16
+    stateIdx*: uint16
+
+  FluidProperty* = object
+    name*: string
+    values*: seq[string]
+
+  Fluid* = object
+    id*: uint16
+    name*: string
+    properties*: Option[seq[FluidProperty]]
+    states*: seq[FluidState]
+    defaultStateIndex*: uint16
+    flowSpeed*: uint32
+    flowDistance*: uint32
+    canConvertToSource*: bool
+
+  FluidPropertiesRef* = ref object
+    ## `Box<dyn FluidProperties>`, for the methods callable on the trait object.
+    toIndex*: proc(): uint16 {.closure.}
+    toStateId*: proc(fluid: Fluid): BlockStateId {.closure.}
+    toProps*: proc(): seq[(string, string)] {.closure.}
+
+const
+  FLUID_LEVEL_SOURCE* = 0'i32
+  FLUID_LEVEL_FLOWING_MAX* = 8'i32
+  FLUID_MIN_HEIGHT* = 0.0'f32
+  FLUID_MAX_HEIGHT* = 1.0'f32
+
+proc `==`*(a, b: Fluid): bool = a.id == b.id
+proc hash*(a: Fluid): Hash = hash(a.id)
+proc registryKey*(self: Fluid): string = self.name
+proc registryId*(self: Fluid): uint16 = self.id
+proc toResourceLocation*(self: Fluid): string = "minecraft:" & self.name
+
+""")
+  # FLUID_STATES: the deduplicated partial states, first-seen order, ignoring the block state id.
+  var unique: seq[StateRow] = @[]
+  for f in fluids:
+    for st in f.states:
+      var exists = false
+      for u in unique:
+        if u.height == st.height and u.level == st.level and u.isEmpty == st.isEmpty and
+            u.blastResistance == st.blastResistance and u.isStill == st.isStill:
+          exists = true
+          break
+      if not exists: unique.add(st)
+  o.add("let FLUID_STATES*: seq[PartialFluidState] = @[\n")
+  for u in unique:
+    o.add("  PartialFluidState(" & stateFields(u) & "),\n")
+  o.add("]\n\nproc getState*(self: FluidStateRef): FluidState =\n  let p = FLUID_STATES[int(self.stateIdx)]\n")
+  o.add("  FluidState(height: p.height, level: p.level, isEmpty: p.isEmpty, blastResistance: p.blastResistance,\n")
+  o.add("    blockStateId: p.blockStateId, isStill: p.isStill, isSource: p.isSource, falling: p.falling)\n\n")
+
+  o.add("let gFluids*: seq[Fluid] = @[\n")
+  var accessors = ""
+  var nameArms = ""
+  var idArms = ""
+  var identArms = ""
+  for i, f in fluids:
+    var props = "none[seq[FluidProperty]]()"
+    if f.properties.len > 0:
+      props = "some(@["
+      for j, p in f.properties:
+        if j > 0: props.add(", ")
+        props.add("FluidProperty(name: " & aowlStr(p.name) & ", values: @[")
+        for k, v in p.values:
+          if k > 0: props.add(", ")
+          props.add(aowlStr(v))
+        props.add("])")
+      props.add("])")
+    var stateText = ""
+    for j, st in f.states:
+      if j > 0: stateText.add(",\n      ")
+      stateText.add("FluidState(" & stateFields(st) & ")")
+    o.add("  Fluid(id: " & $f.id & "'u16, name: " & aowlStr(f.name) & ", properties: " & props &
+      ",\n    states: @[" & stateText & "],\n    defaultStateIndex: " & $f.defaultStateIndex & "'u16, flowSpeed: " &
+      $f.flowSpeed & "'u32, flowDistance: " & $f.flowDistance & "'u32, canConvertToSource: " & $f.canConvertToSource & "),\n")
+    accessors.add("template " & toShoutySnakeCase(f.name) & "*(T: typedesc[Fluid]): Fluid = gFluids[" & $i & "]\n")
+    nameArms.add("  of " & aowlStr(f.name) & ": some(gFluids[" & $i & "])\n")
+    idArms.add("  of " & $f.id & "'u16: some(gFluids[" & $i & "])\n")
+    identArms.add("  of " & aowlStr(f.name) & ": some(" & $f.id & "'u8)\n")
+  o.add("]\n\n" & accessors & "\n")
+
+  # Narrower ranges first, stably, so a still fluid matches before its flowing variant.
+  var arms: seq[(int, int, int)] = @[]
+  for i, f in fluids:
+    var lo = f.states[0].blockStateId
+    var hi = lo
+    for st in f.states:
+      if st.blockStateId < lo: lo = st.blockStateId
+      if st.blockStateId > hi: hi = st.blockStateId
+    arms.add((lo, hi, i))
+  var a = 1
+  while a < arms.len:
+    var b = a
+    while b > 0 and arms[b - 1][1] - arms[b - 1][0] > arms[b][1] - arms[b][0]:
+      let lower = arms[b]
+      let upper = arms[b - 1]
+      arms[b - 1] = lower
+      arms[b] = upper
+      dec b
+    inc a
+
+  o.add("proc fromRegistryKey*(T: typedesc[Fluid]; name: string): Option[Fluid] =\n  case name\n" & nameArms & "  else: none[Fluid]()\n\n")
+  o.add("proc fromId*(T: typedesc[Fluid]; id: uint16): Option[Fluid] =\n  case id\n" & idArms & "  else: none[Fluid]()\n\n")
+  o.add("proc fromStateId*(T: typedesc[Fluid]; id: BlockStateId): Option[Fluid] =\n  let raw = uint16(id)\n")
+  for arm in arms:
+    o.add("  if raw >= " & $arm[0] & "'u16 and raw <= " & $arm[1] & "'u16: return some(gFluids[" & $arm[2] & "])\n")
+  o.add("  none[Fluid]()\n\n")
+  o.add("proc identToFluidId*(T: typedesc[Fluid]; name: string): Option[uint8] =\n  case name\n" & identArms & "  else: none[uint8]()\n\n")
+  o.add("""proc getFluid*(registryId: string): Option[Fluid] =
+  var key = registryId
+  if key.len > 10 and substr(key, 0, 9) == "minecraft:":
+    key = substr(key, 10, key.len - 1)
+  Fluid.fromRegistryKey(key)
+
+proc fromResourceLocation*(T: typedesc[Fluid]; resourceLocation: string): Option[Fluid] = getFluid(resourceLocation)
+
+proc sameFluidType*(T: typedesc[Fluid]; a, b: uint16): bool =
+  a == b or (a == 1'u16 and b == 2'u16) or (a == 2'u16 and b == 1'u16) or
+    (a == 3'u16 and b == 4'u16) or (a == 4'u16 and b == 3'u16)
+
+proc matchesType*(self, other: Fluid): bool = Fluid.sameFluidType(self.id, other.id)
+
+proc toFlowing*(self: Fluid): Fluid =
+  case self.id
+  of 2'u16: Fluid.FLOWING_WATER
+  of 4'u16: Fluid.FLOWING_LAVA
+  else:
+    let f = Fluid.fromId(self.id)
+    if f.isSome: f.get else: Fluid.EMPTY
+
+proc stateIndexOf(self: Fluid; stateId: BlockStateId): int =
+  int(uint16(stateId)) mod self.states.len
+
+proc isSource*(self: Fluid; stateId: BlockStateId): bool = self.states[self.stateIndexOf(stateId)].isSource
+proc isFalling*(self: Fluid; stateId: BlockStateId): bool = self.states[self.stateIndexOf(stateId)].falling
+proc getLevel*(self: Fluid; stateId: BlockStateId): int16 = self.states[self.stateIndexOf(stateId)].level
+proc getHeight*(self: Fluid; stateId: BlockStateId): float32 = self.states[self.stateIndexOf(stateId)].height
+
+""")
+
+  # Property enums, BTreeMap order by enum name, first definition kept.
+  var seen: seq[string] = @[]
+  var enums: seq[PropertyRow] = @[]
+  for f in fluids:
+    for p in f.properties:
+      if toPascalCase(p.name) notin seen:
+        seen.add(toPascalCase(p.name))
+        enums.add(p)
+  var pass = 1
+  while pass < enums.len:
+    var b = pass
+    while b > 0 and toPascalCase(enums[b - 1].name) > toPascalCase(enums[b].name):
+      let lower = enums[b]
+      let upper = enums[b - 1]
+      enums[b - 1] = lower
+      enums[b] = upper
+      dec b
+    inc pass
+  for p in enums: emitEnum(p, o)
+
+  # Property groups, BTreeMap order by the sorted property-name list.
+  var groups: seq[Group] = @[]
+  for f in fluids:
+    if f.properties.len == 0: continue
+    var names: seq[string] = @[]
+    for p in f.properties: names.add(p.name)
+    var x = 1
+    while x < names.len:
+      var y = x
+      while y > 0 and names[y - 1] > names[y]:
+        let lower = names[y]
+        let upper = names[y - 1]
+        names[y - 1] = lower
+        names[y] = upper
+        dec y
+      inc x
+    var groupKey = ""
+    for n in names: groupKey.add(n & "\t")
+    var at = -1
+    for gi in 0 ..< groups.len:
+      if groups[gi].key == groupKey: at = gi
+    if at < 0:
+      groups.add(Group(key: groupKey, mappings: f.properties, fluidNames: @[]))
+      at = groups.len - 1
+    groups[at].fluidNames.add(f.name)
+  var gs = 1
+  while gs < groups.len:
+    var b = gs
+    while b > 0 and groups[b - 1].key > groups[b].key:
+      let lower = groups[b]
+      let upper = groups[b - 1]
+      groups[b - 1] = lower
+      groups[b] = upper
+      dec b
+    inc gs
+  var propsArms = ""
+  var fromArms = ""
+  for g in groups:
+    emitGroup(g, o)
+    let structName = toPascalCase(g.fluidNames[0] & "_like_fluid_properties")
+    for n in g.fluidNames:
+      propsArms.add("  of " & aowlStr(n) & ": boxed(" & structName & ".fromStateId(id, Fluid." & toShoutySnakeCase(n) & "))\n")
+      fromArms.add("  of " & aowlStr(n) & ": boxed(" & structName & ".fromProps(props, Fluid." & toShoutySnakeCase(n) & "))\n")
+  o.add("proc propertiesOf*(self: Fluid; id: BlockStateId): FluidPropertiesRef =\n  ## Upstream's `Fluid::properties`.\n  case self.name\n" & propsArms)
+  o.add("  else:\n    genPanic(\"Invalid state_id\")\n    FluidPropertiesRef()\n\n")
+  o.add("proc fromProperties*(self: Fluid; props: seq[(string, string)]): FluidPropertiesRef =\n  case self.name\n" & fromArms)
+  o.add("  else:\n    genPanic(\"Invalid props\")\n    FluidPropertiesRef()\n")
+  writeGenerated(OutPath, o)
+
+when isMainModule:
+  main()

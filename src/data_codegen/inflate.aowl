@@ -1,0 +1,184 @@
+## A small DEFLATE reader for generators, so reading a gzip asset does not need
+## the system zlib that `compress` binds under its Linux library name.
+##
+## Written from RFC 1951 and RFC 1952. Built for clarity over speed: canonical
+## Huffman codes are decoded bit by bit, which is fine for a build-time tool.
+
+type
+  BitReader = object
+    data: seq[byte]
+    pos: int
+    bitBuf: uint32
+    bitCount: int
+
+  Huffman = object
+    counts: array[16, int]
+    symbols: seq[int]
+
+const
+  LenBase = [3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 15, 17, 19, 23, 27, 31, 35, 43, 51,
+             59, 67, 83, 99, 115, 131, 163, 195, 227, 258]
+  LenExtra = [0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 4, 4, 4,
+              4, 5, 5, 5, 5, 0]
+  DistBase = [1, 2, 3, 4, 5, 7, 9, 13, 17, 25, 33, 49, 65, 97, 129, 193, 257, 385,
+              513, 769, 1025, 1537, 2049, 3073, 4097, 6145, 8193, 12289, 16385, 24577]
+  DistExtra = [0, 0, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7, 7, 8, 8, 9, 9, 10,
+               10, 11, 11, 12, 12, 13, 13]
+  CodeLenOrder = [16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15]
+
+proc bits(r: var BitReader, n: int): int =
+  while r.bitCount < n:
+    if r.pos >= r.data.len:
+      return -1
+    r.bitBuf = r.bitBuf or (uint32(r.data[r.pos]) shl uint32(r.bitCount))
+    inc r.pos
+    r.bitCount += 8
+  if n == 0:
+    return 0
+  result = int(r.bitBuf and ((1'u32 shl uint32(n)) - 1'u32))
+  r.bitBuf = r.bitBuf shr uint32(n)
+  r.bitCount -= n
+
+proc buildHuffman(lengths: openArray[int]): Huffman =
+  result = Huffman(symbols: newSeq[int](lengths.len))
+  for i in 0 ..< 16:
+    result.counts[i] = 0
+  for l in lengths:
+    inc result.counts[l]
+  result.counts[0] = 0
+  var offs: array[16, int]
+  offs[0] = 0
+  offs[1] = 0
+  for i in 1 ..< 15:
+    offs[i + 1] = offs[i] + result.counts[i]
+  for sym in 0 ..< lengths.len:
+    if lengths[sym] != 0:
+      result.symbols[offs[lengths[sym]]] = sym
+      inc offs[lengths[sym]]
+
+proc decodeSym(r: var BitReader, h: Huffman): int =
+  var code = 0
+  var first = 0
+  var index = 0
+  for length in 1 .. 15:
+    let b = bits(r, 1)
+    if b < 0: return -1
+    code = code or b
+    let count = h.counts[length]
+    if code - count < first:
+      return h.symbols[index + (code - first)]
+    index += count
+    first += count
+    first = first shl 1
+    code = code shl 1
+  -1
+
+proc codes(r: var BitReader, lit, dist: Huffman, output: var seq[byte]): bool =
+  while true:
+    let sym = decodeSym(r, lit)
+    if sym < 0: return false
+    if sym < 256:
+      output.add(byte(sym))
+    elif sym == 256:
+      return true
+    else:
+      let li = sym - 257
+      if li >= 29: return false
+      let length = LenBase[li] + bits(r, LenExtra[li])
+      let ds = decodeSym(r, dist)
+      if ds < 0 or ds >= 30: return false
+      let distance = DistBase[ds] + bits(r, DistExtra[ds])
+      if distance > output.len: return false
+      var from0 = output.len - distance
+      for i in 0 ..< length:
+        output.add(output[from0])
+        inc from0
+
+proc inflateRaw*(data: seq[byte], start: int, output: var seq[byte]): bool =
+  ## Decodes one raw DEFLATE stream beginning at `start`.
+  var r = BitReader(data: data, pos: start, bitBuf: 0'u32, bitCount: 0)
+  var last = 0
+  while last == 0:
+    last = bits(r, 1)
+    let kind = bits(r, 2)
+    if last < 0 or kind < 0: return false
+    case kind
+    of 0:
+      r.bitBuf = 0'u32
+      r.bitCount = 0
+      if r.pos + 4 > r.data.len: return false
+      let n = int(r.data[r.pos]) or (int(r.data[r.pos + 1]) shl 8)
+      r.pos += 4
+      for i in 0 ..< n:
+        output.add(r.data[r.pos + i])
+      r.pos += n
+    of 1:
+      var lengths = newSeq[int](288)
+      for i in 0 ..< 144: lengths[i] = 8
+      for i in 144 ..< 256: lengths[i] = 9
+      for i in 256 ..< 280: lengths[i] = 7
+      for i in 280 ..< 288: lengths[i] = 8
+      var distLens = newSeq[int](30)
+      for i in 0 ..< 30: distLens[i] = 5
+      if not codes(r, buildHuffman(lengths), buildHuffman(distLens), output):
+        return false
+    of 2:
+      let nlen = bits(r, 5) + 257
+      let ndist = bits(r, 5) + 1
+      let ncode = bits(r, 4) + 4
+      var codeLens = newSeq[int](19)
+      for i in 0 ..< ncode:
+        codeLens[CodeLenOrder[i]] = bits(r, 3)
+      let clen = buildHuffman(codeLens)
+      var lengths = newSeq[int](nlen + ndist)
+      var index = 0
+      while index < nlen + ndist:
+        let sym = decodeSym(r, clen)
+        if sym < 0: return false
+        if sym < 16:
+          lengths[index] = sym
+          inc index
+        else:
+          var prev = 0
+          var rep = 0
+          if sym == 16:
+            if index == 0: return false
+            prev = lengths[index - 1]
+            rep = 3 + bits(r, 2)
+          elif sym == 17:
+            rep = 3 + bits(r, 3)
+          else:
+            rep = 11 + bits(r, 7)
+          if index + rep > nlen + ndist: return false
+          for i in 0 ..< rep:
+            lengths[index] = prev
+            inc index
+      var litLens = newSeq[int](nlen)
+      for i in 0 ..< nlen: litLens[i] = lengths[i]
+      var distLens = newSeq[int](ndist)
+      for i in 0 ..< ndist: distLens[i] = lengths[nlen + i]
+      if not codes(r, buildHuffman(litLens), buildHuffman(distLens), output):
+        return false
+    else:
+      return false
+  true
+
+proc gunzip*(data: seq[byte]): (bool, seq[byte]) =
+  ## One gzip member, per RFC 1952's header layout.
+  var output: seq[byte] = @[]
+  if data.len < 18 or data[0] != 0x1f'u8 or data[1] != 0x8b'u8 or data[2] != 8'u8:
+    return (false, output)
+  let flags = data[3]
+  var p = 10
+  if (flags and 4'u8) != 0'u8:
+    p += 2 + (int(data[p]) or (int(data[p + 1]) shl 8))
+  if (flags and 8'u8) != 0'u8:
+    while data[p] != 0'u8: inc p
+    inc p
+  if (flags and 16'u8) != 0'u8:
+    while data[p] != 0'u8: inc p
+    inc p
+  if (flags and 2'u8) != 0'u8:
+    p += 2
+  let ok = inflateRaw(data, p, output)
+  (ok, output)

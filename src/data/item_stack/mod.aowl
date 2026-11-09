@@ -1,0 +1,737 @@
+## Port of pumpkin-data/src/item_stack/mod.rs
+##
+## `ItemStack`'s type is in ../data_component_impl/mod.aowl, in one recursive group with the components. An
+## assignment copies a stack deeply, which is upstream's `clone`; `ItemStack::EMPTY` is `emptyItemStack()`.
+##
+## Also here, because they call `read_item_stack`, which needs `Item::from_registry_key` and calls them back
+## (no import cycles in aowlmony): `read_data` from data_component_impl/mod.rs, and `ContainerImpl`'s and
+## `BundleContentsImpl`'s `read_data`, `get_weight`, `try_insert` and `try_extract` from block_entity.rs and
+## utility.rs. `is_armor` and friends are in categories.aowl as upstream, but `damage_item` needs `is_armor`
+## here, so it reads the tag directly.
+##
+## `get_data_component::<T>` is `getDataComponent(T)`, answering (found, value) with a copy, and
+## `get_data_component_mut::<T>` is `getDataComponentMut(T)`, answering the index in `patch` (or -1), since a
+## var into a case object's branch cannot be returned: `s.patch[i].data.enchantments.enchantment.add(..)`.
+## Both are in ../data_component_impl/mod.aowl, one overload per type.
+##
+## `From<&RecipeResultStruct>` is `fromRecipeResult`: it takes the result's id and count, so this file does not
+## pull in the recipe tables. `impl From` upstream panics on an unknown id; this answers an empty stack, since
+## the recipes table is generated from the same data and no id reaches it unknown.
+## `rand::random` is a module-level `Xoroshiro` seeded from the clock: upstream's thread-local generator needs
+## no particular sequence.
+
+import std/times
+import ../../generated/item_full
+import ../../generated/tag as tagdata
+import ../../nbt/tag
+import ../../util/gamemode
+import ../../util/xoroshiro128
+import ../blocks
+
+export item_full
+
+type
+  DamageResult* = enum
+    ## The outcome of a `damageItem` call.
+    drUntouched  ## No damage was applied (zero/negative amount, not damageable, unbreakable,
+                 ## or Unbreaking negated every point).
+    drDamaged    ## Damage was applied and the item is still alive.
+    drBroken     ## The item broke: one item was consumed from the stack (durability reset to 0),
+                 ## or the stack is now empty if it had only one item. Callers should always
+                 ## broadcast the break status; the client handles both cases correctly.
+
+  ItemStackIdGenerator* = object
+    counter: uint32
+
+proc newItemStackIdGenerator*(): ItemStackIdGenerator =
+  ItemStackIdGenerator(counter: 1'u32)
+
+proc nextId*(self: var ItemStackIdGenerator): int32 =
+  # Wraps on overflow, which is what we want.
+  while true:
+    let value = self.counter
+    self.counter = value + 1'u32
+    # Negative values are invalid; cycle through the positives. If we fetched 0 or 0x80000000, that's masked
+    # out as 0, and zero is invalid, so we just ask for the next ID.
+    let masked = value and 0x7FFFFFFF'u32
+    if masked != 0'u32:
+      return int32(masked)
+
+var ITEM_STACK_ID_GEN = newItemStackIdGenerator()
+var gDurabilityRandom = fromSeed(uint64(toUnix(getTime())))
+
+proc toTaggable*(self: Item): Taggable =
+  ## `impl Taggable for Item`.
+  Taggable(tagKey: rkItem, registryKey: self.registryKey, registryId: self.id)
+
+proc newItemStack*(itemCount: uint8; item: Item): ItemStack =
+  ItemStack(itemCount: itemCount, item: item, patch: @[], uid: ITEM_STACK_ID_GEN.nextId())
+
+proc newItemStackWithComponent*(itemCount: uint8; item: Item; component: sink seq[PatchEntry]): ItemStack =
+  ItemStack(itemCount: itemCount, item: item, patch: component, uid: ITEM_STACK_ID_GEN.nextId())
+
+proc staticNewJava*(itemCount: uint8; item: Item): ItemStack =
+  ## Ignore the Bedrock UID for this `ItemStack`. This constructor is intended for Java-only item stacks,
+  ## where the network UID is not required.
+  ItemStack(itemCount: itemCount, item: item, patch: @[], uid: 1'i32)
+
+proc emptyItemStack*(): ItemStack =
+  ## `ItemStack::EMPTY`. A white lie in `uid`: Bedrock's is never sent if the stack is empty.
+  ItemStack(itemCount: 0'u8, item: ITEM_AIR, patch: @[], uid: int32.low)
+
+proc hasDataComponent*(self: ItemStack; id: DataComponent): bool =
+  ## `get_data_component::<T>().is_some()`.
+  for entry in self.patch:
+    if entry.id == id:
+      return entry.present
+  for component in self.item.components:
+    if component.kind == id:
+      return true
+  false
+
+proc hasEnchantments*(self: ItemStack): bool =
+  let (found, e) = self.getDataComponent(EnchantmentsImpl)
+  found and e.enchantment.len > 0
+
+proc addEnchantment*(self: var ItemStack; enchantment: EnchantmentRef; level: uint16) =
+  let i = self.getDataComponentMut(EnchantmentsImpl)
+  if i >= 0:
+    self.patch[i].data.enchantments.enchantment.add(EnchantmentEntry(enchantment: enchantment, level: int32(level)))
+  else:
+    self.patch.add(patchSet(toDyn(EnchantmentsImpl(enchantment: @[EnchantmentEntry(enchantment: enchantment,
+      level: int32(level))]))))
+
+proc decrement*(self: var ItemStack; amount: uint8) =
+  self.itemCount = (if amount >= self.itemCount: 0'u8 else: self.itemCount - amount)
+
+proc copyWithCount*(self: ItemStack; count: uint8): ItemStack =
+  result = self
+  result.uid = ITEM_STACK_ID_GEN.nextId()
+  result.itemCount = count
+
+proc splitOff*(self: var ItemStack; amount: uint8): ItemStack =
+  let count = min(amount, self.itemCount)
+  result = self.copyWithCount(count)
+  self.decrement(count)
+
+proc getMaxStackSize*(self: ItemStack): uint8 =
+  let (found, value) = self.getDataComponent(MaxStackSizeImpl)
+  if found: value.size else: 1'u8
+
+proc getMaxDamage*(self: ItemStack): Option[int32] =
+  let (found, value) = self.getDataComponent(MaxDamageImpl)
+  if found: some(value.maxDamage) else: none[int32]()
+
+proc getUseCooldown*(self: ItemStack): Option[UseCooldownImpl] =
+  let (found, value) = self.getDataComponent(UseCooldownImpl)
+  if found: some(value) else: none[UseCooldownImpl]()
+
+proc getDamage*(self: ItemStack): int32 =
+  let (found, value) = self.getDataComponent(DamageImpl)
+  if found: value.damage else: 0'i32
+
+proc getEnchantmentLevel*(self: ItemStack; enchantment: EnchantmentRef): int32 =
+  let (found, data) = self.getDataComponent(EnchantmentsImpl)
+  if not found:
+    return 0'i32
+  for entry in data.enchantment:
+    if entry.enchantment.id == enchantment.id:
+      return entry.level
+  0'i32
+
+proc isUnbreakable*(self: ItemStack): bool =
+  self.hasDataComponent(dcUnbreakable)
+
+proc removePatch(self: var ItemStack; id: DataComponent) =
+  ## `self.patch.retain(|(x, _)| *x != id)`.
+  var kept: seq[PatchEntry] = @[]
+  for entry in self.patch:
+    if entry.id != id:
+      kept.add(entry)
+  self.patch = kept
+
+proc setDamage*(self: var ItemStack; damage: int32) =
+  let damage = max(damage, 0'i32)
+  if damage == 0'i32:
+    self.removePatch(dcDamage)
+    return
+  for i in 0 ..< self.patch.len:
+    if self.patch[i].id == dcDamage:
+      self.patch[i] = patchSet(toDyn(DamageImpl(damage: damage)))
+      return
+  self.patch.add(patchSet(toDyn(DamageImpl(damage: damage))))
+
+proc isDamageable*(self: ItemStack): bool =
+  let maxDamage = self.getMaxDamage()
+  maxDamage.isSome and maxDamage.unsafeGet > 0'i32
+
+proc repairItem*(self: var ItemStack; amount: int32): int32 =
+  if amount <= 0'i32:
+    return 0'i32
+  let damage = self.getDamage()
+  if damage <= 0'i32:
+    return 0'i32
+  let repaired = min(amount, damage)
+  self.setDamage(damage - repaired)
+  repaired
+
+proc shouldApplyDurabilityDamageWith(isArmor: bool; unbreakingLevel: int32): bool =
+  ## Core logic: apply Unbreaking chance with precomputed armor category and level.
+  ## Extracted for use in damageItem where these values are hoisted outside the loop.
+  if unbreakingLevel <= 0'i32:
+    return true
+  # `#minecraft:enchantable/armor` uses the armor formula; all others use the tool formula.
+  if isArmor:
+    let chance = 0.6'f32 + (0.4'f32 / (float32(unbreakingLevel) + 1.0'f32))
+    # `rand::random::<f32>()`: uniform in [0, 1).
+    let roll = float32(gDurabilityRandom.nextBits(24)) / 16777216.0'f32
+    roll < chance
+  else:
+    # `rand::random::<u32>().is_multiple_of(level + 1)`.
+    (uint32(gDurabilityRandom.nextBits(32)) mod (uint32(unbreakingLevel) + 1'u32)) == 0'u32
+
+proc damageItem*(self: var ItemStack; amount: int32): DamageResult =
+  ## Apply durability damage to this item and return the outcome. Callers must check the return value to
+  ## handle break broadcasts and item stack updates.
+  if amount <= 0'i32 or not self.isDamageable() or self.isUnbreakable():
+    return drUntouched
+  let maxDamageOpt = self.getMaxDamage()
+  let maxDamage = if maxDamageOpt.isSome: maxDamageOpt.unsafeGet else: 0'i32
+  if maxDamage <= 0'i32:
+    return drUntouched
+  # Hoist armor check and enchantment level outside loop to avoid repeated lookups.
+  let isArmor = hasTag(self.item.id, Item_MINECRAFT_ENCHANTABLE_ARMOR)
+  let unbreakingLevel = self.getEnchantmentLevel(ENCHANTMENT_UNBREAKING)
+  var applied = 0'i32
+  for i in 0'i32 ..< amount:
+    if shouldApplyDurabilityDamageWith(isArmor, unbreakingLevel):
+      inc applied
+  if applied <= 0'i32:
+    return drUntouched
+  # `saturating_add`.
+  let sum = int64(self.getDamage()) + int64(applied)
+  let newDamage = if sum > int64(int32.high): int32.high else: int32(sum)
+  if newDamage >= maxDamage:
+    # Vanilla behavior: breaking consumes one item from the stack and resets durability to 0. A single
+    # damage call never breaks more than one item, regardless of the damage amount.
+    if self.itemCount > 1'u8:
+      self.itemCount = self.itemCount - 1'u8
+      self.setDamage(0'i32)
+    else:
+      self = emptyItemStack()
+    return drBroken
+  self.setDamage(newDamage)
+  drDamaged
+
+proc getMaxUseTime*(self: ItemStack): int32 =
+  let (found, value) = self.getDataComponent(ConsumableImpl)
+  if found:
+    return value.consumeTicks()
+  if self.hasDataComponent(dcBlocksAttacks):
+    return 72000'i32
+  0'i32
+
+proc isEmpty*(self: ItemStack): bool {.inline.} =
+  self.itemCount == 0'u8 or self.item.id == ITEM_AIR.id
+
+proc getItem*(self: ItemStack): Item =
+  if self.isEmpty(): ITEM_AIR else: self.item
+
+proc isStackable*(self: ItemStack): bool =
+  self.getMaxStackSize() > 1'u8
+
+proc setCustomName*(self: var ItemStack; name: string) =
+  let component = patchSet(toDyn(CustomNameImpl(name: text(name))))
+  for i in 0 ..< self.patch.len:
+    if self.patch[i].id == dcCustomName:
+      self.patch[i] = component
+      return
+  self.patch.add(component)
+
+proc customDataCompound(self: ItemStack): Option[NbtCompound] =
+  let (found, customData) = self.getDataComponent(CustomDataImpl)
+  if found: some(customData.data) else: none[NbtCompound]()
+
+proc setCustomDataComponent(self: var ItemStack; customData: sink NbtCompound) =
+  let component = patchSet(toDyn(CustomDataImpl(data: customData)))
+  for i in 0 ..< self.patch.len:
+    if self.patch[i].id == dcCustomData:
+      self.patch[i] = component
+      return
+  self.patch.add(component)
+
+proc setCustomData*(self: var ItemStack; namespace, key: string; value: NbtTag) =
+  let existing = self.customDataCompound()
+  var customData = if existing.isSome: existing.unsafeGet else: newCompound()
+  let (hadNamespace, namespaceTag) = customData.remove(namespace)
+  var namespaceData =
+    if hadNamespace and namespaceTag.kind == ntkCompound: namespaceTag.compoundVal
+    else: newCompound()
+  namespaceData.insert(key, value)
+  customData.insert(namespace, NbtTag(kind: ntkCompound, compoundVal: namespaceData))
+  self.setCustomDataComponent(customData)
+
+proc getCustomData*(self: ItemStack; namespace, key: string): Option[NbtTag] =
+  let customData = self.customDataCompound()
+  if customData.isNone:
+    return none[NbtTag]()
+  let (hasNamespace, namespaceTag) = customData.unsafeGet.get(namespace)
+  if not hasNamespace or namespaceTag.kind != ntkCompound:
+    return none[NbtTag]()
+  let (found, value) = namespaceTag.compoundVal.get(key)
+  if found: some(value) else: none[NbtTag]()
+
+proc removeCustomData*(self: var ItemStack; namespace, key: string) =
+  let existing = self.customDataCompound()
+  if existing.isNone:
+    return
+  var customData = existing.unsafeGet
+  let (hadNamespace, namespaceTag) = customData.remove(namespace)
+  if not hadNamespace or namespaceTag.kind != ntkCompound:
+    return
+  var namespaceData = namespaceTag.compoundVal
+  discard namespaceData.remove(key)
+  if not namespaceData.isEmpty():
+    customData.insert(namespace, NbtTag(kind: ntkCompound, compoundVal: namespaceData))
+  if customData.isEmpty():
+    self.removePatch(dcCustomData)
+  else:
+    self.setCustomDataComponent(customData)
+
+proc hasCustomData*(self: ItemStack; namespace, key: string): bool =
+  self.getCustomData(namespace, key).isSome
+
+proc split*(self: var ItemStack; amount: uint8): ItemStack =
+  let m = min(amount, self.itemCount)
+  result = self.copyWithCount(m)
+  self.decrement(m)
+
+proc splitUnlessCreative*(self: var ItemStack; gamemode: GameMode; amount: uint8): ItemStack =
+  let m = min(amount, self.itemCount)
+  result = self.copyWithCount(m)
+  if gamemode != Creative:
+    self.decrement(m)
+
+proc setCount*(self: var ItemStack; count: uint8) =
+  self.itemCount = count
+
+proc clear*(self: var ItemStack) =
+  ## Completely resets the stack to air.
+  self = emptyItemStack()
+
+proc decrementUnlessCreative*(self: var ItemStack; gamemode: GameMode; amount: uint8) =
+  if gamemode != Creative:
+    self.decrement(amount)
+    if self.itemCount == 0'u8:
+      self.clear()
+
+proc increment*(self: var ItemStack; amount: uint8) =
+  # `saturating_add`.
+  self.itemCount = (if int(self.itemCount) + int(amount) > 255: 255'u8 else: self.itemCount + amount)
+
+proc enchant*(self: var ItemStack; enchantment: EnchantmentRef; level: int32) =
+  if level <= 0'i32:
+    return
+  let level = min(level, 255'i32)
+  let i = self.getDataComponentMut(EnchantmentsImpl)
+  if i >= 0:
+    for j in 0 ..< self.patch[i].data.enchantments.enchantment.len:
+      if self.patch[i].data.enchantments.enchantment[j].enchantment.id == enchantment.id:
+        let old = self.patch[i].data.enchantments.enchantment[j].level
+        self.patch[i].data.enchantments.enchantment[j].level = max(old, level)
+        return
+    self.patch[i].data.enchantments.enchantment.add(EnchantmentEntry(enchantment: enchantment, level: level))
+  else:
+    self.patch.add(patchSet(toDyn(EnchantmentsImpl(enchantment: @[EnchantmentEntry(enchantment: enchantment,
+      level: level)]))))
+
+proc areItemsAndComponentsEqual*(self, other: ItemStack): bool =
+  # Items must match
+  if not sameItem(self.item, other.item):
+    return false
+  if self.patch.len != other.patch.len:
+    return false
+  for entry in self.patch:
+    var notFound = true
+    for otherEntry in other.patch:
+      if entry.id == otherEntry.id:
+        if entry.present and otherEntry.present:
+          if not equal(entry.data, otherEntry.data):
+            return false
+          notFound = false
+          break
+        elif not entry.present and not otherEntry.present:
+          notFound = false
+          break
+        return false
+    if notFound:
+      return false
+  true
+
+proc areEqual*(self, other: ItemStack): bool =
+  self.itemCount == other.itemCount and self.areItemsAndComponentsEqual(other)
+
+proc blockHasTag(blockRef: Block; tagName: string): bool =
+  ## `block.is_tagged_with(tag).unwrap_or(false)`.
+  let (known, tagged) = isTaggedWith(Taggable(tagKey: rkBlock, registryKey: blockRef.name,
+    registryId: asU16(blockRef.id)), tagName)
+  known and tagged
+
+proc getSpeed*(self: ItemStack; blockRef: Block): float32 =
+  ## Determines the mining speed for a block based on tool rules.
+  ## Direct matches return immediately, tagged blocks are checked separately.
+  ## If no match is found, returns the tool's default mining speed or `1.0`.
+  let (found, tool) = self.getDataComponent(ToolImpl)
+  if found:
+    for rule in tool.rules:
+      # Skip if speed is not set
+      if rule.speed.isNone:
+        continue
+      case rule.blocks.kind
+      of idsTag:
+        if blockHasTag(blockRef, rule.blocks.tag):
+          return rule.speed.unsafeGet
+      of idsIds:
+        if rule.blocks.contains(int32(asU16(blockRef.id))):
+          return rule.speed.unsafeGet
+    tool.defaultMiningSpeed
+  else:
+    1.0'f32
+
+proc isCorrectForDrops*(self: ItemStack; blockRef: Block): bool =
+  ## Determines if a tool is valid for block drops based on tool rules.
+  ## Direct matches return immediately, while tagged blocks are checked separately.
+  let (found, tool) = self.getDataComponent(ToolImpl)
+  if found:
+    for rule in tool.rules:
+      # Skip if speed is not set
+      if rule.correctForDrops.isNone:
+        continue
+      case rule.blocks.kind
+      of idsTag:
+        if blockHasTag(blockRef, rule.blocks.tag):
+          return rule.correctForDrops.unsafeGet
+      of idsIds:
+        if rule.blocks.contains(int32(asU16(blockRef.id))):
+          return rule.correctForDrops.unsafeGet
+  false
+
+proc writeItemStack*(self: ItemStack; compound: var NbtCompound) =
+  # Minecraft 1.21.4 uses "id" as string with namespaced ID (minecraft:diamond_sword)
+  compound.putString("id", "minecraft:" & self.item.registryKey)
+  compound.putInt("count", int32(self.itemCount))
+  # Create a tag compound for additional data
+  var tag = newCompound()
+  for entry in self.patch:
+    if entry.present:
+      tag.put(entry.id.toName(), writeData(entry.data))
+    else:
+      tag.put("!" & entry.id.toName(), newCompound())
+  compound.putCompound("components", tag)
+
+proc readItemStack*(compound: NbtCompound): Option[ItemStack]
+
+proc readData*(id: DataComponent; data: NbtTag): Option[DataComponentImpl] =
+  ## `read_data` of data_component_impl/mod.rs. `None` for a component with no NBT form.
+  case id
+  of dcMaxStackSize:
+    let v = readData(MaxStackSizeImpl, data)
+    if v.isSome: some(toDyn(v.unsafeGet)) else: none[DataComponentImpl]()
+  of dcCustomData:
+    let v = readData(CustomDataImpl, data)
+    if v.isSome: some(toDyn(v.unsafeGet)) else: none[DataComponentImpl]()
+  of dcEnchantments:
+    let v = readData(EnchantmentsImpl, data)
+    if v.isSome: some(toDyn(v.unsafeGet)) else: none[DataComponentImpl]()
+  of dcDamage:
+    let v = readData(DamageImpl, data)
+    if v.isSome: some(toDyn(v.unsafeGet)) else: none[DataComponentImpl]()
+  of dcUnbreakable:
+    some(toDyn(UnbreakableImpl()))
+  of dcDamageResistant:
+    let v = readData(DamageResistantImpl, data)
+    if v.isSome: some(toDyn(v.unsafeGet)) else: none[DataComponentImpl]()
+  of dcPotionContents:
+    let v = readData(PotionContentsImpl, data)
+    if v.isSome: some(toDyn(v.unsafeGet)) else: none[DataComponentImpl]()
+  of dcFireworks:
+    let v = readData(FireworksImpl, data)
+    if v.isSome: some(toDyn(v.unsafeGet)) else: none[DataComponentImpl]()
+  of dcFireworkExplosion:
+    let v = readData(FireworkExplosionImpl, data)
+    if v.isSome: some(toDyn(v.unsafeGet)) else: none[DataComponentImpl]()
+  of dcCustomName:
+    let v = readData(CustomNameImpl, data)
+    if v.isSome: some(toDyn(v.unsafeGet)) else: none[DataComponentImpl]()
+  of dcItemModel:
+    let v = readData(ItemModelImpl, data)
+    if v.isSome: some(toDyn(v.unsafeGet)) else: none[DataComponentImpl]()
+  of dcConsumable:
+    let v = readData(ConsumableImpl, data)
+    if v.isSome: some(toDyn(v.unsafeGet)) else: none[DataComponentImpl]()
+  of dcEquippable:
+    let v = readData(EquippableImpl, data)
+    if v.isSome: some(toDyn(v.unsafeGet)) else: none[DataComponentImpl]()
+  of dcStoredEnchantments:
+    let v = readData(StoredEnchantmentsImpl, data)
+    if v.isSome: some(toDyn(v.unsafeGet)) else: none[DataComponentImpl]()
+  of dcUseCooldown:
+    let v = readData(UseCooldownImpl, data)
+    if v.isSome: some(toDyn(v.unsafeGet)) else: none[DataComponentImpl]()
+  of dcMapId:
+    let v = readData(MapIdImpl, data)
+    if v.isSome: some(toDyn(v.unsafeGet)) else: none[DataComponentImpl]()
+  of dcChargedProjectiles:
+    let v = readData(ChargedProjectilesImpl, data)
+    if v.isSome: some(toDyn(v.unsafeGet)) else: none[DataComponentImpl]()
+  of dcBlockEntityData:
+    let v = readData(BlockEntityDataImpl, data)
+    if v.isSome: some(toDyn(v.unsafeGet)) else: none[DataComponentImpl]()
+  of dcBundleContents:
+    let v = readData(BundleContentsImpl, data)
+    if v.isSome: some(toDyn(v.unsafeGet)) else: none[DataComponentImpl]()
+  of dcContainer:
+    let v = readData(ContainerImpl, data)
+    if v.isSome: some(toDyn(v.unsafeGet)) else: none[DataComponentImpl]()
+  of dcWrittenBookContent:
+    let v = readData(WrittenBookContentImpl, data)
+    if v.isSome: some(toDyn(v.unsafeGet)) else: none[DataComponentImpl]()
+  of dcWritableBookContent:
+    let v = readData(WritableBookContentImpl, data)
+    if v.isSome: some(toDyn(v.unsafeGet)) else: none[DataComponentImpl]()
+  of dcOminousBottleAmplifier:
+    let v = readData(OminousBottleAmplifierImpl, data)
+    if v.isSome: some(toDyn(v.unsafeGet)) else: none[DataComponentImpl]()
+  of dcBlockState:
+    let v = readData(BlockStateImpl, data)
+    if v.isSome: some(toDyn(v.unsafeGet)) else: none[DataComponentImpl]()
+  of dcProfile:
+    let v = readData(ProfileImpl, data)
+    if v.isSome: some(toDyn(v.unsafeGet)) else: none[DataComponentImpl]()
+  of dcChickenVariant:
+    let v = readStringVariant(data)
+    if v.isSome: some(DataComponentImpl(kind: dcChickenVariant, stringVariant: v.unsafeGet)) else: none[DataComponentImpl]()
+  of dcVillagerVariant:
+    let v = readStringVariant(data)
+    if v.isSome: some(DataComponentImpl(kind: dcVillagerVariant, stringVariant: v.unsafeGet)) else: none[DataComponentImpl]()
+  of dcWolfVariant:
+    let v = readStringVariant(data)
+    if v.isSome: some(DataComponentImpl(kind: dcWolfVariant, stringVariant: v.unsafeGet)) else: none[DataComponentImpl]()
+  of dcWolfSoundVariant:
+    let v = readStringVariant(data)
+    if v.isSome: some(DataComponentImpl(kind: dcWolfSoundVariant, stringVariant: v.unsafeGet)) else: none[DataComponentImpl]()
+  of dcWolfCollar:
+    let v = readStringVariant(data)
+    if v.isSome: some(DataComponentImpl(kind: dcWolfCollar, stringVariant: v.unsafeGet)) else: none[DataComponentImpl]()
+  of dcFoxVariant:
+    let v = readStringVariant(data)
+    if v.isSome: some(DataComponentImpl(kind: dcFoxVariant, stringVariant: v.unsafeGet)) else: none[DataComponentImpl]()
+  of dcSalmonSize:
+    let v = readStringVariant(data)
+    if v.isSome: some(DataComponentImpl(kind: dcSalmonSize, stringVariant: v.unsafeGet)) else: none[DataComponentImpl]()
+  of dcParrotVariant:
+    let v = readStringVariant(data)
+    if v.isSome: some(DataComponentImpl(kind: dcParrotVariant, stringVariant: v.unsafeGet)) else: none[DataComponentImpl]()
+  of dcTropicalFishPattern:
+    let v = readStringVariant(data)
+    if v.isSome: some(DataComponentImpl(kind: dcTropicalFishPattern, stringVariant: v.unsafeGet)) else: none[DataComponentImpl]()
+  of dcTropicalFishBaseColor:
+    let v = readStringVariant(data)
+    if v.isSome: some(DataComponentImpl(kind: dcTropicalFishBaseColor, stringVariant: v.unsafeGet)) else: none[DataComponentImpl]()
+  of dcTropicalFishPatternColor:
+    let v = readStringVariant(data)
+    if v.isSome: some(DataComponentImpl(kind: dcTropicalFishPatternColor, stringVariant: v.unsafeGet)) else: none[DataComponentImpl]()
+  of dcMooshroomVariant:
+    let v = readStringVariant(data)
+    if v.isSome: some(DataComponentImpl(kind: dcMooshroomVariant, stringVariant: v.unsafeGet)) else: none[DataComponentImpl]()
+  of dcRabbitVariant:
+    let v = readStringVariant(data)
+    if v.isSome: some(DataComponentImpl(kind: dcRabbitVariant, stringVariant: v.unsafeGet)) else: none[DataComponentImpl]()
+  of dcPigVariant:
+    let v = readStringVariant(data)
+    if v.isSome: some(DataComponentImpl(kind: dcPigVariant, stringVariant: v.unsafeGet)) else: none[DataComponentImpl]()
+  of dcPigSoundVariant:
+    let v = readStringVariant(data)
+    if v.isSome: some(DataComponentImpl(kind: dcPigSoundVariant, stringVariant: v.unsafeGet)) else: none[DataComponentImpl]()
+  of dcCowVariant:
+    let v = readStringVariant(data)
+    if v.isSome: some(DataComponentImpl(kind: dcCowVariant, stringVariant: v.unsafeGet)) else: none[DataComponentImpl]()
+  of dcCowSoundVariant:
+    let v = readStringVariant(data)
+    if v.isSome: some(DataComponentImpl(kind: dcCowSoundVariant, stringVariant: v.unsafeGet)) else: none[DataComponentImpl]()
+  of dcChickenSoundVariant:
+    let v = readStringVariant(data)
+    if v.isSome: some(DataComponentImpl(kind: dcChickenSoundVariant, stringVariant: v.unsafeGet)) else: none[DataComponentImpl]()
+  of dcZombieNautilusVariant:
+    let v = readStringVariant(data)
+    if v.isSome: some(DataComponentImpl(kind: dcZombieNautilusVariant, stringVariant: v.unsafeGet)) else: none[DataComponentImpl]()
+  of dcFrogVariant:
+    let v = readStringVariant(data)
+    if v.isSome: some(DataComponentImpl(kind: dcFrogVariant, stringVariant: v.unsafeGet)) else: none[DataComponentImpl]()
+  of dcHorseVariant:
+    let v = readStringVariant(data)
+    if v.isSome: some(DataComponentImpl(kind: dcHorseVariant, stringVariant: v.unsafeGet)) else: none[DataComponentImpl]()
+  of dcPaintingVariant:
+    let v = readStringVariant(data)
+    if v.isSome: some(DataComponentImpl(kind: dcPaintingVariant, stringVariant: v.unsafeGet)) else: none[DataComponentImpl]()
+  of dcLlamaVariant:
+    let v = readStringVariant(data)
+    if v.isSome: some(DataComponentImpl(kind: dcLlamaVariant, stringVariant: v.unsafeGet)) else: none[DataComponentImpl]()
+  of dcAxolotlVariant:
+    let v = readStringVariant(data)
+    if v.isSome: some(DataComponentImpl(kind: dcAxolotlVariant, stringVariant: v.unsafeGet)) else: none[DataComponentImpl]()
+  of dcCatVariant:
+    let v = readStringVariant(data)
+    if v.isSome: some(DataComponentImpl(kind: dcCatVariant, stringVariant: v.unsafeGet)) else: none[DataComponentImpl]()
+  of dcCatSoundVariant:
+    let v = readStringVariant(data)
+    if v.isSome: some(DataComponentImpl(kind: dcCatSoundVariant, stringVariant: v.unsafeGet)) else: none[DataComponentImpl]()
+  of dcCatCollar:
+    let v = readStringVariant(data)
+    if v.isSome: some(DataComponentImpl(kind: dcCatCollar, stringVariant: v.unsafeGet)) else: none[DataComponentImpl]()
+  of dcSheepColor:
+    let v = readStringVariant(data)
+    if v.isSome: some(DataComponentImpl(kind: dcSheepColor, stringVariant: v.unsafeGet)) else: none[DataComponentImpl]()
+  of dcShulkerColor:
+    let v = readStringVariant(data)
+    if v.isSome: some(DataComponentImpl(kind: dcShulkerColor, stringVariant: v.unsafeGet)) else: none[DataComponentImpl]()
+  of dcDyedColor:
+    let v = readData(DyedColorImpl, data)
+    if v.isSome: some(toDyn(v.unsafeGet)) else: none[DataComponentImpl]()
+  of dcBaseColor:
+    let v = readData(BaseColorImpl, data)
+    if v.isSome: some(toDyn(v.unsafeGet)) else: none[DataComponentImpl]()
+  of dcNoteBlockSound:
+    let v = readData(NoteBlockSoundImpl, data)
+    if v.isSome: some(toDyn(v.unsafeGet)) else: none[DataComponentImpl]()
+  of dcTooltipStyle:
+    let v = readData(TooltipStyleImpl, data)
+    if v.isSome: some(toDyn(v.unsafeGet)) else: none[DataComponentImpl]()
+  of dcLock:
+    let v = readData(LockImpl, data)
+    if v.isSome: some(toDyn(v.unsafeGet)) else: none[DataComponentImpl]()
+  of dcContainerLoot:
+    let v = readData(ContainerLootImpl, data)
+    if v.isSome: some(toDyn(v.unsafeGet)) else: none[DataComponentImpl]()
+  of dcCustomModelData:
+    let v = readData(CustomModelDataImpl, data)
+    if v.isSome: some(toDyn(v.unsafeGet)) else: none[DataComponentImpl]()
+  of dcLodestoneTracker:
+    let v = readData(LodestoneTrackerImpl, data)
+    if v.isSome: some(toDyn(v.unsafeGet)) else: none[DataComponentImpl]()
+  of dcGlider:
+    some(toDyn(GliderImpl()))
+  of dcIntangibleProjectile:
+    some(toDyn(IntangibleProjectileImpl()))
+  of dcTrim:
+    let v = readData(TrimImpl, data)
+    if v.isSome: some(toDyn(v.unsafeGet)) else: none[DataComponentImpl]()
+  of dcCanPlaceOn:
+    let v = readData(CanPlaceOnImpl, data)
+    if v.isSome: some(toDyn(v.unsafeGet)) else: none[DataComponentImpl]()
+  of dcCanBreak:
+    let v = readData(CanBreakImpl, data)
+    if v.isSome: some(toDyn(v.unsafeGet)) else: none[DataComponentImpl]()
+  else:
+    none[DataComponentImpl]()
+
+
+proc readData*(_: typedesc[ContainerImpl]; tag: NbtTag): Option[ContainerImpl] =
+  var items: seq[ContainerSlot] = @[]
+  if tag.kind == ntkList:
+    for itemTag in tag.listVal:
+      if itemTag.kind == ntkCompound:
+        let slot = getInt(itemTag.compoundVal, "slot")
+        let itemCompound = getCompound(itemTag.compoundVal, "item")
+        if slot.isSome and itemCompound.isSome:
+          let stack = readItemStack(itemCompound.unsafeGet)
+          if stack.isSome:
+            # `slot as u8`.
+            items.add(ContainerSlot(slot: uint8(cast[uint32](slot.unsafeGet) and 0xFF'u32), stack: stack.unsafeGet))
+  some(ContainerImpl(items: items))
+
+proc readData*(_: typedesc[BundleContentsImpl]; tag: NbtTag): Option[BundleContentsImpl] =
+  var items: seq[ItemStack] = @[]
+  if tag.kind == ntkList:
+    for itemTag in tag.listVal:
+      if itemTag.kind == ntkCompound:
+        let stack = readItemStack(itemTag.compoundVal)
+        if stack.isSome:
+          items.add(stack.unsafeGet)
+  some(BundleContentsImpl(items: items))
+
+proc getWeight*(self: BundleContentsImpl): uint32 =
+  result = 0'u32
+  for item in self.items:
+    result += uint32(item.itemCount) * max(64'u32 div uint32(item.getMaxStackSize()), 1'u32)
+
+proc tryInsert*(self: var BundleContentsImpl; stack: var ItemStack): bool =
+  if stack.isEmpty() or stack.hasDataComponent(dcBundleContents):
+    return false
+  let weightPerItem = max(64'u32 div uint32(stack.getMaxStackSize()), 1'u32)
+  var insertedAnything = false
+  while stack.itemCount > 0'u8 and self.getWeight() + weightPerItem <= 64'u32:
+    if self.items.len > 0 and areItemsAndComponentsEqual(self.items[0], stack) and
+        self.items[0].itemCount < self.items[0].getMaxStackSize():
+      self.items[0].itemCount = self.items[0].itemCount + 1'u8
+      stack.itemCount = stack.itemCount - 1'u8
+      insertedAnything = true
+      continue
+    # `self.items.insert(0, ..)`.
+    var moved = @[stack.copyWithCount(1'u8)]
+    for existing in self.items:
+      moved.add(existing)
+    self.items = moved
+    stack.itemCount = stack.itemCount - 1'u8
+    insertedAnything = true
+  insertedAnything
+
+proc tryExtract*(self: var BundleContentsImpl): Option[ItemStack] =
+  if self.items.len == 0:
+    none[ItemStack]()
+  else:
+    let first = self.items[0]
+    self.items.delete(0)
+    some(first)
+
+proc readItemStack*(compound: NbtCompound): Option[ItemStack] =
+  # Get ID, which is a string like "minecraft:diamond_sword"
+  let fullId = getString(compound, "id")
+  if fullId.isNone:
+    return none[ItemStack]()
+  # Try to get item by registry key; this removes the "minecraft:" prefix if present.
+  let item = fromRegistryKey(Item, fullId.unsafeGet)
+  if item == nil:
+    return none[ItemStack]()
+  let count = getInt(compound, "count")
+  if count.isNone:
+    return none[ItemStack]()
+  # Create the item stack; `count as u8`.
+  var itemStack = newItemStack(uint8(cast[uint32](count.unsafeGet) and 0xFF'u32), item)
+  # Process any additional data in the components compound
+  let tag = getCompound(compound, "components")
+  if tag.isSome:
+    let components = tag.unsafeGet
+    for i in 0 ..< components.names.len:
+      let name = components.names[i]
+      if name.len > 0 and name[0] == '!':
+        let (known, id) = tryFromName(substr(name, 1, name.len - 1))
+        if not known:
+          return none[ItemStack]()
+        itemStack.patch.add(patchRemoved(id))
+      else:
+        let (known, id) = tryFromName(name)
+        if not known:
+          return none[ItemStack]()
+        let data = readData(id, components.values[i])
+        if data.isNone:
+          return none[ItemStack]()
+        itemStack.patch.add(patchSet(data.unsafeGet))
+  some(itemStack)
+
+proc fromRecipeResult*(id: string; count: uint8): ItemStack =
+  ## `impl From<&RecipeResultStruct> for ItemStack`.
+  let item = fromRegistryKey(Item, id)
+  if item == nil:
+    return emptyItemStack()
+  newItemStack(count, item)

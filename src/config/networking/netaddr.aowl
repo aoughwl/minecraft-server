@@ -1,14 +1,307 @@
-## Minimal stand-in for Rust's `std::net::SocketAddr`, used by config structs
-## that just need to store a bind address (query.rs, rcon.rs). No real
-## networking module exists yet in this port; this is deliberately just
-## enough shape to hold `ip:port` defaults. TODO: replace with a proper
-## socket-address type (v4/v6, parsing, display) once the networking layer
-## is being ported.
+## Rust's `std::net::SocketAddr` as the config structs use it. No upstream file of its own. serde writes it as
+## its `Display` text and reads it with `FromStr`, so this holds both grammars: decimal octets without leading
+## zeros, IPv6 with `::`, an embedded IPv4 tail and an optional `%scope`, and Rust's IPv6 display rules.
+## `ip` holds IPv4 in its first four bytes.
+
+import ../toml
 
 type
   SocketAddr* = object
-    ip*: array[4, byte]   ## IPv4 only for now.
+    isV6*: bool
+    ip*: array[16, uint8]
     port*: uint16
+    scopeId*: uint32
 
-proc unspecified*(port: uint16): SocketAddr {.inline.} =
-  SocketAddr(ip: [0'u8, 0, 0, 0], port: port)
+proc `==`*(a, b: SocketAddr): bool =
+  if a.isV6 != b.isV6 or a.port != b.port or a.scopeId != b.scopeId:
+    return false
+  var i = 0
+  while i < 16:
+    if a.ip[i] != b.ip[i]:
+      return false
+    inc i
+  true
+
+proc unspecified*(port: uint16): SocketAddr =
+  ## `SocketAddr::new(Ipv4Addr::UNSPECIFIED.into(), port)`
+  SocketAddr(isV6: false, port: port, scopeId: 0'u32)
+
+proc isDigitC(c: char): bool {.inline.} = c >= '0' and c <= '9'
+
+proc hexOf(c: char): int =
+  case c
+  of '0' .. '9': ord(c) - ord('0')
+  of 'a' .. 'f': ord(c) - ord('a') + 10
+  of 'A' .. 'F': ord(c) - ord('A') + 10
+  else: -1
+
+proc parseV4At(s: string; start: int; dst: var array[4, uint8]; stop: var int): bool =
+  ## Four octets from `start`, at most three digits each, no leading zero. `stop` is where they end.
+  var i = start
+  var part = 0
+  while part < 4:
+    if part > 0:
+      if i >= s.len or s[i] != '.':
+        return false
+      inc i
+    let first = i
+    var value = 0
+    while i < s.len and isDigitC(s[i]) and i - first < 3:
+      value = value * 10 + ord(s[i]) - ord('0')
+      inc i
+    if i == first or value > 255 or (i - first > 1 and s[first] == '0'):
+      return false
+    dst[part] = uint8(value)
+    inc part
+  stop = i
+  true
+
+proc parseV6Text(s: string; dst: var array[16, uint8]): bool =
+  ## The whole of `s` as an IPv6 address.
+  var head: seq[uint8] = @[]
+  var tail: seq[uint8] = @[]
+  var i = 0
+  var compressed = false
+  if s.len >= 2 and s[0] == ':' and s[1] == ':':
+    compressed = true
+    i = 2
+  elif s.len >= 1 and s[0] == ':':
+    return false
+  while i < s.len:
+    # An IPv4 tail takes the last two groups.
+    var isTail = false
+    var k = i
+    while k < s.len and s[k] != ':':
+      if s[k] == '.':
+        isTail = true
+      inc k
+    if isTail:
+      var v4 = default(array[4, uint8])
+      var stop = 0
+      if not parseV4At(s, i, v4, stop) or stop != s.len:
+        return false
+      for b in v4:
+        if compressed: tail.add(b) else: head.add(b)
+      i = stop
+      break
+    let first = i
+    var group = 0
+    while i < s.len and hexOf(s[i]) >= 0 and i - first < 4:
+      group = group * 16 + hexOf(s[i])
+      inc i
+    if i == first:
+      return false
+    let hi = uint8(group shr 8)
+    let lo = uint8(group and 255)
+    if compressed:
+      tail.add(hi)
+      tail.add(lo)
+    else:
+      head.add(hi)
+      head.add(lo)
+    if i >= s.len:
+      break
+    if s[i] != ':':
+      return false
+    inc i
+    if i < s.len and s[i] == ':':
+      if compressed:
+        return false
+      compressed = true
+      inc i
+    elif i >= s.len:
+      return false
+  let total = head.len + tail.len
+  if compressed:
+    # `::` stands for at least one group.
+    if total > 14:
+      return false
+  elif total != 16:
+    return false
+  var idx = 0
+  for b in head:
+    dst[idx] = b
+    inc idx
+  idx = 16 - tail.len
+  for b in tail:
+    dst[idx] = b
+    inc idx
+  true
+
+proc parsePortAt(s: string; start: int; port: var uint16): bool =
+  ## Decimal to the end of `s`. Rust takes leading zeros in a port, and no sign.
+  if start >= s.len:
+    return false
+  var value = 0'u32
+  var i = start
+  while i < s.len:
+    if not isDigitC(s[i]):
+      return false
+    value = value * 10'u32 + uint32(ord(s[i]) - ord('0'))
+    if value > 65535'u32:
+      return false
+    inc i
+  port = uint16(value)
+  true
+
+proc parseSocketAddr*(s: string): (bool, SocketAddr) =
+  ## `SocketAddr::from_str`.
+  var addrOut = SocketAddr()
+  if s.len == 0:
+    return (false, addrOut)
+  if s[0] == '[':
+    var close = -1
+    var pct = -1
+    var i = 1
+    while i < s.len:
+      if s[i] == ']':
+        close = i
+        break
+      if s[i] == '%' and pct < 0:
+        pct = i
+      inc i
+    if close < 0 or close + 1 >= s.len or s[close + 1] != ':':
+      return (false, addrOut)
+    let ipEnd = if pct >= 0: pct else: close
+    var bytes = default(array[16, uint8])
+    if not parseV6Text(s[1 ..< ipEnd], bytes):
+      return (false, addrOut)
+    addrOut.isV6 = true
+    addrOut.ip = bytes
+    if pct >= 0:
+      var scope = 0'u64
+      var k = pct + 1
+      if k == close:
+        return (false, addrOut)
+      while k < close:
+        if not isDigitC(s[k]):
+          return (false, addrOut)
+        scope = scope * 10'u64 + uint64(ord(s[k]) - ord('0'))
+        if scope > 4294967295'u64:
+          return (false, addrOut)
+        inc k
+      addrOut.scopeId = uint32(scope)
+    if not parsePortAt(s, close + 2, addrOut.port):
+      return (false, addrOut)
+    return (true, addrOut)
+  var v4 = default(array[4, uint8])
+  var stop = 0
+  if not parseV4At(s, 0, v4, stop) or stop >= s.len or s[stop] != ':':
+    return (false, addrOut)
+  var k = 0
+  while k < 4:
+    addrOut.ip[k] = v4[k]
+    inc k
+  if not parsePortAt(s, stop + 1, addrOut.port):
+    return (false, addrOut)
+  (true, addrOut)
+
+proc addV4(dst: var string; a, b, c, d: uint8) =
+  dst.add($int(a))
+  dst.add('.')
+  dst.add($int(b))
+  dst.add('.')
+  dst.add($int(c))
+  dst.add('.')
+  dst.add($int(d))
+
+proc addHexGroup(dst: var string; g: int) =
+  const Digits = "0123456789abcdef"
+  var started = false
+  var shift = 12
+  while shift >= 0:
+    let n = (g shr shift) and 15
+    if n != 0 or started or shift == 0:
+      dst.add(Digits[n])
+      started = true
+    shift -= 4
+
+proc ipText*(a: SocketAddr): string =
+  ## `IpAddr`'s `Display`.
+  result = ""
+  if not a.isV6:
+    addV4(result, a.ip[0], a.ip[1], a.ip[2], a.ip[3])
+    return
+  var mapped = a.ip[10] == 0xFF'u8 and a.ip[11] == 0xFF'u8
+  var k = 0
+  while k < 10:
+    if a.ip[k] != 0'u8:
+      mapped = false
+    inc k
+  if mapped:
+    result.add("::ffff:")
+    addV4(result, a.ip[12], a.ip[13], a.ip[14], a.ip[15])
+    return
+  var groups = default(array[8, int])
+  k = 0
+  while k < 8:
+    groups[k] = (int(a.ip[k * 2]) shl 8) or int(a.ip[k * 2 + 1])
+    inc k
+  # The first longest run of zero groups, if it is at least two long, becomes `::`.
+  var bestStart = -1
+  var bestLen = 0
+  var runStart = -1
+  k = 0
+  while k < 8:
+    if groups[k] == 0:
+      if runStart < 0:
+        runStart = k
+      if k - runStart + 1 > bestLen:
+        bestLen = k - runStart + 1
+        bestStart = runStart
+    else:
+      runStart = -1
+    inc k
+  if bestLen >= 2:
+    k = 0
+    while k < bestStart:
+      if k > 0:
+        result.add(':')
+      addHexGroup(result, groups[k])
+      inc k
+    result.add("::")
+    k = bestStart + bestLen
+    let first = k
+    while k < 8:
+      if k > first:
+        result.add(':')
+      addHexGroup(result, groups[k])
+      inc k
+  else:
+    k = 0
+    while k < 8:
+      if k > 0:
+        result.add(':')
+      addHexGroup(result, groups[k])
+      inc k
+
+proc `$`*(a: SocketAddr): string =
+  ## `SocketAddr`'s `Display`.
+  result = ""
+  if a.isV6:
+    result.add('[')
+    result.add(ipText(a))
+    if a.scopeId != 0'u32:
+      result.add('%')
+      result.add($a.scopeId)
+    result.add(']')
+  else:
+    result.add(ipText(a))
+  result.add(':')
+  result.add($int(a.port))
+
+proc toToml*(a: SocketAddr): TomlValue =
+  tomlStr($a)
+
+proc getSocketAddr*(d: var TomlDe; v: TomlValue; key: string; dst: var SocketAddr) =
+  var sub = TomlValue()
+  if d.enter(v, key, sub):
+    if sub.kind != tkString:
+      d.fail("invalid type: " & unexpected(sub) & ", expected socket address")
+    else:
+      let (ok, parsed) = parseSocketAddr(sub.strVal)
+      if ok:
+        dst = parsed
+      else:
+        d.fail("invalid socket address syntax")
+    d.leave()

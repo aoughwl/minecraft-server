@@ -1,112 +1,778 @@
-## Scoped-down aowlmony port of tools/pumpkin-codegen/src/noise_router.rs
-## (3405 lines - the largest generator in the suite by a wide margin).
+## Port of pumpkin-codegen/src/noise_router.rs (noise_router.rs)
 ##
-## Upstream's real job: read every worldgen/density_function/**/*.json file
-## (a recursive expression-tree format - constants, noise samples,
-## arithmetic combinators, splines, references to other named density
-## functions), deduplicate identical subtrees by content hash into a flat
-## node array, and emit a `proc_macro2::TokenStream` that builds the whole
-## DAG as Rust `static` data with index-based cross-references. That's a
-## real compiler-shaped problem (hash-consing, topological node ordering,
-## a `SplineRepr` sub-format with its own recursive `values: Box<[Self]>`
-## field) - not attempted here.
+## Reads `assets/density_function.json` and writes src/generated/noise_router.aowl.
 ##
-## IMPORTANT correction made while writing this file: `DensityFunctionRepr`
-## itself is `#[serde(tag = "_class", content = "value")]` - its JSON tag
-## field is `_class`, not the human-authored datapack format's `"type":
-## "minecraft:noise"` style tag seen in the raw
-## `assets/datapack/.../density_function/**/*.json` files (those use
-## namespaced `minecraft:`-prefixed type strings and a flat/nested object
-## shape with no `_class`/`value` wrapper at all). The two are DIFFERENT
-## representations - `DensityFunctionRepr` deserializes some other,
-## internal/precomputed JSON source this pass didn't locate, not the raw
-## datapack files directly. Do not assume the `_class`/JSON-type mapping
-## below has been verified against real on-disk data; it hasn't, since no
-## real `_class`-tagged input was found. It IS verified as an internally
-## consistent enum (fromJsonType/toJsonType round-trip for all 26 kinds).
+## Upstream dedupes a component by the `Hash` of its whole subtree and pushes it after its
+## children, and the runtime reads components by index, so the order here must be exactly
+## upstream's. Nodes are hash-consed bottom-up on a key made of the same fields upstream's
+## `#[derive(Hash)]` covers: so `minValue`/`maxValue` split a Binary, Linear, Unary or Spline that
+## the output does not otherwise distinguish, and `xzScale`/`yScale` of an
+## InterpolatedNoiseSampler do not split anything (upstream does not read them).
 ##
-## Scoped down per this port's established "table first, full semantics
-## later" pattern (block.rs/item.rs, recipes.rs): this generator emits only
-## `DensityFunctionKind`, the flat enum of the 26 node kinds
-## `DensityFunctionRepr` distinguishes (upstream's src, lines 466-587),
-## plus a name<->kind mapping. No tree structure, no evaluation, no spline
-## support. A future pass building the real DAG needs a NON-self-recursive
-## aowlmony shape for the tree (e.g. a flat `seq[DensityFunctionNode]` with
-## index-based child references, mirroring upstream's own post-hash-consing
-## representation) rather than a directly self-recursive `case object`,
-## which fails aowlmony's C-codegen even when `aowlmony check` passes clean
-## (see COMPILER-BUGS.md #3 at the repo root).
-##
-## Run with `aowlmony c -r src/data_codegen/gen_noise_router.aowl` from the
-## repo root.
+## The asset is JSON5: bare `NaN`, `Infinity` and `-Infinity` appear. std/json takes none of them,
+## so those tokens are quoted first and `dfNum` reads them back. All NaNs share one bit
+## pattern, as they do when Rust parses the text.
 
-import std/syncio
+import std/[json, strutils, syncio]
+import codegenutil, worldgenutil
 
 const OutPath = "src/generated/noise_router.aowl"
 
-## The 25 `DensityFunctionRepr` variant names, in upstream's declaration
-## order (tools/pumpkin-codegen/src/noise_router.rs:466-587). Values with a
-## `#[serde(rename(deserialize = "..."))]` are annotated below with the
-## JSON `_type` string that actually selects them, since it differs from
-## the Rust variant name for a few kinds (IntervalSelect keeps its name;
-## Wrapper's JSON type is "Wrapping"; Binary's is "BinaryOperation"; Linear's
-## is "LinearOperation"; Unary's is "UnaryOperation"; ClampedYGradient's is
-## "YClampedGradient").
-let Kinds: seq[(string, string)] = @[
-  ("Beardifier", "Beardifier"),
-  ("BlendAlpha", "BlendAlpha"),
-  ("BlendOffset", "BlendOffset"),
-  ("BlendDensity", "BlendDensity"),
-  ("FindTopSurface", "FindTopSurface"),
-  ("EndIslands", "EndIslands"),
-  ("Noise", "Noise"),
-  ("ShiftA", "ShiftA"),
-  ("ShiftB", "ShiftB"),
-  ("ShiftedNoise", "ShiftedNoise"),
-  ("InterpolatedNoiseSampler", "InterpolatedNoiseSampler"),
-  ("IntervalSelect", "IntervalSelect"),
-  ("Wrapper", "Wrapping"),
-  ("Constant", "Constant"),
-  ("ClampedYGradient", "YClampedGradient"),
-  ("Gradient", "Gradient"),
-  ("DistanceToPoint", "DistanceToPoint"),
-  ("Lerp", "Lerp"),
-  ("Rounding", "Rounding"),
-  ("Slice", "Slice"),
-  ("Binary", "BinaryOperation"),
-  ("Linear", "LinearOperation"),
-  ("Unary", "UnaryOperation"),
-  ("Clamp", "Clamp"),
-  ("RangeChoice", "RangeChoice"),
-  ("Spline", "Spline"),
-]
+type
+  Repr = object
+    ## One interned node. `kids` is in upstream's traversal order, and `isSpline` says which
+    ## arena an index belongs to.
+    cls: string
+    kids: seq[int]
+    extra: string   ## Encoded fields that hold no indices.
+    isSpline: bool
+    key: string     ## What upstream's Hash covers.
 
-proc build(): string =
-  var s = "## GENERATED by src/data_codegen/gen_noise_router.aowl - do not edit by hand.\n"
-  s.add("## Scoped-down: node-kind enum only, no tree structure. See gen_noise_router.aowl's\n")
-  s.add("## doc comment for what's deferred and why.\n\n")
-  s.add("type\n  DensityFunctionKind* = enum\n")
-  for (name, _) in Kinds:
-    s.add("    dfk" & name & "\n")
-  s.add("\n")
+  Interner = ref object
+    nodes: seq[Repr]
+    buckets: seq[seq[int]]
+    noiseNames: seq[string]
 
-  s.add("proc densityFunctionKindFromJsonType*(jsonType: string): (bool, DensityFunctionKind) =\n")
-  s.add("  case jsonType\n")
-  for (name, jsonType) in Kinds:
-    s.add("  of \"" & jsonType & "\": (true, dfk" & name & ")\n")
-  s.add("  else: (false, dfk" & Kinds[0][0] & ")\n\n")
+const BucketCount = 65536
 
-  s.add("proc densityFunctionKindToJsonType*(k: DensityFunctionKind): string =\n")
-  s.add("  case k\n")
-  for (name, jsonType) in Kinds:
-    s.add("  of dfk" & name & ": \"" & jsonType & "\"\n")
+proc hashKey(s: string): int =
+  ## FNV-1a; only an index into buckets. Equality is on the whole key.
+  var h = 2166136261'u32
+  for ch in s:
+    h = (h xor uint32(ord(ch))) * 16777619'u32
+  int(h and uint32(BucketCount - 1))
 
-  s
+proc intern(t: Interner; r: Repr): int =
+  let b = hashKey(r.key)
+  var i = 0
+  while i < t.buckets[b].len:
+    let id = t.buckets[b][i]
+    if t.nodes[id].key == r.key:
+      return id
+    inc i
+  t.nodes.add(r)
+  t.buckets[b].add(t.nodes.len - 1)
+  t.nodes.len - 1
 
-when isMainModule:
-  let generated = build()
-  try:
-    writeFile(OutPath, generated)
-    echo "wrote " & OutPath & " (" & $generated.len & " bytes, " & $Kinds.len & " kinds)"
-  except ErrorCode as e:
-    echo "generation failed: " & $e
+proc quoteNonFinite(text: string): string =
+  ## Quotes the JSON5 number tokens std/json cannot read, outside of strings only.
+  result = newStringOfCap(text.len + 4096)
+  var inString = false
+  var i = 0
+  while i < text.len:
+    let ch = text[i]
+    if inString:
+      result.add(ch)
+      if ch == '\\':
+        inc i
+        if i < text.len: result.add(text[i])
+      elif ch == '"':
+        inString = false
+      inc i
+    elif ch == '"':
+      inString = true
+      result.add(ch)
+      inc i
+    elif ch == 'N' and text.continuesWith("NaN", i):
+      result.add("\"NaN\"")
+      i += 3
+    elif ch == 'I' and text.continuesWith("Infinity", i):
+      result.add("\"Infinity\"")
+      i += 8
+    elif ch == '-' and text.continuesWith("-Infinity", i):
+      result.add("\"-Infinity\"")
+      i += 9
+    else:
+      result.add(ch)
+      inc i
+
+proc nonFinite(bits: uint64): float64 =
+  cast[float64](bits)
+
+proc dfNum(n: JsonNode): float64 =
+  if kind(n) == JString:
+    case getStr(n)
+    of "NaN": nonFinite(0x7ff8000000000000'u64)
+    of "Infinity": nonFinite(0x7ff0000000000000'u64)
+    of "-Infinity": nonFinite(0xfff0000000000000'u64)
+    else:
+      echo "gen_noise_router: not a number: " & getStr(n)
+      quit(1)
+  else:
+    num(n)
+
+proc req(n: JsonNode; key: string): JsonNode =
+  let (ok, v) = fieldOf(n, key)
+  if not ok:
+    echo "gen_noise_router: missing field " & key
+    quit(1)
+  v
+
+proc f64(n: JsonNode; key: string): string =
+  ## A float64 field as its bits: the form both the key and the output use.
+  hexBits64(dfNum(req(n, key)))
+
+proc noiseIndex(t: Interner; rawName: string): int =
+  ## `to_shouty_snake_case` on the id names a `DoublePerlinNoiseParameters` constant.
+  let name = stripMc(rawName).replace("/", "_")
+  var i = 0
+  while i < t.noiseNames.len:
+    if t.noiseNames[i] == name:
+      return i
+    inc i
+  echo "gen_noise_router: unknown noise " & rawName
+  quit(1)
+
+proc internFunction(t: Interner; n: JsonNode): int
+
+proc internSpline(t: Interner; n: JsonNode): int =
+  let splineType = strAt(n, "_type")
+  let (_, v) = fieldOf(n, "value")
+  case splineType
+  of "fixed":
+    let bits = hexBits32(dfNum(req(v, "value")))
+    t.intern(Repr(cls: "F", kids: @[], extra: bits, isSpline: true, key: "sf|" & bits))
+  of "standard":
+    var locs: seq[string] = @[]
+    for x in items(req(v, "locations")):
+      locs.add(hexBits32(dfNum(x)))
+    var ders: seq[string] = @[]
+    for x in items(req(v, "derivatives")):
+      ders.add(hexBits32(dfNum(x)))
+    var kids = @[internFunction(t, req(v, "locationFunction"))]
+    for x in items(req(v, "values")):
+      kids.add(internSpline(t, x))
+    if locs.len != kids.len - 1 or ders.len != kids.len - 1:
+      echo "gen_noise_router: spline lengths differ"
+      quit(1)
+    var extra = ""
+    var i = 0
+    while i < locs.len:
+      if i > 0: extra.add(",")
+      extra.add(locs[i] & ":" & ders[i])
+      inc i
+    var key = "ss|"
+    i = 0
+    while i < kids.len:
+      key.add($kids[i] & ",")
+      inc i
+    key.add("|" & extra)
+    t.intern(Repr(cls: "S", kids: kids, extra: extra, isSpline: true, key: key))
+  else:
+    echo "gen_noise_router: unknown spline type " & splineType
+    quit(1)
+
+proc makeNode(t: Interner; cls: string; kids: seq[int]; extra, hashOnly: string): int =
+  var key = cls & "|"
+  var i = 0
+  while i < kids.len:
+    key.add($kids[i] & ",")
+    inc i
+  key.add("|" & extra & "|" & hashOnly)
+  t.intern(Repr(cls: cls, kids: kids, extra: extra, isSpline: false, key: key))
+
+proc opCode(s: string): string =
+  ## One letter per operation in the serial form.
+  case s
+  of "ADD": "a"
+  of "MUL": "m"
+  of "MIN": "n"
+  of "MAX": "x"
+  of "ABS": "A"
+  of "SQUARE": "S"
+  of "CUBE": "C"
+  of "HALF_NEGATIVE": "H"
+  of "QUARTER_NEGATIVE": "Q"
+  of "SQUEEZE": "Z"
+  of "INVERT": "I"
+  else:
+    echo "gen_noise_router: unknown operation " & s
+    quit(1)
+
+proc wrapperCode(s: string): string =
+  case s
+  of "Interpolated": "I"
+  of "FlatCache": "F"
+  of "Cache2D": "2"
+  of "CacheOnce": "O"
+  of "CellCache": "C"
+  else:
+    echo "gen_noise_router: unknown wrapper " & s
+    quit(1)
+
+proc internFunction(t: Interner; n: JsonNode): int =
+  let cls = strAt(n, "_class")
+  let (_, v) = fieldOf(n, "value")
+  case cls
+  of "Beardifier":
+    makeNode(t, "Be", @[], "", "")
+  of "BlendAlpha":
+    makeNode(t, "Ba", @[], "", "")
+  of "BlendOffset":
+    makeNode(t, "Bo", @[], "", "")
+  of "EndIslands":
+    makeNode(t, "Ei", @[], "", "")
+  of "BlendDensity":
+    makeNode(t, "Bd", @[internFunction(t, req(v, "input"))], "", "")
+  of "FindTopSurface":
+    let d = internFunction(t, req(v, "density"))
+    let u = internFunction(t, req(v, "upperBound"))
+    makeNode(t, "Ft", @[d, u], $intAt(v, "lowerBound") & ":" & $intAt(v, "cellHeight"), "")
+  of "Noise":
+    makeNode(t, "No", @[], $noiseIndex(t, strAt(v, "noise")) & ":" & f64(v, "xzScale") & ":" & f64(v, "yScale"), "")
+  of "ShiftA":
+    makeNode(t, "Sa", @[], $noiseIndex(t, strAt(v, "offsetNoise")), "")
+  of "ShiftB":
+    makeNode(t, "Sb", @[], $noiseIndex(t, strAt(v, "offsetNoise")), "")
+  of "ShiftedNoise":
+    let x = internFunction(t, req(v, "shiftX"))
+    let y = internFunction(t, req(v, "shiftY"))
+    let z = internFunction(t, req(v, "shiftZ"))
+    makeNode(t, "Sn", @[x, y, z],
+      $noiseIndex(t, strAt(v, "noise")) & ":" & f64(v, "xzScale") & ":" & f64(v, "yScale"), "")
+  of "InterpolatedNoiseSampler":
+    makeNode(t, "In", @[],
+      f64(v, "scaledXzScale") & ":" & f64(v, "scaledYScale") & ":" & f64(v, "xzFactor") & ":" &
+      f64(v, "yFactor") & ":" & f64(v, "smearScaleMultiplier"), f64(v, "maxValue"))
+  of "IntervalSelect":
+    var kids = @[internFunction(t, req(v, "input"))]
+    for f in items(req(v, "functions")):
+      kids.add(internFunction(t, f))
+    var extra = ""
+    for x in items(req(v, "thresholds")):
+      if extra.len > 0: extra.add(":")
+      extra.add(hexBits64(dfNum(x)))
+    makeNode(t, "Is", kids, extra, "")
+  of "Wrapping":
+    let inner = internFunction(t, req(v, "wrapped"))
+    makeNode(t, "Wr", @[inner], wrapperCode(strAt(v, "type")), "")
+  of "Constant":
+    makeNode(t, "Co", @[], f64(v, "value"), "")
+  of "YClampedGradient":
+    makeNode(t, "Yg", @[],
+      hexBits64(float64(intAt(v, "fromY"))) & ":" & hexBits64(float64(intAt(v, "toY"))) & ":" &
+      f64(v, "fromValue") & ":" & f64(v, "toValue"), "")
+  of "BinaryOperation":
+    let a = internFunction(t, req(v, "argument1"))
+    let b = internFunction(t, req(v, "argument2"))
+    makeNode(t, "Bi", @[a, b], opCode(strAt(v, "type")), f64(v, "minValue") & ":" & f64(v, "maxValue"))
+  of "LinearOperation":
+    let inner = internFunction(t, req(v, "input"))
+    makeNode(t, "Li", @[inner], opCode(strAt(v, "specificType")) & ":" & f64(v, "argument"),
+      f64(v, "minValue") & ":" & f64(v, "maxValue"))
+  of "UnaryOperation":
+    let inner = internFunction(t, req(v, "input"))
+    makeNode(t, "Un", @[inner], opCode(strAt(v, "type")), f64(v, "minValue") & ":" & f64(v, "maxValue"))
+  of "Clamp":
+    let inner = internFunction(t, req(v, "input"))
+    makeNode(t, "Cl", @[inner], f64(v, "minValue") & ":" & f64(v, "maxValue"), "")
+  of "RangeChoice":
+    let i = internFunction(t, req(v, "input"))
+    let a = internFunction(t, req(v, "whenInRange"))
+    let b = internFunction(t, req(v, "whenOutOfRange"))
+    makeNode(t, "Rc", @[i, a, b], f64(v, "minInclusive") & ":" & f64(v, "maxExclusive"), "")
+  of "Spline":
+    let s = internSpline(t, req(v, "spline"))
+    makeNode(t, "Sp", @[s], "", f64(v, "minValue") & ":" & f64(v, "maxValue"))
+  else:
+    echo "gen_noise_router: unknown density function class " & cls
+    quit(1)
+
+type
+  Stack = ref object
+    ## One `full_component_stack`, and its spline arena.
+    index: seq[int]        ## Interned id to stack index, -1 when absent.
+    lines: seq[string]
+    splineIndex: seq[int]  ## Interned id to arena index, -1 when absent.
+    splineLines: seq[string]
+
+proc newStack(t: Interner): Stack =
+  result = Stack(index: newSeq[int](t.nodes.len), lines: @[],
+    splineIndex: newSeq[int](t.nodes.len), splineLines: @[])
+  var i = 0
+  while i < t.nodes.len:
+    result.index[i] = -1
+    result.splineIndex[i] = -1
+    inc i
+
+proc visitSpline(t: Interner; st: Stack; id: int): int
+
+proc visit(t: Interner; st: Stack; id: int): int =
+  ## `get_index_for_component`.
+  if st.index[id] >= 0:
+    return st.index[id]
+  var parts = ""
+  var i = 0
+  while i < t.nodes[id].kids.len:
+    let k = t.nodes[id].kids[i]
+    if i > 0: parts.add(",")
+    if t.nodes[k].isSpline:
+      parts.add($visitSpline(t, st, k))
+    else:
+      parts.add($visit(t, st, k))
+    inc i
+  st.lines.add(t.nodes[id].cls & "|" & parts & "|" & t.nodes[id].extra)
+  st.index[id] = st.lines.len - 1
+  st.lines.len - 1
+
+proc visitSpline(t: Interner; st: Stack; id: int): int =
+  ## `SplineRepr::get_token_stream`. A repeat traversal adds nothing to the stack, every
+  ## component under it being there already, so a spline seen before can share its arena slot.
+  if st.splineIndex[id] >= 0:
+    return st.splineIndex[id]
+  var parts = ""
+  var i = 0
+  while i < t.nodes[id].kids.len:
+    let k = t.nodes[id].kids[i]
+    if i > 0: parts.add(",")
+    if i == 0:
+      parts.add($visit(t, st, k))
+    else:
+      parts.add($visitSpline(t, st, k))
+    inc i
+  st.splineLines.add(t.nodes[id].cls & "|" & parts & "|" & t.nodes[id].extra)
+  st.splineIndex[id] = st.splineLines.len - 1
+  st.splineLines.len - 1
+
+proc stackText(st: Stack): string =
+  ## Components, a line holding `~`, then the spline arena.
+  result = ""
+  var i = 0
+  while i < st.lines.len:
+    result.add(st.lines[i] & "\n")
+    inc i
+  result.add("~\n")
+  i = 0
+  while i < st.splineLines.len:
+    result.add(st.splineLines[i] & "\n")
+    inc i
+
+type
+  RouterIds = object
+    ## `NoiseRouterRepr`, as interned ids.
+    barrier, floodedness, spread, lava, temperature, vegetation, continents: int
+    erosion, depth, ridges, surface, finalDensity, veinToggle, veinRidged, veinGap: int
+
+proc internRouter(t: Interner; r: JsonNode; fixFinal: bool): RouterIds =
+  ## All fields are interned before any stack is sized. `fixFinal` is `fix_final_density!`.
+  result = RouterIds(
+    barrier: internFunction(t, req(r, "barrierNoise")),
+    floodedness: internFunction(t, req(r, "fluidLevelFloodednessNoise")),
+    spread: internFunction(t, req(r, "fluidLevelSpreadNoise")),
+    lava: internFunction(t, req(r, "lavaNoise")),
+    temperature: internFunction(t, req(r, "temperature")),
+    vegetation: internFunction(t, req(r, "vegetation")),
+    continents: internFunction(t, req(r, "continents")),
+    erosion: internFunction(t, req(r, "erosion")),
+    depth: internFunction(t, req(r, "depth")),
+    ridges: internFunction(t, req(r, "ridges")),
+    surface: internFunction(t, req(r, "preliminarySurfaceLevel")),
+    finalDensity: internFunction(t, req(r, "finalDensity")),
+    veinToggle: internFunction(t, req(r, "veinToggle")),
+    veinRidged: internFunction(t, req(r, "veinRidged")),
+    veinGap: internFunction(t, req(r, "veinGap")))
+  if fixFinal:
+    let beard = makeNode(t, "Be", @[], "", "")
+    let bin = makeNode(t, "Bi", @[result.finalDensity, beard], "a",
+      hexBits64(nonFinite(0xfff0000000000000'u64)) & ":" & hexBits64(nonFinite(0x7ff0000000000000'u64)))
+    result.finalDensity = makeNode(t, "Wr", @[bin], "C", "")
+
+proc routerConst(t: Interner; name: string; ids: RouterIds): string =
+  ## `NoiseRouterRepr::into_token_stream`: the order of these visits fixes every index.
+  let noise = newStack(t)
+  let finalDensity = visit(t, noise, ids.finalDensity)
+  let barrier = visit(t, noise, ids.barrier)
+  let floodedness = visit(t, noise, ids.floodedness)
+  let spread = visit(t, noise, ids.spread)
+  let lava = visit(t, noise, ids.lava)
+  let veinToggle = visit(t, noise, ids.veinToggle)
+  let veinRidged = visit(t, noise, ids.veinRidged)
+  let veinGap = visit(t, noise, ids.veinGap)
+  let noiseErosion = visit(t, noise, ids.erosion)
+  let noiseDepth = visit(t, noise, ids.depth)
+
+  let surface = newStack(t)
+  discard visit(t, surface, ids.surface)
+
+  let multi = newStack(t)
+  let ridges = visit(t, multi, ids.ridges)
+  let temperature = visit(t, multi, ids.temperature)
+  let vegetation = visit(t, multi, ids.vegetation)
+  let continents = visit(t, multi, ids.continents)
+  let multiErosion = visit(t, multi, ids.erosion)
+  let multiDepth = visit(t, multi, ids.depth)
+
+  result = "let " & name & "* = decodeRouters(\n"
+  result.add("  " & aowlStr(stackText(noise)) & ",\n")
+  result.add("  " & aowlStr(stackText(surface)) & ",\n")
+  result.add("  " & aowlStr(stackText(multi)) & ",\n")
+  result.add("  [" & $barrier & "'i32, " & $floodedness & "'i32, " & $spread & "'i32, " & $lava & "'i32, " &
+    $noiseErosion & "'i32, " & $noiseDepth & "'i32, " & $finalDensity & "'i32, " & $veinToggle & "'i32, " &
+    $veinRidged & "'i32, " & $veinGap & "'i32],\n")
+  result.add("  [" & $temperature & "'i32, " & $vegetation & "'i32, " & $continents & "'i32, " &
+    $multiErosion & "'i32, " & $multiDepth & "'i32, " & $ridges & "'i32])\n\n")
+
+const Header = """
+## GENERATED by src/data_codegen/gen_noise_router.aowl - do not edit by hand.
+## Port of pumpkin-data/src/generated/noise_router.rs.
+##
+## Upstream's `BaseNoiseFunctionComponent` enum is one flat object here, since a case object cannot
+## repeat `input_index` across branches, and its `&'static XData` structs flatten into it. `noiseId`
+## is an index into noise_parameter.aowl's `NoiseParameters`. Upstream's nested
+## `&'static SplineRepr` becomes an index into `splines`, a per-stack arena; a self-recursive ref
+## in a case object does not compile (COMPILER-BUGS.md bug 4). Component order and indices are
+## upstream's exactly: see src/data_codegen/noise_routertest.aowl.
+
+import gendecode
+import noise_parameter
+export noise_parameter
+
+type
+  BinaryOperation* {.pure.} = enum
+    Add, Mul, Min, Max
+
+  LinearOperation* {.pure.} = enum
+    Add, Mul
+
+  UnaryOperation* {.pure.} = enum
+    Abs, Square, Cube, HalfNegative, QuarterNegative, Squeeze, Invert
+
+  WrapperType* {.pure.} = enum
+    Interpolated, CacheFlat, Cache2D, CacheOnce, CellCache
+
+  BaseNoiseFunctionComponentKind* {.pure.} = enum
+    Beardifier
+    BlendAlpha
+    BlendOffset
+    BlendDensity
+    FindTopSurface
+    EndIslands
+    Noise
+    ShiftA
+    ShiftB
+    ShiftedNoise
+    InterpolatedNoiseSampler
+    IntervalSelect
+    Wrapper
+    Constant
+    ClampedYGradient
+    Binary
+    Linear
+    Unary
+    Clamp
+    RangeChoice
+    Spline
+
+  BaseNoiseFunctionComponent* = object
+    kind*: BaseNoiseFunctionComponentKind
+    inputIndex*: int32           ## BlendDensity, IntervalSelect, Wrapper, Linear, Unary, Clamp, RangeChoice.
+    densityIndex*: int32         ## FindTopSurface.
+    upperBoundIndex*: int32      ## FindTopSurface.
+    lowerBound*: int32           ## FindTopSurface.
+    cellHeight*: int32           ## FindTopSurface.
+    noiseId*: int32              ## Noise, ShiftA, ShiftB, ShiftedNoise.
+    xzScale*: float64            ## Noise, ShiftedNoise.
+    yScale*: float64             ## Noise, ShiftedNoise.
+    shiftXIndex*: int32          ## ShiftedNoise.
+    shiftYIndex*: int32          ## ShiftedNoise.
+    shiftZIndex*: int32          ## ShiftedNoise.
+    scaledXzScale*: float64      ## InterpolatedNoiseSampler.
+    scaledYScale*: float64       ## InterpolatedNoiseSampler.
+    xzFactor*: float64           ## InterpolatedNoiseSampler.
+    yFactor*: float64            ## InterpolatedNoiseSampler.
+    smearScaleMultiplier*: float64  ## InterpolatedNoiseSampler.
+    thresholds*: seq[float64]    ## IntervalSelect.
+    functionsIndices*: seq[int32]   ## IntervalSelect.
+    wrapper*: WrapperType        ## Wrapper.
+    value*: float64              ## Constant.
+    fromY*: float64              ## ClampedYGradient.
+    toY*: float64                ## ClampedYGradient.
+    fromValue*: float64          ## ClampedYGradient.
+    toValue*: float64            ## ClampedYGradient.
+    argument1Index*: int32       ## Binary.
+    argument2Index*: int32       ## Binary.
+    binaryOperation*: BinaryOperation  ## Binary.
+    linearOperation*: LinearOperation  ## Linear.
+    argument*: float64           ## Linear.
+    unaryOperation*: UnaryOperation    ## Unary.
+    minValue*: float64           ## Clamp.
+    maxValue*: float64           ## Clamp.
+    whenInRangeIndex*: int32     ## RangeChoice.
+    whenOutRangeIndex*: int32    ## RangeChoice.
+    minInclusive*: float64       ## RangeChoice.
+    maxExclusive*: float64       ## RangeChoice.
+    spline*: int32               ## Spline: index into the stack's `splines`.
+
+  SplinePoint* = object
+    location*: float32
+    value*: int32  ## Index into the stack's `splines`.
+    derivative*: float32
+
+  SplineReprKind* {.pure.} = enum
+    Standard, Fixed
+
+  SplineRepr* = object
+    kind*: SplineReprKind
+    locationFunctionIndex*: int32  ## Standard.
+    points*: seq[SplinePoint]      ## Standard.
+    value*: float32                ## Fixed.
+
+  ComponentStack* = object
+    ## Upstream's `full_component_stack` with the arena its splines index.
+    components*: seq[BaseNoiseFunctionComponent]
+    splines*: seq[SplineRepr]
+
+  BaseNoiseRouter* = object
+    fullComponentStack*: ComponentStack
+    barrierNoise*: int32
+    fluidLevelFloodednessNoise*: int32
+    fluidLevelSpreadNoise*: int32
+    lavaNoise*: int32
+    erosion*: int32
+    depth*: int32
+    finalDensity*: int32
+    veinToggle*: int32
+    veinRidged*: int32
+    veinGap*: int32
+
+  BaseSurfaceEstimator* = object
+    fullComponentStack*: ComponentStack
+
+  BaseMultiNoiseRouter* = object
+    fullComponentStack*: ComponentStack
+    temperature*: int32
+    vegetation*: int32
+    continents*: int32
+    erosion*: int32
+    depth*: int32
+    ridges*: int32
+
+  BaseNoiseRouters* = ref object
+    noise*: BaseNoiseRouter
+    surfaceEstimator*: BaseSurfaceEstimator
+    multiNoise*: BaseMultiNoiseRouter
+
+proc applyDensity*(operation: LinearOperation; argument, density: float64): float64 {.inline.} =
+  ## `LinearData::apply_density`.
+  case operation
+  of LinearOperation.Add: density + argument
+  of LinearOperation.Mul: density * argument
+
+proc applyDensity*(operation: UnaryOperation; density: float64): float64 =
+  ## `UnaryData::apply_density`.
+  case operation
+  of UnaryOperation.Abs:
+    if density < 0.0: -density else: density
+  of UnaryOperation.Square:
+    density * density
+  of UnaryOperation.Cube:
+    density * density * density
+  of UnaryOperation.HalfNegative:
+    if density > 0.0: density else: density * 0.5
+  of UnaryOperation.QuarterNegative:
+    if density > 0.0: density else: density * 0.25
+  of UnaryOperation.Squeeze:
+    let clamped = if density < -1.0: -1.0 elif density > 1.0: 1.0 else: density
+    clamped / 2.0 - clamped * clamped * clamped / 24.0
+  of UnaryOperation.Invert:
+    if density == 0.0: cast[float64](0x7ff0000000000000'u64) else: 1.0 / density
+
+proc applyClamp*(minValue, maxValue, density: float64): float64 {.inline.} =
+  ## `ClampData::apply_density`.
+  if density < minValue: minValue elif density > maxValue: maxValue else: density
+
+proc indexList(s: string; pos: var int; sep: char): seq[int32] =
+  ## `3,4,5` up to `sep`, leaving `pos` after it.
+  result = @[]
+  while pos < s.len and s[pos] != sep:
+    result.add(int32(fieldInt(s, pos, ',', sep)))
+    if pos < s.len and s[pos] == ',': inc pos
+  skipSep(s, pos)
+
+proc decodeSplines(s: string; start: int): seq[SplineRepr] =
+  result = @[]
+  var pos = start
+  while pos < s.len:
+    let cls = s[pos]
+    pos += 2
+    let kids = indexList(s, pos, '|')
+    if cls == 'F':
+      result.add(SplineRepr(kind: SplineReprKind.Fixed, value: fieldF32Bits(s, pos, '|')))
+    else:
+      var points = newSeq[SplinePoint](kids.len - 1)
+      var i = 0
+      while i < points.len:
+        let location = fieldF32Bits(s, pos, ':')
+        skipSep(s, pos)
+        let derivative = fieldF32Bits(s, pos, ',')
+        if pos < s.len and s[pos] == ',': inc pos
+        points[i] = SplinePoint(location: location, value: kids[i + 1], derivative: derivative)
+        inc i
+      result.add(SplineRepr(kind: SplineReprKind.Standard, locationFunctionIndex: kids[0], points: points))
+    skipSep(s, pos)
+
+proc decodeStack(s: string): ComponentStack =
+  ## The serial form gen_noise_router writes: `<class>|<child indices>|<fields>` per line.
+  result = ComponentStack(components: @[], splines: @[])
+  var pos = 0
+  while pos < s.len and s[pos] != '~':
+    let cls = substr(s, pos, pos + 1)
+    pos += 3
+    let k = indexList(s, pos, '|')
+    var c = BaseNoiseFunctionComponent()
+    case cls
+    of "Be": c.kind = BaseNoiseFunctionComponentKind.Beardifier
+    of "Ba": c.kind = BaseNoiseFunctionComponentKind.BlendAlpha
+    of "Bo": c.kind = BaseNoiseFunctionComponentKind.BlendOffset
+    of "Ei": c.kind = BaseNoiseFunctionComponentKind.EndIslands
+    of "Bd":
+      c.kind = BaseNoiseFunctionComponentKind.BlendDensity
+      c.inputIndex = k[0]
+    of "Ft":
+      c.kind = BaseNoiseFunctionComponentKind.FindTopSurface
+      c.densityIndex = k[0]
+      c.upperBoundIndex = k[1]
+      c.lowerBound = int32(fieldInt(s, pos, ':')); skipSep(s, pos)
+      c.cellHeight = int32(fieldInt(s, pos, ':'))
+    of "No", "Sn":
+      if cls == "No":
+        c.kind = BaseNoiseFunctionComponentKind.Noise
+      else:
+        c.kind = BaseNoiseFunctionComponentKind.ShiftedNoise
+        c.shiftXIndex = k[0]
+        c.shiftYIndex = k[1]
+        c.shiftZIndex = k[2]
+      c.noiseId = int32(fieldInt(s, pos, ':')); skipSep(s, pos)
+      c.xzScale = fieldF64Bits(s, pos, ':'); skipSep(s, pos)
+      c.yScale = fieldF64Bits(s, pos, ':')
+    of "Sa", "Sb":
+      c.kind = if cls == "Sa": BaseNoiseFunctionComponentKind.ShiftA
+               else: BaseNoiseFunctionComponentKind.ShiftB
+      c.noiseId = int32(fieldInt(s, pos, ':'))
+    of "In":
+      c.kind = BaseNoiseFunctionComponentKind.InterpolatedNoiseSampler
+      c.scaledXzScale = fieldF64Bits(s, pos, ':'); skipSep(s, pos)
+      c.scaledYScale = fieldF64Bits(s, pos, ':'); skipSep(s, pos)
+      c.xzFactor = fieldF64Bits(s, pos, ':'); skipSep(s, pos)
+      c.yFactor = fieldF64Bits(s, pos, ':'); skipSep(s, pos)
+      c.smearScaleMultiplier = fieldF64Bits(s, pos, ':')
+    of "Is":
+      c.kind = BaseNoiseFunctionComponentKind.IntervalSelect
+      c.inputIndex = k[0]
+      c.functionsIndices = newSeq[int32](k.len - 1)
+      var i = 1
+      while i < k.len:
+        c.functionsIndices[i - 1] = k[i]
+        inc i
+      c.thresholds = @[]
+      while pos < s.len and s[pos] != '\n':
+        c.thresholds.add(fieldF64Bits(s, pos, ':'))
+        if pos < s.len and s[pos] == ':': inc pos
+    of "Wr":
+      c.kind = BaseNoiseFunctionComponentKind.Wrapper
+      c.inputIndex = k[0]
+      c.wrapper = case s[pos]
+        of 'I': WrapperType.Interpolated
+        of 'F': WrapperType.CacheFlat
+        of '2': WrapperType.Cache2D
+        of 'O': WrapperType.CacheOnce
+        else: WrapperType.CellCache
+      inc pos
+    of "Co":
+      c.kind = BaseNoiseFunctionComponentKind.Constant
+      c.value = fieldF64Bits(s, pos, ':')
+    of "Yg":
+      c.kind = BaseNoiseFunctionComponentKind.ClampedYGradient
+      c.fromY = fieldF64Bits(s, pos, ':'); skipSep(s, pos)
+      c.toY = fieldF64Bits(s, pos, ':'); skipSep(s, pos)
+      c.fromValue = fieldF64Bits(s, pos, ':'); skipSep(s, pos)
+      c.toValue = fieldF64Bits(s, pos, ':')
+    of "Bi":
+      c.kind = BaseNoiseFunctionComponentKind.Binary
+      c.argument1Index = k[0]
+      c.argument2Index = k[1]
+      c.binaryOperation = case s[pos]
+        of 'a': BinaryOperation.Add
+        of 'm': BinaryOperation.Mul
+        of 'n': BinaryOperation.Min
+        else: BinaryOperation.Max
+      inc pos
+    of "Li":
+      c.kind = BaseNoiseFunctionComponentKind.Linear
+      c.inputIndex = k[0]
+      c.linearOperation = if s[pos] == 'a': LinearOperation.Add else: LinearOperation.Mul
+      pos += 2
+      c.argument = fieldF64Bits(s, pos, ':')
+    of "Un":
+      c.kind = BaseNoiseFunctionComponentKind.Unary
+      c.inputIndex = k[0]
+      c.unaryOperation = case s[pos]
+        of 'A': UnaryOperation.Abs
+        of 'S': UnaryOperation.Square
+        of 'C': UnaryOperation.Cube
+        of 'H': UnaryOperation.HalfNegative
+        of 'Q': UnaryOperation.QuarterNegative
+        of 'Z': UnaryOperation.Squeeze
+        else: UnaryOperation.Invert
+      inc pos
+    of "Cl":
+      c.kind = BaseNoiseFunctionComponentKind.Clamp
+      c.inputIndex = k[0]
+      c.minValue = fieldF64Bits(s, pos, ':'); skipSep(s, pos)
+      c.maxValue = fieldF64Bits(s, pos, ':')
+    of "Rc":
+      c.kind = BaseNoiseFunctionComponentKind.RangeChoice
+      c.inputIndex = k[0]
+      c.whenInRangeIndex = k[1]
+      c.whenOutRangeIndex = k[2]
+      c.minInclusive = fieldF64Bits(s, pos, ':'); skipSep(s, pos)
+      c.maxExclusive = fieldF64Bits(s, pos, ':')
+    of "Sp":
+      c.kind = BaseNoiseFunctionComponentKind.Spline
+      c.spline = k[0]
+    else:
+      genPanic("noise_router: bad class " & cls)
+    result.components.add(c)
+    skipSep(s, pos)
+  pos += 2  # `~` and its newline
+  result.splines = decodeSplines(s, pos)
+
+proc decodeRouters(noise, surface, multi: string; n: array[10, int32]; m: array[6, int32]): BaseNoiseRouters =
+  BaseNoiseRouters(
+    noise: BaseNoiseRouter(fullComponentStack: decodeStack(noise),
+      barrierNoise: n[0], fluidLevelFloodednessNoise: n[1], fluidLevelSpreadNoise: n[2],
+      lavaNoise: n[3], erosion: n[4], depth: n[5], finalDensity: n[6],
+      veinToggle: n[7], veinRidged: n[8], veinGap: n[9]),
+    surfaceEstimator: BaseSurfaceEstimator(fullComponentStack: decodeStack(surface)),
+    multiNoise: BaseMultiNoiseRouter(fullComponentStack: decodeStack(multi),
+      temperature: m[0], vegetation: m[1], continents: m[2], erosion: m[3], depth: m[4], ridges: m[5]))
+
+"""
+
+proc main() =
+  let text = quoteNonFinite(readAsset("density_function.json"))
+  var tree = parseJson(text)
+  let top = root(tree)
+
+  let noiseText = readAsset("noise_parameters.json")
+  var noiseTree = parseJson(noiseText)
+  var noiseNames: seq[string] = @[]
+  let sortedNoise = sortedPairs(root(noiseTree))
+  var i = 0
+  while i < sortedNoise.len:
+    noiseNames.add(stripMc(sortedNoise[i][0]).replace("/", "_"))
+    inc i
+
+  var interner = Interner(nodes: @[], buckets: newSeq[seq[int]](BucketCount), noiseNames: noiseNames)
+  let overworld = internRouter(interner, req(top, "overworld"), true)
+  let nether = internRouter(interner, req(top, "nether"), true)
+  let theEnd = internRouter(interner, req(top, "end"), false)
+
+  var s = Header
+  s.add(routerConst(interner, "OVERWORLD_BASE_NOISE_ROUTER", overworld))
+  s.add(routerConst(interner, "NETHER_BASE_NOISE_ROUTER", nether))
+  s.add(routerConst(interner, "END_BASE_NOISE_ROUTER", theEnd))
+  writeGenerated(OutPath, s)
+  echo "interned nodes: " & $interner.nodes.len
+
+main()

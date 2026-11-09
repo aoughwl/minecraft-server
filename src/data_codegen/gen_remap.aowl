@@ -1,0 +1,287 @@
+## Port of pumpkin-codegen/src/remap/mod.rs, pumpkin-codegen/src/remap/block_state.rs,
+## pumpkin-codegen/src/remap/entity_id.rs, pumpkin-codegen/src/remap/item_id.rs,
+## pumpkin-codegen/src/remap/particle_id.rs and pumpkin-codegen/src/remap/sound_id.rs.
+##
+## Writes src/generated/{block_state,entity_id,item_id,particle_id,sound_id}_remap.aowl from the
+## ViaBackwards/ViaRewind mapping files: tables taking the server's ids (26.2's, those of assets/blocks.json,
+## items.json and so on) to each older client's. Upstream's five build() functions differ in the NBT section,
+## the fallback for an id past the table's end, and whether a missing section skips the version.
+##
+## Each table is one hex string constant (see codegenutil's hexU16Table). A lookup reads its cell in place
+## with gendecode's hexU16At, so nothing unpacks at load or first use and there is no shared cache to guard.
+## The chain stops at 1.20.5, as the checked-in generated/*_remap.rs do. Upstream's source lists 19 older nodes down to
+## 1.7.2, but it cannot read them: every file older than mappings-1.21to1.20.5.nbt holds `val` as a byte array in a packed
+## format that `parse_mappings` does not know, where it wants `at`/`to` int arrays (it panics with "Missing
+## blockstates.at"), and mappings-1.7.6to1.7.2.nbt is not in the tree at all. A version's table depends only on files newer
+## than it, so stopping there changes no table.
+## PARTIAL: pumpkin-codegen/src/remap/mod.rs - the nodes below 1.20.5 have no tables and their ids pass through unchanged: upstream's parser cannot read those assets, the checked-in output omits them too, and a client older than 1.20.5 has no packet table to connect with
+##
+## Run from the repo root: `aowlmony c -r -p:src src/data_codegen/gen_remap.aowl`
+
+import std/syncio
+import codegenutil
+import codegenversion
+import ../nbt/[nbtbase, deserializer, tag, nbtdoc]
+
+const ServerVersion = jmvV26_2
+  ## Upstream `remapper.version`.
+
+type
+  Node = object
+    version: JavaMinecraftVersion
+    file: string
+
+  Mapping = object
+    ## `Option<Vec<u16>>`
+    present: bool
+    ids: seq[int]
+
+  Composed = object
+    version: JavaMinecraftVersion
+    mapping: Mapping
+
+  Kind = object
+    section: string       ## NBT compound in the mapping file
+    prefix: string        ## constant prefix, `BLOCK_STATE_REMAP`
+    procName: string      ## `remapBlockStateForVersion`
+    param: string         ## its id parameter
+    fallbackZero: bool    ## past-the-end ids become 0 rather than themselves
+    skipMissing: bool     ## entity_id.rs's `let Some(mapping) = mapping else { continue }`
+    outFile: string
+
+proc die(msg: string) =
+  echo msg
+  quit(1)
+
+proc nodes(): seq[Node] =
+  ## Upstream's `MappingNode` chain from 1.20.5, oldest first (see the header). Each file maps the next
+  ## newer version's ids to this version's.
+  const back = "viabackwards/data/mappings-"
+  @[
+    Node(version: jmvV1_20_5, file: back & "1.21to1.20.5.nbt"),
+    Node(version: jmvV1_21, file: back & "1.21.2to1.21.nbt"),
+    Node(version: jmvV1_21_2, file: back & "1.21.4to1.21.2.nbt"),
+    Node(version: jmvV1_21_4, file: back & "1.21.5to1.21.4.nbt"),
+    Node(version: jmvV1_21_5, file: back & "1.21.6to1.21.5.nbt"),
+    Node(version: jmvV1_21_6, file: back & "1.21.7to1.21.6.nbt"),
+    Node(version: jmvV1_21_7, file: back & "1.21.9to1.21.7.nbt"),
+    Node(version: jmvV1_21_9, file: back & "1.21.11to1.21.9.nbt"),
+    Node(version: jmvV1_21_11, file: back & "26.1to1.21.11.nbt"),
+    Node(version: jmvV26_1, file: back & "26.2to26.1.nbt")
+  ]
+
+proc getInt(c: NbtCompound; name, path: string): int =
+  let (found, t) = c.get(name)
+  if not found or t.kind != ntkInt:
+    die("Missing `" & name & "` in " & path)
+  int(t.intVal)
+
+proc getIntArray(c: NbtCompound; name, path: string): seq[int32] =
+  let (found, t) = c.get(name)
+  if not found or t.kind != ntkIntArray:
+    die("Missing `" & name & "` in " & path)
+  t.intArrayVal
+
+proc parseMappings(m: NbtCompound; path: string): seq[int32] =
+  ## `ParsedMappings::parse_mappings`.
+  discard getInt(m, "mappedSize", path)
+  let (hasId, idTag) = m.get("id")
+  if not hasId or idTag.kind != ntkByte:
+    die("Missing `id` in " & path)
+  case idTag.byteVal
+  of 0'i8:
+    # Direct
+    return getIntArray(m, "val", path)
+  of 1'i8:
+    # Shifts
+    let shiftsAt = getIntArray(m, "at", path)
+    let shiftsTo = getIntArray(m, "to", path)
+    let size = getInt(m, "size", path)
+    if shiftsAt.len != shiftsTo.len:
+      die("Shift mapping length mismatch in " & path)
+    var res = newSeq[int32](size)
+    for i in 0 ..< size:
+      res[i] = -1'i32
+    if shiftsAt.len > 0 and shiftsAt[0] != 0'i32:
+      for id in 0 ..< int(shiftsAt[0]):
+        res[id] = int32(id)
+    for index in 0 ..< shiftsAt.len:
+      let fromId = int(shiftsAt[index])
+      let toId = if index + 1 == shiftsAt.len: size else: int(shiftsAt[index + 1])
+      var mappedId = int(shiftsTo[index])
+      for id in fromId ..< toId:
+        res[id] = int32(mappedId)
+        inc mappedId
+    return res
+  of 2'i8:
+    # Changes
+    let changesAt = getIntArray(m, "at", path)
+    let values = getIntArray(m, "val", path)
+    let size = getInt(m, "size", path)
+    let (hasNoFill, _) = m.get("nofill")
+    let fillBetween = not hasNoFill
+    if changesAt.len != values.len:
+      die("Change mapping length mismatch in " & path)
+    var res = newSeq[int32](size)
+    for i in 0 ..< size:
+      res[i] = -1'i32
+    var nextUnhandledId = 0
+    for index in 0 ..< changesAt.len:
+      let changedId = int(changesAt[index])
+      if fillBetween:
+        for id in nextUnhandledId ..< changedId:
+          res[id] = int32(id)
+        nextUnhandledId = changedId + 1
+      res[changedId] = values[index]
+    return res
+  of 3'i8:
+    # Identity
+    let size = getInt(m, "size", path)
+    var res = newSeq[int32](size)
+    for i in 0 ..< size:
+      res[i] = int32(i)
+    return res
+  else:
+    die("Unknown mapping strategy in " & path)
+    return @[]
+
+proc readRoot(path: string): NbtCompound =
+  ## Reads one uncompressed big-endian java NBT file.
+  var bytes: seq[byte] = @[]
+  try:
+    let content = readFile(path)
+    bytes = newSeq[byte](content.len)
+    for i in 0 ..< content.len:
+      bytes[i] = byte(content[i])
+  except ErrorCode as e:
+    die("Failed to read " & path & ": " & $e)
+  var reader = newNbtReader(nrmJava, bytes)
+  let doc = read(reader)
+  if not doc.isOk:
+    die("Failed to parse NBT at " & path)
+  doc.value.rootTag
+
+proc parseSection(rootTag: NbtCompound; section, path: string): Mapping =
+  ## `parse_mapping_file` then `to_u16`: unmapped ids become air.
+  let (found, t) = rootTag.get(section)
+  if not found or t.kind != ntkCompound:
+    return Mapping(present: false, ids: @[])
+  let forward = parseMappings(t.compoundVal, path)
+  var ids = newSeq[int](forward.len)
+  for i in 0 ..< forward.len:
+    if forward[i] > 65535'i32:
+      die("id does not fit in u16 in " & path)
+    ids[i] = if forward[i] < 0'i32: 0 else: int(forward[i])
+  Mapping(present: true, ids: ids)
+
+proc compose(first, second: Mapping): Mapping =
+  ## Upstream's `remapper` closure.
+  if first.present and second.present:
+    var ids = newSeq[int](first.ids.len)
+    for i in 0 ..< first.ids.len:
+      let id = first.ids[i]
+      ids[i] = if id < second.ids.len: second.ids[id] else: 0
+    Mapping(present: true, ids: ids)
+  elif second.present:
+    second
+  elif first.present:
+    first
+  else:
+    Mapping(present: false, ids: @[])
+
+proc processChain(chain: seq[Node]; roots: seq[NbtCompound]; section: string): seq[Composed] =
+  ## `Remapper::process`. Recursing to the oldest node first and composing on the way back is this loop.
+  result = @[]
+  for n in 0 ..< chain.len:
+    let current = parseSection(roots[n], section, chain[n].file)
+    for k in 0 ..< result.len:
+      result[k].mapping = compose(current, result[k].mapping)
+    result.add(Composed(version: chain[n].version, mapping: current))
+
+proc reverseMapping(mapping: seq[int]; mappedSize: int): seq[int] =
+  ## item_id.rs's `reverse_mapping`.
+  result = newSeq[int](mappedSize)
+  for newId in 0 ..< mapping.len:
+    let oldId = mapping[newId]
+    if oldId != 0 and oldId < mappedSize:
+      result[oldId] = newId
+
+proc emitTable(s: var string; ident: string; ids: seq[int]) =
+  s.add("const " & ident & "* = \"" & hexU16Table(ids) & "\"\n\n")
+
+proc header(k: Kind): string =
+  result = "## GENERATED by src/data_codegen/gen_remap.aowl from the ViaBackwards/ViaRewind mappings - do not edit by hand.\n"
+  result.add("## Tables are hex-packed u16 cells, read in place. 1.7.2 has none: see the generator's header.\n\n")
+  result.add("import ../util/javaversion\n")
+  result.add("import gendecode\n\n")
+  result.add("proc lookup(table: string; id: uint16; fallback: uint16): uint16 {.inline.} =\n")
+  result.add("  if int(id) * 4 < table.len: hexU16At(table, int(id)) else: fallback\n\n")
+
+proc buildSimple(k: Kind; all: seq[Composed]): string =
+  ## block_state.rs, entity_id.rs, particle_id.rs and sound_id.rs.
+  result = header(k)
+  let fallback = if k.fallbackZero: "0'u16" else: k.param
+  var arms = ""
+  for c in all:
+    if not c.mapping.present:
+      if k.skipMissing: continue
+      die(k.section & ": no mapping composed for " & versionDebugName(c.version))
+    let ident = k.prefix & "_" & versionDebugName(ServerVersion) & "_TO_" & versionDebugName(c.version)
+    emitTable(result, ident, c.mapping.ids)
+    arms.add("  of " & versionEnumName(c.version) & ": lookup(" & ident & ", " & k.param & ", " & fallback & ")\n")
+  result.add("proc " & k.procName & "*(" & k.param & ": uint16; version: JavaMinecraftVersion): uint16 =\n")
+  if arms.len == 0:
+    result.add("  " & k.param & "\n")
+  else:
+    result.add("  case version\n" & arms & "  else: " & k.param & "\n")
+
+proc buildItem(k: Kind; all: seq[Composed]): string =
+  ## item_id.rs: forward tables, plus reverse tables for receiving from old clients.
+  result = header(k)
+  var maxId = 0
+  for c in all:
+    if c.mapping.present:
+      for id in c.mapping.ids:
+        maxId = max(maxId, id)
+  let mappingSize = maxId + 1
+  var forArms = ""
+  var fromArms = ""
+  for c in all:
+    if not c.mapping.present:
+      die(k.section & ": no mapping composed for " & versionDebugName(c.version))
+    let forwardIdent = k.prefix & "_" & versionDebugName(ServerVersion) & "_TO_" & versionDebugName(c.version)
+    emitTable(result, forwardIdent, c.mapping.ids)
+    forArms.add("  of " & versionEnumName(c.version) & ": lookup(" & forwardIdent & ", itemId, itemId)\n")
+    let reverseIdent = k.prefix & "_" & versionDebugName(c.version) & "_TO_" & versionDebugName(ServerVersion)
+    emitTable(result, reverseIdent, reverseMapping(c.mapping.ids, mappingSize))
+    fromArms.add("  of " & versionEnumName(c.version) & ": lookup(" & reverseIdent & ", itemId, itemId)\n")
+  result.add("proc remapItemIdForVersion*(itemId: uint16; version: JavaMinecraftVersion): uint16 =\n  case version\n")
+  result.add(forArms)
+  result.add("  else: itemId\n\n")
+  result.add("proc remapItemIdFromVersion*(itemId: uint16; version: JavaMinecraftVersion): uint16 =\n  case version\n")
+  result.add(fromArms)
+  result.add("  else: itemId\n")
+
+proc main() =
+  let chain = nodes()
+  var roots: seq[NbtCompound] = @[]
+  for n in chain:
+    roots.add(readRoot(AssetsDir & "/" & n.file))
+  let kinds = @[
+    Kind(section: "blockstates", prefix: "BLOCK_STATE_REMAP", procName: "remapBlockStateForVersion", param: "stateId",
+         fallbackZero: true, skipMissing: false, outFile: "block_state_remap"),
+    Kind(section: "entities", prefix: "ENTITY_ID_REMAP", procName: "remapEntityIdForVersion", param: "entityId",
+         fallbackZero: true, skipMissing: true, outFile: "entity_id_remap"),
+    Kind(section: "items", prefix: "ITEM_ID_REMAP", procName: "", param: "itemId",
+         fallbackZero: false, skipMissing: false, outFile: "item_id_remap"),
+    Kind(section: "particles", prefix: "PARTICLE_ID_REMAP", procName: "remapParticleIdForVersion", param: "particleId",
+         fallbackZero: false, skipMissing: false, outFile: "particle_id_remap"),
+    Kind(section: "sounds", prefix: "SOUND_ID_REMAP", procName: "remapSoundIdForVersion", param: "soundId",
+         fallbackZero: false, skipMissing: false, outFile: "sound_id_remap")
+  ]
+  for k in kinds:
+    let all = processChain(chain, roots, k.section)
+    let code = if k.section == "items": buildItem(k, all) else: buildSimple(k, all)
+    writeGenerated("src/generated/" & k.outFile & ".aowl", code)
+
+main()

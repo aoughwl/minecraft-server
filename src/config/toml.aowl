@@ -1,0 +1,1260 @@
+## TOML reader and writer for the config port. No upstream file of its own: this stands in for the `toml`
+## crate (1.1.3, spec 1.1) that pumpkin-config/src/lib.rs loads and saves through, and for serde's field
+## handling on top of it. No aowlmony TOML library exists in this repo or beside it.
+##
+## Reader: tables, dotted tables, arrays, arrays of tables, inline tables (with 1.1's newlines and trailing
+## comma), all string forms, ints in every radix, floats, bools, dates kept as raw text, comments. Redefinition
+## rules follow the spec. A date is stored as text since no config field reads one.
+##
+## Writer: `writeToml` follows the crate's `to_string` document serializer. Each table gets a slot in
+## pre-order; plain values go to their table's body in field order wherever a child table falls between them;
+## `[header]` lines for tables holding nothing but child tables are dropped; one blank line between tables.
+## None is simply a key that was never added. Comments do not survive, as with the crate's `toml::Value`.
+## The crate's source is not on this machine, so the writer's rules were written from knowledge of it, not read.
+##
+## Deserialize helpers: `TomlDe` holds the first error and the key path to it. serde's `#[serde(default)]`
+## becomes "start from the default and read what is there"; a field without it goes through `requireKey`.
+## A unit enum spelled as a one-key table, which serde accepts, is not handled: only the string form.
+
+import std/parseutils
+from ../codecs/json_value import displayF32, displayF64
+
+type
+  TomlKind* = enum
+    tkString
+    tkInt
+    tkFloat
+    tkBool
+    tkDatetime
+    tkArray
+    tkTable
+
+  TomlOrigin = enum
+    toPlain    ## Built by code, or a value.
+    toImplicit ## Created as the parent in a `[a.b]` header.
+    toHeader   ## Named by its own `[a]` header.
+    toDotted   ## Created by a dotted key.
+    toInline   ## An inline table: closed once written.
+
+  TomlValue* = object
+    kind*: TomlKind
+    strVal*: string    ## tkString; tkDatetime's raw text.
+    intVal*: int64
+    floatVal*: float64
+    isF32*: bool       ## Written with f32's shortest digits.
+    boolVal*: bool
+    arr*: seq[TomlValue]
+    keys*: seq[string] ## tkTable, in insertion order, parallel to `vals`.
+    vals*: seq[TomlValue]
+    outOfRange*: bool  ## A u64 above i64::MAX, which TOML cannot hold: writing it fails, as in the crate.
+    origin: TomlOrigin
+    aot: bool          ## An array made by `[[header]]`.
+
+  TomlParseResult* = object
+    ok*: bool
+    value*: TomlValue
+    err*: string
+
+  TomlWriteResult* = object
+    ok*: bool
+    text*: string
+    err*: string
+
+  TomlMergeResult* = object
+    value*: TomlValue
+    changed*: bool
+
+  TomlDe* = object
+    ## Deserialize state: the first error and where the reader is.
+    path*: seq[string]
+    err*: string
+
+# --- constructors ----------------------------------------------------------------------------------
+
+proc tomlStr*(s: string): TomlValue = TomlValue(kind: tkString, strVal: s)
+proc tomlInt*(i: int64): TomlValue = TomlValue(kind: tkInt, intVal: i)
+proc tomlBool*(b: bool): TomlValue = TomlValue(kind: tkBool, boolVal: b)
+proc tomlF64*(f: float64): TomlValue = TomlValue(kind: tkFloat, floatVal: f)
+proc tomlF32*(f: float32): TomlValue = TomlValue(kind: tkFloat, floatVal: float64(f), isF32: true)
+proc tomlArr*(items: seq[TomlValue]): TomlValue = TomlValue(kind: tkArray, arr: items)
+proc newTomlTable*(): TomlValue = TomlValue(kind: tkTable)
+
+proc tomlU64*(u: uint64): TomlValue =
+  if u > uint64(high(int64)):
+    TomlValue(kind: tkInt, outOfRange: true)
+  else:
+    TomlValue(kind: tkInt, intVal: int64(u))
+
+proc tomlStrArr*(items: seq[string]): TomlValue =
+  result = TomlValue(kind: tkArray)
+  for s in items:
+    result.arr.add(tomlStr(s))
+
+proc findKey*(t: TomlValue; key: string): int =
+  ## Index of `key` in a table, -1 when absent.
+  var i = 0
+  while i < t.keys.len:
+    if t.keys[i] == key:
+      return i
+    inc i
+  -1
+
+proc hasKey*(t: TomlValue; key: string): bool =
+  t.kind == tkTable and findKey(t, key) >= 0
+
+proc put*(t: var TomlValue; key: string; value: TomlValue) =
+  ## Replaces `key`'s value where it stands, or appends it.
+  let idx = findKey(t, key)
+  if idx >= 0:
+    t.vals[idx] = value
+  else:
+    t.keys.add(key)
+    t.vals.add(value)
+
+proc flatten*(t: var TomlValue; other: TomlValue) =
+  ## `#[serde(flatten)]` on the serialize side: the other table's keys, in order.
+  var i = 0
+  while i < other.keys.len:
+    put(t, other.keys[i], other.vals[i])
+    inc i
+
+proc mergeTomlValues*(base, overlay: TomlValue): TomlMergeResult =
+  ## `LoadConfiguration::merge_toml_values`: base is the default, overlay overwrites it, and `changed` says a
+  ## key of base was missing from overlay at some depth.
+  if base.kind != tkTable or overlay.kind != tkTable:
+    return TomlMergeResult(value: overlay, changed: false)
+  var merged = base
+  var changed = false
+  for key in base.keys:
+    if findKey(overlay, key) < 0:
+      changed = true
+      break
+  var i = 0
+  while i < overlay.keys.len:
+    let key = overlay.keys[i]
+    let idx = findKey(merged, key)
+    if idx >= 0:
+      let sub = mergeTomlValues(merged.vals[idx], overlay.vals[i])
+      merged.vals[idx] = sub.value
+      if sub.changed:
+        changed = true
+    else:
+      merged.keys.add(key)
+      merged.vals.add(overlay.vals[i])
+    inc i
+  TomlMergeResult(value: merged, changed: changed)
+
+# --- parser ----------------------------------------------------------------------------------------
+
+const MaxDepth = 128
+
+type
+  TomlParser = object
+    s: string
+    i: int
+    err: string
+
+proc atEnd(p: TomlParser): bool {.inline.} = p.i >= p.s.len
+
+proc peek(p: TomlParser; off = 0): char {.inline.} =
+  if p.i + off < p.s.len: p.s[p.i + off] else: '\0'
+
+proc fail(p: var TomlParser; msg: string) =
+  if p.err.len == 0:
+    var line = 1
+    var col = 1
+    var k = 0
+    while k < p.i and k < p.s.len:
+      if p.s[k] == '\n':
+        inc line
+        col = 1
+      else:
+        inc col
+      inc k
+    p.err = "TOML parse error at line " & $line & ", column " & $col & ": " & msg
+
+proc validUtf8(s: string): bool =
+  var i = 0
+  while i < s.len:
+    let c = ord(s[i])
+    var need = 0
+    var minCp = 0
+    var cp = 0
+    if c < 0x80:
+      inc i
+      continue
+    elif c >= 0xC2 and c <= 0xDF:
+      need = 1
+      cp = c and 0x1F
+      minCp = 0x80
+    elif c >= 0xE0 and c <= 0xEF:
+      need = 2
+      cp = c and 0x0F
+      minCp = 0x800
+    elif c >= 0xF0 and c <= 0xF4:
+      need = 3
+      cp = c and 0x07
+      minCp = 0x10000
+    else:
+      return false
+    if i + need > s.len - 1:
+      return false
+    var k = 1
+    while k <= need:
+      let d = ord(s[i + k])
+      if (d and 0xC0) != 0x80:
+        return false
+      cp = (cp shl 6) or (d and 0x3F)
+      inc k
+    if cp < minCp or cp > 0x10FFFF or (cp >= 0xD800 and cp <= 0xDFFF):
+      return false
+    i += need + 1
+  true
+
+proc addUtf8(s: var string; cp: uint32) =
+  if cp < 0x80'u32:
+    s.add(char(cp))
+  elif cp < 0x800'u32:
+    s.add(char(0xC0'u32 or (cp shr 6)))
+    s.add(char(0x80'u32 or (cp and 0x3F'u32)))
+  elif cp < 0x10000'u32:
+    s.add(char(0xE0'u32 or (cp shr 12)))
+    s.add(char(0x80'u32 or ((cp shr 6) and 0x3F'u32)))
+    s.add(char(0x80'u32 or (cp and 0x3F'u32)))
+  else:
+    s.add(char(0xF0'u32 or (cp shr 18)))
+    s.add(char(0x80'u32 or ((cp shr 12) and 0x3F'u32)))
+    s.add(char(0x80'u32 or ((cp shr 6) and 0x3F'u32)))
+    s.add(char(0x80'u32 or (cp and 0x3F'u32)))
+
+proc isControl(c: char): bool {.inline.} =
+  (ord(c) < 0x20 and c != '\t') or ord(c) == 0x7F
+
+proc skipWs(p: var TomlParser) =
+  while p.peek == ' ' or p.peek == '\t':
+    inc p.i
+
+proc skipComment(p: var TomlParser) =
+  if p.peek == '#':
+    while not p.atEnd and p.peek != '\n':
+      let c = p.peek
+      if c == '\r' and p.peek(1) == '\n':
+        break
+      if isControl(c):
+        p.fail("control character in comment")
+        return
+      inc p.i
+
+proc atNewline(p: TomlParser): bool {.inline.} =
+  p.peek == '\n' or (p.peek == '\r' and p.peek(1) == '\n')
+
+proc eatNewline(p: var TomlParser) =
+  if p.peek == '\r':
+    p.i += 2
+  else:
+    inc p.i
+
+proc skipBlank(p: var TomlParser) =
+  ## Whitespace, comments and newlines, as between array items.
+  while p.err.len == 0:
+    p.skipWs()
+    p.skipComment()
+    if p.atNewline:
+      p.eatNewline()
+    else:
+      break
+
+proc hexVal(c: char): int =
+  case c
+  of '0' .. '9': ord(c) - ord('0')
+  of 'a' .. 'f': ord(c) - ord('a') + 10
+  of 'A' .. 'F': ord(c) - ord('A') + 10
+  else: -1
+
+proc parseEscape(p: var TomlParser; dst: var string) =
+  ## At the character after a backslash.
+  let c = p.peek
+  case c
+  of 'b': dst.add('\b'); inc p.i
+  of 't': dst.add('\t'); inc p.i
+  of 'n': dst.add('\n'); inc p.i
+  of 'f': dst.add('\f'); inc p.i
+  of 'r': dst.add('\r'); inc p.i
+  of 'e': dst.add(char(0x1B)); inc p.i
+  of '"': dst.add('"'); inc p.i
+  of '\\': dst.add('\\'); inc p.i
+  of 'x', 'u', 'U':
+    let n = if c == 'x': 2 elif c == 'u': 4 else: 8
+    inc p.i
+    var cp = 0'u32
+    var k = 0
+    while k < n:
+      let h = hexVal(p.peek)
+      if h < 0:
+        p.fail("invalid hex digit in escape")
+        return
+      cp = (cp shl 4) or uint32(h)
+      inc p.i
+      inc k
+    if cp > 0x10FFFF'u32 or (cp >= 0xD800'u32 and cp <= 0xDFFF'u32):
+      p.fail("escape is not a Unicode scalar value")
+      return
+    addUtf8(dst, cp)
+  else:
+    p.fail("invalid escape")
+
+proc parseBasicString(p: var TomlParser): string =
+  result = ""
+  inc p.i # opening quote
+  while true:
+    if p.atEnd or p.atNewline or p.peek == '\r':
+      p.fail("unterminated string")
+      return
+    let c = p.peek
+    if c == '"':
+      inc p.i
+      return
+    if c == '\\':
+      inc p.i
+      p.parseEscape(result)
+      if p.err.len > 0:
+        return
+    elif isControl(c):
+      p.fail("control character in string")
+      return
+    else:
+      result.add(c)
+      inc p.i
+
+proc parseLiteralString(p: var TomlParser): string =
+  result = ""
+  inc p.i
+  while true:
+    if p.atEnd or p.atNewline or p.peek == '\r':
+      p.fail("unterminated string")
+      return
+    let c = p.peek
+    if c == '\'':
+      inc p.i
+      return
+    if isControl(c):
+      p.fail("control character in string")
+      return
+    result.add(c)
+    inc p.i
+
+proc parseMultilineString(p: var TomlParser; quote: char): string =
+  ## After the three opening quotes. A newline right after them is dropped; newlines come out as LF.
+  result = ""
+  p.i += 3
+  if p.atNewline:
+    p.eatNewline()
+  while true:
+    if p.atEnd:
+      p.fail("unterminated multi-line string")
+      return
+    let c = p.peek
+    if c == quote and p.peek(1) == quote and p.peek(2) == quote:
+      p.i += 3
+      # Up to two more quotes belong to the content.
+      var extra = 0
+      while extra < 2 and p.peek == quote:
+        result.add(quote)
+        inc p.i
+        inc extra
+      return
+    if p.atNewline:
+      p.eatNewline()
+      result.add('\n')
+    elif c == '\\' and quote == '"':
+      inc p.i
+      # A line-ending backslash swallows the newline and the whitespace after it.
+      var j = 0
+      while p.peek(j) == ' ' or p.peek(j) == '\t':
+        inc j
+      if p.peek(j) == '\n' or (p.peek(j) == '\r' and p.peek(j + 1) == '\n'):
+        while p.peek == ' ' or p.peek == '\t' or p.atNewline:
+          if p.atNewline:
+            p.eatNewline()
+          else:
+            inc p.i
+      else:
+        p.parseEscape(result)
+        if p.err.len > 0:
+          return
+    elif isControl(c):
+      p.fail("control character in string")
+      return
+    else:
+      result.add(c)
+      inc p.i
+
+proc isBareKeyChar(c: char): bool {.inline.} =
+  c in {'A' .. 'Z', 'a' .. 'z', '0' .. '9', '_', '-'}
+
+proc parseKey(p: var TomlParser): seq[string] =
+  ## A dotted key, whitespace allowed around the dots.
+  result = @[]
+  while true:
+    p.skipWs()
+    let c = p.peek
+    if c == '"':
+      if p.peek(1) == '"' and p.peek(2) == '"':
+        p.fail("multi-line string used as a key")
+        return
+      result.add(p.parseBasicString())
+    elif c == '\'':
+      if p.peek(1) == '\'' and p.peek(2) == '\'':
+        p.fail("multi-line string used as a key")
+        return
+      result.add(p.parseLiteralString())
+    elif isBareKeyChar(c):
+      var key = ""
+      while isBareKeyChar(p.peek):
+        key.add(p.peek)
+        inc p.i
+      result.add(key)
+    else:
+      p.fail("expected a key")
+      return
+    if p.err.len > 0:
+      return
+    p.skipWs()
+    if p.peek == '.':
+      inc p.i
+    else:
+      return
+
+proc isDigit(c: char): bool {.inline.} = c >= '0' and c <= '9'
+
+proc digitsWithUnderscores(t: string; start, stop: int; hex = false): bool =
+  ## One or more digits with single underscores between them, nothing else.
+  if start >= stop:
+    return false
+  var i = start
+  var prevDigit = false
+  while i < stop:
+    let c = t[i]
+    if c == '_':
+      if not prevDigit:
+        return false
+      prevDigit = false
+    elif isDigit(c) or (hex and hexVal(c) >= 0):
+      prevDigit = true
+    else:
+      return false
+    inc i
+  prevDigit
+
+proc parseRadix(p: var TomlParser; t: string; radix: uint64): TomlValue =
+  result = tomlInt(0)
+  if not digitsWithUnderscores(t, 2, t.len, true):
+    p.fail("invalid integer `" & t & "`")
+    return
+  var acc = 0'u64
+  var i = 2
+  while i < t.len:
+    if t[i] != '_':
+      let d = uint64(hexVal(t[i]))
+      if d >= radix:
+        p.fail("invalid digit in integer `" & t & "`")
+        return
+      if acc > (uint64(high(int64)) - d) div radix:
+        p.fail("integer out of range `" & t & "`")
+        return
+      acc = acc * radix + d
+    inc i
+  result = tomlInt(int64(acc))
+
+proc parseDecimal(p: var TomlParser; t: string): TomlValue =
+  result = tomlInt(0)
+  var start = 0
+  var neg = false
+  if t.len > 0 and (t[0] == '+' or t[0] == '-'):
+    neg = t[0] == '-'
+    start = 1
+  if not digitsWithUnderscores(t, start, t.len):
+    p.fail("invalid value `" & t & "`")
+    return
+  if t.len - start > 1 and t[start] == '0':
+    p.fail("leading zero in integer `" & t & "`")
+    return
+  let limit = if neg: 9223372036854775808'u64 else: uint64(high(int64))
+  var acc = 0'u64
+  var i = start
+  while i < t.len:
+    if t[i] != '_':
+      let d = uint64(ord(t[i]) - ord('0'))
+      if acc > (limit - d) div 10'u64:
+        p.fail("integer out of range `" & t & "`")
+        return
+      acc = acc * 10'u64 + d
+    inc i
+  if neg:
+    if acc == 9223372036854775808'u64:
+      result = tomlInt(low(int64))
+    else:
+      result = tomlInt(-int64(acc))
+  else:
+    result = tomlInt(int64(acc))
+
+proc parseFloatText(p: var TomlParser; t: string): TomlValue =
+  result = tomlF64(0.0)
+  var i = 0
+  if t.len > 0 and (t[0] == '+' or t[0] == '-'):
+    i = 1
+  let intStart = i
+  while i < t.len and (isDigit(t[i]) or t[i] == '_'):
+    inc i
+  if not digitsWithUnderscores(t, intStart, i):
+    p.fail("invalid float `" & t & "`")
+    return
+  if i - intStart > 1 and t[intStart] == '0':
+    p.fail("leading zero in float `" & t & "`")
+    return
+  if i < t.len and t[i] == '.':
+    inc i
+    let fracStart = i
+    while i < t.len and (isDigit(t[i]) or t[i] == '_'):
+      inc i
+    if not digitsWithUnderscores(t, fracStart, i):
+      p.fail("invalid float `" & t & "`")
+      return
+  if i < t.len and (t[i] == 'e' or t[i] == 'E'):
+    inc i
+    if i < t.len and (t[i] == '+' or t[i] == '-'):
+      inc i
+    let expStart = i
+    while i < t.len and (isDigit(t[i]) or t[i] == '_'):
+      inc i
+    if not digitsWithUnderscores(t, expStart, i):
+      p.fail("invalid float `" & t & "`")
+      return
+  if i != t.len:
+    p.fail("invalid float `" & t & "`")
+    return
+  var clean = ""
+  for c in t:
+    if c != '_' and c != '+':
+      clean.add(c)
+  # A `+` after the exponent marker is dropped too: the number means the same without it.
+  var f = 0.0'f64
+  if parseBiggestFloat(clean, f) != clean.len:
+    p.fail("invalid float `" & t & "`")
+    return
+  result = tomlF64(f)
+
+proc allDigits(t: string; start, stop: int): bool =
+  if stop > t.len:
+    return false
+  var i = start
+  while i < stop:
+    if not isDigit(t[i]):
+      return false
+    inc i
+  true
+
+proc twoDigits(t: string; at: int): int =
+  (ord(t[at]) - ord('0')) * 10 + ord(t[at + 1]) - ord('0')
+
+proc validTime(t: string; start: int): bool =
+  ## HH:MM, optional :SS and fraction, then the optional offset the caller allowed through.
+  if not allDigits(t, start, start + 2) or start + 5 > t.len or t[start + 2] != ':' or
+      not allDigits(t, start + 3, start + 5):
+    return false
+  if twoDigits(t, start) > 23 or twoDigits(t, start + 3) > 59:
+    return false
+  var i = start + 5
+  if i < t.len and t[i] == ':':
+    if not allDigits(t, i + 1, i + 3) or twoDigits(t, i + 1) > 60:
+      return false
+    i += 3
+    if i < t.len and t[i] == '.':
+      inc i
+      let fs = i
+      while i < t.len and isDigit(t[i]):
+        inc i
+      if fs == i:
+        return false
+  if i == t.len or ((t[i] == 'Z' or t[i] == 'z') and i + 1 == t.len):
+    return true
+  if t[i] == '+' or t[i] == '-':
+    return i + 6 == t.len and allDigits(t, i + 1, i + 3) and t[i + 3] == ':' and allDigits(t, i + 4, i + 6) and
+      twoDigits(t, i + 1) <= 23 and twoDigits(t, i + 4) <= 59
+  false
+
+proc validDatetime(t: string): bool =
+  if t.len >= 5 and isDigit(t[0]) and isDigit(t[1]) and t[2] == ':':
+    # A local time: no offset allowed.
+    for c in t:
+      if c == 'Z' or c == 'z' or c == '+' or c == '-':
+        return false
+    return validTime(t, 0)
+  if not (allDigits(t, 0, 4) and t.len >= 10 and t[4] == '-' and allDigits(t, 5, 7) and t[7] == '-' and
+      allDigits(t, 8, 10)):
+    return false
+  let month = twoDigits(t, 5)
+  let day = twoDigits(t, 8)
+  if month < 1 or month > 12 or day < 1 or day > 31:
+    return false
+  if t.len == 10:
+    return true
+  if t[10] != 'T' and t[10] != 't' and t[10] != ' ':
+    return false
+  validTime(t, 11)
+
+proc looksLikeDatetime(t: string): bool =
+  (t.len >= 5 and isDigit(t[0]) and isDigit(t[1]) and t[2] == ':') or
+    (t.len >= 10 and allDigits(t, 0, 4) and t[4] == '-')
+
+proc parseScalarToken(p: var TomlParser): TomlValue =
+  ## Numbers, dates, bools, inf and nan.
+  result = tomlInt(0)
+  let start = p.i
+  while p.peek in {'A' .. 'Z', 'a' .. 'z', '0' .. '9', '_', '+', '-', '.', ':'}:
+    inc p.i
+  # A date and time may be split by one space.
+  if p.i - start == 10 and p.peek == ' ' and isDigit(p.peek(1)) and isDigit(p.peek(2)) and p.peek(3) == ':' and
+      allDigits(p.s, start, start + 4) and p.s[start + 4] == '-':
+    inc p.i
+    while p.peek in {'A' .. 'Z', 'a' .. 'z', '0' .. '9', '_', '+', '-', '.', ':'}:
+      inc p.i
+  let t = p.s[start ..< p.i]
+  if t.len == 0:
+    p.fail("expected a value")
+    return
+  case t
+  of "true": return tomlBool(true)
+  of "false": return tomlBool(false)
+  of "inf", "+inf": return tomlF64(Inf)
+  of "-inf": return tomlF64(-Inf)
+  of "nan", "+nan", "-nan": return tomlF64(NaN)
+  else: discard
+  if looksLikeDatetime(t):
+    if validDatetime(t):
+      return TomlValue(kind: tkDatetime, strVal: t)
+    p.fail("invalid date or time `" & t & "`")
+    return
+  if t.len > 2 and t[0] == '0' and (t[1] == 'x' or t[1] == 'o' or t[1] == 'b'):
+    let radix = if t[1] == 'x': 16'u64 elif t[1] == 'o': 8'u64 else: 2'u64
+    return p.parseRadix(t, radix)
+  var isFloat = false
+  for c in t:
+    if c == '.' or c == 'e' or c == 'E':
+      isFloat = true
+  if isFloat:
+    p.parseFloatText(t)
+  else:
+    p.parseDecimal(t)
+
+proc setDotted(p: var TomlParser; tbl: var TomlValue; keys: seq[string]; i: int; value: TomlValue) =
+  ## Writes `keys[i..]` under `tbl`; intermediate tables are dotted ones.
+  let idx = findKey(tbl, keys[i])
+  if i == keys.len - 1:
+    if idx >= 0:
+      p.fail("duplicate key `" & keys[i] & "`")
+      return
+    tbl.keys.add(keys[i])
+    tbl.vals.add(value)
+    return
+  var at = idx
+  if at < 0:
+    tbl.keys.add(keys[i])
+    tbl.vals.add(TomlValue(kind: tkTable, origin: toDotted))
+    at = tbl.vals.len - 1
+  elif tbl.vals[at].kind != tkTable or tbl.vals[at].origin != toDotted:
+    p.fail("cannot extend `" & keys[i] & "` with a dotted key")
+    return
+  setDotted(p, tbl.vals[at], keys, i + 1, value)
+
+proc parseValue(p: var TomlParser; depth: int): TomlValue
+
+proc parseArray(p: var TomlParser; depth: int): TomlValue =
+  result = TomlValue(kind: tkArray)
+  inc p.i
+  while p.err.len == 0:
+    p.skipBlank()
+    if p.err.len > 0:
+      return
+    if p.peek == ']':
+      inc p.i
+      return
+    result.arr.add(p.parseValue(depth + 1))
+    if p.err.len > 0:
+      return
+    p.skipBlank()
+    if p.err.len > 0:
+      return
+    if p.peek == ',':
+      inc p.i
+    elif p.peek != ']':
+      p.fail("expected `,` or `]` in array")
+      return
+
+proc parseInlineTable(p: var TomlParser; depth: int): TomlValue =
+  result = TomlValue(kind: tkTable, origin: toInline)
+  inc p.i
+  while p.err.len == 0:
+    p.skipBlank()
+    if p.err.len > 0:
+      return
+    if p.peek == '}':
+      inc p.i
+      return
+    let keys = p.parseKey()
+    if p.err.len > 0:
+      return
+    p.skipWs()
+    if p.peek != '=':
+      p.fail("expected `=` in inline table")
+      return
+    inc p.i
+    p.skipBlank()
+    let value = p.parseValue(depth + 1)
+    if p.err.len > 0:
+      return
+    setDotted(p, result, keys, 0, value)
+    if p.err.len > 0:
+      return
+    p.skipBlank()
+    if p.err.len > 0:
+      return
+    if p.peek == ',':
+      inc p.i
+    elif p.peek != '}':
+      p.fail("expected `,` or `}` in inline table")
+      return
+
+proc parseValue(p: var TomlParser; depth: int): TomlValue =
+  result = tomlInt(0)
+  if depth > MaxDepth:
+    p.fail("value nested too deeply")
+    return
+  p.skipWs()
+  let c = p.peek
+  if c == '"':
+    if p.peek(1) == '"' and p.peek(2) == '"':
+      result = tomlStr(p.parseMultilineString('"'))
+    else:
+      result = tomlStr(p.parseBasicString())
+  elif c == '\'':
+    if p.peek(1) == '\'' and p.peek(2) == '\'':
+      result = tomlStr(p.parseMultilineString('\''))
+    else:
+      result = tomlStr(p.parseLiteralString())
+  elif c == '[':
+    result = p.parseArray(depth)
+  elif c == '{':
+    result = p.parseInlineTable(depth)
+  else:
+    result = p.parseScalarToken()
+
+proc openHeader(p: var TomlParser; tbl: var TomlValue; path: seq[string]; i: int; aot: bool) =
+  ## Applies a `[path]` or `[[path]]` header to the tree.
+  let idx = findKey(tbl, path[i])
+  if i == path.len - 1:
+    if aot:
+      if idx < 0:
+        var arr = TomlValue(kind: tkArray, aot: true)
+        arr.arr.add(TomlValue(kind: tkTable, origin: toHeader))
+        tbl.keys.add(path[i])
+        tbl.vals.add(arr)
+      elif tbl.vals[idx].kind == tkArray and tbl.vals[idx].aot:
+        tbl.vals[idx].arr.add(TomlValue(kind: tkTable, origin: toHeader))
+      else:
+        p.fail("cannot append to `" & path[i] & "`: not an array of tables")
+    else:
+      if idx < 0:
+        tbl.keys.add(path[i])
+        tbl.vals.add(TomlValue(kind: tkTable, origin: toHeader))
+      elif tbl.vals[idx].kind == tkTable and tbl.vals[idx].origin == toImplicit:
+        tbl.vals[idx].origin = toHeader
+      else:
+        p.fail("table `" & path[i] & "` already defined")
+    return
+  var at = idx
+  if at < 0:
+    tbl.keys.add(path[i])
+    tbl.vals.add(TomlValue(kind: tkTable, origin: toImplicit))
+    at = tbl.vals.len - 1
+  if tbl.vals[at].kind == tkArray and tbl.vals[at].aot:
+    openHeader(p, tbl.vals[at].arr[tbl.vals[at].arr.len - 1], path, i + 1, aot)
+  elif tbl.vals[at].kind == tkTable and tbl.vals[at].origin != toInline:
+    openHeader(p, tbl.vals[at], path, i + 1, aot)
+  else:
+    p.fail("`" & path[i] & "` is not a table")
+
+proc setInSection(p: var TomlParser; tbl: var TomlValue; path: seq[string]; i: int; keys: seq[string];
+                  value: TomlValue) =
+  ## Walks to the current section, always the last element of any array of tables on the way.
+  if i == path.len:
+    setDotted(p, tbl, keys, 0, value)
+    return
+  let idx = findKey(tbl, path[i])
+  if idx < 0:
+    p.fail("section `" & path[i] & "` vanished")
+    return
+  if tbl.vals[idx].kind == tkArray:
+    setInSection(p, tbl.vals[idx].arr[tbl.vals[idx].arr.len - 1], path, i + 1, keys, value)
+  else:
+    setInSection(p, tbl.vals[idx], path, i + 1, keys, value)
+
+proc parseToml*(text: string): TomlParseResult =
+  ## `toml::from_str::<toml::Value>`. Never raises: a syntax error comes back in `err`.
+  if not validUtf8(text):
+    return TomlParseResult(ok: false, value: newTomlTable(), err: "stream did not contain valid UTF-8")
+  var p = TomlParser(s: text, i: 0, err: "")
+  if p.peek == char(0xEF) and p.peek(1) == char(0xBB) and p.peek(2) == char(0xBF):
+    p.i = 3
+  var root = newTomlTable()
+  var section: seq[string] = @[]
+  while p.err.len == 0:
+    p.skipBlank()
+    if p.err.len > 0 or p.atEnd:
+      break
+    if p.peek == '[':
+      let aot = p.peek(1) == '['
+      p.i += (if aot: 2 else: 1)
+      let path = p.parseKey()
+      if p.err.len > 0:
+        break
+      if p.peek != ']' or (aot and p.peek(1) != ']'):
+        p.fail("expected closing bracket in table header")
+        break
+      p.i += (if aot: 2 else: 1)
+      openHeader(p, root, path, 0, aot)
+      section = path
+    else:
+      let keys = p.parseKey()
+      if p.err.len > 0:
+        break
+      p.skipWs()
+      if p.peek != '=':
+        p.fail("expected `=` after key")
+        break
+      inc p.i
+      let value = p.parseValue(0)
+      if p.err.len > 0:
+        break
+      setInSection(p, root, section, 0, keys, value)
+    if p.err.len > 0:
+      break
+    p.skipWs()
+    p.skipComment()
+    if p.err.len > 0:
+      break
+    if not p.atEnd and not p.atNewline:
+      p.fail("expected a newline after the value")
+      break
+  if p.err.len > 0:
+    return TomlParseResult(ok: false, value: newTomlTable(), err: p.err)
+  TomlParseResult(ok: true, value: root, err: "")
+
+# --- writer ----------------------------------------------------------------------------------------
+
+proc isBareKey(s: string): bool =
+  if s.len == 0:
+    return false
+  for c in s:
+    if not isBareKeyChar(c):
+      return false
+  true
+
+proc addBasicEscaped(dst: var string; s: string; multiline: bool) =
+  const HexDigits = "0123456789ABCDEF"
+  for c in s:
+    case c
+    of '"':
+      dst.add(if multiline: "\"" else: "\\\"")
+    of '\\': dst.add("\\\\")
+    of '\b': dst.add("\\b")
+    of '\f': dst.add("\\f")
+    of '\r': dst.add("\\r")
+    of '\t': dst.add(if multiline: "\t" else: "\\t")
+    of '\n': dst.add(if multiline: "\n" else: "\\n")
+    else:
+      if ord(c) < 0x20 or ord(c) == 0x7F:
+        dst.add("\\u00")
+        dst.add(HexDigits[ord(c) shr 4])
+        dst.add(HexDigits[ord(c) and 15])
+      else:
+        dst.add(c)
+
+type
+  StrMetrics = object
+    maxSingle, maxDouble: int
+    escape, escapeCodes, newline: bool
+
+proc metricsOf(s: string): StrMetrics =
+  result = StrMetrics()
+  var single = 0
+  var double = 0
+  for c in s:
+    if c == '\'':
+      inc single
+      if single > result.maxSingle:
+        result.maxSingle = single
+    else:
+      single = 0
+    if c == '"':
+      inc double
+      if double > result.maxDouble:
+        result.maxDouble = double
+    else:
+      double = 0
+    if c == '\\':
+      result.escape = true
+    elif c == '\n':
+      result.newline = true
+    elif c != '\t' and (ord(c) < 0x20 or ord(c) == 0x7F):
+      result.escapeCodes = true
+
+proc tomlStringRepr*(s: string): string =
+  ## The crate's default string choice: plain basic if nothing needs escaping, then literal, then the
+  ## multi-line forms, then basic with escapes.
+  let m = metricsOf(s)
+  result = ""
+  if not m.escapeCodes and not m.escape and m.maxDouble == 0 and not m.newline:
+    result.add('"')
+    result.add(s)
+    result.add('"')
+  elif not m.escapeCodes and m.maxSingle == 0 and not m.newline:
+    result.add('\'')
+    result.add(s)
+    result.add('\'')
+  elif m.newline and not m.escapeCodes and not m.escape and m.maxDouble <= 2 and
+      (s.len == 0 or s[s.len - 1] != '"'):
+    result.add("\"\"\"\n")
+    result.add(s)
+    result.add("\"\"\"")
+  elif m.newline and not m.escapeCodes and m.maxSingle <= 2 and (s.len == 0 or s[s.len - 1] != '\''):
+    result.add("'''\n")
+    result.add(s)
+    result.add("'''")
+  elif m.newline:
+    result.add("\"\"\"\n")
+    addBasicEscaped(result, s, true)
+    result.add("\"\"\"")
+  else:
+    result.add('"')
+    addBasicEscaped(result, s, false)
+    result.add('"')
+
+proc tomlKeyRepr*(s: string): string =
+  if isBareKey(s):
+    return s
+  let m = metricsOf(s)
+  result = ""
+  if not m.escapeCodes and not m.escape and m.maxDouble == 0 and not m.newline:
+    result.add('"')
+    result.add(s)
+    result.add('"')
+  elif not m.escapeCodes and m.maxSingle == 0 and not m.newline:
+    result.add('\'')
+    result.add(s)
+    result.add('\'')
+  else:
+    result.add('"')
+    addBasicEscaped(result, s, false)
+    result.add('"')
+
+proc floatRepr(v: TomlValue): string =
+  let f = v.floatVal
+  if f != f:
+    return "nan"
+  if f == Inf:
+    return "inf"
+  if f == -Inf:
+    return "-inf"
+  if f == 0.0:
+    return if 1.0 / f < 0.0: "-0.0" else: "0.0"
+  let digits = if v.isF32: displayF32(float32(f)) else: displayF64(f)
+  for c in digits:
+    if c == '.':
+      return digits
+  digits & ".0"
+
+proc addInlineValue(dst: var string; v: TomlValue; err: var string) =
+  case v.kind
+  of tkString:
+    dst.add(tomlStringRepr(v.strVal))
+  of tkInt:
+    if v.outOfRange and err.len == 0:
+      err = "out-of-range value for u64 type"
+    dst.add($v.intVal)
+  of tkFloat:
+    dst.add(floatRepr(v))
+  of tkBool:
+    dst.add(if v.boolVal: "true" else: "false")
+  of tkDatetime:
+    dst.add(v.strVal)
+  of tkArray:
+    dst.add('[')
+    var i = 0
+    while i < v.arr.len:
+      if i > 0:
+        dst.add(", ")
+      addInlineValue(dst, v.arr[i], err)
+      inc i
+    dst.add(']')
+  of tkTable:
+    if v.keys.len == 0:
+      dst.add("{}")
+    else:
+      dst.add("{ ")
+      var i = 0
+      while i < v.keys.len:
+        if i > 0:
+          dst.add(", ")
+        dst.add(tomlKeyRepr(v.keys[i]))
+        dst.add(" = ")
+        addInlineValue(dst, v.vals[i], err)
+        inc i
+      dst.add(" }")
+
+type
+  OutTable = object
+    path: seq[string]
+    body: string
+    hasChildren: bool
+    array: bool
+
+proc isTableArray(v: TomlValue): bool =
+  if v.kind != tkArray or v.arr.len == 0:
+    return false
+  for item in v.arr:
+    if item.kind != tkTable:
+      return false
+  true
+
+proc emitTable(outp: var seq[OutTable]; v: TomlValue; path: seq[string]; array: bool; err: var string) =
+  ## Reserves this table's slot, then fills its body while children take the later slots, as `Buffer` does.
+  let pos = outp.len
+  outp.add(OutTable(path: path, body: "", hasChildren: false, array: array))
+  var i = 0
+  while i < v.keys.len:
+    let key = v.keys[i]
+    let sub = v.vals[i]
+    if sub.kind == tkTable:
+      outp[pos].hasChildren = true
+      var child = path
+      child.add(key)
+      emitTable(outp, sub, child, false, err)
+    elif isTableArray(sub):
+      outp[pos].hasChildren = true
+      var child = path
+      child.add(key)
+      var k = 0
+      while k < sub.arr.len:
+        emitTable(outp, sub.arr[k], child, true, err)
+        inc k
+    else:
+      outp[pos].body.add(tomlKeyRepr(key))
+      outp[pos].body.add(" = ")
+      addInlineValue(outp[pos].body, sub, err)
+      outp[pos].body.add('\n')
+    inc i
+
+proc writeToml*(root: TomlValue): TomlWriteResult =
+  ## `toml::to_string`. The only failure is a u64 above i64::MAX, which TOML cannot hold.
+  if root.kind != tkTable:
+    return TomlWriteResult(ok: false, text: "", err: "top-level value must be a table")
+  var tables: seq[OutTable] = @[]
+  var err = ""
+  emitTable(tables, root, @[], false, err)
+  if err.len > 0:
+    return TomlWriteResult(ok: false, text: "", err: err)
+  var text = ""
+  var first = true
+  var pos = 0
+  while pos < tables.len:
+    let t = tables[pos]
+    let required =
+      if pos == 0: t.body.len > 0
+      else: t.array or t.body.len > 0 or not t.hasChildren
+    if required:
+      if not first:
+        text.add('\n')
+      first = false
+      if pos > 0:
+        text.add(if t.array: "[[" else: "[")
+        var k = 0
+        while k < t.path.len:
+          if k > 0:
+            text.add('.')
+          text.add(tomlKeyRepr(t.path[k]))
+          inc k
+        text.add(if t.array: "]]\n" else: "]\n")
+      text.add(t.body)
+    inc pos
+  TomlWriteResult(ok: true, text: text, err: "")
+
+# --- deserialize helpers: what serde derives ---------------------------------------------------------
+
+proc fail*(d: var TomlDe; msg: string) =
+  ## Keeps the first error, with the key path it happened at.
+  if d.err.len == 0:
+    var at = ""
+    var i = 0
+    while i < d.path.len:
+      if i > 0:
+        at.add('.')
+      at.add(d.path[i])
+      inc i
+    d.err = (if at.len > 0: at & ": " else: "") & msg
+
+proc failed*(d: TomlDe): bool {.inline.} = d.err.len > 0
+
+proc unexpected*(v: TomlValue): string =
+  ## serde's `Unexpected`.
+  case v.kind
+  of tkString: "string \"" & v.strVal & "\""
+  of tkInt: "integer `" & $v.intVal & "`"
+  of tkFloat: "floating point `" & floatRepr(v) & "`"
+  of tkBool: "boolean `" & (if v.boolVal: "true" else: "false") & "`"
+  of tkDatetime: "datetime"
+  of tkArray: "sequence"
+  of tkTable: "map"
+
+proc expectTable*(d: var TomlDe; v: TomlValue; typeName: string): bool =
+  ## A struct must come from a table.
+  if v.kind == tkTable:
+    return true
+  d.fail("invalid type: " & unexpected(v) & ", expected struct " & typeName)
+  false
+
+proc requireKey*(d: var TomlDe; v: TomlValue; key: string): bool =
+  ## A field with no `#[serde(default)]`.
+  if v.kind == tkTable and findKey(v, key) >= 0:
+    return true
+  d.fail("missing field `" & key & "`")
+  false
+
+proc enter*(d: var TomlDe; v: TomlValue; key: string; sub: var TomlValue): bool =
+  ## Steps into `key` when present; pair it with `leave`. False leaves the path alone and keeps the default.
+  let idx = findKey(v, key)
+  if idx < 0:
+    return false
+  sub = v.vals[idx]
+  d.path.add(key)
+  true
+
+proc leave*(d: var TomlDe) =
+  discard d.path.pop()
+
+proc readUnsigned*(d: var TomlDe; v: TomlValue; hi: uint64; typeName: string): uint64 =
+  ## Rust's integer `Deserialize`: no floats, range-checked.
+  result = 0'u64
+  if v.kind != tkInt:
+    d.fail("invalid type: " & unexpected(v) & ", expected " & typeName)
+  elif v.intVal < 0 or uint64(v.intVal) > hi:
+    d.fail("invalid value: " & unexpected(v) & ", expected " & typeName)
+  else:
+    result = uint64(v.intVal)
+
+proc readVariant*(d: var TomlDe; v: TomlValue; names: openArray[string]): int =
+  ## A unit enum's name; -1 after recording the error.
+  if v.kind != tkString:
+    d.fail("invalid type: " & unexpected(v) & ", expected a string")
+    return -1
+  var i = 0
+  while i < names.len:
+    if names[i] == v.strVal:
+      return i
+    inc i
+  var msg = "unknown variant `" & v.strVal & "`, expected "
+  if names.len == 1:
+    msg.add("`" & names[0] & "`")
+  elif names.len == 2:
+    msg.add("`" & names[0] & "` or `" & names[1] & "`")
+  else:
+    msg.add("one of ")
+    i = 0
+    while i < names.len:
+      if i > 0:
+        msg.add(", ")
+      msg.add("`" & names[i] & "`")
+      inc i
+  d.fail(msg)
+  -1
+
+proc getBool*(d: var TomlDe; v: TomlValue; key: string; dst: var bool) =
+  var sub = TomlValue()
+  if d.enter(v, key, sub):
+    if sub.kind == tkBool:
+      dst = sub.boolVal
+    else:
+      d.fail("invalid type: " & unexpected(sub) & ", expected a boolean")
+    d.leave()
+
+proc getStr*(d: var TomlDe; v: TomlValue; key: string; dst: var string) =
+  var sub = TomlValue()
+  if d.enter(v, key, sub):
+    if sub.kind == tkString:
+      dst = sub.strVal
+    else:
+      d.fail("invalid type: " & unexpected(sub) & ", expected a string")
+    d.leave()
+
+proc getU8*(d: var TomlDe; v: TomlValue; key: string; dst: var uint8) =
+  var sub = TomlValue()
+  if d.enter(v, key, sub):
+    dst = uint8(d.readUnsigned(sub, 255'u64, "u8"))
+    d.leave()
+
+proc getNonZeroU8*(d: var TomlDe; v: TomlValue; key: string; dst: var uint8) =
+  ## `NonZeroU8`.
+  var sub = TomlValue()
+  if d.enter(v, key, sub):
+    if sub.kind == tkInt and sub.intVal == 0:
+      d.fail("invalid value: integer `0`, expected a nonzero u8")
+    else:
+      dst = uint8(d.readUnsigned(sub, 255'u64, "a nonzero u8"))
+    d.leave()
+
+proc getU16*(d: var TomlDe; v: TomlValue; key: string; dst: var uint16) =
+  var sub = TomlValue()
+  if d.enter(v, key, sub):
+    dst = uint16(d.readUnsigned(sub, 65535'u64, "u16"))
+    d.leave()
+
+proc getU32*(d: var TomlDe; v: TomlValue; key: string; dst: var uint32) =
+  var sub = TomlValue()
+  if d.enter(v, key, sub):
+    dst = uint32(d.readUnsigned(sub, 4294967295'u64, "u32"))
+    d.leave()
+
+proc getU64*(d: var TomlDe; v: TomlValue; key: string; dst: var uint64) =
+  var sub = TomlValue()
+  if d.enter(v, key, sub):
+    dst = d.readUnsigned(sub, uint64(high(int64)), "u64")
+    d.leave()
+
+proc getF32*(d: var TomlDe; v: TomlValue; key: string; dst: var float32) =
+  ## serde's float visitors take integers too.
+  var sub = TomlValue()
+  if d.enter(v, key, sub):
+    if sub.kind == tkFloat:
+      dst = float32(sub.floatVal)
+    elif sub.kind == tkInt:
+      dst = float32(sub.intVal)
+    else:
+      d.fail("invalid type: " & unexpected(sub) & ", expected f32")
+    d.leave()
+
+proc getStrSeq*(d: var TomlDe; v: TomlValue; key: string; dst: var seq[string]) =
+  ## `Vec<String>`: the value replaces the default whole.
+  var sub = TomlValue()
+  if d.enter(v, key, sub):
+    if sub.kind != tkArray:
+      d.fail("invalid type: " & unexpected(sub) & ", expected a sequence")
+    else:
+      var items: seq[string] = @[]
+      for item in sub.arr:
+        if item.kind != tkString:
+          d.fail("invalid type: " & unexpected(item) & ", expected a string")
+          break
+        items.add(item.strVal)
+      if not d.failed:
+        dst = items
+    d.leave()
