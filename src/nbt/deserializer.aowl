@@ -1,16 +1,20 @@
-## Low-level NBT deserialization support.
-## Port of upstream/nbt/src/deserializer.rs
+## Low-level NBT reading, the primitive half of deserializer.rs: `NbtDataSource`, `NbtStreamReader`,
+## `NbtReadHelper`, `NbtReadHelperJava`, `NbtReadHelperBedrock` and the cesu8 crate's decoder.
+## Port of pumpkin-nbt/src/deserializer.rs (the serde `Deserializer` half is in serde_de.aowl, because it
+## needs `NbtTag`, which imports this file).
 ##
-## Rust models this with an `NbtDataSource` trait borrowing zero-copy slices
-## out of three different backing sources (`&[u8]`, `Bytes`, a `Read`
-## stream), each wrapped by `NbtReadHelperJava`/`NbtReadHelperBedrock`. That
-## split exists for Rust's borrow-checked zero-copy reads; aowlmony gains
-## nothing from reproducing it, so this is one `NbtReader` over an owned
-## `seq[byte]` with a cursor, matching `serializer.aowl`'s single-writer-type
-## shape. `get_string` therefore always returns an owned `string`, never a
-## `Cow`.
+## Rust's source trait exists for zero-copy borrowing from three backings. Here `NbtReader` is one owned
+## buffer with a cursor and a `mode` in place of the two helper types. Text of the EOF errors follows
+## `Cursor<&[u8]>`, what `from_slice` uses.
+##
+## One deliberate divergence: upstream's Bedrock helper inherits the fixed-width `skip_i32`/`skip_i64`
+## defaults although Bedrock ints are varints, so skipping desyncs. `skipI32`/`skipI64` read the varint.
 
 import nbtbase
+
+const
+  fillEof = "failed to fill whole buffer" ## read_exact's message
+  cursorEof = "unexpected EOF"            ## Cursor read_string/read_byte_array
 
 type
   NbtReadMode* = enum
@@ -28,12 +32,13 @@ proc newNbtReader*(mode: NbtReadMode, data: sink seq[byte]): NbtReader =
 proc remaining(r: NbtReader): int {.inline.} =
   r.data.len - r.pos
 
-proc needBytes(r: NbtReader, n: int): NbtError =
-  incomplete("needed " & $n & " bytes, only " & $remaining(r) & " remaining")
+proc eofAtFill(r: var NbtReader): NbtError =
+  r.pos = r.data.len
+  incompleteEof(fillEof)
 
 proc getU8*(r: var NbtReader): NbtResult[uint8] =
   if remaining(r) < 1:
-    return errRes[uint8](needBytes(r, 1))
+    return errRes[uint8](eofAtFill(r))
   result = ok[uint8](r.data[r.pos])
   inc r.pos
 
@@ -43,65 +48,35 @@ proc getI8*(r: var NbtReader): NbtResult[int8] =
     return errRes[int8](b.error)
   ok[int8](cast[int8](b.value))
 
-proc getSlice(r: var NbtReader, n: int): NbtResult[seq[byte]] =
-  if n < 0:
-    return errRes[seq[byte]](negativeLength(int32(n)))
-  if remaining(r) < n:
-    return errRes[seq[byte]](needBytes(r, n))
-  var s = newSeq[byte](n)
+proc readBig(r: var NbtReader, n: int): uint64 {.inline.} =
+  result = 0
   for i in 0 ..< n:
-    s[i] = r.data[r.pos + i]
+    result = (result shl 8) or uint64(r.data[r.pos + i])
   r.pos += n
-  ok[seq[byte]](s)
 
-proc beU16(bytes: seq[byte]): uint16 {.inline.} =
-  (uint16(bytes[0]) shl 8) or uint16(bytes[1])
-
-proc beU32(bytes: seq[byte]): uint32 {.inline.} =
-  (uint32(bytes[0]) shl 24) or (uint32(bytes[1]) shl 16) or
-    (uint32(bytes[2]) shl 8) or uint32(bytes[3])
-
-proc beU64(bytes: seq[byte]): uint64 {.inline.} =
+proc readLittle(r: var NbtReader, n: int): uint64 {.inline.} =
   result = 0
-  for b in bytes:
-    result = (result shl 8) or uint64(b)
-
-proc leU16(bytes: seq[byte]): uint16 {.inline.} =
-  uint16(bytes[0]) or (uint16(bytes[1]) shl 8)
-
-proc leU32(bytes: seq[byte]): uint32 {.inline.} =
-  uint32(bytes[0]) or (uint32(bytes[1]) shl 8) or
-    (uint32(bytes[2]) shl 16) or (uint32(bytes[3]) shl 24)
-
-proc leU64(bytes: seq[byte]): uint64 {.inline.} =
-  result = 0
-  var shift = 0
-  for b in bytes:
-    result = result or (uint64(b) shl uint64(shift))
-    shift += 8
+  for i in 0 ..< n:
+    result = result or (uint64(r.data[r.pos + i]) shl uint64(i * 8))
+  r.pos += n
 
 proc getI16*(r: var NbtReader): NbtResult[int16] =
-  let s = getSlice(r, 2)
-  if not s.isOk:
-    return errRes[int16](s.error)
+  if remaining(r) < 2:
+    return errRes[int16](eofAtFill(r))
   case r.mode
-  of nrmJava: ok[int16](cast[int16](beU16(s.value)))
-  of nrmBedrock: ok[int16](cast[int16](leU16(s.value)))
+  of nrmJava: ok[int16](cast[int16](uint16(readBig(r, 2))))
+  of nrmBedrock: ok[int16](cast[int16](uint16(readLittle(r, 2))))
 
 proc getVarU32(r: var NbtReader): NbtResult[uint32] =
   var value: uint32 = 0
-  var shift = 0
-  while true:
-    if shift >= 35:
-      return errRes[uint32](varIntTooLarge())
+  for i in 0 ..< 5:
     let b = getU8(r)
     if not b.isOk:
       return errRes[uint32](b.error)
-    value = value or ((uint32(b.value) and 0x7F'u32) shl shift)
+    value = value or ((uint32(b.value) and 0x7F'u32) shl (i * 7))
     if (b.value and 0x80'u8) == 0:
-      break
-    shift += 7
-  ok[uint32](value)
+      return ok[uint32](value)
+  errRes[uint32](varIntTooLarge())
 
 proc getVarI32(r: var NbtReader): NbtResult[int32] =
   let v = getVarU32(r)
@@ -112,18 +87,14 @@ proc getVarI32(r: var NbtReader): NbtResult[int32] =
 
 proc getVarU64(r: var NbtReader): NbtResult[uint64] =
   var value: uint64 = 0
-  var shift = 0
-  while true:
-    if shift >= 70:
-      return errRes[uint64](varLongTooLarge())
+  for i in 0 ..< 10:
     let b = getU8(r)
     if not b.isOk:
       return errRes[uint64](b.error)
-    value = value or ((uint64(b.value) and 0x7F'u64) shl shift)
+    value = value or ((uint64(b.value) and 0x7F'u64) shl (i * 7))
     if (b.value and 0x80'u8) == 0:
-      break
-    shift += 7
-  ok[uint64](value)
+      return ok[uint64](value)
+  errRes[uint64](varLongTooLarge())
 
 proc getVarI64(r: var NbtReader): NbtResult[int64] =
   let v = getVarU64(r)
@@ -135,92 +106,212 @@ proc getVarI64(r: var NbtReader): NbtResult[int64] =
 proc getI32*(r: var NbtReader): NbtResult[int32] =
   case r.mode
   of nrmJava:
-    let s = getSlice(r, 4)
-    if not s.isOk:
-      return errRes[int32](s.error)
-    ok[int32](cast[int32](beU32(s.value)))
+    if remaining(r) < 4:
+      return errRes[int32](eofAtFill(r))
+    ok[int32](cast[int32](uint32(readBig(r, 4))))
   of nrmBedrock:
     getVarI32(r)
 
 proc getI64*(r: var NbtReader): NbtResult[int64] =
   case r.mode
   of nrmJava:
-    let s = getSlice(r, 8)
-    if not s.isOk:
-      return errRes[int64](s.error)
-    ok[int64](cast[int64](beU64(s.value)))
+    if remaining(r) < 8:
+      return errRes[int64](eofAtFill(r))
+    ok[int64](cast[int64](readBig(r, 8)))
   of nrmBedrock:
     getVarI64(r)
 
 proc getF32*(r: var NbtReader): NbtResult[float32] =
+  if remaining(r) < 4:
+    return errRes[float32](eofAtFill(r))
   case r.mode
-  of nrmJava:
-    let s = getSlice(r, 4)
-    if not s.isOk:
-      return errRes[float32](s.error)
-    ok[float32](cast[float32](beU32(s.value)))
-  of nrmBedrock:
-    let s = getSlice(r, 4)
-    if not s.isOk:
-      return errRes[float32](s.error)
-    ok[float32](cast[float32](leU32(s.value)))
+  of nrmJava: ok[float32](cast[float32](uint32(readBig(r, 4))))
+  of nrmBedrock: ok[float32](cast[float32](uint32(readLittle(r, 4))))
 
 proc getF64*(r: var NbtReader): NbtResult[float64] =
+  if remaining(r) < 8:
+    return errRes[float64](eofAtFill(r))
+  case r.mode
+  of nrmJava: ok[float64](cast[float64](readBig(r, 8)))
+  of nrmBedrock: ok[float64](cast[float64](readLittle(r, 8)))
+
+# --- cesu8 crate 1.1.0, Java variant ------------------------------------------
+
+proc isValidUtf8*(b: openArray[byte]): bool =
+  ## Same acceptance as `std::str::from_utf8`.
+  var i = 0
+  let n = b.len
+  template cont(at: int, lo, hi: uint8): bool =
+    at < n and b[at] >= lo and b[at] <= hi
+  while i < n:
+    let c = b[i]
+    if c < 0x80'u8:
+      inc i
+    elif c >= 0xC2'u8 and c <= 0xDF'u8:
+      if not cont(i + 1, 0x80'u8, 0xBF'u8): return false
+      i += 2
+    elif c >= 0xE0'u8 and c <= 0xEF'u8:
+      let lo = if c == 0xE0'u8: 0xA0'u8 else: 0x80'u8
+      let hi = if c == 0xED'u8: 0x9F'u8 else: 0xBF'u8
+      if not cont(i + 1, lo, hi) or not cont(i + 2, 0x80'u8, 0xBF'u8): return false
+      i += 3
+    elif c >= 0xF0'u8 and c <= 0xF4'u8:
+      let lo = if c == 0xF0'u8: 0x90'u8 else: 0x80'u8
+      let hi = if c == 0xF4'u8: 0x8F'u8 else: 0xBF'u8
+      if not cont(i + 1, lo, hi) or not cont(i + 2, 0x80'u8, 0xBF'u8) or
+         not cont(i + 3, 0x80'u8, 0xBF'u8): return false
+      i += 4
+    else:
+      return false
+  true
+
+proc bytesToString(b: openArray[byte]): string =
+  result = newString(b.len)
+  for i in 0 ..< b.len:
+    result[i] = char(b[i])
+
+proc isCont(b: uint8): bool {.inline.} =
+  (b and 0xC0'u8) == 0x80'u8
+
+proc utf8CharWidth(b: uint8): int =
+  if b >= 0xC2'u8 and b <= 0xDF'u8: 2
+  elif b >= 0xE0'u8 and b <= 0xEF'u8: 3
+  elif b >= 0xF0'u8 and b <= 0xF4'u8: 4
+  else: 0
+
+proc decSurrogate(second, third: uint8): uint32 {.inline.} =
+  0xD000'u32 or (uint32(second and 0x3F'u8) shl 6) or uint32(third and 0x3F'u8)
+
+proc fromJavaCesu8*(b: openArray[byte]): NbtResult[string] =
+  ## cesu8::from_java_cesu8: anything that is already valid UTF-8 passes untouched, raw NUL and 4-byte
+  ## forms included. Otherwise it decodes `C0 80` and 6-byte surrogate pairs, and those forms cannot mix
+  ## with a raw NUL or a 4-byte sequence.
+  if isValidUtf8(b):
+    return ok[string](bytesToString(b))
+  var decoded = newStringOfCap(b.len)
+  let bad = errRes[string](cesu8Decoding())
+  var i = 0
+  let n = b.len
+  while i < n:
+    let first = b[i]
+    inc i
+    if first == 0'u8:
+      return bad
+    elif first < 128'u8:
+      decoded.add char(first)
+    elif first == 0xC0'u8:
+      if i >= n or b[i] != 0x80'u8:
+        return bad
+      inc i
+      decoded.add char(0)
+    else:
+      let w = utf8CharWidth(first)
+      if i >= n or not isCont(b[i]):
+        return bad
+      let second = b[i]
+      inc i
+      if w == 2:
+        decoded.add char(first)
+        decoded.add char(second)
+      elif w == 3:
+        if i >= n or not isCont(b[i]):
+          return bad
+        let third = b[i]
+        inc i
+        let passThrough =
+          (first == 0xE0'u8 and second >= 0xA0'u8) or
+          (first >= 0xE1'u8 and first <= 0xEC'u8) or
+          (first == 0xED'u8 and second <= 0x9F'u8) or
+          (first >= 0xEE'u8)
+        if passThrough:
+          decoded.add char(first)
+          decoded.add char(second)
+          decoded.add char(third)
+        elif first == 0xED'u8 and second >= 0xA0'u8 and second <= 0xAF'u8:
+          if i >= n or b[i] != 0xED'u8:
+            return bad
+          inc i
+          if i >= n or not isCont(b[i]) or b[i] < 0xB0'u8:
+            return bad
+          let fifth = b[i]
+          inc i
+          if i >= n or not isCont(b[i]):
+            return bad
+          let sixth = b[i]
+          inc i
+          let c = 0x10000'u32 + (((decSurrogate(second, third) - 0xD800'u32) shl 10) or
+                                 (decSurrogate(fifth, sixth) - 0xDC00'u32))
+          decoded.add char(0xF0'u32 or (c shr 18))
+          decoded.add char(0x80'u32 or ((c shr 12) and 0x3F'u32))
+          decoded.add char(0x80'u32 or ((c shr 6) and 0x3F'u32))
+          decoded.add char(0x80'u32 or (c and 0x3F'u32))
+        else:
+          return bad
+      else:
+        return bad
+  ok[string](decoded)
+
+# --- NbtDataSource ------------------------------------------------------------
+
+proc readU8*(r: var NbtReader): NbtResult[uint8] =
+  getU8(r)
+
+proc readBytes*(r: var NbtReader, buf: var openArray[byte]): NbtVoidResult =
+  if remaining(r) < buf.len:
+    return errVoid(eofAtFill(r))
+  for i in 0 ..< buf.len:
+    buf[i] = r.data[r.pos + i]
+  r.pos += buf.len
+  okVoid()
+
+proc seekRelative*(r: var NbtReader, offset: int64): NbtVoidResult =
+  ## Seeking past the end succeeds, as it does on a Cursor or a file; the next read then hits EOF.
+  let target = int64(r.pos) + offset
+  if target < 0:
+    return errVoid(incomplete("invalid seek to a negative or overflowing position"))
+  r.pos = int(target)
+  okVoid()
+
+proc readString*(r: var NbtReader, len: int): NbtResult[string] =
+  if remaining(r) < len:
+    return errRes[string](incompleteEof(cursorEof))
+  let start = r.pos
+  r.pos += len
+  fromJavaCesu8(r.data.toOpenArray(start, start + len - 1))
+
+proc readByteArray*(r: var NbtReader, len: int): NbtResult[seq[int8]] =
+  if remaining(r) < len:
+    return errRes[seq[int8]](incompleteEof(cursorEof))
+  var out8 = newSeq[int8](len)
+  for i in 0 ..< len:
+    out8[i] = cast[int8](r.data[r.pos + i])
+  r.pos += len
+  ok[seq[int8]](out8)
+
+# --- NbtReadHelper ------------------------------------------------------------
+
+proc getStringLen(r: var NbtReader): NbtResult[int] =
   case r.mode
   of nrmJava:
-    let s = getSlice(r, 8)
-    if not s.isOk:
-      return errRes[float64](s.error)
-    ok[float64](cast[float64](beU64(s.value)))
+    let v = getI16(r)
+    if not v.isOk:
+      return errRes[int](v.error)
+    ok[int](int(cast[uint16](v.value)))
   of nrmBedrock:
-    let s = getSlice(r, 8)
-    if not s.isOk:
-      return errRes[float64](s.error)
-    ok[float64](cast[float64](leU64(s.value)))
-
-proc bytesToStringLossy(bytes: seq[byte]): string =
-  ## Upstream decodes Java CESU-8 / plain UTF-8 strictly and surfaces a
-  ## decode error. A from-scratch CESU-8 *decoder* (surrogate-pair
-  ## recombination, modified-NUL) is real work with its own edge cases;
-  ## punting to a byte-for-byte copy is wrong for the rare non-ASCII/NUL
-  ## case but unblocks everything downstream. TODO: implement strict
-  ## CESU-8/UTF-8 decoding here and return the `utf8Decoding`/
-  ## `nekCesu8Decoding` error on failure like upstream does.
-  result = newString(bytes.len)
-  for i, b in bytes:
-    result[i] = char(b)
+    let v = getVarU32(r)
+    if not v.isOk:
+      return errRes[int](v.error)
+    ok[int](int(v.value))
 
 proc getString*(r: var NbtReader): NbtResult[string] =
-  case r.mode
-  of nrmJava:
-    let lenRes = getI16(r)
-    if not lenRes.isOk:
-      return errRes[string](lenRes.error)
-    let s = getSlice(r, int(cast[uint16](lenRes.value)))
-    if not s.isOk:
-      return errRes[string](s.error)
-    ok[string](bytesToStringLossy(s.value))
-  of nrmBedrock:
-    let lenRes = getVarU32(r)
-    if not lenRes.isOk:
-      return errRes[string](lenRes.error)
-    let s = getSlice(r, int(lenRes.value))
-    if not s.isOk:
-      return errRes[string](s.error)
-    ok[string](bytesToStringLossy(s.value))
+  let len = getStringLen(r)
+  if not len.isOk:
+    return errRes[string](len.error)
+  readString(r, len.value)
 
 proc getByteArray*(r: var NbtReader, len: int): NbtResult[seq[int8]] =
-  ## Takes an already-read, already-validated element count, matching
-  ## upstream `NbtReadHelper::get_byte_array(len)` - the length prefix is
-  ## read and range-checked by the caller (`NbtTag`'s (de)serialize_data),
-  ## not here.
-  let s = getSlice(r, len)
-  if not s.isOk:
-    return errRes[seq[int8]](s.error)
-  var out8 = newSeq[int8](s.value.len)
-  for i, b in s.value:
-    out8[i] = cast[int8](b)
-  ok[seq[int8]](out8)
+  ## The caller reads and range-checks the length prefix.
+  readByteArray(r, len)
 
 proc getI32Array*(r: var NbtReader, len: int): NbtResult[seq[int32]] =
   var out32 = newSeq[int32](len)
@@ -241,18 +332,11 @@ proc getI64Array*(r: var NbtReader, len: int): NbtResult[seq[int64]] =
   ok[seq[int64]](out64)
 
 proc skipBytes*(r: var NbtReader, n: int): NbtVoidResult =
-  if remaining(r) < n:
-    return errVoid(needBytes(r, n))
-  r.pos += n
-  okVoid()
+  seekRelative(r, int64(n))
 
 proc skipU8*(r: var NbtReader): NbtVoidResult = skipBytes(r, 1)
 proc skipI8*(r: var NbtReader): NbtVoidResult = skipBytes(r, 1)
-
-proc skipI16*(r: var NbtReader): NbtVoidResult =
-  case r.mode
-  of nrmJava: skipBytes(r, 2)
-  of nrmBedrock: skipBytes(r, 2)
+proc skipI16*(r: var NbtReader): NbtVoidResult = skipBytes(r, 2)
 
 proc skipI32*(r: var NbtReader): NbtVoidResult =
   case r.mode
@@ -272,5 +356,7 @@ proc skipF32*(r: var NbtReader): NbtVoidResult = skipBytes(r, 4)
 proc skipF64*(r: var NbtReader): NbtVoidResult = skipBytes(r, 8)
 
 proc skipString*(r: var NbtReader): NbtVoidResult =
-  let s = getString(r)
-  if not s.isOk: errVoid(s.error) else: okVoid()
+  let len = getStringLen(r)
+  if not len.isOk:
+    return errVoid(len.error)
+  skipBytes(r, len.value)

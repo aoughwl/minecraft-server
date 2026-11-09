@@ -1,0 +1,658 @@
+## serde's `Deserializer` for NBT, and the `Deserialize` impls of NbtTag, NbtCompound and the derive.
+## Port of pumpkin-nbt/src/deserializer.rs (`Deserializer`, `CompoundAccess`, `MapKey`, `ListAccess`,
+## `from_bytes*`, `from_slice*`; the primitive readers are in deserializer.aowl)
+##
+## There is no serde, so a `#[derive(Deserialize)]` struct is any aowlmony `object`, filled by compile-time
+## field reflection in `deserializeValue`. The visitors serde's std types and derive would use are inlined
+## per type, with serde's error text. An overload of `deserializeValue` visible where `fromBytes` is
+## instantiated takes priority over the object walker, for `#[serde(...)]` attributes.
+##
+## Kept from upstream as they are: `deserialize_bool` reads nothing and gives false for a non-byte tag;
+## `deserialize_str` and the u16/u32/u64 forms read by the Rust type without looking at the tag; a list of
+## int arrays through `NbtTag` fails because its visitor asks for i32 elements; an int array through `NbtTag`
+## comes back as a list of ints, since the thread-local holds the element type and not the array type.
+##
+## Added: `NbtTag` and `NbtCompound` values recurse on input, so they count depth against MaxNbtDepth. The
+## pinned tree would overflow the stack there.
+
+{.feature: "untyped".}
+
+import std/[options, tables]
+import ../codecs/json_value
+import nbtbase, serializer, deserializer, tag
+import serde_ser
+
+type
+  NbtDeserializer* = object
+    input*: NbtReader
+    hasTag: bool     ## tag_to_deserialize_stack is Some
+    tag: uint8
+    inList: bool
+    isNamed: bool
+    depth: int       ## NbtTag and NbtCompound nesting
+
+proc newNbtDeserializer*(input: sink NbtReader, isNamed: bool): NbtDeserializer =
+  ## `isNamed` true consumes the root compound's name. Unnamed network NBT passes false.
+  NbtDeserializer(input: input, hasTag: false, tag: 0'u8, inList: false, isNamed: isNamed, depth: 0)
+
+# --- serde's error text -------------------------------------------------------
+
+proc rustDebugStr(s: string): string =
+  result = "\""
+  for c in s:
+    case c
+    of '"': result.add "\\\""
+    of '\\': result.add "\\\\"
+    of '\n': result.add "\\n"
+    of '\r': result.add "\\r"
+    of '\t': result.add "\\t"
+    else: result.add c
+  result.add "\""
+
+proc withDecimalPoint(f: float64): string =
+  ## serde's Unexpected::Float: Display, plus `.0` when that printed no point.
+  result = displayF64(f)
+  var plain = true
+  for c in result:
+    if c notin {'0' .. '9', '-'}:
+      plain = false
+  if plain:
+    result.add ".0"
+
+proc unexpectedOf(t: NbtTag): string =
+  case t.kind
+  of ntkByte: "integer `" & $t.byteVal & "`"
+  of ntkShort: "integer `" & $t.shortVal & "`"
+  of ntkInt: "integer `" & $t.intVal & "`"
+  of ntkLong: "integer `" & $t.longVal & "`"
+  of ntkFloat: "floating point `" & withDecimalPoint(float64(t.floatVal)) & "`"
+  of ntkDouble: "floating point `" & withDecimalPoint(t.doubleVal) & "`"
+  of ntkString: "string " & rustDebugStr(t.stringVal)
+  else: "map"
+
+proc invalidType(unexpected, expected: string): NbtError =
+  serdeError("invalid type: " & unexpected & ", expected " & expected)
+
+proc invalidValue(unexpected, expected: string): NbtError =
+  serdeError("invalid value: " & unexpected & ", expected " & expected)
+
+proc invalidLength(n: int, expected: string): NbtError =
+  serdeError("invalid length " & $n & ", expected " & expected)
+
+# --- deserialize_any ----------------------------------------------------------
+
+proc topLevelError(): NbtError =
+  serdeError("The top level must be a component (e.g. a struct)")
+
+proc endTagError(): NbtError =
+  serdeError("Trying to deserialize an END tag!")
+
+proc readSeqHeader(d: var NbtDeserializer, listType: var uint8, count: var int): NbtVoidResult =
+  ## The list and array arm of deserialize_any, up to visit_seq.
+  case d.tag
+  of ListId:
+    let t = getU8(d.input)
+    if not t.isOk:
+      return errVoid(t.error)
+    listType = t.value
+  of IntArrayId: listType = IntId
+  of LongArrayId: listType = LongId
+  else: listType = ByteId
+  let remaining = getI32(d.input)
+  if not remaining.isOk:
+    return errVoid(remaining.error)
+  if remaining.value < 0:
+    return errVoid(negativeLength(remaining.value))
+  count = int(remaining.value)
+  if count > MaxArrayLength:
+    return errVoid(largeLength(count))
+  okVoid()
+
+proc isSeqTag(tag: uint8): bool {.inline.} =
+  tag == ListId or tag == IntArrayId or tag == LongArrayId or tag == ByteArrayId
+
+proc anyScalar(d: var NbtDeserializer, expected: string, t: var NbtTag): NbtVoidResult =
+  ## deserialize_any for a visitor that only accepts scalars. Sequences and maps fail the way a visitor's
+  ## default visit_seq and visit_map do, after the list header has been read.
+  if not d.hasTag:
+    return errVoid(topLevelError())
+  if d.tag == EndId:
+    return errVoid(endTagError())
+  if isSeqTag(d.tag):
+    var listType = EndId
+    var count = 0
+    let h = readSeqHeader(d, listType, count)
+    if not h.isOk:
+      return h
+    return errVoid(invalidType("sequence", expected))
+  if d.tag == CompoundId:
+    return errVoid(invalidType("map", expected))
+  let v = deserializeData(d.input, d.tag)
+  if not v.isOk:
+    return errVoid(v.error)
+  t = v.value
+  okVoid()
+
+proc seqStart(d: var NbtDeserializer, expected: string, listType: var uint8, count: var int): NbtVoidResult =
+  ## deserialize_any for a visitor that only accepts a sequence.
+  if not d.hasTag:
+    return errVoid(topLevelError())
+  if d.tag == EndId:
+    return errVoid(endTagError())
+  if isSeqTag(d.tag):
+    return readSeqHeader(d, listType, count)
+  if d.tag == CompoundId:
+    return errVoid(invalidType("map", expected))
+  let v = deserializeData(d.input, d.tag)
+  if not v.isOk:
+    return errVoid(v.error)
+  errVoid(invalidType(unexpectedOf(v.value), expected))
+
+proc mapStart*(d: var NbtDeserializer): NbtVoidResult =
+  ## deserialize_map and deserialize_struct, up to visit_map.
+  if d.hasTag:
+    if d.tag != CompoundId:
+      return errVoid(serdeError("Trying to deserialize a map without a compound ID (id " & $d.tag & ")"))
+  else:
+    let nextByte = getU8(d.input)
+    if not nextByte.isOk:
+      return errVoid(nextByte.error)
+    if nextByte.value != CompoundId:
+      return errVoid(noRootCompound(nextByte.value))
+    if d.isNamed:
+      let s = skipString(d.input)
+      if not s.isOk:
+        return s
+  okVoid()
+
+proc nextKey*(d: var NbtDeserializer, done: var bool, key: var string): NbtVoidResult =
+  ## CompoundAccess::next_key_seed with MapKey.
+  let t = getU8(d.input)
+  if not t.isOk:
+    return errVoid(t.error)
+  d.hasTag = true
+  d.tag = t.value
+  if t.value == EndId:
+    done = true
+    return okVoid()
+  let k = getString(d.input)
+  if not k.isOk:
+    return errVoid(k.error)
+  key = k.value
+  okVoid()
+
+proc skipIgnoredValue*(d: var NbtDeserializer): NbtVoidResult =
+  ## deserialize_ignored_any.
+  if not d.hasTag:
+    return errVoid(serdeError("Ignoring nothing!"))
+  skipData(d.input, d.tag)
+
+proc startElement*(d: var NbtDeserializer, listType: uint8) =
+  ## ListAccess::next_element_seed, before the element.
+  d.hasTag = true
+  d.tag = listType
+  d.inList = true
+
+proc endElement*(d: var NbtDeserializer) =
+  d.inList = false
+
+# --- numbers ------------------------------------------------------------------
+
+proc checkedSigned(d: var NbtDeserializer, expected: string, lo, hi: int64, v: var int64): NbtVoidResult =
+  ## A serde integer visitor fed from deserialize_any.
+  var t = NbtTag(kind: ntkEnd)
+  let r = anyScalar(d, expected, t)
+  if not r.isOk:
+    return r
+  case t.kind
+  of ntkByte: v = int64(t.byteVal)
+  of ntkShort: v = int64(t.shortVal)
+  of ntkInt: v = int64(t.intVal)
+  of ntkLong: v = t.longVal
+  else: return errVoid(invalidType(unexpectedOf(t), expected))
+  if v < lo or v > hi:
+    return errVoid(invalidValue("integer `" & $v & "`", expected))
+  okVoid()
+
+proc deserializeValue*(d: var NbtDeserializer, v: var int8): NbtVoidResult =
+  var x = 0'i64
+  result = checkedSigned(d, "i8", -128'i64, 127'i64, x)
+  if result.isOk: v = int8(x)
+
+proc deserializeValue*(d: var NbtDeserializer, v: var int16): NbtVoidResult =
+  var x = 0'i64
+  result = checkedSigned(d, "i16", -32768'i64, 32767'i64, x)
+  if result.isOk: v = int16(x)
+
+proc deserializeValue*(d: var NbtDeserializer, v: var int32): NbtVoidResult =
+  var x = 0'i64
+  result = checkedSigned(d, "i32", int64(int32.low), int64(int32.high), x)
+  if result.isOk: v = int32(x)
+
+proc deserializeValue*(d: var NbtDeserializer, v: var int64): NbtVoidResult =
+  var x = 0'i64
+  result = checkedSigned(d, "i64", int64.low, int64.high, x)
+  if result.isOk: v = x
+
+proc deserializeValue*(d: var NbtDeserializer, v: var uint8): NbtVoidResult =
+  if not d.inList:
+    return errVoid(unsupportedType("u8; NBT only supports signed values"))
+  let x = getU8(d.input)
+  if not x.isOk:
+    return errVoid(x.error)
+  v = x.value
+  okVoid()
+
+proc deserializeValue*(d: var NbtDeserializer, v: var uint16): NbtVoidResult =
+  let x = getI16(d.input)
+  if not x.isOk:
+    return errVoid(x.error)
+  if x.value < 0:
+    return errVoid(invalidValue("integer `" & $x.value & "`", "u16"))
+  v = uint16(x.value)
+  okVoid()
+
+proc deserializeValue*(d: var NbtDeserializer, v: var uint32): NbtVoidResult =
+  let x = getI32(d.input)
+  if not x.isOk:
+    return errVoid(x.error)
+  if x.value < 0:
+    return errVoid(invalidValue("integer `" & $x.value & "`", "u32"))
+  v = uint32(x.value)
+  okVoid()
+
+proc deserializeValue*(d: var NbtDeserializer, v: var uint64): NbtVoidResult =
+  let x = getI64(d.input)
+  if not x.isOk:
+    return errVoid(x.error)
+  if x.value < 0:
+    return errVoid(invalidValue("integer `" & $x.value & "`", "u64"))
+  v = uint64(x.value)
+  okVoid()
+
+proc deserializeValue*(d: var NbtDeserializer, v: var float32): NbtVoidResult =
+  var t = NbtTag(kind: ntkEnd)
+  let r = anyScalar(d, "f32", t)
+  if not r.isOk:
+    return r
+  case t.kind
+  of ntkByte: v = float32(t.byteVal)
+  of ntkShort: v = float32(t.shortVal)
+  of ntkInt: v = float32(t.intVal)
+  of ntkLong: v = float32(t.longVal)
+  of ntkFloat: v = t.floatVal
+  of ntkDouble: v = float32(t.doubleVal)
+  else: return errVoid(invalidType(unexpectedOf(t), "f32"))
+  okVoid()
+
+proc deserializeValue*(d: var NbtDeserializer, v: var float64): NbtVoidResult =
+  var t = NbtTag(kind: ntkEnd)
+  let r = anyScalar(d, "f64", t)
+  if not r.isOk:
+    return r
+  case t.kind
+  of ntkByte: v = float64(t.byteVal)
+  of ntkShort: v = float64(t.shortVal)
+  of ntkInt: v = float64(t.intVal)
+  of ntkLong: v = float64(t.longVal)
+  of ntkFloat: v = float64(t.floatVal)
+  of ntkDouble: v = t.doubleVal
+  else: return errVoid(invalidType(unexpectedOf(t), "f64"))
+  okVoid()
+
+proc deserializeValue*(d: var NbtDeserializer, v: var bool): NbtVoidResult =
+  if not d.hasTag:
+    return errVoid(topLevelError()) # upstream's unwrap panics here
+  v = false
+  if d.tag == ByteId:
+    let x = getU8(d.input)
+    if not x.isOk:
+      return errVoid(x.error)
+    v = x.value != 0'u8
+  okVoid()
+
+proc deserializeValue*(d: var NbtDeserializer, v: var string): NbtVoidResult =
+  let x = getString(d.input)
+  if not x.isOk:
+    return errVoid(x.error)
+  v = x.value
+  okVoid()
+
+proc deserializeValue*(d: var NbtDeserializer, v: var char): NbtVoidResult =
+  var t = NbtTag(kind: ntkEnd)
+  let r = anyScalar(d, "a character", t)
+  if not r.isOk:
+    return r
+  if t.kind != ntkString:
+    return errVoid(invalidType(unexpectedOf(t), "a character"))
+  if t.stringVal.len != 1:
+    return errVoid(invalidValue("string " & rustDebugStr(t.stringVal), "a character"))
+  v = t.stringVal[0]
+  okVoid()
+
+# --- enums, options, sequences ------------------------------------------------
+
+proc unknownVariant(given: string, names: seq[string]): NbtError =
+  ## serde's OneOf wording.
+  var expected = ""
+  if names.len == 0:
+    expected = "there are no variants"
+  elif names.len == 1:
+    expected = "expected `" & names[0] & "`"
+  elif names.len == 2:
+    expected = "expected `" & names[0] & "` or `" & names[1] & "`"
+  else:
+    expected = "expected one of "
+    for i in 0 ..< names.len:
+      if i > 0: expected.add ", "
+      expected.add "`" & names[i] & "`"
+  serdeError("unknown variant `" & given & "`, " & expected)
+
+proc deserializeValue*[E: enum](d: var NbtDeserializer, v: var E): NbtVoidResult =
+  let x = getString(d.input)
+  if not x.isOk:
+    return errVoid(x.error)
+  var names = newSeq[string](0)
+  for e in E.low .. E.high:
+    if $e == x.value:
+      v = e
+      return okVoid()
+    names.add $e
+  errVoid(unknownVariant(x.value, names))
+
+proc deserializeValue*[T](d: var NbtDeserializer, v: var Option[T]): NbtVoidResult =
+  var x = default(T)
+  result = deserializeValue(d, x)
+  if result.isOk:
+    v = some(x)
+
+proc deserializeValue*[T](d: var NbtDeserializer, v: var ref T): NbtVoidResult =
+  ## Box<T>.
+  new(v)
+  deserializeValue(d, v[])
+
+proc deserializeValue*[T](d: var NbtDeserializer, v: var seq[T]): NbtVoidResult =
+  var listType = EndId
+  var count = 0
+  let h = seqStart(d, "a sequence", listType, count)
+  if not h.isOk:
+    return h
+  v = newSeq[T](0)
+  for i in 0 ..< count:
+    startElement(d, listType)
+    var x = default(T)
+    let e = deserializeValue(d, x)
+    endElement(d)
+    if not e.isOk:
+      return e
+    v.add x
+  okVoid()
+
+proc deserializeBytes*(d: var NbtDeserializer, v: var seq[byte]): NbtVoidResult =
+  ## deserialize_bytes with a bytes visitor: a byte array tag directly, with no length cap, else the
+  ## sequence path.
+  if d.hasTag and d.tag != ByteArrayId:
+    return deserializeValue(d, v)
+  let len = getI32(d.input)
+  if not len.isOk:
+    return errVoid(len.error)
+  if len.value < 0:
+    return errVoid(negativeLength(len.value))
+  let items = getByteArray(d.input, int(len.value))
+  if not items.isOk:
+    return errVoid(items.error)
+  v = newSeq[byte](items.value.len)
+  for i in 0 ..< items.value.len:
+    v[i] = cast[byte](items.value[i])
+  okVoid()
+
+proc deserializeValue*[I, T](d: var NbtDeserializer, v: var array[I, T]): NbtVoidResult =
+  let expected = "an array of length " & $v.len
+  var listType = EndId
+  var count = 0
+  let h = seqStart(d, expected, listType, count)
+  if not h.isOk:
+    return h
+  for i in 0 ..< v.len:
+    if i >= count:
+      return errVoid(invalidLength(i, expected))
+    startElement(d, listType)
+    let e = deserializeValue(d, v[i])
+    endElement(d)
+    if not e.isOk:
+      return e
+  okVoid()
+
+proc deserializeValue*[O: tuple](d: var NbtDeserializer, v: var O): NbtVoidResult =
+  var size = 0
+  for name, f in internalFieldPairs(v):
+    inc size
+  let expected = "a tuple of size " & $size
+  var listType = EndId
+  var count = 0
+  let h = seqStart(d, expected, listType, count)
+  if not h.isOk:
+    return h
+  var seen = 0
+  for name, f in internalFieldPairs(v):
+    if seen >= count:
+      return errVoid(invalidLength(seen, expected))
+    startElement(d, listType)
+    let e = deserializeValue(d, f)
+    endElement(d)
+    if not e.isOk:
+      return e
+    inc seen
+  okVoid()
+
+proc deserializeValue*[V](d: var NbtDeserializer, v: var Table[string, V]): NbtVoidResult =
+  let m = mapStart(d)
+  if not m.isOk:
+    return m
+  v = initTable[string, V]()
+  while true:
+    var done = false
+    var key = ""
+    let k = nextKey(d, done, key)
+    if not k.isOk:
+      return k
+    if done:
+      return okVoid()
+    var x = default(V)
+    let e = deserializeValue(d, x)
+    if not e.isOk:
+      return e
+    v[key] = x
+
+proc deserializeValue*[T](d: var NbtDeserializer, v: var NbtByteArray[T]): NbtVoidResult =
+  deserializeValue(d, v.items)
+
+proc deserializeValue*[T](d: var NbtDeserializer, v: var NbtIntArray[T]): NbtVoidResult =
+  deserializeValue(d, v.items)
+
+proc deserializeValue*[T](d: var NbtDeserializer, v: var NbtLongArray[T]): NbtVoidResult =
+  deserializeValue(d, v.items)
+
+# --- Deserialize for NbtCompound and NbtTag -----------------------------------
+
+proc deserializeValue*(d: var NbtDeserializer, v: var NbtCompound): NbtVoidResult =
+  let m = mapStart(d)
+  if not m.isOk:
+    return m
+  if d.depth > MaxNbtDepth:
+    return errVoid(maxDepthExceeded())
+  inc d.depth
+  v = newCompound()
+  while true:
+    var done = false
+    var key = ""
+    let k = nextKey(d, done, key)
+    if not k.isOk:
+      return k
+    if done:
+      break
+    var x = NbtTag(kind: ntkEnd)
+    let e = deserializeValue(d, x)
+    if not e.isOk:
+      return e
+    insert(v, key, x)
+  dec d.depth
+  okVoid()
+
+proc deserializeValue*(d: var NbtDeserializer, v: var NbtTag): NbtVoidResult =
+  if not d.hasTag:
+    return errVoid(topLevelError())
+  if d.tag == EndId:
+    return errVoid(endTagError())
+  if d.tag == CompoundId:
+    var c = newCompound()
+    let r = deserializeValue(d, c)
+    if not r.isOk:
+      return r
+    v = NbtTag(kind: ntkCompound, compoundVal: c)
+    return okVoid()
+  if not isSeqTag(d.tag):
+    let x = deserializeData(d.input, d.tag)
+    if not x.isOk:
+      return errVoid(x.error)
+    v = x.value
+    return okVoid()
+  var listType = EndId
+  var count = 0
+  let h = readSeqHeader(d, listType, count)
+  if not h.isOk:
+    return h
+  if d.depth > MaxNbtDepth:
+    return errVoid(maxDepthExceeded())
+  inc d.depth
+  # visit_seq branches on the element type here, not on the kind of tag being read.
+  case listType
+  of IntArrayId:
+    var items = newSeq[int32](0)
+    for i in 0 ..< count:
+      startElement(d, listType)
+      var x = 0'i32
+      let e = deserializeValue(d, x)
+      endElement(d)
+      if not e.isOk:
+        return e
+      items.add x
+    v = NbtTag(kind: ntkIntArray, intArrayVal: items)
+  of LongArrayId:
+    var items = newSeq[int64](0)
+    for i in 0 ..< count:
+      startElement(d, listType)
+      var x = 0'i64
+      let e = deserializeValue(d, x)
+      endElement(d)
+      if not e.isOk:
+        return e
+      items.add x
+    v = NbtTag(kind: ntkLongArray, longArrayVal: items)
+  of ByteArrayId:
+    var items = newSeq[int8](0)
+    for i in 0 ..< count:
+      startElement(d, listType)
+      var x = 0'i8
+      let e = deserializeValue(d, x)
+      endElement(d)
+      if not e.isOk:
+        return e
+      items.add x
+    v = NbtTag(kind: ntkByteArray, byteArrayVal: items)
+  else:
+    var items = newSeq[NbtTag](0)
+    for i in 0 ..< count:
+      startElement(d, listType)
+      var x = NbtTag(kind: ntkEnd)
+      let e = deserializeValue(d, x)
+      endElement(d)
+      if not e.isOk:
+        return e
+      items.add x
+    v = NbtTag(kind: ntkList, listVal: items)
+  dec d.depth
+  okVoid()
+
+# --- the derive ---------------------------------------------------------------
+
+proc isOptionalField[T](x: Option[T]): bool = true
+proc isOptionalField[T](x: T): bool = false
+
+proc deserializeValue*[O: object](d: var NbtDeserializer, v: var O): NbtVoidResult =
+  let m = mapStart(d)
+  if not m.isOk:
+    return m
+  var fieldCount = 0
+  for name, f in internalFieldPairs(v):
+    inc fieldCount
+  var seen = newSeq[bool](fieldCount)
+  while true:
+    var done = false
+    var key = ""
+    let k = nextKey(d, done, key)
+    if not k.isOk:
+      return k
+    if done:
+      break
+    var matched = false
+    var idx = 0
+    for name, f in internalFieldPairs(v):
+      if not matched and bareFieldName(name) == key:
+        matched = true
+        if seen[idx]:
+          return errVoid(serdeError("duplicate field `" & key & "`"))
+        seen[idx] = true
+        let e = deserializeValue(d, f)
+        if not e.isOk:
+          return e
+      inc idx
+    if not matched:
+      let s = skipIgnoredValue(d)
+      if not s.isOk:
+        return s
+  var idx = 0
+  for name, f in internalFieldPairs(v):
+    if not seen[idx] and not isOptionalField(f):
+      return errVoid(serdeError("missing field `" & bareFieldName(name) & "`"))
+    inc idx
+  okVoid()
+
+# --- from_bytes ---------------------------------------------------------------
+
+proc fromBytesWith[T](data: seq[byte], mode: NbtReadMode, isNamed: bool): NbtResult[T] =
+  var d = newNbtDeserializer(newNbtReader(mode, data), isNamed)
+  var v = default(T)
+  let r = deserializeValue(d, v)
+  if not r.isOk:
+    return errRes[T](r.error)
+  ok[T](v)
+
+proc fromBytes*[T](data: seq[byte]): NbtResult[T] =
+  ## Named Java Edition NBT.
+  fromBytesWith[T](data, nrmJava, true)
+
+proc fromBytesUnnamed*[T](data: seq[byte]): NbtResult[T] =
+  ## Unnamed Java Edition network NBT.
+  fromBytesWith[T](data, nrmJava, false)
+
+proc fromBytesBedrock*[T](data: seq[byte]): NbtResult[T] =
+  ## Named Bedrock network NBT.
+  fromBytesWith[T](data, nrmBedrock, true)
+
+proc fromSlice*[T](data: seq[byte]): NbtResult[T] =
+  fromBytes[T](data)
+
+proc fromSliceUnnamed*[T](data: seq[byte]): NbtResult[T] =
+  fromBytesUnnamed[T](data)
+
+proc fromSliceBedrock*[T](data: seq[byte]): NbtResult[T] =
+  fromBytesBedrock[T](data)
+
+proc fromNbt*[T](c: NbtCompound): NbtResult[T] =
+  ## The value `c` deserializes to. It goes through the bytes, so it means what those bytes would.
+  var w = newNbtSerializer(nwmJava, false, "")
+  let r = serializeValue(w, c)
+  if not r.isOk:
+    return errRes[T](r.error)
+  fromBytesUnnamed[T](w.output.buf)

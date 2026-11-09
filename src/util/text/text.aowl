@@ -1,0 +1,391 @@
+## Port of pumpkin-util/src/text/mod.rs
+## The types and their serde forms are in textbase.aowl. `get_text` and `to_pretty_console` on the base are
+## in ../translation.aowl, because they recurse through it. All of it is re-exported, so importing this one
+## module gives the whole text API except for legacy.aowl.
+
+{.feature: "untyped".}
+
+import std/unicode
+import textbase, color, serform
+import ../translation
+import ../../nbt/tag
+import ../../codecs/json_value
+
+export textbase, translation
+
+proc fmaf(a, b, c: cfloat): cfloat {.importc: "fmaf", header: "<math.h>".}
+proc floorf(a: cfloat): cfloat {.importc: "floorf", header: "<math.h>".}
+
+# --- impl TextComponentBase ----------------------------------------------------------------------
+
+proc toBedrockString*(self: TextComponentBase): string =
+  ## A raw Bedrock string for translation parameters. Translations become `%translation.key`.
+  result = ""
+  case self.content.kind
+  of tcText:
+    result.add self.content.text
+  of tcTranslate:
+    result.add '%'
+    if self.content.bedrockTranslate.isSome: result.add self.content.bedrockTranslate.get()
+    else: result.add self.content.translate
+  of tcEntityNames:
+    result.add self.content.selector
+  of tcKeybind:
+    result.add self.content.keybind
+  of tcCustom:
+    result.add '%'
+    result.add self.content.key
+  for child in self.extra:
+    result.add toBedrockString(child)
+
+proc toBedrockLegacy*(self: TextComponentBase, locale: Locale): string =
+  result = ""
+  if self.style.color.isSome:
+    let color = self.style.color.get()
+    case color.kind
+    of ckNamed:
+      result.add "§"
+      result.add toLegacyChar(color.named)
+    of ckRgb:
+      discard   # Bedrock has no form of Java's §x hex.
+    of ckReset:
+      result.add "§r"
+
+  if self.style.bold == some(true): result.add "§l"
+  if self.style.italic == some(true): result.add "§o"
+  if self.style.underlined == some(true): result.add "§n"
+  if self.style.obfuscated == some(true): result.add "§k"
+
+  case self.content.kind
+  of tcText:
+    result.add self.content.text
+  of tcTranslate:
+    let key = if self.content.bedrockTranslate.isSome: self.content.bedrockTranslate.get() else: self.content.translate
+    result.add getTranslationText(key, locale, self.content.translateWith)
+  of tcEntityNames:
+    result.add self.content.selector
+  of tcKeybind:
+    result.add self.content.keybind
+  of tcCustom:
+    result.add getTranslationText(self.content.key, locale, self.content.customWith)
+
+  for child in self.extra:
+    result.add toBedrockLegacy(child, locale)
+    result.add "§r"   # Bedrock styles bleed into later text.
+
+proc translateHoverEvent(style: var Style) =
+  if style.hoverEvent.isNone:
+    return
+  let hover = style.hoverEvent.get()
+  case hover.kind
+  of heShowText:
+    var translated: seq[TextComponentBase] = @[]
+    for component in hover.value:
+      translated.add toTranslated(component)
+    style.hoverEvent = some(HoverEvent(kind: heShowText, value: translated))
+  of heShowEntity:
+    if hover.name.isSome:
+      var translated: seq[TextComponentBase] = @[]
+      for component in hover.name.get():
+        translated.add toTranslated(component)
+      style.hoverEvent = some(HoverEvent(kind: heShowEntity, entityId: hover.entityId, uuid: hover.uuid,
+        name: some(translated)))
+  of heShowItem:
+    discard
+
+proc toTranslated*(self: TextComponentBase): TextComponentBase =
+  ## Resolves `TextContent::Custom` into text and slices, on this component and everything under it.
+  ## `Translate` stays for the client to translate; only its substitutions are visited.
+  var component = self
+  case self.content.kind
+  of tcTranslate:
+    var translatedWith: seq[TextComponentBase] = @[]
+    for w in self.content.translateWith:
+      translatedWith.add toTranslated(w)
+    component.content = TextContent(kind: tcTranslate, translate: self.content.translate,
+      bedrockTranslate: self.content.bedrockTranslate, translateWith: translatedWith)
+  of tcCustom:
+    let translation = getTranslation(self.content.key, self.content.locale)
+    var translationParent = translation
+    var translationSlices: seq[TextComponentBase] = @[]
+
+    var hasPercent = false
+    for c in translation:
+      if c == '%': hasPercent = true
+    if hasPercent:
+      let (substitutions, ranges) = reorderSubstitutions(translation, self.content.customWith)
+      for idx in 0 ..< ranges.len:
+        let range = ranges[idx]
+        if idx == 0:
+          translationParent = sliceOf(translation, 0, range.start)
+        # Rust indexes out of bounds with fewer substitutions than placeholders.
+        translationSlices.add(if idx < substitutions.len: substitutions[idx] else: textBase(""))
+        if range.`end` >= translation.len - 1:
+          continue
+        if idx == ranges.len - 1:
+          # Last substitution, append the rest of the translation
+          translationSlices.add textBase(sliceOf(translation, range.`end` + 1, translation.len))
+        else:
+          translationSlices.add textBase(sliceOf(translation, range.`end` + 1, ranges[idx + 1].start))
+    for i in self.extra:
+      translationSlices.add i
+    component = TextComponentBase(content: textContent(translationParent), style: self.style, extra: translationSlices)
+  else:
+    discard
+
+  var extra: seq[TextComponentBase] = @[]
+  for e in component.extra:
+    extra.add toTranslated(e)
+
+  var style = component.style
+  translateHoverEvent(style)
+  TextComponentBase(content: component.content, style: style, extra: extra)
+
+# --- impl TextComponent --------------------------------------------------------------------------
+
+proc basesOf(args: openArray[TextComponent]): seq[TextComponentBase] =
+  result = @[]
+  for a in args: result.add a.base
+
+proc text*(plain: string): TextComponent =
+  ## A component with plain text content.
+  TextComponent(base: textBase(plain))
+
+proc empty*(): TextComponent =
+  ## A component without text, useful to join others as its children.
+  text("")
+
+proc translate*(key: string, args: openArray[TextComponent]): TextComponent =
+  ## A component the client translates, with substitution parameters.
+  TextComponent(base: baseOf(TextContent(kind: tcTranslate, translate: key,
+    bedrockTranslate: none[string](), translateWith: basesOf(args))))
+
+proc translate*(key: string): TextComponent =
+  TextComponent(base: baseOf(TextContent(kind: tcTranslate, translate: key,
+    bedrockTranslate: none[string](), translateWith: @[])))
+
+proc translateCross*(javaKey, bedrockKey: string, args: openArray[TextComponent]): TextComponent =
+  ## A translation with a Bedrock-specific key.
+  TextComponent(base: baseOf(TextContent(kind: tcTranslate, translate: javaKey,
+    bedrockTranslate: some(bedrockKey), translateWith: basesOf(args))))
+
+proc translateCross*(javaKey, bedrockKey: string): TextComponent =
+  TextComponent(base: baseOf(TextContent(kind: tcTranslate, translate: javaKey,
+    bedrockTranslate: some(bedrockKey), translateWith: @[])))
+
+proc custom*(namespace, key: string, locale: Locale, args: openArray[TextComponent]): TextComponent =
+  ## A component resolved on the server from the namespaced translation key.
+  TextComponent(base: baseOf(TextContent(kind: tcCustom, key: toLower(namespace & ":" & key),
+    locale: locale, customWith: basesOf(args))))
+
+proc custom*(namespace, key: string, locale: Locale): TextComponent =
+  TextComponent(base: baseOf(TextContent(kind: tcCustom, key: toLower(namespace & ":" & key),
+    locale: locale, customWith: @[])))
+
+proc addChild*(self: TextComponent, child: TextComponent): TextComponent =
+  result = self
+  result.base.extra.add child.base
+
+proc fromContent*(content: TextContent): TextComponent =
+  TextComponent(base: baseOf(content))
+
+proc addText*(self: TextComponent, text: string): TextComponent =
+  result = self
+  result.base.extra.add textBase(text)
+
+proc getText*(self: TextComponent): string =
+  ## The raw text for English (US).
+  getText(self.base, lcEnUs)
+
+proc replaceAll(s, sub, by: string): string =
+  result = ""
+  var i = 0
+  while i < s.len:
+    var hit = i + sub.len <= s.len
+    if hit:
+      for j in 0 ..< sub.len:
+        if s[i + j] != sub[j]:
+          hit = false
+          break
+    if hit:
+      result.add by
+      i += sub.len
+    else:
+      result.add s[i]
+      inc i
+
+proc chatDecorated*(format, playerName, content: string): TextComponent =
+  ## Replaces `&` with `§`, then `{DISPLAYNAME}` and `{MESSAGE}`, in that order.
+  let withResolvedFields = replaceAll(replaceAll(replaceAll(format, "&", "§"), "{DISPLAYNAME}", playerName), "{MESSAGE}", content)
+  text(withResolvedFields)
+
+proc toPrettyConsole*(self: TextComponent): string =
+  toPrettyConsole(self.base)
+
+proc tryEncode*(self: TextComponent): TextResult[seq[byte]] =
+  ## `encode`, reporting what upstream's `expect` panics on: a string too long for NBT's u16 prefix.
+  toBytesUnnamed(toTranslated(self.base))
+
+proc encode*(self: TextComponent): seq[byte] =
+  ## Unnamed network NBT of the translated component. Empty on failure; see `tryEncode`.
+  let res = tryEncode(self)
+  if res.ok: res.value else: @[]
+
+proc color*(self: TextComponent, color: Color): TextComponent =
+  result = self
+  result.base.style.color = some(color)
+
+proc colorNamed*(self: TextComponent, color: NamedColor): TextComponent =
+  result = self
+  result.base.style.color = some(colorNamed(color))
+
+proc colorRgb*(self: TextComponent, color: RGBColor): TextComponent =
+  result = self
+  result.base.style.color = some(colorRgb(color))
+
+proc newLine*(self: TextComponent): TextComponent =
+  addChild(self, text("\n"))
+
+proc utf8Chars(s: string): seq[string] =
+  ## `str::chars`, each as its own string.
+  result = @[]
+  var i = 0
+  while i < s.len:
+    let c = ord(s[i])
+    var n = 1
+    if c >= 0xF0: n = 4
+    elif c >= 0xE0: n = 3
+    elif c >= 0xC0: n = 2
+    let stop = min(i + n, s.len)
+    var ch = ""
+    for j in i ..< stop: ch.add s[j]
+    result.add ch
+    i = stop
+
+proc applyColorEffect(self: TextComponent, colorGen: proc (i, len: int): RGBColor {.closure.}): TextComponent =
+  ## Colors each character on its own: the content becomes empty and the characters become `extra`.
+  result = self
+  let chars = utf8Chars(getText(self.base, lcEnUs))
+  let len = chars.len
+  if len == 0:
+    return
+  var coloredExtra: seq[TextComponentBase] = @[]
+  for i in 0 ..< len:
+    let rgb = colorGen(i, len)
+    var charBase = TextComponentBase(content: textContent(chars[i]), style: self.base.style, extra: @[])
+    charBase.style.color = some(colorRgb(rgb))
+    coloredExtra.add charBase
+  result.base.content = textContent("")
+  result.base.extra = coloredExtra
+
+proc lerpChannel(startC, endC: uint8, t: float32): uint8 =
+  let s = float32(startC)
+  let e = float32(endC)
+  saturatingU8(float32(fmaf(e - s, t, s)))
+
+proc gradient*(self: TextComponent, colors: openArray[RGBColor]): TextComponent =
+  ## A color gradient over the text. Fewer than two colors leaves it unchanged.
+  if colors.len < 2:
+    return self
+  var owned: seq[RGBColor] = @[]
+  for c in colors: owned.add c
+  let gen = proc (i, len: int): RGBColor {.closure.} =
+    if len <= 1:
+      return owned[0]
+    let totalSegments = owned.len - 1
+    let position = float32(i) / float32(len - 1)
+    let segmentF = position * float32(totalSegments)
+    let segmentIndex = min(int(float32(floorf(segmentF))), totalSegments - 1)
+    let localT = segmentF - float32(segmentIndex)
+    let start = owned[segmentIndex]
+    let stop = owned[segmentIndex + 1]
+    newRGBColor(lerpChannel(start.red, stop.red, localT), lerpChannel(start.green, stop.green, localT),
+      lerpChannel(start.blue, stop.blue, localT))
+  applyColorEffect(self, gen)
+
+proc gradientNamed*(self: TextComponent, colors: openArray[NamedColor]): TextComponent =
+  var rgbColors: seq[RGBColor] = @[]
+  for c in colors: rgbColors.add toRgb(c)
+  gradient(self, rgbColors)
+
+proc rainbow*(self: TextComponent): TextComponent =
+  ## Each character gets a different hue.
+  let gen = proc (i, len: int): RGBColor {.closure.} =
+    let hue = (float32(i) / float32(len)) * 360.0'f32
+    let (r, g, b) = hsvToRgb(hue, 1.0'f32, 1.0'f32)
+    newRGBColor(r, g, b)
+  applyColorEffect(self, gen)
+
+proc wrapInSquareBrackets*(self: TextComponent): TextComponent =
+  translate("chat.square_brackets", [self])
+
+proc bold*(self: TextComponent): TextComponent =
+  result = self
+  result.base.style.bold = some(true)
+
+proc italic*(self: TextComponent): TextComponent =
+  result = self
+  result.base.style.italic = some(true)
+
+proc underlined*(self: TextComponent): TextComponent =
+  result = self
+  result.base.style.underlined = some(true)
+
+proc strikethrough*(self: TextComponent): TextComponent =
+  result = self
+  result.base.style.strikethrough = some(true)
+
+proc obfuscated*(self: TextComponent): TextComponent =
+  result = self
+  result.base.style.obfuscated = some(true)
+
+proc insertion*(self: TextComponent, text: string): TextComponent =
+  ## Text inserted into the player's chat input when shift-clicked.
+  result = self
+  result.base.style.insertion = some(text)
+
+proc clickEvent*(self: TextComponent, event: ClickEvent): TextComponent =
+  result = self
+  result.base.style.clickEvent = some(event)
+
+proc hoverEvent*(self: TextComponent, event: HoverEvent): TextComponent =
+  result = self
+  result.base.style.hoverEvent = some(event)
+
+proc font*(self: TextComponent, resourceLocation: string): TextComponent =
+  result = self
+  result.base.style.font = some(resourceLocation)
+
+proc shadowColor*(self: TextComponent, color: ARGBColor): TextComponent =
+  result = self
+  result.base.style.shadowColor = some(color)
+
+proc join*(elements: openArray[TextComponent], separator: TextComponent): TextComponent =
+  result = empty()
+  var first = true
+  for element in elements:
+    if not first:
+      result = addChild(result, separator)
+    result = addChild(result, element)
+    first = false
+
+proc joinWithComma*(elements: openArray[TextComponent]): TextComponent =
+  ## Joins with a gray comma and a space.
+  join(elements, colorNamed(text(", "), ncGray))
+
+# --- impl Serialize for TextComponent ------------------------------------------------------------
+
+proc toJson*(self: TextComponent): JsonValue =
+  ## `serde_json::to_value(&TextComponent)`. Translates first, so it cannot fail.
+  var err = ""
+  serToJsonValue(toSer(toTranslated(self.base), err))
+
+proc toJsonString*(self: TextComponent): string =
+  ## `serde_json::to_string(&TextComponent)`: declaration order, not sorted.
+  var err = ""
+  serToJsonString(toSer(toTranslated(self.base), err))
+
+proc toNbt*(self: TextComponent): NbtTag =
+  ## The compound `encode` writes, for `writeNbt` and for embedding in other NBT.
+  var err = ""
+  serToNbt(toSer(toTranslated(self.base), err))

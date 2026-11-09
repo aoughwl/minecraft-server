@@ -1,0 +1,219 @@
+## Port of pumpkin-codecs/src/codec/mod.rs
+## Port of pumpkin-codecs/src/codec/map.rs
+## `Encode` and `Decode` are overloads, one per type, in the module that defines the type:
+##     proc encode*[V](x: X, ops: DynamicOps[V], prefix: V): DataResult[V]
+##     proc decode*[V](t: typedesc[X], input: V, ops: DynamicOps[V]): DataResult[(X, V)]
+## and `encodeStart`, `parse`, `encodeField`, `decodeField`, `seq`, `Table` and `Either` find them with `mixin`.
+## `mixin` sees this module's scope and the module that owns the argument's type, not the caller's imports. So
+## the codecs for `seq` (list.rs) and `Table` (map.rs), whose types no module here owns, must live in this file.
+## `HashMap<K, E, S>` is `Table[K, E]`; keys need `$` and, as `func`s, `hash` and `==`.
+## A module writing them needs `{.feature: "untyped".}`. `FieldEncode` and `FieldDecode` are generic procs.
+##
+## The Rust macros: `xmapCodecImpl`, `comapFlatMapCodecImpl`, `flatComapMapCodecImpl`, `flatXmapCodecImpl`,
+## `encodeImplInfallible`, `encodeImplFallible`, `decodeImplInfallible`, `decodeImplFallible` are templates
+## (dirty, or the generated procs are not visible to `mixin`). `flat_map(|m| ...)` is written out.
+## `assert_success!`, `assert_encode_success!` and `assert_decode!` from data_result.rs live here because
+## they need `encodeStart` and `parse`.
+
+{.feature: "untyped".}
+
+import std/[options, syncio, tables]
+import dynamic_ops, struct_builder, list_builder, primitive, optional_field
+export dynamic_ops, struct_builder, list_builder, primitive, optional_field, options, tables
+
+proc encodeStart*[T, V](x: T, ops: DynamicOps[V]): DataResult[V] =
+  mixin encode
+  encode(x, ops, ops.empty())
+
+proc parse*[T, V](t: typedesc[T], input: V, ops: DynamicOps[V]): DataResult[T] =
+  mixin decode
+  let d = decode(T, input, ops)
+  if d.isSuccess:
+    newSuccessWithLifecycle(d.successResult[0], d.successLifecycle)
+  elif d.partialResult.len > 0:
+    newPartialErrorWithLifecycle(d.message, d.partialResult[0][0], d.errorLifecycle)
+  else:
+    newErrorWithLifecycle[T](d.message, d.errorLifecycle)
+
+proc encodeField*[T, V, B](x: T, name: string, ops: DynamicOps[V], prefix: B): B =
+  addStringKeyValueResult(prefix, name, encodeStart(x, ops))
+
+proc encodeDefaultedField*[T, V, B](x: T, name: string, ops: DynamicOps[V], prefix: B, default: T): B =
+  ## Same condition as upstream, which encodes the field when it equals the default.
+  if default == x:
+    addStringKeyValueResult(prefix, name, encodeStart(x, ops))
+  else:
+    prefix
+
+proc decodeField*[T, V](t: typedesc[T], name: string, input: MapLike[V], ops: DynamicOps[V]): DataResult[T] =
+  let v = getStr(input, name)
+  if v.isSome: parse(T, v.get, ops)
+  else: newError[T]("No key " & name & " in map")
+
+proc decodeDefaultedField*[T, V](t: typedesc[T], name: string, input: MapLike[V], ops: DynamicOps[V],
+                                 default: T, lenient: bool): DataResult[T] =
+  let d = decodeOptionalField(T, name, input, ops, lenient)
+  if d.isSuccess:
+    newSuccessWithLifecycle(if d.successResult.isSome: d.successResult.get else: default, d.successLifecycle)
+  elif d.partialResult.len > 0:
+    newPartialErrorWithLifecycle(d.message, if d.partialResult[0].isSome: d.partialResult[0].get else: default,
+                                 d.errorLifecycle)
+  else:
+    newErrorWithLifecycle[T](d.message, d.errorLifecycle)
+
+# --- Vec<T> --------------------------------------------------------------------------------------------
+
+proc encode*[T, V](x: seq[T], ops: DynamicOps[V], prefix: V): DataResult[V] =
+  var builder = listBuilder(ops)
+  for e in x:
+    builder = addDataResult(builder, encodeStart(e, ops))
+  build(builder, prefix)
+
+proc decode*[T, V](t: typedesc[seq[T]], input: V, ops: DynamicOps[V]): DataResult[(seq[T], V)] =
+  mixin decode
+  let it = withLifecycle(ops.getIter(input), stable())
+  if not it.hasResultOrPartial:
+    return propagateError[seq[V], (seq[T], V)](it)
+  var elements: seq[T] = @[]
+  var res = newSuccess(Unit())
+  for element in it.valueOrPartial:
+    let elementResult = decode(T, element, ops)
+    res = addMessage(res, elementResult)
+    if elementResult.hasResultOrPartial:
+      elements.add elementResult.valueOrPartial[0]
+  let none: seq[V] = @[]
+  flatMapJoin(it, withCompleteOrPartial(res, (elements, ops.createList(none))))
+
+# --- HashMap (map.rs) ---------------------------------------------------------------------------------
+
+proc encodeBaseHashMap[K, E, V, B](map: Table[K, E], ops: DynamicOps[V], prefix: B): B =
+  result = prefix
+  for key, element in pairs(map):
+    result = addKeyResultValueResult(result, encodeStart(key, ops), encodeStart(element, ops))
+
+proc decodeBaseHashMap[K, E, V](input: MapLike[V], ops: DynamicOps[V]): DataResult[Table[K, E]] =
+  mixin `$`
+  var readMap = initTable[K, E]()
+  var failed: seq[(V, V)] = @[]
+  var res = newSuccessWithLifecycle(Unit(), stable())
+  for i in 0 ..< input.keys.len:
+    let k = input.keys[i]
+    let e = input.vals[i]
+    # First, try to parse the key and value.
+    let keyResult = parse(K, k, ops)
+    let elementResult = parse(E, e, ops)
+    let entryMessage = combineMessages(keyResult, elementResult)
+    if keyResult.isSuccess and elementResult.isSuccess:
+      res = addMessage(res, newSuccess(Unit()))
+    elif bothHaveValues(keyResult, elementResult):
+      res = addMessage(res, newPartialError(entryMessage, Unit()))
+    else:
+      res = addMessage(res, newError[Unit](entryMessage))
+    if bothHaveValues(keyResult, elementResult):
+      # If this parses successfully, try adding it to the map.
+      let key = keyResult.valueOrPartial
+      if hasKey(readMap, key):
+        # There was already a value for this key.
+        failed.add (k, e)
+        res = addMessage(res, newError[Unit]("Duplicate entry for key: " & $key))
+      else:
+        readMap[key] = elementResult.valueOrPartial
+    else:
+      failed.add (k, e)
+  let errors = ops.valueDisplay(ops.createMap(failed))
+  let outcome = withCompleteOrPartial(res, readMap)
+  if outcome.isSuccess:
+    outcome
+  else:
+    newOptionErrorWithLifecycle(outcome.message & " (Missed inputs: " & errors & ")", outcome.partialResult, outcome.errorLifecycle)
+
+proc encode*[K, E, V](x: Table[K, E], ops: DynamicOps[V], prefix: V): DataResult[V] =
+  build(encodeBaseHashMap(x, ops, ops.mapBuilder()), prefix)
+
+proc decode*[K, E, V](t: typedesc[Table[K, E]], input: V, ops: DynamicOps[V]): DataResult[(Table[K, E], V)] =
+  let m = withLifecycle(ops.getMap(input), stable())
+  if not m.hasResultOrPartial:
+    return propagateError[MapLike[V], (Table[K, E], V)](m)
+  let decoded = decodeBaseHashMap[K, E, V](m.valueOrPartial, ops)
+  withRemainder(flatMapJoin(m, decoded), input)
+
+# --- encode_impl!, decode_impl! and the xmap family ------------------------------------------------
+
+template encodeImplInfallible*(Second, backward: untyped) {.dirty.} =
+  proc encode*[V](x: Second, ops: DynamicOps[V], prefix: V): DataResult[V] =
+    encode(backward(x), ops, prefix)
+
+template encodeImplFallible*(Second, backward: untyped) {.dirty.} =
+  proc encode*[V](x: Second, ops: DynamicOps[V], prefix: V): DataResult[V] =
+    let first = backward(x)
+    if not first.hasResultOrPartial:
+      return newErrorWithLifecycle[V](first.message, first.errorLifecycle)
+    flatMapJoin(first, encode(first.valueOrPartial, ops, prefix))
+
+template decodeImplInfallible*(First, Second, forward: untyped) {.dirty.} =
+  proc decode*[V](t: typedesc[Second], input: V, ops: DynamicOps[V]): DataResult[(Second, V)] =
+    let first = decode(First, input, ops)
+    if first.isSuccess:
+      newSuccessWithLifecycle((forward(first.successResult[0]), first.successResult[1]), first.successLifecycle)
+    elif first.partialResult.len > 0:
+      newPartialErrorWithLifecycle(first.message, (forward(first.partialResult[0][0]), first.partialResult[0][1]),
+                                   first.errorLifecycle)
+    else:
+      newErrorWithLifecycle[(Second, V)](first.message, first.errorLifecycle)
+
+template decodeImplFallible*(First, Second, forward: untyped) {.dirty.} =
+  proc decode*[V](t: typedesc[Second], input: V, ops: DynamicOps[V]): DataResult[(Second, V)] =
+    let first = decode(First, input, ops)
+    if not first.hasResultOrPartial:
+      return newErrorWithLifecycle[(Second, V)](first.message, first.errorLifecycle)
+    let pair = first.valueOrPartial
+    flatMapJoin(first, withRemainder(forward(pair[0]), pair[1]))
+
+template xmapCodecImpl*(First, Second, forward, backward: untyped) {.dirty.} =
+  ## `forward: First -> Second`, `backward: Second -> First`.
+  encodeImplInfallible(Second, backward)
+  decodeImplInfallible(First, Second, forward)
+
+template comapFlatMapCodecImpl*(First, Second, forward, backward: untyped) {.dirty.} =
+  ## `forward: First -> DataResult[Second]`, `backward: Second -> First`.
+  encodeImplInfallible(Second, backward)
+  decodeImplFallible(First, Second, forward)
+
+template flatComapMapCodecImpl*(First, Second, forward, backward: untyped) {.dirty.} =
+  ## `forward: First -> Second`, `backward: Second -> DataResult[First]`.
+  encodeImplFallible(Second, backward)
+  decodeImplInfallible(First, Second, forward)
+
+template flatXmapCodecImpl*(First, Second, forward, backward: untyped) {.dirty.} =
+  ## `forward: First -> DataResult[Second]`, `backward: Second -> DataResult[First]`.
+  encodeImplFallible(Second, backward)
+  decodeImplFallible(First, Second, forward)
+
+# --- assertion helpers -------------------------------------------------------------------------------
+
+proc checkSuccess*[V](result1: DataResult[V], ops: DynamicOps[V], right: V, what: string) =
+  if result1.isError:
+    echo "FAIL ", what, ": expected a `DataResult` success, got: ", result1.message
+    quit(1)
+  if not ops.valueEq(result1.successResult, right):
+    echo "FAIL ", what, ": `DataResult` was successful but the value doesn't match: ",
+      ops.valueDisplay(result1.successResult), " != ", ops.valueDisplay(right)
+    quit(1)
+
+proc assertEncodeSuccess*[T, V](left: T, ops: DynamicOps[V], right: V) =
+  ## `assert_encode_success!`.
+  checkSuccess(encodeStart(left, ops), ops, right, "encode " & ops.valueDisplay(right))
+
+proc assertDecodeIsSuccess*[T, V](t: typedesc[T], input: V, ops: DynamicOps[V]) =
+  ## `assert_decode!(T, input, ops, is_success)`.
+  let r = parse(T, input, ops)
+  if not r.isSuccess:
+    echo "FAIL decode ", ops.valueDisplay(input), ": expected success, got: ", r.message
+    quit(1)
+
+proc assertDecodeIsError*[T, V](t: typedesc[T], input: V, ops: DynamicOps[V]) =
+  ## `assert_decode!(T, input, ops, is_error)`.
+  let r = parse(T, input, ops)
+  if not r.isError:
+    echo "FAIL decode ", ops.valueDisplay(input), ": expected an error"
+    quit(1)

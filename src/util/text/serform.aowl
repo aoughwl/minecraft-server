@@ -1,0 +1,206 @@
+## Support module with no upstream file of its own: the serde data model behind the derives in
+## pumpkin-util/src/text. A value is first lowered to a `SerValue`, the order-preserving tree serde
+## walks, and that one tree then prints as:
+##   - JSON text in declaration order (`serde_json::to_string`, which streams and never sorts),
+##   - a sorted `JsonValue` (`serde_json::to_value`),
+##   - an `NbtTag` with the same bytes pumpkin-nbt's `Serializer` writes.
+## The JSON and NBT backends differ where serde's do: a unit is `null` in JSON and writes nothing in
+## NBT, a bool is a byte in NBT, and `serialize_bytes` is a number array in JSON and a byte list in NBT.
+
+import ../../nbt/tag
+import ../../codecs/json_value
+
+type
+  SerKind* = enum
+    skUnit
+    skBool
+    skInt
+    skString
+    skBytes
+    skList
+    skMap
+
+  SerValue* = object
+    case kind*: SerKind
+    of skUnit: discard
+    of skBool: boolVal*: bool
+    of skInt: intVal*: int64
+    of skString: strVal*: string
+    of skBytes: bytes*: seq[uint8]
+    of skList: items*: seq[SerValue]
+    of skMap:
+      keys*: seq[string]
+      vals*: seq[SerValue]
+
+  TextResult*[T] = object
+    ## Result of a fallible text conversion. `error` carries serde's message.
+    case ok*: bool
+    of true:
+      value*: T
+    of false:
+      error*: string
+
+proc textOk*[T](value: sink T): TextResult[T] =
+  TextResult[T](ok: true, value: value)
+
+proc textErr*[T](msg: string): TextResult[T] =
+  TextResult[T](ok: false, error: msg)
+
+proc serUnit*(): SerValue {.inline.} = SerValue(kind: skUnit)
+proc serBool*(b: bool): SerValue {.inline.} = SerValue(kind: skBool, boolVal: b)
+proc serInt*(i: int64): SerValue {.inline.} = SerValue(kind: skInt, intVal: i)
+proc serString*(s: string): SerValue {.inline.} = SerValue(kind: skString, strVal: s)
+proc serBytes*(b: seq[uint8]): SerValue {.inline.} = SerValue(kind: skBytes, bytes: b)
+proc serList*(items: seq[SerValue]): SerValue {.inline.} = SerValue(kind: skList, items: items)
+proc serMap*(): SerValue {.inline.} = SerValue(kind: skMap, keys: @[], vals: @[])
+
+proc entry*(m: var SerValue, key: string, value: SerValue) =
+  ## `SerializeMap::serialize_entry` / `SerializeStruct::serialize_field`.
+  m.keys.add key
+  m.vals.add value
+
+# --- JSON ----------------------------------------------------------------------------------------
+
+proc addJsonText*(s: var string, v: SerValue) =
+  ## What `serde_json::to_string` streams.
+  case v.kind
+  of skUnit: s.add "null"
+  of skBool: s.add(if v.boolVal: "true" else: "false")
+  of skInt: s.add $v.intVal
+  of skString: s.addEscaped v.strVal
+  of skBytes:
+    s.add '['
+    for i in 0 ..< v.bytes.len:
+      if i > 0: s.add ','
+      s.add $int(v.bytes[i])
+    s.add ']'
+  of skList:
+    s.add '['
+    for i in 0 ..< v.items.len:
+      if i > 0: s.add ','
+      s.addJsonText v.items[i]
+    s.add ']'
+  of skMap:
+    s.add '{'
+    for i in 0 ..< v.keys.len:
+      if i > 0: s.add ','
+      s.addEscaped v.keys[i]
+      s.add ':'
+      s.addJsonText v.vals[i]
+    s.add '}'
+
+proc serToJsonString*(v: SerValue): string =
+  result = ""
+  result.addJsonText v
+
+proc serToJsonValue*(v: SerValue): JsonValue =
+  ## What `serde_json::to_value` builds: the same content with sorted object keys.
+  case v.kind
+  of skUnit: result = jsonNull()
+  of skBool: result = jsonBool(v.boolVal)
+  of skInt: result = jsonInt(v.intVal)
+  of skString: result = jsonString(v.strVal)
+  of skBytes:
+    var items: seq[JsonValue] = @[]
+    for b in v.bytes: items.add jsonInt(int64(b))
+    result = jsonArray(items)
+  of skList:
+    var items: seq[JsonValue] = @[]
+    for it in v.items: items.add serToJsonValue(it)
+    result = jsonArray(items)
+  of skMap:
+    result = jsonObject()
+    for i in 0 ..< v.keys.len:
+      result.put(v.keys[i], serToJsonValue(v.vals[i]))
+
+# --- NBT -----------------------------------------------------------------------------------------
+
+proc serToNbt*(v: SerValue): NbtTag =
+  ## A unit becomes `ntkEnd` here and is dropped by the enclosing compound, because pumpkin-nbt's
+  ## `serialize_unit` writes neither a tag id nor a name.
+  case v.kind
+  of skUnit:
+    result = NbtTag(kind: ntkEnd)
+  of skBool:
+    result = NbtTag(kind: ntkByte, byteVal: (if v.boolVal: 1'i8 else: 0'i8))
+  of skInt:
+    # `serialize_u32` writes through `as i32`, so the top bit wraps.
+    result = NbtTag(kind: ntkInt, intVal: cast[int32](cast[uint32](uint64(cast[uint64](v.intVal) and 0xFFFF_FFFF'u64))))
+  of skString:
+    result = NbtTag(kind: ntkString, stringVal: v.strVal)
+  of skBytes:
+    var items: seq[NbtTag] = @[]
+    for b in v.bytes: items.add NbtTag(kind: ntkByte, byteVal: cast[int8](b))
+    result = NbtTag(kind: ntkList, listVal: items)
+  of skList:
+    var items: seq[NbtTag] = @[]
+    for it in v.items: items.add serToNbt(it)
+    result = NbtTag(kind: ntkList, listVal: items)
+  of skMap:
+    var c = newCompound()
+    for i in 0 ..< v.keys.len:
+      if v.vals[i].kind != skUnit:
+        c.put(v.keys[i], serToNbt(v.vals[i]))
+    result = NbtTag(kind: ntkCompound, compoundVal: c)
+
+proc nbtToJsonValue*(t: NbtTag): JsonValue =
+  ## Lets the serde-derived decoders read NBT: the same decoder runs over this tree with its
+  ## `lenient` flag set, which is where byte-as-bool and signed-byte-as-u8 are allowed.
+  case t.kind
+  of ntkEnd: result = jsonNull()
+  of ntkByte: result = jsonInt(int64(t.byteVal))
+  of ntkShort: result = jsonInt(int64(t.shortVal))
+  of ntkInt: result = jsonInt(int64(t.intVal))
+  of ntkLong: result = jsonInt(t.longVal)
+  of ntkFloat: result = jsonFloat(float64(t.floatVal))
+  of ntkDouble: result = jsonFloat(t.doubleVal)
+  of ntkString: result = jsonString(t.stringVal)
+  of ntkByteArray:
+    var items: seq[JsonValue] = @[]
+    for b in t.byteArrayVal: items.add jsonInt(int64(b))
+    result = jsonArray(items)
+  of ntkIntArray:
+    var items: seq[JsonValue] = @[]
+    for b in t.intArrayVal: items.add jsonInt(int64(b))
+    result = jsonArray(items)
+  of ntkLongArray:
+    var items: seq[JsonValue] = @[]
+    for b in t.longArrayVal: items.add jsonInt(b)
+    result = jsonArray(items)
+  of ntkList:
+    var items: seq[JsonValue] = @[]
+    for it in t.listVal: items.add nbtToJsonValue(it)
+    result = jsonArray(items)
+  of ntkCompound:
+    result = jsonObject()
+    for i in 0 ..< t.compoundVal.names.len:
+      result.put(t.compoundVal.names[i], nbtToJsonValue(t.compoundVal.values[i]))
+
+# --- decoding helpers ----------------------------------------------------------------------------
+
+proc decodeBool*(v: JsonValue, lenient: bool, ok: var bool): bool =
+  ## With `lenient`, a byte reads as a bool the way pumpkin-nbt's `deserialize_bool` does.
+  if v.kind == jvBool: return v.boolVal
+  if lenient and v.kind == jvInt: return v.intVal != 0'i64
+  ok = false
+  false
+
+proc decodeU8*(v: JsonValue, lenient: bool, ok: var bool): uint8 =
+  if v.kind == jvInt:
+    if v.intVal >= 0'i64 and v.intVal <= 255'i64: return uint8(v.intVal)
+    if lenient and v.intVal >= -128'i64 and v.intVal < 0'i64: return cast[uint8](int8(v.intVal))
+  ok = false
+  0'u8
+
+proc decodeU32*(v: JsonValue, lenient: bool, ok: var bool): uint32 =
+  if v.kind == jvInt:
+    if v.intVal >= 0'i64 and v.intVal <= 0xFFFF_FFFF'i64: return uint32(v.intVal)
+    if lenient and v.intVal >= int64(int32.low) and v.intVal < 0'i64: return cast[uint32](int32(v.intVal))
+  ok = false
+  0'u32
+
+proc decodeI32*(v: JsonValue, ok: var bool): int32 =
+  if v.kind == jvInt and v.intVal >= int64(int32.low) and v.intVal <= int64(int32.high):
+    return int32(v.intVal)
+  ok = false
+  0'i32

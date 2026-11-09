@@ -15,27 +15,33 @@ import subprocess
 import sys
 
 here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-args = [a for a in sys.argv[1:] if not a.startswith('--')]
-upstream = args[0] if args else os.path.join(os.path.dirname(here), 'ref', 'pumpkin-1.21.11')
-only = sys.argv[sys.argv.index('--missing') + 1] if '--missing' in sys.argv else ''
-if only in args: args.remove(only)
+argv = sys.argv[1:]
+only = ''
+if '--missing' in argv:
+    i = argv.index('--missing')
+    only = argv[i + 1]
+    del argv[i:i + 2]
+upstream = argv[0] if argv else os.path.join(os.path.dirname(here), 'ref', 'pumpkin-1.21.11')
 
 rs = subprocess.run(['git', '-C', upstream, 'ls-files', '*.rs'], capture_output=True, text=True).stdout.splitlines()
 rs = [p for p in rs if '/generated/' not in p and '/src/' in p]
 
-text = []
-for root, _, names in os.walk(os.path.join(here, 'src')):
+# Only comments name upstream files. Generated tables hold huge single tokens, and a regex over
+# those takes minutes, so generated output is skipped and only lines mentioning `.rs` are read.
+named = set()
+ref = re.compile(r'[\w\-./]+\.rs\b')
+for root, dirs, names in os.walk(os.path.join(here, 'src')):
+    dirs[:] = [d for d in dirs if d != 'generated']
     for n in names:
         if n.endswith('.aowl'):
-            text.append(open(os.path.join(root, n), encoding='utf-8', errors='replace').read())
-blob = '\n'.join(text)
-named = set(m.replace(chr(92), '/') for m in re.findall(r'[\w\-./]+\.rs\b', blob))
+            for line in open(os.path.join(root, n), encoding='utf-8', errors='replace'):
+                if '.rs' in line and len(line) < 2000:
+                    named.update(m.replace(chr(92), '/') for m in ref.findall(line))
 tails = set()
 for n in named:
     parts = n.split('/')
     for i in range(len(parts)):
         tails.add('/'.join(parts[i:]))
-partial = set(re.findall(r'## PARTIAL: ([\w\-./]+\.rs)', blob))
 
 rows = {}
 missing = []
@@ -46,7 +52,10 @@ for p in rs:
     r = rows.setdefault(crate, [0, 0, 0, 0])
     r[0] += 1
     r[1] += lines
-    hit = tail in tails if '/' in tail else (tail in named and tail not in ('mod.rs', 'lib.rs', 'main.rs'))
+    # The full path always counts. A shorter tail counts unless it could be any crate's file.
+    hit = p in tails or (crate + '/src/' + tail) in tails or (
+        tail in tails and tail.split('/')[-1] not in ('mod.rs', 'lib.rs', 'main.rs') if '/' in tail
+        else tail in named and tail not in ('mod.rs', 'lib.rs', 'main.rs'))
     if hit:
         r[2] += 1
         r[3] += lines

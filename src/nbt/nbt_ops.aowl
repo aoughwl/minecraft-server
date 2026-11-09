@@ -1,12 +1,428 @@
-## NBT support for the upstream server's dynamic serialization operations.
-## Port of upstream/nbt/src/nbt_ops.rs
-##
-## TODO: not started. This entire file is built on `codecs`'s
-## `DynamicOps`/`MapLike`/`StructBuilder`/`Number` trait system (a
-## Serde-Codec-style dynamic (de)serialization abstraction used pervasively
-## elsewhere in the upstream server for config/registry/NBT-agnostic (de)serialization).
-## That crate is being ported concurrently elsewhere in this repo
-## (src/codecs/, still in progress as of this file). Porting `NbtOps`
-## against a moving, not-yet-settled `DynamicOps` aowlmony API would mean
-## redoing this file once codecs lands - wait for src/codecs/ to have a
-## stable `DynamicOps`-equivalent type before starting this.
+## Port of pumpkin-nbt/src/nbt_ops.rs
+## `NbtOps` is the value from `nbtOps()`, its `DynamicOps[NbtTag]` vtable. `NbtStructBuilder` is
+## `StringStructBuilder[NbtTag]`, see codecs/struct_builder.aowl. `NbtIter` is a `seq`.
+## `compound.put` keeps an existing value, as upstream's does, so `merge_into_map` and `set_element` do not
+## replace a key that is already there.
+
+{.feature: "untyped".}
+
+import std/options
+import tag
+import codecs/json_value
+import codecs/dynamic_ops
+import codecs/struct_builder
+export dynamic_ops
+
+type
+  NbtStructBuilder* = StringStructBuilder[NbtTag]
+
+  ListCollectorKind* = enum
+    lcGeneric
+    lcByte
+    lcInt
+    lcLong
+
+  ListCollector* = object
+    ## The variants of upstream's `ListCollector` with their inner collector.
+    case kind*: ListCollectorKind
+    of lcGeneric: generic*: seq[NbtTag]
+    of lcByte: bytes*: seq[int8]
+    of lcInt: ints*: seq[int32]
+    of lcLong: longs*: seq[int64]
+
+proc nbtEnd(): NbtTag {.inline.} = NbtTag(kind: ntkEnd)
+proc nbtStringTag(s: string): NbtTag {.inline.} = NbtTag(kind: ntkString, stringVal: s)
+
+# --- Debug -------------------------------------------------------------------------------------------
+
+proc addDebugStr(s: var string, text: string) =
+  ## Rust's `{:?}` for a str, for ASCII and passing other bytes through.
+  s.add '"'
+  for c in text:
+    case c
+    of '"': s.add "\\\""
+    of '\\': s.add "\\\\"
+    of '\n': s.add "\\n"
+    of '\r': s.add "\\r"
+    of '\t': s.add "\\t"
+    of '\0': s.add "\\0"
+    else: s.add c
+  s.add '"'
+
+proc debugFloat(display, serdeText: string, isNonFinite, inPlainRange: bool): string =
+  ## Rust's `{:?}` for a float: `{}` with at least one fraction digit between 1e-4 and 1e16, else an exponent.
+  if isNonFinite:
+    return display
+  if inPlainRange:
+    for c in display:
+      if c == '.': return display
+    return display & ".0"
+  # An exponent form. Below 1e-4 the display text is 0.000ddd, otherwise serde's text already has it.
+  var dot = -1
+  for i in 0 ..< display.len:
+    if display[i] == '.': dot = i
+  let neg = display.len > 0 and display[0] == '-'
+  let intStart = if neg: 1 else: 0
+  if dot < 0 or display[intStart] != '0':
+    return serdeText
+  var first = dot + 1
+  while first < display.len and display[first] == '0': inc first
+  result = if neg: "-" else: ""
+  result.add display[first]
+  if first + 1 < display.len:
+    result.add '.'
+    for i in first + 1 ..< display.len: result.add display[i]
+  result.add 'e'
+  result.add $(-(first - dot))
+
+proc debugF32(f: float32): string =
+  let a = abs(float64(f))
+  debugFloat(displayF32(f), (if f != f or a == Inf: "" else: formatF32(f)), f != f or a == Inf,
+             a == 0.0 or (a >= 1e-4 and a < 1e16))
+
+proc debugF64(f: float64): string =
+  let a = abs(f)
+  debugFloat(displayF64(f), (if f != f or a == Inf: "" else: formatF64(f)), f != f or a == Inf,
+             a == 0.0 or (a >= 1e-4 and a < 1e16))
+
+proc nbtDebug*(t: NbtTag): string =
+  ## Rust's derived Debug.
+  result = ""
+  case t.kind
+  of ntkEnd: result.add "End"
+  of ntkByte: result.add "Byte(" & $t.byteVal & ")"
+  of ntkShort: result.add "Short(" & $t.shortVal & ")"
+  of ntkInt: result.add "Int(" & $t.intVal & ")"
+  of ntkLong: result.add "Long(" & $t.longVal & ")"
+  of ntkFloat: result.add "Float(" & debugF32(t.floatVal) & ")"
+  of ntkDouble: result.add "Double(" & debugF64(t.doubleVal) & ")"
+  of ntkString:
+    result.add "String("
+    result.addDebugStr t.stringVal
+    result.add ')'
+  of ntkCompound:
+    result.add "Compound(NbtCompound { child_tags: {"
+    for i in 0 ..< t.compoundVal.names.len:
+      if i > 0: result.add ", "
+      result.addDebugStr t.compoundVal.names[i]
+      result.add ": "
+      result.add nbtDebug(t.compoundVal.values[i])
+    result.add "} })"
+  of ntkByteArray:
+    result.add "ByteArray(["
+    for i in 0 ..< t.byteArrayVal.len:
+      if i > 0: result.add ", "
+      result.add $t.byteArrayVal[i]
+    result.add "])"
+  of ntkList:
+    result.add "List(["
+    for i in 0 ..< t.listVal.len:
+      if i > 0: result.add ", "
+      result.add nbtDebug(t.listVal[i])
+    result.add "])"
+  of ntkIntArray:
+    result.add "IntArray(["
+    for i in 0 ..< t.intArrayVal.len:
+      if i > 0: result.add ", "
+      result.add $t.intArrayVal[i]
+    result.add "])"
+  of ntkLongArray:
+    result.add "LongArray(["
+    for i in 0 ..< t.longArrayVal.len:
+      if i > 0: result.add ", "
+      result.add $t.longArrayVal[i]
+    result.add "])"
+
+# --- list collectors ---------------------------------------------------------------------------------
+
+proc newCollector*(): ListCollector =
+  let none: seq[NbtTag] = @[]
+  ListCollector(kind: lcGeneric, generic: none)
+
+proc newListCollector*(tag: NbtTag): Option[ListCollector] =
+  ## Only `End` and list tags have a collector.
+  case tag.kind
+  of ntkEnd:
+    some(newCollector())
+  of ntkList:
+    if tag.listVal.len == 0: some(newCollector())
+    else: some(ListCollector(kind: lcGeneric, generic: tag.listVal))
+  of ntkByteArray:
+    if tag.byteArrayVal.len == 0: some(newCollector())
+    else: some(ListCollector(kind: lcByte, bytes: tag.byteArrayVal))
+  of ntkIntArray:
+    if tag.intArrayVal.len == 0: some(newCollector())
+    else: some(ListCollector(kind: lcInt, ints: tag.intArrayVal))
+  of ntkLongArray:
+    if tag.longArrayVal.len == 0: some(newCollector())
+    else: some(ListCollector(kind: lcLong, longs: tag.longArrayVal))
+  else:
+    none[ListCollector]()
+
+proc accept*(c: sink ListCollector, tag: NbtTag): ListCollector =
+  case c.kind
+  of lcGeneric:
+    var list = c.generic
+    list.add tag
+    ListCollector(kind: lcGeneric, generic: list)
+  of lcByte:
+    if tag.kind == ntkByte:
+      var list = c.bytes
+      list.add tag.byteVal
+      return ListCollector(kind: lcByte, bytes: list)
+    var list: seq[NbtTag] = @[]
+    for v in c.bytes: list.add NbtTag(kind: ntkByte, byteVal: v)
+    list.add tag
+    ListCollector(kind: lcGeneric, generic: list)
+  of lcInt:
+    if tag.kind == ntkInt:
+      var list = c.ints
+      list.add tag.intVal
+      return ListCollector(kind: lcInt, ints: list)
+    var list: seq[NbtTag] = @[]
+    for v in c.ints: list.add NbtTag(kind: ntkInt, intVal: v)
+    list.add tag
+    ListCollector(kind: lcGeneric, generic: list)
+  of lcLong:
+    if tag.kind == ntkLong:
+      var list = c.longs
+      list.add tag.longVal
+      return ListCollector(kind: lcLong, longs: list)
+    var list: seq[NbtTag] = @[]
+    for v in c.longs: list.add NbtTag(kind: ntkLong, longVal: v)
+    list.add tag
+    ListCollector(kind: lcGeneric, generic: list)
+
+proc acceptAll*(c: sink ListCollector, tags: seq[NbtTag]): ListCollector =
+  result = c
+  for tag in tags:
+    result = accept(result, tag)
+
+proc toResult*(c: ListCollector): NbtTag =
+  ## `ListCollector::result`.
+  case c.kind
+  of lcGeneric: NbtTag(kind: ntkList, listVal: c.generic)
+  of lcByte: NbtTag(kind: ntkByteArray, byteArrayVal: c.bytes)
+  of lcInt: NbtTag(kind: ntkIntArray, intArrayVal: c.ints)
+  of lcLong: NbtTag(kind: ntkLongArray, longArrayVal: c.longs)
+
+# --- DynamicOps ---------------------------------------------------------------------------------------
+
+proc tryUnwrap(compound: NbtCompound): NbtTag =
+  ## A compound whose only entry has the empty key `""` is that entry.
+  if compound.len == 1 and compound.containsKey(""):
+    let (_, inner) = get(compound, "")
+    inner
+  else:
+    NbtTag(kind: ntkCompound, compoundVal: compound)
+
+proc nbtCreateMap(entries: seq[(NbtTag, NbtTag)]): NbtTag =
+  ## Upstream logs a warning for a key that is not a string and skips it; there is no logger here.
+  var compound = newCompound()
+  for i in 0 ..< entries.len:
+    if entries[i][0].kind == ntkString:
+      compound.put(entries[i][0].stringVal, entries[i][1])
+  NbtTag(kind: ntkCompound, compoundVal: compound)
+
+proc nbtGetNumber(input: NbtTag): DataResult[Number] =
+  case input.kind
+  of ntkByte: newSuccess(numberByte(input.byteVal))
+  of ntkShort: newSuccess(numberShort(input.shortVal))
+  of ntkInt: newSuccess(numberInt(input.intVal))
+  of ntkLong: newSuccess(numberLong(input.longVal))
+  of ntkFloat: newSuccess(numberFloat(input.floatVal))
+  of ntkDouble: newSuccess(numberDouble(input.doubleVal))
+  else: newError[Number]("Not a number")
+
+proc nbtGetBool(input: NbtTag): DataResult[bool] =
+  let n = nbtGetNumber(input)
+  if n.isSuccess: newSuccessWithLifecycle(toFloat64(n.successResult) != 0.0, n.successLifecycle)
+  else: newErrorWithLifecycle[bool](n.message, n.errorLifecycle)
+
+proc nbtGetString(input: NbtTag): DataResult[string] =
+  if input.kind == ntkString: newSuccess(input.stringVal)
+  else: newError[string]("Not a string")
+
+proc nbtGetMapIter(input: NbtTag): DataResult[seq[(NbtTag, NbtTag)]] =
+  if input.kind != ntkCompound:
+    return newError[seq[(NbtTag, NbtTag)]]("Not a map: " & $(input))
+  var entries: seq[(NbtTag, NbtTag)] = @[]
+  for i in 0 ..< input.compoundVal.names.len:
+    entries.add (nbtStringTag(input.compoundVal.names[i]), input.compoundVal.values[i])
+  newSuccess(entries)
+
+proc nbtGetMap(input: NbtTag): DataResult[MapLike[NbtTag]] =
+  if input.kind != ntkCompound:
+    return newError[MapLike[NbtTag]]("Not a map: " & $(input))
+  var m = newMapLike[NbtTag]()
+  for i in 0 ..< input.compoundVal.names.len:
+    m.addNamed(input.compoundVal.names[i], nbtStringTag(input.compoundVal.names[i]), input.compoundVal.values[i])
+  newSuccess(m)
+
+proc nbtGetIter(input: NbtTag): DataResult[seq[NbtTag]] =
+  var values: seq[NbtTag] = @[]
+  case input.kind
+  of ntkList:
+    # A list of compounds may hold wrapped elements.
+    if input.listVal.len > 0 and input.listVal[0].kind == ntkCompound:
+      for c in input.listVal:
+        if c.kind == ntkCompound: values.add tryUnwrap(c.compoundVal)
+        else: values.add c
+    else:
+      values = input.listVal
+  of ntkByteArray:
+    for b in input.byteArrayVal: values.add NbtTag(kind: ntkByte, byteVal: b)
+  of ntkIntArray:
+    for i in input.intArrayVal: values.add NbtTag(kind: ntkInt, intVal: i)
+  of ntkLongArray:
+    for l in input.longArrayVal: values.add NbtTag(kind: ntkLong, longVal: l)
+  else:
+    return newError[seq[NbtTag]]("Not a list: " & $(input))
+  newSuccess(values)
+
+proc nbtGetByteList(input: NbtTag): DataResult[seq[int8]] =
+  if input.kind == ntkByteArray: newSuccess(input.byteArrayVal)
+  else: defaultGetByteList(nbtOps(), input)
+
+proc nbtGetIntList(input: NbtTag): DataResult[seq[int32]] =
+  if input.kind == ntkIntArray: newSuccess(input.intArrayVal)
+  else: defaultGetIntList(nbtOps(), input)
+
+proc nbtGetLongList(input: NbtTag): DataResult[seq[int64]] =
+  if input.kind == ntkLongArray: newSuccess(input.longArrayVal)
+  else: defaultGetLongList(nbtOps(), input)
+
+proc nbtMergeIntoList(list, value: NbtTag): DataResult[NbtTag] =
+  let c = newListCollector(list)
+  if c.isSome: newSuccess(toResult(accept(c.get, value)))
+  else: newPartialError("Not a list", list)
+
+proc nbtMergeValuesIntoList(list: NbtTag, values: seq[NbtTag]): DataResult[NbtTag] =
+  let c = newListCollector(list)
+  if c.isSome: newSuccess(toResult(acceptAll(c.get, values)))
+  else: newPartialError("Not a list", list)
+
+proc nbtMergeIntoMap(map, key, value: NbtTag): DataResult[NbtTag] =
+  if map.kind != ntkCompound and map.kind != ntkEnd:
+    newPartialError("Not a map: " & $(map), map)
+  elif key.kind != ntkString:
+    newPartialError("Key is not a string: " & $(key), map)
+  else:
+    var compound = if map.kind == ntkCompound: map.compoundVal else: newCompound()
+    compound.put(key.stringVal, value)
+    newSuccess(NbtTag(kind: ntkCompound, compoundVal: compound))
+
+proc nbtMergeMapLikeIntoMap(map: NbtTag, other: MapLike[NbtTag]): DataResult[NbtTag] =
+  if map.kind != ntkCompound and map.kind != ntkEnd:
+    return newPartialError("Not a map: " & $(map), map)
+  var compound = if map.kind == ntkCompound: map.compoundVal else: newCompound()
+  var failed = ""
+  var failedCount = 0
+  for i in 0 ..< other.keys.len:
+    if other.keys[i].kind == ntkString:
+      compound.put(other.keys[i].stringVal, other.vals[i])
+    else:
+      if failedCount > 0: failed.add ", "
+      failed.add '('
+      failed.add nbtDebug(other.keys[i])
+      failed.add ", "
+      failed.add nbtDebug(other.vals[i])
+      failed.add ')'
+      inc failedCount
+  let merged = NbtTag(kind: ntkCompound, compoundVal: compound)
+  if failedCount == 0: newSuccess(merged)
+  else: newPartialError("Some keys are not strings: [" & failed & "]", merged)
+
+proc nbtRemove(input: NbtTag, key: string): NbtTag =
+  if input.kind != ntkCompound:
+    return input
+  var compound = newCompound()
+  for i in 0 ..< input.compoundVal.names.len:
+    if input.compoundVal.names[i] != key:
+      compound.put(input.compoundVal.names[i], input.compoundVal.values[i])
+  NbtTag(kind: ntkCompound, compoundVal: compound)
+
+proc nbtBuildWithBuilder(builder, prefix: NbtTag): DataResult[NbtTag] =
+  case prefix.kind
+  of ntkEnd:
+    newSuccess(builder)
+  of ntkCompound:
+    if builder.kind != ntkCompound:
+      return newError[NbtTag]("Expected compound in builder, found " & $(builder))
+    var compound = prefix.compoundVal
+    for i in 0 ..< builder.compoundVal.names.len:
+      compound.put(builder.compoundVal.names[i], builder.compoundVal.values[i])
+    newSuccess(NbtTag(kind: ntkCompound, compoundVal: compound))
+  else:
+    newPartialError("Prefix is not a map: " & $(prefix), prefix)
+
+proc nbtAppend(key: string, value, builder: NbtTag): NbtTag =
+  if builder.kind != ntkCompound:
+    return builder
+  var compound = builder.compoundVal
+  compound.put(key, value)
+  NbtTag(kind: ntkCompound, compoundVal: compound)
+
+proc buildNbtOps(): DynamicOps[NbtTag] =
+  result = DynamicOps[NbtTag]()
+  result.valueEq = proc (a, b: NbtTag): bool {.closure.} = a == b
+  result.valueDisplay = proc (a: NbtTag): string {.closure.} = $(a)
+  result.empty = proc (): NbtTag {.closure.} = nbtEnd()
+  result.createNumber = proc (n: Number): NbtTag {.closure.} = NbtTag(kind: ntkDouble, doubleVal: toFloat64(n))
+  result.createByte = proc (data: int8): NbtTag {.closure.} = NbtTag(kind: ntkByte, byteVal: data)
+  result.createShort = proc (data: int16): NbtTag {.closure.} = NbtTag(kind: ntkShort, shortVal: data)
+  result.createInt = proc (data: int32): NbtTag {.closure.} = NbtTag(kind: ntkInt, intVal: data)
+  result.createLong = proc (data: int64): NbtTag {.closure.} = NbtTag(kind: ntkLong, longVal: data)
+  result.createFloat = proc (data: float32): NbtTag {.closure.} = NbtTag(kind: ntkFloat, floatVal: data)
+  result.createDouble = proc (data: float64): NbtTag {.closure.} = NbtTag(kind: ntkDouble, doubleVal: data)
+  result.createBool = proc (data: bool): NbtTag {.closure.} = NbtTag(kind: ntkByte, byteVal: (if data: 1'i8 else: 0'i8))
+  result.createString = proc (data: string): NbtTag {.closure.} = nbtStringTag(data)
+  result.createList = proc (values: seq[NbtTag]): NbtTag {.closure.} = toResult(acceptAll(newCollector(), values))
+  result.createMap = proc (entries: seq[(NbtTag, NbtTag)]): NbtTag {.closure.} = nbtCreateMap(entries)
+  result.getBool = proc (input: NbtTag): DataResult[bool] {.closure.} = nbtGetBool(input)
+  result.getNumber = proc (input: NbtTag): DataResult[Number] {.closure.} = nbtGetNumber(input)
+  result.getString = proc (input: NbtTag): DataResult[string] {.closure.} = nbtGetString(input)
+  result.getMapIter = proc (input: NbtTag): DataResult[seq[(NbtTag, NbtTag)]] {.closure.} = nbtGetMapIter(input)
+  result.getMap = proc (input: NbtTag): DataResult[MapLike[NbtTag]] {.closure.} = nbtGetMap(input)
+  result.getIter = proc (input: NbtTag): DataResult[seq[NbtTag]] {.closure.} = nbtGetIter(input)
+  result.getByteList = proc (input: NbtTag): DataResult[seq[int8]] {.closure.} = nbtGetByteList(input)
+  result.createByteList = proc (data: seq[int8]): NbtTag {.closure.} = NbtTag(kind: ntkByteArray, byteArrayVal: data)
+  result.getIntList = proc (input: NbtTag): DataResult[seq[int32]] {.closure.} = nbtGetIntList(input)
+  result.createIntList = proc (data: seq[int32]): NbtTag {.closure.} = NbtTag(kind: ntkIntArray, intArrayVal: data)
+  result.getLongList = proc (input: NbtTag): DataResult[seq[int64]] {.closure.} = nbtGetLongList(input)
+  result.createLongList = proc (data: seq[int64]): NbtTag {.closure.} = NbtTag(kind: ntkLongArray, longArrayVal: data)
+  result.mergeIntoList = proc (list, value: NbtTag): DataResult[NbtTag] {.closure.} = nbtMergeIntoList(list, value)
+  result.mergeValuesIntoList = proc (list: NbtTag, values: seq[NbtTag]): DataResult[NbtTag] {.closure.} =
+    nbtMergeValuesIntoList(list, values)
+  result.mergeIntoMap = proc (map, key, value: NbtTag): DataResult[NbtTag] {.closure.} = nbtMergeIntoMap(map, key, value)
+  result.mergeMapLikeIntoMap = proc (map: NbtTag, other: MapLike[NbtTag]): DataResult[NbtTag] {.closure.} =
+    nbtMergeMapLikeIntoMap(map, other)
+  result.remove = proc (input: NbtTag, key: string): NbtTag {.closure.} = nbtRemove(input, key)
+  result.structSeed = proc (): NbtTag {.closure.} = NbtTag(kind: ntkCompound, compoundVal: newCompound())
+  result.structAppend = proc (key: string, value, builder: NbtTag): NbtTag {.closure.} = nbtAppend(key, value, builder)
+  result.buildWithBuilder = proc (builder, prefix: NbtTag): DataResult[NbtTag] {.closure.} = nbtBuildWithBuilder(builder, prefix)
+
+var theNbtOps: DynamicOps[NbtTag] = buildNbtOps()
+
+proc nbtOps*(): DynamicOps[NbtTag] =
+  theNbtOps
+
+proc get*(m: MapLike[NbtTag], key: NbtTag): Option[NbtTag] =
+  ## `NbtMapLike::get`.
+  if key.kind == ntkString: getStr(m, key.stringVal) else: none[NbtTag]()
+
+proc convertTo*[U](ops: DynamicOps[NbtTag], outOps: DynamicOps[U], input: NbtTag): U =
+  case input.kind
+  of ntkEnd: outOps.empty()
+  of ntkByte: outOps.createByte(input.byteVal)
+  of ntkShort: outOps.createShort(input.shortVal)
+  of ntkInt: outOps.createInt(input.intVal)
+  of ntkLong: outOps.createLong(input.longVal)
+  of ntkFloat: outOps.createFloat(input.floatVal)
+  of ntkDouble: outOps.createDouble(input.doubleVal)
+  of ntkByteArray: outOps.createByteList(input.byteArrayVal)
+  of ntkString: outOps.createString(input.stringVal)
+  of ntkList: convertList(ops, outOps, input)
+  of ntkCompound: convertMap(ops, outOps, input)
+  of ntkIntArray: outOps.createIntList(input.intArrayVal)
+  of ntkLongArray: outOps.createLongList(input.longArrayVal)

@@ -1,0 +1,203 @@
+## Port of pumpkin-util/src/noise/perlin.rs
+##
+## The pinned tree's f64 samplers. The newer tree's f32 `PerlinNoise`/`NormalNoise` family is ../perlin.aowl.
+## `impl RandomImpl` becomes a plain generic `[R]`. `splitter.split_string` always comes back a `RandomGenerator`.
+
+{.feature: "untyped".}
+
+import std/math
+import std/assertions
+import ../mathlerp
+import ../noisegrad
+import ../random/rustnum
+import ../random/random
+
+type
+  PerlinNoiseSampler* = object
+    permutation*: array[256, uint8]
+    xOrigin*, yOrigin*, zOrigin*: float64
+
+  SamplerData* = object
+    sampler*: PerlinNoiseSampler
+    amplitude*: float64
+    persistence*: float64
+    lacunarity*: float64
+
+  OctavePerlinNoiseSampler* = object
+    samplers*: seq[SamplerData]
+    maxValueField: float64
+
+proc newPerlinNoiseSampler*[R](random: var R): PerlinNoiseSampler =
+  let xOrigin = nextF64(random) * 256.0'f64
+  let yOrigin = nextF64(random) * 256.0'f64
+  let zOrigin = nextF64(random) * 256.0'f64
+  var permutation = default(array[256, uint8])
+  for i in 0 ..< 256:
+    permutation[i] = uint8(i)
+  for i in 0 ..< 256:
+    let j = int(nextBoundedI32(random, int32(256 - i)))
+    let tmp = permutation[i]
+    permutation[i] = permutation[i + j]
+    permutation[i + j] = tmp
+  PerlinNoiseSampler(permutation: permutation, xOrigin: xOrigin, yOrigin: yOrigin, zOrigin: zOrigin)
+
+proc grad(hash: int32, x, y, z: float64): float64 {.inline.} =
+  Gradients[int(hash and 15'i32)].dot(x, y, z)
+
+proc perlinFade(value: float64): float64 {.inline.} =
+  value * value * value * (value * (value * 6.0'f64 - 15.0'f64) + 10.0'f64)
+
+proc map*(s: PerlinNoiseSampler, input: int32): int32 {.inline.} =
+  int32(s.permutation[int(input and 0xFF'i32)])
+
+proc sample(s: PerlinNoiseSampler, x, y, z: int32, localX, localY, localZ, fadeLocalY: float64): float64 =
+  let i = s.map(x)
+  let j = s.map(wrapAdd(x, 1'i32))
+  let k = s.map(wrapAdd(i, y))
+  let l = s.map(wrapAdd(wrapAdd(i, y), 1'i32))
+
+  let m = s.map(wrapAdd(j, y))
+  let n = s.map(wrapAdd(wrapAdd(j, y), 1'i32))
+
+  let d = grad(s.map(wrapAdd(k, z)), localX, localY, localZ)
+  let e = grad(s.map(wrapAdd(m, z)), localX - 1.0'f64, localY, localZ)
+  let f = grad(s.map(wrapAdd(l, z)), localX, localY - 1.0'f64, localZ)
+  let g = grad(s.map(wrapAdd(n, z)), localX - 1.0'f64, localY - 1.0'f64, localZ)
+  let h = grad(s.map(wrapAdd(wrapAdd(k, z), 1'i32)), localX, localY, localZ - 1.0'f64)
+  let o = grad(s.map(wrapAdd(wrapAdd(m, z), 1'i32)), localX - 1.0'f64, localY, localZ - 1.0'f64)
+  let p = grad(s.map(wrapAdd(wrapAdd(l, z), 1'i32)), localX, localY - 1.0'f64, localZ - 1.0'f64)
+  let q = grad(s.map(wrapAdd(wrapAdd(n, z), 1'i32)), localX - 1.0'f64, localY - 1.0'f64, localZ - 1.0'f64)
+  let r = perlinFade(localX)
+  let t2 = perlinFade(fadeLocalY)
+  let t = perlinFade(localZ)
+
+  lerp3(r, t2, t, d, e, f, g, h, o, p, q)
+
+proc sampleNoFade*(s: PerlinNoiseSampler, x, y, z, yScale, yMax: float64): float64 =
+  let trueX = x + s.xOrigin
+  let trueY = y + s.yOrigin
+  let trueZ = z + s.zOrigin
+
+  let xFloor = floor(trueX)
+  let yFloor = floor(trueY)
+  let zFloor = floor(trueZ)
+
+  let xDec = trueX - xFloor
+  let yDec = trueY - yFloor
+  let zDec = trueZ - zFloor
+
+  var yNoise = 0.0'f64
+  if yScale != 0.0'f64:
+    let rawYDec = if yMax >= 0.0'f64 and yMax < yDec: yMax else: yDec
+    yNoise = floor(rawYDec / yScale + 1e-7'f64) * yScale
+
+  s.sample(asI32(xFloor), asI32(yFloor), asI32(zFloor), xDec, yDec - yNoise, zDec, yDec)
+
+proc sampleFlatY*(s: PerlinNoiseSampler, x, y, z: float64): float64 {.inline.} =
+  s.sampleNoFade(x, y, z, 0.0'f64, 0.0'f64)
+
+proc getTotalAmplitudeGeneric(scale: float64, persistences, amplitudes: openArray[float64]): float64 =
+  var total = 0.0'f64
+  for i in 0 ..< min(amplitudes.len, persistences.len):
+    if amplitudes[i] != 0.0'f64:
+      total += scale * amplitudes[i] * persistences[i]
+  total
+
+proc maintainPrecision*(value: float64): float64 {.inline.} =
+  value - floor(value / 3.3554432e7'f64 + 0.5'f64) * 3.3554432e7'f64
+
+proc calculateAmplitudes*(octaves: openArray[int32]): (int32, seq[float64]) =
+  assert octaves.len > 0, "we should have some octaves"
+  # Upstream sorts, but only reads the two ends and then sets every entry, so order does not matter.
+  var first = octaves[0]
+  var last = octaves[0]
+  for o in octaves:
+    if o < first: first = o
+    if o > last: last = o
+
+  let i = -first
+  let j = last
+  let k = i + j + 1'i32
+
+  var doubleList = newSeq[float64](int(k))
+  for l in octaves:
+    doubleList[int(l + i)] = 1.0'f64
+
+  (-i, doubleList)
+
+proc newOctavePerlinNoiseSampler*[R](random: var R, firstOctave: int32, amplitudes: openArray[float64],
+                                     legacy: bool): OctavePerlinNoiseSampler =
+  let i = amplitudes.len
+  let j = -firstOctave
+
+  var present = newSeq[bool](i)
+  var built = newSeq[PerlinNoiseSampler](i)
+
+  if legacy:
+    let sampler = newPerlinNoiseSampler(random)
+    if j >= 0'i32 and j < int32(i):
+      if amplitudes[int(j)] != 0.0'f64:
+        present[int(j)] = true
+        built[int(j)] = sampler
+
+    # Upstream's `0..j as usize` with j < 0 would count to usize::MAX; a positive first octave is not legacy's use.
+    var kx = int(j) - 1
+    while kx >= 0:
+      if kx < i:
+        if amplitudes[kx] == 0.0'f64:
+          skip(random, 262'i32)
+        else:
+          present[kx] = true
+          built[kx] = newPerlinNoiseSampler(random)
+      else:
+        skip(random, 262'i32)
+      kx -= 1
+  else:
+    let splitter = nextSplitter(random)
+    for k in 0 ..< i:
+      if amplitudes[k] != 0.0'f64:
+        let l = firstOctave + int32(k)
+        var octaveRandom = splitString(splitter, "octave_" & $l)
+        present[k] = true
+        built[k] = newPerlinNoiseSampler(octaveRandom)
+
+  var persistence = powi(2.0'f64, int32(i) - 1'i32) / (powi(2.0'f64, int32(i)) - 1.0'f64)
+  var lacunarity = powi(2.0'f64, -j)
+
+  var persistences = newSeq[float64](i)
+  var lacunarities = newSeq[float64](i)
+  for x in 0 ..< i:
+    persistences[x] = persistence
+    persistence = persistence / 2.0'f64
+    lacunarities[x] = lacunarity
+    lacunarity *= 2.0'f64
+
+  let maxValue = getTotalAmplitudeGeneric(2.0'f64, persistences, amplitudes)
+
+  var samplers: seq[SamplerData] = @[]
+  for x in 0 ..< i:
+    if present[x]:
+      samplers.add SamplerData(sampler: built[x], amplitude: amplitudes[x],
+                               persistence: persistences[x], lacunarity: lacunarities[x])
+
+  OctavePerlinNoiseSampler(samplers: samplers, maxValueField: maxValue)
+
+proc maxValue*(s: OctavePerlinNoiseSampler): float64 {.inline.} =
+  s.maxValueField
+
+proc getTotalAmplitude*(s: OctavePerlinNoiseSampler, scale: float64): float64 =
+  var total = 0.0'f64
+  for index in 0 ..< s.samplers.len:
+    total += s.samplers[index].amplitude * scale * s.samplers[index].persistence
+  total
+
+proc sample*(s: OctavePerlinNoiseSampler, x, y, z: float64): float64 =
+  var total = 0.0'f64
+  for index in 0 ..< s.samplers.len:
+    let lacunarity = s.samplers[index].lacunarity
+    let mappedX = maintainPrecision(x * lacunarity)
+    let mappedY = maintainPrecision(y * lacunarity)
+    let mappedZ = maintainPrecision(z * lacunarity)
+    let value = s.samplers[index].sampler.sampleNoFade(mappedX, mappedY, mappedZ, 0.0'f64, 0.0'f64)
+    total += s.samplers[index].amplitude * value * s.samplers[index].persistence
+  total

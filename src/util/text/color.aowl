@@ -1,0 +1,414 @@
+## Port of pumpkin-util/src/text/color.rs
+## PARTIAL: pumpkin-util/src/text/color.rs - console output only: the `colored` crate's source is not on this machine, so its SGR layout is from memory and any fallback for terminals without truecolor is not ported. Everything sent to a client is whole.
+## The `colored` crate's output (`ColoredString`'s Display, `control::SHOULD_COLORIZE`) is ported here too,
+## because `console_color` returns it. Its source is not vendored in the pinned tree: the SGR layout below
+## is from colored 3.1.1 as recalled, not read, and its fallback for terminals without COLORTERM truecolor
+## is not ported, so an RGB color always prints `38;2;r;g;b`.
+
+import std/[options, syncio, terminal, envvars]
+import serform
+import ../../codecs/json_value
+
+proc fmodf(a, b: cfloat): cfloat {.importc: "fmodf", header: "<math.h>".}
+
+type
+  NamedColor* = enum
+    ncBlack = 0
+    ncDarkBlue
+    ncDarkGreen
+    ncDarkAqua
+    ncDarkRed
+    ncDarkPurple
+    ncGold
+    ncGray
+    ncDarkGray
+    ncBlue
+    ncGreen
+    ncAqua
+    ncRed
+    ncLightPurple
+    ncYellow
+    ncWhite
+
+  RGBColor* = object
+    red*: uint8
+    green*: uint8
+    blue*: uint8
+
+  ARGBColor* = object
+    alpha*: uint8
+    red*: uint8
+    green*: uint8
+    blue*: uint8
+
+  ColorKind* = enum
+    ckReset
+    ckRgb
+    ckNamed
+
+  Color* = object
+    case kind*: ColorKind
+    of ckReset: discard
+    of ckRgb: rgb*: RGBColor
+    of ckNamed: named*: NamedColor
+
+proc newRGBColor*(red, green, blue: uint8): RGBColor =
+  RGBColor(red: red, green: green, blue: blue)
+
+proc newARGBColor*(alpha, red, green, blue: uint8): ARGBColor =
+  ARGBColor(alpha: alpha, red: red, green: green, blue: blue)
+
+proc colorReset*(): Color = Color(kind: ckReset)
+proc colorRgb*(c: RGBColor): Color = Color(kind: ckRgb, rgb: c)
+proc colorNamed*(c: NamedColor): Color = Color(kind: ckNamed, named: c)
+
+proc `==`*(a, b: Color): bool =
+  if a.kind != b.kind: return false
+  case a.kind
+  of ckReset: true
+  of ckRgb: a.rgb == b.rgb
+  of ckNamed: a.named == b.named
+
+proc saturatingI32(f: float32): int32 =
+  ## Rust's `f32 as i32`.
+  if f != f: 0'i32
+  elif f >= 2147483648.0'f32: int32.high
+  elif f <= -2147483648.0'f32: int32.low
+  else: int32(f)
+
+proc saturatingU8*(f: float32): uint8 =
+  ## Rust's `f32 as u8`.
+  if f != f or f <= 0.0'f32: 0'u8
+  elif f >= 255.0'f32: 255'u8
+  else: uint8(int32(f))
+
+proc hsvToRgb*(h, s, v: float32): (uint8, uint8, uint8) =
+  ## `h` in degrees (0-360), `s` and `v` in 0-1.
+  let c = v * s
+  let inner = float32(fmodf(h / 60.0'f32, 2.0'f32)) - 1.0'f32
+  let x = c * (1.0'f32 - (if inner < 0.0'f32: -inner else: inner))
+  let m = v - c
+  var r = 0.0'f32
+  var g = 0.0'f32
+  var b = 0.0'f32
+  case (saturatingI32(h) div 60'i32) mod 6'i32
+  of 0'i32:
+    r = c; g = x
+  of 1'i32:
+    r = x; g = c
+  of 2'i32:
+    g = c; b = x
+  of 3'i32:
+    g = x; b = c
+  of 4'i32:
+    r = x; b = c
+  else:
+    r = c; b = x
+  (saturatingU8((r + m) * 255.0'f32), saturatingU8((g + m) * 255.0'f32), saturatingU8((b + m) * 255.0'f32))
+
+# --- colored: ColoredString and control::ShouldColorize -------------------------------------------
+
+proc normalizeEnv(key: string): int =
+  ## `normalize_env`: -1 for unset, 1 for set and not "0", 0 for "0".
+  if not existsEnv(key): -1
+  elif getEnv(key) != "0": 1
+  else: 0
+
+proc envClicolor(): bool =
+  normalizeEnv("CLICOLOR") != 0 and isatty(stdout)
+
+proc envClicolorForce(): int =
+  ## `resolve_clicolor_force`: -1 undecided, otherwise 0 or 1.
+  if normalizeEnv("CLICOLOR_FORCE") == 1: 1
+  elif normalizeEnv("NO_COLOR") != -1: 0
+  else: -1
+
+var colorOverride = -1
+let clicolor = envClicolor()
+let clicolorForce = envClicolorForce()
+
+proc setColorOverride*(enabled: bool) =
+  ## `colored::control::set_override`.
+  colorOverride = if enabled: 1 else: 0
+
+proc unsetColorOverride*() =
+  ## `colored::control::unset_override`.
+  colorOverride = -1
+
+proc shouldColorize*(): bool =
+  if colorOverride != -1: colorOverride == 1
+  elif clicolorForce != -1: clicolorForce == 1
+  else: clicolor
+
+proc coloredString*(input, code: string): string =
+  ## `ColoredString`'s Display for one SGR code; a reset inside `input` re-arms the style.
+  if code.len == 0 or not shouldColorize():
+    return input
+  const reset = "\x1B[0m"
+  let style = "\x1B[" & code & "m"
+  result = style
+  var i = 0
+  while i < input.len:
+    if i + reset.len <= input.len and input[i] == '\x1B' and input[i + 1] == '[' and input[i + 2] == '0' and input[i + 3] == 'm':
+      result.add reset
+      result.add style
+      i += reset.len
+    else:
+      result.add input[i]
+      inc i
+  result.add reset
+
+proc consoleColor*(self: Color, text: string): string =
+  ## Colors `text` for terminal output.
+  case self.kind
+  of ckReset:
+    text
+  of ckRgb:
+    coloredString(text, "38;2;" & $int(self.rgb.red) & ";" & $int(self.rgb.green) & ";" & $int(self.rgb.blue))
+  of ckNamed:
+    let code =
+      case self.named
+      of ncBlack: "30"
+      of ncDarkBlue: "34"
+      of ncDarkGreen: "32"
+      of ncDarkAqua: "36"
+      of ncDarkRed: "31"
+      of ncDarkPurple: "35"
+      of ncGold: "33"
+      of ncGray, ncDarkGray: "90"
+      of ncBlue: "94"
+      of ncGreen: "92"
+      of ncAqua: "96"
+      of ncRed: "91"
+      of ncLightPurple: "95"
+      of ncYellow: "93"
+      of ncWhite: "37"
+    coloredString(text, code)
+
+# --- impl Color ----------------------------------------------------------------------------------
+
+proc fromLegacyCode*(code: char): Option[Color] =
+  ## The color for a legacy code (0-9, a-f, either case).
+  let named =
+    case code
+    of '0': ncBlack
+    of '1': ncDarkBlue
+    of '2': ncDarkGreen
+    of '3': ncDarkAqua
+    of '4': ncDarkRed
+    of '5': ncDarkPurple
+    of '6': ncGold
+    of '7': ncGray
+    of '8': ncDarkGray
+    of '9': ncBlue
+    of 'a', 'A': ncGreen
+    of 'b', 'B': ncAqua
+    of 'c', 'C': ncRed
+    of 'd', 'D': ncLightPurple
+    of 'e', 'E': ncYellow
+    of 'f', 'F': ncWhite
+    else: return none[Color]()
+  some(colorNamed(named))
+
+proc hexDigit(c: char): int =
+  case c
+  of '0'..'9': ord(c) - ord('0')
+  of 'a'..'f': ord(c) - ord('a') + 10
+  of 'A'..'F': ord(c) - ord('A') + 10
+  else: -1
+
+proc parseHexPair(a, b: char, ok: var bool): uint8 =
+  ## `u8::from_str_radix(.., 16)` on two bytes, which takes a leading `+`.
+  let lo = hexDigit(b)
+  let hi = if a == '+': 0 else: hexDigit(a)
+  if lo < 0 or hi < 0:
+    ok = false
+    return 0'u8
+  uint8(hi * 16 + lo)
+
+proc fromHexStr*(hex: string): Option[Color] =
+  ## An RGB color from `RRGGBB` without the '#'. Rust panics when a non-ASCII byte splits a
+  ## character at a pair boundary; such text simply fails to parse here.
+  if hex.len != 6:
+    return none[Color]()
+  var ok = true
+  let r = parseHexPair(hex[0], hex[1], ok)
+  let g = parseHexPair(hex[2], hex[3], ok)
+  let b = parseHexPair(hex[4], hex[5], ok)
+  if not ok:
+    return none[Color]()
+  some(colorRgb(newRGBColor(r, g, b)))
+
+# --- impl NamedColor -----------------------------------------------------------------------------
+
+proc toRgb*(self: NamedColor): RGBColor =
+  case self
+  of ncBlack: newRGBColor(0'u8, 0'u8, 0'u8)
+  of ncDarkBlue: newRGBColor(0'u8, 0'u8, 170'u8)
+  of ncDarkGreen: newRGBColor(0'u8, 170'u8, 0'u8)
+  of ncDarkAqua: newRGBColor(0'u8, 170'u8, 170'u8)
+  of ncDarkRed: newRGBColor(170'u8, 0'u8, 0'u8)
+  of ncDarkPurple: newRGBColor(170'u8, 0'u8, 170'u8)
+  of ncGold: newRGBColor(255'u8, 170'u8, 0'u8)
+  of ncGray: newRGBColor(170'u8, 170'u8, 170'u8)
+  of ncDarkGray: newRGBColor(85'u8, 85'u8, 85'u8)
+  of ncBlue: newRGBColor(85'u8, 85'u8, 255'u8)
+  of ncGreen: newRGBColor(85'u8, 255'u8, 85'u8)
+  of ncAqua: newRGBColor(85'u8, 255'u8, 255'u8)
+  of ncRed: newRGBColor(255'u8, 85'u8, 85'u8)
+  of ncLightPurple: newRGBColor(255'u8, 85'u8, 255'u8)
+  of ncYellow: newRGBColor(255'u8, 255'u8, 85'u8)
+  of ncWhite: newRGBColor(255'u8, 255'u8, 255'u8)
+
+proc toLegacyChar*(self: NamedColor): char =
+  case self
+  of ncBlack: '0'
+  of ncDarkBlue: '1'
+  of ncDarkGreen: '2'
+  of ncDarkAqua: '3'
+  of ncDarkRed: '4'
+  of ncDarkPurple: '5'
+  of ncGold: '6'
+  of ncGray: '7'
+  of ncDarkGray: '8'
+  of ncBlue: '9'
+  of ncGreen: 'a'
+  of ncAqua: 'b'
+  of ncRed: 'c'
+  of ncLightPurple: 'd'
+  of ncYellow: 'e'
+  of ncWhite: 'f'
+
+proc namedColorName*(self: NamedColor): string =
+  ## The `rename_all = "snake_case"` serde name.
+  case self
+  of ncBlack: "black"
+  of ncDarkBlue: "dark_blue"
+  of ncDarkGreen: "dark_green"
+  of ncDarkAqua: "dark_aqua"
+  of ncDarkRed: "dark_red"
+  of ncDarkPurple: "dark_purple"
+  of ncGold: "gold"
+  of ncGray: "gray"
+  of ncDarkGray: "dark_gray"
+  of ncBlue: "blue"
+  of ncGreen: "green"
+  of ncAqua: "aqua"
+  of ncRed: "red"
+  of ncLightPurple: "light_purple"
+  of ncYellow: "yellow"
+  of ncWhite: "white"
+
+proc namedColorTryFrom*(value: string): Option[NamedColor] =
+  ## `TryFrom<&str> for NamedColor`.
+  case value
+  of "black": some(ncBlack)
+  of "dark_blue": some(ncDarkBlue)
+  of "dark_green": some(ncDarkGreen)
+  of "dark_aqua": some(ncDarkAqua)
+  of "dark_red": some(ncDarkRed)
+  of "dark_purple": some(ncDarkPurple)
+  of "gold": some(ncGold)
+  of "gray": some(ncGray)
+  of "dark_gray": some(ncDarkGray)
+  of "blue": some(ncBlue)
+  of "green": some(ncGreen)
+  of "aqua": some(ncAqua)
+  of "red": some(ncRed)
+  of "light_purple": some(ncLightPurple)
+  of "yellow": some(ncYellow)
+  of "white": some(ncWhite)
+  else: none[NamedColor]()
+
+# --- serde ---------------------------------------------------------------------------------------
+
+const UpperHex = "0123456789ABCDEF"
+
+proc toSer*(self: RGBColor): SerValue =
+  ## `#RRGGBB`, upper case.
+  var s = "#"
+  for c in [self.red, self.green, self.blue]:
+    s.add UpperHex[int(c shr 4)]
+    s.add UpperHex[int(c and 15'u8)]
+  serString(s)
+
+proc toSer*(self: ARGBColor): SerValue =
+  ## `serialize_bytes`: a list of bytes in NBT, a number array in JSON.
+  serBytes(@[self.alpha, self.red, self.green, self.blue])
+
+proc toSer*(self: NamedColor): SerValue =
+  serString(namedColorName(self))
+
+proc toSer*(self: Color): SerValue =
+  ## Untagged, so `Reset` is a unit: `null` in JSON, and nothing at all in NBT.
+  case self.kind
+  of ckReset: serUnit()
+  of ckRgb: toSer(self.rgb)
+  of ckNamed: toSer(self.named)
+
+proc toJson*(self: RGBColor): JsonValue = serToJsonValue(toSer(self))
+proc toJson*(self: ARGBColor): JsonValue = serToJsonValue(toSer(self))
+proc toJson*(self: NamedColor): JsonValue = serToJsonValue(toSer(self))
+proc toJson*(self: Color): JsonValue = serToJsonValue(toSer(self))
+
+proc fromJson*(t: typedesc[Color], v: JsonValue): TextResult[Color] =
+  if v.kind != jvString:
+    return textErr[Color]("invalid type: expected a borrowed string")
+  let s = v.strVal
+  if s == "reset":
+    return textOk(colorReset())
+  if s.len > 0 and s[0] == '#':
+    if s.len != 7:
+      return textErr[Color]("Hex color must be in the format '#RRGGBB'")
+    var ok = true
+    let r = parseHexPair(s[1], s[2], ok)
+    if not ok: return textErr[Color]("Invalid red component in hex color")
+    let g = parseHexPair(s[3], s[4], ok)
+    if not ok: return textErr[Color]("Invalid green component in hex color")
+    let b = parseHexPair(s[5], s[6], ok)
+    if not ok: return textErr[Color]("Invalid blue component in hex color")
+    return textOk(colorRgb(newRGBColor(r, g, b)))
+  let named = namedColorTryFrom(s)
+  if named.isNone:
+    return textErr[Color]("Invalid named color")
+  textOk(colorNamed(named.get()))
+
+proc fromJson*(t: typedesc[NamedColor], v: JsonValue): TextResult[NamedColor] =
+  if v.kind != jvString:
+    return textErr[NamedColor]("invalid type: expected variant identifier")
+  let named = namedColorTryFrom(v.strVal)
+  if named.isNone:
+    return textErr[NamedColor]("unknown variant `" & v.strVal & "`")
+  textOk(named.get())
+
+proc decodeU8Fields(v: JsonValue, names: openArray[string], lenient: bool, outp: var seq[uint8]): string =
+  ## A derived struct reads a map by name or a sequence by field order. Returns serde's error, or "".
+  outp = @[]
+  var ok = true
+  if v.kind == jvObject:
+    for n in names:
+      let i = v.find(n)
+      if i < 0: return "missing field `" & n & "`"
+      outp.add decodeU8(v.vals[i], lenient, ok)
+      if not ok: return "invalid value for field `" & n & "`, expected u8"
+  elif v.kind == jvArray:
+    if v.items.len != names.len:
+      return "invalid length " & $v.items.len & ", expected " & $names.len & " elements"
+    for it in v.items:
+      outp.add decodeU8(it, lenient, ok)
+      if not ok: return "invalid value, expected u8"
+  else:
+    return "invalid type: expected a map or a sequence"
+  ""
+
+proc fromJson*(t: typedesc[RGBColor], v: JsonValue, lenient = false): TextResult[RGBColor] =
+  var f: seq[uint8] = @[]
+  let e = decodeU8Fields(v, ["red", "green", "blue"], lenient, f)
+  if e.len > 0: return textErr[RGBColor](e)
+  textOk(newRGBColor(f[0], f[1], f[2]))
+
+proc fromJson*(t: typedesc[ARGBColor], v: JsonValue, lenient = false): TextResult[ARGBColor] =
+  var f: seq[uint8] = @[]
+  let e = decodeU8Fields(v, ["alpha", "red", "green", "blue"], lenient, f)
+  if e.len > 0: return textErr[ARGBColor](e)
+  textOk(newARGBColor(f[0], f[1], f[2], f[3]))

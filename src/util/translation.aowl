@@ -1,0 +1,316 @@
+## Port of pumpkin-util/src/translation.rs
+## `Locale` is in text/locale.aowl and is re-exported here. The assets upstream embeds with `include_str!` are
+## in src/generated/translations.aowl, written by src/data_codegen/gen_translations.aowl. `TextComponentBase`'s
+## `get_text` and `to_pretty_console` from text/mod.rs are here too: they and `get_translation_text` and
+## `translation_to_pretty` call each other, and modules cannot form a cycle. text/text.aowl re-exports them.
+##
+## Upstream panics in a few spots on malformed input: a `%` as the last byte or `%%` (a slice past its end),
+## and fewer substitutions than placeholders (an index out of bounds). A panic here would take the server
+## down over a translation file, so those read as empty text instead.
+
+import std/[locks, tables, unicode, syncio]
+import text/textbase
+import ../codecs/json_value
+import ../generated/translations
+
+export textbase
+
+type
+  SubstitutionRange* = object
+    ## A placeholder's span in a translation string, in bytes, both ends inclusive.
+    start*: int
+    `end`*: int
+
+proc len*(self: SubstitutionRange): int =
+  (self.`end` - self.start) + 1
+
+proc isEmpty*(self: SubstitutionRange): bool =
+  self.start == self.`end`
+
+var translationsLock: Lock
+var translationTables: seq[Table[string, string]] = @[]
+initLock(translationsLock)
+
+proc parseStringMap(json: string, keys, vals: var seq[string]): bool =
+  ## `serde_json::from_str::<HashMap<String, String>>`.
+  let parsed = parseJsonValue(json)
+  if not parsed.ok or parsed.value.kind != jvObject:
+    return false
+  let n = parsed.value.keys.len
+  for i in 0 ..< n:
+    if parsed.value.vals[i].kind != jvString:
+      return false
+  keys = parsed.value.keys
+  vals = newSeq[string](n)
+  for i in 0 ..< n:
+    vals[i] = parsed.value.vals[i].strVal
+  true
+
+proc whitespaceLenAt(s: string, i: int): int =
+  ## Byte length of the Unicode White_Space character at `i`, or 0.
+  let c = ord(s[i])
+  if c == 0x20 or (c >= 0x09 and c <= 0x0D): return 1
+  if i + 1 < s.len and c == 0xC2 and (ord(s[i + 1]) == 0x85 or ord(s[i + 1]) == 0xA0): return 2
+  if i + 2 < s.len:
+    let c1 = ord(s[i + 1])
+    let c2 = ord(s[i + 2])
+    if c == 0xE1 and c1 == 0x9A and c2 == 0x80: return 3
+    if c == 0xE2 and c1 == 0x80 and ((c2 >= 0x80 and c2 <= 0x8A) or c2 == 0xA8 or c2 == 0xA9 or c2 == 0xAF): return 3
+    if c == 0xE2 and c1 == 0x81 and c2 == 0x9F: return 3
+    if c == 0xE3 and c1 == 0x80 and c2 == 0x80: return 3
+  0
+
+proc rustTrim(s: string, a, b: int): string =
+  ## `str::trim` on the bytes `a ..< b`.
+  var lo = a
+  var hi = b
+  while lo < hi:
+    let n = whitespaceLenAt(s, lo)
+    if n == 0 or lo + n > hi: break
+    lo += n
+  while hi > lo:
+    var trimmed = false
+    for n in 1 .. 3:
+      if hi - n >= lo and whitespaceLenAt(s, hi - n) == n:
+        hi -= n
+        trimmed = true
+        break
+    if not trimmed: break
+  result = ""
+  for i in lo ..< hi: result.add s[i]
+
+proc loadNamespaced(table: var Table[string, string], prefix, json, name: string) =
+  ## Upstream panics with "Could not parse <file>"; the assets are checked by translationtest.
+  var keys: seq[string] = @[]
+  var vals: seq[string] = @[]
+  if not parseStringMap(json, keys, vals):
+    echo "Could not parse " & name & "."
+    return
+  for i in 0 ..< keys.len:
+    table[prefix & keys[i]] = vals[i]
+
+proc loadBedrockLang(table: var Table[string, string], lang: string) =
+  var pos = 0
+  while pos < lang.len:
+    var stop = pos
+    while stop < lang.len and lang[stop] != '\n': inc stop
+    let line = rustTrim(lang, pos, stop)
+    pos = stop + 1
+    if line.len == 0 or line[0] == '#' or line[0] == '/':
+      continue
+    var eq = -1
+    for i in 0 ..< line.len:
+      if line[i] == '=':
+        eq = i
+        break
+    if eq < 0:
+      continue
+    let key = toLower(rustTrim(line, 0, eq))
+    let value = rustTrim(line, eq + 1, line.len)
+    table[key] = value
+    table["minecraft:" & key] = value
+    table["pumpkin:" & key] = value
+
+proc ensureLoaded() =
+  ## `LazyLock` init of `TRANSLATIONS`. Call with the lock held. The Bedrock pass comes last and so
+  ## overrides vanilla and pumpkin entries with the same key, as upstream's does.
+  if translationTables.len > 0:
+    return
+  var tables = newSeq[Table[string, string]](LocaleCount)
+  loadNamespaced(tables[ord(lcEnUs)], "minecraft:", vanillaEnUsJson(), "en_us_java.json")
+  for file in PumpkinTranslationFiles:
+    let locale = localeFromStr(file)
+    loadNamespaced(tables[ord(locale)], "pumpkin:", pumpkinTranslationJson(file), file & ".json")
+  loadBedrockLang(tables[ord(lcEnUs)], bedrockEnUsLang())
+  translationTables = tables
+
+proc addTranslation*(namespace, key, translation: string, locale: Locale) =
+  ## Adds or overrides a single translation entry.
+  let namespacedKey = toLower(namespace & ":" & key)
+  acquire(translationsLock)
+  ensureLoaded()
+  translationTables[ord(locale)][namespacedKey] = translation
+  release(translationsLock)
+
+proc addTranslationFile*(namespace, filePath: string, locale: Locale) =
+  ## Loads a flat key-value JSON map under a namespace. `filePath` holds the JSON text itself, as
+  ## upstream's parameter of that name does.
+  var keys: seq[string] = @[]
+  var vals: seq[string] = @[]
+  if not parseStringMap(filePath, keys, vals) or keys.len == 0:
+    return
+  acquire(translationsLock)
+  ensureLoaded()
+  for i in 0 ..< keys.len:
+    translationTables[ord(locale)][toLower(namespace & ":" & keys[i])] = vals[i]
+  release(translationsLock)
+
+proc getTranslation*(key: string, locale: Locale): string =
+  ## The localized text for `namespace:key`, falling back to en_us and then to the key itself.
+  let lower = toLower(key)
+  acquire(translationsLock)
+  ensureLoaded()
+  if translationTables[ord(locale)].hasKey(lower):
+    result = translationTables[ord(locale)].getOrDefault(lower, "")
+  elif translationTables[ord(lcEnUs)].hasKey(lower):
+    result = translationTables[ord(lcEnUs)].getOrDefault(lower, "")
+  else:
+    result = lower
+  release(translationsLock)
+
+proc translationCount*(locale: Locale): int =
+  ## Entries loaded for `locale`.
+  acquire(translationsLock)
+  ensureLoaded()
+  result = translationTables[ord(locale)].len
+  release(translationsLock)
+
+proc reorderSubstitutions*(translation: string, args: seq[TextComponentBase]): (seq[TextComponentBase], seq[SubstitutionRange]) =
+  ## The substitutions in placeholder order and each placeholder's range.
+  var indices: seq[int] = @[]
+  var plain = 0   # `translation.matches("%s").count()`, which also counts an escaped `\%s`.
+  for i in 0 ..< translation.len:
+    if translation[i] == '%':
+      if i + 1 < translation.len and translation[i + 1] == 's':
+        inc plain
+      if i == 0 or translation[i - 1] != '\\':
+        indices.add i
+
+  var ranges: seq[SubstitutionRange] = @[]
+  if plain == indices.len:
+    for i in indices:
+      ranges.add SubstitutionRange(start: i, `end`: i + 1)
+    return (args, ranges)
+
+  var substitutions = newSeq[TextComponentBase](indices.len)
+  for i in 0 ..< indices.len:
+    substitutions[i] = textBase("")
+
+  var nextIdx = 0
+  for idx in 0 ..< indices.len:
+    let i = indices[idx]
+    var numChars = ""
+    var pos = 1
+    while i + pos < translation.len and translation[i + pos] >= '0' and translation[i + pos] <= '9':
+      numChars.add translation[i + pos]
+      inc pos
+
+    if numChars.len == 0:
+      ranges.add SubstitutionRange(start: i, `end`: i + 1)
+      if nextIdx < args.len:
+        substitutions[idx] = args[nextIdx]
+      nextIdx = min(nextIdx + 1, max(args.len - 1, 0))
+      continue
+
+    ranges.add SubstitutionRange(start: i, `end`: i + pos + 1)
+    # `parse::<usize>` fails on overflow and then the empty substitution stays.
+    var digit = 0'u64
+    var fits = true
+    for ch in numChars:
+      let d = uint64(ord(ch) - ord('0'))
+      if digit > (0xFFFF_FFFF_FFFF_FFFF'u64 - d) div 10'u64:
+        fits = false
+        break
+      digit = digit * 10'u64 + d
+    if fits and args.len > 0:
+      let clamped = if digit < 1'u64: 1 elif digit > uint64(args.len): args.len else: int(digit)
+      substitutions[idx] = args[clamped - 1]
+  (substitutions, ranges)
+
+proc sliceOf*(s: string, a, b: int): string =
+  ## `s[a..b]`, empty where Rust would panic.
+  result = ""
+  var i = a
+  while i < b and i < s.len:
+    result.add s[i]
+    inc i
+
+proc containsPercent(s: string): bool =
+  for c in s:
+    if c == '%': return true
+  false
+
+proc translationToPretty*(namespacedKey: string, locale: Locale, args: seq[TextComponentBase]): string =
+  ## Resolves a translation into formatted console output.
+  let translation = getTranslation(namespacedKey, locale)
+  if args.len == 0 or not containsPercent(translation):
+    return translation
+  let (substitutions, indices) = reorderSubstitutions(translation, args)
+  result = ""
+  var pos = 0
+  for idx in 0 ..< indices.len:
+    let range = indices[idx]
+    let subIdx = min(idx, substitutions.len - 1)
+    let substitution = toPrettyConsole(substitutions[subIdx])
+    result.add sliceOf(translation, pos, range.start)
+    result.add substitution
+    pos = range.`end` + 1
+  result.add sliceOf(translation, pos, translation.len)
+
+proc getTranslationText*(namespacedKey: string, locale: Locale, args: seq[TextComponentBase]): string =
+  ## Resolves a translation into plain text.
+  let translation = getTranslation(namespacedKey, locale)
+  if args.len == 0 or not containsPercent(translation):
+    return translation
+  let (substitutions, indices) = reorderSubstitutions(translation, args)
+  result = ""
+  var pos = 0
+  for idx in 0 ..< indices.len:
+    let range = indices[idx]
+    let subIdx = min(idx, substitutions.len - 1)
+    let substitution = getText(substitutions[subIdx], locale)
+    result.add sliceOf(translation, pos, range.start)
+    result.add substitution
+    pos = range.`end` + 1
+  result.add sliceOf(translation, pos, translation.len)
+
+# --- from text/mod.rs, see the header ------------------------------------------------------------
+
+proc osc8Link(url, text: string): string =
+  "\x1B]8;;" & url & "\x1B\\" & text & "\x1B]8;;\x1B\\"
+
+proc translateKey(c: TextContent): string =
+  if c.bedrockTranslate.isSome: c.bedrockTranslate.get() else: c.translate
+
+proc toPrettyConsole*(self: TextComponentBase): string =
+  ## A human-readable string for console output.
+  var text =
+    case self.content.kind
+    of tcText: self.content.text
+    of tcTranslate: translationToPretty("minecraft:" & translateKey(self.content), lcEnUs, self.content.translateWith)
+    of tcEntityNames: self.content.selector
+    of tcKeybind: self.content.keybind
+    of tcCustom: translationToPretty(self.content.key, lcEnUs, self.content.customWith)
+  let style = self.style
+  if style.color.isSome:
+    text = consoleColor(style.color.get(), text)
+  if style.bold.isSome:
+    text = coloredString(text, "1")
+  if style.italic.isSome:
+    text = coloredString(text, "3")
+  if style.underlined.isSome:
+    text = coloredString(text, "4")
+  if style.strikethrough.isSome:
+    text = coloredString(text, "9")
+  if style.clickEvent.isSome:
+    let click = style.clickEvent.get()
+    if click.kind == ceOpenUrl:
+      text = osc8Link(click.url, text)
+    elif click.kind == ceOpenFile:
+      text = osc8Link("file://" & click.path, text)
+  for child in self.extra:
+    text.add toPrettyConsole(child)
+  text
+
+proc getText*(self: TextComponentBase, locale: Locale): string =
+  ## The raw text of this component and its children for `locale`.
+  var text =
+    case self.content.kind
+    of tcText: self.content.text
+    of tcTranslate: getTranslationText("minecraft:" & translateKey(self.content), locale, self.content.translateWith)
+    of tcEntityNames: self.content.selector
+    of tcKeybind: self.content.keybind
+    of tcCustom: getTranslationText(self.content.key, locale, self.content.customWith)
+  for child in self.extra:
+    text.add getText(child, locale)
+  text

@@ -1,0 +1,414 @@
+## Known-answer checks for deserializer.aowl and serializer.aowl (no upstream tests of their own beyond
+## lib.rs) and for reading and skipping in tag.aowl: CESU-8 per the cesu8 crate, Bedrock varints, EOF
+## behaviour, length checks, list handling and the depth limit.
+
+import std/[syncio, options]
+import tag, nbtbase, nbtdoc, serializer, deserializer
+
+var failures = 0
+
+proc chk(cond: bool, what: string) =
+  if not cond:
+    echo "FAILED: " & what
+    inc failures
+
+proc cesu8Encode() =
+  chk(toJavaCesu8("minecraft:stone") == cast[seq[byte]](@[0x6D'u8, 0x69, 0x6E, 0x65, 0x63, 0x72, 0x61, 0x66,
+    0x74, 0x3A, 0x73, 0x74, 0x6F, 0x6E, 0x65]), "ascii unchanged")
+  chk(toJavaCesu8("\0") == @[0xC0'u8, 0x80], "NUL")
+  chk(toJavaCesu8("a\0b") == @[0x61'u8, 0xC0, 0x80, 0x62], "embedded NUL")
+  chk(toJavaCesu8("\xC3\xA9") == @[0xC3'u8, 0xA9], "2-byte unchanged")
+  chk(toJavaCesu8("\xE4\xB8\xAD") == @[0xE4'u8, 0xB8, 0xAD], "3-byte unchanged")
+  chk(toJavaCesu8("\xF0\x90\x90\x81") == @[0xED'u8, 0xA0, 0x81, 0xED, 0xB0, 0x81], "U+10401 surrogates")
+  chk(toJavaCesu8("\xF0\x9F\x98\x80") == @[0xED'u8, 0xA0, 0xBD, 0xED, 0xB8, 0x80], "U+1F600 surrogates")
+  chk(toJavaCesu8("\xF4\x8F\xBF\xBF") == @[0xED'u8, 0xAF, 0xBF, 0xED, 0xBF, 0xBF], "U+10FFFF surrogates")
+  chk(toJavaCesu8("\xF0\x90\x80\x80") == @[0xED'u8, 0xA0, 0x80, 0xED, 0xB0, 0x80], "U+10000 surrogates")
+
+proc decodesTo(b: seq[byte], expected: string, what: string) =
+  let r = fromJavaCesu8(b)
+  chk(r.isOk and r.value == expected, what)
+
+proc rejected(b: seq[byte], what: string) =
+  let r = fromJavaCesu8(b)
+  chk(not r.isOk and r.error.kind == nekCesu8Decoding and r.error.msg == "Failed to Cesu 8 Decode", what)
+
+proc cesu8Decode() =
+  decodesTo(newSeq[byte](0), "", "empty")
+  decodesTo(@[0x61'u8, 0x62], "ab", "ascii")
+  decodesTo(@[0xC0'u8, 0x80], "\0", "C0 80 is NUL")
+  decodesTo(@[0x61'u8, 0xC0, 0x80, 0x62], "a\0b", "embedded C0 80")
+  decodesTo(@[0xED'u8, 0xA0, 0x81, 0xED, 0xB0, 0x81], "\xF0\x90\x90\x81", "surrogate pair U+10401")
+  decodesTo(@[0xED'u8, 0xA0, 0xBD, 0xED, 0xB8, 0x80], "\xF0\x9F\x98\x80", "surrogate pair U+1F600")
+  decodesTo(@[0xED'u8, 0xAF, 0xBF, 0xED, 0xBF, 0xBF], "\xF4\x8F\xBF\xBF", "surrogate pair U+10FFFF")
+  decodesTo(@[0xC3'u8, 0xA9, 0xC0, 0x80, 0xE4, 0xB8, 0xAD], "\xC3\xA9\0\xE4\xB8\xAD", "2 and 3 byte around C0 80")
+  # from_utf8 runs first, so all of this is accepted as it stands.
+  decodesTo(@[0x00'u8], "\0", "raw NUL is valid UTF-8")
+  decodesTo(@[0xF0'u8, 0x90, 0x90, 0x81], "\xF0\x90\x90\x81", "raw 4-byte is valid UTF-8")
+  # Not UTF-8 and not valid CESU-8.
+  rejected(@[0x00'u8, 0xC0, 0x80], "raw NUL next to C0 80")
+  rejected(@[0xF0'u8, 0x90, 0x90, 0x81, 0xC0, 0x80], "4-byte next to C0 80")
+  rejected(@[0xFF'u8], "FF")
+  rejected(@[0x80'u8], "lone continuation")
+  rejected(@[0xC0'u8], "C0 at end")
+  rejected(@[0xC0'u8, 0x81], "C0 81 overlong")
+  rejected(@[0xC1'u8, 0xBF], "C1 overlong")
+  rejected(@[0xE0'u8, 0x80, 0x80], "E0 overlong")
+  rejected(@[0xC3'u8], "truncated 2-byte")
+  rejected(@[0xC3'u8, 0x41], "bad continuation")
+  rejected(@[0xE4'u8, 0xB8], "truncated 3-byte")
+  rejected(@[0xED'u8, 0xA0, 0x81], "lone high surrogate")
+  rejected(@[0xED'u8, 0xB0, 0x81], "lone low surrogate")
+  rejected(@[0xED'u8, 0xA0, 0x81, 0x41, 0xB0, 0x81], "high surrogate then not ED")
+  rejected(@[0xED'u8, 0xA0, 0x81, 0xED, 0x80, 0x80], "high surrogate then not a low one")
+  rejected(@[0xED'u8, 0xA0, 0x81, 0xED, 0xB0], "truncated pair")
+
+proc utf8Validity() =
+  chk(isValidUtf8(@[0x00'u8, 0x7F]), "ascii")
+  chk(isValidUtf8(@[0xC2'u8, 0x80]), "C2 80")
+  chk(not isValidUtf8(@[0xC1'u8, 0xBF]), "C1 BF")
+  chk(not isValidUtf8(@[0xE0'u8, 0x9F, 0xBF]), "E0 9F BF overlong")
+  chk(isValidUtf8(@[0xE0'u8, 0xA0, 0x80]), "E0 A0 80")
+  chk(not isValidUtf8(@[0xED'u8, 0xA0, 0x80]), "surrogate")
+  chk(isValidUtf8(@[0xED'u8, 0x9F, 0xBF]), "U+D7FF")
+  chk(not isValidUtf8(@[0xF0'u8, 0x8F, 0xBF, 0xBF]), "F0 overlong")
+  chk(isValidUtf8(@[0xF4'u8, 0x8F, 0xBF, 0xBF]), "U+10FFFF")
+  chk(not isValidUtf8(@[0xF4'u8, 0x90, 0x80, 0x80]), "above U+10FFFF")
+  chk(not isValidUtf8(@[0xF5'u8, 0x80, 0x80, 0x80]), "F5")
+
+proc reader(mode: NbtReadMode, b: seq[byte]): NbtReader =
+  newNbtReader(mode, b)
+
+proc primitivesJava() =
+  var r = reader(nrmJava, @[0xFE'u8, 0xFF, 0x01, 0x02, 0xFF, 0xFF, 0xFF, 0xFE, 0x80, 0, 0, 0, 0, 0, 0, 0,
+    0x3F, 0x80, 0, 0, 0xBF, 0xF0, 0, 0, 0, 0, 0, 0])
+  chk(getU8(r).value == 0xFE'u8, "get_u8")
+  chk(getI8(r).value == -1'i8, "get_i8")
+  chk(getI16(r).value == 0x0102'i16, "get_i16 big endian")
+  chk(getI32(r).value == -2'i32, "get_i32 big endian")
+  chk(getI64(r).value == int64.low, "get_i64 big endian")
+  chk(getF32(r).value == 1.0'f32, "get_f32 big endian")
+  chk(getF64(r).value == -1.0, "get_f64 big endian")
+  chk(not getU8(r).isOk, "exhausted")
+
+proc primitivesBedrock() =
+  var r = reader(nrmBedrock, @[0x02'u8, 0x01, 0xBD, 0x1C, 0xF6, 0x01, 0x02,
+    0, 0, 0x80, 0x3F, 0, 0, 0, 0, 0, 0, 0xF0, 0xBF])
+  chk(getI16(r).value == 0x0102'i16, "get_i16 little endian")
+  chk(getI32(r).value == -1823'i32, "zigzag -1823")
+  chk(getI32(r).value == 123'i32, "zigzag 123")
+  chk(getI64(r).value == 1'i64, "zigzag long 1")
+  chk(getF32(r).value == 1.0'f32, "get_f32 little endian")
+  chk(getF64(r).value == -1.0, "get_f64 little endian")
+  var mn = reader(nrmBedrock, @[0xFF'u8, 0xFF, 0xFF, 0xFF, 0x0F])
+  chk(getI32(mn).value == int32.low, "i32::MIN")
+  var mx = reader(nrmBedrock, @[0xFE'u8, 0xFF, 0xFF, 0xFF, 0x0F])
+  chk(getI32(mx).value == int32.high, "i32::MAX")
+  var ln = reader(nrmBedrock, @[0xFF'u8, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x01])
+  chk(getI64(ln).value == int64.low, "i64::MIN")
+  var over = reader(nrmBedrock, @[0x80'u8, 0x80, 0x80, 0x80, 0x80, 0x01])
+  let e = getI32(over)
+  chk(not e.isOk and e.error.kind == nekVarIntTooLarge and e.error.msg == "Failed to decode varint - value too large", "VarIntTooLarge")
+  chk(over.pos == 5, "VarIntTooLarge after five bytes")
+  var overL = reader(nrmBedrock, @[0x80'u8, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x01])
+  let eL = getI64(overL)
+  chk(not eL.isOk and eL.error.kind == nekVarLongTooLarge and eL.error.msg == "Failed to decode varlong - value too large", "VarLongTooLarge")
+  var strR = reader(nrmBedrock, @[0x03'u8, 0x61, 0xC0, 0x80])
+  chk(getString(strR).value == "a\0", "Bedrock strings decode CESU-8 too")
+
+proc writerBytes() =
+  var w = newNbtWriter(nwmJava)
+  w.writeU8(0xFE'u8)
+  w.writeI8(-1'i8)
+  w.writeI16(0x0102'i16)
+  w.writeI32(-2'i32)
+  w.writeI64(1'i64)
+  w.writeF32(1.0'f32)
+  w.writeF64(-1.0)
+  chk(w.buf == @[0xFE'u8, 0xFF, 1, 2, 0xFF, 0xFF, 0xFF, 0xFE, 0, 0, 0, 0, 0, 0, 0, 1,
+    0x3F, 0x80, 0, 0, 0xBF, 0xF0, 0, 0, 0, 0, 0, 0], "Java writer")
+  var b = newNbtWriter(nwmBedrock)
+  b.writeI16(0x0102'i16)
+  b.writeI32(-1823'i32)
+  b.writeI32(123'i32)
+  b.writeI64(1'i64)
+  b.writeF32(1.0'f32)
+  b.writeF64(-1.0)
+  chk(b.buf == @[2'u8, 1, 0xBD, 0x1C, 0xF6, 0x01, 0x02, 0, 0, 0x80, 0x3F, 0, 0, 0, 0, 0, 0, 0xF0, 0xBF], "Bedrock writer")
+  var mn = newNbtWriter(nwmBedrock)
+  mn.writeI32(int32.low)
+  chk(mn.buf == @[0xFF'u8, 0xFF, 0xFF, 0xFF, 0x0F], "write i32::MIN")
+  var mnL = newNbtWriter(nwmBedrock)
+  mnL.writeI64(int64.low)
+  chk(mnL.buf == @[0xFF'u8, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x01], "write i64::MIN")
+  var neg = newNbtWriter(nwmBedrock)
+  neg.writeI64(-1'i64)
+  chk(neg.buf == @[0x01'u8], "write -1L")
+
+proc writerStrings() =
+  var j = newNbtWriter(nwmJava)
+  chk(j.writeString("\xF0\x90\x90\x81").isOk, "write cesu string")
+  chk(j.buf == @[0'u8, 6, 0xED, 0xA0, 0x81, 0xED, 0xB0, 0x81], "Java string is CESU-8, length in encoded bytes")
+  var b = newNbtWriter(nwmBedrock)
+  chk(b.writeString("\xF0\x90\x90\x81\0").isOk, "write utf8 string")
+  chk(b.buf == @[5'u8, 0xF0, 0x90, 0x90, 0x81, 0x00], "Bedrock string is plain UTF-8")
+  var maxOk = newString(65535)
+  for i in 0 ..< maxOk.len: maxOk[i] = 'x'
+  var j2 = newNbtWriter(nwmJava)
+  chk(j2.writeString(maxOk).isOk and j2.buf.len == 65537, "65535 bytes fit")
+  var j3 = newNbtWriter(nwmJava)
+  let e = j3.writeString(maxOk & "x")
+  chk(not e.isOk and e.error.kind == nekLargeLength and e.error.msg == "Length too large: 65536", "LargeLength string")
+  var nulls = newString(40000)
+  for i in 0 ..< nulls.len: nulls[i] = char(0)
+  var j4 = newNbtWriter(nwmJava)
+  let e4 = j4.writeString(nulls)
+  chk(not e4.isOk and e4.error.msg == "Length too large: 80000", "the limit applies to the encoded length")
+
+proc eofErrors() =
+  var r = reader(nrmJava, newSeq[byte](0))
+  let e = getU8(r)
+  chk(not e.isOk and e.error.kind == nekIncomplete and e.error.unexpectedEof and
+    e.error.msg == "NBT reading was cut short: failed to fill whole buffer", "get_u8 at EOF")
+  var r2 = reader(nrmJava, @[0x00'u8, 0x05, 0x61])
+  let e2 = getString(r2)
+  chk(not e2.isOk and e2.error.kind == nekIncomplete and e2.error.msg == "NBT reading was cut short: unexpected EOF", "string EOF")
+  var r3 = reader(nrmJava, @[0x00'u8, 0x00, 0x00])
+  chk(not getI32(r3).isOk, "short i32")
+  var r4 = reader(nrmJava, @[1'u8])
+  let e4 = getByteArray(r4, 2)
+  chk(not e4.isOk and e4.error.msg == "NBT reading was cut short: unexpected EOF", "byte array EOF")
+  chk(getByteArray(r4, 1).value == @[1'i8], "byte array")
+
+proc dataSource() =
+  var r = reader(nrmJava, @[1'u8, 2, 3, 4, 5, 0xC0, 0x80])
+  var buf = default(array[2, byte])
+  chk(readBytes(r, buf).isOk and buf[0] == 1'u8 and buf[1] == 2'u8, "read_bytes")
+  chk(readU8(r).value == 3'u8, "read_u8")
+  chk(seekRelative(r, 2'i64).isOk and r.pos == 5, "seek_relative")
+  chk(readString(r, 2).value == "\0", "read_string decodes")
+  chk(seekRelative(r, -7'i64).isOk and r.pos == 0, "seek back")
+  chk(not seekRelative(r, -1'i64).isOk, "seek before the start fails")
+  chk(readByteArray(r, 2).value == @[1'i8, 2'i8], "read_byte_array")
+  chk(getI32Array(r, 1).value == @[0x030405C0'i32], "get_i32_array")
+
+proc compoundEof() =
+  # NbtCompound::deserialize_content: EOF where a tag id belongs ends the compound.
+  var a = reader(nrmJava, @[0x0A'u8, 0x00, 0x00])
+  let ra = read(a)
+  chk(ra.isOk and ra.value.rootTag.len == 0, "no end tag at all")
+  var b = reader(nrmJava, @[0x0A'u8, 0x00, 0x00, 0x03, 0x00, 0x01, 0x61, 0, 0, 0, 7])
+  let rb = read(b)
+  chk(rb.isOk and rb.value.rootTag.getInt("a") == some(7'i32), "missing end tag after an entry")
+  # Anywhere else EOF is an error.
+  var c = reader(nrmJava, @[0x0A'u8, 0x00, 0x00, 0x03, 0x00])
+  let rc = read(c)
+  chk(not rc.isOk and rc.error.kind == nekIncomplete, "EOF in a name")
+  var d = reader(nrmJava, @[0x0A'u8, 0x00, 0x00, 0x03, 0x00, 0x01, 0x61, 0, 0])
+  let rd = read(d)
+  chk(not rd.isOk and rd.error.kind == nekIncomplete, "EOF in a value")
+  var e = reader(nrmJava, @[0x0A'u8])
+  let re = read(e)
+  chk(not re.isOk and re.error.kind == nekIncomplete, "EOF in the root name")
+  var f = reader(nrmJava, @[0x0A'u8, 0x00, 0x00, 0x09, 0x00, 0x01, 0x61, 0x0A, 0, 0, 0, 2, 0x00])
+  let rf = read(f)
+  chk(rf.isOk and rf.value.rootTag.getList("a").unsafeGet.len == 2, "EOF ends a compound list element too")
+
+proc duplicatesAndOrder() =
+  var r = reader(nrmJava, @[0x0A'u8, 0, 0,
+    0x01, 0, 1, 0x62, 1,
+    0x01, 0, 1, 0x61, 2,
+    0x01, 0, 1, 0x62, 3,
+    0])
+  let v = read(r)
+  chk(v.isOk and v.value.rootTag.getByte("b") == some(3'i8), "read duplicates: last wins")
+  chk(v.value.rootTag.names == @["b", "a"], "read keeps first position")
+  # Same behaviour in a compound big enough for the index.
+  var big = @[0x0A'u8, 0, 0]
+  for i in 0 ..< 300:
+    big.add 0x01'u8
+    big.add 0'u8
+    big.add 2'u8
+    big.add byte(0x41 + i div 26)
+    big.add byte(0x41 + i mod 26)
+    big.add byte(i mod 100)
+  big.add 0x01'u8
+  big.add 0'u8
+  big.add 2'u8
+  big.add 0x41'u8
+  big.add 0x41'u8
+  big.add 99'u8
+  big.add 0'u8
+  var rb = reader(nrmJava, big)
+  let vb = read(rb)
+  chk(vb.isOk and vb.value.rootTag.len == 300 and vb.value.rootTag.getByte("AA") == some(99'i8), "large duplicates: last wins")
+  chk(vb.value.rootTag.names[0] == "AA", "large order")
+
+proc lengthChecks() =
+  var a = reader(nrmJava, @[0xFF'u8, 0xFF, 0xFF, 0xFF])
+  let ea = deserializeData(a, ByteArrayId)
+  chk(not ea.isOk and ea.error.kind == nekNegativeLength and ea.error.msg == "Negative list length: -1", "NegativeLength byte array")
+  var b = reader(nrmJava, @[0x00'u8, 0x1E, 0x84, 0x81])
+  let eb = deserializeData(b, ByteArrayId)
+  chk(not eb.isOk and eb.error.kind == nekLargeLength and eb.error.msg == "Length too large: 2000001", "LargeLength byte array")
+  var b2 = reader(nrmJava, @[0x00'u8, 0x1E, 0x84, 0x80])
+  let eb2 = deserializeData(b2, ByteArrayId)
+  chk(not eb2.isOk and eb2.error.kind == nekIncomplete, "2000000 passes the check")
+  for id in [IntArrayId, LongArrayId]:
+    var n = reader(nrmJava, @[0xFF'u8, 0xFF, 0xFF, 0xFE])
+    let en = deserializeData(n, id)
+    chk(not en.isOk and en.error.msg == "Negative list length: -2", "NegativeLength array")
+    var l = reader(nrmJava, @[0x00'u8, 0x1E, 0x84, 0x81])
+    let el = deserializeData(l, id)
+    chk(not el.isOk and el.error.msg == "Length too large: 2000001", "LargeLength array")
+  var l1 = reader(nrmJava, @[0x03'u8, 0xFF, 0xFF, 0xFF, 0xFF])
+  let e1 = deserializeData(l1, ListId)
+  chk(not e1.isOk and e1.error.kind == nekNegativeLength, "NegativeLength list")
+  var l2 = reader(nrmJava, @[0x03'u8, 0x00, 0x1E, 0x84, 0x81])
+  let e2 = deserializeData(l2, ListId)
+  chk(not e2.isOk and e2.error.kind == nekLargeLength, "LargeLength list")
+  var u = reader(nrmJava, newSeq[byte](0))
+  let eu = deserializeData(u, 13'u8)
+  chk(not eu.isOk and eu.error.kind == nekUnknownTagId and eu.error.msg == "Encountered an unknown NBT tag id: 13.", "UnknownTagId")
+  var bd = reader(nrmBedrock, @[0x01'u8])
+  let ebd = deserializeData(bd, ByteArrayId)
+  chk(not ebd.isOk and ebd.error.msg == "Negative list length: -1", "Bedrock lengths are zigzag")
+
+proc listElements() =
+  # The pinned tree has no check on an END-typed list: it yields that many End tags.
+  var a = reader(nrmJava, @[0x00'u8, 0, 0, 0, 2])
+  let ra = deserializeData(a, ListId)
+  chk(ra.isOk and ra.value.listVal.len == 2 and ra.value.listVal[0].kind == ntkEnd, "END list with a length")
+  var b = reader(nrmJava, @[0x00'u8, 0, 0, 0, 0])
+  let rb = deserializeData(b, ListId)
+  chk(rb.isOk and rb.value.listVal.len == 0, "empty END list")
+  # flatten: {"": 5} becomes 5, a nested wrapper loses one level, a plain compound stays.
+  var c = reader(nrmJava, @[0x0A'u8, 0, 0, 0, 3,
+    0x03, 0, 0, 0, 0, 0, 5, 0,
+    0x0A, 0, 0, 0x03, 0, 0, 0, 0, 0, 6, 0, 0,
+    0x03, 0, 1, 0x61, 0, 0, 0, 7, 0])
+  let rc = deserializeData(c, ListId)
+  chk(rc.isOk, "wrapped list reads")
+  let l = rc.value.listVal
+  chk(l[0] == NbtTag(kind: ntkInt, intVal: 5'i32), "wrapper flattened")
+  chk(l[1].kind == ntkCompound and l[1].compoundVal.getInt("") == some(6'i32), "double wrapper loses one level")
+  chk(l[2].kind == ntkCompound and l[2].compoundVal.getInt("a") == some(7'i32), "plain compound kept")
+  # The element id is only trusted to pick the reader; an unknown one fails.
+  var d = reader(nrmJava, @[0x63'u8, 0, 0, 0, 1])
+  let rd = deserializeData(d, ListId)
+  chk(not rd.isOk and rd.error.msg == "Encountered an unknown NBT tag id: 99.", "unknown element id")
+  var e = reader(nrmJava, @[0x63'u8, 0, 0, 0, 0])
+  chk(deserializeData(e, ListId).isOk, "unknown element id with no elements")
+
+proc skipping() =
+  var a = reader(nrmJava, @[0'u8, 2, 0x61, 0x62, 9])
+  chk(skipString(a).isOk and a.pos == 4, "skip_string")
+  var bad = reader(nrmJava, @[0'u8, 1, 0xFF, 9])
+  chk(skipString(bad).isOk and bad.pos == 3, "skip_string does not decode")
+  # A seek past the end succeeds; the next read is what fails.
+  var b = reader(nrmJava, @[0'u8, 0, 0, 100, 1, 2])
+  chk(skipData(b, ByteArrayId).isOk and b.pos == 104, "skip past the end")
+  chk(not getU8(b).isOk, "read after skipping past the end")
+  var c = reader(nrmJava, @[1'u8])
+  chk(skipData(c, DoubleId).isOk, "skip f64 past the end")
+  var d = reader(nrmJava, @[0xFF'u8, 0xFF, 0xFF, 0xFF])
+  let ed = skipData(d, ByteArrayId)
+  chk(not ed.isOk and ed.error.kind == nekNegativeLength, "skip negative byte array")
+  var e = reader(nrmJava, @[0x00'u8, 0x1E, 0x84, 0x81])
+  chk(skipData(e, ByteArrayId).isOk, "skip has no MAX_ARRAY_LENGTH")
+  var f = reader(nrmJava, @[0x03'u8, 0, 0, 0, 2, 0, 0, 0, 1, 0, 0, 0, 2])
+  chk(skipData(f, ListId).isOk and f.pos == 13, "skip list")
+  var g = reader(nrmJava, @[0'u8, 0, 0, 2, 0, 0, 0, 1, 0, 0, 0, 2])
+  chk(skipData(g, IntArrayId).isOk and g.pos == 12, "skip int array")
+  var h = reader(nrmJava, @[0'u8, 0, 0, 1, 1, 2, 3, 4, 5, 6, 7, 8])
+  chk(skipData(h, LongArrayId).isOk and h.pos == 12, "skip long array")
+  var i = reader(nrmJava, newSeq[byte](0))
+  let ei = skipData(i, 99'u8)
+  chk(not ei.isOk and ei.error.kind == nekUnknownTagId, "skip unknown id")
+  var j = reader(nrmJava, @[0x03'u8, 0, 1, 0x61, 0, 0, 0, 1, 0x01, 0, 1, 0x62, 2, 0, 0xEE])
+  chk(skipContent(j).isOk and j.pos == 14, "skip_content stops at the end tag")
+  var k = reader(nrmJava, @[0x03'u8, 0, 1, 0x61, 0, 0, 0, 1])
+  chk(skipContent(k).isOk, "skip_content at EOF")
+  var m = reader(nrmJava, @[0x03'u8, 0])
+  chk(not skipContent(m).isOk, "skip_content EOF in a name")
+  # Bedrock ints are varints: see the note in deserializer.aowl.
+  var n = reader(nrmBedrock, @[0xBD'u8, 0x1C, 0x77])
+  chk(skipData(n, IntId).isOk and n.pos == 2, "Bedrock skip int")
+  var o = reader(nrmBedrock, @[0x04'u8, 0xF6, 0x01, 0xF6, 0x01, 0x77])
+  chk(skipData(o, LongArrayId).isOk and o.pos == 5, "Bedrock skip long array")
+  var p = reader(nrmBedrock, @[0x03'u8, 0x61, 0x62, 0x63, 0x77])
+  chk(skipString(p).isOk and p.pos == 4, "Bedrock skip string")
+
+proc nestedLists(levels: int): seq[byte] =
+  ## `levels` lists, each holding the next; the innermost is an empty list of END.
+  result = newSeq[byte](0)
+  for i in 0 ..< levels - 1:
+    result.add ListId
+    result.add 0'u8
+    result.add 0'u8
+    result.add 0'u8
+    result.add 1'u8
+  result.add EndId
+  result.add 0'u8
+  result.add 0'u8
+  result.add 0'u8
+  result.add 0'u8
+
+proc nestedCompounds(levels: int): seq[byte] =
+  ## Content of `levels` compounds, each holding the next under the key "".
+  result = newSeq[byte](0)
+  for i in 0 ..< levels - 1:
+    result.add CompoundId
+    result.add 0'u8
+    result.add 0'u8
+  for i in 0 ..< levels:
+    result.add EndId
+
+proc depthLimit() =
+  # Lists: the outermost tag reads at depth 0 and each element one deeper, so 513 lists reach 512.
+  var a = reader(nrmJava, nestedLists(513))
+  chk(deserializeData(a, ListId).isOk, "513 nested lists read")
+  var b = reader(nrmJava, nestedLists(514))
+  let eb = deserializeData(b, ListId)
+  chk(not eb.isOk and eb.error.kind == nekMaxDepthExceeded and eb.error.msg == "NBT depth exceeded maximum allowed limit", "514 nested lists fail")
+  var s1 = reader(nrmJava, nestedLists(513))
+  chk(skipData(s1, ListId).isOk, "skip 513 nested lists")
+  var s2 = reader(nrmJava, nestedLists(514))
+  let es = skipData(s2, ListId)
+  chk(not es.isOk and es.error.kind == nekMaxDepthExceeded, "skip 514 nested lists fails")
+  # Compounds: content 0, its value tag 1, that tag's content 2, ... each compound costs two.
+  var c = reader(nrmJava, nestedCompounds(257))
+  chk(deserializeContent(c).isOk, "257 nested compounds read")
+  var d = reader(nrmJava, nestedCompounds(258))
+  let ed = deserializeContent(d)
+  chk(not ed.isOk and ed.error.kind == nekMaxDepthExceeded, "258 nested compounds fail")
+  var e = reader(nrmJava, nestedCompounds(257))
+  chk(skipContent(e).isOk, "skip 257 nested compounds")
+  var f = reader(nrmJava, nestedCompounds(258))
+  chk(not skipContent(f).isOk, "skip 258 nested compounds fails")
+  # Far beyond the limit must fail cleanly, not overflow the stack.
+  var g = reader(nrmJava, nestedLists(200_000))
+  chk(not deserializeData(g, ListId).isOk, "200000 nested lists fail")
+  # The depth arguments exist for callers.
+  var h = reader(nrmJava, @[0'u8])
+  chk(not deserializeContentDepth(h, 513).isOk, "deserialize_content_depth over the limit")
+
+cesu8Encode()
+cesu8Decode()
+utf8Validity()
+primitivesJava()
+primitivesBedrock()
+writerBytes()
+writerStrings()
+eofErrors()
+dataSource()
+compoundEof()
+duplicatesAndOrder()
+lengthChecks()
+listElements()
+skipping()
+depthLimit()
+
+if failures > 0:
+  echo $failures & " reader checks FAILED"
+  quit(1)
+echo "reader checks: OK"

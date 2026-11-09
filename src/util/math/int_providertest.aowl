@@ -1,0 +1,267 @@
+## Known-answer tests for int_provider.aowl: upstream's vectors with a fixed seed, plus a scripted generator
+## that fixes each call's arguments and order, plus the exact serde shapes.
+import std/[assertions, syncio]
+import int_provider
+import serdeforms
+import ../random/random
+import ../xoroshiro128
+import ../../codecs/json_value
+
+type
+  Scripted = object
+    ## Hands out queued answers and records each bound it was asked for.
+    bounded: seq[int32]
+    gaussians: seq[float64]
+    triangulars: seq[float64]
+    calls: seq[string]
+
+proc nextBoundedI32(r: var Scripted, bound: int32): int32 =
+  r.calls.add "b" & $bound
+  result = r.bounded[0]
+  r.bounded.delete(0)
+
+proc nextInbetweenI32(r: var Scripted, lo, hi: int32): int32 =
+  r.calls.add "i" & $lo & "," & $hi
+  result = r.bounded[0]
+  r.bounded.delete(0)
+
+proc nextGaussian(r: var Scripted): float64 =
+  r.calls.add "g"
+  result = r.gaussians[0]
+  r.gaussians.delete(0)
+
+proc nextTriangular(r: var Scripted, mode, deviation: float64): float64 =
+  r.calls.add "t" & $mode & "," & $deviation
+  result = r.triangulars[0]
+  r.triangulars.delete(0)
+
+proc scripted(): Scripted =
+  Scripted(bounded: @[], gaussians: @[], triangulars: @[], calls: @[])
+
+proc parse(text: string): JsonValue =
+  let r = parseJsonValue(text)
+  assert r.ok
+  r.value
+
+proc seeded(): RandomGenerator =
+  toRandomGenerator(fromSeed(12345'u64))
+
+proc testConstant() =
+  var random = seeded()
+  let provider = newConstantIntProvider(42)
+  assert getMin(provider) == 42
+  assert getMax(provider) == 42
+  assert get(provider, random) == 42
+  assert get(provider, random) == 42
+
+proc testUniform() =
+  var random = seeded()
+  let provider = newUniformIntProvider(1, 10)
+  assert getMin(provider) == 1
+  assert getMax(provider) == 10
+  for _ in 0 ..< 100:
+    let value = get(provider, random)
+    assert value >= 1 and value <= 10
+  var s = scripted()
+  s.bounded = @[7'i32]
+  assert get(provider, s) == 7
+  assert s.calls == @["i1,10"]
+
+proc testBiased() =
+  var random = seeded()
+  let provider = newBiasedToBottomIntProvider(1, 20)
+  assert getMin(provider) == 1
+  assert getMax(provider) == 20
+  for _ in 0 ..< 100:
+    let value = get(provider, random)
+    assert value >= 1 and value <= 20
+  # next_triangular(0, 20): abs, truncate, cap at max - min.
+  var s = scripted()
+  s.triangulars = @[-3.7'f64, 19.9'f64, 25.0'f64]
+  assert get(provider, s) == 4
+  assert get(provider, s) == 20
+  assert get(provider, s) == 20
+  assert s.calls[0] == "t0.0,20.0"
+
+proc testClampedNormal() =
+  var random = seeded()
+  let provider = newClampedNormalIntProvider(5.0'f32, 2.0'f32, 1, 10)
+  assert getMin(provider) == 1
+  assert getMax(provider) == 10
+  for _ in 0 ..< 100:
+    let value = get(provider, random)
+    assert value >= 1 and value <= 10
+  var s = scripted()
+  # 0.25 * 2 + 5 = 5.5 rounds away from zero to 6; -0.25 * 2 + 5 = 4.5 rounds to 5; then the clamps.
+  s.gaussians = @[0.25'f64, -0.25'f64, 100.0'f64, -100.0'f64]
+  assert get(provider, s) == 6
+  assert get(provider, s) == 5
+  assert get(provider, s) == 10
+  assert get(provider, s) == 1
+  # A negative midpoint rounds away from zero too.
+  var n = scripted()
+  n.gaussians = @[-1.25'f64]
+  assert get(newClampedNormalIntProvider(0.0'f32, 2.0'f32, -10, 10), n) == -3
+
+proc testClamped() =
+  var random = seeded()
+  let source = intProvider(normal(newUniformIntProvider(1, 100)))
+  let provider = newClampedIntProvider(source, 5, 15)
+  assert getMin(provider) == 5
+  assert getMax(provider) == 15
+  for _ in 0 ..< 100:
+    let value = get(provider, random)
+    assert value >= 5 and value <= 15
+  # Bounds come from the tighter side.
+  let inner = newClampedIntProvider(intProvider(normal(newUniformIntProvider(8, 12))), 5, 15)
+  assert getMin(inner) == 8 and getMax(inner) == 12
+
+proc testTrapezoid() =
+  let provider = newTrapezoidIntProvider(0, 10, 4)
+  assert getMin(provider) == 0 and getMax(provider) == 10
+  # range 10, plateau 4: start (10-4)/2 = 3, end 7. Bounds 8 then 4.
+  var a = scripted()
+  a.bounded = @[5'i32, 2'i32]
+  assert get(provider, a) == 7
+  assert a.calls == @["b8", "b4"]
+  # Plateau 0 and a symmetric range: difference of two draws, bound max + 1.
+  var b = scripted()
+  b.bounded = @[1'i32, 4'i32]
+  assert get(newTrapezoidIntProvider(-5, 5, 0), b) == -3
+  assert b.calls == @["b6", "b6"]
+  # Plateau equal to the range: uniform.
+  var c = scripted()
+  c.bounded = @[3'i32]
+  assert get(newTrapezoidIntProvider(2, 6, 4), c) == 5
+  assert c.calls == @["b5"]
+  # Odd remainder: (5-2)/2 truncates to 1, so end is 4.
+  var d = scripted()
+  d.bounded = @[0'i32, 0'i32]
+  assert get(newTrapezoidIntProvider(1, 6, 2), d) == 1
+  assert d.calls == @["b5", "b2"]
+
+proc weightedEntries(): seq[WeightedEntry] =
+  @[WeightedEntry(data: intProvider(1'i32), weight: 10),
+    WeightedEntry(data: intProvider(2'i32), weight: 20),
+    WeightedEntry(data: intProvider(3'i32), weight: 5)]
+
+proc testWeightedList() =
+  var random = seeded()
+  let provider = newWeightedListIntProvider(weightedEntries())
+  assert getMin(provider) == 1
+  assert getMax(provider) == 3
+  for _ in 0 ..< 100:
+    let value = get(provider, random)
+    assert value >= 1 and value <= 3
+  var s = scripted()
+  s.bounded = @[0'i32, 9'i32, 10'i32, 29'i32, 30'i32, 34'i32]
+  assert get(provider, s) == 1
+  assert get(provider, s) == 1
+  assert get(provider, s) == 2
+  assert get(provider, s) == 2
+  assert get(provider, s) == 3
+  assert get(provider, s) == 3
+  assert s.calls[0] == "b35"
+  let empty = newWeightedListIntProvider(@[])
+  assert getMin(empty) == 0 and getMax(empty) == 0
+  assert get(empty, s) == 0
+  let zero = newWeightedListIntProvider(@[WeightedEntry(data: intProvider(9'i32), weight: 0)])
+  assert get(zero, s) == 0
+
+proc testEnum() =
+  var random = seeded()
+  let c = intProvider(25'i32)
+  assert getMin(c) == 25 and getMax(c) == 25 and get(c, random) == 25
+  let o = intProvider(normal(newUniformIntProvider(5, 15)))
+  assert getMin(o) == 5 and getMax(o) == 15
+  let value = get(o, random)
+  assert value >= 5 and value <= 15
+
+proc testFromJson() =
+  let bare = fromJson(IntProvider, parse("7"))
+  assert bare.ok and bare.value.kind == ipConstant and bare.value.value == 7
+
+  let constant = fromJson(IntProvider, parse("{\"type\":\"minecraft:constant\",\"value\":3}"))
+  assert constant.ok and constant.value.kind == ipObject and constant.value.obj.kind == nipConstant
+  assert constant.value.obj.constant.value == 3
+
+  let uniform = fromJson(IntProvider, parse("{\"type\":\"minecraft:uniform\",\"min_inclusive\":1,\"max_inclusive\":4,\"ignored\":[]}"))
+  assert uniform.ok and uniform.value.obj.kind == nipUniform
+  assert uniform.value.obj.uniform.minInclusive == 1 and uniform.value.obj.uniform.maxInclusive == 4
+
+  let biased = fromJson(IntProvider, parse("{\"type\":\"minecraft:biased_to_bottom\",\"min_inclusive\":0,\"max_inclusive\":2}"))
+  assert biased.ok and biased.value.obj.kind == nipBiasedToBottom
+
+  let clamped = fromJson(IntProvider, parse(
+    "{\"type\":\"minecraft:clamped\",\"min_inclusive\":0,\"max_inclusive\":9," &
+    "\"source\":{\"type\":\"minecraft:uniform\",\"min_inclusive\":-5,\"max_inclusive\":20}}"))
+  assert clamped.ok and clamped.value.obj.kind == nipClamped
+  assert getMin(clamped.value) == 0 and getMax(clamped.value) == 9
+  assert clamped.value.obj.clamped.source[].obj.uniform.minInclusive == -5
+
+  let bareSource = fromJson(IntProvider, parse("{\"type\":\"minecraft:clamped\",\"min_inclusive\":0,\"max_inclusive\":9,\"source\":4}"))
+  assert bareSource.ok and getMin(bareSource.value) == 4
+
+  let trapezoid = fromJson(IntProvider, parse("{\"type\":\"minecraft:trapezoid\",\"min_inclusive\":-2,\"max_inclusive\":2,\"plateau\":1}"))
+  assert trapezoid.ok and trapezoid.value.obj.trapezoid.plateau == 1
+
+  let normalP = fromJson(IntProvider, parse(
+    "{\"type\":\"minecraft:clamped_normal\",\"mean\":5,\"deviation\":1.5,\"min_inclusive\":1,\"max_inclusive\":9}"))
+  assert normalP.ok and normalP.value.obj.clampedNormal.mean == 5.0'f32
+  assert normalP.value.obj.clampedNormal.deviation == 1.5'f32
+
+  let weighted = fromJson(IntProvider, parse(
+    "{\"type\":\"minecraft:weighted_list\",\"distribution\":[{\"data\":1,\"weight\":3}," &
+    "{\"data\":{\"type\":\"minecraft:uniform\",\"min_inclusive\":5,\"max_inclusive\":6},\"weight\":1}]}"))
+  assert weighted.ok and weighted.value.obj.weightedList.distribution.len == 2
+  assert getMin(weighted.value) == 1 and getMax(weighted.value) == 6
+  assert weighted.value.obj.weightedList.distribution[0].weight == 3
+
+proc testFromJsonErrors() =
+  let untagged = "data did not match any variant of untagged enum IntProvider"
+  assert fromJson(IntProvider, parse("1.5")).error == untagged
+  assert fromJson(IntProvider, parse("\"x\"")).error == untagged
+  assert fromJson(IntProvider, parse("3000000000")).error == untagged
+  assert fromJson(IntProvider, parse("{\"type\":\"minecraft:nope\"}")).error == untagged
+  assert fromJson(IntProvider, parse("{\"type\":\"minecraft:uniform\",\"min_inclusive\":1}")).error == untagged
+  # i32 fields refuse floats.
+  assert fromJson(IntProvider, parse("{\"type\":\"minecraft:constant\",\"value\":1.0}")).error == untagged
+  # Without the untagged wrapper the inner message is visible.
+  assert fromJson(NormalIntProvider, parse("{\"type\":\"minecraft:uniform\",\"min_inclusive\":1}")).error ==
+    "missing field `max_inclusive`"
+  assert fromJson(NormalIntProvider, parse("{}")).error == "missing field `type`"
+  assert fromJson(NormalIntProvider, parse("{\"type\":\"minecraft:nope\"}")).error ==
+    "unknown variant `minecraft:nope`, expected one of `minecraft:constant`, `minecraft:uniform`, " &
+    "`minecraft:biased_to_bottom`, `minecraft:clamped`, `minecraft:trapezoid`, `minecraft:clamped_normal`, " &
+    "`minecraft:weighted_list`"
+  assert fromJson(NormalIntProvider, parse("{\"type\":\"minecraft:constant\",\"value\":1.5}")).error ==
+    "invalid type: floating point `1.5`, expected i32"
+
+proc checkShape(text: string) =
+  let r = fromJson(IntProvider, parse(text))
+  assert r.ok, text
+  assert toJsonString(toJson(r.value)) == text, toJsonString(toJson(r.value))
+
+proc testToJson() =
+  # Keys are byte-sorted, as serde_json's default map prints them.
+  checkShape("7")
+  checkShape("{\"type\":\"minecraft:constant\",\"value\":3}")
+  checkShape("{\"max_inclusive\":4,\"min_inclusive\":1,\"type\":\"minecraft:uniform\"}")
+  checkShape("{\"max_inclusive\":2,\"min_inclusive\":0,\"type\":\"minecraft:biased_to_bottom\"}")
+  checkShape("{\"max_inclusive\":9,\"min_inclusive\":0,\"source\":4,\"type\":\"minecraft:clamped\"}")
+  checkShape("{\"max_inclusive\":2,\"min_inclusive\":-2,\"plateau\":1,\"type\":\"minecraft:trapezoid\"}")
+  checkShape("{\"deviation\":1.5,\"max_inclusive\":9,\"mean\":5.0,\"min_inclusive\":1,\"type\":\"minecraft:clamped_normal\"}")
+  checkShape("{\"distribution\":[{\"data\":1,\"weight\":3}],\"type\":\"minecraft:weighted_list\"}")
+
+testConstant()
+testUniform()
+testBiased()
+testClampedNormal()
+testClamped()
+testTrapezoid()
+testWeightedList()
+testEnum()
+testFromJson()
+testFromJsonErrors()
+testToJson()
+echo "int_provider checks passed"

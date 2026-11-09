@@ -1,0 +1,298 @@
+## Port of pumpkin-util/src/permission.rs
+##
+## `Arc<RwLock<_>>` holds become plain refs, and async becomes plain calls.
+
+import std/tables
+import std/syncio
+import ../codecs/json_value
+import ../codecs/data_result
+import serde_forms
+import uuid
+
+type
+  PermissionLvl* = enum
+    Zero = 0
+    One = 1
+    Two = 2
+    Three = 3
+    Four = 4
+
+  PermissionDefaultKind* = enum
+    pdkDeny
+    pdkAllow
+    pdkOp
+
+  PermissionDefault* = object
+    case kind*: PermissionDefaultKind
+    of pdkDeny, pdkAllow:
+      discard
+    of pdkOp:
+      level*: PermissionLvl
+
+  Permission* = object
+    node*: string
+    description*: string
+    default*: PermissionDefault
+    children*: Table[string, bool]
+
+  PermissionRegistry* = ref object
+    permissions: Table[string, Permission]
+
+  PermissionAttachment* = ref object
+    permissions: Table[string, bool]
+
+  PermissionManager* = object
+    registry*: PermissionRegistry
+    attachments*: Table[Uuid, PermissionAttachment]
+
+proc permissionDeny*(): PermissionDefault = PermissionDefault(kind: pdkDeny)
+proc permissionAllow*(): PermissionDefault = PermissionDefault(kind: pdkAllow)
+proc permissionOp*(level: PermissionLvl): PermissionDefault = PermissionDefault(kind: pdkOp, level: level)
+
+proc `==`*(a, b: PermissionDefault): bool =
+  if a.kind != b.kind: return false
+  case a.kind
+  of pdkOp: a.level == b.level
+  else: true
+
+proc newPermission*(node, description: string, default: PermissionDefault): Permission =
+  Permission(node: node, description: description, default: default, children: initTable[string, bool]())
+
+proc addChild*(p: var Permission, child: string, value: bool) =
+  p.children[child] = value
+
+proc newPermissionRegistry*(): PermissionRegistry =
+  PermissionRegistry(permissions: initTable[string, Permission]())
+
+proc registerPermission*(r: PermissionRegistry, permission: Permission): (bool, string) =
+  ## `(false, message)` when a permission with the same node already exists.
+  if r.permissions.hasKey(permission.node):
+    return (false, "Permission " & permission.node & " is already registered")
+  r.permissions[permission.node] = permission
+  (true, "")
+
+proc registerPermissionOrPanic*(r: PermissionRegistry, permission: Permission) =
+  let (ok, _) = registerPermission(r, permission)
+  if not ok:
+    quit("Permission should have been registered successfully")
+
+proc hasPermission*(r: PermissionRegistry, node: string): bool =
+  r.permissions.hasKey(node)
+
+proc getPermission*(r: PermissionRegistry, node: string): (bool, Permission) =
+  if r.permissions.hasKey(node):
+    (true, r.permissions.getOrDefault(node, Permission()))
+  else:
+    (false, Permission())
+
+proc newPermissionAttachment*(): PermissionAttachment =
+  PermissionAttachment(permissions: initTable[string, bool]())
+
+proc setPermission*(a: PermissionAttachment, node: string, value: bool) =
+  a.permissions[node] = value
+
+proc unsetPermission*(a: PermissionAttachment, node: string) =
+  a.permissions.del(node)
+
+proc hasPermissionSet*(a: PermissionAttachment, node: string): (bool, bool) =
+  ## `Option<bool>`: whether set, then its value.
+  if a.permissions.hasKey(node):
+    (true, a.permissions.getOrDefault(node, false))
+  else:
+    (false, false)
+
+proc getPermissions*(a: PermissionAttachment): Table[string, bool] =
+  a.permissions
+
+proc newPermissionManager*(registry: PermissionRegistry): PermissionManager =
+  PermissionManager(registry: registry, attachments: initTable[Uuid, PermissionAttachment]())
+
+proc getAttachment*(m: var PermissionManager, playerId: Uuid): PermissionAttachment =
+  if m.attachments.hasKey(playerId):
+    return m.attachments.getOrDefault(playerId, newPermissionAttachment())
+  result = newPermissionAttachment()
+  m.attachments[playerId] = result
+
+proc removeAttachment*(m: var PermissionManager, playerId: Uuid) =
+  m.attachments.del(playerId)
+
+proc splitOn(text: string, sep: char): seq[string] =
+  ## `str::split`: always at least one part.
+  result = @[]
+  var part = ""
+  for c in text:
+    if c == sep:
+      result.add(part)
+      part = ""
+    else:
+      part.add(c)
+  result.add(part)
+
+proc hasPermission*(m: PermissionManager, playerId: Uuid, permissionNode: string,
+                    playerOpLevel: PermissionLvl): bool =
+  let reg = m.registry
+
+  # Check explicitly set permissions
+  if m.attachments.hasKey(playerId):
+    let attachment = m.attachments.getOrDefault(playerId, newPermissionAttachment())
+
+    # Check for the exact permission match
+    let exact = attachment.hasPermissionSet(permissionNode)
+    if exact[0]:
+      return exact[1]
+
+    # Check parent nodes (for wildcard permissions)
+    let nodeParts = splitOn(permissionNode, ':')
+    if nodeParts.len == 2:
+      let keyParts = splitOn(nodeParts[1], '.')
+
+      # Check wildcard permissions at each level
+      var currentNode = nodeParts[0]
+      let top = attachment.hasPermissionSet(currentNode & ":*")
+      if top[0]:
+        return top[1]
+
+      currentNode.add(':')
+      for i in 0 ..< keyParts.len:
+        currentNode.add(keyParts[i])
+
+        let here = attachment.hasPermissionSet(currentNode)
+        if here[0]:
+          return here[1]
+
+        if i < keyParts.len - 1:
+          let wild = attachment.hasPermissionSet(currentNode & ".*")
+          if wild[0]:
+            return wild[1]
+          currentNode.add('.')
+
+    # Check for inherited permissions from parent nodes
+    for node, value in attachment.permissions.pairs:
+      let (found, permission) = reg.getPermission(node)
+      if found and permission.children.hasKey(permissionNode):
+        return value and permission.children.getOrDefault(permissionNode, false)
+
+  # Fall back to the default permission value
+  let (found, permission) = reg.getPermission(permissionNode)
+  if not found:
+    return false
+  case permission.default.kind
+  of pdkAllow: true
+  of pdkDeny: false
+  of pdkOp: playerOpLevel >= permission.default.level
+
+proc toJson*(l: PermissionLvl): JsonValue =
+  ## `impl Serialize`: the level as a u8.
+  jsonInt(int64(ord(l)))
+
+proc fromJson*(t: typedesc[PermissionLvl], v: JsonValue): DataResult[PermissionLvl] =
+  ## `impl Deserialize`. Upstream leaves 1 out of this match.
+  let r = readUnsigned(v, 255'u64, "u8")
+  if not r.isSuccess:
+    return newError[PermissionLvl](r.message)
+  case r.successResult
+  of 0'u64: newSuccess(Zero)
+  of 2'u64: newSuccess(Two)
+  of 3'u64: newSuccess(Three)
+  of 4'u64: newSuccess(Four)
+  else: newError[PermissionLvl]("Invalid value for OpLevel: " & $r.successResult)
+
+proc toJson*(d: PermissionDefault): JsonValue =
+  ## Derived `Serialize`, externally tagged.
+  case d.kind
+  of pdkDeny:
+    result = jsonString("Deny")
+  of pdkAllow:
+    result = jsonString("Allow")
+  of pdkOp:
+    result = jsonObject()
+    result.put("Op", toJson(d.level))
+
+proc fromJson*(t: typedesc[PermissionDefault], v: JsonValue): DataResult[PermissionDefault] =
+  const names = ["Deny", "Allow", "Op"]
+  case v.kind
+  of jvString:
+    case v.strVal
+    of "Deny": newSuccess(permissionDeny())
+    of "Allow": newSuccess(permissionAllow())
+    of "Op": newError[PermissionDefault]("invalid type: unit variant, expected newtype variant")
+    else: newError[PermissionDefault](unknownVariant(v.strVal, names))
+  of jvObject:
+    if v.keys.len != 1:
+      return newError[PermissionDefault]("invalid value: map, expected map with a single key")
+    case v.keys[0]
+    of "Op":
+      let lvl = fromJson(PermissionLvl, v.vals[0])
+      if lvl.isSuccess: newSuccess(permissionOp(lvl.successResult))
+      else: newError[PermissionDefault](lvl.message)
+    of "Deny", "Allow":
+      if v.vals[0].kind != jvNull:
+        newError[PermissionDefault](invalidType(v.vals[0], "unit variant"))
+      elif v.keys[0] == "Deny":
+        newSuccess(permissionDeny())
+      else:
+        newSuccess(permissionAllow())
+    else:
+      newError[PermissionDefault](unknownVariant(v.keys[0], names))
+  else:
+    newError[PermissionDefault](invalidType(v, "string or map"))
+
+proc boolMapToJson(m: Table[string, bool]): JsonValue =
+  result = jsonObject()
+  for k, x in m.pairs:
+    result.put(k, jsonBool(x))
+
+proc boolMapFromJson(v: JsonValue): DataResult[Table[string, bool]] =
+  if v.kind != jvObject:
+    return newError[Table[string, bool]](invalidType(v, "a map"))
+  var m = initTable[string, bool]()
+  for i in 0 ..< v.keys.len:
+    let b = readBool(v.vals[i])
+    if not b.isSuccess:
+      return newError[Table[string, bool]](b.message)
+    m[v.keys[i]] = b.successResult
+  newSuccess(m)
+
+proc toJson*(p: Permission): JsonValue =
+  result = jsonObject()
+  result.put("node", jsonString(p.node))
+  result.put("description", jsonString(p.description))
+  result.put("default", toJson(p.default))
+  result.put("children", boolMapToJson(p.children))
+
+proc fromJson*(t: typedesc[Permission], v: JsonValue): DataResult[Permission] =
+  if v.kind != jvObject:
+    return newError[Permission](invalidType(v, "struct Permission"))
+  let (hasNode, nodeV) = v.get("node")
+  if not hasNode: return newError[Permission](missingField("node"))
+  let node = readString(nodeV)
+  if not node.isSuccess: return newError[Permission](node.message)
+  let (hasDesc, descV) = v.get("description")
+  if not hasDesc: return newError[Permission](missingField("description"))
+  let desc = readString(descV)
+  if not desc.isSuccess: return newError[Permission](desc.message)
+  let (hasDefault, defaultV) = v.get("default")
+  if not hasDefault: return newError[Permission](missingField("default"))
+  let def = fromJson(PermissionDefault, defaultV)
+  if not def.isSuccess: return newError[Permission](def.message)
+  let (hasChildren, childrenV) = v.get("children")
+  if not hasChildren: return newError[Permission](missingField("children"))
+  let children = boolMapFromJson(childrenV)
+  if not children.isSuccess: return newError[Permission](children.message)
+  newSuccess(Permission(node: node.successResult, description: desc.successResult,
+    default: def.successResult, children: children.successResult))
+
+proc toJson*(a: PermissionAttachment): JsonValue =
+  result = jsonObject()
+  result.put("permissions", boolMapToJson(a.permissions))
+
+proc fromJson*(t: typedesc[PermissionAttachment], v: JsonValue): DataResult[PermissionAttachment] =
+  if v.kind != jvObject:
+    return newError[PermissionAttachment](invalidType(v, "struct PermissionAttachment"))
+  let (hasPerms, permsV) = v.get("permissions")
+  if not hasPerms:
+    return newError[PermissionAttachment](missingField("permissions"))
+  let perms = boolMapFromJson(permsV)
+  if not perms.isSuccess:
+    return newError[PermissionAttachment](perms.message)
+  newSuccess(PermissionAttachment(permissions: perms.successResult))

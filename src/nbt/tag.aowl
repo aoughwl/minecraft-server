@@ -1,12 +1,25 @@
-## In-memory representation of individual NBT tags, plus compound-tag
-## (de)serialization content.
-## Port of upstream/nbt/src/tag.rs and (the content-level
-## procs of) src/compound.rs. Both live in this file because `NbtTag`'s
-## serialize/deserialize recurses into `NbtCompound`'s and vice versa;
-## Rust resolves that with two modules and `pub(crate)` visibility, aowlmony
-## resolves it more simply by not splitting the cycle across files.
+## The in-memory NBT tree: `NbtTag` and `NbtCompound`, with their reading, writing, skipping and accessors.
+## Port of pumpkin-nbt/src/tag.rs
+## Port of pumpkin-nbt/src/compound.rs
+##
+## One file because the two types recurse into each other. serde's `Serialize`/`Deserialize` for them is
+## in serde_ser.aowl and serde_de.aowl.
+##
+## `child_tags` is a HashMap in the pinned tree; here it stays the parallel `names`/`values` seqs, in
+## insertion order, which is one valid HashMap order. `put` keeps the first value, as the pinned tree does;
+## `insert` is `child_tags.insert`, which replaces. Rust `Option` is std/options, except the original `get`.
+##
+## The depth limit (MaxNbtDepth) is the newer checkout's logic, counted the same way: a compound costs two
+## levels, one entering its tag and one entering its content, a list one per element. Everything else
+## about reading follows the pinned tree.
 
+import std/[options, tables]
+import ../codecs/json_value
 import nbtbase, serializer, deserializer
+
+const
+  wrapperKey = ""
+  indexedInsertFrom = 64 ## compounds this large stop rescanning `names` for each tag read
 
 type
   NbtTagKind* = enum
@@ -41,12 +54,6 @@ type
     of ntkLongArray: longArrayVal*: seq[int64]
 
   NbtCompound* = object
-    ## Insertion-ordered map of name -> NbtTag.
-    ## Rust's `NbtCompound.child_tags` is an IndexMap; aowlmony has no stdlib
-    ## ordered map yet, so this keeps parallel `names`/`values` seqs and does
-    ## a linear scan on lookup. Fine for the compound sizes NBT tags contain
-    ## (chunk sections, entities, item components); revisit if it shows up
-    ## as a hot path once the deserializer is ported.
     names*: seq[string]
     values*: seq[NbtTag]
 
@@ -59,20 +66,33 @@ proc newCompound*(): NbtCompound =
 proc len*(c: NbtCompound): int {.inline.} =
   c.names.len
 
+proc isEmpty*(c: NbtCompound): bool {.inline.} =
+  c.names.len == 0
+
 proc indexOf(c: NbtCompound, name: string): int =
-  for i, n in c.names:
-    if n == name:
+  for i in 0 ..< c.names.len:
+    if c.names[i] == name:
       return i
   result = -1
 
 proc containsKey*(c: NbtCompound, name: string): bool {.inline.} =
   indexOf(c, name) >= 0
 
-proc put*(c: var NbtCompound, name: string, tag: NbtTag) =
+proc has*(c: NbtCompound, name: string): bool {.inline.} =
+  indexOf(c, name) >= 0
+
+proc insert*(c: var NbtCompound, name: string, tag: sink NbtTag) =
+  ## `child_tags.insert`: replaces an existing value, in its existing position.
   let i = indexOf(c, name)
   if i >= 0:
     c.values[i] = tag
   else:
+    c.names.add(name)
+    c.values.add(tag)
+
+proc put*(c: var NbtCompound, name: string, tag: sink NbtTag) =
+  ## Inserts a tag when `name` is not already present. Existing entries are left unchanged.
+  if indexOf(c, name) < 0:
     c.names.add(name)
     c.values.add(tag)
 
@@ -84,8 +104,7 @@ proc get*(c: NbtCompound, name: string): (bool, NbtTag) =
     (false, NbtTag(kind: ntkEnd))
 
 proc remove*(c: var NbtCompound, name: string): (bool, NbtTag) =
-  ## Port of `IndexMap::remove` as used by `NbtTag::flatten`: removes and
-  ## returns the value, if present.
+  ## `child_tags.remove`: removes and returns the value, if present.
   let i = indexOf(c, name)
   if i >= 0:
     result = (true, c.values[i])
@@ -94,55 +113,308 @@ proc remove*(c: var NbtCompound, name: string): (bool, NbtTag) =
   else:
     result = (false, NbtTag(kind: ntkEnd))
 
-proc getListElementTypeId(list: seq[NbtTag]): uint8 =
-  ## If any elements differ in type, upstream falls back to COMPOUND_ID
-  ## (matching how a heterogeneous list gets wrapped on write).
-  var elementId = ord(ntkEnd).uint8
-  for tag in list:
-    let id = tag.getTypeId()
-    if elementId == ord(ntkEnd).uint8:
+iterator pairs*(c: NbtCompound): (string, NbtTag) =
+  for i in 0 ..< c.names.len:
+    yield (c.names[i], c.values[i])
+
+# --- From<T> for NbtTag -------------------------------------------------------
+
+proc nbtTag*(value: string): NbtTag = NbtTag(kind: ntkString, stringVal: value)
+proc nbtTag*(value: openArray[int8]): NbtTag = NbtTag(kind: ntkByteArray, byteArrayVal: @value)
+proc nbtTag*(value: float32): NbtTag = NbtTag(kind: ntkFloat, floatVal: value)
+proc nbtTag*(value: float64): NbtTag = NbtTag(kind: ntkDouble, doubleVal: value)
+proc nbtTag*(value: bool): NbtTag = NbtTag(kind: ntkByte, byteVal: (if value: 1'i8 else: 0'i8))
+proc nbtTag*(value: sink NbtCompound): NbtTag = NbtTag(kind: ntkCompound, compoundVal: value)
+
+proc put*(c: var NbtCompound, name: string, value: string) = put(c, name, nbtTag(value))
+proc put*(c: var NbtCompound, name: string, value: openArray[int8]) = put(c, name, nbtTag(value))
+proc put*(c: var NbtCompound, name: string, value: float32) = put(c, name, nbtTag(value))
+proc put*(c: var NbtCompound, name: string, value: float64) = put(c, name, nbtTag(value))
+proc put*(c: var NbtCompound, name: string, value: bool) = put(c, name, nbtTag(value))
+proc put*(c: var NbtCompound, name: string, value: sink NbtCompound) = put(c, name, nbtTag(value))
+
+# --- compound.rs accessors ----------------------------------------------------
+
+proc putString*(c: var NbtCompound, name: string, value: string) =
+  put(c, name, NbtTag(kind: ntkString, stringVal: value))
+
+proc putList*(c: var NbtCompound, name: string, value: sink seq[NbtTag]) =
+  put(c, name, NbtTag(kind: ntkList, listVal: value))
+
+proc putByte*(c: var NbtCompound, name: string, value: int8) =
+  put(c, name, NbtTag(kind: ntkByte, byteVal: value))
+
+proc putBool*(c: var NbtCompound, name: string, value: bool) =
+  put(c, name, nbtTag(value))
+
+proc putShort*(c: var NbtCompound, name: string, value: int16) =
+  put(c, name, NbtTag(kind: ntkShort, shortVal: value))
+
+proc putInt*(c: var NbtCompound, name: string, value: int32) =
+  put(c, name, NbtTag(kind: ntkInt, intVal: value))
+
+proc putLong*(c: var NbtCompound, name: string, value: int64) =
+  put(c, name, NbtTag(kind: ntkLong, longVal: value))
+
+proc putFloat*(c: var NbtCompound, name: string, value: float32) =
+  put(c, name, NbtTag(kind: ntkFloat, floatVal: value))
+
+proc putDouble*(c: var NbtCompound, name: string, value: float64) =
+  put(c, name, NbtTag(kind: ntkDouble, doubleVal: value))
+
+proc putCompound*(c: var NbtCompound, name: string, value: sink NbtCompound) =
+  put(c, name, NbtTag(kind: ntkCompound, compoundVal: value))
+
+proc putUuid*(c: var NbtCompound, name: string, hi, lo: uint64) =
+  ## A UUID as a 4-element int array, most significant bits first (vanilla's `UUID` layout). A UUID is its
+  ## two 64-bit halves here, as in src/protocol/uuid.aowl, which imports this crate.
+  put(c, name, NbtTag(kind: ntkIntArray, intArrayVal: @[
+    cast[int32](uint32(hi shr 32)), cast[int32](uint32(hi and 0xFFFF_FFFF'u64)),
+    cast[int32](uint32(lo shr 32)), cast[int32](uint32(lo and 0xFFFF_FFFF'u64))]))
+
+# --- tag.rs extract_* ---------------------------------------------------------
+
+proc extractByte*(tag: NbtTag): Option[int8] =
+  if tag.kind == ntkByte: some(tag.byteVal) else: none[int8]()
+
+proc extractShort*(tag: NbtTag): Option[int16] =
+  if tag.kind == ntkShort: some(tag.shortVal) else: none[int16]()
+
+proc extractInt*(tag: NbtTag): Option[int32] =
+  if tag.kind == ntkInt: some(tag.intVal) else: none[int32]()
+
+proc extractLong*(tag: NbtTag): Option[int64] =
+  if tag.kind == ntkLong: some(tag.longVal) else: none[int64]()
+
+proc extractFloat*(tag: NbtTag): Option[float32] =
+  if tag.kind == ntkFloat: some(tag.floatVal) else: none[float32]()
+
+proc extractDouble*(tag: NbtTag): Option[float64] =
+  if tag.kind == ntkDouble: some(tag.doubleVal) else: none[float64]()
+
+proc extractBool*(tag: NbtTag): Option[bool] =
+  if tag.kind == ntkByte: some(tag.byteVal != 0'i8) else: none[bool]()
+
+proc extractByteArray*(tag: NbtTag): Option[seq[int8]] =
+  if tag.kind == ntkByteArray: some(tag.byteArrayVal) else: none[seq[int8]]()
+
+proc extractString*(tag: NbtTag): Option[string] =
+  if tag.kind == ntkString: some(tag.stringVal) else: none[string]()
+
+proc extractList*(tag: NbtTag): Option[seq[NbtTag]] =
+  if tag.kind == ntkList: some(tag.listVal) else: none[seq[NbtTag]]()
+
+proc extractCompound*(tag: NbtTag): Option[NbtCompound] =
+  if tag.kind == ntkCompound: some(tag.compoundVal) else: none[NbtCompound]()
+
+proc extractIntArray*(tag: NbtTag): Option[seq[int32]] =
+  if tag.kind == ntkIntArray: some(tag.intArrayVal) else: none[seq[int32]]()
+
+proc extractLongArray*(tag: NbtTag): Option[seq[int64]] =
+  if tag.kind == ntkLongArray: some(tag.longArrayVal) else: none[seq[int64]]()
+
+proc getByte*(c: NbtCompound, name: string): Option[int8] =
+  let i = indexOf(c, name)
+  if i >= 0: extractByte(c.values[i]) else: none[int8]()
+
+proc getShort*(c: NbtCompound, name: string): Option[int16] =
+  let i = indexOf(c, name)
+  if i >= 0: extractShort(c.values[i]) else: none[int16]()
+
+proc getInt*(c: NbtCompound, name: string): Option[int32] =
+  let i = indexOf(c, name)
+  if i >= 0: extractInt(c.values[i]) else: none[int32]()
+
+proc getLong*(c: NbtCompound, name: string): Option[int64] =
+  let i = indexOf(c, name)
+  if i >= 0: extractLong(c.values[i]) else: none[int64]()
+
+proc getFloat*(c: NbtCompound, name: string): Option[float32] =
+  let i = indexOf(c, name)
+  if i >= 0: extractFloat(c.values[i]) else: none[float32]()
+
+proc getDouble*(c: NbtCompound, name: string): Option[float64] =
+  let i = indexOf(c, name)
+  if i >= 0: extractDouble(c.values[i]) else: none[float64]()
+
+proc getBool*(c: NbtCompound, name: string): Option[bool] =
+  let i = indexOf(c, name)
+  if i >= 0: extractBool(c.values[i]) else: none[bool]()
+
+proc getString*(c: NbtCompound, name: string): Option[string] =
+  let i = indexOf(c, name)
+  if i >= 0: extractString(c.values[i]) else: none[string]()
+
+proc getList*(c: NbtCompound, name: string): Option[seq[NbtTag]] =
+  let i = indexOf(c, name)
+  if i >= 0: extractList(c.values[i]) else: none[seq[NbtTag]]()
+
+proc getCompound*(c: NbtCompound, name: string): Option[NbtCompound] =
+  let i = indexOf(c, name)
+  if i >= 0: extractCompound(c.values[i]) else: none[NbtCompound]()
+
+proc getIntArray*(c: NbtCompound, name: string): Option[seq[int32]] =
+  let i = indexOf(c, name)
+  if i >= 0: extractIntArray(c.values[i]) else: none[seq[int32]]()
+
+proc getLongArray*(c: NbtCompound, name: string): Option[seq[int64]] =
+  let i = indexOf(c, name)
+  if i >= 0: extractLongArray(c.values[i]) else: none[seq[int64]]()
+
+proc getUuid*(c: NbtCompound, name: string): Option[(uint64, uint64)] =
+  ## (hi, lo), as written by `putUuid`. None unless the tag is an int array of exactly 4.
+  let i = indexOf(c, name)
+  if i < 0 or c.values[i].kind != ntkIntArray or c.values[i].intArrayVal.len != 4:
+    return none[(uint64, uint64)]()
+  let a = c.values[i].intArrayVal
+  some((
+    (uint64(cast[uint32](a[0])) shl 32) or uint64(cast[uint32](a[1])),
+    (uint64(cast[uint32](a[2])) shl 32) or uint64(cast[uint32](a[3]))))
+
+proc fromIter*(entries: openArray[(string, NbtTag)]): NbtCompound =
+  ## FromIterator<(String, NbtTag)>: goes through `put`, so the first of two equal names wins.
+  result = newCompound()
+  for i in 0 ..< entries.len:
+    put(result, entries[i][0], entries[i][1])
+
+proc extend*(c: var NbtCompound, entries: openArray[(string, NbtTag)]) =
+  ## Extend<(String, NbtTag)>: goes through `put`.
+  for i in 0 ..< entries.len:
+    put(c, entries[i][0], entries[i][1])
+
+proc nbtCompoundTag*(entries: openArray[(string, NbtTag)]): NbtTag =
+  ## `nbt_compound_tag!`.
+  NbtTag(kind: ntkCompound, compoundVal: fromIter(entries))
+
+proc nbtCompoundTag*(): NbtTag =
+  NbtTag(kind: ntkCompound, compoundVal: newCompound())
+
+# --- PartialEq and Display ----------------------------------------------------
+
+proc `==`*(a, b: NbtTag): bool =
+  if a.kind != b.kind:
+    return false
+  case a.kind
+  of ntkEnd: true
+  of ntkByte: a.byteVal == b.byteVal
+  of ntkShort: a.shortVal == b.shortVal
+  of ntkInt: a.intVal == b.intVal
+  of ntkLong: a.longVal == b.longVal
+  of ntkFloat: a.floatVal == b.floatVal
+  of ntkDouble: a.doubleVal == b.doubleVal
+  of ntkByteArray: a.byteArrayVal == b.byteArrayVal
+  of ntkString: a.stringVal == b.stringVal
+  of ntkList:
+    if a.listVal.len != b.listVal.len:
+      return false
+    for i in 0 ..< a.listVal.len:
+      if not (a.listVal[i] == b.listVal[i]):
+        return false
+    true
+  of ntkCompound: a.compoundVal == b.compoundVal
+  of ntkIntArray: a.intArrayVal == b.intArrayVal
+  of ntkLongArray: a.longArrayVal == b.longArrayVal
+
+proc `==`*(a, b: NbtCompound): bool =
+  ## HashMap equality: order does not matter.
+  if a.names.len != b.names.len:
+    return false
+  for i in 0 ..< a.names.len:
+    let j = indexOf(b, a.names[i])
+    if j < 0 or not (a.values[i] == b.values[j]):
+      return false
+  true
+
+proc `$`*(c: NbtCompound): string =
+  result = "{"
+  for i in 0 ..< c.names.len:
+    if i > 0:
+      result.add ", "
+    result.add c.names[i]
+    result.add ": "
+    result.add $c.values[i]
+  result.add "}"
+
+proc `$`*(tag: NbtTag): string =
+  ## SNBT display. Strings are not escaped, as upstream's TODO says.
+  result = ""
+  case tag.kind
+  of ntkEnd: discard
+  of ntkByte: result = $tag.byteVal & "b"
+  of ntkShort: result = $tag.shortVal & "s"
+  of ntkInt: result = $tag.intVal
+  of ntkLong: result = $tag.longVal & "L"
+  of ntkFloat: result = displayF32(tag.floatVal) & "f"
+  of ntkDouble: result = displayF64(tag.doubleVal) & "d"
+  of ntkString: result = "\"" & tag.stringVal & "\""
+  of ntkCompound: result = $tag.compoundVal
+  of ntkByteArray:
+    result = "[B;"
+    for i in 0 ..< tag.byteArrayVal.len:
+      if i > 0: result.add ","
+      result.add " " & $tag.byteArrayVal[i] & "b"
+    result.add "]"
+  of ntkList:
+    result = "["
+    for i in 0 ..< tag.listVal.len:
+      if i > 0: result.add ", "
+      result.add $tag.listVal[i]
+    result.add "]"
+  of ntkIntArray:
+    result = "[I;"
+    for i in 0 ..< tag.intArrayVal.len:
+      if i > 0: result.add ","
+      result.add " " & $tag.intArrayVal[i]
+    result.add "]"
+  of ntkLongArray:
+    result = "[L;"
+    for i in 0 ..< tag.longArrayVal.len:
+      if i > 0: result.add ","
+      result.add " " & $tag.longArrayVal[i] & "L"
+    result.add "]"
+
+# --- list wrapping ------------------------------------------------------------
+
+proc getListElementTypeId*(list: seq[NbtTag]): uint8 =
+  ## The element type a list tag is written with; COMPOUND_ID when the elements differ.
+  var elementId = EndId
+  for i in 0 ..< list.len:
+    let id = list[i].getTypeId()
+    if elementId == EndId:
       elementId = id
     elif elementId != id:
-      return ord(ntkCompound).uint8
+      return CompoundId
   elementId
 
-proc isWrapperCompound(c: NbtCompound): bool {.inline.} =
-  ## A *wrapper compound* stores exactly one key-value pair under the empty
-  ## string key `""`.
-  c.len == 1 and c.containsKey("")
+proc isWrapperCompound*(c: NbtCompound): bool {.inline.} =
+  ## Exactly one entry, under the empty key.
+  c.names.len == 1 and c.names[0] == wrapperKey
 
 proc flatten*(tag: sink NbtTag): NbtTag =
-  ## Tries to unwrap (flatten) a wrapped `NbtTag`. If no unwrap is possible,
-  ## returns the tag unchanged.
-  if tag.kind == ntkCompound:
-    var compound = tag.compoundVal
-    if isWrapperCompound(compound):
-      let (found, inner) = remove(compound, "")
-      if found:
-        return inner
-    NbtTag(kind: ntkCompound, compoundVal: compound)
+  ## Unwraps a wrapper compound; anything else comes back unchanged.
+  if tag.kind == ntkCompound and isWrapperCompound(tag.compoundVal):
+    tag.compoundVal.values[0]
   else:
     tag
 
 proc wrapTag*(tag: sink NbtTag): NbtTag =
   var compound = newCompound()
-  put(compound, "", tag)
+  put(compound, wrapperKey, tag)
   NbtTag(kind: ntkCompound, compoundVal: compound)
 
+proc needsWrap*(elementType: uint8, tag: NbtTag): bool {.inline.} =
+  elementType == CompoundId and
+    not (tag.kind == ntkCompound and not isWrapperCompound(tag.compoundVal))
+
 proc wrapTagIfNeeded*(elementType: uint8, tag: sink NbtTag): NbtTag =
-  if elementType == ord(ntkCompound).uint8:
-    if tag.kind == ntkCompound and not isWrapperCompound(tag.compoundVal):
-      tag
-    else:
-      wrapTag(tag)
+  if needsWrap(elementType, tag):
+    wrapTag(tag)
   else:
     tag
 
-# --- serialize_data / serialize_content -------------------------------
-
+# --- serialize_data / serialize_content --------------------------------------
 
 proc serializeContent*(c: NbtCompound, w: var NbtWriter): NbtVoidResult =
-  ## Port of `NbtCompound::serialize_content`.
   for i in 0 ..< c.names.len:
     w.writeU8(c.values[i].getTypeId())
     let nameRes = w.writeString(c.names[i])
@@ -175,8 +447,8 @@ proc serializeData*(tag: NbtTag, w: var NbtWriter): NbtVoidResult =
     if len > int(int32.high):
       return errVoid(largeLength(len))
     w.writeI32(int32(len))
-    for b in tag.byteArrayVal:
-      w.writeU8(cast[uint8](b))
+    for i in 0 ..< len:
+      w.writeI8(tag.byteArrayVal[i])
   of ntkString:
     let r = w.writeString(tag.stringVal)
     if not r.isOk:
@@ -188,11 +460,11 @@ proc serializeData*(tag: NbtTag, w: var NbtWriter): NbtVoidResult =
     let elemId = getListElementTypeId(tag.listVal)
     w.writeU8(elemId)
     w.writeI32(int32(len))
-    for t in tag.listVal:
-      # Tags within one list tag must share a type; heterogeneous elements
-      # get wrapped in a single-entry NbtCompound so the stream stays valid.
-      let wrapped = wrapTagIfNeeded(elemId, t)
-      let r = serializeData(wrapped, w)
+    for i in 0 ..< len:
+      # Tags in one list tag must share a type, so mixed elements go in wrapper compounds.
+      let r =
+        if needsWrap(elemId, tag.listVal[i]): serializeData(wrapTag(tag.listVal[i]), w)
+        else: serializeData(tag.listVal[i], w)
       if not r.isOk:
         return r
   of ntkCompound:
@@ -204,143 +476,181 @@ proc serializeData*(tag: NbtTag, w: var NbtWriter): NbtVoidResult =
     if len > int(int32.high):
       return errVoid(largeLength(len))
     w.writeI32(int32(len))
-    for v in tag.intArrayVal:
-      w.writeI32(v)
+    for i in 0 ..< len:
+      w.writeI32(tag.intArrayVal[i])
   of ntkLongArray:
     let len = tag.longArrayVal.len
     if len > int(int32.high):
       return errVoid(largeLength(len))
     w.writeI32(int32(len))
-    for v in tag.longArrayVal:
-      w.writeI64(v)
+    for i in 0 ..< len:
+      w.writeI64(tag.longArrayVal[i])
   okVoid()
 
 proc serialize*(tag: NbtTag, w: var NbtWriter): NbtVoidResult =
-  ## Serializes the tag's type ID followed by its payload.
+  ## The tag's type id followed by its payload.
   w.writeU8(tag.getTypeId())
   serializeData(tag, w)
 
-# --- deserialize_data_depth / deserialize_content_depth ----------------
+# --- deserialize_data / deserialize_content -----------------------------------
 
+proc insertIndexed(c: var NbtCompound, index: var Table[string, int], name: string, tag: sink NbtTag) =
+  ## `child_tags.insert`, without rescanning a huge compound once per tag.
+  if c.names.len < indexedInsertFrom:
+    insert(c, name, tag)
+    return
+  if index.len == 0:
+    for i in 0 ..< c.names.len:
+      index[c.names[i]] = i
+  let i = index.getOrDefault(name, -1)
+  if i >= 0:
+    c.values[i] = tag
+  else:
+    index[name] = c.names.len
+    c.names.add(name)
+    c.values.add(tag)
 
-proc deserializeContentDepth*(r: var NbtReader, depth: int): NbtResult[NbtCompound] =
-  ## Port of `NbtCompound::deserialize_content_depth`.
+proc readContentInto(r: var NbtReader, depth: int, c: var NbtCompound): NbtVoidResult =
   if depth > MaxNbtDepth:
-    return errRes[NbtCompound](maxDepthExceeded())
-  var compound = newCompound()
+    return errVoid(maxDepthExceeded())
+  var index = default(Table[string, int])
   while true:
     let idRes = getU8(r)
     if not idRes.isOk:
-      # Upstream treats an unexpected-EOF here as "no more tags" (the root
-      # document's trailing END tag is optional on some sources); any other
-      # read failure still propagates.
-      break
+      if idRes.error.kind == nekIncomplete and idRes.error.unexpectedEof:
+        break # upstream: EOF where a tag id belongs ends the compound
+      return errVoid(idRes.error)
     let tagId = idRes.value
     if tagId == EndId:
       break
     let nameRes = getString(r)
     if not nameRes.isOk:
-      return errRes[NbtCompound](nameRes.error)
-    let tagRes = deserializeDataDepth(r, tagId, depth + 1)
+      return errVoid(nameRes.error)
+    var tag = NbtTag(kind: ntkEnd)
+    let tagRes = readDataInto(r, tagId, depth + 1, tag)
     if not tagRes.isOk:
-      return errRes[NbtCompound](tagRes.error)
-    put(compound, nameRes.value, tagRes.value)
-  ok[NbtCompound](compound)
+      return tagRes
+    insertIndexed(c, index, nameRes.value, tag)
+  okVoid()
+
+proc readLength(r: var NbtReader, n: var int): NbtVoidResult =
+  ## The array and list length prefix: negative first, then the cap.
+  let lenRes = getI32(r)
+  if not lenRes.isOk:
+    return errVoid(lenRes.error)
+  if lenRes.value < 0:
+    return errVoid(negativeLength(lenRes.value))
+  n = int(lenRes.value)
+  if n > MaxArrayLength:
+    return errVoid(largeLength(n))
+  okVoid()
+
+proc readDataInto(r: var NbtReader, tagId: uint8, depth: int, t: var NbtTag): NbtVoidResult =
+  if depth > MaxNbtDepth:
+    return errVoid(maxDepthExceeded())
+  case tagId
+  of EndId:
+    t = NbtTag(kind: ntkEnd)
+  of ByteId:
+    let v = getI8(r)
+    if not v.isOk: return errVoid(v.error)
+    t = NbtTag(kind: ntkByte, byteVal: v.value)
+  of ShortId:
+    let v = getI16(r)
+    if not v.isOk: return errVoid(v.error)
+    t = NbtTag(kind: ntkShort, shortVal: v.value)
+  of IntId:
+    let v = getI32(r)
+    if not v.isOk: return errVoid(v.error)
+    t = NbtTag(kind: ntkInt, intVal: v.value)
+  of LongId:
+    let v = getI64(r)
+    if not v.isOk: return errVoid(v.error)
+    t = NbtTag(kind: ntkLong, longVal: v.value)
+  of FloatId:
+    let v = getF32(r)
+    if not v.isOk: return errVoid(v.error)
+    t = NbtTag(kind: ntkFloat, floatVal: v.value)
+  of DoubleId:
+    let v = getF64(r)
+    if not v.isOk: return errVoid(v.error)
+    t = NbtTag(kind: ntkDouble, doubleVal: v.value)
+  of ByteArrayId:
+    var n = 0
+    let lenRes = readLength(r, n)
+    if not lenRes.isOk: return lenRes
+    let arr = getByteArray(r, n)
+    if not arr.isOk: return errVoid(arr.error)
+    t = NbtTag(kind: ntkByteArray, byteArrayVal: arr.value)
+  of StringId:
+    let v = getString(r)
+    if not v.isOk: return errVoid(v.error)
+    t = NbtTag(kind: ntkString, stringVal: v.value)
+  of ListId:
+    let elemIdRes = getU8(r)
+    if not elemIdRes.isOk: return errVoid(elemIdRes.error)
+    let elemId = elemIdRes.value
+    var n = 0
+    let lenRes = readLength(r, n)
+    if not lenRes.isOk: return lenRes
+    var list = newSeq[NbtTag](0)
+    for _ in 0 ..< n:
+      var elem = NbtTag(kind: ntkEnd)
+      let elemRes = readDataInto(r, elemId, depth + 1, elem)
+      if not elemRes.isOk: return elemRes
+      list.add(flatten(elem))
+    t = NbtTag(kind: ntkList, listVal: list)
+  of CompoundId:
+    var inner = newCompound()
+    let c = readContentInto(r, depth + 1, inner)
+    if not c.isOk: return c
+    t = NbtTag(kind: ntkCompound, compoundVal: inner)
+  of IntArrayId:
+    var n = 0
+    let lenRes = readLength(r, n)
+    if not lenRes.isOk: return lenRes
+    let arr = getI32Array(r, n)
+    if not arr.isOk: return errVoid(arr.error)
+    t = NbtTag(kind: ntkIntArray, intArrayVal: arr.value)
+  of LongArrayId:
+    var n = 0
+    let lenRes = readLength(r, n)
+    if not lenRes.isOk: return lenRes
+    let arr = getI64Array(r, n)
+    if not arr.isOk: return errVoid(arr.error)
+    t = NbtTag(kind: ntkLongArray, longArrayVal: arr.value)
+  else:
+    return errVoid(unknownTagId(tagId))
+  okVoid()
+
+proc deserializeContentDepth*(r: var NbtReader, depth: int): NbtResult[NbtCompound] =
+  var c = newCompound()
+  let res = readContentInto(r, depth, c)
+  if not res.isOk:
+    return errRes[NbtCompound](res.error)
+  ok[NbtCompound](c)
 
 proc deserializeContent*(r: var NbtReader): NbtResult[NbtCompound] =
   deserializeContentDepth(r, 0)
 
 proc deserializeDataDepth*(r: var NbtReader, tagId: uint8, depth: int): NbtResult[NbtTag] =
-  if depth > MaxNbtDepth:
-    return errRes[NbtTag](maxDepthExceeded())
-  case tagId
-  of EndId:
-    ok[NbtTag](NbtTag(kind: ntkEnd))
-  of ByteId:
-    let v = getI8(r)
-    if not v.isOk: errRes[NbtTag](v.error)
-    else: ok[NbtTag](NbtTag(kind: ntkByte, byteVal: v.value))
-  of ShortId:
-    let v = getI16(r)
-    if not v.isOk: errRes[NbtTag](v.error)
-    else: ok[NbtTag](NbtTag(kind: ntkShort, shortVal: v.value))
-  of IntId:
-    let v = getI32(r)
-    if not v.isOk: errRes[NbtTag](v.error)
-    else: ok[NbtTag](NbtTag(kind: ntkInt, intVal: v.value))
-  of LongId:
-    let v = getI64(r)
-    if not v.isOk: errRes[NbtTag](v.error)
-    else: ok[NbtTag](NbtTag(kind: ntkLong, longVal: v.value))
-  of FloatId:
-    let v = getF32(r)
-    if not v.isOk: errRes[NbtTag](v.error)
-    else: ok[NbtTag](NbtTag(kind: ntkFloat, floatVal: v.value))
-  of DoubleId:
-    let v = getF64(r)
-    if not v.isOk: errRes[NbtTag](v.error)
-    else: ok[NbtTag](NbtTag(kind: ntkDouble, doubleVal: v.value))
-  of ByteArrayId:
-    let lenRes = getI32(r)
-    if not lenRes.isOk: return errRes[NbtTag](lenRes.error)
-    if lenRes.value < 0: return errRes[NbtTag](negativeLength(lenRes.value))
-    if int(lenRes.value) > MaxArrayLength: return errRes[NbtTag](largeLength(int(lenRes.value)))
-    let arr = getByteArray(r, int(lenRes.value))
-    if not arr.isOk: errRes[NbtTag](arr.error)
-    else: ok[NbtTag](NbtTag(kind: ntkByteArray, byteArrayVal: arr.value))
-  of StringId:
-    let v = getString(r)
-    if not v.isOk: errRes[NbtTag](v.error)
-    else: ok[NbtTag](NbtTag(kind: ntkString, stringVal: v.value))
-  of ListId:
-    let elemIdRes = getU8(r)
-    if not elemIdRes.isOk: return errRes[NbtTag](elemIdRes.error)
-    let elemId = elemIdRes.value
-    let lenRes = getI32(r)
-    if not lenRes.isOk: return errRes[NbtTag](lenRes.error)
-    if lenRes.value < 0: return errRes[NbtTag](negativeLength(lenRes.value))
-    if elemId == EndId and lenRes.value > 0: return errRes[NbtTag](invalidListTag(elemId))
-    let n = int(lenRes.value)
-    if n > MaxArrayLength: return errRes[NbtTag](largeLength(n))
-    var list = newSeq[NbtTag](0)
-    for _ in 0 ..< n:
-      let elemRes = deserializeDataDepth(r, elemId, depth + 1)
-      if not elemRes.isOk: return errRes[NbtTag](elemRes.error)
-      if elemRes.value.getTypeId() != elemId:
-        return errRes[NbtTag](invalidListTag(elemRes.value.getTypeId()))
-      list.add(flatten(elemRes.value))
-    ok[NbtTag](NbtTag(kind: ntkList, listVal: list))
-  of CompoundId:
-    let c = deserializeContentDepth(r, depth + 1)
-    if not c.isOk: errRes[NbtTag](c.error)
-    else: ok[NbtTag](NbtTag(kind: ntkCompound, compoundVal: c.value))
-  of IntArrayId:
-    let lenRes = getI32(r)
-    if not lenRes.isOk: return errRes[NbtTag](lenRes.error)
-    if lenRes.value < 0: return errRes[NbtTag](negativeLength(lenRes.value))
-    if int(lenRes.value) > MaxArrayLength: return errRes[NbtTag](largeLength(int(lenRes.value)))
-    let arr = getI32Array(r, int(lenRes.value))
-    if not arr.isOk: errRes[NbtTag](arr.error)
-    else: ok[NbtTag](NbtTag(kind: ntkIntArray, intArrayVal: arr.value))
-  of LongArrayId:
-    let lenRes = getI32(r)
-    if not lenRes.isOk: return errRes[NbtTag](lenRes.error)
-    if lenRes.value < 0: return errRes[NbtTag](negativeLength(lenRes.value))
-    if int(lenRes.value) > MaxArrayLength: return errRes[NbtTag](largeLength(int(lenRes.value)))
-    let arr = getI64Array(r, int(lenRes.value))
-    if not arr.isOk: errRes[NbtTag](arr.error)
-    else: ok[NbtTag](NbtTag(kind: ntkLongArray, longArrayVal: arr.value))
-  else:
-    errRes[NbtTag](unknownTagId(tagId))
+  var t = NbtTag(kind: ntkEnd)
+  let res = readDataInto(r, tagId, depth, t)
+  if not res.isOk:
+    return errRes[NbtTag](res.error)
+  ok[NbtTag](t)
+
+proc deserializeData*(r: var NbtReader, tagId: uint8): NbtResult[NbtTag] =
+  deserializeDataDepth(r, tagId, 0)
 
 proc deserialize*(r: var NbtReader): NbtResult[NbtTag] =
+  ## A type id and its payload.
   let idRes = getU8(r)
   if not idRes.isOk:
     return errRes[NbtTag](idRes.error)
   deserializeDataDepth(r, idRes.value, 0)
 
-# --- skip_data_depth / skip_content_depth -------------------------------
-
+# --- skip_data / skip_content -------------------------------------------------
 
 proc skipContentDepth*(r: var NbtReader, depth: int): NbtVoidResult =
   if depth > MaxNbtDepth:
@@ -348,7 +658,9 @@ proc skipContentDepth*(r: var NbtReader, depth: int): NbtVoidResult =
   while true:
     let idRes = getU8(r)
     if not idRes.isOk:
-      break
+      if idRes.error.kind == nekIncomplete and idRes.error.unexpectedEof:
+        break
+      return errVoid(idRes.error)
     let tagId = idRes.value
     if tagId == EndId:
       break
@@ -363,6 +675,16 @@ proc skipContentDepth*(r: var NbtReader, depth: int): NbtVoidResult =
 proc skipContent*(r: var NbtReader): NbtVoidResult =
   skipContentDepth(r, 0)
 
+proc skipLength(r: var NbtReader, n: var int): NbtVoidResult =
+  ## Skipping checks the sign but not MAX_ARRAY_LENGTH.
+  let lenRes = getI32(r)
+  if not lenRes.isOk:
+    return errVoid(lenRes.error)
+  if lenRes.value < 0:
+    return errVoid(negativeLength(lenRes.value))
+  n = int(lenRes.value)
+  okVoid()
+
 proc skipDataDepth*(r: var NbtReader, tagId: uint8, depth: int): NbtVoidResult =
   if depth > MaxNbtDepth:
     return errVoid(maxDepthExceeded())
@@ -375,22 +697,20 @@ proc skipDataDepth*(r: var NbtReader, tagId: uint8, depth: int): NbtVoidResult =
   of FloatId: skipF32(r)
   of DoubleId: skipF64(r)
   of ByteArrayId:
-    let lenRes = getI32(r)
-    if not lenRes.isOk: return errVoid(lenRes.error)
-    if lenRes.value < 0: return errVoid(negativeLength(lenRes.value))
-    if int(lenRes.value) > MaxArrayLength: return errVoid(largeLength(int(lenRes.value)))
-    skipBytes(r, int(lenRes.value))
+    var n = 0
+    let lenRes = skipLength(r, n)
+    if not lenRes.isOk: return lenRes
+    skipBytes(r, n)
   of StringId: skipString(r)
   of ListId:
     let elemIdRes = getU8(r)
     if not elemIdRes.isOk: return errVoid(elemIdRes.error)
     let elemId = elemIdRes.value
-    let lenRes = getI32(r)
-    if not lenRes.isOk: return errVoid(lenRes.error)
-    if lenRes.value < 0: return errVoid(negativeLength(lenRes.value))
-    if elemId == EndId and lenRes.value > 0: return errVoid(invalidListTag(elemId))
-    let n = int(lenRes.value)
-    if n > MaxArrayLength: return errVoid(largeLength(n))
+    var n = 0
+    let lenRes = skipLength(r, n)
+    if not lenRes.isOk: return lenRes
+    if elemId == EndId:
+      return okVoid() # every element would skip nothing
     for _ in 0 ..< n:
       let r2 = skipDataDepth(r, elemId, depth + 1)
       if not r2.isOk: return r2
@@ -398,20 +718,22 @@ proc skipDataDepth*(r: var NbtReader, tagId: uint8, depth: int): NbtVoidResult =
   of CompoundId:
     skipContentDepth(r, depth + 1)
   of IntArrayId:
-    let lenRes = getI32(r)
-    if not lenRes.isOk: return errVoid(lenRes.error)
-    if lenRes.value < 0: return errVoid(negativeLength(lenRes.value))
-    if int(lenRes.value) > MaxArrayLength: return errVoid(largeLength(int(lenRes.value)))
-    for _ in 0 ..< int(lenRes.value):
+    var n = 0
+    let lenRes = skipLength(r, n)
+    if not lenRes.isOk: return lenRes
+    if r.mode == nrmJava:
+      return skipBytes(r, n * 4)
+    for _ in 0 ..< n:
       let r2 = skipI32(r)
       if not r2.isOk: return r2
     okVoid()
   of LongArrayId:
-    let lenRes = getI32(r)
-    if not lenRes.isOk: return errVoid(lenRes.error)
-    if lenRes.value < 0: return errVoid(negativeLength(lenRes.value))
-    if int(lenRes.value) > MaxArrayLength: return errVoid(largeLength(int(lenRes.value)))
-    for _ in 0 ..< int(lenRes.value):
+    var n = 0
+    let lenRes = skipLength(r, n)
+    if not lenRes.isOk: return lenRes
+    if r.mode == nrmJava:
+      return skipBytes(r, n * 8)
+    for _ in 0 ..< n:
       let r2 = skipI64(r)
       if not r2.isOk: return r2
     okVoid()
@@ -420,4 +742,3 @@ proc skipDataDepth*(r: var NbtReader, tagId: uint8, depth: int): NbtVoidResult =
 
 proc skipData*(r: var NbtReader, tagId: uint8): NbtVoidResult =
   skipDataDepth(r, tagId, 0)
-

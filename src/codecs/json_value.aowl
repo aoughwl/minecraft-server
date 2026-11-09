@@ -1,0 +1,531 @@
+## In-memory JSON value, parser and printer. Support module with no upstream file of its own: it is
+## what `serde_json::Value` is to pumpkin-codecs/src/json_ops.rs and to the serde JSON forms in
+## pumpkin-util. std/json is a flat token buffer whose trees cannot be copied, so it cannot be a
+## `DynamicOps` value; this is a plain tree that can.
+##
+## Behaviour copied from serde_json with default features (the pinned tree does not enable
+## `preserve_order`): objects iterate in byte-sorted key order, integers stay integers, a float always
+## prints with a fraction or exponent the way ryu does (`1.0`, `1.5`, `1e16`, `1.5e-7`), NaN and infinity
+## become null, the parser's nesting limit is 128, and `-0` parses as the float -0.0.
+
+import std/parseutils
+
+type
+  JsonValueKind* = enum
+    jvNull
+    jvBool
+    jvInt     ## fits i64
+    jvUInt    ## above i64::MAX, fits u64
+    jvFloat
+    jvString
+    jvArray
+    jvObject
+
+  JsonValue* = object
+    case kind*: JsonValueKind
+    of jvNull: discard
+    of jvBool: boolVal*: bool
+    of jvInt: intVal*: int64
+    of jvUInt: uintVal*: uint64
+    of jvFloat: floatVal*: float64
+    of jvString: strVal*: string
+    of jvArray: items*: seq[JsonValue]
+    of jvObject:
+      keys*: seq[string]    ## byte-sorted, parallel to `vals`
+      vals*: seq[JsonValue]
+
+  JsonParseOutcome* = object
+    ok*: bool
+    value*: JsonValue
+    error*: string
+
+proc jsonNull*(): JsonValue {.inline.} = JsonValue(kind: jvNull)
+proc jsonBool*(b: bool): JsonValue {.inline.} = JsonValue(kind: jvBool, boolVal: b)
+proc jsonInt*(i: int64): JsonValue {.inline.} = JsonValue(kind: jvInt, intVal: i)
+proc jsonString*(s: string): JsonValue {.inline.} = JsonValue(kind: jvString, strVal: s)
+proc jsonArray*(items: seq[JsonValue]): JsonValue {.inline.} = JsonValue(kind: jvArray, items: items)
+proc jsonObject*(): JsonValue {.inline.} = JsonValue(kind: jvObject, keys: @[], vals: @[])
+
+proc jsonUInt*(u: uint64): JsonValue =
+  if u <= 0x7FFF_FFFF_FFFF_FFFF'u64: JsonValue(kind: jvInt, intVal: int64(u))
+  else: JsonValue(kind: jvUInt, uintVal: u)
+
+proc jsonFloat*(f: float64): JsonValue =
+  ## `serde_json::Number::from_f64`: non-finite values have no JSON form and become null.
+  if f != f or f == Inf or f == -Inf: JsonValue(kind: jvNull)
+  else: JsonValue(kind: jvFloat, floatVal: f)
+
+proc lowerBound(keys: seq[string], key: string): int =
+  var lo = 0
+  var hi = keys.len
+  while lo < hi:
+    let mid = (lo + hi) div 2
+    if keys[mid] < key: lo = mid + 1
+    else: hi = mid
+  lo
+
+proc hasKey*(v: JsonValue, key: string): bool =
+  if v.kind != jvObject: return false
+  let i = lowerBound(v.keys, key)
+  i < v.keys.len and v.keys[i] == key
+
+proc find*(v: JsonValue, key: string): int =
+  ## Index of `key` in `keys`/`vals`, or -1 when absent or `v` is not an object.
+  if v.kind != jvObject: return -1
+  let i = lowerBound(v.keys, key)
+  if i < v.keys.len and v.keys[i] == key: i else: -1
+
+proc get*(v: JsonValue, key: string): (bool, JsonValue) =
+  let i = find(v, key)
+  if i >= 0: (true, v.vals[i]) else: (false, jsonNull())
+
+proc put*(v: var JsonValue, key: string, value: JsonValue) =
+  ## Inserts or replaces, keeping the keys sorted. `v` must be an object.
+  let i = lowerBound(v.keys, key)
+  if i < v.keys.len and v.keys[i] == key:
+    v.vals[i] = value
+  else:
+    v.keys.add key
+    v.vals.add value
+    var j = v.keys.len - 1
+    while j > i:
+      swap v.keys[j], v.keys[j - 1]
+      swap v.vals[j], v.vals[j - 1]
+      dec j
+
+proc remove*(v: var JsonValue, key: string): bool =
+  let i = find(v, key)
+  if i < 0: return false
+  v.keys.delete(i)
+  v.vals.delete(i)
+  true
+
+proc `==`*(a, b: JsonValue): bool =
+  ## serde_json compares numbers by representation, so 1 and 1.0 differ.
+  if a.kind != b.kind: return false
+  case a.kind
+  of jvNull: true
+  of jvBool: a.boolVal == b.boolVal
+  of jvInt: a.intVal == b.intVal
+  of jvUInt: a.uintVal == b.uintVal
+  of jvFloat: a.floatVal == b.floatVal
+  of jvString: a.strVal == b.strVal
+  of jvArray:
+    if a.items.len != b.items.len: return false
+    for i in 0 ..< a.items.len:
+      if not (a.items[i] == b.items[i]): return false
+    true
+  of jvObject:
+    if a.keys.len != b.keys.len: return false
+    for i in 0 ..< a.keys.len:
+      if a.keys[i] != b.keys[i] or not (a.vals[i] == b.vals[i]): return false
+    true
+
+# --- float text ---------------------------------------------------------------------------------
+
+proc splitShortest(text: string): (bool, string, int) =
+  ## Takes the shortest round-trip text `$x` gives and returns (negative, significant digits, k) where
+  ## the value is 0.d1d2d3... * 10^k.
+  var neg = false
+  var digits = ""
+  var pointAt = -1
+  var exp10 = 0
+  var i = 0
+  if i < text.len and text[i] == '-':
+    neg = true
+    inc i
+  while i < text.len and text[i] != 'e' and text[i] != 'E':
+    if text[i] == '.': pointAt = digits.len
+    else: digits.add text[i]
+    inc i
+  if i < text.len:
+    inc i
+    var eneg = false
+    if i < text.len and (text[i] == '+' or text[i] == '-'):
+      eneg = text[i] == '-'
+      inc i
+    while i < text.len:
+      exp10 = exp10 * 10 + (ord(text[i]) - ord('0'))
+      inc i
+    if eneg: exp10 = -exp10
+  if pointAt < 0: pointAt = digits.len
+  var start = 0
+  while start < digits.len - 1 and digits[start] == '0':
+    inc start
+    dec pointAt
+  var stop = digits.len
+  while stop > start + 1 and digits[stop - 1] == '0': dec stop
+  var trimmed = ""
+  for j in start ..< stop: trimmed.add digits[j]
+  (neg, trimmed, pointAt + exp10)
+
+proc ryuPretty(text: string): string =
+  ## Lays out shortest digits the way `ryu::Buffer::format_finite` does.
+  let (neg, digits, kk) = splitShortest(text)
+  result = if neg: "-" else: ""
+  if digits == "0":
+    result.add "0.0"
+    return
+  let n = digits.len
+  if n <= kk and kk <= 16:
+    result.add digits
+    for _ in n ..< kk: result.add '0'
+    result.add ".0"
+  elif 0 < kk and kk <= 16:
+    for i in 0 ..< kk: result.add digits[i]
+    result.add '.'
+    for i in kk ..< n: result.add digits[i]
+  elif -5 < kk and kk <= 0:
+    result.add "0."
+    for _ in 0 ..< -kk: result.add '0'
+    result.add digits
+  else:
+    result.add digits[0]
+    if n > 1:
+      result.add '.'
+      for i in 1 ..< n: result.add digits[i]
+    result.add 'e'
+    result.add $(kk - 1)
+
+proc formatF64*(f: float64): string =
+  ## Text serde_json prints for a finite f64.
+  ryuPretty($f)
+
+proc formatF32*(f: float32): string =
+  ## Text serde_json prints for a finite f32.
+  ryuPretty($f)
+
+proc rustDisplay(text: string): string =
+  ## Rust's `{}` for floats: shortest digits, never an exponent, no `.0` on whole numbers.
+  let (neg, digits, kk) = splitShortest(text)
+  result = if neg: "-" else: ""
+  if digits == "0":
+    result.add '0'
+  elif kk <= 0:
+    result.add "0."
+    for _ in 0 ..< -kk: result.add '0'
+    result.add digits
+  elif kk >= digits.len:
+    result.add digits
+    for _ in digits.len ..< kk: result.add '0'
+  else:
+    for i in 0 ..< kk: result.add digits[i]
+    result.add '.'
+    for i in kk ..< digits.len: result.add digits[i]
+
+proc displayF64*(f: float64): string =
+  ## Rust's `format!("{}", f)` for an f64: `inf`, `-inf` and `NaN` included.
+  if f != f: "NaN"
+  elif f == Inf: "inf"
+  elif f == -Inf: "-inf"
+  else: rustDisplay($f)
+
+proc displayF32*(f: float32): string =
+  ## Rust's `format!("{}", f)` for an f32.
+  if f != f: "NaN"
+  elif f == Inf: "inf"
+  elif f == -Inf: "-inf"
+  else: rustDisplay($f)
+
+# --- printer -----------------------------------------------------------------------------------
+
+const HexDigits = "0123456789abcdef"
+
+proc addEscaped*(s: var string, text: string) =
+  ## Appends `text` as a quoted JSON string, escaping exactly what serde_json escapes.
+  s.add '"'
+  for c in text:
+    case c
+    of '"': s.add "\\\""
+    of '\\': s.add "\\\\"
+    of '\b': s.add "\\b"
+    of '\f': s.add "\\f"
+    of '\n': s.add "\\n"
+    of '\r': s.add "\\r"
+    of '\t': s.add "\\t"
+    else:
+      if ord(c) < 0x20:
+        s.add "\\u00"
+        s.add HexDigits[ord(c) shr 4]
+        s.add HexDigits[ord(c) and 15]
+      else:
+        s.add c
+  s.add '"'
+
+proc addJson*(s: var string, v: JsonValue) =
+  case v.kind
+  of jvNull: s.add "null"
+  of jvBool: s.add(if v.boolVal: "true" else: "false")
+  of jvInt: s.add $v.intVal
+  of jvUInt: s.add $v.uintVal
+  of jvFloat: s.add formatF64(v.floatVal)
+  of jvString: s.addEscaped v.strVal
+  of jvArray:
+    s.add '['
+    for i in 0 ..< v.items.len:
+      if i > 0: s.add ','
+      s.addJson v.items[i]
+    s.add ']'
+  of jvObject:
+    s.add '{'
+    for i in 0 ..< v.keys.len:
+      if i > 0: s.add ','
+      s.addEscaped v.keys[i]
+      s.add ':'
+      s.addJson v.vals[i]
+    s.add '}'
+
+proc toJsonString*(v: JsonValue): string =
+  ## `serde_json::to_string`.
+  result = ""
+  result.addJson v
+
+proc `$`*(v: JsonValue): string = toJsonString(v)
+
+# --- parser ------------------------------------------------------------------------------------
+
+const RecursionLimit = 128
+
+type
+  JsonParser = object
+    s: string
+    pos: int
+    depth: int
+    err: string
+
+proc fail(p: var JsonParser, msg: string): JsonValue =
+  if p.err.len == 0:
+    p.err = msg & " at byte " & $p.pos
+  jsonNull()
+
+proc skipWs(p: var JsonParser) =
+  while p.pos < p.s.len and (p.s[p.pos] == ' ' or p.s[p.pos] == '\n' or p.s[p.pos] == '\t' or p.s[p.pos] == '\r'):
+    inc p.pos
+
+proc addUtf8(s: var string, cp: uint32) =
+  if cp < 0x80'u32:
+    s.add char(cp)
+  elif cp < 0x800'u32:
+    s.add char(0xC0'u32 or (cp shr 6))
+    s.add char(0x80'u32 or (cp and 0x3F'u32))
+  elif cp < 0x10000'u32:
+    s.add char(0xE0'u32 or (cp shr 12))
+    s.add char(0x80'u32 or ((cp shr 6) and 0x3F'u32))
+    s.add char(0x80'u32 or (cp and 0x3F'u32))
+  else:
+    s.add char(0xF0'u32 or (cp shr 18))
+    s.add char(0x80'u32 or ((cp shr 12) and 0x3F'u32))
+    s.add char(0x80'u32 or ((cp shr 6) and 0x3F'u32))
+    s.add char(0x80'u32 or (cp and 0x3F'u32))
+
+proc hex4(p: var JsonParser): (bool, uint32) =
+  if p.pos + 4 > p.s.len: return (false, 0'u32)
+  var v = 0'u32
+  for _ in 0 ..< 4:
+    let c = p.s[p.pos]
+    var d = 0'u32
+    if c >= '0' and c <= '9': d = uint32(ord(c) - ord('0'))
+    elif c >= 'a' and c <= 'f': d = uint32(ord(c) - ord('a') + 10)
+    elif c >= 'A' and c <= 'F': d = uint32(ord(c) - ord('A') + 10)
+    else: return (false, 0'u32)
+    v = (v shl 4) or d
+    inc p.pos
+  (true, v)
+
+proc parseStringBody(p: var JsonParser): (bool, string) =
+  ## `p.pos` is just past the opening quote.
+  var r = ""
+  while true:
+    if p.pos >= p.s.len:
+      discard fail(p, "EOF while parsing a string")
+      return (false, r)
+    let c = p.s[p.pos]
+    inc p.pos
+    if c == '"':
+      return (true, r)
+    if c == '\\':
+      if p.pos >= p.s.len:
+        discard fail(p, "EOF while parsing a string")
+        return (false, r)
+      let e = p.s[p.pos]
+      inc p.pos
+      case e
+      of '"': r.add '"'
+      of '\\': r.add '\\'
+      of '/': r.add '/'
+      of 'b': r.add '\b'
+      of 'f': r.add '\f'
+      of 'n': r.add '\n'
+      of 'r': r.add '\r'
+      of 't': r.add '\t'
+      of 'u':
+        let (ok, hi) = hex4(p)
+        if not ok:
+          discard fail(p, "invalid escape")
+          return (false, r)
+        if hi >= 0xD800'u32 and hi <= 0xDBFF'u32:
+          if p.pos + 1 < p.s.len and p.s[p.pos] == '\\' and p.s[p.pos + 1] == 'u':
+            p.pos += 2
+            let (ok2, lo) = hex4(p)
+            if not ok2 or lo < 0xDC00'u32 or lo > 0xDFFF'u32:
+              discard fail(p, "lone leading surrogate in hex escape")
+              return (false, r)
+            r.addUtf8(0x10000'u32 + ((hi - 0xD800'u32) shl 10) + (lo - 0xDC00'u32))
+          else:
+            discard fail(p, "lone leading surrogate in hex escape")
+            return (false, r)
+        elif hi >= 0xDC00'u32 and hi <= 0xDFFF'u32:
+          discard fail(p, "lone leading surrogate in hex escape")
+          return (false, r)
+        else:
+          r.addUtf8(hi)
+      else:
+        discard fail(p, "invalid escape")
+        return (false, r)
+    elif ord(c) < 0x20:
+      discard fail(p, "control character found while parsing a string")
+      return (false, r)
+    else:
+      r.add c
+
+proc parseNumberValue(p: var JsonParser): JsonValue =
+  let start = p.pos
+  var neg = false
+  if p.s[p.pos] == '-':
+    neg = true
+    inc p.pos
+  if p.pos >= p.s.len or p.s[p.pos] < '0' or p.s[p.pos] > '9':
+    return fail(p, "invalid number")
+  var integral = true
+  if p.s[p.pos] == '0':
+    inc p.pos
+    if p.pos < p.s.len and p.s[p.pos] >= '0' and p.s[p.pos] <= '9':
+      return fail(p, "invalid number")
+  else:
+    while p.pos < p.s.len and p.s[p.pos] >= '0' and p.s[p.pos] <= '9': inc p.pos
+  if p.pos < p.s.len and p.s[p.pos] == '.':
+    integral = false
+    inc p.pos
+    if p.pos >= p.s.len or p.s[p.pos] < '0' or p.s[p.pos] > '9':
+      return fail(p, "invalid number")
+    while p.pos < p.s.len and p.s[p.pos] >= '0' and p.s[p.pos] <= '9': inc p.pos
+  if p.pos < p.s.len and (p.s[p.pos] == 'e' or p.s[p.pos] == 'E'):
+    integral = false
+    inc p.pos
+    if p.pos < p.s.len and (p.s[p.pos] == '+' or p.s[p.pos] == '-'): inc p.pos
+    if p.pos >= p.s.len or p.s[p.pos] < '0' or p.s[p.pos] > '9':
+      return fail(p, "invalid number")
+    while p.pos < p.s.len and p.s[p.pos] >= '0' and p.s[p.pos] <= '9': inc p.pos
+  let text = p.s[start ..< p.pos]
+  if integral:
+    # Accumulate as u64 and fall through to a float on overflow, as serde_json does.
+    var acc = 0'u64
+    var fits = true
+    let first = if neg: 1 else: 0
+    for i in first ..< text.len:
+      let d = uint64(ord(text[i]) - ord('0'))
+      if acc > (0xFFFF_FFFF_FFFF_FFFF'u64 - d) div 10'u64:
+        fits = false
+        break
+      acc = acc * 10'u64 + d
+    if fits:
+      if neg:
+        if acc == 0'u64:
+          return JsonValue(kind: jvFloat, floatVal: -0.0)
+        if acc <= 0x8000_0000_0000_0000'u64:
+          return jsonInt(cast[int64](0'u64 - acc))
+      else:
+        return jsonUInt(acc)
+  var f = 0.0'f64
+  if parseBiggestFloat(text, f) != text.len:
+    return fail(p, "invalid number")
+  if f == Inf or f == -Inf:
+    return fail(p, "number out of range")
+  JsonValue(kind: jvFloat, floatVal: f)
+
+proc parseArrayValue(p: var JsonParser): JsonValue =
+  var items: seq[JsonValue] = @[]
+  skipWs(p)
+  if p.pos < p.s.len and p.s[p.pos] == ']':
+    inc p.pos
+    return jsonArray(items)
+  while true:
+    let v = parseValue(p)
+    if p.err.len > 0: return jsonNull()
+    items.add v
+    skipWs(p)
+    if p.pos >= p.s.len: return fail(p, "EOF while parsing a list")
+    let c = p.s[p.pos]
+    inc p.pos
+    if c == ']': return jsonArray(items)
+    if c != ',': return fail(p, "expected `,` or `]`")
+
+proc parseObjectValue(p: var JsonParser): JsonValue =
+  var obj = jsonObject()
+  skipWs(p)
+  if p.pos < p.s.len and p.s[p.pos] == '}':
+    inc p.pos
+    return obj
+  while true:
+    skipWs(p)
+    if p.pos >= p.s.len: return fail(p, "EOF while parsing an object")
+    if p.s[p.pos] != '"': return fail(p, "key must be a string")
+    inc p.pos
+    let (ok, key) = parseStringBody(p)
+    if not ok: return jsonNull()
+    skipWs(p)
+    if p.pos >= p.s.len or p.s[p.pos] != ':': return fail(p, "expected `:`")
+    inc p.pos
+    let v = parseValue(p)
+    if p.err.len > 0: return jsonNull()
+    obj.put(key, v)
+    skipWs(p)
+    if p.pos >= p.s.len: return fail(p, "EOF while parsing an object")
+    let c = p.s[p.pos]
+    inc p.pos
+    if c == '}': return obj
+    if c != ',': return fail(p, "expected `,` or `}`")
+
+proc matchWord(p: var JsonParser, word: string): bool =
+  if p.pos + word.len > p.s.len: return false
+  for i in 0 ..< word.len:
+    if p.s[p.pos + i] != word[i]: return false
+  p.pos += word.len
+  true
+
+proc parseValue(p: var JsonParser): JsonValue =
+  skipWs(p)
+  if p.pos >= p.s.len: return fail(p, "EOF while parsing a value")
+  let c = p.s[p.pos]
+  if c == 'n':
+    return if matchWord(p, "null"): jsonNull() else: fail(p, "expected ident")
+  if c == 't':
+    return if matchWord(p, "true"): jsonBool(true) else: fail(p, "expected ident")
+  if c == 'f':
+    return if matchWord(p, "false"): jsonBool(false) else: fail(p, "expected ident")
+  if c == '"':
+    inc p.pos
+    let (ok, s) = parseStringBody(p)
+    return if ok: jsonString(s) else: jsonNull()
+  if c == '[' or c == '{':
+    inc p.depth
+    if p.depth > RecursionLimit: return fail(p, "recursion limit exceeded")
+    inc p.pos
+    let v = if c == '[': parseArrayValue(p) else: parseObjectValue(p)
+    dec p.depth
+    return v
+  if c == '-' or (c >= '0' and c <= '9'):
+    return parseNumberValue(p)
+  fail(p, "expected value")
+
+proc parseJsonValue*(text: string): JsonParseOutcome =
+  ## `serde_json::from_str::<Value>`: one value, surrounding whitespace only.
+  var p = JsonParser(s: text, pos: 0, depth: 0, err: "")
+  let v = parseValue(p)
+  if p.err.len > 0:
+    return JsonParseOutcome(ok: false, value: jsonNull(), error: p.err)
+  skipWs(p)
+  if p.pos != p.s.len:
+    discard fail(p, "trailing characters")
+    return JsonParseOutcome(ok: false, value: jsonNull(), error: p.err)
+  JsonParseOutcome(ok: true, value: v, error: "")

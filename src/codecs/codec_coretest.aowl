@@ -1,0 +1,163 @@
+## Known answers for codec_core.aowl: encode, encodeStart, decode, parse, field codecs, the xmap templates.
+
+{.feature: "untyped".}
+
+import std/syncio
+import codec_core, json_ops
+
+var failures = 0
+
+proc check(cond: bool, what: string) =
+  if not cond:
+    echo "FAIL ", what
+    inc failures
+
+proc checkEq(a, b: string, what: string) =
+  if a != b:
+    echo "FAIL ", what, ": got [", a, "] want [", b, "]"
+    inc failures
+
+proc js(text: string): JsonValue =
+  let o = parseJsonValue(text)
+  if not o.ok:
+    echo "bad json in test: ", text
+    quit(1)
+  o.value
+
+# A hand-written Encode and Decode, on a plain type through a stream.
+type Pos = object
+  x, y, z: int32
+
+proc encode[V](p: Pos, ops: DynamicOps[V], prefix: V): DataResult[V] =
+  encode(intStream(@[p.x, p.y, p.z]), ops, prefix)
+
+proc decode[V](t: typedesc[Pos], input: V, ops: DynamicOps[V]): DataResult[(Pos, V)] =
+  let first = decode(IntStream, input, ops)
+  if not first.hasResultOrPartial:
+    return newError[(Pos, V)](first.message)
+  let pair = first.valueOrPartial
+  if pair[0].data.len != 3:
+    return flatMapJoin(first, newError[(Pos, V)]("Input is not a list of 3 elements"))
+  flatMapJoin(first, newSuccess((Pos(x: pair[0].data[0], y: pair[0].data[1], z: pair[0].data[2]), pair[1])))
+
+# A struct with fields, through a map builder.
+type Named = object
+  name: string
+  count: int32
+
+proc encode[V](n: Named, ops: DynamicOps[V], prefix: V): DataResult[V] =
+  var b = ops.mapBuilder()
+  b = encodeField(n.name, "name", ops, b)
+  b = encodeField(n.count, "count", ops, b)
+  build(b, prefix)
+
+proc decode[V](t: typedesc[Named], input: V, ops: DynamicOps[V]): DataResult[(Named, V)] =
+  let m = ops.getMap(input)
+  if not m.hasResultOrPartial:
+    return newError[(Named, V)](m.message)
+  let map1 = m.valueOrPartial
+  let name = decodeField(string, "name", map1, ops)
+  let count = decodeDefaultedField(int32, "count", map1, ops, 7'i32, false)
+  if name.isSuccess and count.isSuccess:
+    newSuccess((Named(name: name.successResult, count: count.successResult), input))
+  else:
+    newError[(Named, V)](combineMessages(name, count))
+
+# The xmap family.
+type Wrapped = object
+  n: int32
+
+proc wrapForward(i: int32): Wrapped = Wrapped(n: i)
+proc wrapBackward(w: Wrapped): int32 = w.n
+xmapCodecImpl(int32, Wrapped, wrapForward, wrapBackward)
+
+type Positive = object
+  n: int32
+
+proc positiveForward(i: int32): DataResult[Positive] =
+  if i > 0: newSuccess(Positive(n: i)) else: newError[Positive]("not positive: " & $i)
+proc positiveBackward(p: Positive): int32 = p.n
+comapFlatMapCodecImpl(int32, Positive, positiveForward, positiveBackward)
+
+type Even = object
+  n: int32
+
+proc evenForward(i: int32): Even = Even(n: i)
+proc evenBackward(e: Even): DataResult[int32] =
+  if e.n mod 2 == 0: newSuccess(e.n) else: newError[int32]("odd: " & $e.n)
+flatComapMapCodecImpl(int32, Even, evenForward, evenBackward)
+
+type Letter = object
+  s: string
+
+proc letterForward(s: string): DataResult[Letter] =
+  if s.len == 1: newSuccess(Letter(s: s)) else: newError[Letter]("Not a letter: " & s)
+proc letterBackward(l: Letter): DataResult[string] =
+  if l.s.len == 1: newSuccess(l.s) else: newError[string]("Not a letter: " & l.s)
+flatXmapCodecImpl(string, Letter, letterForward, letterBackward)
+
+proc main() =
+  let ops = jsonOps()
+
+  # encode, encodeStart, decode, parse
+  checkEq($encodeStart(3'i32, ops).unwrap, "3", "encodeStart int")
+  let d0 = decode(int32, js("-2"), ops)
+  check(d0.isSuccess and d0.successResult[0] == -2'i32 and d0.successResult[1] == jsonNull(), "decode int and remainder")
+  check(parse(int32, js("-2"), ops).unwrap == -2'i32, "parse int")
+  checkEq(encode(3'i32, ops, js("1")).message, "Do not know how to append a primitive value 3 to 1", "merge into primitive")
+
+  # Hand-written type
+  checkEq($encodeStart(Pos(x: 1, y: -2, z: 3), ops).unwrap, "[1,-2,3]", "Pos encode")
+  let p = parse(Pos, js("[4,5,6]"), ops).unwrap
+  check(p.x == 4 and p.y == 5 and p.z == 6, "Pos parse")
+  checkEq(parse(Pos, js("[4,5]"), ops).message, "Input is not a list of 3 elements", "Pos too short")
+  assertEncodeSuccess(Pos(x: 1, y: 2, z: 3), ops, js("[1,2,3]"))
+  assertDecodeIsSuccess(Pos, js("[1,2,3]"), ops)
+  assertDecodeIsError(Pos, js("true"), ops)
+
+  # Field codecs
+  checkEq($encodeStart(Named(name: "a", count: 2), ops).unwrap, """{"count":2,"name":"a"}""", "Named encode")
+  let n1 = parse(Named, js("""{"name":"x","count":4}"""), ops).unwrap
+  check(n1.name == "x" and n1.count == 4, "Named parse")
+  let n2 = parse(Named, js("""{"name":"x"}"""), ops).unwrap
+  check(n2.count == 7, "defaulted field absent")
+  checkEq(parse(Named, js("""{"count":4}"""), ops).message, "No key name in map", "missing field")
+  checkEq(parse(Named, js("""{"name":5}"""), ops).message, "Not a string: 5", "wrong field type")
+
+  # Lenient and strict defaulted and optional fields
+  let m = ops.getMap(js("""{"a":"text","b":5}""")).unwrap
+  check(decodeDefaultedField(int32, "a", m, ops, 9'i32, true).unwrap == 9'i32, "lenient default")
+  checkEq(decodeDefaultedField(int32, "a", m, ops, 9'i32, false).message, "Not a number: \"text\"", "strict default")
+  check(decodeDefaultedField(int32, "b", m, ops, 9'i32, false).unwrap == 5'i32, "present default")
+  check(decodeOptionalField(int32, "zz", m, ops, false).unwrap.isNone, "optional absent")
+  check(decodeOptionalField(int32, "a", m, ops, true).unwrap.isNone, "optional lenient")
+  check(decodeOptionalField(int32, "a", m, ops, false).isError, "optional strict")
+  check(decodeOptionalField(int32, "b", m, ops, false).unwrap.get == 5'i32, "optional present")
+
+  # encodeOptionalField, encodeDefaultedField with upstream's condition
+  var b = ops.mapBuilder()
+  b = encodeOptionalField(some(1'i32), "yes", ops, b)
+  b = encodeOptionalField(none[int32](), "no", ops, b)
+  b = encodeDefaultedField(5'i32, "equal", ops, b, 5'i32)
+  b = encodeDefaultedField(6'i32, "different", ops, b, 5'i32)
+  checkEq($build(b, jsonNull()).unwrap, """{"equal":5,"yes":1}""", "optional and defaulted encode")
+
+  # Templates
+  checkEq($encodeStart(Wrapped(n: 9), ops).unwrap, "9", "xmap encode")
+  check(parse(Wrapped, js("9"), ops).unwrap.n == 9, "xmap decode")
+  checkEq($encodeStart(Positive(n: 3), ops).unwrap, "3", "comapFlatMap encode")
+  check(parse(Positive, js("3"), ops).unwrap.n == 3, "comapFlatMap decode")
+  checkEq(parse(Positive, js("-3"), ops).message, "not positive: -3", "comapFlatMap decode error")
+  checkEq($encodeStart(Even(n: 2), ops).unwrap, "2", "flatComapMap encode")
+  checkEq(encodeStart(Even(n: 3), ops).message, "odd: 3", "flatComapMap encode error")
+  check(parse(Even, js("3"), ops).unwrap.n == 3, "flatComapMap decode")
+  checkEq($encodeStart(Letter(s: "a"), ops).unwrap, "\"a\"", "flatXmap encode")
+  checkEq(encodeStart(Letter(s: "ab"), ops).message, "Not a letter: ab", "flatXmap encode error")
+  check(parse(Letter, js("\"a\""), ops).unwrap.s == "a", "flatXmap decode")
+  checkEq(parse(Letter, js("\"ab\""), ops).message, "Not a letter: ab", "flatXmap decode error")
+
+main()
+if failures > 0:
+  echo failures, " failures"
+  quit(1)
+echo "codec_coretest ok"

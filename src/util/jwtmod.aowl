@@ -1,0 +1,853 @@
+## Port of pumpkin-util/src/jwt/mod.rs
+## PARTIAL: pumpkin-util/src/jwt/mod.rs - `fetch_oidc_jwks` takes its HTTP GET as a parameter, because no HTTP client in this repo compiles yet (src/auth/client.aowl); the discovery walk and parsing are all here.
+##
+## Named jwtmod because `jwt` already resolves to ../jwt/src/jwt.nim on the search path. P-384 arithmetic, SHA-2 and
+## HMAC are that sibling library's. RS256 verification, SPKI DER, compressed points, RFC 6979 signing and ECDH were
+## not in it or in src/auth/jwt.aowl and are here, on its bignum. `p384::PublicKey` is `EcPoint`.
+## That bignum is not constant time, which matters for `signEs384` and `computeSharedSecret` as they hold a private key.
+
+{.feature: "untyped".}
+
+import std/options
+import std/times
+import ../codecs/json_value
+import ../codecs/data_result
+import serde_forms
+import uuid
+import bignum, ecdsa, hmac, sha2
+
+const
+  OidcIssuer* = "https://identity.minecraft-services.net"
+  OidcAudience* = "api://auth-minecraft-services/multiplayer"
+  OidcDiscoveryUrl* = "https://client.discovery.minecraft-services.net/api/v1.0/discovery/MinecraftPE/builds/1.0.0.0"
+  FieldLen = 48
+
+type
+  PlayerClaims* = object
+    displayName*: string
+    uuid*: string
+    xuid*: string
+
+  AuthErrorKind* = enum
+    aekInvalidTokenFormat
+    aekMissingX5U
+    aekBase64Decode
+    aekJsonParse
+    aekPublicKeyBuild
+    aekMojangKeyMismatch
+    aekInvalidSignature
+    aekEcdsa
+
+  AuthError* = object
+    kind*: AuthErrorKind
+    detail*: string
+
+  JwtResult*[T] = object
+    case isOk*: bool
+    of true:
+      value*: T
+    of false:
+      error*: AuthError
+
+  Jwk* = object
+    kty*: string
+    alg*: Option[string]
+    crv*: Option[string]
+    x*: Option[string]
+    y*: Option[string]
+    n*: Option[string]
+    e*: Option[string]
+    kid*: string
+
+  Jwks* = object
+    keys*: seq[Jwk]
+
+  RsaPublicKey* = object
+    n*: BigInt
+    e*: BigInt
+
+  P384SigningKey* = object
+    d: BigInt
+
+  HttpGet* = proc (url: string, connectTimeoutMs, readTimeoutMs: uint32): (bool, string) {.closure.}
+    ## The body, or `(false, message)`.
+
+proc `$`*(e: AuthError): string =
+  ## thiserror's `Display`.
+  case e.kind
+  of aekInvalidTokenFormat: "Invalid token format"
+  of aekMissingX5U: "x5u not found in header"
+  of aekBase64Decode: "Base64 decoding failed: " & e.detail
+  of aekJsonParse: "JSON parse error: " & e.detail
+  of aekPublicKeyBuild: "Public key build failed: " & e.detail
+  of aekMojangKeyMismatch: "Token not signed by trusted Mojang key"
+  of aekInvalidSignature: "Invalid signature"
+  of aekEcdsa: "ECDSA signature error: " & e.detail
+
+proc jwtOk[T](value: sink T): JwtResult[T] =
+  JwtResult[T](isOk: true, value: value)
+
+proc jwtErr[T](kind: AuthErrorKind, detail = ""): JwtResult[T] =
+  JwtResult[T](isOk: false, error: AuthError(kind: kind, detail: detail))
+
+proc keyErr[T](detail: string): JwtResult[T] =
+  jwtErr[T](aekPublicKeyBuild, detail)
+
+# --- base64: the crate's strict engines -----------------------------------------------------------
+
+proc b64Value(c: char, urlSafe: bool): int =
+  if c >= 'A' and c <= 'Z': ord(c) - ord('A')
+  elif c >= 'a' and c <= 'z': ord(c) - ord('a') + 26
+  elif c >= '0' and c <= '9': ord(c) - ord('0') + 52
+  elif urlSafe and c == '-': 62
+  elif urlSafe and c == '_': 63
+  elif not urlSafe and c == '+': 62
+  elif not urlSafe and c == '/': 63
+  else: -1
+
+proc b64Decode(s: string, urlSafe, padded: bool): JwtResult[seq[byte]] =
+  ## Canonical padding when `padded`, none otherwise, and no stray trailing bits.
+  var bodyLen = s.len
+  while bodyLen > 0 and s[bodyLen - 1] == '=':
+    dec bodyLen
+  let pad = s.len - bodyLen
+  for i in 0 ..< bodyLen:
+    if b64Value(s[i], urlSafe) < 0:
+      return jwtErr[seq[byte]](aekBase64Decode, "Invalid symbol " & $ord(s[i]) & ", offset " & $i & ".")
+  if pad > 2:
+    return jwtErr[seq[byte]](aekBase64Decode, "Invalid symbol 61, offset " & $bodyLen & ".")
+  let rem = bodyLen mod 4
+  if rem == 1:
+    return jwtErr[seq[byte]](aekBase64Decode, "Invalid input length " & $bodyLen)
+  if padded:
+    if pad != (4 - rem) mod 4:
+      return jwtErr[seq[byte]](aekBase64Decode, "Invalid padding")
+  elif pad > 0:
+    return jwtErr[seq[byte]](aekBase64Decode, "Invalid padding")
+  var bytes: seq[byte] = @[]
+  var acc = 0'u32
+  var bits = 0
+  for i in 0 ..< bodyLen:
+    acc = (acc shl 6) or uint32(b64Value(s[i], urlSafe))
+    bits += 6
+    if bits >= 8:
+      bits -= 8
+      bytes.add(byte((acc shr uint32(bits)) and 0xFF'u32))
+  if (acc and ((1'u32 shl uint32(bits)) - 1'u32)) != 0'u32:
+    return jwtErr[seq[byte]](aekBase64Decode,
+      "Invalid last symbol " & $ord(s[bodyLen - 1]) & ", offset " & $(bodyLen - 1) & ".")
+  jwtOk(bytes)
+
+proc b64Encode(data: openArray[byte], urlSafe, padded: bool): string =
+  const std = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+  const url = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
+  result = ""
+  var i = 0
+  while i < data.len:
+    let remaining = data.len - i
+    let b0 = uint32(data[i])
+    let b1 = if remaining > 1: uint32(data[i + 1]) else: 0'u32
+    let b2 = if remaining > 2: uint32(data[i + 2]) else: 0'u32
+    let triple = (b0 shl 16) or (b1 shl 8) or b2
+    for j in 0 .. 3:
+      if j <= remaining:
+        let idx = int((triple shr uint32(18 - 6 * j)) and 63'u32)
+        result.add(if urlSafe: url[idx] else: std[idx])
+      elif padded:
+        result.add('=')
+    i += 3
+
+proc decodeB64UrlNopad*(s: string): JwtResult[seq[byte]] =
+  b64Decode(s, true, false)
+
+proc decodeB64Standard*(s: string): JwtResult[seq[byte]] =
+  b64Decode(s, false, true)
+
+proc strToBytes(s: string): seq[byte] =
+  result = newSeq[byte](s.len)
+  for i in 0 ..< s.len:
+    result[i] = byte(ord(s[i]))
+
+proc bytesToStr(b: openArray[byte]): string =
+  result = newString(b.len)
+  for i in 0 ..< b.len:
+    result[i] = char(b[i])
+
+proc parseJsonBytes(b: seq[byte]): JwtResult[JsonValue] =
+  let parsed = parseJsonValue(bytesToStr(b))
+  if parsed.ok: jwtOk(parsed.value)
+  else: jwtErr[JsonValue](aekJsonParse, parsed.error)
+
+# --- P-384 public keys -------------------------------------------------------------------------------
+
+const SpkiHeader = [0x30'u8, 0x76'u8, 0x30'u8, 0x10'u8, 0x06'u8, 0x07'u8, 0x2A'u8, 0x86'u8, 0x48'u8, 0xCE'u8,
+  0x3D'u8, 0x02'u8, 0x01'u8, 0x06'u8, 0x05'u8, 0x2B'u8, 0x81'u8, 0x04'u8, 0x00'u8, 0x22'u8, 0x03'u8, 0x62'u8, 0x00'u8]
+
+proc sliceOf(b: openArray[byte], first, count: int): seq[byte] =
+  result = newSeq[byte](count)
+  for i in 0 ..< count:
+    result[i] = b[first + i]
+
+proc fromSec1Bytes*(bytes: openArray[byte]): JwtResult[EcPoint] =
+  ## `PublicKey::from_sec1_bytes`: uncompressed or compressed, on the curve, never the identity.
+  let curve = p384()
+  if bytes.len == 1 + 2 * FieldLen and bytes[0] == 0x04'u8:
+    let x = bnFromBytesBE(sliceOf(bytes, 1, FieldLen))
+    let y = bnFromBytesBE(sliceOf(bytes, 1 + FieldLen, FieldLen))
+    if bnCmp(x, curve.p) >= 0 or bnCmp(y, curve.p) >= 0:
+      return keyErr[EcPoint]("crypto error")
+    let pt = EcPoint(x: x, y: y, infinity: false)
+    if not pointOnCurve(pt, curve):
+      return keyErr[EcPoint]("crypto error")
+    return jwtOk(pt)
+  if bytes.len == 1 + FieldLen and (bytes[0] == 0x02'u8 or bytes[0] == 0x03'u8):
+    let x = bnFromBytesBE(sliceOf(bytes, 1, FieldLen))
+    if bnCmp(x, curve.p) >= 0:
+      return keyErr[EcPoint]("crypto error")
+    let x3 = bnMulMod(bnMulMod(x, x, curve.p), x, curve.p)
+    let rhs = bnAddMod(bnAddMod(x3, bnMulMod(curve.a, x, curve.p), curve.p), bnMod(curve.b, curve.p), curve.p)
+    # p is 3 mod 4, so a root is rhs^((p + 1) / 4)
+    let exponent = bnShr1(bnShr1(bnAdd(curve.p, bnFromU32(1'u32))))
+    var y = bnModPow(rhs, exponent, curve.p)
+    if bnCmp(bnMulMod(y, y, curve.p), rhs) != 0:
+      return keyErr[EcPoint]("crypto error")
+    if bnTestBit(y, 0) != (bytes[0] == 0x03'u8):
+      y = bnSub(curve.p, y)
+    return jwtOk(EcPoint(x: x, y: y, infinity: false))
+  keyErr[EcPoint]("crypto error")
+
+proc toSec1Bytes*(pt: EcPoint): seq[byte] =
+  result = newSeq[byte](1 + 2 * FieldLen)
+  result[0] = 0x04'u8
+  let x = bnToBytesBE(pt.x, FieldLen)
+  let y = bnToBytesBE(pt.y, FieldLen)
+  for i in 0 ..< FieldLen:
+    result[1 + i] = x[i]
+    result[1 + FieldLen + i] = y[i]
+
+proc derReadTlv(b: openArray[byte], pos: var int, tag: uint8): (bool, int) =
+  ## Reads a tag and definite length at `pos` and leaves `pos` on the contents. Gives the contents' length.
+  if pos + 2 > b.len or b[pos] != tag:
+    return (false, 0)
+  inc pos
+  var length = int(b[pos])
+  inc pos
+  if length >= 0x80:
+    let count = length - 0x80
+    if count == 0 or count > 3 or pos + count > b.len:
+      return (false, 0)
+    length = 0
+    for i in 0 ..< count:
+      length = (length shl 8) or int(b[pos])
+      inc pos
+  if pos + length > b.len:
+    return (false, 0)
+  (true, length)
+
+proc fromPublicKeyDer*(der: openArray[byte]): JwtResult[EcPoint] =
+  ## `PublicKey::from_public_key_der`: SubjectPublicKeyInfo for id-ecPublicKey on secp384r1.
+  const IdEcPublicKey = [0x2A'u8, 0x86'u8, 0x48'u8, 0xCE'u8, 0x3D'u8, 0x02'u8, 0x01'u8]
+  const Secp384r1 = [0x2B'u8, 0x81'u8, 0x04'u8, 0x00'u8, 0x22'u8]
+  var pos = 0
+  let (hasOuter, outerLen) = derReadTlv(der, pos, 0x30'u8)
+  if not hasOuter or pos + outerLen != der.len:
+    return keyErr[EcPoint]("ASN.1 error: malformed SubjectPublicKeyInfo")
+  let (hasAlg, algLen) = derReadTlv(der, pos, 0x30'u8)
+  if not hasAlg:
+    return keyErr[EcPoint]("ASN.1 error: malformed AlgorithmIdentifier")
+  let algEnd = pos + algLen
+  let (hasOid, oidLen) = derReadTlv(der, pos, 0x06'u8)
+  if not hasOid or oidLen != IdEcPublicKey.len:
+    return keyErr[EcPoint]("unknown/unsupported algorithm OID")
+  for i in 0 ..< oidLen:
+    if der[pos + i] != IdEcPublicKey[i]:
+      return keyErr[EcPoint]("unknown/unsupported algorithm OID")
+  pos += oidLen
+  let (hasCurve, curveLen) = derReadTlv(der, pos, 0x06'u8)
+  if not hasCurve or curveLen != Secp384r1.len:
+    return keyErr[EcPoint]("unknown/unsupported algorithm OID")
+  for i in 0 ..< curveLen:
+    if der[pos + i] != Secp384r1[i]:
+      return keyErr[EcPoint]("unknown/unsupported algorithm OID")
+  pos += curveLen
+  if pos != algEnd:
+    return keyErr[EcPoint]("ASN.1 error: malformed AlgorithmIdentifier")
+  let (hasBits, bitsLen) = derReadTlv(der, pos, 0x03'u8)
+  if not hasBits or bitsLen < 1 or pos + bitsLen != der.len or der[pos] != 0'u8:
+    return keyErr[EcPoint]("ASN.1 error: malformed subjectPublicKey")
+  fromSec1Bytes(sliceOf(der, pos + 1, bitsLen - 1))
+
+proc toPublicKeyDer*(pt: EcPoint): seq[byte] =
+  result = @[]
+  for b in SpkiHeader:
+    result.add(b)
+  for b in toSec1Bytes(pt):
+    result.add(b)
+
+proc buildPublicKeyFromB64*(b64: string): JwtResult[EcPoint] =
+  var decoded = decodeB64Standard(b64)
+  if not decoded.isOk:
+    decoded = b64Decode(b64, true, true)
+  if not decoded.isOk:
+    decoded = decodeB64UrlNopad(b64)
+  if not decoded.isOk:
+    return jwtErr[EcPoint](decoded.error.kind, decoded.error.detail)
+  let bytes = decoded.value
+
+  if bytes.len > 0 and bytes[0] == 0x30'u8:
+    fromPublicKeyDer(bytes)
+  elif bytes.len == 97 and bytes[0] == 0x04'u8:
+    fromSec1Bytes(bytes)
+  elif bytes.len == 96:
+    var sec1 = newSeq[byte](97)
+    sec1[0] = 0x04'u8
+    for i in 0 ..< 96:
+      sec1[i + 1] = bytes[i]
+    fromSec1Bytes(sec1)
+  else:
+    keyErr[EcPoint]("Unsupported key format/length: " & $bytes.len & " bytes")
+
+proc decodeHeaderGetX5u*(headerB64: string): JwtResult[string] =
+  let headerBytes = decodeB64UrlNopad(headerB64)
+  if not headerBytes.isOk:
+    return jwtErr[string](headerBytes.error.kind, headerBytes.error.detail)
+  let headerJson = parseJsonBytes(headerBytes.value)
+  if not headerJson.isOk:
+    return jwtErr[string](headerJson.error.kind, headerJson.error.detail)
+  let (hasX5u, x5u) = headerJson.value.get("x5u")
+  if hasX5u and x5u.kind == jvString:
+    return jwtOk(x5u.strVal)
+  jwtErr[string](aekMissingX5U)
+
+# --- JWK ----------------------------------------------------------------------------------------------
+
+proc optionalString(v: JsonValue, key: string): DataResult[Option[string]] =
+  ## A missing or null `Option<String>` is `None`.
+  let (present, field) = v.get(key)
+  if not present or field.kind == jvNull:
+    return newSuccess(none[string]())
+  let s = readString(field)
+  if not s.isSuccess:
+    return newError[Option[string]](s.message)
+  newSuccess(some(s.successResult))
+
+proc fromJson*(t: typedesc[Jwk], v: JsonValue): DataResult[Jwk] =
+  if v.kind != jvObject:
+    return newError[Jwk](invalidType(v, "struct Jwk"))
+  let (hasKty, ktyV) = v.get("kty")
+  if not hasKty:
+    return newError[Jwk](missingField("kty"))
+  let kty = readString(ktyV)
+  if not kty.isSuccess:
+    return newError[Jwk](kty.message)
+  let alg = optionalString(v, "alg")
+  if not alg.isSuccess: return newError[Jwk](alg.message)
+  let crv = optionalString(v, "crv")
+  if not crv.isSuccess: return newError[Jwk](crv.message)
+  let x = optionalString(v, "x")
+  if not x.isSuccess: return newError[Jwk](x.message)
+  let y = optionalString(v, "y")
+  if not y.isSuccess: return newError[Jwk](y.message)
+  let n = optionalString(v, "n")
+  if not n.isSuccess: return newError[Jwk](n.message)
+  let e = optionalString(v, "e")
+  if not e.isSuccess: return newError[Jwk](e.message)
+  let (hasKid, kidV) = v.get("kid")
+  if not hasKid:
+    return newError[Jwk](missingField("kid"))
+  let kid = readString(kidV)
+  if not kid.isSuccess:
+    return newError[Jwk](kid.message)
+  newSuccess(Jwk(kty: kty.successResult, alg: alg.successResult, crv: crv.successResult, x: x.successResult,
+    y: y.successResult, n: n.successResult, e: e.successResult, kid: kid.successResult))
+
+proc fromJson*(t: typedesc[Jwks], v: JsonValue): DataResult[Jwks] =
+  if v.kind != jvObject:
+    return newError[Jwks](invalidType(v, "struct Jwks"))
+  let (hasKeys, keysV) = v.get("keys")
+  if not hasKeys:
+    return newError[Jwks](missingField("keys"))
+  if keysV.kind != jvArray:
+    return newError[Jwks](invalidType(keysV, "a sequence"))
+  var keys: seq[Jwk] = @[]
+  for item in keysV.items:
+    let k = fromJson(Jwk, item)
+    if not k.isSuccess:
+      return newError[Jwks](k.message)
+    keys.add(k.successResult)
+  newSuccess(Jwks(keys: keys))
+
+proc toEcPublicKey*(jwk: Jwk): JwtResult[EcPoint] =
+  if jwk.kty != "EC":
+    return keyErr[EcPoint]("Unsupported JWK kty for EC: " & jwk.kty)
+  if jwk.crv.isSome and jwk.crv.unsafeGet != "P-384":
+    return keyErr[EcPoint]("Unsupported JWK crv: " & jwk.crv.unsafeGet)
+  if jwk.x.isNone:
+    return keyErr[EcPoint]("JWK missing x coordinate for EC key")
+  if jwk.y.isNone:
+    return keyErr[EcPoint]("JWK missing y coordinate for EC key")
+
+  let xBytes = decodeB64UrlNopad(jwk.x.unsafeGet)
+  if not xBytes.isOk:
+    return jwtErr[EcPoint](xBytes.error.kind, xBytes.error.detail)
+  let yBytes = decodeB64UrlNopad(jwk.y.unsafeGet)
+  if not yBytes.isOk:
+    return jwtErr[EcPoint](yBytes.error.kind, yBytes.error.detail)
+
+  if xBytes.value.len != 48 or yBytes.value.len != 48:
+    return keyErr[EcPoint]("Invalid P-384 coordinate lengths")
+
+  var sec1: seq[byte] = @[0x04'u8]
+  for b in xBytes.value:
+    sec1.add(b)
+  for b in yBytes.value:
+    sec1.add(b)
+  fromSec1Bytes(sec1)
+
+proc toRsaPublicKey*(jwk: Jwk): JwtResult[RsaPublicKey] =
+  if jwk.kty != "RSA":
+    return keyErr[RsaPublicKey]("Unsupported JWK kty for RSA: " & jwk.kty)
+  if jwk.n.isNone:
+    return keyErr[RsaPublicKey]("JWK missing n modulus for RSA key")
+  if jwk.e.isNone:
+    return keyErr[RsaPublicKey]("JWK missing e exponent for RSA key")
+
+  let nBytes = decodeB64UrlNopad(jwk.n.unsafeGet)
+  if not nBytes.isOk:
+    return jwtErr[RsaPublicKey](nBytes.error.kind, nBytes.error.detail)
+  let eBytes = decodeB64UrlNopad(jwk.e.unsafeGet)
+  if not eBytes.isOk:
+    return jwtErr[RsaPublicKey](eBytes.error.kind, eBytes.error.detail)
+
+  let n = bnFromBytesBE(nBytes.value)
+  let e = bnFromBytesBE(eBytes.value)
+  # `RsaPublicKey::new`'s checks, in its order
+  if bnBitLen(n) > 4096:
+    return keyErr[RsaPublicKey]("modulus too large")
+  if bnCmp(e, n) >= 0 or not bnTestBit(n, 0):
+    return keyErr[RsaPublicKey]("invalid modulus")
+  if not bnTestBit(e, 0):
+    return keyErr[RsaPublicKey]("invalid exponent")
+  if bnCmp(e, bnFromU32(2'u32)) < 0:
+    return keyErr[RsaPublicKey]("public exponent too small")
+  if bnBitLen(e) > 33:
+    return keyErr[RsaPublicKey]("public exponent too large")
+  jwtOk(RsaPublicKey(n: n, e: e))
+
+# --- signatures ---------------------------------------------------------------------------------------
+
+proc verifyEs384Signature*(publicKey: EcPoint, signingInput, signatureB64: string): JwtResult[bool] =
+  let sigBytes = decodeB64UrlNopad(signatureB64)
+  if not sigBytes.isOk:
+    return jwtErr[bool](sigBytes.error.kind, sigBytes.error.detail)
+  if sigBytes.value.len != 96:
+    return jwtErr[bool](aekInvalidSignature)
+  let r = bnFromBytesBE(sliceOf(sigBytes.value, 0, 48))
+  let s = bnFromBytesBE(sliceOf(sigBytes.value, 48, 48))
+  if not ecdsaVerify(publicKey, sha384(strToBytes(signingInput)), r, s):
+    return jwtErr[bool](aekInvalidSignature)
+  jwtOk(true)
+
+proc verifyRs256Signature*(jwk: Jwk, signingInput, signatureB64: string): JwtResult[bool] =
+  ## RSASSA-PKCS1-v1_5 with SHA-256.
+  const DigestInfo = [0x30'u8, 0x31'u8, 0x30'u8, 0x0D'u8, 0x06'u8, 0x09'u8, 0x60'u8, 0x86'u8, 0x48'u8, 0x01'u8,
+    0x65'u8, 0x03'u8, 0x04'u8, 0x02'u8, 0x01'u8, 0x05'u8, 0x00'u8, 0x04'u8, 0x20'u8]
+  let publicKey = toRsaPublicKey(jwk)
+  if not publicKey.isOk:
+    return jwtErr[bool](publicKey.error.kind, publicKey.error.detail)
+  let sigBytes = decodeB64UrlNopad(signatureB64)
+  if not sigBytes.isOk:
+    return jwtErr[bool](sigBytes.error.kind, sigBytes.error.detail)
+
+  let k = (bnBitLen(publicKey.value.n) + 7) div 8
+  if sigBytes.value.len != k or k < DigestInfo.len + 32 + 11:
+    return jwtErr[bool](aekInvalidSignature)
+  let sig = bnFromBytesBE(sigBytes.value)
+  if bnCmp(sig, publicKey.value.n) >= 0:
+    return jwtErr[bool](aekInvalidSignature)
+  let em = bnToBytesBE(bnModPow(sig, publicKey.value.e, publicKey.value.n), k)
+  let hash = sha256(strToBytes(signingInput))
+
+  # 00 01 FF..FF 00 DigestInfo hash
+  let tLen = DigestInfo.len + 32
+  var good = em[0] == 0x00'u8 and em[1] == 0x01'u8 and em[k - tLen - 1] == 0x00'u8
+  for i in 2 ..< k - tLen - 1:
+    good = good and em[i] == 0xFF'u8
+  for i in 0 ..< DigestInfo.len:
+    good = good and em[k - tLen + i] == DigestInfo[i]
+  for i in 0 ..< 32:
+    good = good and em[k - 32 + i] == hash[i]
+  if not good:
+    return jwtErr[bool](aekInvalidSignature)
+  jwtOk(true)
+
+# --- claims -------------------------------------------------------------------------------------------
+
+proc debugValue(v: JsonValue): string =
+  ## serde_json::Value's `Debug`, which the audience mismatch message prints.
+  case v.kind
+  of jvNull: "Null"
+  of jvBool: (if v.boolVal: "Bool(true)" else: "Bool(false)")
+  of jvInt: "Number(" & $v.intVal & ")"
+  of jvUInt: "Number(" & $v.uintVal & ")"
+  of jvFloat: "Number(" & formatF64(v.floatVal) & ")"
+  of jvString: "String(\"" & v.strVal & "\")"
+  of jvArray:
+    var s = "Array ["
+    for i in 0 ..< v.items.len:
+      if i > 0: s.add(", ")
+      s.add(debugValue(v.items[i]))
+    s.add("]")
+    s
+  of jvObject:
+    var s = "Object {"
+    for i in 0 ..< v.keys.len:
+      if i > 0: s.add(", ")
+      s.add("\"" & v.keys[i] & "\": " & debugValue(v.vals[i]))
+    s.add("}")
+    s
+
+proc getStr(v: JsonValue, key: string): (bool, string) =
+  let (present, field) = v.get(key)
+  if present and field.kind == jvString: (true, field.strVal)
+  else: (false, "")
+
+proc nowUnixSeconds(): uint64 =
+  uint64(toUnix(getTime()))
+
+proc verifyOidcClaims*(payload: JsonValue, expectedIssuer: Option[string]): JwtResult[bool] =
+  if expectedIssuer.isSome:
+    let expected = expectedIssuer.unsafeGet
+    let (hasIss, iss) = getStr(payload, "iss")
+    if not hasIss:
+      return keyErr[bool]("OIDC payload missing iss")
+    if iss != expected:
+      return keyErr[bool]("OIDC issuer mismatch: expected " & expected & ", got " & iss)
+
+  let (hasAud, aud) = payload.get("aud")
+  if not hasAud:
+    return keyErr[bool]("OIDC payload missing aud")
+  var audMatch = false
+  if aud.kind == jvString:
+    audMatch = aud.strVal == OidcAudience
+  elif aud.kind == jvArray:
+    for item in aud.items:
+      if item.kind == jvString and item.strVal == OidcAudience:
+        audMatch = true
+  if not audMatch:
+    return keyErr[bool]("OIDC audience mismatch: expected " & OidcAudience & ", got " & debugValue(aud))
+
+  let (hasExp, expV) = payload.get("exp")
+  var exp = 0'u64
+  if hasExp and expV.kind == jvInt and expV.intVal >= 0:
+    exp = uint64(expV.intVal)
+  elif hasExp and expV.kind == jvUInt:
+    exp = expV.uintVal
+  else:
+    return keyErr[bool]("OIDC payload missing exp")
+  if nowUnixSeconds() > exp:
+    return keyErr[bool]("OIDC token expired")
+  jwtOk(true)
+
+proc xuidToUuid*(xuid: string): string =
+  $nameUuidFromBytes("pocket-auth-1-xuid:" & xuid)
+
+proc extractOidcPlayerClaims*(payload: JsonValue): PlayerClaims =
+  let displayName = getStr(payload, "xname")[1]
+  let xuid = getStr(payload, "xid")[1]
+  var uuidText = ""
+  if xuid.len == 0:
+    let leguuid = getStr(payload, "leguuid")[1]
+    uuidText = if leguuid.len == 0: xuidToUuid(xuid) else: leguuid
+  else:
+    uuidText = xuidToUuid(xuid)
+  PlayerClaims(displayName: displayName, uuid: uuidText, xuid: xuid)
+
+proc splitToken(token: string): seq[string] =
+  result = @[]
+  var part = ""
+  for c in token:
+    if c == '.':
+      result.add(part)
+      part = ""
+    else:
+      part.add(c)
+  result.add(part)
+
+proc verifyOidcToken*(token, expectedIssuer: string, jwks: Jwks): JwtResult[PlayerClaims] =
+  let parts = splitToken(token)
+  if parts.len < 3:
+    return jwtErr[PlayerClaims](aekInvalidTokenFormat)
+  let headerB64 = parts[0]
+  let payloadB64 = parts[1]
+  let signatureB64 = parts[2]
+
+  let signingInput = headerB64 & "." & payloadB64
+
+  let headerBytes = decodeB64UrlNopad(headerB64)
+  if not headerBytes.isOk:
+    return jwtErr[PlayerClaims](headerBytes.error.kind, headerBytes.error.detail)
+  let header = parseJsonBytes(headerBytes.value)
+  if not header.isOk:
+    return jwtErr[PlayerClaims](header.error.kind, header.error.detail)
+  let (hasKid, kid) = getStr(header.value, "kid")
+  if not hasKid:
+    return keyErr[PlayerClaims]("OIDC header missing kid")
+  let (hasAlg, alg) = getStr(header.value, "alg")
+  if not hasAlg:
+    return keyErr[PlayerClaims]("OIDC header missing alg")
+
+  var keyIndex = -1
+  for i in 0 ..< jwks.keys.len:
+    if jwks.keys[i].kid == kid:
+      keyIndex = i
+      break
+  if keyIndex < 0:
+    return keyErr[PlayerClaims]("Key not found in JWKS: " & kid)
+  let jwk = jwks.keys[keyIndex]
+
+  if alg == "ES384":
+    let key = toEcPublicKey(jwk)
+    if not key.isOk:
+      return jwtErr[PlayerClaims](key.error.kind, key.error.detail)
+    let verified = verifyEs384Signature(key.value, signingInput, signatureB64)
+    if not verified.isOk:
+      return jwtErr[PlayerClaims](verified.error.kind, verified.error.detail)
+  elif alg == "RS256":
+    let verified = verifyRs256Signature(jwk, signingInput, signatureB64)
+    if not verified.isOk:
+      return jwtErr[PlayerClaims](verified.error.kind, verified.error.detail)
+  else:
+    return keyErr[PlayerClaims]("Unsupported OIDC algorithm: " & alg)
+
+  let payloadBytes = decodeB64UrlNopad(payloadB64)
+  if not payloadBytes.isOk:
+    return jwtErr[PlayerClaims](payloadBytes.error.kind, payloadBytes.error.detail)
+  let v = parseJsonBytes(payloadBytes.value)
+  if not v.isOk:
+    return jwtErr[PlayerClaims](v.error.kind, v.error.detail)
+
+  let claims = verifyOidcClaims(v.value, some(expectedIssuer))
+  if not claims.isOk:
+    return jwtErr[PlayerClaims](claims.error.kind, claims.error.detail)
+
+  jwtOk(extractOidcPlayerClaims(v.value))
+
+proc verifyOidcTokenSelfSigned*(token: string): JwtResult[PlayerClaims] =
+  let parts = splitToken(token)
+  if parts.len < 3:
+    return jwtErr[PlayerClaims](aekInvalidTokenFormat)
+  let headerB64 = parts[0]
+  let payloadB64 = parts[1]
+  let signatureB64 = parts[2]
+
+  let signingInput = headerB64 & "." & payloadB64
+
+  let headerBytes = decodeB64UrlNopad(headerB64)
+  if not headerBytes.isOk:
+    return jwtErr[PlayerClaims](headerBytes.error.kind, headerBytes.error.detail)
+  let header = parseJsonBytes(headerBytes.value)
+  if not header.isOk:
+    return jwtErr[PlayerClaims](header.error.kind, header.error.detail)
+  let (hasAlg, alg) = getStr(header.value, "alg")
+  if not hasAlg:
+    return keyErr[PlayerClaims]("OIDC header missing alg")
+  if alg == "ES384":
+    let x5u = decodeHeaderGetX5u(headerB64)
+    if not x5u.isOk:
+      return jwtErr[PlayerClaims](x5u.error.kind, x5u.error.detail)
+    let der = decodeB64Standard(x5u.value)
+    if not der.isOk:
+      return jwtErr[PlayerClaims](der.error.kind, der.error.detail)
+    let key = fromPublicKeyDer(der.value)
+    if not key.isOk:
+      return keyErr[PlayerClaims]("Couldn't build public key from x5u")
+    let verified = verifyEs384Signature(key.value, signingInput, signatureB64)
+    if not verified.isOk:
+      return jwtErr[PlayerClaims](verified.error.kind, verified.error.detail)
+  else:
+    return keyErr[PlayerClaims]("Unsupported OIDC algorithm (for self-signed): " & alg)
+
+  let payloadBytes = decodeB64UrlNopad(payloadB64)
+  if not payloadBytes.isOk:
+    return jwtErr[PlayerClaims](payloadBytes.error.kind, payloadBytes.error.detail)
+  let v = parseJsonBytes(payloadBytes.value)
+  if not v.isOk:
+    return jwtErr[PlayerClaims](v.error.kind, v.error.detail)
+
+  let claims = verifyOidcClaims(v.value, none[string]())
+  if not claims.isOk:
+    return jwtErr[PlayerClaims](claims.error.kind, claims.error.detail)
+
+  jwtOk(extractOidcPlayerClaims(v.value))
+
+proc payloadOf(token: string): JwtResult[JsonValue] =
+  let parts = splitToken(token)
+  if parts.len < 2:
+    return jwtErr[JsonValue](aekInvalidTokenFormat)
+  let payloadBytes = decodeB64UrlNopad(parts[1])
+  if not payloadBytes.isOk:
+    return jwtErr[JsonValue](payloadBytes.error.kind, payloadBytes.error.detail)
+  parseJsonBytes(payloadBytes.value)
+
+proc extractOidcTokenPlayerClaims*(token: string): JwtResult[PlayerClaims] =
+  let v = payloadOf(token)
+  if not v.isOk:
+    return jwtErr[PlayerClaims](v.error.kind, v.error.detail)
+  jwtOk(extractOidcPlayerClaims(v.value))
+
+proc extractCpkFromToken*(token: string): JwtResult[EcPoint] =
+  let v = payloadOf(token)
+  if not v.isOk:
+    return jwtErr[EcPoint](v.error.kind, v.error.detail)
+  let (hasCpk, cpk) = getStr(v.value, "cpk")
+  if not hasCpk:
+    return keyErr[EcPoint]("OIDC payload missing cpk")
+  buildPublicKeyFromB64(cpk)
+
+# --- fetching keys ------------------------------------------------------------------------------------
+
+proc getJson(httpGet: HttpGet, url: string, connectTimeoutMs, readTimeoutMs: uint32): JwtResult[JsonValue] =
+  let (ok, body) = httpGet(url, connectTimeoutMs, readTimeoutMs)
+  if not ok:
+    return keyErr[JsonValue](body)
+  let parsed = parseJsonValue(body)
+  if not parsed.ok:
+    return keyErr[JsonValue](parsed.error)
+  jwtOk(parsed.value)
+
+proc fetchOidcJwks*(httpGet: HttpGet, discoveryUrl: Option[string], connectTimeoutMs,
+                    readTimeoutMs: uint32): JwtResult[(string, Jwks)] =
+  let url = if discoveryUrl.isSome: discoveryUrl.unsafeGet else: OidcDiscoveryUrl
+  let discovery = getJson(httpGet, url, connectTimeoutMs, readTimeoutMs)
+  if not discovery.isOk:
+    return jwtErr[(string, Jwks)](discovery.error.kind, discovery.error.detail)
+
+  var node = discovery.value
+  var found = true
+  for key in ["result", "serviceEnvironments", "auth", "prod"]:
+    let (present, inner) = node.get(key)
+    if not present:
+      found = false
+      break
+    node = inner
+  let (hasUri, serviceUri) = getStr(node, "serviceUri")
+  if not found or not hasUri:
+    return keyErr[(string, Jwks)]("Discovery missing serviceUri")
+
+  let openidConfig = getJson(httpGet, serviceUri & "/.well-known/openid-configuration",
+    connectTimeoutMs, readTimeoutMs)
+  if not openidConfig.isOk:
+    return jwtErr[(string, Jwks)](openidConfig.error.kind, openidConfig.error.detail)
+
+  let (hasJwksUri, jwksUri) = getStr(openidConfig.value, "jwks_uri")
+  if not hasJwksUri:
+    return keyErr[(string, Jwks)]("OpenID config missing jwks_uri")
+  let (hasIssuer, issuer) = getStr(openidConfig.value, "issuer")
+  if not hasIssuer:
+    return keyErr[(string, Jwks)]("OpenID config missing issuer")
+
+  let jwksValue = getJson(httpGet, jwksUri, connectTimeoutMs, readTimeoutMs)
+  if not jwksValue.isOk:
+    return jwtErr[(string, Jwks)](jwksValue.error.kind, jwksValue.error.detail)
+  let jwks = fromJson(Jwks, jwksValue.value)
+  if not jwks.isSuccess:
+    return keyErr[(string, Jwks)](jwks.message)
+
+  jwtOk((issuer, jwks.successResult))
+
+# --- signing and ECDH ---------------------------------------------------------------------------------
+
+proc signingKeyFromBytes*(secret: openArray[byte]): JwtResult[P384SigningKey] =
+  ## `SigningKey::from_slice`: 48 bytes, big-endian, in [1, n).
+  if secret.len != FieldLen:
+    return jwtErr[P384SigningKey](aekEcdsa, "signature error")
+  let d = bnFromBytesBE(secret)
+  if bnIsZero(d) or bnCmp(d, p384().n) >= 0:
+    return jwtErr[P384SigningKey](aekEcdsa, "signature error")
+  jwtOk(P384SigningKey(d: d))
+
+proc verifyingKey*(key: P384SigningKey): EcPoint =
+  let curve = p384()
+  scalarMul(key.d, EcPoint(x: curve.gx, y: curve.gy, infinity: false), curve)
+
+proc concat3(a: openArray[byte], tag: int, b, c: openArray[byte]): seq[byte] =
+  ## `a || tag || b || c`, with no tag byte when `tag` is negative.
+  result = @[]
+  for x in a:
+    result.add(x)
+  if tag >= 0:
+    result.add(uint8(tag))
+  for x in b:
+    result.add(x)
+  for x in c:
+    result.add(x)
+
+proc signEs384*(key: P384SigningKey, message: openArray[byte]): seq[byte] =
+  ## `SigningKey::sign`: SHA-384 with an RFC 6979 deterministic nonce, as `r || s`. No low-S step, as for NIST curves.
+  let curve = p384()
+  let g = EcPoint(x: curve.gx, y: curve.gy, infinity: false)
+  let digest = sha384(message)
+  let z = bnFromBytesBE(digest)
+  let x = bnToBytesBE(key.d, FieldLen)
+  let h = bnToBytesBE(bnMod(z, curve.n), FieldLen)
+  let none0: seq[byte] = @[]
+
+  var v = newSeq[byte](FieldLen)
+  var k = newSeq[byte](FieldLen)
+  for i in 0 ..< FieldLen:
+    v[i] = 0x01'u8
+    k[i] = 0x00'u8
+  var mac = hmacSha384(k, concat3(concat3(v, 0, x, h), -1, none0, none0))
+  for i in 0 ..< FieldLen: k[i] = mac[i]
+  mac = hmacSha384(k, v)
+  for i in 0 ..< FieldLen: v[i] = mac[i]
+  mac = hmacSha384(k, concat3(v, 1, x, h))
+  for i in 0 ..< FieldLen: k[i] = mac[i]
+  mac = hmacSha384(k, v)
+  for i in 0 ..< FieldLen: v[i] = mac[i]
+
+  while true:
+    mac = hmacSha384(k, v)
+    for i in 0 ..< FieldLen: v[i] = mac[i]
+    let nonce = bnFromBytesBE(v)
+    if not bnIsZero(nonce) and bnCmp(nonce, curve.n) < 0:
+      let point = scalarMul(nonce, g, curve)
+      let r = bnMod(point.x, curve.n)
+      if not bnIsZero(r):
+        let s = bnMulMod(bnModInv(nonce, curve.n), bnAddMod(bnMod(z, curve.n), bnMulMod(r, key.d, curve.n), curve.n), curve.n)
+        if not bnIsZero(s):
+          result = bnToBytesBE(r, FieldLen)
+          for b in bnToBytesBE(s, FieldLen):
+            result.add(b)
+          return result
+    mac = hmacSha384(k, concat3(v, 0, none0, none0))
+    for i in 0 ..< FieldLen: k[i] = mac[i]
+    mac = hmacSha384(k, v)
+    for i in 0 ..< FieldLen: v[i] = mac[i]
+
+proc generateHandshakeJwt*(signingKey: P384SigningKey, salt: openArray[byte]): JwtResult[string] =
+  let x5u = b64Encode(toPublicKeyDer(verifyingKey(signingKey)), false, true)
+  let saltB64 = b64Encode(salt, false, false)
+
+  var headerJson = jsonObject()
+  headerJson.put("alg", jsonString("ES384"))
+  headerJson.put("x5u", jsonString(x5u))
+  var payloadJson = jsonObject()
+  payloadJson.put("salt", jsonString(saltB64))
+
+  let headerB64 = b64Encode(strToBytes(toJsonString(headerJson)), true, false)
+  let payloadB64 = b64Encode(strToBytes(toJsonString(payloadJson)), true, false)
+
+  let signingInput = headerB64 & "." & payloadB64
+
+  let signatureB64 = b64Encode(signEs384(signingKey, strToBytes(signingInput)), true, false)
+
+  jwtOk(signingInput & "." & signatureB64)
+
+proc computeSharedSecret*(signingKey: P384SigningKey, clientPublicKey: EcPoint): array[48, byte] =
+  ## The x coordinate of the ECDH point.
+  let shared = bnToBytesBE(scalarMul(signingKey.d, clientPublicKey, p384()).x, FieldLen)
+  result = sha384(@[])
+  for i in 0 ..< FieldLen:
+    result[i] = shared[i]

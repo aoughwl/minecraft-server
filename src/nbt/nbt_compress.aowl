@@ -1,63 +1,105 @@
-## Helpers for reading and writing gzip-compressed NBT data.
-## Port of upstream/nbt/src/nbt_compress.rs
+## Reading and writing gzip-compressed NBT.
+## Port of pumpkin-nbt/src/nbt_compress.rs
 ##
-## Backed by the aoughwl `compress` library (../compress, added via
-## aowlmony.paths), a one-shot `string -> string` gzip/Brotli/Zstd codec set
-## over the system zlib/brotli/zstd. Its `gzipCompress`/`gzipDecompress`
-## operate on `string`, so this file converts to/from `seq[byte]` at the
-## boundary; `compress` signals failure by returning `""`, which this
-## module turns into a proper `NbtResult` error rather than silently
-## treating it as valid empty output.
+## Gzip comes from zlibgz.aowl, linked statically on Windows; gziptest.aowl runs it here. Compressed bytes
+## differ from upstream's flate2 output with the miniz_oxide backend, while the header matches. As upstream:
+## decompressed data is cut off at 64 MiB with no error of its own, and trailing bytes after the first
+## gzip member are ignored.
 ##
-## Verification status: this file and gziptest.aowl compile clean, but
-## full runtime round-trip verification was NOT achieved on this Windows
-## dev machine. `compress`'s zlib binding hardcodes the Linux shared-object
-## name `libz.so.1` via `{.dynlib.}` (no Windows name variant), so on
-## Windows it fails to load by default. Making a same-format zlib DLL
-## available under that exact literal filename gets past the load step,
-## but the subsequent `deflateInit2_`/`deflate` calls then fail (returns
-## nonzero) - a deeper ABI/calling-convention mismatch on Windows, not
-## just a naming issue, and debugging that is `compress`'s own internals
-## (a sibling project), out of scope here. `compress`'s own README targets
-## Linux (`libz.so.1`/`libbrotlienc.so.1`/`libzstd.so.1`), so this is
-## expected to work correctly on the project's actual Linux deployment
-## target; it just couldn't be proven end-to-end from here. Re-run
-## gziptest.aowl on Linux to confirm before relying on this in production.
+## `impl Read`/`impl Write` become a byte buffer or a File. The original `writeGzipCompoundTag(compound)`
+## returning the bytes stays, the same as `writeGzipCompoundTagToBytes`.
 
-import nbtbase, nbtdoc, tag, serializer, deserializer
-import compress
+{.feature: "untyped".}
 
-const MaxDecompressedSize = 64 * 1024 * 1024 ## matches upstream's 64 MiB cap
+import std/syncio
+import nbtbase, nbtdoc, tag, deserializer
+import serde_ser, serde_de
+import zlibgz
 
-proc bytesToStr(data: seq[byte]): string =
-  result = newString(data.len)
-  for i, b in data:
-    result[i] = char(b)
+const MaxDecompressedSize* = 64 * 1024 * 1024
 
-proc strToBytes(s: string): seq[byte] =
-  result = newSeq[byte](s.len)
-  for i, c in s:
-    result[i] = byte(c)
+proc gunzip(input: openArray[byte], output: var seq[byte]): NbtVoidResult =
+  let d = gzipDecompressBytes(input, MaxDecompressedSize)
+  if not d.ok:
+    return errVoid(incomplete(d.msg))
+  output = d.data
+  okVoid()
+
+proc gzip(input: openArray[byte], output: var seq[byte]): NbtVoidResult =
+  let c = gzipCompressBytes(input)
+  if not c.ok:
+    return errVoid(incomplete(c.msg))
+  addAll(output, c.data)
+  okVoid()
+
+proc readWholeFile(f: File, output: var seq[byte]): NbtVoidResult =
+  var chunk = newSeq[byte](65536)
+  while true:
+    let n = readBuffer(f, addr chunk[0], chunk.len)
+    if n <= 0:
+      return okVoid()
+    for i in 0 ..< n:
+      output.add chunk[i]
 
 proc readGzipCompoundTag*(input: seq[byte]): NbtResult[NbtCompound] =
-  let compressed = bytesToStr(input)
-  let decompressed = gzipDecompress(compressed, maxSize = MaxDecompressedSize)
-  if decompressed.len == 0 and compressed.len != 0:
-    # compress.aowl signals a decode failure with "" - genuine empty-payload
-    # gzip streams still carry a nonzero (header+trailer) compressed size,
-    # so a nonempty input decompressing to "" is always the error case.
-    return errRes[NbtCompound](incomplete("gzip decompression failed (bad stream or exceeded " &
-      $MaxDecompressedSize & " byte limit)"))
-  var reader = newNbtReader(nrmJava, strToBytes(decompressed))
+  ## A gzip-compressed, named NBT compound.
+  var buf = newSeq[byte](0)
+  let d = gunzip(input, buf)
+  if not d.isOk:
+    return errRes[NbtCompound](d.error)
+  var reader = newNbtReader(nrmJava, buf)
   let nbtRes = read(reader)
   if not nbtRes.isOk:
     return errRes[NbtCompound](nbtRes.error)
   ok[NbtCompound](nbtRes.value.rootTag)
 
+proc readGzipCompoundTag*(input: File): NbtResult[NbtCompound] =
+  var raw = newSeq[byte](0)
+  let r = readWholeFile(input, raw)
+  if not r.isOk:
+    return errRes[NbtCompound](r.error)
+  readGzipCompoundTag(raw)
+
+proc writeGzipCompoundTag*(compound: sink NbtCompound, output: var seq[byte]): NbtVoidResult =
+  ## The root name is written as an empty string.
+  gzip(write(newNbt("", compound)), output)
+
+proc writeGzipCompoundTag*(compound: sink NbtCompound, output: File): NbtVoidResult =
+  var buf = newSeq[byte](0)
+  let r = writeGzipCompoundTag(compound, buf)
+  if not r.isOk:
+    return r
+  writeBytesTo(buf, output)
+
+proc writeGzipCompoundTagToBytes*(compound: sink NbtCompound): NbtResult[seq[byte]] =
+  var buf = newSeq[byte](0)
+  let r = writeGzipCompoundTag(compound, buf)
+  if not r.isOk:
+    return errRes[seq[byte]](r.error)
+  ok[seq[byte]](buf)
+
 proc writeGzipCompoundTag*(compound: sink NbtCompound): NbtResult[seq[byte]] =
-  let doc = newNbt("", compound)
-  let raw = write(doc, nwmJava)
-  let compressed = gzipCompress(bytesToStr(raw))
-  if compressed.len == 0 and raw.len != 0:
-    return errRes[seq[byte]](incomplete("gzip compression failed"))
-  ok[seq[byte]](strToBytes(compressed))
+  writeGzipCompoundTagToBytes(compound)
+
+proc fromGzipBytes*[T](input: seq[byte]): NbtResult[T] =
+  ## A value from gzip-compressed, named Java Edition NBT.
+  var buf = newSeq[byte](0)
+  let d = gunzip(input, buf)
+  if not d.isOk:
+    return errRes[T](d.error)
+  fromBytes[T](buf)
+
+proc toGzipBytes*[T](value: T, output: var seq[byte]): NbtVoidResult =
+  ## The root name is written as an empty string.
+  var raw = newSeq[byte](0)
+  let r = toBytes(value, raw)
+  if not r.isOk:
+    return r
+  gzip(raw, output)
+
+proc toGzipBytesVec*[T](value: T): NbtResult[seq[byte]] =
+  var buf = newSeq[byte](0)
+  let r = toGzipBytes(value, buf)
+  if not r.isOk:
+    return errRes[seq[byte]](r.error)
+  ok[seq[byte]](buf)
