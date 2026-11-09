@@ -1,0 +1,199 @@
+## Test for proto.aowl: lib.rs's types with exact bytes, and the worked example from
+## the convention in the header, compiled and run so that it cannot go stale.
+import std/assertions
+import std/syncio
+import protobase, netcodec, varint, proto, textcomponent, aescfb8, lpvector3d, packetbase
+import ../generated/packet
+import ../util/javaversion
+import ../util/vector3
+
+# --- The worked example ---------------------------------------------------------
+
+type
+  CEntityVelocity* = object
+    entityId*: VarInt
+    velocity*: LpVector3d
+
+proc toId*(_: typedesc[CEntityVelocity]; v: JavaMinecraftVersion): int32 =
+  CB_PLAY_SET_ENTITY_MOTION.toId(v)
+
+proc writePacket*(p: CEntityVelocity; w: var NetWriter; v: JavaMinecraftVersion): ProtoWriteVoidResult =
+  writeVarInt(w, p.entityId)
+  # Protocol 773+ uses packed velocity; 772 and below use three i16 components.
+  if v >= jmvV1_21_9:
+    p.velocity.write(w)
+  else:
+    p.velocity.writeLegacy(w)
+  writeOkVoid()
+
+type
+  SExample* = object
+    name*: string
+    nick*: Option[string]
+    ids*: seq[int32]
+    flags*: uint8       ## only sent since 1.21.2
+
+proc toId*(_: typedesc[SExample]; v: JavaMinecraftVersion): int32 =
+  SB_PLAY_CHAT_COMMAND.toId(v)
+
+proc readPacket*(_: typedesc[SExample]; r: var NetReader; v: JavaMinecraftVersion): ProtoReadResult[SExample] =
+  let name = tryRead(SExample, getStrBounded(r, 16))
+  var nick = none[string]()
+  if tryRead(SExample, getBool(r)):
+    nick = some(tryRead(SExample, getStr(r)))
+  let count = tryRead(SExample, getVarInt(r)).value
+  if count < 0 or count > 64:                 # upstream caps its lists; this is an example cap
+    return readErr[SExample](tooLarge("ids"))
+  var ids: seq[int32] = @[]
+  for i in 0 ..< count:
+    ids.add(tryRead(SExample, getVarInt(r)).value)
+  var flags = 0'u8
+  if v >= jmvV1_21_2:
+    flags = tryRead(SExample, getU8(r))
+  readOk(SExample(name: name, nick: nick, ids: ids, flags: flags))
+
+proc writePacket*(p: SExample; w: var NetWriter; v: JavaMinecraftVersion): ProtoWriteVoidResult =
+  tryWrite writeStringBounded(w, p.name, 16)
+  writeBool(w, p.nick.isSome)
+  if p.nick.isSome:
+    tryWrite writeString(w, p.nick.unsafeGet)
+  writeVarInt(w, newVarInt(int32(p.ids.len)))
+  for id in p.ids:
+    writeVarInt(w, newVarInt(id))
+  if v >= jmvV1_21_2:
+    writeU8(w, p.flags)
+  writeOkVoid()
+
+block entityVelocity:
+  let p = CEntityVelocity(entityId: newVarInt(300),
+    velocity: LpVector3d(value: Vector3[float64](x: 0.5, y: -0.5, z: 0.0)))
+  assert CEntityVelocity.toId(fromProtocol(774'u32)) == 99'i32
+
+  # The whole packet as it goes out: id, entity, packed velocity.
+  var w = newNetWriter()
+  writeJavaPacketId(w, CEntityVelocity.toId(jmvV1_21_11))
+  assert writePacket(p, w, jmvV1_21_11).isOk
+  assert w.buf == @[99'u8, 0xAC, 0x02, 0xF9, 0xFF, 0x7F, 0xFE, 0x80, 0x02]
+
+  # The other side of the gate.
+  var old = newNetWriter()
+  assert writePacket(p, old, jmvV1_21_7).isOk
+  assert old.buf == @[0xAC'u8, 0x02, 0x0F, 0xA0, 0xF0, 0x60, 0x00, 0x00]
+
+block example:
+  let p = SExample(name: "ab", nick: some("c"), ids: @[1'i32, 300'i32], flags: 7'u8)
+  var w = newNetWriter()
+  assert writePacket(p, w, jmvV1_21_11).isOk
+  assert w.buf == @[2'u8, 0x61, 0x62, 1, 1, 0x63, 2, 1, 0xAC, 0x02, 7]
+  var r = newNetReader(w.buf)
+  let got = readPacket(SExample, r, jmvV1_21_11)
+  assert got.isOk
+  assert got.value.name == "ab" and got.value.nick.unsafeGet == "c"
+  assert got.value.ids == @[1'i32, 300'i32] and got.value.flags == 7'u8
+
+  # Older version: no flags on the wire.
+  var oldW = newNetWriter()
+  assert writePacket(SExample(name: "a", nick: none[string](), ids: @[], flags: 7'u8), oldW, jmvV1_21).isOk
+  assert oldW.buf == @[1'u8, 0x61, 0, 0]
+  var oldR = newNetReader(oldW.buf)
+  let oldGot = readPacket(SExample, oldR, jmvV1_21)
+  assert oldGot.isOk and oldGot.value.flags == 0'u8 and oldGot.value.nick.isNone
+
+  # An error from any field stops the read, at each step.
+  for cut in 0 ..< w.buf.len:
+    var truncated = newNetReader(w.buf[0 ..< cut])
+    assert not readPacket(SExample, truncated, jmvV1_21_11).isOk
+
+  # An error from a fallible write stops the write.
+  var tooLong = newNetWriter()
+  assert not writePacket(SExample(name: "12345678901234567", nick: none[string](), ids: @[], flags: 0'u8),
+    tooLong, jmvV1_21_11).isOk
+
+# --- lib.rs ---------------------------------------------------------------------
+
+block connectionState:
+  assert connectionStateFromVarInt(1) == (true, csStatus)
+  assert connectionStateFromVarInt(2) == (true, csLogin)
+  assert connectionStateFromVarInt(3) == (true, csTransfer)
+  assert connectionStateFromVarInt(4)[0] == false
+
+block idOr:
+  let sound = SoundEvent(soundName: "a", range: some(1.0'f32))
+  let putSound: proc(w: var NetWriter; e: SoundEvent): ProtoWriteVoidResult {.closure.} = writeSoundEvent
+  var w = newNetWriter()
+  assert writeIdOr[SoundEvent](IdOr[SoundEvent](kind: iokId, id: 5'u16), w, putSound).isOk
+  assert writeIdOr[SoundEvent](IdOr[SoundEvent](kind: iokValue, value: sound), w, putSound).isOk
+  assert w.buf == @[6'u8, 0, 1, 0x61, 1, 0x3F, 0x80, 0, 0]
+  var r = newNetReader(w.buf)
+  let first = readIdOr[SoundEvent](r, readSoundEvent)
+  assert first.isOk and first.value.kind == iokId and first.value.id == 5'u16
+  let second = readIdOr[SoundEvent](r, readSoundEvent)
+  assert second.isOk and second.value.kind == iokValue
+  assert second.value.value.soundName == "a" and second.value.value.range.unsafeGet == 1.0'f32
+
+block property:
+  let p = Property(name: "n", value: "v", signature: some("s"))
+  var w = newNetWriter()
+  assert p.write(w).isOk
+  assert w.buf == @[1'u8, 0x6E, 1, 0x76, 1, 1, 0x73]
+  var r = newNetReader(w.buf)
+  let got = read(Property, r)
+  assert got.isOk and got.value.name == "n" and got.value.value == "v" and got.value.signature.unsafeGet == "s"
+
+block knownPack:
+  var w = newNetWriter()
+  assert KnownPack(namespace: "m", id: "c", version: "1").write(w).isOk
+  assert w.buf == @[1'u8, 0x6D, 1, 0x63, 1, 0x31]
+
+block numberFormat:
+  var w = newNetWriter()
+  NumberFormat(kind: nfBlank).write(w)
+  NumberFormat(kind: nfStyled, style: Style()).write(w)
+  NumberFormat(kind: nfFixed, fixedText: text("")).write(w)
+  assert w.buf == @[0'u8, 1, 2, 0x0A, 0x08, 0, 4, 0x74, 0x65, 0x78, 0x74, 0, 0, 0]
+
+block positionFlags:
+  assert getBitfield([pfX, pfY, pfZ]) == 7'i32
+  assert getBitfield([pfYRot, pfXRot]) == 24'i32
+  assert getBitfield([pfDeltaX, pfDeltaY, pfDeltaZ, pfRotateDelta]) == 0x1E0'i32
+
+block link:
+  let builtin = newLink(Label(kind: lkBuiltIn, builtIn: ltWebsite), "u")
+  assert builtin.isBuiltIn
+  var w = newNetWriter()
+  assert builtin.write(w).isOk
+  assert w.buf == @[1'u8, 6, 1, 0x75]
+  let custom = newLink(Label(kind: lkTextComponent, textComponent: text("")), "u")
+  assert not custom.isBuiltIn
+  var w2 = newNetWriter()
+  assert custom.write(w2).isOk
+  assert w2.buf == @[0'u8, 0x0A, 0x08, 0, 4, 0x74, 0x65, 0x78, 0x74, 0, 0, 0, 1, 0x75]
+
+block statusResponse:
+  let s = StatusResponse(
+    version: some(Version(name: "1.21.11", protocol: 774'u32)),
+    players: some(Players(max: 20'u32, online: 1'u32, sample: @[Sample(name: "a", id: "b")])),
+    description: "q\"x\n",
+    favicon: none[string](),
+    enforceSecureChat: false)
+  assert s.toJson() == "{\"version\":{\"name\":\"1.21.11\",\"protocol\":774},\"players\":{\"max\":20,\"online\":1,\"sample\":[{\"name\":\"a\",\"id\":\"b\"}]},\"description\":\"q\\\"x\\n\",\"favicon\":null,\"enforceSecureChat\":false}"
+
+block errors:
+  assert packetTooLong(9).msg == "Packet exceeds maximum length: 9"
+  assert packetDecodeError(pdeTooLong).msg == "packet exceeds maximum length"
+  let conv = toPacketDecodeError(tooLarge("x"))
+  assert conv.kind == pdeFailedDecompression and conv.msg == "failed to decompress packet: too large: x"
+
+block streamCipher:
+  # NIST SP 800-38A CFB8-AES128, through the stream types.
+  let key = @[0x2b'u8, 0x7e, 0x15, 0x16, 0x28, 0xae, 0xd2, 0xa6, 0xab, 0xf7, 0x15, 0x88, 0x09, 0xcf, 0x4f, 0x3c]
+  let iv = @[0x00'u8, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f]
+  var enc = newStreamEncryptor(newAes128Cfb8(key, iv))
+  var dec = newStreamDecryptor(newAes128Cfb8(key, iv))
+  var buf = @[0x6b'u8, 0xc1, 0xbe]
+  enc.encrypt(buf)
+  assert buf == @[0x3b'u8, 0x79, 0x42]
+  dec.decrypt(buf)
+  assert buf == @[0x6b'u8, 0xc1, 0xbe]
+
+echo "all proto checks passed"

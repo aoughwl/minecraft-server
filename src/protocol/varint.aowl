@@ -1,23 +1,31 @@
 ## Variable-length integer codecs used by the Minecraft network protocol.
-## Port of upstream/protocol/src/codec/var_int.rs and
-## var_uint.rs.
+## Port of pumpkin-protocol/src/codec/var_int.rs, pumpkin-protocol/src/codec/var_uint.rs,
+## pumpkin-protocol/src/codec/var_long.rs and pumpkin-protocol/src/codec/var_ulong.rs.
 ##
 ## Two distinct wire shapes coexist here, matching upstream exactly (and
 ## matching the same Java-vs-Bedrock split already established in
 ## src/nbt/serializer.aowl / deserializer.aowl):
-## - `VarInt.encode`/`.decode` (Java Edition): plain LEB128 of the value's
-##   `u32` bit pattern, no ZigZag. This is the one actually used on the
-##   Java wire for packet-length prefixes and most integer fields.
-## - `VarInt`'s `PacketWrite`/`PacketRead` impl (Bedrock): LEB128 of the
-##   ZigZag-encoded value. Upstream's own test names this
-##   `bedrock_zig_zag_round_trip`.
-## `VarUInt` only has the plain-LEB128 shape (no signed/ZigZag variant).
+## - `encodeJava`/`decodeJava` (upstream `encode`/`decode`, Java Edition): plain
+##   LEB128 of the value's bit pattern, no ZigZag.
+## - `encodeBedrock`/`decodeBedrock` (upstream's `PacketWrite`/`PacketRead` impl):
+##   LEB128 of the ZigZag-encoded value.
+## `VarUInt`/`VarULong` only have the plain-LEB128 shape.
 ##
 ## Reader/writer here are the same "operate on an owned seq[byte] with a
 ## position cursor" shape as src/nbt/deserializer.aowl's `NbtReader`, rather
-## than reproducing Rust's generic `Read`/`Write`/`AsyncRead` split - the
-## async variants (`decode_async`/`encode_async`) are tokio-runtime
-## plumbing with no aowlmony equivalent yet and are not ported.
+## than reproducing Rust's generic `Read`/`Write`/`AsyncRead` split. The async
+## variants are one implementation here: a decode that hits the end of the
+## buffer on its first byte reports `reCleanEof` as `decode_async` does, and on
+## a later byte `reIncomplete`.
+##
+## Deliberate differences from the pinned tree, each taken from the newer
+## `../ref/pumpkin` checkout because the pinned code is wrong or has a TODO:
+## - `decodeJava`/`decodeBedrock`/`decode` reject a fifth byte with payload bits
+##   above bit 31 (the pinned `// TODO: Validate`).
+## - `decodeBedrock` for VarInt undoes ZigZag properly. The pinned
+##   `(val >> 1) ^ (val << 31)` decodes every negative value wrongly.
+## And one found here: `writtenSizeVarULong` measures 64 bits. The pinned
+## `31 - leading_zeros` underflows for any value below 2^32.
 
 import protobase
 
@@ -52,6 +60,9 @@ proc leadingZeros32(n: uint32): int =
     inc result
     mask = mask shr 1
 
+proc eofAt(i: int; what: string): ReadingError =
+  if i == 0: cleanEof(what) else: incompleteRead("EOF inside " & what)
+
 proc writtenSizeVarInt*(v: VarInt): int =
   let n = cast[uint32](v.value)
   if n == 0: 1
@@ -60,6 +71,13 @@ proc writtenSizeVarInt*(v: VarInt): int =
 proc writtenSizeVarUInt*(v: VarUInt): int =
   if v.value == 0: 1
   else: (31 - leadingZeros32(v.value)) div 7 + 1
+
+proc writtenSizeVarULong*(v: VarULong): int =
+  var n = v.value
+  result = 1
+  while n > 0x7F'u64:
+    n = n shr 7
+    inc result
 
 # --- Java: plain LEB128 (VarInt.encode/decode) ------------------------------
 
@@ -75,7 +93,7 @@ proc decodeJava*(data: seq[byte], pos: var int): ProtoReadResult[VarInt] =
   var i = 0
   while i < MaxVarIntSize:
     if pos >= data.len:
-      return readErr[VarInt](cleanEof("VarInt"))
+      return readErr[VarInt](eofAt(i, "VarInt"))
     let b = data[pos]
     inc pos
     if i == MaxVarIntSize - 1 and (b and 0x70'u8) != 0:
@@ -100,7 +118,7 @@ proc decodeBedrock*(data: seq[byte], pos: var int): ProtoReadResult[VarInt] =
   var i = 0
   while i < MaxVarIntSize:
     if pos >= data.len:
-      return readErr[VarInt](cleanEof("VarInt"))
+      return readErr[VarInt](eofAt(i, "VarInt"))
     let b = data[pos]
     inc pos
     if i == MaxVarIntSize - 1 and (b and 0x70'u8) != 0:
@@ -130,7 +148,7 @@ proc decode*(data: seq[byte], pos: var int, _: typedesc[VarUInt]): ProtoReadResu
   var i = 0
   while i < MaxVarIntSize:
     if pos >= data.len:
-      return readErr[VarUInt](cleanEof("VarUInt"))
+      return readErr[VarUInt](eofAt(i, "VarUInt"))
     let b = data[pos]
     inc pos
     if i == MaxVarIntSize - 1 and (b and 0x70'u8) != 0:
@@ -155,7 +173,7 @@ proc decodeJava*(data: seq[byte], pos: var int, _: typedesc[VarLong]): ProtoRead
   var i = 0
   while i < MaxVarLongSize:
     if pos >= data.len:
-      return readErr[VarLong](cleanEof("VarLong"))
+      return readErr[VarLong](eofAt(i, "VarLong"))
     let b = data[pos]
     inc pos
     val = val or ((int64(b) and 0x7F'i64) shl (i * 7))
@@ -163,6 +181,30 @@ proc decodeJava*(data: seq[byte], pos: var int, _: typedesc[VarLong]): ProtoRead
       return readOk[VarLong](VarLong(value: val))
     inc i
   readErr[VarLong](tooLarge("VarLong"))
+
+proc encodeBedrock*(v: VarLong, buf: var seq[byte]) =
+  var val = cast[uint64]((v.value shl 1) xor (v.value shr 63))
+  while val > 0x7F'u64:
+    buf.add(uint8(val and 0x7F'u64) or 0x80'u8)
+    val = val shr 7
+  buf.add(uint8(val))
+
+proc decodeBedrock*(data: seq[byte], pos: var int, _: typedesc[VarLong]): ProtoReadResult[VarLong] =
+  var val: uint64 = 0
+  var shift = 0
+  while true:
+    if pos >= data.len:
+      return readErr[VarLong](eofAt(shift, "VarLong"))
+    let b = data[pos]
+    inc pos
+    val = val or (uint64(b and 0x7F'u8) shl shift)
+    if (b and 0x80'u8) == 0:
+      break
+    shift += 7
+    if shift >= 64:
+      return readErr[VarLong](messageRead("VarLong is too big (overflow)"))
+  let decoded = cast[int64](val shr 1) xor (-cast[int64](val and 1'u64))
+  readOk[VarLong](VarLong(value: decoded))
 
 proc encode*(v: VarULong, buf: var seq[byte]) =
   var val = v.value
@@ -180,7 +222,7 @@ proc decode*(data: seq[byte], pos: var int, _: typedesc[VarULong]): ProtoReadRes
   var i = 0
   while i < MaxVarLongSize:
     if pos >= data.len:
-      return readErr[VarULong](cleanEof("VarULong"))
+      return readErr[VarULong](eofAt(i, "VarULong"))
     let b = data[pos]
     inc pos
     val = val or ((uint64(b) and 0x7F'u64) shl (i * 7))

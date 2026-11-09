@@ -1,23 +1,132 @@
 ## Top-level protocol constants and shared types.
-## Port of the non-async, non-encryption-stream parts of
-## upstream/protocol/src/lib.rs.
+## Port of pumpkin-protocol/src/lib.rs
 ##
-## NOT ported: `StreamDecryptor`/`StreamEncryptor` (AES-128-CFB8 login
-## encryption over an `AsyncRead`/`AsyncWrite` - tokio-specific async I/O
-## with no aowlmony equivalent yet; the crypto primitive itself would reuse
-## this port's sibling `jwt` library's approach once ported) and the
-## `ClientPacket`/`ServerPacket`/`BClientPacket` traits (aowlmony has no
-## traits; each concrete packet type will just expose its own
-## `writePacketData`/`readPacketData` procs directly, the way
-## `src/nbt/tag.aowl`'s `serializeData`/`deserializeDataDepth` do).
+## THE PACKET CONVENTION
+## =====================
+## Every Java packet file ports to one `.aowl` module that imports `protobase`,
+## `netcodec`, `varint`, `../generated/packet`, `../util/javaversion`, and holds:
+##
+## 1. The object, with upstream's fields in camelCase and upstream's name
+##    (`CEntityVelocity`). `Option<T>` is `std/options`' `Option[T]`.
+## 2. `toId`, which is upstream's `#[java_packet(X)]`. `clientbound::X` is `CB_X` and
+##    `serverbound::X` is `SB_X` in `src/generated/packet.aowl`.
+## 3. `writePacket`, which is upstream's `ClientPacket::write_packet_data`, for a
+##    packet the server sends. `readPacket`, which is `ServerPacket::read`, for one
+##    it receives. Port whichever upstream has. Both always take the version, even
+##    when upstream ignores it, and both always return a result, so that every
+##    packet has the same shape. Fields are in upstream's order.
+##
+## Fallible calls use `tryWrite`/`tryRead` where Rust has `?`. Writing a primitive
+## cannot fail (the writer is a `seq`), so it takes no `tryWrite`; `writeString`,
+## `writeNbt` and the like do. Version gates are comparisons on the enum, whose order
+## is upstream's: `version >= &JavaMinecraftVersion::V_1_21_9` is `v >= jmvV1_21_9`.
+## Upstream's `to_id` returning -1 for an absent packet is unchanged. Procs cannot be
+## generic over "any packet" (aowlmony generics do not look up `writePacket` on their
+## type parameter), so there is no generic send: the caller writes `CFoo.toId(v)` with
+## `writeJavaPacketId` from packetbase.aowl, then calls `writePacket`.
+##
+## Worked example, pumpkin-protocol/src/java/client/play/set_entity_motion.rs plus a
+## made-up serverbound packet with an optional field, a list and a gate:
+##
+##     ## Port of pumpkin-protocol/src/java/client/play/set_entity_motion.rs
+##     import std/options
+##     import ../../../protobase, ../../../netcodec, ../../../varint, ../../../lpvector3d
+##     import ../../../../generated/packet, ../../../../util/javaversion
+##
+##     type
+##       CEntityVelocity* = object
+##         entityId*: VarInt
+##         velocity*: LpVector3d
+##
+##     proc toId*(_: typedesc[CEntityVelocity]; v: JavaMinecraftVersion): int32 =
+##       CB_PLAY_SET_ENTITY_MOTION.toId(v)
+##
+##     proc writePacket*(p: CEntityVelocity; w: var NetWriter; v: JavaMinecraftVersion): ProtoWriteVoidResult =
+##       writeVarInt(w, p.entityId)
+##       # Protocol 773+ uses packed velocity; 772 and below use three i16 components.
+##       if v >= jmvV1_21_9:
+##         p.velocity.write(w)
+##       else:
+##         p.velocity.writeLegacy(w)
+##       writeOkVoid()
+##
+##     type
+##       SExample* = object
+##         name*: string
+##         nick*: Option[string]
+##         ids*: seq[int32]
+##         flags*: uint8       ## only sent since 1.21.2
+##
+##     proc toId*(_: typedesc[SExample]; v: JavaMinecraftVersion): int32 =
+##       SB_PLAY_CHAT_COMMAND.toId(v)
+##
+##     proc readPacket*(_: typedesc[SExample]; r: var NetReader; v: JavaMinecraftVersion): ProtoReadResult[SExample] =
+##       let name = tryRead(SExample, getStrBounded(r, 16))
+##       var nick = none[string]()
+##       if tryRead(SExample, getBool(r)):
+##         nick = some(tryRead(SExample, getStr(r)))
+##       let count = tryRead(SExample, getVarInt(r)).value
+##       if count < 0 or count > 64:                 # upstream caps its lists; this is an example cap
+##         return readErr[SExample](tooLarge("ids"))
+##       var ids: seq[int32] = @[]
+##       for i in 0 ..< count:
+##         ids.add(tryRead(SExample, getVarInt(r)).value)
+##       var flags = 0'u8
+##       if v >= jmvV1_21_2:
+##         flags = tryRead(SExample, getU8(r))
+##       readOk(SExample(name: name, nick: nick, ids: ids, flags: flags))
+##
+##     proc writePacket*(p: SExample; w: var NetWriter; v: JavaMinecraftVersion): ProtoWriteVoidResult =
+##       tryWrite writeStringBounded(w, p.name, 16)
+##       writeBool(w, p.nick.isSome)
+##       if p.nick.isSome:
+##         tryWrite writeString(w, p.nick.unsafeGet)
+##       writeVarInt(w, newVarInt(int32(p.ids.len)))
+##       for id in p.ids:
+##         writeVarInt(w, newVarInt(id))
+##       if v >= jmvV1_21_2:
+##         writeU8(w, p.flags)
+##       writeOkVoid()
+##
+## A test beside it (`<name>test.aowl`) asserts the exact bytes for 774 and for each
+## side of a gate, as prototest.aowl does for this example.
+##
+## Compiler limits to work with, each hit while writing this crate:
+## - Passing a plain proc where a `{.closure.}` parameter is wanted crashes the compiler
+##   when the call is an argument of a template, which includes `tryRead`, `tryWrite`,
+##   `assert` and `echo` ("frontend should not encounter `toClosure`"). Bind the result
+##   first (`let id = readIdOr[T](r, f)`, then `tryRead`) or the proc to a closure-typed
+##   `let`. Loops as in the example above need no closure at all.
+## - A template cannot declare a name for its caller, so there is no
+##   `tryRead(T, name, call)`: write `let name = tryRead(T, call)`.
+##
+## Bedrock packets use the same two shapes, built on `packetWrite`/`packetRead` from
+## serial.aowl (little-endian, ZigZag VarInt) in place of the Java primitives, with
+## `const CFooPacketId* = 11'i32` for `Packet::PACKET_ID`.
+##
+## Traits with several implementers (`dyn`) become a `ref object` of `{.closure.}`
+## fields, per PORTING.md; packets have no such case.
 
-import protobase, netcodec, varint
+import std/options
+import protobase, netcodec, varint, textcomponent, aescfb8
+
+export options
 
 const
   MaxPacketSize* = 2_097_152'u64
   MaxPacketDataSize* = 8_388_608
 
 type
+  FixedBitSet* = seq[byte]
+
+  CompressionThreshold* = int
+    ## The minimum size of data that should be compressed. Data smaller than the
+    ## threshold will not be compressed.
+
+  CompressionLevel* = uint32
+    ## The amount of compression applied to the data. Higher levels generally give
+    ## higher compression ratios, but also increase CPU usage.
+
   ConnectionState* = enum
     csHandShake
     csStatus
@@ -62,10 +171,317 @@ proc readIdOr*[T](r: var NetReader, readValue: proc(r: var NetReader): ProtoRead
   else:
     readOk[IdOr[T]](IdOr[T](kind: iokId, id: uint16(idR.value.value - 1)))
 
-proc writeIdOr*[T](v: IdOr[T], w: var NetWriter, writeValue: proc(w: var NetWriter, val: T) {.closure.}) =
+proc writeIdOr*[T](v: IdOr[T], w: var NetWriter, writeValue: proc(w: var NetWriter, val: T): ProtoWriteVoidResult {.closure.}): ProtoWriteVoidResult =
   case v.kind
   of iokId:
     writeVarInt(w, newVarInt(int32(v.id) + 1))
+    writeOkVoid()
   of iokValue:
     writeVarInt(w, newVarInt(0))
     writeValue(w, v.value)
+
+type
+  SoundEvent* = object
+    soundName*: string
+    range*: Option[float32]
+
+proc readSoundEvent*(r: var NetReader): ProtoReadResult[SoundEvent] =
+  ## The closure upstream passes to `IdOr::<SoundEvent>::read` throughout
+  ## codec/data_component.rs.
+  let soundName = tryRead(SoundEvent, getStr(r))
+  var range = none[float32]()
+  if tryRead(SoundEvent, getBool(r)):
+    range = some(tryRead(SoundEvent, getF32(r)))
+  readOk(SoundEvent(soundName: soundName, range: range))
+
+proc writeSoundEvent*(w: var NetWriter; e: SoundEvent): ProtoWriteVoidResult =
+  tryWrite writeString(w, e.soundName)
+  writeBool(w, e.range.isSome)
+  if e.range.isSome:
+    writeF32(w, e.range.unsafeGet)
+  writeOkVoid()
+
+# --- StreamDecryptor / StreamEncryptor ----------------------------------------
+# Upstream wraps an `AsyncRead`/`AsyncWrite` and applies the cipher to the bytes
+# passing through. There is no async stream here, so these apply it to a buffer.
+# `last_unwritten_encrypted_byte` existed only to resume a pending `poll_write`
+# and has no equivalent when the caller owns the buffer.
+
+type
+  StreamDecryptor* = object
+    cipher: Aes128Cfb8
+
+  StreamEncryptor* = object
+    cipher: Aes128Cfb8
+
+proc newStreamDecryptor*(cipher: Aes128Cfb8): StreamDecryptor =
+  StreamDecryptor(cipher: cipher)
+
+proc newStreamEncryptor*(cipher: Aes128Cfb8): StreamEncryptor =
+  StreamEncryptor(cipher: cipher)
+
+proc decrypt*(self: var StreamDecryptor; buf: var openArray[byte]) =
+  ## Decrypts `buf` in place. Call with bytes in the order they were received.
+  for i in 0 ..< buf.len:
+    buf[i] = self.cipher.decryptByte(buf[i])
+
+proc encrypt*(self: var StreamEncryptor; buf: var openArray[byte]) =
+  ## Encrypts `buf` in place. Call with bytes in the order they will be sent.
+  for i in 0 ..< buf.len:
+    buf[i] = self.cipher.encryptByte(buf[i])
+
+# --- Errors -------------------------------------------------------------------
+
+type
+  PacketEncodeErrorKind* = enum
+    peeTooLong
+    peeCompressionFailed
+    peeMessage
+
+  PacketEncodeError* = object
+    ## Errors that can occur during packet encoding.
+    kind*: PacketEncodeErrorKind
+    msg*: string
+
+  PacketDecodeErrorKind* = enum
+    pdeDecodeId
+    pdeTooLong
+    pdeOutOfBounds
+    pdeMalformedLength
+    pdeFailedDecompression
+    pdeNotCompressed
+    pdeConnectionClosed
+    pdeMessage
+
+  PacketDecodeError* = object
+    kind*: PacketDecodeErrorKind
+    msg*: string
+
+proc packetTooLong*(size: int): PacketEncodeError =
+  PacketEncodeError(kind: peeTooLong, msg: "Packet exceeds maximum length: " & $size)
+
+proc packetCompressionFailed*(detail: string): PacketEncodeError =
+  PacketEncodeError(kind: peeCompressionFailed, msg: "Compression failed " & detail)
+
+proc packetEncodeMessage*(detail: string): PacketEncodeError =
+  PacketEncodeError(kind: peeMessage, msg: "Writing packet failed: " & detail)
+
+proc packetDecodeError*(kind: PacketDecodeErrorKind; detail: string = ""): PacketDecodeError =
+  ## The `#[error(...)]` text of each variant.
+  let msg = case kind
+    of pdeDecodeId: "failed to decode packet ID"
+    of pdeTooLong: "packet exceeds maximum length"
+    of pdeOutOfBounds: "packet length is out of bounds"
+    of pdeMalformedLength: "malformed packet length VarInt: " & detail
+    of pdeFailedDecompression: "failed to decompress packet: " & detail
+    of pdeNotCompressed: "packet is uncompressed but greater than the threshold"
+    of pdeConnectionClosed: "the connection has closed"
+    of pdeMessage: detail
+  PacketDecodeError(kind: kind, msg: msg)
+
+proc toPacketDecodeError*(value: ReadingError): PacketDecodeError =
+  ## Port of `From<ReadingError> for PacketDecodeError`, including its choice of
+  ## `FailedDecompression` for every reading error.
+  packetDecodeError(pdeFailedDecompression, value.msg)
+
+# --- StatusResponse -----------------------------------------------------------
+
+type
+  Version* = object
+    name*: string    ## The name of the version (e.g. 1.21.4)
+    protocol*: uint32  ## The protocol version (e.g. 767)
+
+  Sample* = object
+    name*: string  ## The player's name.
+    id*: string    ## The player's UUID.
+
+  Players* = object
+    max*: uint32     ## The maximum player count that the server allows.
+    online*: uint32  ## The current online player count.
+    sample*: seq[Sample]
+      ## Information about currently connected players.
+      ## Note: players can disable listing here.
+
+  StatusResponse* = object
+    version*: Option[Version]   ## The version on which the server is running.
+    players*: Option[Players]   ## Information about currently connected players.
+    description*: string        ## The MOTD.
+    favicon*: Option[string]    ## The icon displayed.
+    enforceSecureChat*: bool    ## Whether players are forced to use secure chat.
+
+proc jsonString(s: string): string =
+  ## serde_json's string form: only `"`, `\` and control characters are escaped.
+  const Hex = "0123456789abcdef"
+  result = "\""
+  for ch in s:
+    case ch
+    of '"': result.add("\\\"")
+    of '\\': result.add("\\\\")
+    of '\b': result.add("\\b")
+    of '\f': result.add("\\f")
+    of '\n': result.add("\\n")
+    of '\r': result.add("\\r")
+    of '\t': result.add("\\t")
+    else:
+      if ord(ch) < 0x20:
+        result.add("\\u00")
+        result.add(Hex[ord(ch) shr 4])
+        result.add(Hex[ord(ch) and 15])
+      else:
+        result.add(ch)
+  result.add('"')
+
+proc toJson*(self: StatusResponse): string =
+  ## What `serde_json::to_string` gives for upstream's `#[derive(Serialize)]` with
+  ## `rename_all = "camelCase"`: fields in declaration order, `None` as `null`.
+  result = "{\"version\":"
+  if self.version.isSome:
+    let v = self.version.unsafeGet
+    result.add("{\"name\":" & jsonString(v.name) & ",\"protocol\":" & $v.protocol & "}")
+  else:
+    result.add("null")
+  result.add(",\"players\":")
+  if self.players.isSome:
+    let p = self.players.unsafeGet
+    result.add("{\"max\":" & $p.max & ",\"online\":" & $p.online & ",\"sample\":[")
+    for i in 0 ..< p.sample.len:
+      if i > 0:
+        result.add(",")
+      result.add("{\"name\":" & jsonString(p.sample[i].name) & ",\"id\":" & jsonString(p.sample[i].id) & "}")
+    result.add("]}")
+  else:
+    result.add("null")
+  result.add(",\"description\":" & jsonString(self.description))
+  result.add(",\"favicon\":")
+  if self.favicon.isSome:
+    result.add(jsonString(self.favicon.unsafeGet))
+  else:
+    result.add("null")
+  result.add(",\"enforceSecureChat\":")
+  result.add(if self.enforceSecureChat: "true" else: "false")
+  result.add("}")
+
+# --- Property / KnownPack -----------------------------------------------------
+
+type
+  Property* = object
+    name*: string
+    value*: string
+    signature*: Option[string]
+
+  KnownPack* = object
+    namespace*: string
+    id*: string
+    version*: string
+
+proc read*(_: typedesc[Property]; r: var NetReader): ProtoReadResult[Property] =
+  let name = tryRead(Property, getStr(r))
+  let value = tryRead(Property, getStr(r))
+  var signature = none[string]()
+  if tryRead(Property, getBool(r)):
+    signature = some(tryRead(Property, getStr(r)))
+  readOk(Property(name: name, value: value, signature: signature))
+
+proc write*(self: Property; w: var NetWriter): ProtoWriteVoidResult =
+  tryWrite writeString(w, self.name)
+  tryWrite writeString(w, self.value)
+  writeBool(w, self.signature.isSome)
+  if self.signature.isSome:
+    tryWrite writeString(w, self.signature.unsafeGet)
+  writeOkVoid()
+
+proc write*(self: KnownPack; w: var NetWriter): ProtoWriteVoidResult =
+  tryWrite writeString(w, self.namespace)
+  tryWrite writeString(w, self.id)
+  tryWrite writeString(w, self.version)
+  writeOkVoid()
+
+# --- NumberFormat -------------------------------------------------------------
+
+type
+  NumberFormatKind* = enum
+    nfBlank   ## Show nothing.
+    nfStyled  ## The styling to be used when formatting the score number.
+    nfFixed   ## The text to be used as a placeholder.
+
+  NumberFormat* = object
+    case kind*: NumberFormatKind
+    of nfBlank: discard
+    of nfStyled: style*: Style
+    of nfFixed: fixedText*: TextComponent
+
+proc write*(self: NumberFormat; w: var NetWriter) =
+  case self.kind
+  of nfBlank:
+    writeVarInt(w, newVarInt(0))
+  of nfStyled:
+    # Upstream: "TODO: Style write". The style's bytes are absent there too.
+    writeVarInt(w, newVarInt(1))
+  of nfFixed:
+    writeVarInt(w, newVarInt(2))
+    writeSlice(w, self.fixedText.encode())
+
+# --- PositionFlag -------------------------------------------------------------
+
+type
+  PositionFlag* = enum
+    ## For the first 8 values set means relative value while unset means absolute
+    pfX
+    pfY
+    pfZ
+    pfYRot
+    pfXRot
+    pfDeltaX
+    pfDeltaY
+    pfDeltaZ
+    pfRotateDelta
+
+proc getMask(self: PositionFlag): int32 {.inline.} =
+  1'i32 shl ord(self)
+
+proc getBitfield*(flags: openArray[PositionFlag]): int32 =
+  result = 0
+  for flag in flags:
+    result = result or flag.getMask()
+
+# --- Label / Link -------------------------------------------------------------
+
+type
+  LinkType* = enum
+    ltBugReport = 0
+    ltCommunityGuidelines = 1
+    ltSupport = 2
+    ltStatus = 3
+    ltFeedback = 4
+    ltCommunity = 5
+    ltWebsite = 6
+    ltForums = 7
+    ltNews = 8
+    ltAnnouncements = 9
+
+  LabelKind* = enum
+    lkBuiltIn
+    lkTextComponent
+
+  Label* = object
+    case kind*: LabelKind
+    of lkBuiltIn: builtIn*: LinkType
+    of lkTextComponent: textComponent*: TextComponent
+
+  Link* = object
+    isBuiltIn*: bool
+    label*: Label
+    url*: string
+
+proc newLink*(label: Label; url: string): Link =
+  Link(isBuiltIn: label.kind == lkBuiltIn, label: label, url: url)
+
+proc write*(self: Link; w: var NetWriter): ProtoWriteVoidResult =
+  case self.label.kind
+  of lkBuiltIn:
+    writeBool(w, true)
+    writeVarInt(w, newVarInt(int32(ord(self.label.builtIn))))
+  of lkTextComponent:
+    writeBool(w, false)
+    writeSlice(w, self.label.textComponent.encode())
+  writeString(w, self.url)

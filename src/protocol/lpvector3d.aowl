@@ -1,0 +1,129 @@
+## Port of pumpkin-protocol/src/codec/lp_vector_3d.rs
+
+import std/math
+import protobase, netcodec, varint
+import ../util/vector3
+
+const
+  MaxVelocityClamp = 1.717_986_918_3e10
+  LegacyComponentClamp = 3.9
+  LegacyComponentScale = 8000.0
+  MinVelocityMagnitude = 3.051_944_088_384_301e-5
+  Max15BitValue = 32766.0
+
+type
+  LpVector3d* = object
+    value*: Vector3[float64]
+
+proc fma(x, y, z: cdouble): cdouble {.importc: "fma", header: "<math.h>".}
+  ## Rust's `mul_add`, which is fused: a separate multiply and add can round
+  ## differently and change a quantized component by one.
+
+proc clampF(value, lo, hi: float64): float64 {.inline.} =
+  if value < lo: lo
+  elif value > hi: hi
+  else: value
+
+proc isNan(value: float64): bool {.inline.} =
+  value != value
+
+proc encodeLegacyVelocityComponent*(component: float64): int16 =
+  ## Legacy clients (<= 1.21.8 / protocol 772) encode velocity as clamped component * 8000.
+  ## Rust's saturating `as i16` turns NaN into 0.
+  if isNan(component):
+    return 0'i16
+  int16(clampF(component, -LegacyComponentClamp, LegacyComponentClamp) * LegacyComponentScale)
+
+proc clampValue(value: float64): float64 =
+  if isNan(value):
+    return 0.0
+  clampF(value, -MaxVelocityClamp, MaxVelocityClamp)
+
+proc absMax(a, b: float64): float64 {.inline.} =
+  max(abs(a), abs(b))
+
+proc toLong(value: float64): int64 =
+  let scaled = int64(round(float64(fma(cdouble(value), 0.5, 0.5)) * Max15BitValue))
+  if scaled < 0'i64: 0'i64
+  elif scaled > 32766'i64: 32766'i64
+  else: scaled
+
+proc fromLong(quantized: int64; scale: float64): float64 =
+  # Reverse: ((v * 0.5 + 0.5) * 32766) -> v
+  let normalized = (float64(quantized) / Max15BitValue) - 0.5
+  (normalized / 0.5) * scale
+
+proc write*(self: LpVector3d; w: var NetWriter) =
+  let velocity = self.value
+
+  # Clamp and find the maximum component magnitude
+  let clampedX = clampValue(velocity.x)
+  let clampedY = clampValue(velocity.y)
+  let clampedZ = clampValue(velocity.z)
+  let maxComponent = absMax(clampedX, absMax(clampedY, clampedZ))
+
+  if maxComponent < MinVelocityMagnitude:
+    writeU8(w, 0'u8)
+    return
+
+  let scaleFactor = int64(ceil(maxComponent))
+  let isExtended = scaleFactor > 3'i64
+
+  # The header byte: bits 0-1 are scale, bit 2 is the extension flag
+  let header = if isExtended: (scaleFactor and 3'i64) or 4'i64 else: scaleFactor
+
+  # Pack the 15-bit quantized components into a 64-bit buffer
+  # Quantized components: x (bits 3-17), y (bits 18-32), z (bits 33-47)
+  let quantizedX = toLong(clampedX / float64(scaleFactor)) shl 3
+  let quantizedY = toLong(clampedY / float64(scaleFactor)) shl 18
+  let quantizedZ = toLong(clampedZ / float64(scaleFactor)) shl 33
+
+  let packedData = cast[uint64](header or quantizedX or quantizedY or quantizedZ)
+
+  # Write low 16 bits (Little Endian)
+  writeU8(w, uint8(packedData and 0xFF'u64))
+  writeU8(w, uint8((packedData shr 8) and 0xFF'u64))
+
+  # Write next 32 bits (Big Endian)
+  writeU32Be(w, uint32((packedData shr 16) and 0xFFFF_FFFF'u64))
+
+  if isExtended:
+    writeVarInt(w, newVarInt(int32(scaleFactor shr 2)))
+
+proc read*(_: typedesc[LpVector3d]; r: var NetReader): ProtoReadResult[LpVector3d] =
+  let low0 = tryRead(LpVector3d, getU8(r))
+  let low1 = tryRead(LpVector3d, getU8(r))
+
+  if low0 == 0'u8 and low1 == 0'u8:
+    return readOk(LpVector3d(value: Vector3[float64](x: 0.0, y: 0.0, z: 0.0)))
+
+  let mid = tryRead(LpVector3d, getI32Be(r))
+  let low = int64(low0) or (int64(low1) shl 8)
+  let packedData = low or (int64(mid) shl 16)
+
+  let header = packedData and 0x07'i64
+  let isExtended = (header and 4'i64) != 0'i64
+
+  var scaleFactor = header and 3'i64
+  if isExtended:
+    let scaleTail = tryRead(LpVector3d, getVarInt(r))
+    scaleFactor = (int64(scaleTail.value) shl 2) or (header and 3'i64)
+
+  if scaleFactor == 0'i64 and not isExtended:
+    return readOk(LpVector3d(value: Vector3[float64](x: 0.0, y: 0.0, z: 0.0)))
+
+  let qX = (packedData shr 3) and 0x7FFF'i64
+  let qY = (packedData shr 18) and 0x7FFF'i64
+  let qZ = (packedData shr 33) and 0x7FFF'i64
+
+  let scale = float64(scaleFactor)
+
+  readOk(LpVector3d(value: Vector3[float64](
+    x: fromLong(qX, scale),
+    y: fromLong(qY, scale),
+    z: fromLong(qZ, scale))))
+
+proc writeLegacy*(self: LpVector3d; w: var NetWriter) =
+  writeI16Be(w, encodeLegacyVelocityComponent(self.value.x))
+  writeI16Be(w, encodeLegacyVelocityComponent(self.value.y))
+  writeI16Be(w, encodeLegacyVelocityComponent(self.value.z))

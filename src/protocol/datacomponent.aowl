@@ -1,0 +1,810 @@
+## Port of pumpkin-protocol/src/codec/data_component.rs
+## PARTIAL: pumpkin-protocol/src/codec/data_component.rs - no id validation against registries that are not ported: `Enchantment::from_id`, `StatusEffect::from_id`/`from_minecraft_name`, `IDSetContent::from_id` and the `Sound` lookup in `proto_to_data_sound`. Those ids are carried raw, so a bad id from a client reaches the caller rather than failing here. Every wire layout, count limit and other check is ported.
+## PARTIAL: pumpkin-data/src/data_component_impl/mod.rs - minimal `*Impl` value types: the fields this codec reads and writes. No `read_data`/`write_data` NBT forms, no `get_hash`.
+## PARTIAL: pumpkin-data/src/item_stack/mod.rs - minimal `ItemStack`: count, item id, component patch, `is_empty`. Consumers in src/inventory still use their own stub.
+##
+## Upstream dispatches over `Box<dyn DataComponentImpl>`. Here that is the closed
+## `DataComponentValue` variant, keyed by `kind`, which is also what `serialize` and
+## `deserialize` below check against the `DataComponent` id. `dcvRemoved` is the `None`
+## of a patch entry. As upstream, the `*Impl` overloads of `serialize`/`deserialize`
+## exist for all types, but the two dispatch procs reject what their match omits
+## (`StringVariantImpl`'s 29 types among them).
+
+import std/options
+import protobase, netcodec, varint, proto, textcomponent
+import ../generated/data_component
+import ../generated/item as itemdata
+import ../nbt/[nbtbase, serializer, tag]
+
+export data_component
+
+const MaxStatusEffects = 128
+
+type
+  IDSetKind* = enum
+    idsTag
+    idsIds
+
+  IDSet* = object
+    ## Upstream `IDSet<T>`, with `T` carried as its registry id.
+    case kind*: IDSetKind
+    of idsTag: tag*: string
+    of idsIds: ids*: seq[int32]
+
+  StatusEffectInstance* = object
+    effectId*: int32  ## Registry id. Upstream resolves this to the effect's name.
+    amplifier*: int32
+    duration*: int32
+    ambient*: bool
+    showParticles*: bool
+    showIcon*: bool
+
+  ConsumeEffectKind* = enum
+    # The declaration order is `registry_id`.
+    ceApplyEffects
+    ceRemoveEffects
+    ceClearAllEffects
+    ceTeleportRandomly
+    cePlaySound
+
+  ConsumeEffect* = object
+    case kind*: ConsumeEffectKind
+    of ceApplyEffects:
+      effects*: seq[StatusEffectInstance]
+      probability*: float32
+    of ceRemoveEffects:
+      removed*: IDSet
+    of ceClearAllEffects:
+      discard
+    of ceTeleportRandomly:
+      diameter*: float32
+    of cePlaySound:
+      sound*: IdOr[SoundEvent]
+
+  ConsumeAnimation* = enum
+    # The declaration order is the wire id.
+    caNone, caEat, caDrink, caBlock, caBow, caSpear, caCrossbow, caSpyglass, caHorn, caBrush
+
+  EquipmentSlot* = enum
+    # The value is `get_slot_index`.
+    esMainHand = 0, esFeet = 1, esLegs = 2, esChest = 3, esHead = 4, esOffHand = 5, esBody = 6, esSaddle = 7
+
+  FireworkExplosionShape* = enum
+    fesSmallBall = 0, fesLargeBall = 1, fesStar = 2, fesCreeper = 3, fesBurst = 4
+
+  MaxStackSizeImpl* = object
+    size*: uint8
+
+  DamageImpl* = object
+    damage*: int32
+
+  EnchantmentEntry* = object
+    id*: uint8     ## Upstream `&'static Enchantment`; `enc.id` is what goes on the wire.
+    level*: int32
+
+  EnchantmentsImpl* = object
+    enchantment*: seq[EnchantmentEntry]
+
+  StoredEnchantmentsImpl* = object
+    enchantment*: seq[EnchantmentEntry]
+
+  UnbreakableImpl* = object
+
+  ItemModelImpl* = object
+    id*: string
+
+  CustomNameImpl* = object
+    name*: TextComponent
+
+  CustomDataImpl* = object
+    data*: NbtCompound
+
+  ConsumableImpl* = object
+    consumeSeconds*: float32
+    animation*: ConsumeAnimation
+    soundEvent*: IdOr[SoundEvent]
+    consumeParticles*: bool
+    effects*: seq[ConsumeEffect]
+
+  EquippableImpl* = object
+    slot*: EquipmentSlot
+    equipSound*: IdOr[SoundEvent]
+    assetId*: Option[string]
+    cameraOverlay*: Option[string]
+    hasAllowedEntities*: bool
+    allowedEntities*: IDSet  ## Meaningful only when `hasAllowedEntities`.
+    dispensable*: bool
+    swappable*: bool
+    damageOnHurt*: bool
+    equipOnInteract*: bool
+    canBeSheared*: bool
+    shearingSound*: IdOr[SoundEvent]
+
+  PotionContentsImpl* = object
+    potionId*: Option[int32]
+    customColor*: Option[int32]
+    customEffects*: seq[StatusEffectInstance]
+    customName*: Option[string]
+
+  FireworkExplosionImpl* = object
+    shape*: FireworkExplosionShape
+    colors*: seq[int32]
+    fadeColors*: seq[int32]
+    hasTrail*: bool
+    hasTwinkle*: bool
+
+  FireworksImpl* = object
+    flightDuration*: int32
+    explosions*: seq[FireworkExplosionImpl]
+
+  MapIdImpl* = object
+    id*: int32
+
+  UseCooldownImpl* = object
+    seconds*: float32
+    cooldownGroup*: Option[string]
+
+  StringVariantImpl* = object
+    ## `codec_string_variant!`'s 29 types (`VillagerVariantImpl`, `WolfVariantImpl`, ...)
+    ## all have this one field and one codec.
+    value*: string
+
+  BundleContentsImpl* = object
+    items*: seq[ItemStack]
+
+  DataComponentValueKind* = enum
+    dcvRemoved  ## `None` in a patch: the component is removed.
+    dcvMaxStackSize
+    dcvDamage
+    dcvEnchantments
+    dcvUnbreakable
+    dcvItemModel
+    dcvCustomName
+    dcvCustomData
+    dcvConsumable
+    dcvEquippable
+    dcvPotionContents
+    dcvFireworkExplosion
+    dcvFireworks
+    dcvStoredEnchantments
+    dcvMapId
+    dcvUseCooldown
+    dcvBundleContents
+
+  DataComponentValue* = object
+    case kind*: DataComponentValueKind
+    of dcvRemoved: discard
+    of dcvMaxStackSize: maxStackSize*: MaxStackSizeImpl
+    of dcvDamage: damage*: DamageImpl
+    of dcvEnchantments: enchantments*: EnchantmentsImpl
+    of dcvUnbreakable: unbreakable*: UnbreakableImpl
+    of dcvItemModel: itemModel*: ItemModelImpl
+    of dcvCustomName: customName*: CustomNameImpl
+    of dcvCustomData: customData*: CustomDataImpl
+    of dcvConsumable: consumable*: ConsumableImpl
+    of dcvEquippable: equippable*: EquippableImpl
+    of dcvPotionContents: potionContents*: PotionContentsImpl
+    of dcvFireworkExplosion: fireworkExplosion*: FireworkExplosionImpl
+    of dcvFireworks: fireworks*: FireworksImpl
+    of dcvStoredEnchantments: storedEnchantments*: StoredEnchantmentsImpl
+    of dcvMapId: mapId*: MapIdImpl
+    of dcvUseCooldown: useCooldown*: UseCooldownImpl
+    of dcvBundleContents: bundleContents*: BundleContentsImpl
+
+  PatchEntry* = object
+    id*: DataComponent
+    data*: DataComponentValue
+
+  ItemStack* = object
+    itemCount*: uint8
+    itemId*: uint16
+    patch*: seq[PatchEntry]
+
+proc newItemStack*(itemCount: uint8; itemId: uint16; patch: sink seq[PatchEntry]): ItemStack =
+  ItemStack(itemCount: itemCount, itemId: itemId, patch: patch)
+
+proc emptyItemStack*(): ItemStack =
+  ## `ItemStack::EMPTY`.
+  ItemStack(itemCount: 0'u8, itemId: 0'u16, patch: @[])
+
+proc isEmpty*(self: ItemStack): bool {.inline.} =
+  self.itemCount == 0'u8 or self.itemId == 0'u16
+
+proc itemFromIdOrAir*(id: uint16): uint16 =
+  ## `Item::from_id(id).unwrap_or(&Item::AIR).id`.
+  if int(id) < itemdata.AllItems.len: id else: 0'u16
+
+proc serialize*(id: DataComponent; value: DataComponentValue; w: var NetWriter): ProtoWriteVoidResult
+proc deserialize*(id: DataComponent; r: var NetReader): ProtoReadResult[DataComponentValue]
+
+# --- IDSet --------------------------------------------------------------------
+
+proc deserializeIdset(r: var NetReader): ProtoReadResult[IDSet] =
+  let idType = tryRead(IDSet, getVarInt(r)).value
+  if idType == 0'i32:
+    let tagName = tryRead(IDSet, getStr(r))
+    return readOk(IDSet(kind: idsTag, tag: tagName))
+  if idType < 0'i32:
+    return readErr[IDSet](messageRead("Negative type/len VarInt in IDSet"))
+  let len = idType - 1'i32
+  var contentVec: seq[int32] = @[]
+  for i in 0 ..< len:
+    contentVec.add(tryRead(IDSet, getVarInt(r)).value)
+  readOk(IDSet(kind: idsIds, ids: contentVec))
+
+proc serializeIdset(idset: IDSet; w: var NetWriter): ProtoWriteVoidResult =
+  case idset.kind
+  of idsTag:
+    writeVarInt(w, newVarInt(0'i32))
+    writeString(w, idset.tag)
+  of idsIds:
+    writeVarInt(w, newVarInt(int32(idset.ids.len) + 1'i32))
+    for elmt in idset.ids:
+      writeVarInt(w, newVarInt(elmt))
+    writeOkVoid()
+
+# --- Status and consume effects -----------------------------------------------
+
+proc skipEffectParameters(r: var NetReader): ProtoReadVoidResult =
+  ## Helper to skip hidden effect parameters recursively. The recursion is this loop.
+  while true:
+    # amplifier, duration
+    let amplifier = getVarInt(r)
+    if not amplifier.isOk: return readErrVoid(amplifier.error)
+    let duration = getVarInt(r)
+    if not duration.isOk: return readErrVoid(duration.error)
+    # ambient, show_particles, show_icon
+    for i in 0 ..< 3:
+      let flag = getBool(r)
+      if not flag.isOk: return readErrVoid(flag.error)
+    # has_hidden (recursive)
+    let hasHidden = getBool(r)
+    if not hasHidden.isOk: return readErrVoid(hasHidden.error)
+    if not hasHidden.value:
+      return readOkVoid()
+
+proc deserializeStatusEffects(r: var NetReader): ProtoReadResult[seq[StatusEffectInstance]] =
+  type R = seq[StatusEffectInstance]
+  let effectsLen = tryRead(R, getVarInt(r)).value
+  if effectsLen < 0'i32 or int(effectsLen) > MaxStatusEffects:
+    return readErr[R](messageRead("Too many status effects"))
+  var customEffects: R = @[]
+  for i in 0 ..< effectsLen:
+    let effectRegistryId = tryRead(R, getVarInt(r)).value
+    # Effect parameters
+    let amplifier = tryRead(R, getVarInt(r)).value
+    let duration = tryRead(R, getVarInt(r)).value
+    let ambient = tryRead(R, getBool(r))
+    let showParticles = tryRead(R, getBool(r))
+    let showIcon = tryRead(R, getBool(r))
+    # Hidden effect (optional, recursive) - we skip it for now
+    if tryRead(R, getBool(r)):
+      tryReadVoid(R, skipEffectParameters(r))
+    customEffects.add(StatusEffectInstance(effectId: effectRegistryId, amplifier: amplifier,
+      duration: duration, ambient: ambient, showParticles: showParticles, showIcon: showIcon))
+  readOk(customEffects)
+
+proc serializeStatusEffects(effects: seq[StatusEffectInstance]; w: var NetWriter) =
+  writeVarInt(w, newVarInt(int32(effects.len)))
+  for effect in effects:
+    writeVarInt(w, newVarInt(effect.effectId))
+    # Effect parameters
+    writeVarInt(w, newVarInt(effect.amplifier))
+    writeVarInt(w, newVarInt(effect.duration))
+    writeBool(w, effect.ambient)
+    writeBool(w, effect.showParticles)
+    writeBool(w, effect.showIcon)
+    # No hidden effect for now
+    writeBool(w, false)
+
+proc readIdOrSound(r: var NetReader): ProtoReadResult[IdOr[SoundEvent]] =
+  readIdOr[SoundEvent](r, readSoundEvent)
+
+proc writeIdOrSound(w: var NetWriter; v: IdOr[SoundEvent]): ProtoWriteVoidResult =
+  writeIdOr[SoundEvent](v, w, writeSoundEvent)
+
+proc deserializeConsumeEffect(r: var NetReader): ProtoReadResult[ConsumeEffect] =
+  let effectType = tryRead(ConsumeEffect, getVarInt(r)).value
+  case effectType
+  of 0'i32:
+    # Upstream reads the probability first here but writes it last in
+    # `serializeConsumeEffect`. Kept as upstream has it.
+    let probability = tryRead(ConsumeEffect, getF32(r))
+    let effects = tryRead(ConsumeEffect, deserializeStatusEffects(r))
+    readOk(ConsumeEffect(kind: ceApplyEffects, effects: effects, probability: probability))
+  of 1'i32:
+    let idset = tryRead(ConsumeEffect, deserializeIdset(r))
+    readOk(ConsumeEffect(kind: ceRemoveEffects, removed: idset))
+  of 2'i32:
+    readOk(ConsumeEffect(kind: ceClearAllEffects))
+  of 3'i32:
+    let diameter = tryRead(ConsumeEffect, getF32(r))
+    readOk(ConsumeEffect(kind: ceTeleportRandomly, diameter: diameter))
+  of 4'i32:
+    let soundRes = readIdOrSound(r)
+    if not soundRes.isOk:
+      return readErr[ConsumeEffect](messageRead("No sound IdOr<SoundEvent> in ConsumeEffect: " & soundRes.error.msg))
+    readOk(ConsumeEffect(kind: cePlaySound, sound: soundRes.value))
+  else:
+    readErr[ConsumeEffect](messageRead("Invalid effect_type in ConsumeEffect"))
+
+proc serializeConsumeEffect(effect: ConsumeEffect; w: var NetWriter): ProtoWriteVoidResult =
+  writeVarInt(w, newVarInt(int32(ord(effect.kind))))
+  case effect.kind
+  of ceApplyEffects:
+    serializeStatusEffects(effect.effects, w)
+    writeF32(w, effect.probability)
+    writeOkVoid()
+  of ceRemoveEffects:
+    serializeIdset(effect.removed, w)
+  of ceClearAllEffects:
+    writeOkVoid()
+  of ceTeleportRandomly:
+    writeF32(w, effect.diameter)
+    writeOkVoid()
+  of cePlaySound:
+    writeIdOrSound(w, effect.sound)
+
+# --- DataComponentCodec impls -------------------------------------------------
+
+proc serialize*(self: MaxStackSizeImpl; w: var NetWriter) =
+  writeVarInt(w, newVarInt(int32(self.size)))
+
+proc deserialize*(_: typedesc[MaxStackSizeImpl]; r: var NetReader): ProtoReadResult[MaxStackSizeImpl] =
+  let size = tryRead(MaxStackSizeImpl, getVarInt(r)).value
+  if size < 0'i32 or size > 255'i32:
+    return readErr[MaxStackSizeImpl](messageRead("No MaxStackSize VarInt!"))
+  readOk(MaxStackSizeImpl(size: uint8(size)))
+
+proc serialize*(self: DamageImpl; w: var NetWriter) =
+  writeVarInt(w, newVarInt(self.damage))
+
+proc deserialize*(_: typedesc[DamageImpl]; r: var NetReader): ProtoReadResult[DamageImpl] =
+  let damage = tryRead(DamageImpl, getVarInt(r)).value
+  readOk(DamageImpl(damage: damage))
+
+proc writeEnchantmentList(list: seq[EnchantmentEntry]; w: var NetWriter) =
+  writeVarInt(w, newVarInt(int32(list.len)))
+  for entry in list:
+    writeVarInt(w, newVarInt(int32(entry.id)))
+    writeVarInt(w, newVarInt(entry.level))
+
+proc readEnchantmentList(r: var NetReader): ProtoReadResult[seq[EnchantmentEntry]] =
+  const MaxEnchantments = 256
+  type R = seq[EnchantmentEntry]
+  let len = tryRead(R, getVarInt(r)).value
+  if len < 0'i32 or int(len) > MaxEnchantments:
+    return readErr[R](messageRead("Too many enchantments"))
+  var enc: R = @[]
+  for i in 0 ..< len:
+    # `as u8`: only the low byte counts.
+    let id = uint8(cast[uint32](tryRead(R, getVarInt(r)).value) and 0xFF'u32)
+    let level = tryRead(R, getVarInt(r)).value
+    enc.add(EnchantmentEntry(id: id, level: level))
+  readOk(enc)
+
+proc serialize*(self: EnchantmentsImpl; w: var NetWriter) =
+  writeEnchantmentList(self.enchantment, w)
+
+proc deserialize*(_: typedesc[EnchantmentsImpl]; r: var NetReader): ProtoReadResult[EnchantmentsImpl] =
+  let list = tryRead(EnchantmentsImpl, readEnchantmentList(r))
+  readOk(EnchantmentsImpl(enchantment: list))
+
+proc serialize*(self: StoredEnchantmentsImpl; w: var NetWriter) =
+  writeEnchantmentList(self.enchantment, w)
+
+proc deserialize*(_: typedesc[StoredEnchantmentsImpl]; r: var NetReader): ProtoReadResult[StoredEnchantmentsImpl] =
+  let list = tryRead(StoredEnchantmentsImpl, readEnchantmentList(r))
+  readOk(StoredEnchantmentsImpl(enchantment: list))
+
+proc serialize*(self: UnbreakableImpl; w: var NetWriter) =
+  discard
+
+proc deserialize*(_: typedesc[UnbreakableImpl]; r: var NetReader): ProtoReadResult[UnbreakableImpl] =
+  readOk(UnbreakableImpl())
+
+proc serialize*(self: ItemModelImpl; w: var NetWriter): ProtoWriteVoidResult =
+  writeString(w, self.id)
+
+proc deserialize*(_: typedesc[ItemModelImpl]; r: var NetReader): ProtoReadResult[ItemModelImpl] =
+  let id = tryRead(ItemModelImpl, getStr(r))
+  readOk(ItemModelImpl(id: id))
+
+proc serialize*(self: CustomNameImpl; w: var NetWriter): ProtoWriteVoidResult =
+  writeNbt(w, NbtTag(kind: ntkString, stringVal: self.name.getText()))
+
+proc deserialize*(_: typedesc[CustomNameImpl]; r: var NetReader): ProtoReadResult[CustomNameImpl] =
+  let name = tryRead(CustomNameImpl, getStr(r))
+  readOk(CustomNameImpl(name: text(name)))
+
+proc serialize*(self: CustomDataImpl; w: var NetWriter): ProtoWriteVoidResult =
+  writeNbt(w, NbtTag(kind: ntkCompound, compoundVal: self.data))
+
+proc deserialize*(_: typedesc[CustomDataImpl]; r: var NetReader): ProtoReadResult[CustomDataImpl] =
+  readErr[CustomDataImpl](messageRead("CustomData raw component decoding is not supported; use the custom-data item-stack API"))
+
+proc serialize*(self: ConsumableImpl; w: var NetWriter): ProtoWriteVoidResult =
+  writeF32(w, self.consumeSeconds)
+  writeVarInt(w, newVarInt(int32(ord(self.animation))))
+  tryWrite writeIdOrSound(w, self.soundEvent)
+  writeBool(w, self.consumeParticles)
+  writeVarInt(w, newVarInt(int32(self.effects.len)))
+  for effect in self.effects:
+    tryWrite serializeConsumeEffect(effect, w)
+  writeOkVoid()
+
+proc deserialize*(_: typedesc[ConsumableImpl]; r: var NetReader): ProtoReadResult[ConsumableImpl] =
+  let consumeSeconds = tryRead(ConsumableImpl, getF32(r))
+  let animationId = tryRead(ConsumableImpl, getVarInt(r)).value
+  if animationId < 0'i32 or animationId > int32(ord(ConsumeAnimation.high)):
+    return readErr[ConsumableImpl](messageRead("Invalid ConsumableImpl animation id!"))
+  let soundEvent = tryRead(ConsumableImpl, readIdOrSound(r))
+  let consumeParticles = tryRead(ConsumableImpl, getBool(r))
+  let effectsLen = tryRead(ConsumableImpl, getVarInt(r)).value
+  var effects: seq[ConsumeEffect] = @[]
+  for i in 0 ..< effectsLen:
+    effects.add(tryRead(ConsumableImpl, deserializeConsumeEffect(r)))
+  readOk(ConsumableImpl(consumeSeconds: consumeSeconds, animation: ConsumeAnimation(animationId),
+    soundEvent: soundEvent, consumeParticles: consumeParticles, effects: effects))
+
+proc serialize*(self: EquippableImpl; w: var NetWriter): ProtoWriteVoidResult =
+  writeVarInt(w, newVarInt(int32(ord(self.slot))))
+  tryWrite writeIdOrSound(w, self.equipSound)
+
+  writeBool(w, self.assetId.isSome)
+  if self.assetId.isSome:
+    tryWrite writeString(w, self.assetId.unsafeGet)
+
+  writeBool(w, self.cameraOverlay.isSome)
+  if self.cameraOverlay.isSome:
+    tryWrite writeString(w, self.cameraOverlay.unsafeGet)
+
+  writeBool(w, self.hasAllowedEntities)
+  if self.hasAllowedEntities:
+    tryWrite serializeIdset(self.allowedEntities, w)
+
+  writeBool(w, self.dispensable)
+  writeBool(w, self.swappable)
+  writeBool(w, self.damageOnHurt)
+  writeBool(w, self.equipOnInteract)
+  writeBool(w, self.canBeSheared)
+  writeIdOrSound(w, self.shearingSound)
+
+proc deserialize*(_: typedesc[EquippableImpl]; r: var NetReader): ProtoReadResult[EquippableImpl] =
+  let slotIndex = tryRead(EquippableImpl, getVarInt(r)).value
+  if slotIndex < 0'i32 or slotIndex > 7'i32:
+    return readErr[EquippableImpl](messageRead("Invalid equipment slot index " & $slotIndex))
+  let equipSound = tryRead(EquippableImpl, readIdOrSound(r))
+
+  var assetId = none[string]()
+  if tryRead(EquippableImpl, getBool(r)):
+    assetId = some(tryRead(EquippableImpl, getStr(r)))
+
+  var cameraOverlay = none[string]()
+  if tryRead(EquippableImpl, getBool(r)):
+    cameraOverlay = some(tryRead(EquippableImpl, getStr(r)))
+
+  let hasAllowedEntities = tryRead(EquippableImpl, getBool(r))
+  var allowedEntities = IDSet(kind: idsIds, ids: @[])
+  if hasAllowedEntities:
+    allowedEntities = tryRead(EquippableImpl, deserializeIdset(r))
+
+  let dispensable = tryRead(EquippableImpl, getBool(r))
+  let swappable = tryRead(EquippableImpl, getBool(r))
+  let damageOnHurt = tryRead(EquippableImpl, getBool(r))
+  let equipOnInteract = tryRead(EquippableImpl, getBool(r))
+  let canBeSheared = tryRead(EquippableImpl, getBool(r))
+  let shearingSound = tryRead(EquippableImpl, readIdOrSound(r))
+
+  readOk(EquippableImpl(slot: EquipmentSlot(slotIndex), equipSound: equipSound, assetId: assetId,
+    cameraOverlay: cameraOverlay, hasAllowedEntities: hasAllowedEntities, allowedEntities: allowedEntities,
+    dispensable: dispensable, swappable: swappable, damageOnHurt: damageOnHurt,
+    equipOnInteract: equipOnInteract, canBeSheared: canBeSheared, shearingSound: shearingSound))
+
+proc serialize*(self: PotionContentsImpl; w: var NetWriter): ProtoWriteVoidResult =
+  # Potion ID (optional)
+  writeBool(w, self.potionId.isSome)
+  if self.potionId.isSome:
+    writeVarInt(w, newVarInt(self.potionId.unsafeGet))
+  # Custom color (optional)
+  writeBool(w, self.customColor.isSome)
+  if self.customColor.isSome:
+    writeI32(w, self.customColor.unsafeGet)
+  # Custom effects list
+  serializeStatusEffects(self.customEffects, w)
+  # Custom name (optional)
+  writeBool(w, self.customName.isSome)
+  if self.customName.isSome:
+    tryWrite writeString(w, self.customName.unsafeGet)
+  writeOkVoid()
+
+proc deserialize*(_: typedesc[PotionContentsImpl]; r: var NetReader): ProtoReadResult[PotionContentsImpl] =
+  # Potion ID (optional)
+  var potionId = none[int32]()
+  if tryRead(PotionContentsImpl, getBool(r)):
+    potionId = some(tryRead(PotionContentsImpl, getVarInt(r)).value)
+  # Custom color (optional)
+  var customColor = none[int32]()
+  if tryRead(PotionContentsImpl, getBool(r)):
+    customColor = some(tryRead(PotionContentsImpl, getI32(r)))
+  # Custom effects list
+  let customEffects = tryRead(PotionContentsImpl, deserializeStatusEffects(r))
+  # Custom name (optional)
+  var customName = none[string]()
+  if tryRead(PotionContentsImpl, getBool(r)):
+    customName = some(tryRead(PotionContentsImpl, getStr(r)))
+  readOk(PotionContentsImpl(potionId: potionId, customColor: customColor,
+    customEffects: customEffects, customName: customName))
+
+proc serialize*(self: FireworkExplosionImpl; w: var NetWriter) =
+  # Shape (VarInt enum)
+  writeVarInt(w, newVarInt(int32(ord(self.shape))))
+  # Colors list
+  writeVarInt(w, newVarInt(int32(self.colors.len)))
+  for color in self.colors:
+    writeI32(w, color)
+  # Fade colors list
+  writeVarInt(w, newVarInt(int32(self.fadeColors.len)))
+  for color in self.fadeColors:
+    writeI32(w, color)
+  # hasTrail
+  writeBool(w, self.hasTrail)
+  # hasTwinkle
+  writeBool(w, self.hasTwinkle)
+
+proc deserialize*(_: typedesc[FireworkExplosionImpl]; r: var NetReader): ProtoReadResult[FireworkExplosionImpl] =
+  # Needs a length cap during deserialization to prevent OOM from malicious packets
+  # Vanilla doesn't have any limits (Integer.MAX_VALUE is technically a limit but not enforced in practice)
+  const MaxColors = 256
+  const MaxFadeColors = 256
+  type R = FireworkExplosionImpl
+
+  # Shape (VarInt enum)
+  let shapeId = tryRead(R, getVarInt(r)).value
+  if shapeId < 0'i32 or shapeId > 4'i32:
+    return readErr[R](messageRead("Invalid FireworkExplosionShape id!"))
+
+  # Colors list
+  let colorsLen = tryRead(R, getVarInt(r)).value
+  if colorsLen < 0'i32 or int(colorsLen) > MaxColors:
+    return readErr[R](messageRead("FireworkExplosionImpl colors_len " & $colorsLen & " exceeds maximum of " & $MaxColors))
+  var colors: seq[int32] = @[]
+  for i in 0 ..< colorsLen:
+    colors.add(tryRead(R, getI32(r)))
+
+  # Fade colors list
+  let fadeColorsLen = tryRead(R, getVarInt(r)).value
+  if fadeColorsLen < 0'i32 or int(fadeColorsLen) > MaxFadeColors:
+    return readErr[R](messageRead("FireworkExplosionImpl fade_colors_len " & $fadeColorsLen & " exceeds maximum of " & $MaxFadeColors))
+  var fadeColors: seq[int32] = @[]
+  for i in 0 ..< fadeColorsLen:
+    fadeColors.add(tryRead(R, getI32(r)))
+
+  let hasTrail = tryRead(R, getBool(r))
+  let hasTwinkle = tryRead(R, getBool(r))
+
+  readOk(FireworkExplosionImpl(shape: FireworkExplosionShape(shapeId), colors: colors,
+    fadeColors: fadeColors, hasTrail: hasTrail, hasTwinkle: hasTwinkle))
+
+proc serialize*(self: FireworksImpl; w: var NetWriter) =
+  # Flight duration (VarInt)
+  writeVarInt(w, newVarInt(self.flightDuration))
+  # Explosions list
+  writeVarInt(w, newVarInt(int32(self.explosions.len)))
+  for explosion in self.explosions:
+    explosion.serialize(w)
+
+proc deserialize*(_: typedesc[FireworksImpl]; r: var NetReader): ProtoReadResult[FireworksImpl] =
+  # Needs a length cap during deserialization to prevent OOM from malicious packets
+  # Vanilla doesn't have any limits
+  const MaxExplosions = 256
+  # Vanilla restricts to 0-255 (UNSIGNED_BYTE in data component codec) (do not trust client NBT to limit it)
+  const MaxFlightDuration = 255'i32
+
+  # Flight duration
+  let flightDuration = tryRead(FireworksImpl, getVarInt(r)).value
+  if flightDuration < 0'i32 or flightDuration > MaxFlightDuration:
+    return readErr[FireworksImpl](messageRead("FireworksImpl flight_duration " & $flightDuration & " is out of bounds (0-" & $MaxFlightDuration & ")"))
+
+  # Explosions list
+  let explosionsLen = tryRead(FireworksImpl, getVarInt(r)).value
+  if explosionsLen < 0'i32 or int(explosionsLen) > MaxExplosions:
+    return readErr[FireworksImpl](messageRead("FireworksImpl explosions_len " & $explosionsLen & " exceeds maximum of " & $MaxExplosions))
+  var explosions: seq[FireworkExplosionImpl] = @[]
+  for i in 0 ..< explosionsLen:
+    # Recursively deserialize each explosion
+    explosions.add(tryRead(FireworksImpl, deserialize(FireworkExplosionImpl, r)))
+
+  readOk(FireworksImpl(flightDuration: flightDuration, explosions: explosions))
+
+proc serialize*(self: MapIdImpl; w: var NetWriter) =
+  writeVarInt(w, newVarInt(self.id))
+
+proc deserialize*(_: typedesc[MapIdImpl]; r: var NetReader): ProtoReadResult[MapIdImpl] =
+  let id = tryRead(MapIdImpl, getVarInt(r)).value
+  readOk(MapIdImpl(id: id))
+
+proc serialize*(self: UseCooldownImpl; w: var NetWriter): ProtoWriteVoidResult =
+  writeF32(w, self.seconds)
+  writeBool(w, self.cooldownGroup.isSome)
+  if self.cooldownGroup.isSome:
+    tryWrite writeString(w, self.cooldownGroup.unsafeGet)
+  writeOkVoid()
+
+proc deserialize*(_: typedesc[UseCooldownImpl]; r: var NetReader): ProtoReadResult[UseCooldownImpl] =
+  let seconds = tryRead(UseCooldownImpl, getF32(r))
+  var cooldownGroup = none[string]()
+  if tryRead(UseCooldownImpl, getBool(r)):
+    cooldownGroup = some(tryRead(UseCooldownImpl, getStr(r)))
+  readOk(UseCooldownImpl(seconds: seconds, cooldownGroup: cooldownGroup))
+
+proc serialize*(self: StringVariantImpl; w: var NetWriter): ProtoWriteVoidResult =
+  writeString(w, self.value)
+
+proc deserialize*(_: typedesc[StringVariantImpl]; r: var NetReader): ProtoReadResult[StringVariantImpl] =
+  let value = tryRead(StringVariantImpl, getStr(r))
+  readOk(StringVariantImpl(value: value))
+
+# --- Item stack templates and bundles -----------------------------------------
+
+proc deserializeItemStackTemplate(r: var NetReader): ProtoReadResult[ItemStack] =
+  const MaxComponents = 256'i64
+
+  let itemId = uint16(cast[uint32](tryRead(ItemStack, getVarInt(r)).value) and 0xFFFF'u32)
+  let count = uint8(cast[uint32](tryRead(ItemStack, getVarInt(r)).value) and 0xFF'u32)
+
+  let numToAdd = tryRead(ItemStack, getVarInt(r)).value
+  let numToRemove = tryRead(ItemStack, getVarInt(r)).value
+
+  if numToAdd < 0'i32 or numToRemove < 0'i32:
+    return readErr[ItemStack](messageRead("Negative component count"))
+  if int64(numToAdd) + int64(numToRemove) > MaxComponents:
+    return readErr[ItemStack](messageRead("Too many components in ItemStackTemplate patch"))
+
+  var patch: seq[PatchEntry] = @[]
+
+  for i in 0 ..< numToAdd:
+    let idVal = tryRead(ItemStack, getVarInt(r)).value
+    let (known, id) = tryFromId(uint8(cast[uint32](idVal) and 0xFF'u32))
+    if not known:
+      return readErr[ItemStack](messageRead("Unknown component ID: " & $idVal))
+    discard tryRead(ItemStack, getVarInt(r))  # _byte_len
+    let component = tryRead(ItemStack, deserialize(id, r))
+    patch.add(PatchEntry(id: id, data: component))
+
+  for i in 0 ..< numToRemove:
+    let idVal = tryRead(ItemStack, getVarInt(r)).value
+    let (known, id) = tryFromId(uint8(cast[uint32](idVal) and 0xFF'u32))
+    if not known:
+      return readErr[ItemStack](messageRead("Unknown component ID"))
+    patch.add(PatchEntry(id: id, data: DataComponentValue(kind: dcvRemoved)))
+
+  readOk(newItemStack(count, itemFromIdOrAir(itemId), patch))
+
+proc serializeItemStackTemplate(stack: ItemStack; w: var NetWriter): ProtoWriteVoidResult =
+  writeVarInt(w, newVarInt(int32(stack.itemId)))
+  writeVarInt(w, newVarInt(int32(stack.itemCount)))
+
+  var toAdd = 0'i32
+  var toRemove = 0'i32
+  for entry in stack.patch:
+    if entry.data.kind == dcvRemoved:
+      inc toRemove
+    else:
+      inc toAdd
+
+  writeVarInt(w, newVarInt(toAdd))
+  writeVarInt(w, newVarInt(toRemove))
+
+  for entry in stack.patch:
+    if entry.data.kind != dcvRemoved:
+      writeVarInt(w, newVarInt(int32(entry.id.toId())))
+      tryWrite serialize(entry.id, entry.data, w)
+
+  for entry in stack.patch:
+    if entry.data.kind == dcvRemoved:
+      writeVarInt(w, newVarInt(int32(entry.id.toId())))
+
+  writeOkVoid()
+
+proc serialize*(self: BundleContentsImpl; w: var NetWriter): ProtoWriteVoidResult =
+  writeVarInt(w, newVarInt(int32(self.items.len)))
+  for item in self.items:
+    tryWrite serializeItemStackTemplate(item, w)
+  writeOkVoid()
+
+proc deserialize*(_: typedesc[BundleContentsImpl]; r: var NetReader): ProtoReadResult[BundleContentsImpl] =
+  const MaxBundleItems = 64
+  let len = tryRead(BundleContentsImpl, getVarInt(r)).value
+  if len < 0'i32 or int(len) > MaxBundleItems:
+    return readErr[BundleContentsImpl](messageRead("Too many items in BundleContents"))
+  var items: seq[ItemStack] = @[]
+  for i in 0 ..< len:
+    items.add(tryRead(BundleContentsImpl, deserializeItemStackTemplate(r)))
+  readOk(BundleContentsImpl(items: items))
+
+# --- The dispatch -------------------------------------------------------------
+
+proc deserialize*(id: DataComponent; r: var NetReader): ProtoReadResult[DataComponentValue] =
+  type R = DataComponentValue
+  case id
+  of dcMaxStackSize:
+    readOk(R(kind: dcvMaxStackSize, maxStackSize: tryRead(R, deserialize(MaxStackSizeImpl, r))))
+  of dcCustomData:
+    readErr[R](messageRead("CustomData raw component decoding is not supported; use the custom-data item-stack API"))
+  of dcEnchantments:
+    readOk(R(kind: dcvEnchantments, enchantments: tryRead(R, deserialize(EnchantmentsImpl, r))))
+  of dcDamage:
+    readOk(R(kind: dcvDamage, damage: tryRead(R, deserialize(DamageImpl, r))))
+  of dcUnbreakable:
+    readOk(R(kind: dcvUnbreakable, unbreakable: tryRead(R, deserialize(UnbreakableImpl, r))))
+  of dcPotionContents:
+    readOk(R(kind: dcvPotionContents, potionContents: tryRead(R, deserialize(PotionContentsImpl, r))))
+  of dcFireworkExplosion:
+    readOk(R(kind: dcvFireworkExplosion, fireworkExplosion: tryRead(R, deserialize(FireworkExplosionImpl, r))))
+  of dcFireworks:
+    readOk(R(kind: dcvFireworks, fireworks: tryRead(R, deserialize(FireworksImpl, r))))
+  of dcItemModel:
+    readOk(R(kind: dcvItemModel, itemModel: tryRead(R, deserialize(ItemModelImpl, r))))
+  of dcCustomName:
+    readOk(R(kind: dcvCustomName, customName: tryRead(R, deserialize(CustomNameImpl, r))))
+  of dcConsumable:
+    readOk(R(kind: dcvConsumable, consumable: tryRead(R, deserialize(ConsumableImpl, r))))
+  of dcEquippable:
+    readOk(R(kind: dcvEquippable, equippable: tryRead(R, deserialize(EquippableImpl, r))))
+  of dcStoredEnchantments:
+    readOk(R(kind: dcvStoredEnchantments, storedEnchantments: tryRead(R, deserialize(StoredEnchantmentsImpl, r))))
+  of dcUseCooldown:
+    readOk(R(kind: dcvUseCooldown, useCooldown: tryRead(R, deserialize(UseCooldownImpl, r))))
+  of dcMapId:
+    readOk(R(kind: dcvMapId, mapId: tryRead(R, deserialize(MapIdImpl, r))))
+  of dcBundleContents:
+    readOk(R(kind: dcvBundleContents, bundleContents: tryRead(R, deserialize(BundleContentsImpl, r))))
+  else:
+    readErr[R](messageRead(id.debugName() & " (TODO)"))
+
+proc serialize*(id: DataComponent; value: DataComponentValue; w: var NetWriter): ProtoWriteVoidResult =
+  # Upstream's `get::<T>(value)` panics when the value is not the id's type. A
+  # mismatch here reaches the `else`, an error rather than a panic.
+  if id == dcMaxStackSize and value.kind == dcvMaxStackSize:
+    value.maxStackSize.serialize(w)
+    writeOkVoid()
+  elif id == dcCustomData and value.kind == dcvCustomData:
+    value.customData.serialize(w)
+  elif id == dcEnchantments and value.kind == dcvEnchantments:
+    value.enchantments.serialize(w)
+    writeOkVoid()
+  elif id == dcDamage and value.kind == dcvDamage:
+    value.damage.serialize(w)
+    writeOkVoid()
+  elif id == dcUnbreakable and value.kind == dcvUnbreakable:
+    value.unbreakable.serialize(w)
+    writeOkVoid()
+  elif id == dcPotionContents and value.kind == dcvPotionContents:
+    value.potionContents.serialize(w)
+  elif id == dcFireworkExplosion and value.kind == dcvFireworkExplosion:
+    value.fireworkExplosion.serialize(w)
+    writeOkVoid()
+  elif id == dcFireworks and value.kind == dcvFireworks:
+    value.fireworks.serialize(w)
+    writeOkVoid()
+  elif id == dcItemModel and value.kind == dcvItemModel:
+    value.itemModel.serialize(w)
+  elif id == dcCustomName and value.kind == dcvCustomName:
+    value.customName.serialize(w)
+  elif id == dcConsumable and value.kind == dcvConsumable:
+    value.consumable.serialize(w)
+  elif id == dcEquippable and value.kind == dcvEquippable:
+    value.equippable.serialize(w)
+  elif id == dcStoredEnchantments and value.kind == dcvStoredEnchantments:
+    value.storedEnchantments.serialize(w)
+    writeOkVoid()
+  elif id == dcUseCooldown and value.kind == dcvUseCooldown:
+    value.useCooldown.serialize(w)
+  elif id == dcMapId and value.kind == dcvMapId:
+    value.mapId.serialize(w)
+    writeOkVoid()
+  elif id == dcBundleContents and value.kind == dcvBundleContents:
+    value.bundleContents.serialize(w)
+  else:
+    writeErrVoid(messageWrite(id.toName() & " not yet implemented"))

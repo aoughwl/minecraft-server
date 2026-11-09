@@ -1,0 +1,285 @@
+## Port of pumpkin-protocol/src/codec/item_stack_seralizer.rs
+## PARTIAL: pumpkin-protocol/src/codec/item_stack_seralizer.rs - `OptionalItemStackHash.hashEquals` does not compare the hashes of added components, because `DataComponentImpl::get_hash` (pumpkin-data) is not ported. Everything else it checks is checked.
+##
+## `Cow<ItemStack>` becomes an owned `ItemStack`; `ItemStack::EMPTY` is `emptyItemStack`.
+
+import std/options
+import protobase, netcodec, varint, textcomponent, datacomponent
+import ../generated/item_id_remap
+import ../util/javaversion
+import ../nbt/[nbtbase, deserializer, tag]
+
+const MaxComponents = 256'i64
+
+type
+  ItemStackSerializer* = object
+    stack*: ItemStack
+
+  ItemStackTemplateSerializer* = object
+    stack*: ItemStack
+
+  ComponentHashEntry* = object
+    id*: VarInt
+    hash*: int32
+
+  ItemComponentHash* = object
+    added*: seq[ComponentHashEntry]
+    removed*: seq[VarInt]
+
+  ItemStackHash* = object
+    itemId: VarInt
+    count: VarInt
+    components: ItemComponentHash
+
+  OptionalItemStackHash* = object
+    value*: Option[ItemStackHash]
+
+proc itemComponentCounts(stack: ItemStack): (int32, int32) =
+  var toAdd = 0'i32
+  var toRemove = 0'i32
+  for entry in stack.patch:
+    if entry.data.kind == dcvRemoved:
+      inc toRemove
+    else:
+      inc toAdd
+  (toAdd, toRemove)
+
+proc serializeAnyItemStackWithId(stack: ItemStack; itemId: uint16; isTemplate: bool;
+    w: var NetWriter): ProtoWriteVoidResult =
+  if stack.isEmpty():
+    putVarInt(w, newVarInt(0'i32))
+    return writeOkVoid()
+  let (toAdd, toRemove) = itemComponentCounts(stack)
+  if isTemplate:
+    putVarInt(w, newVarInt(int32(itemId)))
+    putVarInt(w, newVarInt(int32(stack.itemCount)))
+  else:
+    putVarInt(w, newVarInt(int32(stack.itemCount)))
+    putVarInt(w, newVarInt(int32(itemId)))
+  putVarInt(w, newVarInt(toAdd))
+  putVarInt(w, newVarInt(toRemove))
+
+  for entry in stack.patch:
+    if entry.data.kind != dcvRemoved:
+      putVarInt(w, newVarInt(int32(entry.id.toId())))
+      tryWrite serialize(entry.id, entry.data, w)
+
+  for entry in stack.patch:
+    if entry.data.kind == dcvRemoved:
+      putVarInt(w, newVarInt(int32(entry.id.toId())))
+
+  writeOkVoid()
+
+proc serializeItemStackWithId(stack: ItemStack; itemId: uint16; w: var NetWriter): ProtoWriteVoidResult =
+  serializeAnyItemStackWithId(stack, itemId, false, w)
+
+proc readComponentId(r: var NetReader): ProtoReadResult[DataComponent] =
+  let idVal = tryRead(DataComponent, getVarInt(r)).value
+  if idVal < 0'i32 or idVal > 255'i32:
+    return readErr[DataComponent](messageRead("Invalid component ID: " & $idVal))
+  let (known, id) = tryFromId(uint8(idVal))
+  if not known:
+    return readErr[DataComponent](messageRead("Unknown component ID: " & $idVal))
+  readOk(id)
+
+proc decodeCustomName(componentData: seq[byte]): ProtoReadResult[DataComponentValue] =
+  type R = DataComponentValue
+  var nbtReader = newNbtReader(nrmJava, componentData)
+  let tagRes = deserialize(nbtReader)
+  if not tagRes.isOk:
+    return readErr[R](messageRead("Failed to decode CustomName NBT: " & tagRes.error.msg))
+  var name = empty()
+  case tagRes.value.kind
+  of ntkString:
+    name = text(tagRes.value.stringVal)
+  of ntkCompound:
+    let (found, t) = tagRes.value.compoundVal.get("text")
+    if found and t.kind == ntkString:
+      name = text(t.stringVal)
+  else:
+    discard
+  readOk(R(kind: dcvCustomName, customName: CustomNameImpl(name: name)))
+
+proc readLengthPrefixedComponent(r: var NetReader): ProtoReadResult[PatchEntry] =
+  let id = tryRead(PatchEntry, readComponentId(r))
+  let byteLen = tryRead(PatchEntry, getVarInt(r)).value
+  if byteLen < 0'i32:
+    return readErr[PatchEntry](messageRead("Negative component data length"))
+  let componentData = tryRead(PatchEntry, readSlice(r, int(byteLen)))
+  if id == dcCustomName:
+    let decoded = tryRead(PatchEntry, decodeCustomName(componentData))
+    return readOk(PatchEntry(id: id, data: decoded))
+  var cursor = newNetReader(componentData)
+  let decoded = tryRead(PatchEntry, deserialize(id, cursor))
+  readOk(PatchEntry(id: id, data: decoded))
+
+proc read*(_: typedesc[ItemStackSerializer]; r: var NetReader): ProtoReadResult[ItemStackSerializer] =
+  type R = ItemStackSerializer
+  let itemCount = tryRead(R, getVarInt(r)).value
+  if itemCount == 0'i32:
+    return readOk(R(stack: emptyItemStack()))
+
+  let itemId = tryRead(R, getVarInt(r)).value
+  let numToAdd = tryRead(R, getVarInt(r)).value
+  let numToRemove = tryRead(R, getVarInt(r)).value
+
+  if numToAdd < 0'i32 or numToRemove < 0'i32:
+    return readErr[R](messageRead("Negative component count"))
+  if int64(numToAdd) + int64(numToRemove) > MaxComponents:
+    return readErr[R](messageRead("Too many components in ItemStack patch"))
+
+  var patch: seq[PatchEntry] = @[]
+
+  for i in 0 ..< numToAdd:
+    let idVal = tryRead(R, getVarInt(r)).value
+    let (known, id) = tryFromId(uint8(cast[uint32](idVal) and 0xFF'u32))
+    if not known:
+      return readErr[R](messageRead("Unknown component ID: " & $idVal))
+    discard tryRead(R, getVarInt(r))  # _byte_len
+    let component = tryRead(R, deserialize(id, r))
+    patch.add(PatchEntry(id: id, data: component))
+
+  for i in 0 ..< numToRemove:
+    let idVal = tryRead(R, getVarInt(r)).value
+    let (known, id) = tryFromId(uint8(cast[uint32](idVal) and 0xFF'u32))
+    if not known:
+      return readErr[R](messageRead("Unknown component ID"))
+    patch.add(PatchEntry(id: id, data: DataComponentValue(kind: dcvRemoved)))
+
+  if itemId < 0'i32 or itemId > 65535'i32:
+    return readErr[R](messageRead("Invalid item id!"))
+
+  let count = uint8(cast[uint32](itemCount) and 0xFF'u32)
+  readOk(R(stack: newItemStack(count, itemFromIdOrAir(uint16(itemId)), patch)))
+
+proc write*(self: ItemStackSerializer; w: var NetWriter): ProtoWriteVoidResult =
+  serializeItemStackWithId(self.stack, self.stack.itemId, w)
+
+proc readLengthPrefixedOptional*(r: var NetReader): ProtoReadResult[ItemStackSerializer] =
+  type R = ItemStackSerializer
+  let itemCount = tryRead(R, getVarInt(r)).value
+  if itemCount == 0'i32:
+    return readOk(R(stack: emptyItemStack()))
+  if itemCount < 0'i32 or itemCount > 255'i32:
+    return readErr[R](messageRead("Invalid item count!"))
+
+  let itemId = tryRead(R, getVarInt(r)).value
+  let numToAdd = tryRead(R, getVarInt(r)).value
+  let numToRemove = tryRead(R, getVarInt(r)).value
+
+  if numToAdd < 0'i32 or numToRemove < 0'i32:
+    return readErr[R](messageRead("Negative component count"))
+  if int64(numToAdd) + int64(numToRemove) > MaxComponents:
+    return readErr[R](messageRead("Too many components in ItemStack patch"))
+
+  var patch: seq[PatchEntry] = @[]
+
+  for i in 0 ..< numToAdd:
+    patch.add(tryRead(R, readLengthPrefixedComponent(r)))
+
+  for i in 0 ..< numToRemove:
+    let id = tryRead(R, readComponentId(r))
+    patch.add(PatchEntry(id: id, data: DataComponentValue(kind: dcvRemoved)))
+
+  if itemId < 0'i32 or itemId > 65535'i32:
+    return readErr[R](messageRead("Invalid item id!"))
+
+  readOk(R(stack: newItemStack(uint8(itemCount), itemFromIdOrAir(uint16(itemId)), patch)))
+
+proc writeWithVersion*(self: ItemStackSerializer; w: var NetWriter; version: JavaMinecraftVersion): ProtoWriteVoidResult =
+  let remappedItemId = remapItemIdForVersion(self.stack.itemId, version)
+  serializeItemStackWithId(self.stack, remappedItemId, w)
+
+proc toStack*(self: ItemStackSerializer): ItemStack =
+  self.stack
+
+proc toStackForVersion*(self: ItemStackSerializer; version: JavaMinecraftVersion): ItemStack =
+  result = self.stack
+  if result.isEmpty():
+    return result
+  result.itemId = itemFromIdOrAir(remapItemIdFromVersion(result.itemId, version))
+
+proc fromItemStack*(item: ItemStack): ItemStackSerializer =
+  ItemStackSerializer(stack: item)
+
+proc fromOptionalItemStack*(item: Option[ItemStack]): ItemStackSerializer =
+  if item.isSome: ItemStackSerializer(stack: item.unsafeGet)
+  else: ItemStackSerializer(stack: emptyItemStack())
+
+proc read*(_: typedesc[ItemComponentHash]; r: var NetReader): ProtoReadResult[ItemComponentHash] =
+  const MaxHashComponents = 256'i32
+  type R = ItemComponentHash
+
+  let addedLength = tryRead(R, getVarInt(r)).value
+  if addedLength < 0'i32 or addedLength > MaxHashComponents:
+    return readErr[R](messageRead("added_length out of bounds"))
+  var added: seq[ComponentHashEntry] = @[]
+  for i in 0 ..< addedLength:
+    let componentId = tryRead(R, getVarInt(r))
+    let componentValue = tryRead(R, getI32(r))
+    added.add(ComponentHashEntry(id: componentId, hash: componentValue))
+
+  let removedLength = tryRead(R, getVarInt(r)).value
+  if removedLength < 0'i32 or removedLength > MaxHashComponents:
+    return readErr[R](messageRead("removed_length out of bounds"))
+  var removed: seq[VarInt] = @[]
+  for i in 0 ..< removedLength:
+    removed.add(tryRead(R, getVarInt(r)))
+
+  readOk(R(added: added, removed: removed))
+
+proc write*(self: ItemComponentHash; w: var NetWriter) =
+  putVarInt(w, newVarInt(int32(self.added.len)))
+  for entry in self.added:
+    putVarInt(w, entry.id)
+    putI32(w, entry.hash)
+  putVarInt(w, newVarInt(int32(self.removed.len)))
+  for id in self.removed:
+    putVarInt(w, id)
+
+proc read*(_: typedesc[OptionalItemStackHash]; r: var NetReader): ProtoReadResult[OptionalItemStackHash] =
+  type R = OptionalItemStackHash
+  if tryRead(R, getBool(r)):
+    let itemId = tryRead(R, getVarInt(r))
+    let count = tryRead(R, getVarInt(r))
+    let components = tryRead(R, read(ItemComponentHash, r))
+    readOk(R(value: some(ItemStackHash(itemId: itemId, count: count, components: components))))
+  else:
+    readOk(R(value: none[ItemStackHash]()))
+
+proc write*(self: OptionalItemStackHash; w: var NetWriter) =
+  if self.value.isSome:
+    let hash = self.value.unsafeGet
+    putBool(w, true)
+    putVarInt(w, hash.itemId)
+    putVarInt(w, hash.count)
+    hash.components.write(w)
+  else:
+    putBool(w, false)
+
+proc hashEquals*(self: OptionalItemStackHash; other: ItemStack): bool =
+  if not self.value.isSome:
+    return other.isEmpty()
+  let hash = self.value.unsafeGet
+  if hash.itemId.value != int32(other.itemId) or hash.count.value != int32(other.itemCount):
+    return false
+  let (toAdd, toRemove) = itemComponentCounts(other)
+  if int(toAdd) != hash.components.added.len or int(toRemove) != hash.components.removed.len:
+    return false
+  for entry in other.patch:
+    if entry.data.kind == dcvRemoved:
+      var found = false
+      for id in hash.components.removed:
+        if id.value == int32(entry.id.toId()):
+          found = true
+      if not found:
+        return false
+    # PARTIAL: the added component's `get_hash` comparison goes here.
+  true
+
+proc writeWithVersion*(self: ItemStackTemplateSerializer; w: var NetWriter; version: JavaMinecraftVersion): ProtoWriteVoidResult =
+  let remappedItemId = remapItemIdForVersion(self.stack.itemId, version)
+  serializeAnyItemStackWithId(self.stack, remappedItemId, version >= jmvV26_1, w)
+
+proc write*(self: ItemStackTemplateSerializer; w: var NetWriter): ProtoWriteVoidResult =
+  serializeAnyItemStackWithId(self.stack, self.stack.itemId, true, w)

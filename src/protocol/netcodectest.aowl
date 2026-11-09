@@ -4,7 +4,9 @@
 
 import std/assertions
 import std/syncio
-import netcodec, varint, protobase
+import std/options
+import netcodec, varint, protobase, blockpos
+import ../nbt/tag
 
 var w = newNetWriter()
 writeU8(w, 0xAB'u8)
@@ -42,5 +44,110 @@ assert vi.value.value == -999999'i32
 let strR = getStr(r)
 assert strR.isOk
 assert strR.value == "hello é中\U0001F600"
+
+block eofKinds:
+  # The numbers report Incomplete, as `read_exact` does upstream; a VarInt on its
+  # first byte reports CleanEOF, as `decode_async` does.
+  var empty = newNetReader(newSeq[byte](0))
+  assert getU8(empty).error.kind == reIncomplete
+  assert getI32Be(empty).error.kind == reIncomplete
+  assert getVarInt(empty).error.kind == reCleanEof
+  var partial = newNetReader(@[0x80'u8])
+  assert getVarInt(partial).error.kind == reIncomplete
+
+block strings:
+  # write_string_bounded compares bytes, get_str_bounded UTF-16 units and bytes.
+  var w2 = newNetWriter()
+  assert not writeStringBounded(w2, "abc", 2).isOk
+  assert w2.buf.len == 0
+  assert writeStringBounded(w2, "ab", 2).isOk
+  assert w2.buf == @[2'u8, 0x61, 0x62]
+
+  var tooManyUnits = newNetReader(w2.buf)
+  let tmu = getStrBounded(tooManyUnits, 1)
+  assert not tmu.isOk and tmu.error.kind == reTooLarge
+  var tooManyBytes = newNetReader(@[4'u8, 0x61, 0x61, 0x61, 0x61])
+  assert getStrBounded(tooManyBytes, 1).error.kind == reTooLarge
+
+  # A character outside the BMP is two UTF-16 units but four UTF-8 bytes.
+  var astral = newNetReader(@[4'u8, 0xF0, 0x9F, 0x98, 0x80])
+  assert getStrBounded(astral, 2).isOk
+  var astralTight = newNetReader(@[4'u8, 0xF0, 0x9F, 0x98, 0x80])
+  assert getStrBounded(astralTight, 1).error.kind == reTooLarge
+
+  # from_utf8 rejects these: bad start, overlong, surrogate, truncated.
+  for bad in [@[1'u8, 0xFF], @[2'u8, 0xC0, 0x80], @[3'u8, 0xED, 0xA0, 0x80], @[2'u8, 0xE2, 0x82]]:
+    var rb = newNetReader(bad)
+    let res = getStr(rb)
+    assert not res.isOk and res.error.kind == reMessage
+
+  # A declared length past the buffer's end.
+  var short = newNetReader(@[5'u8, 0x61])
+  assert getStr(short).error.kind == reIncomplete
+
+block fixedBitset:
+  var w3 = newNetWriter()
+  writeFixedBitset(w3, 12, @[1'u8])
+  assert w3.buf == @[1'u8, 0]
+  w3 = newNetWriter()
+  writeFixedBitset(w3, 8, @[1'u8, 2, 3])
+  assert w3.buf == @[1'u8]
+  var r3 = newNetReader(@[1'u8, 2, 3])
+  assert getFixedBitset(r3, 9).value == @[1'u8, 2]
+
+block otherWrites:
+  var w4 = newNetWriter()
+  writeBlockPos(w4, BlockPos(x: 1, y: 2, z: 3))
+  assert w4.buf == @[0'u8, 0, 0, 0x40, 0, 0, 0x30, 0x02]
+  w4 = newNetWriter()
+  assert writeNbt(w4, NbtTag(kind: ntkByte, byteVal: 5'i8)).isOk
+  assert w4.buf == @[1'u8, 5]
+  w4 = newNetWriter()
+  writeVarULong(w4, newVarULong(300'u64))
+  assert w4.buf == @[0xAC'u8, 0x02]
+
+proc writeU8Item(w: var NetWriter; item: uint8): ProtoWriteVoidResult =
+  writeU8(w, item)
+  writeOkVoid()
+
+proc readU8Item(r: var NetReader): ProtoReadResult[uint8] =
+  getU8(r)
+
+block closures:
+  # Bound first: an implicit proc-to-closure conversion inside `assert` crashes the
+  # compiler. See proto.aowl's header.
+  let putItem: proc(w: var NetWriter; item: uint8): ProtoWriteVoidResult {.closure.} = writeU8Item
+  let getItem: proc(r: var NetReader): ProtoReadResult[uint8] {.closure.} = readU8Item
+  var w5 = newNetWriter()
+  assert writeOption[uint8](w5, some(7'u8), putItem).isOk
+  assert writeOption[uint8](w5, none[uint8](), putItem).isOk
+  assert w5.buf == @[1'u8, 7, 0]
+  var r5 = newNetReader(w5.buf)
+  let o1 = getOption[uint8](r5, getItem)
+  assert o1.isOk and o1.value.unsafeGet == 7'u8
+  let o2 = getOption[uint8](r5, getItem)
+  assert o2.isOk and o2.value.isNone
+  var r6 = newNetReader(@[2'u8, 9, 8])
+  let l = getList[uint8](r6, getItem)
+  assert l.isOk and l.items == @[9'u8, 8]
+  var negative = newNetReader(@[0xFF'u8, 0xFF, 0xFF, 0xFF, 0x0F])
+  assert not getList[uint8](negative, getItem).isOk
+
+block remainingSlices:
+  var r7 = newNetReader(@[1'u8, 2, 3])
+  assert readSlice(r7, 1).value == @[1'u8]
+  assert readRemainingSlice(r7, 1).error.kind == reTooLarge
+  assert readRemainingSlice(r7, 2).value == @[2'u8, 3]
+  assert remaining(r7) == 0
+
+block u128s:
+  var bytes16 = newSeq[byte](16)
+  bytes16[0] = 0xFF'u8
+  bytes16[15] = 2'u8
+  var r8 = newNetReader(bytes16)
+  let u = getU128Be(r8).value
+  assert u[0] == 0xFF00000000000000'u64 and u[1] == 2'u64
+  var r9 = newNetReader(bytes16)
+  assert getI128Be(r9).value[0] < 0'i64
 
 echo "all netcodec checks passed"
