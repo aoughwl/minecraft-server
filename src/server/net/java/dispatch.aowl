@@ -1,0 +1,178 @@
+## `JavaClient`'s dispatchers from pumpkin/src/net/java/mod.rs: `handle_packet`, the handlers per state and
+## `progress_player_packets`. See javamod.aowl's PARTIAL line for what they do not route yet.
+
+import std/[options, syncio]
+import ../../../protocol/java/client/play/[keep_alive as ckeepalive, acknowledge_block]
+import ../../../protocol/java/server/handshake/handshakemod
+import ../../../protocol/java/server/status/[status_request, ping_request]
+import ../../../protocol/java/server/login/[login_start, encryption_response, plugin_response, login_response,
+  cookie_response as logincookie]
+import ../../../protocol/java/server/config/[client_information as cfginfo, plugin_message, custom_click_action,
+  acknowledge_finish_config, known_packs, keep_alive as cfgkeepalive, cookie_response as cfgcookie, resource_pack_response]
+import ../../../protocol/java/server/play/[confirm_teleport, keep_alive as playkeepalive, chunk_batch, player_position, player_position_rotation,
+  player_rotation, client_information as playinfo, player_loaded, client_tick_end]
+import ../../../generated/translation as tr
+import ../../../util/text/text
+import ../../serverbase
+import ../../entity/player as playermod
+import ../winsock
+import javamod, handshake, status, login, config, play
+
+const KeepAliveIntervalMs = 15000'i64
+
+proc handleHandshakePacket(self: JavaClient; packet: RawPacket): ProtoReadVoidResult =
+  var payload = newNetReader(packet.payload)
+  if packet.id == 0'i32:
+    let hs = SHandShake.readPacket(payload, self.version)
+    if not hs.isOk:
+      return readErrVoid(hs.error)
+    self.handleHandshake(hs.value)
+    return readOkVoid()
+  readErrVoid(messageRead("Failed to handle packet id " & $packet.id & " in Handshake State"))
+
+proc handleStatusPacket(self: JavaClient; server: Server; packet: RawPacket): ProtoReadVoidResult =
+  var payload = newNetReader(packet.payload)
+  let version = self.version
+  if packet.id == SStatusRequest.toId(version):
+    self.handleStatusRequest(server)
+    return readOkVoid()
+  if packet.id == SStatusPingRequest.toId(version):
+    let ping = SStatusPingRequest.readPacket(payload, version)
+    if not ping.isOk:
+      return readErrVoid(ping.error)
+    self.handlePingRequest(ping.value)
+    return readOkVoid()
+  readErrVoid(messageRead("Failed to handle java client packet id " & $packet.id & " in Status State"))
+
+proc handleLoginPacket(self: JavaClient; server: Server; packet: RawPacket): ProtoReadVoidResult =
+  var payload = newNetReader(packet.payload)
+  let version = self.version
+  if packet.id == SLoginStart.toId(version):
+    let start = SLoginStart.readPacket(payload, version)
+    if not start.isOk:
+      return readErrVoid(start.error)
+    self.handleLoginStart(server, start.value)
+  elif packet.id == SLoginAcknowledged.toId(version):
+    self.handleLoginAcknowledged(server)
+  elif packet.id == SEncryptionResponse.toId(version) or packet.id == SLoginPluginResponse.toId(version):
+    # A client only sends these in answer to what this server does not ask yet; see login.aowl's PARTIAL line.
+    echo "Unexpected login packet id ", packet.id, " from client ", self.id
+  elif packet.id == SLoginCookieResponse.toId(version):
+    let cookie = SLoginCookieResponse.readPacket(payload, version)
+    if not cookie.isOk:
+      return readErrVoid(cookie.error)
+    self.handleLoginCookieResponse(cookie.value)
+  else:
+    echo "Failed to handle java client packet id ", packet.id, " in Login State"
+  readOkVoid()
+
+proc handleConfigPacket(self: JavaClient; server: Server; packet: RawPacket; result0: var PacketHandlerResult): ProtoReadVoidResult =
+  var payload = newNetReader(packet.payload)
+  let version = self.version
+  if packet.id == SClientInformationConfig.toId(version):
+    let info = SClientInformationConfig.readPacket(payload, version)
+    if not info.isOk:
+      return readErrVoid(info.error)
+    self.handleClientInformationConfig(info.value)
+  elif packet.id == plugin_message.SPluginMessage.toId(version):
+    let message = plugin_message.SPluginMessage.readPacket(payload, version)
+    if not message.isOk:
+      return readErrVoid(message.error)
+    self.handlePluginMessage(message.value)
+  elif packet.id == custom_click_action.SCustomClickAction.toId(version):
+    echo "CustomClickAction in config state not yet supported"
+  elif packet.id == SAcknowledgeFinishConfig.toId(version):
+    result0 = self.handleConfigAcknowledged(server)
+  elif packet.id == SKnownPacks.toId(version):
+    let packs = SKnownPacks.readPacket(payload, version)
+    if not packs.isOk:
+      return readErrVoid(packs.error)
+    self.handleKnownPacks(packs.value, server)
+  elif packet.id == cfgkeepalive.SKeepAlive.toId(version):
+    let alive = cfgkeepalive.SKeepAlive.readPacket(payload, version)
+    if not alive.isOk:
+      return readErrVoid(alive.error)
+    self.handleConfigKeepAlive(alive.value)
+  elif packet.id == SConfigCookieResponse.toId(version):
+    let cookie = SConfigCookieResponse.readPacket(payload, version)
+    if not cookie.isOk:
+      return readErrVoid(cookie.error)
+    self.handleConfigCookieResponse(cookie.value)
+  elif packet.id == SConfigResourcePack.toId(version):
+    let pack = SConfigResourcePack.readPacket(payload, version)
+    if not pack.isOk:
+      return readErrVoid(pack.error)
+    self.handleResourcePackResponse(pack.value)
+  else:
+    echo "Failed to handle java client packet id ", packet.id, " in Config State"
+  readOkVoid()
+
+proc handlePacket*(self: JavaClient; server: Server; packet: RawPacket; result0: var PacketHandlerResult): ProtoReadVoidResult =
+  ## `handle_packet`: `result0` stops being `phrContinue`, upstream's `None`, when the login sequence has ended.
+  case self.connectionState
+  of csHandShake: self.handleHandshakePacket(packet)
+  of csStatus: self.handleStatusPacket(server, packet)
+  # TODO: Check config if transfer is enabled
+  of csLogin, csTransfer: self.handleLoginPacket(server, packet)
+  of csConfig: self.handleConfigPacket(server, packet, result0)
+  of csPlay: readOkVoid()
+
+proc handlePlayPacket*(self: JavaClient; player: Player; server: Server; packet: RawPacket): ProtoReadVoidResult =
+  var payload = newNetReader(packet.payload)
+  let version = self.version
+  if packet.id == SConfirmTeleport.toId(version):
+    let p = SConfirmTeleport.readPacket(payload, version)
+    if not p.isOk: return readErrVoid(p.error)
+    self.handleConfirmTeleport(player, p.value)
+  elif packet.id == SClientInformationPlay.toId(version):
+    let p = SClientInformationPlay.readPacket(payload, version)
+    if not p.isOk: return readErrVoid(p.error)
+    self.handleClientInformation(player, server, p.value)
+  elif packet.id == playkeepalive.SKeepAlive.toId(version):
+    let p = playkeepalive.SKeepAlive.readPacket(payload, version)
+    if not p.isOk: return readErrVoid(p.error)
+    self.handleKeepAlive(player, p.value)
+  elif packet.id == SClientTickEnd.toId(version):
+    discard # TODO
+  elif packet.id == SPlayerPosition.toId(version):
+    let p = SPlayerPosition.readPacket(payload, version)
+    if not p.isOk: return readErrVoid(p.error)
+    self.handlePosition(player, server, p.value)
+  elif packet.id == SPlayerPositionRotation.toId(version):
+    let p = SPlayerPositionRotation.readPacket(payload, version)
+    if not p.isOk: return readErrVoid(p.error)
+    self.handlePositionRotation(player, server, p.value)
+  elif packet.id == SPlayerRotation.toId(version):
+    let p = SPlayerRotation.readPacket(payload, version)
+    if not p.isOk: return readErrVoid(p.error)
+    self.handleRotation(player, p.value)
+  elif packet.id == SPlayerLoaded.toId(version):
+    player.clientLoaded = true
+  elif packet.id == SChunkBatch.toId(version):
+    let p = SChunkBatch.readPacket(payload, version)
+    if not p.isOk: return readErrVoid(p.error)
+    self.handleChunkBatch(player, p.value)
+  # The rest of upstream's match is in play.aowl's PARTIAL line. Unlike upstream's "Failed to handle" warning
+  # this stays quiet: a real client sends a dozen such packets a second.
+  readOkVoid()
+
+proc progressKeepAlive*(self: JavaClient) =
+  ## The keep-alive timer branch of `progress_player_packets`.
+  let now = nowMs()
+  if now < self.nextKeepAliveAt:
+    return
+  self.nextKeepAliveAt = now + KeepAliveIntervalMs
+  # If the client never responded to the LAST keep-alive, they timed out.
+  if self.waitForKeepAlive:
+    self.kick(translate(tr.JAVA_DISCONNECT_TIMEOUT))
+    return
+  # Generate a unique ID (upstream: current timestamp in ms)
+  let keepAliveId = now
+  self.keepAliveId = keepAliveId
+  self.waitForKeepAlive = true
+  self.lastKeepAliveTime = now
+  self.writePacketFor(CKeepAlive(keepAliveId: keepAliveId))
+  let seq0 = self.packetSequence
+  self.packetSequence = -1'i32
+  if seq0 != -1'i32:
+    self.writePacketFor(CAcknowledgeBlockChange(sequenceId: newVarInt(seq0)))

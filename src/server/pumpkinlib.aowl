@@ -1,0 +1,115 @@
+## Port of pumpkin/src/lib.rs
+## PARTIAL: pumpkin/src/lib.rs - `PumpkinServer` with the Java listener and the tick loop. No Bedrock socket, console, RCON, query, LAN broadcast, plugins or logger.
+##
+## Upstream runs an accept task, tasks per client and a separate tick task. Here `serverLoop` is all of them in
+## turn, on one thread, over non-blocking sockets; see src/server/net/winsock.aowl.
+
+import std/[options, syncio]
+import serverbase, servermod
+import entity/player as playermod
+import world/worldmod
+import net/java/[dispatch]
+import net/winsock
+import ../util/text/text
+
+const
+  TickMs = 50'i64
+  FlushGraceMs = 2000'i64     ## How long a closed client's queued bytes may take to drain.
+
+type
+  Connection = ref object
+    client: JavaClient
+    player: Option[Player]
+    closingSince: int64
+
+proc handleLoginResult(conn: Connection; server: Server; res: PacketHandlerResult) =
+  ## The `match login_result` of `unified_listener_task`.
+  case res.kind
+  of phrStop, phrContinue:
+    conn.client.close()
+  of phrReadyToPlay:
+    let (player, world) = server.addPlayer(conn.client, res.profile, res.config)
+    # Set the player on the client BEFORE spawning so that chunk sends during spawn_java_player don't get dropped.
+    conn.player = some(player)
+    conn.client.nextKeepAliveAt = nowMs() + 15000'i64
+    spawnJavaPlayer(world, server.basicConfig, player, server)
+
+proc pumpConnection(conn: Connection; server: Server) =
+  ## One pass of what upstream's per-client task does between awaits.
+  let client = conn.client
+  client.pumpSocket()
+  while true:
+    let packet = client.getPacket()
+    if packet.isNone:
+      break
+    let raw = packet.unsafeGet
+    if conn.player.isSome:
+      let res = client.handlePlayPacket(conn.player.unsafeGet, server, raw)
+      if not res.isOk:
+        echo "Failed to handle play packet id ", raw.id, " (payload ", raw.payload.len, " bytes): ", res.error.msg
+        client.kick(text("Error while handling incoming packet " & res.error.msg))
+    else:
+      var loginResult = PacketHandlerResult(kind: phrContinue)
+      let res = client.handlePacket(server, raw, loginResult)
+      if not res.isOk:
+        echo "Failed to read incoming packet with id ", raw.id, ": ", res.error.msg
+        client.kick(text("Error while reading incoming packet " & res.error.msg))
+      elif loginResult.kind != phrContinue:
+        handleLoginResult(conn, server, loginResult)
+  if conn.player.isSome and not client.isClosed:
+    client.progressKeepAlive()
+  client.flushOutgoing()
+
+proc finished(conn: Connection; now: int64): bool =
+  ## True once a closed client has nothing left to send, or has had its time to drain it.
+  if not conn.client.isClosed:
+    return false
+  if conn.closingSince == 0'i64:
+    conn.closingSince = now
+  conn.client.gone or not conn.client.hasOutgoing() or now - conn.closingSince > FlushGraceMs
+
+proc serverLoop*(server: Server; port: uint16): bool =
+  ## `PumpkinServer::start`. Returns false when the socket cannot be opened; otherwise it does not return.
+  if not initWinsock():
+    echo "FATAL: WSAStartup failed"
+    return false
+  let listener = listenOnNonBlocking(port)
+  if int(listener) == int(InvalidSocket):
+    echo "FATAL: could not bind/listen on port ", port, " (already in use?)"
+    return false
+  echo "aowlmony Minecraft server listening on port ", port
+  var connections: seq[Connection] = @[]
+  var masterClientIdCounter = 0'u64
+  var nextTick = nowMs() + TickMs
+  while true:
+    while true:
+      let socket = tryAccept(listener)
+      if int(socket) == int(InvalidSocket):
+        break
+      let clientId = masterClientIdCounter
+      masterClientIdCounter += 1'u64
+      connections.add(Connection(client: newJavaClient(socket, clientId), player: none[Player](), closingSince: 0'i64))
+
+    for conn in connections:
+      pumpConnection(conn, server)
+
+    let now = nowMs()
+    if now >= nextTick:
+      nextTick = now + TickMs
+      server.tick()
+      for conn in connections:
+        conn.client.flushOutgoing()
+
+    var kept: seq[Connection] = @[]
+    for conn in connections:
+      if finished(conn, now):
+        if conn.player.isSome:
+          server.removePlayer(conn.player.unsafeGet)
+          conn.player = none[Player]()
+        closeClient(conn.client.socket)
+      else:
+        kept.add(conn)
+    connections = kept
+
+    sleepMs(1)
+  true

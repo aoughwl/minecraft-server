@@ -1,0 +1,234 @@
+## Port of pumpkin/src/world/mod.rs
+## PARTIAL: pumpkin/src/world/mod.rs - `spawn_java_player`, `get_top_block`, `add_player`, `remove_player`'s tab-list half and the time part of `tick_environment`. Of `spawn_java_player`, the commands packet is an empty tree (src/command has no wire form yet), and the inventory (`on_screen_handler_opened`, `CSetEquipment`), effects, recipes, bossbars and plugin events are missing. Everything else in its 5500 lines is not ported: blocks, entities, ticking, weather changes, explosions. The types are in ../serverbase.aowl.
+
+import std/options
+import ../../protocol/java/client/play/[login, player_spawn_data, ticking_state, ticking_step, commands,
+  chunk_batch_start, chunk_batch_end, chunk_data, player_action, spawn_entity, set_held_item,
+  game_event, initialize_world_border, player_spawn_position, system_chat_message, player_remove, remove_entities]
+import ../../protocol/java/client/play/player_info_update except Player
+import ../../generated/translation as tr
+import ../../generated/entity_type
+import ../../util/math/position
+import ../../util/text/text
+import ../../world/[biomeparam, blockstates, chunkdata]
+import ../serverbase
+import ../entity/player as playermod
+import chunker
+
+proc newWorldborder(centerX, centerZ, diameter: float64; speed: int64; warningBlocks, warningTime: int32): Worldborder =
+  ## `Worldborder::new`
+  Worldborder(centerX: centerX, centerZ: centerZ, oldDiameter: diameter, newDiameter: diameter, speed: speed,
+    portalTeleportBoundary: 29_999_984'i32, warningBlocks: warningBlocks, warningTime: warningTime)
+
+proc loadWorld*(theLevel: Level; levelInfo: LevelData; theDimension: Dimension; seaLevel: int32): World =
+  ## `World::load`.
+  World(level: theLevel, levelInfo: levelInfo, dimension: theDimension, players: @[], seaLevel: seaLevel,
+    worldborder: newWorldborder(0.0, 0.0, 5.999_996_8e7, 0'i64, 5'i32, 300'i32),
+    levelTime: LevelTime(worldAge: 0'i64, timeOfDay: levelInfo.dayTime),
+    weather: Weather(raining: false, rainLevel: 0.0'f32, thunderLevel: 0.0'f32))
+
+proc addPlayer*(self: World; player: Player) =
+  self.players.add(player)
+
+proc getTopBlock*(self: World; position: Vector2[int32]): int32 =
+  let chunkPos = Vector2[int32](x: position.x shr 4, y: position.y shr 4)
+  let relativeX = int(position.x and 15'i32)
+  let relativeZ = int(position.y and 15'i32)
+  let chunk = readChunkSync(self.level, chunkPos.x, chunkPos.y)
+  if chunk == nil:
+    return self.dimension.minY
+  let height = getHeightmap(chunk.heightmap, chmWorldSurface, position.x, position.y, self.dimension.minY)
+  if height >= self.dimension.minY:
+    return height
+  var y = self.dimension.minY + self.dimension.height - 1'i32
+  while y >= self.dimension.minY:
+    let (found, blockId) = getBlockAbsoluteY(chunk.section, relativeX, y, relativeZ)
+    if found and not isAir(blockId):
+      return y
+    dec y
+  self.dimension.minY
+
+proc playerActionsFor(p: Player; selfJoin: bool): seq[PlayerAction] =
+  ## The five actions both of `spawn_java_player`'s tab-list packets send.
+  var props: seq[Property] = @[]
+  for property in p.gameprofile.properties:
+    props.add(Property(name: property.name, value: property.value,
+      signature: if property.signature.len > 0: some(property.signature) else: none[string]()))
+  result = @[
+    PlayerAction(kind: paAddPlayer, name: p.gameprofile.name, properties: props),
+    PlayerAction(kind: paUpdateGameMode, gameMode: newVarInt(int32(ord(p.gamemode)))),
+    PlayerAction(kind: paUpdateListed, listed: if selfJoin: true else: p.tabListListed),
+    PlayerAction(kind: paUpdateLatency, latency: newVarInt(if selfJoin: 0'i32 else: p.tabListLatency)),
+    PlayerAction(kind: paUpdateListOrder, listOrder: newVarInt(if selfJoin: 0'i32 else: p.tabListOrder))]
+
+const TabListFlags = PlayerInfoAddPlayer or PlayerInfoUpdateGameMode or PlayerInfoUpdateListed or
+  PlayerInfoUpdateLatency or PlayerInfoUpdateListPriority
+
+proc spawnEntityPacket(p: Player): CSpawnEntity =
+  let (_, playerType) = entityTypeByName("player")
+  newCSpawnEntity(newVarInt(p.entityId), p.gameprofile.id, newVarInt(int32(playerType.id)), p.pos, p.pitch, p.yaw,
+    p.yaw, newVarInt(0'i32), p.velocity)
+
+proc broadcastSystemMessage*(self: World; message: TextComponent; overlay: bool) =
+  for p in self.players:
+    p.client.writePacketFor(CSystemChatMessage(content: message, overlay: overlay))
+
+proc spawnJavaPlayer*(self: World; baseConfig: BasicConfiguration; player: Player; server: Server) =
+  var dimensions: seq[string] = @[]
+  for d in server.dimensions:
+    dimensions.add(d.minecraftName)
+
+  # This code follows the vanilla packet order
+  let entityId = player.entityId
+  let gamemode = player.gamemode
+  let client = player.client
+  let java = server.advancedConfig.networking.java
+
+  # Send the login packet for our new player
+  client.writePacketFor(CLogin(
+    entityId: entityId,
+    isHardcore: baseConfig.hardcore,
+    dimensionNames: dimensions,
+    maxPlayers: newVarInt(int32(java.maxPlayers)),
+    viewDistance: newVarInt(int32(java.viewDistance)),
+    simulatedDistance: newVarInt(int32(java.simulationDistance)),
+    reducedDebugInfo: false,
+    enabledRespawnScreen: true,
+    limitedCrafting: false,
+    spawnData: PlayerSpawnData(
+      dimension: self.dimension,
+      hashedSeed: hashSeed(self.level.seed),
+      gameMode: uint8(ord(gamemode)),
+      previousGamemode: (if player.previousGamemode.isSome: int8(ord(player.previousGamemode.unsafeGet)) else: -1'i8),
+      debug: false,
+      isFlat: false,
+      deathDimensionName: none[(string, BlockPos)](),
+      portalCooldown: newVarInt(0'i32),
+      sealevel: newVarInt(self.seaLevel)),
+    onlineMode: java.onlineMode,
+    # This should stay true even when reports are disabled.
+    # It prevents the annoying popup when joining the server.
+    enforceSecureChat: true))
+
+  # Send the current ticking state to the new player so they are in sync.
+  client.writePacketFor(CTickingState(tickRate: baseConfig.tps, isFrozen: false))
+  client.writePacketFor(CTickingStep(tickSteps: newVarInt(0'i32)))
+
+  # Permissions, i.e. the commands a player may use.
+  player.sendPermissionLvlUpdate()
+
+  # Difficulty of the world
+  player.sendDifficultyUpdate()
+  client.writePacketFor(emptyCommandTree())
+
+  var position: Vector3[float64]
+  var yaw: float32
+  var pitch: float32
+  if player.hasPlayedBefore:
+    position = player.pos
+    yaw = player.yaw
+    pitch = player.pitch
+  else:
+    let info = self.levelInfo
+    discard fetchChunkFromDisk(self.level, info.spawnX shr 4, info.spawnZ shr 4)
+    let posY = self.getTopBlock(Vector2[int32](x: info.spawnX, y: info.spawnZ)) + 1'i32 # +1 to spawn on top of the block
+    position = Vector3[float64](x: float64(info.spawnX) + 0.5, y: float64(posY), z: float64(info.spawnZ) + 0.5)
+    yaw = info.spawnYaw
+    pitch = info.spawnPitch
+
+  # Load chunks around the real spawn position before teleporting the client there.
+  player.setPos(position)
+  player.setRotation(yaw, pitch)
+  player.lastPos = position
+  updatePosition(player, server)
+
+  let centerChunk = player.chunkPos
+  let fetched = fetchChunkFromDisk(self.level, centerChunk.x, centerChunk.y)
+  client.writePacketFor(CChunkBatchStart())
+  var centerCount = 0'u16
+  if fetched.kind == lkLoaded and fetched.chunk.status == csFull:
+    client.writePacketFor(CChunkData(data: fetched.chunk))
+    centerCount = 1'u16
+  client.writePacketFor(newCChunkBatchEnd(centerCount))
+
+  player.requestTeleport(position, yaw, pitch)
+
+  let joined = @[PlayerInfoEntry(uuid: player.gameprofile.id, actions: playerActionsFor(player, true))]
+  for p in self.players:
+    p.client.writePacketFor(CPlayerInfoUpdate(actions: TabListFlags, players: joined))
+
+  # Here, we send all the infos of players who already joined.
+  var others: seq[PlayerInfoEntry] = @[]
+  for p in self.players:
+    if p.gameprofile.id != player.gameprofile.id:
+      others.add(PlayerInfoEntry(uuid: p.gameprofile.id, actions: playerActionsFor(p, false)))
+  client.writePacketFor(CPlayerInfoUpdate(actions: TabListFlags, players: others))
+
+  # Spawn the player for every client.
+  for p in self.players:
+    if p.gameprofile.id != player.gameprofile.id:
+      p.client.writePacketFor(spawnEntityPacket(player))
+
+  # Spawn players for our client.
+  for p in self.players:
+    if p.gameprofile.id != player.gameprofile.id:
+      client.writePacketFor(spawnEntityPacket(p))
+
+  player.sendClientInformation()
+
+  player.sendAbilitiesUpdate()
+
+  # Sync selected slot
+  client.writePacketFor(CSetSelectedSlot(slot: player.selectedSlot))
+
+  # Start waiting for level chunks. Sets the "Loading Terrain" screen
+  client.writePacketFor(newCGameEvent(geStartWaitingChunks, 0.0'f32))
+
+  let border = self.worldborder
+  client.writePacketFor(CInitializeWorldBorder(x: border.centerX, z: border.centerZ, oldDiameter: border.oldDiameter,
+    newDiameter: border.newDiameter, speed: newVarLong(border.speed),
+    portalTeleportBoundary: newVarInt(border.portalTeleportBoundary), warningBlocks: newVarInt(border.warningBlocks),
+    warningTime: newVarInt(border.warningTime)))
+
+  # Sends initial time
+  player.sendTime(self)
+
+  let info = self.levelInfo
+  client.writePacketFor(CPlayerSpawnPosition(dimensionName: self.dimension.minecraftName,
+    location: newBlockPos(info.spawnX, info.spawnY, info.spawnZ), yaw: info.spawnYaw, pitch: info.spawnPitch))
+
+  # Send initial weather state
+  if self.weather.raining:
+    client.writePacketFor(newCGameEvent(geBeginRaining, 0.0'f32))
+    client.writePacketFor(newCGameEvent(geRainLevelChange, max(min(self.weather.rainLevel, 1.0'f32), 0.0'f32)))
+    client.writePacketFor(newCGameEvent(geThunderLevelChange, max(min(self.weather.thunderLevel, 1.0'f32), 0.0'f32)))
+
+  player.hasPlayedBefore = true
+
+  let msgComp = translateCross(tr.JAVA_MULTIPLAYER_PLAYER_JOINED, tr.BEDROCK_MULTIPLAYER_PLAYER_JOINED,
+    [text(player.gameprofile.name)]).colorNamed(ncYellow)
+  self.broadcastSystemMessage(msgComp, false)
+
+proc removePlayer*(self: World; player: Player) =
+  ## The half of `remove_player` a joined client can see.
+  var kept: seq[Player] = @[]
+  for p in self.players:
+    if p != player:
+      kept.add(p)
+  self.players = kept
+  for p in self.players:
+    p.client.writePacketFor(CRemovePlayerInfo(players: @[player.gameprofile.id]))
+    p.client.writePacketFor(CRemoveEntities(entityIds: @[newVarInt(player.entityId)]))
+
+proc tickEnvironment*(self: World) =
+  ## `tick_environment`'s time. `LevelTime::tick_time`, then the broadcast `tick_time`'s caller does.
+  self.levelTime.worldAge += 1'i64
+  self.levelTime.timeOfDay += 1'i64
+  if self.levelTime.worldAge mod 20'i64 == 0'i64:
+    for p in self.players:
+      p.sendTime(self)
+
+proc tick*(self: World) =
+  self.tickEnvironment()
+  for p in self.players:
+    p.tick()

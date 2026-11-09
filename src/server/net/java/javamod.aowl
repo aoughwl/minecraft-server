@@ -1,0 +1,150 @@
+## Port of pumpkin/src/net/java/mod.rs
+## PARTIAL: pumpkin/src/net/java/mod.rs - `handle_play_packet` routes only what src/server/net/java/play.aowl handles, and there are no plugin events. The dispatchers (`handle_packet` and friends) are in dispatch.aowl, since the handlers they call import this module.
+##
+## See src/server/net/winsock.aowl for the design: one thread polls every client. Upstream's outgoing task and
+## its two queues become one byte buffer: "enqueue" and "send now" both frame the packet into `outgoing`, in
+## order, and `flushOutgoing` hands the kernel what it will take. So `tasks`, `spawn_task`, `await_tasks`,
+## `close_token` and the `OutgoingPacket` queues have no equivalent, and `close` flushes before it hangs up.
+
+{.feature: "untyped".}
+
+import std/[options, syncio]
+import ../../../protocol/[protobase, netcodec, varint, proto, packetbase]
+import ../../../protocol/java/[packet_decoder, packet_encoder]
+import ../../../protocol/java/client/config/config_disconnect
+import ../../../protocol/java/client/login/login_disconnect
+import ../../../protocol/java/client/play/disconnect
+import ../../../util/javaversion
+import ../../../util/text/text
+import ../../../config/networking/compression
+import ../winsock, ../netbase
+
+export netbase, javaversion, netcodec, varint, packetbase, proto, protobase
+
+const ReadChunkSize = 65536
+
+type
+  JavaClient* = ref object
+    id*: uint64
+    version*: JavaMinecraftVersion
+    gameprofile*: Option[GameProfile]
+    config*: Option[PlayerConfig]
+    serverAddress*: string
+    connectionState*: ConnectionState
+    brand*: Option[string]
+    socket*: SocketHandle
+    networkWriter*: TCPNetworkEncoder
+    networkReader*: TCPNetworkDecoder
+    outgoing*: seq[byte]   ## Framed bytes the kernel has not taken yet.
+    outgoingStart*: int    ## How many of `outgoing` it has.
+    closed*: bool          ## `close_token`: no more packets are read; what is queued is still flushed.
+    gone*: bool            ## The socket is dead: nothing more can move either way.
+    waitForKeepAlive*: bool
+    keepAliveId*: int64
+    lastKeepAliveTime*: int64
+    nextKeepAliveAt*: int64
+    packetSequence*: int32
+    readBuffer: seq[byte]
+
+proc newJavaClient*(socket: SocketHandle; id: uint64): JavaClient =
+  JavaClient(id: id, version: CurrentMcVersion, gameprofile: none[GameProfile](), config: none[PlayerConfig](),
+    serverAddress: "", connectionState: csHandShake, brand: none[string](), socket: socket,
+    networkWriter: newTCPNetworkEncoder(), networkReader: newTCPNetworkDecoder(), outgoing: @[], outgoingStart: 0,
+    closed: false, gone: false, waitForKeepAlive: false, keepAliveId: 0'i64, lastKeepAliveTime: nowMs(),
+    nextKeepAliveAt: 0'i64, packetSequence: -1'i32, readBuffer: newSeq[byte](ReadChunkSize))
+
+proc close*(self: JavaClient) =
+  ## `close`: stops reading. Anything already queued, such as a kick's reason, still goes out.
+  self.closed = true
+
+proc isClosed*(self: JavaClient): bool {.inline.} = self.closed
+
+proc setCompression*(self: JavaClient; compression: CompressionInfo) =
+  if compression.level > 9'u32:
+    echo "Invalid compression level! Clients will not be able to read this!"
+  self.networkReader.setCompression(int(compression.threshold))
+  self.networkWriter.setCompression(int(compression.threshold), compression.level)
+
+proc flushOutgoing*(self: JavaClient) =
+  ## Hands the kernel as much as it takes; the rest waits for the next pass.
+  let framed = self.networkWriter.flush()
+  if framed.len > 0:
+    let at = self.outgoing.len
+    self.outgoing.setLen(at + framed.len)
+    for i in 0 ..< framed.len:
+      self.outgoing[at + i] = framed[i]
+  while self.outgoingStart < self.outgoing.len and not self.gone:
+    let n = trySend(self.socket, self.outgoing, self.outgoingStart)
+    if n == WouldBlock:
+      break
+    if n == SocketClosed:
+      self.gone = true
+      break
+    self.outgoingStart += n
+  if self.outgoingStart >= self.outgoing.len:
+    self.outgoing.setLen(0)
+    self.outgoingStart = 0
+
+proc hasOutgoing*(self: JavaClient): bool {.inline.} =
+  self.outgoing.len > self.outgoingStart
+
+proc sendPacketNowData*(self: JavaClient; packet: openArray[byte]) =
+  ## `send_packet_now_data` and `enqueue_packet_data`, which do not differ here.
+  let res = self.networkWriter.writePacket(packet)
+  if not res.isOk:
+    echo "Failed to send packet to client ", self.id, ": ", res.error.msg
+    self.close()
+
+template writePacketFor*(self: JavaClient; packet: untyped) =
+  ## `send_packet_now`, `enqueue_packet` and `write_packet_for_version` in one: the caller's module must see the
+  ## packet's `toId` and `writePacket`, which a template finds and a generic proc does not.
+  block:
+    let wpVersion = self.version
+    let wpPacket = packet
+    var wpBuf = newNetWriter()
+    let wpId = typeof(wpPacket).toId(wpVersion)
+    if wpId == -1'i32:
+      echo "Packet ID for version ", wpVersion, " is invalid"
+    writeJavaPacketId(wpBuf, wpId)
+    let wpRes = writePacket(wpPacket, wpBuf, wpVersion)
+    if wpRes.isOk:
+      sendPacketNowData(self, wpBuf.buf)
+    else:
+      echo "Failed to write packet: ", wpRes.error.msg
+
+proc kick*(self: JavaClient; reason: TextComponent) =
+  ## `kick`. Login's reason is JSON, Configuration's a plain string as upstream sends it, Play's NBT.
+  case self.connectionState
+  of csLogin:
+    self.writePacketFor(CLoginDisconnect(jsonReason: toJsonString(reason)))
+  of csConfig:
+    self.writePacketFor(CConfigDisconnect(reason: getText(reason)))
+  of csPlay:
+    self.writePacketFor(CPlayDisconnect(reason: reason))
+  else:
+    discard
+  self.close()
+
+proc pumpSocket*(self: JavaClient) =
+  ## Feeds the decoder what the socket has. The first half of `get_packet`.
+  while not self.gone and not self.closed:
+    let n = tryRecv(self.socket, self.readBuffer)
+    if n == WouldBlock:
+      return
+    if n == SocketClosed:
+      self.gone = true
+      self.closed = true
+      return
+    self.networkReader.feed(self.readBuffer.toOpenArray(0, n - 1))
+
+proc getPacket*(self: JavaClient): Option[RawPacket] =
+  ## The other half of `get_packet`: the next whole packet, if one has arrived.
+  if self.closed or not self.networkReader.packetReady():
+    return none[RawPacket]()
+  let res = self.networkReader.getRawPacket()
+  if res.isOk:
+    return some(res.value)
+  if res.error.kind != pdeConnectionClosed:
+    echo "Failed to decode packet from client ", self.id, ": ", res.error.msg
+    self.kick(text("Error while reading incoming packet " & res.error.msg))
+  none[RawPacket]()

@@ -1,6 +1,15 @@
 ## Port of pumpkin-protocol/src/java/client/play/chunk_data.rs
 ## Provides the client with the full data for a chunk: heightmaps, block and biome sections, block entities and
 ## light.
+##
+## Not upstream: `remapBiomeForVersion`. Upstream writes the pinned tree's biome ids to every version, but a client
+## reads them as positions in the biome registry it was sent, and 26.2's has one more biome than 1.21.11's, so
+## from index 53 on they name the wrong biome or none at all. Every other id in this packet goes through a remap
+## table; this one has none upstream, so it is built from the registries themselves.
+##
+## Also not upstream: a light section that is uniform but not zero (`Empty(15)`, what an absent `SkyLight` above the
+## terrain reads as, see chunkformat.aowl) goes out as a filled array. Upstream's empty mask means zero to the client,
+## which would show everything in those sections unlit.
 import std/options
 import ../../../protobase, ../../../netcodec, ../../../varint
 import ../../../../generated/packet, ../../../../util/javaversion
@@ -9,6 +18,8 @@ import ../../../../generated/block_state_remap, ../../../../generated/block_prop
 import ../../../../nbt/tag
 import ../../../../util/math/position
 import ../../../../world/[chunkdata, palette]
+import ../../../../generated/registry
+from ../../../../world/blockstates import biomeCount, biomeNameById
 
 type
   CChunkData* = object
@@ -62,6 +73,64 @@ proc remapForVersion(network: var NetworkSerialization; version: JavaMinecraftVe
         remappedWord = remappedWord or (uint64(remappedId) shl shift)
       network.packedData[wordIndex] = cast[int64](remappedWord)
 
+var biomeRemaps: seq[seq[uint8]] = @[]  ## By `ord(version)`, built when first asked for.
+
+proc buildBiomeRemap(version: JavaMinecraftVersion): seq[uint8] =
+  ## Position of each pinned biome in `version`'s registry. One the version lacks becomes plains.
+  var names: seq[string] = @[]
+  let tables = staticRegistries(version)
+  for reg in tables:
+    if reg.registryId == "worldgen/biome":
+      for entry in reg.entries:
+        names.add(entry.name)
+  var plains = 0'u8
+  for i in 0 ..< names.len:
+    if names[i] == "plains":
+      plains = uint8(i)
+  result = newSeq[uint8](biomeCount())
+  for id in 0 ..< biomeCount():
+    result[id] = plains
+    for i in 0 ..< names.len:
+      if names[i] == biomeNameById(id)[1]:
+        result[id] = uint8(i)
+        break
+
+proc remapBiomeForVersion*(id: uint32; version: JavaMinecraftVersion): uint32 =
+  let v = ord(version)
+  while biomeRemaps.len <= v:
+    biomeRemaps.add(newSeq[uint8](0))
+  if biomeRemaps[v].len == 0:
+    biomeRemaps[v] = buildBiomeRemap(version)
+  if int(id) < biomeRemaps[v].len:
+    return uint32(biomeRemaps[v][int(id)])
+  id
+
+proc remapBiomesForVersion(network: var NetworkSerialization; version: JavaMinecraftVersion) =
+  case network.paletteKind
+  of npSingle:
+    network.value = remapBiomeForVersion(network.value, version)
+  of npIndirect:
+    for i in 0 ..< network.values.len:
+      network.values[i] = remapBiomeForVersion(network.values[i], version)
+  of npDirect:
+    let bitsPerEntry = int(network.bitsPerEntry)
+    let valuesPerI64 = 64 div bitsPerEntry
+    let idMask = (1'u64 shl bitsPerEntry) - 1'u64
+    for wordIndex in 0 ..< network.packedData.len:
+      var remappedWord = 0'u64
+      let packedWordU64 = cast[uint64](network.packedData[wordIndex])
+      for index in 0 ..< valuesPerI64:
+        let shift = index * bitsPerEntry
+        let biomeId = uint32((packedWordU64 shr shift) and idMask)
+        let remappedId = remapBiomeForVersion(biomeId, version)
+        remappedWord = remappedWord or (uint64(remappedId) shl shift)
+      network.packedData[wordIndex] = cast[int64](remappedWord)
+
+proc biomeNetworkFor(palette: BiomePalette; v: JavaMinecraftVersion): NetworkSerialization =
+  result = biomeConvertNetwork(palette)
+  if v < CURRENT_MC_VERSION:
+    remapBiomesForVersion(result, v)
+
 proc writeNetworkSerialization(buf: var NetWriter; network: NetworkSerialization; version: JavaMinecraftVersion) =
   writeU8(buf, network.bitsPerEntry)
 
@@ -94,6 +163,17 @@ proc blockEntityTypeId(name: Option[string]): int32 =
     if BLOCK_ENTITY_TYPES[i] == short:
       return int32(i)
   0'i32
+
+proc lightHasData(l: LightContainer): bool {.inline.} =
+  not l.isEmpty or l.default != 0'u8
+
+proc writeLightArray(w: var NetWriter; l: LightContainer) =
+  if l.isEmpty:
+    let filled = (l.default shl 4) or l.default
+    for i in 0 ..< LightArraySize:
+      writeU8(w, filled)
+  else:
+    writeSlice(w, l.data)
 
 proc toId*(_: typedesc[CChunkData]; v: JavaMinecraftVersion): int32 =
   CB_PLAY_LEVEL_CHUNK_WITH_LIGHT.toId(v)
@@ -128,7 +208,7 @@ proc writePacket*(p: CChunkData; w: var NetWriter; v: JavaMinecraftVersion): Pro
         remapForVersion(blockNetwork, v)
       writeNetworkSerialization(blocksAndBiomesBuf, blockNetwork, v)
 
-      writeNetworkSerialization(blocksAndBiomesBuf, biomeConvertNetwork(biomePalette), v)
+      writeNetworkSerialization(blocksAndBiomesBuf, biomeNetworkFor(biomePalette, v), v)
 
     writeVarInt(w, newVarInt(int32(blocksAndBiomesBuf.buf.len)))
     writeSlice(w, blocksAndBiomesBuf.buf)
@@ -169,12 +249,12 @@ proc writePacket*(p: CChunkData; w: var NetWriter; v: JavaMinecraftVersion): Pro
     for sectionIndex in 0 ..< numSections:
       let bitIndex = sectionIndex + 1  # Offset by 1 for the below-world section
 
-      if not lightEngine.skyLight[sectionIndex].isEmpty:
+      if lightHasData(lightEngine.skyLight[sectionIndex]):
         skyLightMask = skyLightMask or (1'u64 shl bitIndex)
       else:
         skyLightEmptyMask = skyLightEmptyMask or (1'u64 shl bitIndex)
 
-      if not lightEngine.blockLight[sectionIndex].isEmpty:
+      if lightHasData(lightEngine.blockLight[sectionIndex]):
         blockLightMask = blockLightMask or (1'u64 shl bitIndex)
       else:
         blockLightEmptyMask = blockLightEmptyMask or (1'u64 shl bitIndex)
@@ -197,14 +277,14 @@ proc writePacket*(p: CChunkData; w: var NetWriter; v: JavaMinecraftVersion): Pro
     # Write Sky Light arrays
     writeVarInt(w, newVarInt(int32(countOnes(fromU64(skyLightMask)))))
     for sectionIndex in 0 ..< numSections:
-      if not lightEngine.skyLight[sectionIndex].isEmpty:
+      if lightHasData(lightEngine.skyLight[sectionIndex]):
         writeVarInt(w, lightDataSize)
-        writeSlice(w, lightEngine.skyLight[sectionIndex].data)
+        writeLightArray(w, lightEngine.skyLight[sectionIndex])
 
     # Write Block Light arrays
     writeVarInt(w, newVarInt(int32(countOnes(fromU64(blockLightMask)))))
     for sectionIndex in 0 ..< numSections:
-      if not lightEngine.blockLight[sectionIndex].isEmpty:
+      if lightHasData(lightEngine.blockLight[sectionIndex]):
         writeVarInt(w, lightDataSize)
-        writeSlice(w, lightEngine.blockLight[sectionIndex].data)
+        writeLightArray(w, lightEngine.blockLight[sectionIndex])
   writeOkVoid()

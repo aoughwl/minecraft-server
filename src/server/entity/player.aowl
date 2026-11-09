@@ -1,0 +1,187 @@
+## Port of pumpkin/src/entity/player.rs
+## PARTIAL: pumpkin/src/entity/player.rs - the `Player` and `ChunkManager` a client needs to spawn, stand and receive chunks, which are only those already on disk, with no generation. No inventory, screen handlers, health, hunger, mining, chat sessions, NBT read and write, permissions beyond level zero, or any of the rest of its 5300 lines.
+##
+## The types are in ../serverbase.aowl.
+
+import std/[options, tables, algorithm, math]
+import ../../protocol/java/client/play/[player_abilities, player_position, change_difficulty, set_time,
+  entity_metadata, chunk_batch_start, chunk_batch_end, chunk_data, entity_status]
+import ../../generated/tracked_data
+from ../../generated/meta_data_type import BYTE, HUMANOID_ARM
+import ../../generated/entity_status as entitystatusdata
+import ../../util/difficulty
+import ../../world/chunkdata
+import ../serverbase
+import ../net/winsock
+
+const
+  NotchianBatchesWithoutAckUntilPause = 10'u8
+  AckStallFallbackDelay = 250'i64
+
+proc chunkPosKey*(x, z: int32): int64 {.inline.} = chunkKey(x, z)
+
+# --- ChunkManager ----------------------------------------------------------------------------------
+
+proc newChunkManager*(chunksPerTick: int): ChunkManager =
+  ChunkManager(chunksPerTick: chunksPerTick, center: Vector2[int32](x: 0'i32, y: 0'i32), viewDistance: 0'u8,
+    chunkSent: initTable[int64, bool](), chunkQueue: @[], batchesSentSinceAck: 0'u8,
+    lastChunkBatchSentAt: nowMs())
+
+proc chebyshev(a, b: Vector2[int32]): int32 =
+  max(abs(a.x - b.x), abs(a.y - b.y))
+
+proc byDistance(a, b: (int32, Vector2[int32])): int =
+  ## Upstream's `HeapNode` order for its `BinaryHeap`: nearest first.
+  cmp(a[0], b[0])
+
+proc ackWindowOpen(self: ChunkManager): bool =
+  self.batchesSentSinceAck < NotchianBatchesWithoutAckUntilPause
+
+proc ackFallbackReady(self: ChunkManager): bool =
+  not self.ackWindowOpen() and nowMs() - self.lastChunkBatchSentAt >= AckStallFallbackDelay
+
+proc updateCenterAndViewDistance*(self: var ChunkManager; center: Vector2[int32]; viewDistance: uint8;
+    loadingChunks, unloadingChunks: seq[Vector2[int32]]) =
+  ## `update_center_and_view_distance`. Chunk tickets have no equivalent: `nextChunk` reads from the level.
+  let vd = viewDistance + 1'u8 # Margin for loading
+  self.center = center
+  self.viewDistance = vd
+  let viewDistanceI32 = int32(vd)
+  var unloading = initTable[int64, bool]()
+  for pos in unloadingChunks:
+    unloading[chunkPosKey(pos.x, pos.y)] = true
+
+  var sentKeep = initTable[int64, bool]()
+  for key, _ in self.chunkSent:
+    let pos = Vector2[int32](x: int32(key shr 32), y: cast[int32](uint32(cast[uint64](key) and 0xFFFFFFFF'u64)))
+    if chebyshev(pos, center) <= viewDistanceI32 and not unloading.hasKey(key):
+      sentKeep[key] = true
+  self.chunkSent = sentKeep
+
+  var tasks: seq[(int32, Vector2[int32])] = @[]
+  for node in self.chunkQueue:
+    let dst = chebyshev(node[1], center)
+    if dst <= viewDistanceI32 and not unloading.hasKey(chunkPosKey(node[1].x, node[1].y)):
+      tasks.add((dst, node[1]))
+  for pos in loadingChunks:
+    let key = chunkPosKey(pos.x, pos.y)
+    if not self.chunkSent.hasKey(key):
+      self.chunkSent[key] = true
+      tasks.add((chebyshev(pos, center), pos))
+  sort(tasks, byDistance)
+  self.chunkQueue = tasks
+
+proc handleAcknowledge*(self: var ChunkManager; chunksPerTick: float32) =
+  self.batchesSentSinceAck = 0'u8
+  self.chunksPerTick = int(ceil(chunksPerTick))
+
+proc canSendChunk*(self: ChunkManager): bool =
+  (self.ackWindowOpen() or self.ackFallbackReady()) and self.chunkQueue.len > 0
+
+proc nextChunk*(self: var ChunkManager): seq[Vector2[int32]] =
+  ## `next_chunk`: the nearest positions, as many as the client asked for per tick.
+  let take = min(self.chunkQueue.len, max(self.chunksPerTick, 1))
+  result = @[]
+  for i in 0 ..< take:
+    result.add(self.chunkQueue[i][1])
+  self.chunkQueue = self.chunkQueue[take ..< self.chunkQueue.len]
+  self.batchesSentSinceAck += 1'u8
+  self.lastChunkBatchSentAt = nowMs()
+
+# --- Player ----------------------------------------------------------------------------------------
+
+proc abilitiesFor*(gamemode: GameMode): Abilities =
+  ## `Abilities::default` with `set_gamemode`'s flags.
+  result = Abilities(invulnerable: false, flying: false, allowFlying: false, creative: false,
+    flySpeed: 0.05'f32, walkSpeed: 0.1'f32)
+  case gamemode
+  of Creative:
+    result.invulnerable = true
+    result.allowFlying = true
+    result.creative = true
+  of Spectator:
+    result.invulnerable = true
+    result.allowFlying = true
+    result.flying = true
+  else:
+    discard
+
+proc newPlayer*(client: JavaClient; gameprofile: GameProfile; config: PlayerConfig; world: World;
+    gamemode: GameMode; entityId: int32): Player =
+  ## `Player::new`, default to sending 16 chunks per tick as upstream does.
+  Player(client: client, gameprofile: gameprofile, config: config, world: world, entityId: entityId,
+    gamemode: gamemode, previousGamemode: none[GameMode](),
+    pos: Vector3[float64](x: 0.0, y: 0.0, z: 0.0), lastPos: Vector3[float64](x: 0.0, y: 0.0, z: 0.0),
+    velocity: Vector3[float64](x: 0.0, y: 0.0, z: 0.0), yaw: 0.0'f32, pitch: 0.0'f32, onGround: false,
+    chunkPos: Vector2[int32](x: 0'i32, y: 0'i32), abilities: abilitiesFor(gamemode), hasPlayedBefore: false,
+    teleportIdCount: 0'i32, awaitingTeleport: none[(int32, Vector3[float64])](),
+    watchedSection: newCylindrical(Vector2[int32](x: 0'i32, y: 0'i32), 1'u8), chunkManager: newChunkManager(16),
+    selectedSlot: 0'i8, ping: 0'u32, clientLoaded: false, tabListListed: true, tabListLatency: 0'i32,
+    tabListOrder: 0'i32)
+
+proc setPos*(self: Player; newPosition: Vector3[float64]) =
+  ## `Entity::set_pos`: also keeps the chunk position.
+  self.pos = newPosition
+  self.chunkPos = Vector2[int32](x: int32(floor(newPosition.x)) shr 4, y: int32(floor(newPosition.z)) shr 4)
+
+proc setRotation*(self: Player; yaw, pitch: float32) =
+  self.yaw = yaw
+  self.pitch = pitch
+
+proc sendAbilitiesUpdate*(self: Player) =
+  var b = 0'i8
+  if self.abilities.invulnerable: b = b or 1'i8
+  if self.abilities.flying: b = b or 2'i8
+  if self.abilities.allowFlying: b = b or 4'i8
+  if self.abilities.creative: b = b or 8'i8
+  self.client.writePacketFor(CPlayerAbilities(flags: b, flyingSpeed: self.abilities.flySpeed,
+    fieldOfView: self.abilities.walkSpeed))
+
+proc sendPermissionLvlUpdate*(self: Player) =
+  ## Permission level zero until entity/player.rs's permission code is ported.
+  self.client.writePacketFor(CEntityStatus(entityId: self.entityId, entityStatus: int8(ord(esPermissionLevelAll))))
+
+proc sendDifficultyUpdate*(self: Player) =
+  let info = self.world.levelInfo
+  self.client.writePacketFor(CChangeDifficulty(difficulty: uint8(ord(info.difficulty)), locked: info.difficultyLocked))
+
+proc sendTime*(self: Player; world: World) =
+  self.client.writePacketFor(newCUpdateTime(world.levelTime.worldAge, world.levelTime.timeOfDay, true))
+
+proc requestTeleport*(self: Player; position: Vector3[float64]; yaw, pitch: float32) =
+  let i = self.teleportIdCount
+  self.teleportIdCount = i + 1'i32
+  let teleportId = i + 1'i32
+  self.setPos(position)
+  self.setRotation(yaw, pitch)
+  self.awaitingTeleport = some((teleportId, position))
+  self.client.writePacketFor(CPlayerPosition(teleportId: newVarInt(teleportId), position: position,
+    delta: Vector3[float64](x: 0.0, y: 0.0, z: 0.0), yaw: yaw, pitch: pitch, relatives: @[]))
+
+proc sendClientInformation*(self: Player) =
+  ## `send_client_information`, through `Entity::send_meta_data`, to the player itself and whoever watches it.
+  var buf = newNetWriter()
+  let skin = self.config.skinParts
+  let hand = uint8(ord(self.config.mainHand))
+  let v = self.client.version
+  discard newMetadata(TrackedData_PLAYER_MODE_CUSTOMISATION, BYTE, skin).write(buf, v)
+  discard newMetadata(TrackedData_PLAYER_MAIN_HAND, HUMANOID_ARM, hand).write(buf, v)
+  discard newMetadata(TrackedData_PLAYER_MODE_CUSTOMIZATION_ID, BYTE, skin).write(buf, v)
+  discard newMetadata(TrackedData_MAIN_ARM_ID, BYTE, hand).write(buf, v)
+  writeU8(buf, 255'u8)
+  self.client.writePacketFor(CSetEntityMetadata(entityId: newVarInt(self.entityId), metadata: buf.buf))
+
+proc tick*(self: Player) =
+  ## `Player::tick`: of all it does, the chunk sending.
+  if self.chunkManager.canSendChunk():
+    let positions = self.chunkManager.nextChunk()
+    self.client.writePacketFor(CChunkBatchStart())
+    var count = 0'u16
+    for pos in positions:
+      # From disk only, and only a finished chunk. Upstream generates what is missing on its own threads; here
+      # `fetchChunk` would do that inside the one loop that also answers every client.
+      let fetched = fetchChunkFromDisk(self.world.level, pos.x, pos.y)
+      if fetched.kind == lkLoaded and fetched.chunk.status == csFull:
+        self.client.writePacketFor(CChunkData(data: fetched.chunk))
+        count += 1'u16
+    self.client.writePacketFor(newCChunkBatchEnd(count))

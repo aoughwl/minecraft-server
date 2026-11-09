@@ -1,5 +1,11 @@
 ## Minimal raw Winsock2 FFI.
 ##
+## THE DESIGN OF THE SERVER'S NETWORKING: one thread, non-blocking sockets, polled from the loop in
+## ../pumpkinlib.aowl. Upstream gives each connection tokio tasks and blocks them on `await`; none of that
+## has an equivalent here. A socket from `listenOnNonBlocking`/`tryAccept` never blocks: `tryRecv` and
+## `trySend` report "nothing now" (`WouldBlock`) and the loop moves on. Bytes the kernel will not take yet
+## stay in the client's own buffer (src/server/net/java/javamod.aowl) and go out on a later pass.
+##
 ## aowlmony's `std/nativesocket.aowl` is type scaffolding only - no actual
 ## `socket`/`bind`/`listen`/`accept`/`send`/`recv` syscalls are wired up
 ## (confirmed by reading it: just `Port`/`Domain`/`SockType`/`Protocol`
@@ -142,3 +148,68 @@ proc sendAll*(s: SocketHandle, data: seq[byte]): bool =
 
 proc closeClient*(s: SocketHandle) =
   discard cCloseSocket(s)
+
+# --- Non-blocking use; see the design note at the top ----------------------------------------------
+
+const
+  Fionbio = 0x8004667E'u32           ## FIONBIO, as `ioctlsocket` takes it.
+  WsaEWouldBlock = cint(10035)
+  TcpNoDelay = cint(1)
+  WouldBlock* = -1                   ## `tryRecv`/`trySend`: nothing can move right now.
+  SocketClosed* = -2                 ## `tryRecv`/`trySend`: the peer is gone or the socket failed.
+
+proc ioctlSocket(s: SocketHandle, cmd: uint32, argp: ptr uint32): cint
+  {.stdcall, importc: "ioctlsocket", dynlib: Ws2_32.}
+
+proc wsaGetLastError(): cint {.stdcall, importc: "WSAGetLastError", dynlib: Ws2_32.}
+
+proc winSleep(ms: uint32) {.stdcall, importc: "Sleep", dynlib: "kernel32.dll".}
+
+proc getTickCount64(): uint64 {.stdcall, importc: "GetTickCount64", dynlib: "kernel32.dll".}
+
+proc sleepMs*(ms: int) =
+  winSleep(uint32(ms))
+
+proc nowMs*(): int64 =
+  ## Milliseconds on a monotonic clock, for keep-alives and the tick loop.
+  int64(getTickCount64())
+
+proc setNonBlocking*(s: SocketHandle): bool =
+  var on = 1'u32
+  ioctlSocket(s, Fionbio, addr on) == cint(0)
+
+proc setNoDelay*(s: SocketHandle) =
+  ## `set_nodelay(true)`, which upstream's accept does.
+  var on: cint = cint(1)
+  discard setsockoptInt(s, IpprotoTcp, TcpNoDelay, addr on, cint(sizeof(cint)))
+
+proc listenOnNonBlocking*(port: uint16): SocketHandle =
+  result = listenOn(port)
+  if int(result) != int(InvalidSocket) and not setNonBlocking(result):
+    discard cCloseSocket(result)
+    return InvalidSocket
+
+proc tryAccept*(listener: SocketHandle): SocketHandle =
+  ## A new non-blocking client, or `InvalidSocket` when none is waiting.
+  result = cAccept(listener, cast[pointer](0), cast[pointer](0))
+  if int(result) != int(InvalidSocket):
+    if not setNonBlocking(result):
+      discard cCloseSocket(result)
+      return InvalidSocket
+    setNoDelay(result)
+
+proc tryRecv*(s: SocketHandle, buf: var seq[byte]): int =
+  ## Bytes read into `buf`, `WouldBlock`, or `SocketClosed` (also for an orderly close).
+  let n = cRecv(s, addr buf[0], cint(buf.len), cint(0))
+  if n > cint(0):
+    return int(n)
+  if n == cint(0):
+    return SocketClosed
+  if wsaGetLastError() == WsaEWouldBlock: WouldBlock else: SocketClosed
+
+proc trySend*(s: SocketHandle, data: seq[byte], start: int): int =
+  ## Bytes the kernel took from `data[start..]`, `WouldBlock`, or `SocketClosed`.
+  let n = cSend(s, unsafeAddr data[start], cint(data.len - start), cint(0))
+  if n >= cint(0):
+    return int(n)
+  if wsaGetLastError() == WsaEWouldBlock: WouldBlock else: SocketClosed

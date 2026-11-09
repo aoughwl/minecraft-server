@@ -1,0 +1,135 @@
+## Port of pumpkin/src/net/java/config.rs
+## PARTIAL: pumpkin/src/net/java/config.rs - `handle_resource_pack_response` logs nothing, and the branch for clients before 1.20.2 is gone, since handshake.aowl refuses them.
+
+import std/options
+import ../../../protocol/java/client/config/[feature_flags, finish_config, registry_data, update_tags]
+import ../../../protocol/java/server/config/[client_information, keep_alive, known_packs, plugin_message,
+  resource_pack_response, cookie_response]
+import ../../../generated/registry
+import ../../../generated/tag
+import ../../../generated/translation as tr
+import ../../../generated/dimension
+import ../../../nbt/[tag as nbttag, nbtbase, serializer]
+import ../../../util/text/text
+import ../../serverbase
+import javamod
+import login
+
+const BrandChannelPrefix = "minecraft:brand"
+
+proc buildDimensionNbt(dim: Dimension): seq[byte] =
+  ## `build_dimension_nbt`
+  proc b(value: bool): NbtTag = NbtTag(kind: ntkByte, byteVal: if value: 1'i8 else: 0'i8)
+  proc i(value: int32): NbtTag = NbtTag(kind: ntkInt, intVal: value)
+  proc s(value: string): NbtTag = NbtTag(kind: ntkString, stringVal: value)
+  var compound = newCompound()
+  compound.put("ambient_light", NbtTag(kind: ntkFloat, floatVal: dim.ambientLight))
+  compound.put("height", i(dim.height))
+  compound.put("logical_height", i(dim.logicalHeight))
+  compound.put("min_y", i(dim.minY))
+  compound.put("infiniburn", s(dim.infiniburn))
+  compound.put("monster_spawn_block_light_limit", i(int32(dim.monsterSpawnBlockLightLimit)))
+  compound.put("coordinate_scale", NbtTag(kind: ntkDouble, doubleVal: dim.coordinateScale))
+  compound.put("has_skylight", b(dim.hasSkylight))
+  compound.put("has_ceiling", b(dim.hasCeiling))
+  compound.put("ultrawarm", b(dim.id == 3'u8))
+  compound.put("natural", b(dim.id == 0'u8 or dim.id == 1'u8))
+  compound.put("piglin_safe", b(dim.id == 3'u8))
+  compound.put("respawn_anchor_works", b(dim.id == 3'u8))
+  compound.put("bed_works", b(dim.id == 0'u8 or dim.id == 1'u8))
+  compound.put("has_raids", b(dim.id == 0'u8 or dim.id == 1'u8))
+  compound.put("effects", s(dim.minecraftName))
+
+  var monsterSpawn = newCompound()
+  monsterSpawn.put("type", s("minecraft:uniform"))
+  var value = newCompound()
+  value.put("min_inclusive", i(0'i32))
+  value.put("max_inclusive", i(7'i32))
+  monsterSpawn.put("value", NbtTag(kind: ntkCompound, compoundVal: value))
+  compound.put("monster_spawn_light_level", NbtTag(kind: ntkCompound, compoundVal: monsterSpawn))
+
+  var writer = newNbtWriter(nwmJava)
+  discard serialize(NbtTag(kind: ntkCompound, compoundVal: compound), writer)
+  writer.buf
+
+proc handleClientInformationConfig*(self: JavaClient; clientInformation: SClientInformationConfig) =
+  if clientInformation.viewDistance <= 0'i8:
+    self.kick(text("Cannot have zero or negative view distance!"))
+    return
+  let (ok, config) = playerConfigFrom(clientInformation.locale, clientInformation.viewDistance,
+    clientInformation.chatMode.value, clientInformation.chatColors, clientInformation.skinParts,
+    clientInformation.mainHand.value, clientInformation.textFiltering, clientInformation.serverListing)
+  if ok:
+    self.config = some(config)
+  else:
+    self.kick(text("Invalid hand or chat type"))
+
+proc handlePluginMessage*(self: JavaClient; pluginMessage: SPluginMessage) =
+  if pluginMessage.channel.len >= BrandChannelPrefix.len and
+      pluginMessage.channel[0 ..< BrandChannelPrefix.len] == BrandChannelPrefix:
+    var brand = newString(pluginMessage.data.len)
+    for i in 0 ..< pluginMessage.data.len:
+      brand[i] = char(pluginMessage.data[i])
+    self.brand = some(brand)
+
+proc handleResourcePackResponse*(self: JavaClient; packet: SConfigResourcePack) =
+  if packet.responseResult().kind == rprrAccepted:
+    # Return here to wait for the next response update
+    return
+  self.sendKnownPacks()
+
+proc handleConfigCookieResponse*(self: JavaClient; packet: SConfigCookieResponse) =
+  discard
+
+proc hasTags(version: JavaMinecraftVersion; key: RegistryKey): bool =
+  let map = getRegistryKeyTags(version, key)
+  map.present and map.names.len > 0
+
+proc handleKnownPacks*(self: JavaClient; configAcknowledged: SKnownPacks; server: Server) =
+  let version = self.version
+  self.writePacketFor(CFeatureFlags(features: @["minecraft:vanilla"]))
+  let registries = getSynced(version)
+  var sentDimensionType = false
+  for reg in registries:
+    if reg.registryId == "minecraft:dimension_type":
+      sentDimensionType = true
+    self.writePacketFor(CRegistryData(registryId: reg.registryId, entries: reg.registryEntries))
+  if not sentDimensionType:
+    var dimEntries: seq[RegistryEntryData] = @[]
+    let dims = allDimensions()
+    for dim in dims:
+      dimEntries.add(RegistryEntryData(entryId: dim.minecraftName, hasData: true, data: buildDimensionNbt(dim)))
+    self.writePacketFor(CRegistryData(registryId: "minecraft:dimension_type", entries: dimEntries))
+
+  var tags = @[rkBlock, rkFluid, rkEnchantment, rkWorldgenBiome, rkItem, rkEntityType, rkDialog]
+  # optionally include timeline/dimension_type if there are any tags to send
+  if version.protocolVersion() >= jmvV1_21_11.protocolVersion() and hasTags(version, rkTimeline):
+    tags.add(rkTimeline)
+  if hasTags(version, rkDimensionType):
+    tags.add(rkDimensionType)
+  if hasTags(version, rkDamageType):
+    tags.add(rkDamageType)
+  if hasTags(version, rkBannerPattern):
+    tags.add(rkBannerPattern)
+  self.writePacketFor(CUpdateTags(tags: tags))
+
+  # We are done with configuring
+  self.writePacketFor(CFinishConfig())
+
+proc handleConfigKeepAlive*(self: JavaClient; keepAlive: SKeepAlive) =
+  if self.waitForKeepAlive and keepAlive.keepAliveId == self.keepAliveId:
+    self.waitForKeepAlive = false
+  else:
+    self.kick(translate(tr.JAVA_DISCONNECT_TIMEOUT))
+
+proc handleConfigAcknowledged*(self: JavaClient; server: Server): PacketHandlerResult =
+  self.connectionState = csPlay
+  if self.gameprofile.isNone:
+    return PacketHandlerResult(kind: phrStop)
+  let profile = self.gameprofile.unsafeGet
+  let reason = canNotJoin(profile)
+  if reason.isSome:
+    self.kick(reason.unsafeGet)
+    return PacketHandlerResult(kind: phrStop)
+  let config = if self.config.isSome: self.config.unsafeGet else: defaultPlayerConfig()
+  PacketHandlerResult(kind: phrReadyToPlay, profile: profile, config: config)

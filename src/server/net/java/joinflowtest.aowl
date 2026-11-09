@@ -1,0 +1,142 @@
+## Runs the connection path's pure parts with no socket: a client whose outgoing bytes are read back from its encoder.
+## Covers handshake.aowl, status.aowl, login.aowl, config.aowl, connection_cache.aowl, netbase.aowl's additions and
+## entity/player.aowl's ChunkManager. tools/mcbot.py is the end-to-end check.
+import std/[assertions, options, syncio]
+import ../../../protocol/java/server/handshake/handshakemod
+import ../../../protocol/java/server/login/login_start
+import ../../../protocol/java/packet_decoder
+import ../../../generated/packet
+import ../../serverbase
+import ../../entity/player
+import ../../world/chunker
+import ../winsock
+import javamod, handshake, status, login, config
+
+proc newServer(onlineMode: bool): Server =
+  var advanced = defaultAdvancedConfiguration()
+  advanced.networking.java.onlineMode = onlineMode
+  advanced.networking.java.encryption = onlineMode
+  advanced.networking.java.compression.enabled = false
+  Server(basicConfig: defaultBasicConfiguration(), advancedConfig: advanced, worlds: @[], dimensions: @[],
+    tickCounter: 0'i64, nextEntityId: 1'i32)
+
+proc nextPacket(client: JavaClient; decoder: var TCPNetworkDecoder): RawPacket =
+  ## What the client would read next: the encoder's bytes through a fresh decoder.
+  decoder.feed(client.networkWriter.flush())
+  assert decoder.packetReady()
+  let res = decoder.getRawPacket()
+  assert res.isOk
+  res.value
+
+proc hs(next: ConnectionState; protocol: int32): SHandShake =
+  SHandShake(protocolVersion: newVarInt(protocol), serverAddress: "localhost", serverPort: 25565'u16, nextState: next)
+
+block version_gates:
+  let c = newJavaClient(InvalidSocket, 1'u64)
+  c.handleHandshake(hs(csLogin, 774'i32))
+  assert c.version == jmvV1_21_11
+  assert c.connectionState == csLogin
+  assert not c.isClosed
+
+  let old = newJavaClient(InvalidSocket, 2'u64)
+  old.handleHandshake(hs(csLogin, 765'i32))
+  assert old.isClosed, "below V_1_20_5"
+
+  let newer = newJavaClient(InvalidSocket, 3'u64)
+  newer.handleHandshake(hs(csLogin, 777'i32))
+  assert newer.isClosed, "above V_26_2"
+
+  let statusOnly = newJavaClient(InvalidSocket, 4'u64)
+  statusOnly.handleHandshake(hs(csStatus, 765'i32))
+  assert not statusOnly.isClosed, "any version may ask for the status"
+
+block status_reports_the_wire_target:
+  let server = newServer(false)
+  let c = newJavaClient(InvalidSocket, 5'u64)
+  c.handleHandshake(hs(csStatus, 774'i32))
+  c.handleStatusRequest(server)
+  var d = newTCPNetworkDecoder()
+  let p = nextPacket(c, d)
+  assert p.id == 0'i32
+  var r = newNetReader(p.payload)
+  let json = getStr(r)
+  assert json.isOk
+  let expected = "{\"version\":{\"name\":\"1.21.11\",\"protocol\":774},\"players\":{\"max\":1000,\"online\":0,\"sample\":[]}," &
+    "\"description\":\"A blazingly fast Pumpkin server!\",\"favicon\":null,\"enforceSecureChat\":false}"
+  assert json.value == expected
+
+block offline_login_and_config_order:
+  let server = newServer(false)
+  let c = newJavaClient(InvalidSocket, 6'u64)
+  c.handleHandshake(hs(csLogin, 774'i32))
+  c.handleLoginStart(server, SLoginStart(name: "Alice", uuid: NilUuid))
+  var d = newTCPNetworkDecoder()
+  let success = nextPacket(c, d)
+  assert success.id == CB_LOGIN_LOGIN_FINISHED.toId(jmvV1_21_11)
+  assert c.gameprofile.isSome and c.gameprofile.unsafeGet.id == offlineUuid("Alice")
+
+  c.handleLoginAcknowledged(server)
+  assert c.connectionState == csConfig
+  assert nextPacket(c, d).id == CB_CONFIG_CUSTOM_PAYLOAD.toId(jmvV1_21_11)
+  assert nextPacket(c, d).id == CB_CONFIG_SERVER_LINKS.toId(jmvV1_21_11)
+  let packs = nextPacket(c, d)
+  assert packs.id == CB_CONFIG_SELECT_KNOWN_PACKS.toId(jmvV1_21_11)
+  # The pack's version is the client's, not the pinned tree's.
+  var r = newNetReader(packs.payload)
+  assert getVarInt(r).value.value == 1'i32
+  assert getStr(r).value == "minecraft"
+  assert getStr(r).value == "core"
+  assert getStr(r).value == "1.21.11"
+
+  let ready = c.handleConfigAcknowledged(server)
+  assert ready.kind == phrReadyToPlay
+  assert ready.profile.name == "Alice"
+  assert c.connectionState == csPlay
+
+block online_mode_is_refused_until_ported:
+  let server = newServer(true)
+  let c = newJavaClient(InvalidSocket, 7'u64)
+  c.handleHandshake(hs(csLogin, 774'i32))
+  c.handleLoginStart(server, SLoginStart(name: "Bob", uuid: NilUuid))
+  assert c.isClosed
+
+block bad_names_are_refused:
+  let server = newServer(false)
+  let c = newJavaClient(InvalidSocket, 8'u64)
+  c.handleHandshake(hs(csLogin, 774'i32))
+  c.handleLoginStart(server, SLoginStart(name: "bad name", uuid: NilUuid))
+  assert c.isClosed
+
+
+block chunk_manager_order_and_acks:
+  var m = newChunkManager(2)
+  let c0 = Vector2[int32](x: 0'i32, y: 0'i32)
+  let far = Vector2[int32](x: 3'i32, y: 0'i32)
+  let near = Vector2[int32](x: 1'i32, y: 1'i32)
+  let out0 = Vector2[int32](x: 9'i32, y: 0'i32)
+  m.updateCenterAndViewDistance(c0, 4'u8, @[far, near, c0], @[])
+  assert m.canSendChunk()
+  let first = m.nextChunk()
+  assert first.len == 2
+  assert first[0].x == 0'i32 and first[1].x == 1'i32, "nearest first"
+  # A position already queued is not queued again, and moving away drops it.
+  m.updateCenterAndViewDistance(out0, 1'u8, @[], @[])
+  assert not m.canSendChunk()
+  # Ten unacknowledged batches, counting the one above, stop the sending until the client answers.
+  var locs: seq[Vector2[int32]] = @[]
+  for i in 0'i32 ..< 40'i32:
+    locs.add(Vector2[int32](x: 9'i32, y: i - 1'i32))
+  m.updateCenterAndViewDistance(Vector2[int32](x: 9'i32, y: 20'i32), 30'u8, locs, @[])
+  for i in 0 ..< 9:
+    assert m.canSendChunk()
+    discard m.nextChunk()
+  assert not m.canSendChunk()
+  m.handleAcknowledge(3.5'f32)
+  assert m.canSendChunk()
+  assert m.chunksPerTick == 4
+
+block view_distance:
+  assert isWithinViewDistance(Vector2[int32](x: 0'i32, y: 0'i32), Vector2[int32](x: 2'i32, y: -2'i32), 2'i32)
+  assert not isWithinViewDistance(Vector2[int32](x: 0'i32, y: 0'i32), Vector2[int32](x: 3'i32, y: 0'i32), 2'i32)
+
+echo "all join flow checks passed"

@@ -4,6 +4,13 @@ Port target: upstream's `net/` (~19.5k lines across ~110 files: 733-line
 `mod.rs`, per-edition state machines under `java/`/`bedrock/`, and
 hundreds of individual packet handler files, mostly 8-100 lines each).
 
+## The connection path
+
+`java/` is the port of `pumpkin/src/net/java/`: `javamod.aowl` (the client), `handshake`, `status`, `login`, `config`
+and part of `play`, with `dispatch.aowl` routing packets to them. One thread polls non-blocking sockets from
+`../pumpkinlib.aowl`; `winsock.aowl`'s header has the design. `tools/mcbot.py` drives all of it end to end. Each
+file's PARTIAL line says what is missing; online mode and encryption are the biggest part.
+
 ## What's here
 
 `netbase.aowl` — the plain-data/pure-function slice of `mod.rs`:
@@ -30,9 +37,7 @@ hundreds of individual packet handler files, mostly 8-100 lines each).
   matching upstream's actual (not spec-compliant) behavior exactly. Uses
   this port's own SHA-256 from the sibling `jwt` library (already the
   source for `hash_seed` in `src/world/biomeparam.aowl`).
-- `PlayerUuid` — a `(hi, lo): (uint64, uint64)` tuple, matching
-  `src/protocol/uuid.aowl`'s existing wire-shape convention rather than
-  inventing a second UUID representation.
+- `PlayerUuid` — src/util/uuid.aowl's `Uuid`, under the name src/plugin_api uses.
 
 `chatmsg.aowl` — the plain-data/pure-logic slice of `net/chat/mod.rs`
 (432 lines): `FilterMask` (pass-through/fully-filtered/partially-filtered,
@@ -40,8 +45,7 @@ with the `#`-redaction `apply` logic), `SignedMessageLink`/
 `SignedMessageBody`, `PlayerChatMessage` (construction, filtering,
 signature removal, all the pure accessors), and `OutgoingChatMessage`'s
 `create`/`content` split (system messages become "disguised", player
-messages stay attributed). No `TextComponent` type exists in this port
-yet, so every `TextComponent` field is a plain `string`, matching
+messages stay attributed). Every `TextComponent` field is still a plain `string`, matching
 `cmdsource.aowl`'s/`eventdata.aowl`'s convention. `send_to_player` (the
 packet-construction/player-mutation tail) is NOT ported - needs `Player`'s
 chat-session/signature-cache state and the `CPlayerChatMessage`/`SText`
