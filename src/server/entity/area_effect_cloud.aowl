@@ -1,0 +1,196 @@
+## Port of pumpkin/src/entity/area_effect_cloud.rs
+##
+## The potion half lives in src/server/item/potion.aowl (`pumpkin/src/item/potion.rs`), which this imports.
+
+import std/[math, options, tables]
+import "../../data/item_stack/mod"
+import ../../generated/[effect, item_full, meta_data_type, particle, tracked_data]
+import ../../protocol/netcodec
+import ../../protocol/protobase
+import ../../protocol/java/client/play/entity_metadata
+import ../world/chunker
+import ../item/potion
+import entitymod
+
+type
+  AreaEffectCloudEntity* = ref object of EntityBase
+    ## The effect cloud entity that is spawned where a lingering potion lands.
+    itemStack*: ItemStack
+    effects*: seq[EffectEntry]
+    radius*: float32
+    duration*: int32
+    ageTicks*: int32                ## Upstream's own `age`, apart from `entity.age`.
+    reapplicationDelay*: int32
+    reapplicationMap*: Table[int32, int32]
+    radiusOnTick*: float32
+    radiusOnUse*: float32
+    durationOnUse*: int32
+    waitTime*: int32
+
+proc mixedColor(effects: seq[EffectEntry]): int32 =
+  ## The averaged color, twice in upstream's `init_data_tracker`.
+  var rSum = 0.0'f32
+  var gSum = 0.0'f32
+  var bSum = 0.0'f32
+  let count = float32(effects.len)
+  for e in effects:
+    let c = e.effectType.color
+    rSum += float32((c shr 16) and 0xFF'i32)
+    gSum += float32((c shr 8) and 0xFF'i32)
+    bSum += float32(c and 0xFF'i32)
+  let r = int32(rSum / count)
+  let g = int32(gSum / count)
+  let b = int32(bSum / count)
+  cast[int32](0xFF000000'u32) or (r shl 16) or (g shl 8) or b
+
+proc particleColor*(self: AreaEffectCloudEntity): int32 =
+  ## The color of `init_data_tracker`: ARGB.
+  result = cast[int32](0xFF000000'u32) or 0x385dc6'i32 # default water-like color
+  let (has, pc) = self.itemStack.getDataComponent(PotionContentsImpl)
+  if has:
+    if pc.customColor.isSome:
+      result = pc.customColor.unsafeGet or cast[int32](0xFF000000'u32)
+    elif self.effects.len > 0:
+      result = mixedColor(self.effects)
+  elif self.effects.len > 0:
+    result = mixedColor(self.effects)
+
+proc makeVt(): EntityVt =
+  result = copyVt(entityVt())
+  result.initDataTracker = proc(self: EntityBase) {.closure.} =
+    let s = AreaEffectCloudEntity(self)
+    # Send initial radius and particle (color) so clients render correctly
+    let color = s.particleColor()
+    # Build raw particle option bytes for ENTITY_EFFECT
+    let entity = s.entity
+    let world = entity.world
+    for player in world.players:
+      if isWithinViewDistance(entity.chunkPos, player.chunkPos, int32(getViewDistance(player, world.server))):
+        var valueWriter = newNetWriter()
+        writeVarInt(valueWriter, newVarInt(int32(ord(ptEntityEffect))))
+        writeI32Be(valueWriter, color)
+        var buf = newNetWriter()
+        discard metadataOf(TrackedData_PARTICLE, PARTICLE, valueWriter.buf, writeOkVoid()).write(buf, player.client.version)
+        writeU8(buf, 255'u8)
+        player.client.writePacketFor(CSetEntityMetadata(entityId: newVarInt(entity.entityId), metadata: buf.buf))
+    entity.sendMetaData(TrackedData_RADIUS, FLOAT, s.radius)
+    # Initial waiting flag
+    entity.sendMetaData(TrackedData_WAITING, BOOLEAN, 0'i32 < s.waitTime)
+  result.tick = proc(self, caller: EntityBase; server: Server) {.closure.} =
+    let s = AreaEffectCloudEntity(self)
+    # Age & duration handling
+    s.ageTicks += 1'i32
+    if s.ageTicks > s.duration:
+      # Remove old entities
+      s.entity.remove()
+      return
+    # Get current age and waiting period
+    let age = s.ageTicks
+    let waitTime = s.waitTime
+    # When the waiting period ends, notify clients so they render full particles
+    if age == waitTime and waitTime > 0'i32:
+      s.entity.sendMetaData(TrackedData_WAITING, BOOLEAN, false)
+    if age < waitTime:
+      # Respect waiting/grace period
+      return
+    # Update radius
+    s.radius += s.radiusOnTick
+    if s.radius <= 0.0'f32:
+      s.entity.remove()
+      return
+    # Send new radius
+    s.entity.sendMetaData(TrackedData_RADIUS, FLOAT, s.radius)
+    # Tick down reapplication map
+    var keys: seq[int32] = @[]
+    for k, v in s.reapplicationMap:
+      keys.add(k)
+    for k in keys:
+      let left = s.reapplicationMap.getOrDefault(k) - 1'i32
+      if left <= 0'i32:
+        s.reapplicationMap.del(k)
+      else:
+        s.reapplicationMap[k] = left
+    # Apply effects to nearby entities if eligible
+    let pos = s.entity.pos
+    let r = float64(s.radius)
+    let aabb = newBoundingBox(Vector3[float64](x: pos.x - r, y: pos.y - r, z: pos.z - r),
+      Vector3[float64](x: pos.x + r, y: pos.y + r, z: pos.z + r))
+    let world = s.entity.world
+    var candidates = world.getEntitiesAtBox(aabb)
+    for p in world.getPlayersAtBox(aabb):
+      candidates.add(playerBase(p))
+    for cand in candidates:
+      # Skip self and other `AreaEffectCloud` entities
+      if cand.entity.entityId == s.entity.entityId:
+        continue
+      if cand.entity.entityType.id == EntityType.AREA_EFFECT_CLOUD.id:
+        continue
+      # Determine candidate id early
+      let entId = cand.entity.entityId
+      let radiusF = float64(s.radius)
+      let posE = cand.entity.pos
+      let dx = posE.x - pos.x
+      let dy = posE.y - pos.y
+      let dz = posE.z - pos.z
+      let dist = sqrt(dx * dx + dy * dy + dz * dz)
+      if dist > radiusF:
+        continue
+      let scale = 1.0'f32 - (float32(dist) / float32(radiusF))
+      # Decide whether this contact will actually apply an effect
+      var willApply = false
+      # Only living entities can receive effects
+      let livingRef = cand.living
+      if livingRef != nil:
+        for e in s.effects:
+          # Instant effects always apply
+          if e.effectType.id == StatusEffect.INSTANT_DAMAGE.id or e.effectType.id == StatusEffect.INSTANT_HEALTH.id:
+            willApply = true
+            break
+          # Only apply if entity does not already have that effect
+          if not livingRef.hasEffect(e.effectType):
+            willApply = true
+            break
+        # If nothing would be applied, skip
+        if not willApply:
+          continue
+        # Apply scaled effects. Upstream spawns a task for it.
+        applyEffectsTo(livingRef, s.effects, scale, pasAreaEffectCloud)
+      else:
+        continue
+      # Set reapplication delay for this entity
+      s.reapplicationMap[entId] = s.reapplicationDelay
+      # Apply radius-on-use (shrink)
+      if s.radiusOnUse != 0.0'f32:
+        s.radius += s.radiusOnUse
+        if s.radius < 0.5'f32:
+          s.entity.remove()
+          return
+        # Send updated radius to clients
+        s.entity.sendMetaData(TrackedData_RADIUS, FLOAT, s.radius)
+      # Apply duration-on-use (shorten lifespan)
+      if s.durationOnUse != 0'i32 and s.duration != -1'i32:
+        s.duration += s.durationOnUse
+        if s.duration <= 0'i32:
+          s.entity.remove()
+          return
+  result.writeNbt = proc(self: EntityBase; nbt: var NbtCompound) {.closure.} = discard
+  result.readNbt = proc(self: EntityBase; nbt: NbtCompound) {.closure.} = discard
+
+let areaEffectCloudVt* = makeVt()
+
+proc newAreaEffectCloudEntity*(entity: Entity): AreaEffectCloudEntity =
+  ## `AreaEffectCloudEntity::new`
+  result = AreaEffectCloudEntity(vt: areaEffectCloudVt, entity: entity, itemStack: newItemStack(0'u8, ITEM_GLASS_BOTTLE),
+    effects: @[], radius: 3.0'f32, duration: 600'i32, ageTicks: 0'i32, reapplicationDelay: 20'i32,
+    reapplicationMap: initTable[int32, int32](), radiusOnTick: -3.0'f32 / 600.0'f32, radiusOnUse: 0.0'f32,
+    durationOnUse: 0'i32, waitTime: 20'i32)
+  entity.base = result
+
+proc createAreaEffectCloud*(entity: Entity; itemStack: ItemStack; effectsIn: seq[EffectEntry]; durationIn: int32;
+    radiusIn: float32; reapplicationDelayIn, waitTimeIn: int32; radiusOnUseIn: float32; durationOnUseIn: int32): AreaEffectCloudEntity =
+  ## `AreaEffectCloudEntity::create`
+  result = AreaEffectCloudEntity(vt: areaEffectCloudVt, entity: entity, itemStack: itemStack, effects: effectsIn,
+    radius: radiusIn, duration: durationIn, ageTicks: 0'i32, reapplicationDelay: reapplicationDelayIn,
+    reapplicationMap: initTable[int32, int32](), radiusOnTick: -radiusIn / max(float32(durationIn), 1.0'f32),
+    radiusOnUse: radiusOnUseIn, durationOnUse: durationOnUseIn, waitTime: waitTimeIn)
+  entity.base = result

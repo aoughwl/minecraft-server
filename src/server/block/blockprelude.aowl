@@ -1,0 +1,229 @@
+## What every translated block file sees: the data tables, the ids, the math types and blockbehaviour.aowl.
+## The helpers at the end are what upstream gets from std and `rand`.
+
+{.feature: "untyped".}
+
+import std/[options, tables, math, syncio, strutils]
+import ../../data/block_ext
+import ../../data/block_rotation
+import ../../data/block_direction
+from ../../data/block_state import BlockStateId, BlockState, asU16, newBlockStateIdUnchecked, isAir, replaceable, isLiquid,
+  isSolid, isFullCube, isSolidBlock, hasRandomTicks, isSideSolid, isCenterSolid, burnable, toolRequired, PistonBehavior, blockStateIdAir
+import ../../generated/[block_enums, fluid, sound, sound_category, world_event, particle, tag, statistic]
+import "../../data/item_stack/mod" as itemstackmod
+import ../../util/gamemode
+import ../../util/math/position
+import ../../util/math/boundingbox
+import ../../util/vector3
+import ../../util/text/text
+import ../../nbt/tag as nbttag
+import ../../world/tick
+import ../../inventory/inventory
+import ../../generated/gendecode
+from ../../util/random/random import getSeed
+import blockbehaviour
+
+export options, tables, math, block_ext, block_rotation, block_direction, block_state, block_enums, fluid, sound,
+  sound_category, world_event, particle, tag, statistic, itemstackmod, gamemode, position, boundingbox, vector3, text, nbttag, tick, inventory,
+  blockbehaviour
+
+proc isEmpty*[T](s: seq[T]): bool {.inline.} = s.len == 0
+proc isEmpty*(s: string): bool {.inline.} = s.len == 0
+proc rustPanic*(what: string) {.noreturn.} =
+  genPanic(what)
+  quit(1)
+proc saturatingSub*[T](a, b: T): T =
+  if a < b: T(0) else: a - b
+proc saturatingAdd*[T](a, b: T): T =
+  let c = a + b
+  if c < a: high(T) else: c
+
+# `(bool, T)` is how src/data answers what upstream answers as `Option<T>`.
+proc isSome*[T](t: (bool, T)): bool {.inline.} = t[0]
+proc isNone*[T](t: (bool, T)): bool {.inline.} = not t[0]
+proc unsafeGet*[T](t: (bool, T)): T {.inline.} = t[1]
+proc get*[T](t: (bool, T)): T =
+  if not t[0]:
+    rustPanic("unwrap on None")
+  t[1]
+
+proc asType*[T](e: BlockEntity; ignored: typedesc[T]): Option[T] =
+  ## `as_any().downcast_ref::<T>()`
+  if e of T: some(T(e)) else: none[T]()
+
+# `rand`: one module-level generator, seeded from the clock as upstream's thread-local one is.
+type BlockRng* = object
+
+var gRngState: uint64 = getSeed() or 1'u64
+
+proc nextU64(): uint64 =
+  ## xorshift64*
+  gRngState = gRngState xor (gRngState shr 12)
+  gRngState = gRngState xor (gRngState shl 25)
+  gRngState = gRngState xor (gRngState shr 27)
+  gRngState * 2685821657736338717'u64
+
+proc rng*(): BlockRng {.inline.} = BlockRng()
+proc unitF64(): float64 = float64(nextU64() shr 11) / 9007199254740992.0
+proc randomRange*[A, B](r: BlockRng; s: HSlice[A, B]): A =
+  ## `random_range(a..=b)`; an exclusive range arrives here with its top already lowered by `..<`.
+  let span = uint64(int64(s.b) - int64(s.a)) + 1'u64
+  A(int64(s.a) + int64(nextU64() mod span))
+proc randomRange*(r: BlockRng; s: HSlice[float32, float32]): float32 = s.a + float32(unitF64()) * (s.b - s.a)
+proc randomRange*(r: BlockRng; s: HSlice[float64, float64]): float64 = s.a + unitF64() * (s.b - s.a)
+proc randomRange*[A, B](s: HSlice[A, B]): A = randomRange(BlockRng(), s)
+proc randomBool*(r: BlockRng; p: float64): bool = (float64(nextU64() shr 11) / 9007199254740992.0) < p
+proc randomOf*(T: typedesc[float32]): float32 = float32(unitF64())
+proc randomOf*(T: typedesc[float64]): float64 = unitF64()
+proc randomOf*(T: typedesc[bool]): bool = (nextU64() and 1'u64) == 1'u64
+proc randomOf*(T: typedesc[uint8]): uint8 = uint8(nextU64() and 255'u64)
+proc randomOf*(T: typedesc[uint32]): uint32 = uint32(nextU64() shr 32)
+proc randomOf*(T: typedesc[int32]): int32 = int32(nextU64() shr 33)
+proc randomOf*(T: typedesc[int64]): int64 = int64(nextU64() shr 1)
+proc nextU32*(r: BlockRng): uint32 = uint32(nextU64() shr 32)
+
+proc getHorizontalFacing*(e: BlockActor): HorizontalFacing =
+  ## `Entity::get_horizontal_facing`. Vanilla's formula: floor(angle / 90.0 + 0.5) & 3
+  let f = e.yaw0
+  let yaw = f()
+  let turns = (yaw / 90.0'f32) + 0.5'f32
+  let floored0 = floor(float64(turns))
+  let quarterTurns = int32(floored0) and 3'i32
+  case quarterTurns
+  of 0'i32: HorizontalFacing.South
+  of 1'i32: HorizontalFacing.West
+  of 2'i32: HorizontalFacing.North
+  else: HorizontalFacing.East
+
+proc mulAdd*[B, C](a: float32; b: B; c: C): float32 = a * float32(b) + float32(c)
+proc livingEntity*(p: BlockPlayer): BlockActor {.inline.} = p
+proc entity*(a: BlockActor): BlockActor {.inline.} = a
+
+proc getFacing*(e: BlockActor): Facing =
+  ## `Entity::get_facing`
+  let pf = e.pitch0
+  let yf = e.yaw0
+  let pitch = degToRad(float64(pf()))
+  let yaw = -degToRad(float64(yf()))
+  let x = sin(yaw) * cos(pitch)
+  let y = -sin(pitch)
+  let z = cos(yaw) * cos(pitch)
+  let ax = abs(x)
+  let ay = abs(y)
+  let az = abs(z)
+  if ax > ay and ax > az:
+    if x > 0.0: Facing.East else: Facing.West
+  elif ay > ax and ay > az:
+    if y > 0.0: Facing.Up else: Facing.Down
+  elif z > 0.0:
+    Facing.South
+  else:
+    Facing.North
+
+proc hasTag*(b: Block; t: TagRef): bool = hasTag(asU16(b.id), t)
+
+proc rustFormat*(f: string): string = f
+proc rustFormat*[A](f: string; a: A): string =
+  ## `format!` with one `{}`
+  let i = f.find("{}")
+  if i < 0: f else: f[0 ..< i] & $a & f[i + 2 .. ^1]
+proc rustFormat*[A, B](f: string; a: A; b: B): string = rustFormat(rustFormat(f, a), b)
+proc rustFormat*[A, B, C](f: string; a: A; b: B; c: C): string = rustFormat(rustFormat(rustFormat(f, a), b), c)
+
+# `CanPlaceAtArgs` holds `Option<&World>` and `Option<&Player>` as nilable refs.
+proc isSome*(w: nil BlockWorld): bool {.inline.} = w != nil
+proc unsafeGet*(w: nil BlockWorld): BlockWorld {.inline.} = BlockWorld(w)
+proc isSome*(w: nil BlockPlayer): bool {.inline.} = w != nil
+proc unsafeGet*(w: nil BlockPlayer): BlockPlayer {.inline.} = BlockPlayer(w)
+
+# Rust's f32 arithmetic with a float literal: a literal stays float64 here, and a float32 does not meet it by itself.
+proc `*`*(a: float32; b: float64): float32 {.inline, noSideEffect.} = a * float32(b)
+proc `*`*(a: float64; b: float32): float32 {.inline, noSideEffect.} = float32(a) * b
+proc `/`*(a: float32; b: float64): float32 {.inline, noSideEffect.} = a / float32(b)
+proc `/`*(a: float64; b: float32): float32 {.inline, noSideEffect.} = float32(a) / b
+proc `+`*(a: float32; b: float64): float32 {.inline, noSideEffect.} = a + float32(b)
+proc `+`*(a: float64; b: float32): float32 {.inline, noSideEffect.} = float32(a) + b
+proc `-`*(a: float32; b: float64): float32 {.inline, noSideEffect.} = a - float32(b)
+proc `-`*(a: float64; b: float32): float32 {.inline, noSideEffect.} = float32(a) - b
+proc `<`*(a: float32; b: float64): bool {.inline, noSideEffect.} = a < float32(b)
+proc `<`*(a: float64; b: float32): bool {.inline, noSideEffect.} = float32(a) < b
+proc `<=`*(a: float32; b: float64): bool {.inline, noSideEffect.} = a <= float32(b)
+proc `<=`*(a: float64; b: float32): bool {.inline, noSideEffect.} = float32(a) <= b
+
+proc remove*[T](s: var seq[T]; i: int): T =
+  ## `Vec::remove`: keeps the order.
+  result = s[i]
+  var k = i
+  while k + 1 < s.len:
+    s[k] = s[k + 1]
+    inc k
+  s.setLen(s.len - 1)
+
+proc copyWithin*[N, T](a: var array[N, T]; s: HSlice[int, int]; dest: int) =
+  ## `slice::copy_within`
+  var tmp: seq[T] = @[]
+  for i in s.a .. s.b:
+    tmp.add(a[i])
+  for i in 0 ..< tmp.len:
+    a[dest + i] = tmp[i]
+
+proc toOpt*[T](t: (bool, T)): Option[T] =
+  if t[0]: some(t[1]) else: none[T]()
+
+proc tagBlockIds*(tagRef: TagRef): seq[BlockId] =
+  ## The ids of a block tag, `tag.1` with `BlockId::new_or_air`.
+  result = @[]
+  let (found, ids) = getTagIds(rkBlock, tagName(tagRef))
+  if found:
+    for v in ids:
+      result.add(newBlockIdOrAir(v))
+
+proc getEntityFacingOrder*(e: BlockActor): array[6, Facing] =
+  ## `Entity::get_entity_facing_order`
+  let pf = e.pitch0
+  let yf = e.yaw0
+  let pitch = degToRad(float64(pf()))
+  let yaw = -degToRad(float64(yf()))
+  let sinP = sin(pitch)
+  let cosP = cos(pitch)
+  let sinY = sin(yaw)
+  let cosY = cos(yaw)
+  let eastWest = if sinY > 0.0: Facing.East else: Facing.West
+  let upDown = if sinP < 0.0: Facing.Up else: Facing.Down
+  let southNorth = if cosY > 0.0: Facing.South else: Facing.North
+  let xAxis = abs(sinY)
+  let yAxis = abs(sinP)
+  let zAxis = abs(cosY)
+  let xWeight = xAxis * cosP
+  let zWeight = zAxis * cosP
+  var first, second, third: Facing
+  if xAxis > zAxis:
+    if yAxis > xWeight:
+      first = upDown; second = eastWest; third = southNorth
+    elif zWeight > yAxis:
+      first = eastWest; second = southNorth; third = upDown
+    else:
+      first = eastWest; second = upDown; third = southNorth
+  elif yAxis > zWeight:
+    first = upDown; second = southNorth; third = eastWest
+  elif xWeight > yAxis:
+    first = southNorth; second = eastWest; third = upDown
+  else:
+    first = southNorth; second = upDown; third = eastWest
+  [first, second, third, third.opposite(), second.opposite(), first.opposite()]
+
+type PlayerAbilities* = object
+  allowModifyWorld*: bool
+
+proc abilities*(p: BlockPlayer): PlayerAbilities =
+  let f = p.allowModifyWorld0
+  PlayerAbilities(allowModifyWorld: f != nil and f())
+
+proc incrementStat*[A, B](p: BlockPlayer; category: A; stat: B; amount: int32) =
+  let f = p.incrementStat0
+  if f != nil:
+    f($category & ":" & $stat, amount)
+
+proc containsKey*[K, V](t: Table[K, V]; k: K): bool {.inline.} = t.hasKey(k)
+proc insert*[K, V](t: var Table[K, V]; k: K; v: V) {.inline.} = t[k] = v
+proc clear*[T](s: var seq[T]) {.inline.} = s.setLen(0)

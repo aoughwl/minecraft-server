@@ -1,0 +1,185 @@
+## The serverbound handlers with no socket: a client whose outgoing bytes are read back. tools/mcbot.py is the end-to-end check.
+import std/[assertions, options, syncio, cmdline]
+import "../../../data/item_stack/mod"
+import ../../../generated/packet
+import ../../../inventory/[inventory, player_inventory, player_screen_handler, screenhandler, slot, stackbridge]
+import ../../../nbt/tag
+import ../../../protocol/java/packet_decoder
+import ../../../protocol/java/server/play/[chat_message, player_action, player_position, set_held_item, use_item_on,
+  swing_arm, ping_request, player_rotation, player_input]
+import ../../../util/math/position
+import ../../../world/[chunkdata, playerdata, worldfs, worldinfo]
+import ../../../world/blockstates as states
+import ../../data/datamod
+import ../../entity/player
+import ../../recipe
+import ../../scheduler
+import ../../serverbase
+import ../../tick_rate_manager
+import ../../world/worldmod
+import ../winsock
+import javamod, play
+
+proc scratch(): string =
+  result = parentDirW(paramStr(0)) & "/play_scratch"
+  discard createDirAllW(result)
+
+proc newTestServer(): Server =
+  let adv = defaultAdvancedConfiguration()
+  let basic = defaultBasicConfiguration()
+  result = Server(basicConfig: basic, advancedConfig: adv, worlds: @[], dimensions: @[OVERWORLD],
+    tickCounter: 0'i64, nextEntityId: 1'i32, tickRateManager: newServerTickRateManager(20.0'f32), keyStore: nil,
+    recipeManager: newRecipeManager(), scheduler: newTaskScheduler(), data: ServerData(),
+    playerDataStorage: newPlayerDataStorage(scratch() & "/playerdata", true), levelFolder: scratch(),
+    playerIdleTimeout: 0'i32, mojangPublicKeys: @[], stopRequested: false, stopAtMs: 0'i64)
+  let theLevel = fromRootFolder(adv.world, scratch(), 1'i64, OVERWORLD)
+  result.worlds.add(loadWorld(theLevel, defaultLevelData(1'u64), OVERWORLD, 63'i32, -64'i32, result))
+  let c = newChunkData(0'i32, 0'i32, newChunkSections(24, -64'i32))
+  c.lightEngine.skyLight = newSeq[LightContainer](26)
+  c.lightEngine.blockLight = newSeq[LightContainer](26)
+  for i in 0 ..< 26:
+    c.lightEngine.skyLight[i] = newLightEmpty(15'u8)
+    c.lightEngine.blockLight[i] = newLightEmpty(0'u8)
+  addLoadedChunk(theLevel, c)
+
+proc newTestPlayer(server: Server): Player =
+  let client = newJavaClient(InvalidSocket, 1'u64)
+  client.connectionState = csPlay
+  client.version = jmvV1_21_11
+  let profile = GameProfile(id: offlineUuid("Tester"), name: "Tester", properties: @[], profileActions: @[])
+  result = newPlayer(client, profile, defaultPlayerConfig(), server.worlds[0], server, Survival, 1'i32)
+  worldmod.addPlayer(server.worlds[0], result)
+  result.setClientLoaded(true)
+
+proc packetIds(client: JavaClient): seq[int32] =
+  ## What has gone out since the last call.
+  var decoder = newTCPNetworkDecoder()
+  decoder.feed(client.networkWriter.flush())
+  result = @[]
+  while decoder.packetReady():
+    let res = decoder.getRawPacket()
+    assert res.isOk
+    result.add(res.value.id)
+
+let server = newTestServer()
+let p = newTestPlayer(server)
+let theWorld = server.worlds[0]
+let client = p.client
+let v = jmvV1_21_11
+let (_, stone) = defaultStateByName("stone")
+let target = newBlockPos(2'i32, 64'i32, 2'i32)
+discard setBlockState(theWorld.level, target, stone)
+p.setPos(Vector3[float64](x: 2.5, y: 65.0, z: 3.5))
+
+block movement_kicks_on_nan:
+  let nanClient = newTestPlayer(server)
+  var nan = 0.0
+  nan = nan / nan
+  nanClient.client.handlePosition(nanClient, server, SPlayerPosition(position: Vector3[float64](x: nan, y: 0.0, z: 0.0), collision: 0'u8))
+  assert nanClient.client.isClosed
+
+block teleport_blocks_movement:
+  p.requestTeleport(p.pos, 0.0'f32, 0.0'f32)
+  discard packetIds(client)
+  client.handlePosition(p, server, SPlayerPosition(position: Vector3[float64](x: 100.0, y: 65.0, z: 100.0), collision: 1'u8))
+  assert p.pos.x == 2.5, "stale movement during a teleport is ignored"
+  let (id, _) = p.awaitingTeleport.unsafeGet
+  p.awaitingTeleport = none[(int32, Vector3[float64])]()
+  discard id
+
+block movement_moves_and_clamps:
+  client.handlePosition(p, server, SPlayerPosition(position: Vector3[float64](x: 2.6, y: 65.0, z: 3.5), collision: 1'u8))
+  assert p.pos.x == 2.6 and p.onGround
+  discard packetIds(client)
+  p.setPos(Vector3[float64](x: 2.5, y: 65.0, z: 3.5))
+
+block out_of_reach_digging_does_nothing:
+  let far = newBlockPos(2'i32, 64'i32, 15'i32)
+  discard setBlockState(theWorld.level, far, stone)
+  client.handlePlayerAction(p, SPlayerAction(status: newVarInt(int32(ord(stStartedDigging))), position: far, face: 1'u8,
+    sequence: newVarInt(3'i32)), server)
+  assert getBlockState(theWorld.level, far) == stone
+  assert client.packetSequence == 3'i32, "still acknowledged"
+
+block survival_digging_takes_time_then_finishes:
+  client.handlePlayerAction(p, SPlayerAction(status: newVarInt(int32(ord(stStartedDigging))), position: target, face: 1'u8,
+    sequence: newVarInt(4'i32)), server)
+  assert getBlockState(theWorld.level, target) == stone, "bare hands do not break stone at once"
+  assert p.mining
+  client.handlePlayerAction(p, SPlayerAction(status: newVarInt(int32(ord(stFinishedDigging))), position: target, face: 1'u8,
+    sequence: newVarInt(5'i32)), server)
+  assert isAir(getBlockState(theWorld.level, target))
+  assert not p.mining
+  let ids = packetIds(client)
+  assert CB_PLAY_BLOCK_UPDATE.toId(v) in ids, "the digger hears the result"
+  p.tick()
+  let ack = packetIds(client)
+  assert CB_PLAY_BLOCK_CHANGED_ACK.toId(v) in ack, "acknowledged within the tick"
+
+block placing_uses_the_stack:
+  let stoneItem = Item.fromRegistryKey("stone")
+  assert stoneItem != nil
+  p.inventory.setHeldItem(newItemStack(2'u8, stoneItem))
+  client.packetSequence = -1'i32
+  let (ok, _) = client.handleUseItemOn(p, SUseItemOn(hand: newVarInt(0'i32), position: newBlockPos(2'i32, 64'i32, 3'i32),
+    face: newVarInt(2'i32), cursorPos: Vector3[float32](x: 0.5'f32, y: 0.5'f32, z: 0.0'f32), insideBlock: false,
+    isAgainstWorldBorder: false, sequence: newVarInt(6'i32)), server)
+  assert ok
+  # Clicking air at the column in front replaces it: the clicked block is air, which is replaceable.
+  assert getBlockState(theWorld.level, newBlockPos(2'i32, 64'i32, 3'i32)) == stone
+  assert p.inventory.heldItem().itemCount == 1'u8, "survival spends one"
+  let ids = packetIds(client)
+  assert CB_PLAY_SET_PLAYER_INVENTORY.toId(v) in ids
+  assert CB_PLAY_BLOCK_UPDATE.toId(v) in ids
+
+block placing_inside_the_player_is_refused:
+  let (ok, _) = client.handleUseItemOn(p, SUseItemOn(hand: newVarInt(0'i32), position: newBlockPos(2'i32, 65'i32, 3'i32),
+    face: newVarInt(1'i32), cursorPos: Vector3[float32](x: 0.5'f32, y: 1.0'f32, z: 0.5'f32), insideBlock: false,
+    isAgainstWorldBorder: false, sequence: newVarInt(7'i32)), server)
+  assert ok
+  assert p.inventory.heldItem().itemCount == 1'u8, "the player stands there"
+
+block held_slot:
+  client.handleSetHeldItem(p, SSetHeldItem(slot: 3'i16))
+  assert p.inventory.getSelectedSlot() == 3'u8
+  let bad = newTestPlayer(server)
+  bad.client.handleSetHeldItem(bad, SSetHeldItem(slot: 9'i16))
+  assert bad.client.isClosed
+
+block chat_checks:
+  let bad = newTestPlayer(server)
+  bad.client.handleChatMessage(server, bad, SChatMessage(message: "a\x07b", timestamp: 0'i64, salt: 0'i64,
+    signature: none[seq[byte]](), messageCount: newVarInt(0'i32), acknowledged: @[], checksum: 0'u8))
+  assert bad.client.isClosed, "a control character is a kick"
+  var long = ""
+  for i in 0 ..< 257:
+    long.add('a')
+  let bad2 = newTestPlayer(server)
+  bad2.client.handleChatMessage(server, bad2, SChatMessage(message: long, timestamp: 0'i64, salt: 0'i64,
+    signature: none[seq[byte]](), messageCount: newVarInt(0'i32), acknowledged: @[], checksum: 0'u8))
+  assert bad2.client.isClosed, "too long is a kick"
+  discard packetIds(client)
+  client.handleChatMessage(server, p, SChatMessage(message: "hello", timestamp: 0'i64, salt: 0'i64,
+    signature: none[seq[byte]](), messageCount: newVarInt(0'i32), acknowledged: @[], checksum: 0'u8))
+  assert not client.isClosed
+  assert CB_PLAY_SYSTEM_CHAT.toId(v) in packetIds(client)
+
+block ping:
+  client.handlePlayPingRequest(SPlayPingRequest(payload: 7'i64))
+  assert CB_PLAY_PONG_RESPONSE.toId(v) in packetIds(client)
+
+block nbt_round_trip:
+  p.experienceLevel = 3'i32
+  var nbt = newCompound()
+  p.setRotation(10.0'f32, 20.0'f32)
+  p.writeNbt(nbt)
+  let other = newTestPlayer(server)
+  other.readNbt(nbt)
+  assert other.pos.x == p.pos.x and other.pos.y == p.pos.y and other.pos.z == p.pos.z
+  assert other.yaw == 10.0'f32 and other.pitch == 20.0'f32
+  assert other.hasPlayedBefore == p.hasPlayedBefore
+  assert other.experienceLevel == 3'i32
+  assert other.inventory.getSelectedSlot() == 3'u8
+  assert Inventory(other.inventory).getStack(0).itemCount == 1'u8, "the stack came back"
+
+echo "play handlers ok"

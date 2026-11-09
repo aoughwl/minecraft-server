@@ -2,62 +2,151 @@
 ## worlds, a World holds players and a Player holds its World, and aowlmony types cannot be recursive across
 ## modules, so they share this one, as nbtbase.aowl does for the NBT crate. The logic is in servermod.aowl,
 ## world/worldmod.aowl and entity/player.aowl.
+##
+## A closure field is called only through a proc in the module that declares its type, and the fields that
+## src/inventory declares hold plain procs with no environment: see the note in
+## ../world/chunk_system/worker_logic.aowl.
+
+{.feature: "untyped".}
 
 import std/[options, tables]
 import ../config/lib as configlib
+import "../data/item_stack/mod" as itemstackmod
 import ../generated/dimension
+import ../inventory/[entity_equipment, ender_chest_inventory, player_inventory, player_screen_handler, screenhandler,
+  sync_handler]
 import ../util/uuid
 import ../util/gamemode
+import ../util/permission
+import ../util/math/position
 import ../util/vector2
 import ../util/vector3
-import ../world/[level, cylindrical]
+import ../world/[chunkdata, level, cylindrical, playerdata]
+import ../world/chunk_system/chunk_listener
 from ../world/worldinfo import LevelData
+import data/datamod
+import key_store
+import tick_rate_manager
+import recipe
+import scheduler
 import net/java/javamod
 
-export javamod, dimension, gamemode, vector2, vector3, level, LevelData, cylindrical, configlib, uuid
+export javamod, dimension, gamemode, vector2, vector3, level, LevelData, cylindrical, configlib, uuid, position,
+  permission, datamod, tick_rate_manager, key_store, recipe, scheduler
+
+type
+  GameLevel* = level.Level
+    ## The name to use from a module that also sees `pumpkin_data`'s fluid `Level`.
+
+const
+  MaxCachedSignatures* = 128  ## `MAX_CACHED_SIGNATURES`. Vanilla: 128
+  MaxPreviousMessages* = 20   ## `MAX_PREVIOUS_MESSAGES`. Vanilla: 20
+  MineBlockExhaustion* = 0.005'f32  ## `MINE_BLOCK_EXHAUSTION`. Vanilla: 0.005F
 
 type
   LevelTime* = object
     ## Port of pumpkin/src/world/time.rs's fields.
     worldAge*: int64
     timeOfDay*: int64
+    rainTime*: int64
 
   Weather* = object
-    ## Port of pumpkin/src/world/weather.rs's fields, as far as the join reads them.
+    ## Port of pumpkin/src/world/weather.rs's fields.
+    clearWeatherTime*: int32
     raining*: bool
+    rainTime*: int32
+    thundering*: bool
+    thunderTime*: int32
     rainLevel*: float32
+    oldRainLevel*: float32
     thunderLevel*: float32
+    oldThunderLevel*: float32
+    weatherCycleEnabled*: bool
 
   Worldborder* = object
-    ## Port of pumpkin/src/world/border.rs's fields, as far as the join reads them.
+    ## Port of pumpkin/src/world/border.rs's fields.
     centerX*, centerZ*: float64
     oldDiameter*, newDiameter*: float64
     speed*: int64
     portalTeleportBoundary*: int32
     warningBlocks*: int32
     warningTime*: int32
+    damagePerBlock*: float32
+    buffer*: float32
 
   Abilities* = object
     ## `Abilities` in entity/player.rs.
-    invulnerable*, flying*, allowFlying*, creative*: bool
+    invulnerable*, flying*, allowFlying*, creative*, allowModifyWorld*: bool
     flySpeed*, walkSpeed*: float32
 
+  ChunkQueueNode* = object
+    ## `HeapNode` in entity/player.rs. Upstream's `Weak<ChunkData>` is a reference: nothing here is reclaimed while
+    ## the queue holds it, and the queue is cut when the view moves.
+    distance*: int32
+    pos*: Vector2[int32]
+    chunk*: ChunkData
+
   ChunkManager* = object
-    ## `ChunkManager` in entity/player.rs, holding positions: a chunk is read from the level when its turn comes,
-    ## where upstream's chunk system hands over the loaded chunk through `chunk_listener`.
+    ## `ChunkManager` in entity/player.rs.
     chunksPerTick*: int
     center*: Vector2[int32]
     viewDistance*: uint8
-    chunkSent*: Table[int64, bool]
-    chunkQueue*: seq[(int32, Vector2[int32])]  ## (distance, position), nearest first.
+    chunkListener*: nil GlobalChunkListener
+    chunkSent*: Table[int64, ChunkData]
+    chunkQueue*: seq[ChunkQueueNode]  ## Nearest first.
     batchesSentSinceAck*: uint8
     lastChunkBatchSentAt*: int64
+
+  HungerManager* = object
+    ## `HungerManager` in entity/hunger.rs.
+    level*: uint8
+    saturation*: float32
+    exhaustion*: float32
+    tickTimer*: uint32
+
+  ChatSession* = object
+    ## `ChatSession` in entity/player.rs.
+    sessionId*: Uuid
+    expiresAt*: int64
+    publicKey*: seq[byte]
+    signature*: seq[byte]
+    messagesSent*: int32
+    messagesReceived*: int32
+
+  MessageCache* = object
+    ## `MessageCache` in entity/player.rs. `fullCache` holds at most 128 signatures, most recent first, and must stay
+    ## one to one with the client's. `lastSeen` holds at most 20, most recent last.
+    fullCache*: seq[seq[byte]]
+    lastSeen*: seq[seq[byte]]
+
+  RespawnPoint* = object
+    ## `RespawnPoint` in entity/player.rs.
+    dimension*: Dimension
+    position*: BlockPos
+    yaw*: float32
+    force*: bool
+
+  PendingSpawn* = object
+    ## What the second half of `spawn_java_player` waits for: the chunk the player stands in. See worldmod.aowl.
+    active*: bool
+    center*: Vector2[int32]
+    listener*: nil SingleChunkListener
+    since*: int64
+    position*: Vector3[float64]
+    yaw*, pitch*: float32
+    needsTopBlock*: bool
+    respawn*: bool
+
+  ServerInventoryPlayer* = ref object of InventoryPlayer
+    ## `impl InventoryPlayer for Player`, the way src/inventory declares that interface: a subclass with plain procs.
+    owner*: nil Player
 
   Player* = ref object
     client*: JavaClient
     gameprofile*: GameProfile
     config*: PlayerConfig
     world*: World
+    server*: Server
     entityId*: int32
     gamemode*: GameMode
     previousGamemode*: Option[GameMode]
@@ -65,7 +154,11 @@ type
     lastPos*: Vector3[float64]
     velocity*: Vector3[float64]
     yaw*, pitch*: float32
+    headYaw*: float32
     onGround*: bool
+    sneaking*, sprinting*, fallFlying*: bool
+    entityFlags*: int8
+    fallDistance*: float32
     chunkPos*: Vector2[int32]
     abilities*: Abilities
     hasPlayedBefore*: bool
@@ -73,12 +166,62 @@ type
     awaitingTeleport*: Option[(int32, Vector3[float64])]
     watchedSection*: Cylindrical
     chunkManager*: ChunkManager
-    selectedSlot*: int8
     ping*: uint32
     clientLoaded*: bool
+    clientLoadedTimeout*: uint32
     tabListListed*: bool
     tabListLatency*: int32
     tabListOrder*: int32
+    # Inventory.
+    inventoryPlayer*: ServerInventoryPlayer
+    equipment*: EntityEquipment
+    inventory*: PlayerInventory
+    enderChestInventory*: EnderChestInventory
+    playerScreenHandler*: PlayerScreenHandler
+    currentScreenHandler*: ScreenHandler
+    screenHandlerSyncId*: uint8
+    screenHandlerSyncHandler*: SyncHandler
+    openContainerPos*: Option[BlockPos]
+    # Health and hunger, what entity/living.rs and entity/hunger.rs keep for a player.
+    health*: float32
+    maxHealth*: float32
+    absorption*: float32
+    dead*: bool
+    hungerManager*: HungerManager
+    lastSentHealth*: int32
+    lastSentFood*: uint8
+    lastFoodSaturation*: bool
+    experienceLevel*: int32
+    experienceProgress*: float32
+    experiencePoints*: int32
+    enchantmentSeed*: int32
+    # Mining.
+    mining*: bool
+    miningPos*: BlockPos
+    startMiningTime*: int32
+    currentBlockDestroyStage*: int32
+    tickCounter*: int32
+    # The rest of Player's per-client state.
+    lastInput*: int8
+    cameraTargetId*: Option[int32]
+    lastActionTime*: int64
+    permissionLvl*: PermissionLvl
+    subscribedDebugSample*: bool
+    chatSession*: ChatSession
+    signatureCache*: MessageCache
+    respawnPoint*: Option[RespawnPoint]
+    lastAttackedTicks*: uint32
+    pendingSpawn*: PendingSpawn
+    removed*: bool
+
+  BlockChange* = object
+    position*: BlockPos
+    stateId*: uint32
+
+  BlockEvent* = object
+    position*: BlockPos
+    eventType*: uint8
+    data*: uint8
 
   World* = ref object
     level*: Level
@@ -86,9 +229,15 @@ type
     dimension*: Dimension
     players*: seq[Player]
     seaLevel*: int32
+    minY*: int32
+    server*: Server
     worldborder*: Worldborder
     levelTime*: LevelTime
     weather*: Weather
+    unsentBlockChanges*: Table[int64, BlockChange]
+    syncedBlockEventQueue*: seq[BlockEvent]
+    activeChunks*: seq[Vector2[int32]]
+    forcedChunks*: seq[Vector2[int32]]
 
   Server* = ref object
     basicConfig*: BasicConfiguration
@@ -97,3 +246,27 @@ type
     dimensions*: seq[Dimension]
     tickCounter*: int64
     nextEntityId*: int32
+    tickRateManager*: TickRateManager
+    keyStore*: nil KeyStore
+    recipeManager*: RecipeManager
+    scheduler*: TaskScheduler
+    data*: ServerData
+    playerDataStorage*: PlayerDataStorage
+    levelFolder*: string
+    playerIdleTimeout*: int32
+    mojangPublicKeys*: seq[seq[byte]]
+    stopRequested*: bool
+    stopAtMs*: int64  ## 0: never. See src/main.aowl.
+
+template broadcastPacketAll*(self: World; packet: untyped) =
+  ## `broadcast_packet_all`. A template for the same reason `writePacketFor` is one.
+  let bpPacket = packet
+  for bpPlayer in self.players:
+    bpPlayer.client.writePacketFor(bpPacket)
+
+template broadcastPacketExcept*(self: World; except0: Uuid; packet: untyped) =
+  ## `broadcast_packet_except`, with the one uuid every caller passes.
+  let bpPacket = packet
+  for bpPlayer in self.players:
+    if bpPlayer.gameprofile.id != except0:
+      bpPlayer.client.writePacketFor(bpPacket)

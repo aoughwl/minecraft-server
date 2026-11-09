@@ -1,0 +1,520 @@
+## Port of pumpkin/src/entity/player/advancement.rs
+## Port of pumpkin/src/data/advancement_data.rs
+## PARTIAL: pumpkin/src/data/advancement_data.rs - `save_all_players` and `save_player` take advancements rather than `Arc<Player>`s, since serverbase's `Player` has no `advancements` field yet (hook listed in player/advancement/trigger.aowl).
+##
+## A `Player` is held in a World which is held by a Server, all in serverbase.aowl, and a Player must in turn hold
+## its PlayerAdvancement. Imports may not cycle, so this module does not see `Player`: upstream's `player: Weak<Player>`
+## is `AdvancementPlayer`, the handful of calls `flush_dirty`, `award` and `set_selected_tab` make on it. `tokio::spawn`
+## is a plain call. `Arc<AdvancementManager>` is a ref. `IndexMap` and the `HashSet`s keep insertion order in a seq with
+## a table to look up by.
+##
+## On disk, as serde writes them: a `SystemTime` is `{"secs_since_epoch":n,"nanos_since_epoch":n}`, an ungranted
+## criterion is null, and PlayerAdvancement is `{id: {criterion: time-or-null}}` holding only advancements with
+## progress. `to_string_pretty`'s two-space layout is `prettyJson` below.
+
+import std/[assertions, options, tables, times]
+import ../../../codecs/json_value
+import ../../../data/advancement_data
+import ../../../protocol/java/client/play/select_advancements_tab
+import ../../../protocol/java/client/play/update_advancement
+import ../../../util/uuid
+import ../../../util/text/text
+import ../../../world/worldfs
+import ../../../generated/translation
+import advancement/visibility_evaluator
+
+export advancement_data, update_advancement, select_advancements_tab
+
+type
+  SystemTime* = object
+    ## `std::time::SystemTime`, as far as serde's view of it.
+    secsSinceEpoch*: int64
+    nanosSinceEpoch*: int32
+
+  CriterionProgress* = object
+    time*: Option[SystemTime]
+
+  AdvancementProgress* = object
+    ## Represents the progress of a given advancement for a player.
+    ## `criteriaNames` is `criteria`'s keys in the order they were first added.
+    criteria*: Table[string, CriterionProgress]
+    criteriaNames*: seq[string]
+    requirements*: AdvancementRequirement
+
+  AdvancementProgressMap* = object
+    ## `IndexMap<&'static Advancement, AdvancementProgress>`.
+    keys*: seq[Advancement]
+    values*: seq[AdvancementProgress]
+    index: Table[string, int]
+
+  AdvancementManager* = ref object
+    ## Manages player advancements, including data creation and saving.
+    advancementPath*: string
+    saveEnabled*: bool
+
+  AdvancementPlayer* = ref object
+    ## What upstream's `Weak<Player>` is used for here. A field left nil is the `Weak` that no longer upgrades.
+    sendUpdateAdvancements*: proc (packet: CUpdateAdvancements) {.closure.}
+    sendSelectAdvancementsTab*: proc (packet: CSelectAdvancementsTab) {.closure.}
+    addExperiencePoints*: proc (amount: int32) {.closure.}
+    showAdvancementMessages*: proc (): bool {.closure.}
+    getDisplayName*: proc (): TextComponent {.closure.}
+    broadcastSystemMessage*: proc (message: TextComponent; overlay: bool) {.closure.}
+
+  PlayerAdvancement* = ref object
+    ## Manages a player's collection of advancements.
+    ## This handles saving, loading, and tracking the state of granted / revoked advancements.
+    progress*: AdvancementProgressMap
+    isFirstPacket*: bool
+    rootsToUpdate*: seq[AdvancementNode]
+    visible*: seq[Advancement]
+    progressChanged*: seq[Advancement]
+    manager*: AdvancementManager
+    path*: string
+    lastSelectedTab*: Option[Advancement]
+    player*: nil AdvancementPlayer  ## A weak reference to the player who owns these advancements.
+
+  AdvancementDataErrorKind* = enum
+    adeIo
+    adeJson
+
+  AdvancementDataError* = object
+    ## Errors that can occur when saving or loading advancement data.
+    kind*: AdvancementDataErrorKind
+    message*: string
+
+  AdvancementResult* = object
+    ok*: bool
+    error*: AdvancementDataError
+
+proc okResult(): AdvancementResult =
+  AdvancementResult(ok: true)
+
+proc errResult(kind: AdvancementDataErrorKind; message: string): AdvancementResult =
+  AdvancementResult(ok: false, error: AdvancementDataError(kind: kind, message: message))
+
+proc systemTimeNow(): SystemTime =
+  let now = getTime()
+  SystemTime(secsSinceEpoch: int64(toUnix(now)), nanosSinceEpoch: int32(nanosecond(now)))
+
+proc grant*(self: var CriterionProgress) =
+  self.time = some(systemTimeNow())
+
+proc revoke*(self: var CriterionProgress) =
+  self.time = none[SystemTime]()
+
+proc isDone*(self: CriterionProgress): bool =
+  self.time.isSome
+
+proc isCriterionDone(self: AdvancementProgress; criterion: string): bool =
+  ## Check if a criterion his mark has complete
+  self.criteria.hasKey(criterion) and self.criteria.getOrDefault(criterion).isDone()
+
+proc isDone*(self: AdvancementProgress): bool =
+  ## Returns `true` if the advancement is done. `AdvancementRequirement::test`, with its predicate inline.
+  if self.requirements.requirements.len == 0:
+    return false
+  for group in self.requirements.requirements:
+    var anyDone = false
+    for name in group:
+      if self.isCriterionDone(name):
+        anyDone = true
+        break
+    if not anyDone:
+      return false
+  true
+
+proc hasProgress*(self: AdvancementProgress): bool =
+  ## Returns `true` if the advancement has any progress.
+  for name in self.criteriaNames:
+    if self.criteria.getOrDefault(name).isDone():
+      return true
+  false
+
+proc addCriterion*(self: var AdvancementProgress; name: string; value: CriterionProgress) =
+  if not self.criteria.hasKey(name):
+    self.criteriaNames.add(name)
+  self.criteria[name] = value
+
+proc grantProgress*(self: var AdvancementProgress; name: string): bool =
+  if self.criteria.hasKey(name) and not self.criteria.getOrDefault(name).isDone():
+    var value = self.criteria.getOrDefault(name)
+    value.grant()
+    self.criteria[name] = value
+    true
+  else:
+    false
+
+proc revokeProgress*(self: var AdvancementProgress; name: string): bool =
+  if self.criteria.hasKey(name) and self.criteria.getOrDefault(name).isDone():
+    var value = self.criteria.getOrDefault(name)
+    value.revoke()
+    self.criteria[name] = value
+    true
+  else:
+    false
+
+proc update*(self: var AdvancementProgress; requirements: AdvancementRequirement) =
+  let names = requirements.names()
+  var kept: seq[string] = @[]
+  for key in self.criteriaNames:
+    if key in names:
+      kept.add(key)
+    else:
+      self.criteria.del(key)
+  self.criteriaNames = kept
+  for name in names:
+    if not self.criteria.hasKey(name):
+      self.addCriterion(name, CriterionProgress(time: none[SystemTime]()))
+  self.requirements = requirements
+
+proc getRemainingCriteria*(self: AdvancementProgress): seq[string] =
+  result = @[]
+  for name in self.criteriaNames:
+    if not self.criteria.getOrDefault(name).isDone():
+      result.add(name)
+
+proc getCompletedCriteria*(self: AdvancementProgress): seq[string] =
+  result = @[]
+  for name in self.criteriaNames:
+    if self.criteria.getOrDefault(name).isDone():
+      result.add(name)
+
+proc toJson*(self: CriterionProgress): JsonValue =
+  if self.time.isNone:
+    return jsonNull()
+  result = jsonObject()
+  result.put("secs_since_epoch", jsonInt(self.time.unsafeGet.secsSinceEpoch))
+  result.put("nanos_since_epoch", jsonInt(int64(self.time.unsafeGet.nanosSinceEpoch)))
+
+proc criterionProgressFromJson*(v: JsonValue): (bool, CriterionProgress) =
+  let none0 = CriterionProgress(time: none[SystemTime]())
+  if v.kind == jvNull:
+    return (true, none0)
+  if v.kind != jvObject:
+    return (false, none0)
+  let (secsFound, secs) = v.get("secs_since_epoch")
+  let (nanosFound, nanos) = v.get("nanos_since_epoch")
+  if not secsFound or not nanosFound or secs.kind != jvInt or nanos.kind != jvInt:
+    return (false, none0)
+  (true, CriterionProgress(time: some(SystemTime(secsSinceEpoch: secs.intVal, nanosSinceEpoch: int32(nanos.intVal)))))
+
+proc toJson*(self: AdvancementProgress): JsonValue =
+  ## `impl Serialize for AdvancementProgress`: the done criteria.
+  result = jsonObject()
+  for name in self.criteriaNames:
+    let value = self.criteria.getOrDefault(name)
+    if value.isDone():
+      result.put(name, value.toJson())
+
+proc advancementProgressFromJson*(v: JsonValue): (bool, AdvancementProgress) =
+  ## `impl Deserialize for AdvancementProgress`.
+  var progress = AdvancementProgress(requirements: AdvancementRequirement(requirements: @[]))
+  if v.kind != jvObject:
+    return (false, progress)
+  for i in 0 ..< v.keys.len:
+    let (ok, value) = criterionProgressFromJson(v.vals[i])
+    if not ok:
+      return (false, progress)
+    progress.addCriterion(v.keys[i], value)
+  (true, progress)
+
+proc getMutOrStartProgress*(self: var AdvancementProgressMap; advancement: Advancement): var AdvancementProgress =
+  ## Gets a mutable reference to the current progress for a given advancement. Creates the state entry if missing.
+  var at = self.index.getOrDefault($advancement, -1)
+  if at < 0:
+    var progress = AdvancementProgress(requirements: AdvancementRequirement(requirements: @[]))
+    progress.update(fromConst(AdvancementRequirement, advancement.requirements))
+    at = self.keys.len
+    self.keys.add(advancement)
+    self.values.add(progress)
+    self.index[$advancement] = at
+  self.values[at]
+
+proc containsKey*(self: AdvancementProgressMap; advancement: Advancement): bool =
+  self.index.hasKey($advancement)
+
+proc clear*(self: var AdvancementProgressMap) =
+  self.index = initTable[string, int]()
+  self.keys.setLen(0)
+  self.values.setLen(0)
+
+proc insert*(self: var AdvancementProgressMap; advancement: Advancement; progress: AdvancementProgress) =
+  let at = self.index.getOrDefault($advancement, -1)
+  if at >= 0:
+    self.values[at] = progress
+  else:
+    self.index[$advancement] = self.keys.len
+    self.keys.add(advancement)
+    self.values.add(progress)
+
+proc len*(self: AdvancementProgressMap): int =
+  self.keys.len
+
+proc isEmpty*(self: AdvancementProgressMap): bool =
+  self.keys.len == 0
+
+proc newAdvancementManager*(playerDataPath: string; saveEnabled: bool): AdvancementManager =
+  ## Creates a new instance of `AdvancementManager` using the player data path.
+  let path = joinPathW(playerDataPath, "advancements")
+  discard createDirAllW(path)
+  AdvancementManager(advancementPath: path, saveEnabled: saveEnabled)
+
+proc getAdvancements*(self: AdvancementManager): seq[Identifier] =
+  ## Retrieves the list of all available advancements in the game.
+  Advancement.getIdentifierList()
+
+proc newPlayerAdvancement*(manager: AdvancementManager; uuid: Uuid): PlayerAdvancement =
+  ## Creates a new instance of `PlayerAdvancement`.
+  PlayerAdvancement(
+    progress: AdvancementProgressMap(keys: @[], values: @[], index: initTable[string, int]()),
+    path: joinPathW(manager.advancementPath, $uuid & ".json"),
+    manager: manager,
+    player: nil,
+    isFirstPacket: true,
+    rootsToUpdate: @[],
+    visible: @[],
+    progressChanged: @[],
+    lastSelectedTab: none[Advancement]())
+
+proc setPlayer*(self: PlayerAdvancement; player: AdvancementPlayer) =
+  ## Associates the `PlayerAdvancement` data with the given player.
+  self.player = player
+
+proc isSaveEnabled*(self: PlayerAdvancement): bool =
+  ## Returns whether advancement saving is enabled for this player.
+  self.manager.saveEnabled
+
+proc prettyJsonInto(s: var string; v: JsonValue; indent: int) =
+  proc pad(s: var string; n: int) =
+    for i in 0 ..< n:
+      s.add("  ")
+  case v.kind
+  of jvObject:
+    if v.keys.len == 0:
+      s.add("{}")
+      return
+    s.add("{\n")
+    for i in 0 ..< v.keys.len:
+      pad(s, indent + 1)
+      s.add(toJsonString(jsonString(v.keys[i])))
+      s.add(": ")
+      prettyJsonInto(s, v.vals[i], indent + 1)
+      if i + 1 < v.keys.len:
+        s.add(",")
+      s.add("\n")
+    pad(s, indent)
+    s.add("}")
+  else:
+    s.add(toJsonString(v))
+
+proc prettyJson*(v: JsonValue): string =
+  ## `serde_json::to_string_pretty`, for what is written here: objects and scalars.
+  result = ""
+  prettyJsonInto(result, v, 0)
+
+proc toJson*(self: PlayerAdvancement): JsonValue =
+  ## `impl Serialize for PlayerAdvancement`. Every criterion is written, null when not granted, which `load` reads back.
+  result = jsonObject()
+  for i in 0 ..< self.progress.keys.len:
+    if self.progress.values[i].hasProgress():
+      var criteria = jsonObject()
+      for name in self.progress.values[i].criteriaNames:
+        criteria.put(name, self.progress.values[i].criteria.getOrDefault(name).toJson())
+      result.put($self.progress.keys[i], criteria)
+
+proc writeJson(path, json: string): bool =
+  var bytes = newSeq[byte](json.len)
+  for i in 0 ..< json.len:
+    bytes[i] = byte(ord(json[i]))
+  writeFileBytes(path, bytes)
+
+proc save*(self: PlayerAdvancement): AdvancementResult =
+  ## Saves the player's advancement progress to disk as JSON.
+  if not self.isSaveEnabled():
+    return okResult()
+  let json = prettyJson(self.toJson())
+  if not createDirAllW(parentDirW(self.path)):
+    return errResult(adeIo, "Failed to create player advancement directory")
+  if not writeJson(self.path, json):
+    return errResult(adeIo, "Failed to write " & self.path)
+  okResult()
+
+proc markForVisibilityUpdate(self: PlayerAdvancement; advancement: Advancement) =
+  let node = ADVANCEMENT_TREE.getNodeFromId(advancement.id)
+  if node.isSome:
+    let root = node.unsafeGet.root()
+    if root notin self.rootsToUpdate:
+      self.rootsToUpdate.add(root)
+
+proc load*(self: PlayerAdvancement): AdvancementResult =
+  ## Loads the player's advancement progress from disk.
+  if not fileExistsW(self.path) or not self.isSaveEnabled():
+    return okResult()
+
+  let (status, bytes) = readFileBytes(self.path)
+  if status != rsOk:
+    return errResult(adeIo, "Failed to read " & self.path)
+  var text = newString(bytes.len)
+  for i in 0 ..< bytes.len:
+    text[i] = char(bytes[i])
+
+  let parsed = parseJsonValue(text)
+  if not parsed.ok or parsed.value.kind != jvObject:
+    return errResult(adeJson, "Invalid advancement JSON in " & self.path)
+  var loaded: seq[(string, AdvancementProgress)] = @[]
+  for i in 0 ..< parsed.value.keys.len:
+    let (ok, progress) = advancementProgressFromJson(parsed.value.vals[i])
+    if not ok:
+      return errResult(adeJson, "Invalid advancement progress for " & parsed.value.keys[i])
+    loaded.add((parsed.value.keys[i], progress))
+
+  self.progress.clear()
+  for entry in loaded:
+    let (advancementId, loadedProgress) = entry
+    var progress = loadedProgress
+    let advancementRef = fromMinecraftName(Advancement, advancementId)
+    if advancementRef.isSome:
+      let advancement = advancementRef.unsafeGet
+      progress.update(fromConst(AdvancementRequirement, advancement.requirements))
+      self.progress.insert(advancement, progress)
+      if advancement notin self.progressChanged:
+        self.progressChanged.add(advancement)
+      self.markForVisibilityUpdate(advancement)
+    # else upstream warns: "The Advancement name {} is invalid"
+  okResult()
+
+proc reload*(self: PlayerAdvancement): AdvancementResult =
+  ## reload the advancements from the file
+  self.progress.clear()
+  self.visible.setLen(0)
+  self.rootsToUpdate.setLen(0)
+  self.progressChanged.setLen(0)
+  self.isFirstPacket = true
+  self.lastSelectedTab = none[Advancement]()
+  self.load()
+
+proc updateTreeVisibility(self: PlayerAdvancement; root: AdvancementNode; added: var seq[Advancement];
+    removed: var seq[Identifier]) =
+  var addedHere: seq[Advancement] = @[]
+  var removedHere: seq[Identifier] = @[]
+  proc isDoneOf(node: AdvancementNode): bool {.closure.} =
+    self.progress.getMutOrStartProgress(node.value).isDone()
+  proc outputOf(node: AdvancementNode; shouldBeVisible: bool) {.closure.} =
+    let advancement = node.value
+    if shouldBeVisible:
+      if advancement notin self.visible:
+        self.visible.add(advancement)
+        addedHere.add(advancement)
+        if self.progress.containsKey(advancement) and advancement notin self.progressChanged:
+          self.progressChanged.add(advancement)
+    else:
+      if advancement in self.visible:
+        var kept: seq[Advancement] = @[]
+        for other in self.visible:
+          if other != advancement:
+            kept.add(other)
+        self.visible = kept
+        removedHere.add(advancement.id)
+  discard evaluateVisibility(root, isDoneOf, outputOf)
+  for advancement in addedHere:
+    added.add(advancement)
+  for id in removedHere:
+    removed.add(id)
+
+proc flushDirty*(self: PlayerAdvancement; showAdvancement: bool) =
+  ## Flushes any pending advancement state down to the client.
+  if self.isFirstPacket or self.rootsToUpdate.len > 0:
+    var parsedProgress: seq[AdvancementProgressData] = @[]
+    var added: seq[Advancement] = @[]
+    var removed: seq[Identifier] = @[]
+    let roots = self.rootsToUpdate
+    for root in roots:
+      self.updateTreeVisibility(root, added, removed)
+    self.rootsToUpdate.setLen(0)
+    for advancement in self.progressChanged:
+      if advancement in self.visible:
+        let value = self.progress.getMutOrStartProgress(advancement)
+        var criteria: seq[Criteria] = @[]
+        for name in value.criteriaNames:
+          let criterion = value.criteria.getOrDefault(name)
+          var achieveDate = none[int64]()
+          if criterion.time.isSome:
+            let time = criterion.time.unsafeGet
+            achieveDate = some(time.secsSinceEpoch * 1000 + int64(time.nanosSinceEpoch) div 1000000)
+          criteria.add(Criteria(criterionId: name, achieveDate: achieveDate))
+        parsedProgress.add(AdvancementProgressData(id: advancement.id, progress: criteria))
+    self.progressChanged.setLen(0)
+    if parsedProgress.len > 0 or added.len > 0 or removed.len > 0:
+      let player = self.player
+      if player != nil:
+        player.sendUpdateAdvancements(CUpdateAdvancements(reset: self.isFirstPacket, added: added,
+          progress: parsedProgress, removed: removed, showAdvancements: showAdvancement))
+  self.isFirstPacket = false
+
+proc grantReward*(player: AdvancementPlayer; reward: AdvancementReward) =
+  ## Grants the rewards (like experience) associated with completing an advancement.
+  player.addExperiencePoints(reward.experience)
+
+proc award*(self: PlayerAdvancement; advancement: Advancement; criterion: string): bool =
+  ## award a criterion of an advancement to the player, updating its status to complete and granting rewards if
+  ## applicable.
+  result = false
+  let player = self.player
+  # Upstream unwraps the Weak here; a player that is gone is a panic there and an unchecked deref would be one here.
+  assert player != nil, "award on a PlayerAdvancement with no player"
+  let wasDone = self.progress.getMutOrStartProgress(advancement).isDone()
+  if self.progress.getMutOrStartProgress(advancement).grantProgress(criterion):
+    result = true
+    if advancement notin self.progressChanged:
+      self.progressChanged.add(advancement)
+    if not wasDone and self.progress.getMutOrStartProgress(advancement).isDone():
+      grantReward(player, advancement.reward)
+      if advancement.display.isSome and advancement.display.unsafeGet.announceToChat and player.showAdvancementMessages():
+        let display = advancement.display.unsafeGet
+        let component = translateCross(display.frameType.getTranslation(), BEDROCK_CHAT_TYPE_ACHIEVEMENT,
+          @[player.getDisplayName(), advancement.name()])
+        player.broadcastSystemMessage(component, false)
+  if not wasDone and self.progress.getMutOrStartProgress(advancement).isDone():
+    self.markForVisibilityUpdate(advancement)
+
+proc revoke*(self: PlayerAdvancement; advancement: Advancement; criterion: string): bool =
+  ## Revokes a previously awarded advancement, clearing its progress state.
+  result = false
+  let wasDone = self.progress.getMutOrStartProgress(advancement).isDone()
+  if self.progress.getMutOrStartProgress(advancement).revokeProgress(criterion):
+    if advancement notin self.progressChanged:
+      self.progressChanged.add(advancement)
+    result = true
+  if wasDone and not self.progress.getMutOrStartProgress(advancement).isDone():
+    self.markForVisibilityUpdate(advancement)
+
+proc setSelectedTab*(self: PlayerAdvancement; advancement: Option[Advancement]) =
+  ## set the selected advancement tab of the player
+  let old = self.lastSelectedTab
+  if advancement.isSome and advancement.unsafeGet.isRoot and advancement.unsafeGet.display.isSome:
+    self.lastSelectedTab = advancement
+  else:
+    self.lastSelectedTab = none[Advancement]()
+  if old != self.lastSelectedTab:
+    let player = self.player
+    if player != nil:
+      var tabId = none[Identifier]()
+      if self.lastSelectedTab.isSome:
+        tabId = some(self.lastSelectedTab.unsafeGet.id)
+      player.sendSelectAdvancementsTab(CSelectAdvancementsTab(tabId: tabId))
+
+proc saveAllPlayers*(self: AdvancementManager; players: openArray[PlayerAdvancement]): AdvancementResult =
+  ## Saves the advancements of all provided players.
+  if not self.saveEnabled:
+    return okResult()
+  if not createDirAllW(self.advancementPath):
+    return errResult(adeIo, "Failed to create player advancement directory")
+  for advancements in players:
+    if not writeJson(advancements.path, prettyJson(advancements.toJson())):
+      return errResult(adeIo, "Failed to write " & advancements.path)
+  okResult()
+
+proc savePlayer*(self: AdvancementManager; player: PlayerAdvancement): AdvancementResult =
+  ## Saves the advancements of a specific player.
+  self.saveAllPlayers([player])

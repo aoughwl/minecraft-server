@@ -7,9 +7,10 @@ hundreds of individual packet handler files, mostly 8-100 lines each).
 ## The connection path
 
 `java/` is the port of `pumpkin/src/net/java/`: `javamod.aowl` (the client), `handshake`, `status`, `login`, `config`
-and part of `play`, with `dispatch.aowl` routing packets to them. One thread polls non-blocking sockets from
+and `play`, with `dispatch.aowl` routing packets to them. One thread polls non-blocking sockets from
 `../pumpkinlib.aowl`; `winsock.aowl`'s header has the design. `tools/mcbot.py` drives all of it end to end. Each
-file's PARTIAL line says what is missing; online mode and encryption are the biggest part.
+file's PARTIAL line says what is missing; Mojang's session check, which needs an HTTP client, and what the handlers
+hand to block, item and entity behaviour are the biggest part.
 
 ## What's here
 

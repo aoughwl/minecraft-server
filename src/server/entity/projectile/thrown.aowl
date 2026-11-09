@@ -1,0 +1,416 @@
+## Port of pumpkin/src/entity/projectile/mod.rs
+## Port of pumpkin/src/entity/projectile/snowball.rs
+## Port of pumpkin/src/entity/projectile/fireball.rs
+## Port of pumpkin/src/entity/projectile/small_fireball.rs
+## Port of pumpkin/src/entity/projectile/wind_charge.rs
+## Port of pumpkin/src/entity/projectile/firework_rocket.rs
+##
+## Upstream's concrete projectiles hold a `thrown: ThrownItemEntity`. Here they derive from it: a `ThrownItemEntity` is a
+## `dyn EntityBase` already, with `self.entity` for `self.thrown.entity`. `ProjectileHit` is in entitymod.aowl, since
+## `EntityBase::on_hit` names it. A concrete type's vtable starts from `thrownVt()`, which has `process_tick` as `tick`.
+
+import std/[math, options]
+import ../../../data/block_ext
+from ../../../data/block_state import asU16
+import ../../../generated/[damage_type, entity_status, meta_data_type, tracked_data]
+import ../../../protocol/java/client/play/[entity_metadata, entity_velocity]
+from ../../../protocol/varint import OptionalInt
+import ../../../util/xoroshiro128
+from ../../../util/random/random import getSeed
+import ../../../world/world as worldtraits
+import ../../world/chunker
+import ../../world/explosion
+import ../entitymod
+import ../projectile_deflection
+
+export entitymod
+
+type
+  ThrownItemEntity* = ref object of EntityBase
+    ownerId*: Option[int32]
+    collidesWithProjectiles*: bool
+    hasHit*: bool
+    gravity*: float64
+
+  SnowballEntity* = ref object of ThrownItemEntity
+  FireballEntity* = ref object of ThrownItemEntity
+    explosionPower*: float32
+  SmallFireballEntity* = ref object of ThrownItemEntity
+
+  WindChargeKind* = enum
+    wcNormal, wcBreeze
+
+  WindChargeEntity* = ref object of ThrownItemEntity
+    kind*: WindChargeKind
+    deflectCooldown*: uint8
+
+  FireworkRocketEntity* = ref object of ThrownItemEntity
+    life*, lifeTime*: uint32
+
+const
+  WindChargeGravity* = 0.0'f64
+  SnowballGravity = 0.03'f64
+  FireballExplosionPower = 1.0'f32
+  WindChargeExplosionPower = 1.2'f32
+  DefaultDeflectCooldown = 5'u8
+
+proc isProjectile*(t: EntityType): bool =
+  ## `is_projectile`
+  let id = t.id
+  id == EntityType.ARROW.id or id == EntityType.TRIDENT.id or id == EntityType.EGG.id or id == EntityType.SNOWBALL.id or
+    id == EntityType.FIREWORK_ROCKET.id or id == EntityType.WIND_CHARGE.id or id == EntityType.SPLASH_POTION.id or
+    id == EntityType.LINGERING_POTION.id or id == EntityType.ENDER_PEARL.id or id == EntityType.SHULKER_BULLET.id or
+    id == EntityType.FIREBALL.id or id == EntityType.SMALL_FIREBALL.id or id == EntityType.FISHING_BOBBER.id
+
+proc calculateRayIntersection*(start, dir: Vector3[float64]; bb: BoundingBox): Option[float64] =
+  ## `calculate_ray_intersection`: ray intersection for AABBs, returning a t value.
+  var tMin = 0.0'f64
+  var tMax = 1.0'f64
+  for axis in [axisX, axisY, axisZ]:
+    let d = dir.getAxis(axis)
+    let s = start.getAxis(axis)
+    let bMin = bb.min.getAxis(axis)
+    let bMax = bb.max.getAxis(axis)
+    if abs(d) < 1e-9'f64:
+      if s < bMin or s > bMax:
+        return none[float64]()
+    else:
+      let t1 = (bMin - s) / d
+      let t2 = (bMax - s) / d
+      tMin = max(tMin, min(t1, t2))
+      tMax = min(tMax, max(t1, t2))
+  if tMin >= 0.0'f64 and tMin <= 1.0'f64: some(tMin) else: none[float64]()
+
+proc getHitFace*(hitPos: Vector3[float64]; blockPos: BlockPos): BlockDirection =
+  ## `get_hit_face`
+  let local = hitPos.sub(blockPos.vec.toF64())
+  let eps = 1.0e-4'f64
+  if local.x <= eps: BlockDirection.West
+  elif local.x >= 1.0'f64 - eps: BlockDirection.East
+  elif local.y <= eps: BlockDirection.Down
+  elif local.y >= 1.0'f64 - eps: BlockDirection.Up
+  elif local.z <= eps: BlockDirection.North
+  else: BlockDirection.South
+
+proc setVelocityThrown*(self: ThrownItemEntity; x, y, z, power, uncertainty: float64) =
+  ## `set_velocity`. The result is `Vector3::multiply`, which multiplies each component by `power`.
+  proc nextTriangular(mode, deviation: float64): float64 =
+    mulAdd(deviation, randomF64() - randomF64(), mode)
+  let velocity = Vector3[float64](x: x, y: y, z: z).normalize().addRaw(
+    nextTriangular(0.0'f64, 0.017_227_5'f64 * uncertainty),
+    nextTriangular(0.0'f64, 0.017_227_5'f64 * uncertainty),
+    nextTriangular(0.0'f64, 0.017_227_5'f64 * uncertainty)).multiply(power, power, power)
+  self.entity.velocity = velocity
+  let len = velocity.horizontalLength()
+  self.entity.setRotation(float32(arctan2(velocity.x, velocity.z)) * 57.295_776'f32,
+    float32(arctan2(velocity.y, len)) * 57.295_776'f32)
+
+proc setVelocityFrom*(self: ThrownItemEntity; shooter: Entity; pitch, yaw, roll, speed, divergence: float32) =
+  ## `set_velocity_from`
+  let yawRad = toRadiansF32(yaw)
+  let pitchRad = toRadiansF32(pitch)
+  let rollRad = toRadiansF32(pitch + roll)
+  let x = -sinF32(yawRad) * cosF32(pitchRad)
+  let y = -sinF32(rollRad)
+  let z = cosF32(yawRad) * cosF32(pitchRad)
+  self.setVelocityThrown(float64(x), float64(y), float64(z), float64(speed), float64(divergence))
+
+proc shouldSkipCollision(self: ThrownItemEntity; selfEnt: Entity; other: EntityBase): bool =
+  ## `should_skip_collision`: e.g. owner or projectile vs projectile.
+  let otherEnt = other.entity
+  if otherEnt.entityId == selfEnt.entityId:
+    return true
+  # Skip owner for initial frames
+  if self.ownerId.isSome and self.ownerId.unsafeGet == otherEnt.entityId and selfEnt.age < 5'i32:
+    return true
+  # Projectiles should pass through lingering clouds
+  if otherEnt.entityType.id == EntityType.AREA_EFFECT_CLOUD.id:
+    return true
+  # Projectile vs projectile logic
+  if not self.collidesWithProjectiles and isProjectile(otherEnt.entityType):
+    return true
+  false
+
+proc processTick*(self: ThrownItemEntity; caller: EntityBase; server: Server) =
+  ## `process_tick`: a tick for projectile movement and collisions.
+  let entity = self.entity
+  let world = entity.world
+  discard entity.updateLastPos()
+  # Apply gravity and inertia
+  var velocity = entity.velocity
+  velocity.y -= self.gravity
+  let inertia = if entity.touchingWater: 0.8'f64 else: 0.99'f64
+  velocity = velocity.multiply(inertia, inertia, inertia)
+  # Store velocity
+  entity.velocity = velocity
+  let startPos = entity.pos
+  let delta = velocity
+  # Update position
+  let newPos = startPos.add(delta)
+  entity.setPos(newPos)
+  # Send updated velocity to clients
+  world.broadcastToChunk(entity.chunkPos, newCEntityVelocity(newVarInt(entity.entityId), velocity))
+  # Calculate search box for collisions
+  let searchBox = newBoundingBox(
+    Vector3[float64](x: min(startPos.x, newPos.x), y: min(startPos.y, newPos.y), z: min(startPos.z, newPos.z)),
+    Vector3[float64](x: max(startPos.x, newPos.x), y: max(startPos.y, newPos.y), z: max(startPos.z, newPos.z))).expand(
+      0.3'f64, 0.3'f64, 0.3'f64)
+  var closestT = 1.0'f64
+  var hit = none[ProjectileHit]()
+  # Block collisions
+  let (blockCols, blockPositions) = world.getBlockCollisions(searchBox, caller)
+  for idx in 0 ..< blockCols.len:
+    let t = calculateRayIntersection(startPos, delta, blockCols[idx])
+    if t.isSome and t.unsafeGet < closestT:
+      closestT = t.unsafeGet
+      # Map back to block pos. Upstream adds up the entries' lengths, which are cumulative already; that is kept, and
+      # it only makes the first position match sooner.
+      var curr = 0
+      for entry in blockPositions:
+        curr += entry[0]
+        if idx < curr:
+          let hitPos = startPos.add(delta.multiply(closestT, closestT, closestT))
+          hit = some(ProjectileHit(kind: phBlock, pos: entry[1], face: getHitFace(hitPos, entry[1]), hitPos: hitPos,
+            normal: delta.normalize().multiply(-1.0'f64, -1.0'f64, -1.0'f64)))
+          break
+  # Entity collisions
+  for cand in world.getEntitiesAtBox(searchBox):
+    if self.shouldSkipCollision(entity, cand):
+      continue
+    let ebb = cand.entity.boundingBox.expand(0.3'f64, 0.3'f64, 0.3'f64)
+    let t = calculateRayIntersection(startPos, delta, ebb)
+    if t.isSome and t.unsafeGet < closestT:
+      closestT = t.unsafeGet
+      let hitPos = startPos.add(delta.multiply(closestT, closestT, closestT))
+      hit = some(ProjectileHit(kind: phEntity, entity: cand, hitPos: hitPos,
+        normal: delta.normalize().multiply(-1.0'f64, -1.0'f64, -1.0'f64)))
+  # Handle hit or continue
+  if hit.isSome:
+    # Ensure hit is only processed once per projectile
+    let wasHit = self.hasHit
+    self.hasHit = true
+    if wasHit:
+      return
+    # Just trigger hit effects and remove
+    caller.onHit(hit.unsafeGet)
+    entity.remove()
+
+proc makeThrownVt(): EntityVt =
+  result = copyVt(entityVt())
+  result.tick = proc(self, caller: EntityBase; server: Server) {.closure.} =
+    let s = ThrownItemEntity(self)
+    s.processTick(caller, server)
+  result.writeNbt = proc(self: EntityBase; nbt: var NbtCompound) {.closure.} = discard
+  result.readNbt = proc(self: EntityBase; nbt: NbtCompound) {.closure.} = discard
+
+let gThrownVt = makeThrownVt()
+
+proc thrownVt*(): EntityVt = gThrownVt
+  ## Shared; `copyVt` it for a concrete type.
+
+template initThrownFields*(self: untyped; entity: Entity; gravity0: float64; ownerId0: Option[int32]) =
+  ## The fields every thrown projectile sets, and the back pointer. For a derived type built with its required
+  ## `vt` and `entity`.
+  self.ownerId = ownerId0
+  self.collidesWithProjectiles = false
+  self.hasHit = false
+  self.gravity = gravity0
+  entity.base = self
+
+proc placeAtShooter*(entity, owner: Entity): Option[int32] =
+  ## `ThrownItemEntity::new`'s position: `entity.pos.store`, so the box and block position are left as they were.
+  var ownerPos = owner.pos
+  ownerPos.y += owner.getEyeHeight() - 0.1'f64
+  entity.pos = ownerPos
+  some(owner.entityId)
+
+# --- SnowballEntity --------------------------------------------------------------------------------------------------------------------
+
+proc makeSnowballVt(): EntityVt =
+  result = copyVt(gThrownVt)
+  result.onHit = proc(self: EntityBase; hit: ProjectileHit) {.closure.} =
+    # Always send particle status regardless of what was hit
+    self.entity.world.sendEntityStatus(self.entity, esDeath)
+    # Handle entity-specific damage
+    if hit.kind == phEntity:
+      let target = hit.entity
+      let isBlaze = target.entity.entityType.id == EntityType.BLAZE.id
+      let damage = if isBlaze: 3.0'f32 else: 0.0'f32 # Only damage blazes
+      discard target.damage(target, damage, THROWN)
+
+let snowballVt* = makeSnowballVt()
+
+proc newSnowballEntity*(entity: Entity): SnowballEntity =
+  ## `SnowballEntity::new`
+  # Keep the velocity initialization
+  entity.setVelocity(Vector3[float64](x: 0.0, y: 0.1, z: 0.0))
+  result = SnowballEntity(vt: snowballVt, entity: entity)
+  initThrownFields(result, entity, SnowballGravity, none[int32]())
+
+proc newSnowballShot*(entity, shooter: Entity): SnowballEntity =
+  ## `SnowballEntity::new_shot`
+  let owner = placeAtShooter(entity, shooter)
+  entity.setVelocity(Vector3[float64](x: 0.0, y: 0.1, z: 0.0))
+  result = SnowballEntity(vt: snowballVt, entity: entity)
+  initThrownFields(result, entity, SnowballGravity, owner)
+
+# --- FireballEntity --------------------------------------------------------------------------------------------------------------------
+
+proc makeFireballVt(): EntityVt =
+  result = copyVt(gThrownVt)
+  result.onHit = proc(self: EntityBase; hit: ProjectileHit) {.closure.} =
+    let s = FireballEntity(self)
+    # Handle entity/block hit
+    if hit.kind == phEntity:
+      let target = hit.entity
+      # Fireball does 6.0 damage in vanilla
+      target.entity.setOnFireFor(5.0'f32)
+      discard target.damage(target, 6.0'f32, damage_type.FIREBALL)
+    # Explosion sets fire if mob griefing is enabled (assuming true for now)
+    explode(s.entity.world, hit.hitPos, s.explosionPower)
+
+let fireballVt* = makeFireballVt()
+
+proc newFireballEntity*(entity: Entity): FireballEntity =
+  ## `FireballEntity::new`
+  result = FireballEntity(vt: fireballVt, entity: entity, explosionPower: FireballExplosionPower)
+  initThrownFields(result, entity, 0.0'f64, none[int32]())
+
+proc newFireballShot*(entity, shooter: Entity): FireballEntity =
+  ## `FireballEntity::new_shot`
+  let owner = placeAtShooter(entity, shooter)
+  result = FireballEntity(vt: fireballVt, entity: entity, explosionPower: FireballExplosionPower)
+  initThrownFields(result, entity, 0.0'f64, owner)
+
+# --- SmallFireballEntity ---------------------------------------------------------------------------------------------------------------
+
+proc makeSmallFireballVt(): EntityVt =
+  result = copyVt(gThrownVt)
+  result.onHit = proc(self: EntityBase; hit: ProjectileHit) {.closure.} =
+    if hit.kind == phEntity:
+      let target = hit.entity
+      target.entity.setOnFireFor(5.0'f32)
+      discard target.damage(target, 5.0'f32, damage_type.FIREBALL)
+    else:
+      # Try to place fire
+      let blockToPlace = hit.pos.offset(hit.face.toOffset())
+      discard self.entity.world.setBlockState(blockToPlace, uint32(asU16(blockFire().defaultState.id)), BfNotifyAll)
+
+let smallFireballVt* = makeSmallFireballVt()
+
+proc newSmallFireballEntity*(entity: Entity): SmallFireballEntity =
+  ## `SmallFireballEntity::new`
+  result = SmallFireballEntity(vt: smallFireballVt, entity: entity)
+  initThrownFields(result, entity, 0.0'f64, none[int32]())
+
+proc newSmallFireballShot*(entity, shooter: Entity): SmallFireballEntity =
+  ## `SmallFireballEntity::new_shot`
+  let owner = placeAtShooter(entity, shooter)
+  result = SmallFireballEntity(vt: smallFireballVt, entity: entity)
+  initThrownFields(result, entity, 0.0'f64, owner)
+
+# --- WindChargeEntity ------------------------------------------------------------------------------------------------------------------
+
+proc makeWindChargeVt(): EntityVt =
+  result = copyVt(gThrownVt)
+  result.tick = proc(self, caller: EntityBase; server: Server) {.closure.} =
+    let s = WindChargeEntity(self)
+    s.processTick(caller, server)
+    if s.kind == wcNormal and s.deflectCooldown > 0'u8:
+      s.deflectCooldown -= 1'u8
+
+let windChargeVt* = makeWindChargeVt()
+
+proc newWindChargeNormal*(entity: Entity): WindChargeEntity =
+  ## `WindChargeEntity::new_normal`, over the `ThrownItemEntity` upstream's caller builds.
+  result = WindChargeEntity(vt: windChargeVt, entity: entity, kind: wcNormal, deflectCooldown: DefaultDeflectCooldown)
+  initThrownFields(result, entity, WindChargeGravity, none[int32]())
+
+proc newWindChargeBreeze*(entity: Entity): WindChargeEntity =
+  ## `WindChargeEntity::new_breeze`
+  result = WindChargeEntity(vt: windChargeVt, entity: entity, kind: wcBreeze, deflectCooldown: 0'u8)
+  initThrownFields(result, entity, WindChargeGravity, none[int32]())
+
+proc createExplosion*(self: WindChargeEntity; position: Vector3[float64]) =
+  ## `create_explosion`
+  explode(self.entity.world, position, WindChargeExplosionPower)
+
+proc deflectWindCharge*(self: WindChargeEntity; deflection: ProjectileDeflectionType; deflector: nil EntityBase; fromAttack: bool): bool =
+  ## `deflect`
+  if self.kind == wcNormal and self.deflectCooldown > 0'u8:
+    return false
+  let base: EntityBase = self
+  deflection.deflect(base, deflector)
+  true
+
+# --- FireworkRocketEntity --------------------------------------------------------------------------------------------------------------
+
+proc explodeAndRemove*(self: FireworkRocketEntity; world: World) =
+  ## `explode_and_remove`
+  world.sendEntityStatus(self.entity, esFireworksExplode)
+  # TODO upstream: Explode/colors
+  self.entity.remove()
+
+proc makeFireworkVt(): EntityVt =
+  result = copyVt(gThrownVt)
+  result.tick = proc(self, caller: EntityBase; server: Server) {.closure.} =
+    let s = FireworkRocketEntity(self)
+    s.processTick(caller, server)
+    let entity = s.entity
+    let world = entity.world
+    var velocity = entity.velocity
+    if s.ownerId.isSome:
+      # Check if the player who fired this rocket still exists in the world
+      let shooterBase = world.getEntityById(s.ownerId.unsafeGet)
+      if shooterBase != nil:
+        let shooter = shooterBase.entity
+        # Logic for boosting Elytra flight
+        if shooter.isFallFlying():
+          let rotation = shooter.rotation().toF64()
+          let shooterVel = shooter.velocity
+          let newShooterVel = shooterVel + (rotation * 0.1'f64 + (rotation * 1.5'f64 - shooterVel) * 0.5'f64)
+          shooter.setVelocity(newShooterVel)
+          entity.setPos(shooter.pos)
+          entity.setVelocity(newShooterVel)
+    else:
+      # Standard firework rocket flight logic
+      velocity.x *= 1.15'f64
+      velocity.z *= 1.15'f64
+      velocity.y += 0.04'f64
+      entity.setVelocity(velocity)
+    # Increment life and check for explosion
+    let currentLife = s.life
+    s.life += 1'u32
+    if currentLife > s.lifeTime:
+      s.explodeAndRemove(world)
+
+let fireworkRocketVt* = makeFireworkVt()
+
+proc rollLifeTime(random: var Xoroshiro): uint32 =
+  # TODO upstream
+  let a = random.nextBoundedI32(6'i32)
+  let b = random.nextBoundedI32(7'i32)
+  10'u32 + uint32(a) + uint32(b)
+
+proc newFireworkRocketEntity*(entity: Entity): FireworkRocketEntity =
+  ## `FireworkRocketEntity::new`
+  var random = xoroshiro128.fromSeed(getSeed())
+  let vx = random.nextTriangular(0.0'f64, 0.002_297'f64)
+  let vz = random.nextTriangular(0.0'f64, 0.002_297'f64)
+  entity.setVelocity(Vector3[float64](x: vx, y: 0.05'f64, z: vz))
+  result = FireworkRocketEntity(vt: fireworkRocketVt, entity: entity, life: 0'u32, lifeTime: rollLifeTime(random))
+  initThrownFields(result, entity, 0.0'f64, none[int32]())
+
+proc newFireworkRocketShot*(entity, shooter: Entity): FireworkRocketEntity =
+  ## `FireworkRocketEntity::new_shot`
+  var random = xoroshiro128.fromSeed(getSeed())
+  # Set random initial velocity
+  let owner = placeAtShooter(entity, shooter)
+  let vx = random.nextTriangular(0.0'f64, 0.002_297'f64)
+  let vz = random.nextTriangular(0.0'f64, 0.002_297'f64)
+  entity.setVelocity(Vector3[float64](x: vx, y: 0.05'f64, z: vz))
+  # Set random life
+  result = FireworkRocketEntity(vt: fireworkRocketVt, entity: entity, life: 0'u32, lifeTime: rollLifeTime(random))
+  initThrownFields(result, entity, 0.0'f64, owner)
+  # Set shooter metadata
+  entity.sendMetaData(TrackedData_ATTACHED_TO_TARGET, OPTIONAL_INT, OptionalInt(value: some(shooter.entityId)))

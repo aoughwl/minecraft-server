@@ -1,12 +1,23 @@
 ## Port of pumpkin/src/server/mod.rs
-## PARTIAL: pumpkin/src/server/mod.rs - construction from a save, `add_player`, `remove_player`, lookups, counts, branding, status and the tick. The overworld only: no nether or end, no plugin manager, command dispatcher, tick-rate manager, recipe or advancement managers, key store, user cache or player data. The types are in serverbase.aowl.
+## PARTIAL: pumpkin/src/server/mod.rs - construction from a save, all three dimensions, `add_player`, `remove_player`, lookups, counts, branding, status, `decrypt`, `digest_secret` and the tick, with the tick-rate manager, recipe manager, key store and `data/`. No plugin manager, command dispatcher (held back by the compiler fix), block or item registries, advancement manager or listing. The types are in serverbase.aowl.
 
-import std/options
+import std/[options, syncio]
+import ../generated/translation as tr
 import ../protocol/proto
+import ../util/text/text
 from ../generated/chunk_gen_settings as gensettings import nil
-import ../world/worldinfoanvil
+import ../world/[level, playerdata, worldinfoanvil, worldfs]
+import ../world/generation/feature/survival
+import ../world/worldinfo except Dimension
+import ../inventory/sync_handler
+import ../nbt/tag
 import connection_cache
+import data/player_server
+import key_store
+import recipe
+import scheduler
 import serverbase
+import tick_rate_manager
 import entity/player as playermod
 import world/worldmod
 
@@ -16,15 +27,50 @@ type
     server*: nil Server
     error*: string
 
+proc intoLevel(advancedConfig: AdvancedConfiguration; levelFolder: string; seed: int64; dim: Dimension): GameLevel =
+  ## `into_level`: the nether and the end are folders inside the save, as vanilla lays them out.
+  var root = levelFolder
+  if dim.minecraftName == THE_NETHER.minecraftName:
+    root = joinPathW(levelFolder, "DIM-1")
+  elif dim.minecraftName == THE_END.minecraftName:
+    root = joinPathW(levelFolder, "DIM1")
+  fromRootFolder(advancedConfig.world, root, seed, dim)
+
+proc settingsFor(dim: Dimension): (int32, int32) =
+  ## `GenerationSettings::from_dimension`'s sea level and bottom.
+  if dim.minecraftName == THE_NETHER.minecraftName:
+    (gensettings.NETHER.seaLevel, dim.minY)
+  elif dim.minecraftName == THE_END.minecraftName:
+    (gensettings.END.seaLevel, dim.minY)
+  else:
+    (gensettings.OVERWORLD.seaLevel, dim.minY)
+
 proc loadServer*(basicConfig: BasicConfiguration; advancedConfig: AdvancedConfiguration; levelFolder: string): ServerLoadResult =
-  ## `Server::new`, reading the one world from an existing save.
+  ## `Server::new`, reading the worlds from an existing save.
   let (ok, levelInfo, err) = readWorldInfo(levelFolder)
   if not ok:
     return ServerLoadResult(ok: false, server: nil, error: "cannot read " & levelFolder & ": " & $err)
-  let level = fromRootFolder(advancedConfig.world, levelFolder, levelInfo.worldGenSettings.seed, OVERWORLD)
-  let world = loadWorld(level, levelInfo, OVERWORLD, gensettings.OVERWORLD.seaLevel)
-  let server = Server(basicConfig: basicConfig, advancedConfig: advancedConfig, worlds: @[world],
-    dimensions: @[OVERWORLD, THE_NETHER, THE_END], tickCounter: 0'i64, nextEntityId: 1'i32)
+  var dimensions = @[OVERWORLD]
+  if basicConfig.allowNether:
+    dimensions.add(THE_NETHER)
+  if basicConfig.allowEnd:
+    dimensions.add(THE_END)
+  let server = Server(basicConfig: basicConfig, advancedConfig: advancedConfig, worlds: @[], dimensions: dimensions,
+    tickCounter: 0'i64, nextEntityId: 1'i32, tickRateManager: newServerTickRateManager(basicConfig.tps), keyStore: nil,
+    recipeManager: newRecipeManager(), scheduler: newTaskScheduler(), data: loadServerData(DataFolder),
+    playerDataStorage: newPlayerDataStorage(joinPathW(levelFolder, "playerdata"), advancedConfig.playerData.savePlayerData),
+    levelFolder: levelFolder, playerIdleTimeout: 0'i32, mojangPublicKeys: @[], stopRequested: false)
+  for dim in dimensions:
+    let level = intoLevel(advancedConfig, levelFolder, levelInfo.worldGenSettings.seed, dim)
+    # `level.world_portal.store`: upstream's asks the block registry. Until that is here, `worldgenPortal` answers
+    # `can_place_at` for what features place; `noOpWorldPortal` would grow trees on stone.
+    level.worldPortal = worldgenPortal()
+    let (seaLevel, minY) = settingsFor(dim)
+    server.worlds.add(loadWorld(level, levelInfo, dim, seaLevel, minY, server))
+  let java = advancedConfig.networking.java
+  if java.onlineMode or java.encryption:
+    echo "Creating encryption keys..."
+    server.keyStore = newKeyStore()
   ServerLoadResult(ok: true, server: server, error: "")
 
 proc getPlayerCount*(self: Server): int =
@@ -51,20 +97,109 @@ proc getStatus*(self: Server): StatusResponse =
   buildStatusResponse(self.advancedConfig.networking.java.motd,
     self.advancedConfig.networking.java.maxPlayers, uint32(self.getPlayerCount()))
 
+proc canNotJoin*(self: Server; profile: GameProfile): Option[TextComponent] =
+  ## `can_not_join` from pumpkin/src/net/mod.rs. The banned-ip half needs the client's address, which `tryAccept` does not
+  ## keep yet: see ../net/winsock.aowl.
+  let banned = self.data.bannedPlayerList.getEntry(profile.id)
+  if banned.isSome:
+    let entry = banned.unsafeGet
+    let reason = translateCross(tr.JAVA_MULTIPLAYER_DISCONNECT_BANNED_REASON, tr.JAVA_MULTIPLAYER_DISCONNECT_BANNED_REASON,
+      [text(entry.reason)])
+    if entry.expires != NoExpiry:
+      return some(reason.addChild(translateCross(tr.JAVA_MULTIPLAYER_DISCONNECT_BANNED_EXPIRATION,
+        tr.JAVA_MULTIPLAYER_DISCONNECT_BANNED_EXPIRATION, [text(formatBanDate(entry.expires))])))
+    return some(reason)
+  if self.basicConfig.whiteList:
+    if self.data.operatorConfig.getEntry(profile.id).isNone and not self.data.whitelistConfig.isWhitelisted(profile.id):
+      return some(translateCross(tr.JAVA_MULTIPLAYER_DISCONNECT_NOT_WHITELISTED, tr.JAVA_MULTIPLAYER_DISCONNECT_NOT_WHITELISTED))
+  none[TextComponent]()
+
+proc getWorldFromDimension*(self: Server; dimension: Dimension): World =
+  ## `get_world_from_dimension`: falls back to the overworld, for a dimension that is switched off.
+  for world in self.worlds:
+    if world.dimension.minecraftName == dimension.minecraftName:
+      return world
+  self.worlds[0]
+
 proc addPlayer*(self: Server; client: JavaClient; profile: GameProfile; config: PlayerConfig): (Player, World) =
-  ## `add_player`. Saved player data is not read: every join is a first join.
-  let world = self.worlds[0]
+  ## `add_player`
+  var world = self.worlds[0]
+  let loaded = loadData(self, profile.id)
+  if loaded.isSome:
+    let dimensionKey = loaded.unsafeGet.getString("Dimension")
+    if dimensionKey.isSome:
+      let (known, dimension) = dimensionFromName(dimensionKey.unsafeGet)
+      if known:
+        world = self.getWorldFromDimension(dimension)
+      else:
+        echo "Invalid dimension key in player data: ", dimensionKey.unsafeGet
   let entityId = self.nextEntityId
   self.nextEntityId = entityId + 1'i32
-  let player = newPlayer(client, profile, config, world, self.basicConfig.defaultGamemode, entityId)
+  let player = newPlayer(client, profile, config, world, self, self.basicConfig.defaultGamemode, entityId)
+  if loaded.isSome:
+    player.readNbt(loaded.unsafeGet)
+  player.screenHandlerSyncHandler.storePlayer(player.asInventoryPlayer())
   worldmod.addPlayer(world, player)
+  self.data.userCache.upsert(profile.id, profile.name)
   (player, world)
 
 proc removePlayer*(self: Server; player: Player) =
-  worldmod.removePlayer(player.world, player)
+  ## `remove_player` and `Player::remove`.
+  if player.removed:
+    return
+  player.removed = true
+  handlePlayerLeave(self, player)
+  let world = player.world
+  worldmod.removePlayer(world, player, true)
+  let radialChunks = allChunksWithin(player.watchedSection)
+  player.chunkManager.cleanUp(world.level)
+  var chunks: seq[(int32, int32)] = @[]
+  for chunk in radialChunks:
+    chunks.add((chunk.x, chunk.y))
+  let toClean = markChunksAsNotWatched(world.level, chunks)
+  if toClean.len > 0:
+    discard cleanEntityChunks(world.level, toClean)
+  let cleaned = cleanMemory(world.level)
+  if cleaned.len > 0:
+    discard cleanEntityChunks(world.level, cleaned)
+
+proc tickPlayersAndNetwork(self: Server) =
+  ## `tick_players_and_network`
+  for world in self.worlds:
+    world.flushBlockUpdates()
+    world.flushSyncedBlockEvents()
+    world.tickPlayers(self)
+
+proc tickWorlds(self: Server) =
+  ## `tick_worlds`
+  discard self.scheduler.tick(uint64(self.tickCounter))
+  for world in self.worlds:
+    worldmod.tick(world, self)
+  tickPlayerData(self)
 
 proc tick*(self: Server) =
-  ## `tick`: both of upstream's halves, since nothing here freezes.
+  ## `tick`
   self.tickCounter += 1'i64
+  if self.tickRateManager.runsNormally() or self.tickRateManager.isSprinting():
+    self.tickWorlds()
+  else:
+    # Always run player and network ticking, even when game is frozen
+    self.tickPlayersAndNetwork()
+
+proc pumpChunkSystems*(self: Server; maxGenerationTasks: int): bool =
+  ## One pass of every level's chunk system, for the main loop: true while there is work. See pumpkinlib.aowl.
+  result = false
   for world in self.worlds:
-    worldmod.tick(world)
+    if pumpChunkSystem(world.level, maxGenerationTasks):
+      result = true
+
+proc shutdown*(self: Server) =
+  ## `Server::shutdown`: saves the players, the chunks and the level's data.
+  saveAllPlayers(self)
+  for world in self.worlds:
+    worldmod.shutdown(world)
+  var info = self.worlds[0].levelInfo
+  info.dayTime = self.worlds[0].levelTime.timeOfDay
+  let (ok, err) = writeWorldInfo(info, self.levelFolder)
+  if not ok:
+    echo "Could not save level.dat: ", $err

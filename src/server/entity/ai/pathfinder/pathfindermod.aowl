@@ -1,0 +1,317 @@
+## Port of pumpkin/src/entity/ai/pathfinder/mod.rs
+
+import std/[math, options, tables]
+from ../../../../generated/attributes import MOVEMENT_SPEED, FOLLOW_RANGE, STEP_HEIGHT
+import ../../../../util/math/mathmod
+import ../../../../util/math/rustnum
+import ../../entitymod
+import node, binary_heap, path, pathfinding_context, node_evaluator, walk_node_evaluator
+
+export node, path, binary_heap, pathfinding_context, node_evaluator, walk_node_evaluator
+
+const
+  # If I counted correctly this should be equal to the number of iters that vanilla does for a zombie.
+  # TODO upstream: calculate from mob attributes like in vanilla
+  MaxIters = 560
+  TargetDistanceMultiplier = 1.5'f32
+  NodeReachXz = 0.5'f64
+  NodeReachY = 1.0'f64
+  MaxYawTurnPerTick = 90.0'f32
+
+type
+  NavigatorGoal* = object
+    currentProgress*: Vector3[float64]
+    destination*: Vector3[float64]
+    speed*: float64
+
+  Navigator* = ref object
+    currentGoal: Option[NavigatorGoal]
+    evaluator*: WalkNodeEvaluator
+    currentPath0: nil Path
+    # Stuck detection
+    ticksOnCurrentNode: uint32
+    lastNodeIndex: int
+    totalTicks: uint32
+    pathStartPos: Option[Vector3[float64]]
+    pathTypeOverrides: Table[int, float32]  ## By `ord(PathType)`.
+    mobWidth: float32
+    mobHeight: float32
+    # Smart re-pathing cooldown
+    repathCooldown: uint32
+    # Reusable allocations to avoid per-pathfind heap allocations
+    openSet: BinaryHeap
+    neighborsBuf: seq[Node]
+    isIdleFlag: bool
+
+proc newNavigatorGoal*(currentProgress, destination: Vector3[float64]; speed: float64): NavigatorGoal =
+  NavigatorGoal(currentProgress: currentProgress, destination: destination, speed: speed)
+
+proc newNavigator*(): Navigator =
+  ## `Navigator::default`
+  Navigator(currentGoal: none[NavigatorGoal](), evaluator: newWalkNodeEvaluator(), currentPath0: nil, ticksOnCurrentNode: 0'u32,
+    lastNodeIndex: 0, totalTicks: 0'u32, pathStartPos: none[Vector3[float64]](), pathTypeOverrides: initTable[int, float32](),
+    mobWidth: 0.6'f32, mobHeight: 1.95'f32, repathCooldown: 0'u32, openSet: newBinaryHeap(), neighborsBuf: @[], isIdleFlag: true)
+
+proc setProgress*(self: Navigator; goal: NavigatorGoal) =
+  ## `set_progress`
+  self.isIdleFlag = false
+  self.currentGoal = some(goal)
+  self.currentPath0 = nil
+
+proc setSpeed*(self: Navigator; speed: float64) =
+  if self.currentGoal.isSome:
+    var g = self.currentGoal.unsafeGet
+    g.speed = speed
+    self.currentGoal = some(g)
+
+proc stop*(self: Navigator) =
+  self.isIdleFlag = true
+  self.currentGoal = none[NavigatorGoal]()
+  self.currentPath0 = nil
+  self.ticksOnCurrentNode = 0'u32
+  self.totalTicks = 0'u32
+  self.pathStartPos = none[Vector3[float64]]()
+
+proc setPathfindingMalus*(self: Navigator; pathType: PathType; malus: float32) =
+  self.pathTypeOverrides[ord(pathType)] = malus
+
+proc setMobDimensions*(self: Navigator; width, height: float32) =
+  self.mobWidth = width
+  self.mobHeight = height
+
+proc isIdle*(self: Navigator): bool = self.isIdleFlag
+
+proc currentPath*(self: Navigator): nil Path = self.currentPath0
+  ## For a goal or a test to read the path; upstream's field is private.
+
+proc computePath*(self: Navigator; entity: LivingEntity; destination: Vector3[float64]): nil Path =
+  ## `compute_path`
+  let startPosF = entity.entity.pos
+  let startBlockVec = startPosF.toI32()
+  let mobPosition = Vector3[int32](x: startBlockVec.x, y: startBlockVec.y, z: startBlockVec.z)
+  let context = newPathfindingContext(mobPosition, entity.entity.world)
+  var mobData = newMobData(startPosF, self.mobWidth, self.mobHeight, 1.0'f32)
+  mobData.onGround = entity.entity.onGround
+  mobData.setPathfindingMalus(ptDangerFire, 16.0'f32)
+  mobData.setPathfindingMalus(ptDamageFire, -1.0'f32)
+  mobData.setPathfindingMalus(ptWater, 8.0'f32)
+  mobData.setPathfindingMalus(ptLava, -1.0'f32)
+  mobData.setPathfindingMalus(ptDangerOther, 8.0'f32)
+  # Apply per-mob pathfinding malus overrides
+  for k, malus in self.pathTypeOverrides:
+    mobData.setPathfindingMalus(PathType(k), malus)
+  self.evaluator.prepare(context, mobData)
+  let startOpt = self.evaluator.getStart()
+  if startOpt.isNone:
+    return nil
+  var startNode = startOpt.unsafeGet
+  var target = self.evaluator.getTarget(destination.toBlockPos())
+  startNode.g = 0.0'f32
+  let startDist = startNode.distance(target)
+  target.updateBest(startDist, startNode)
+  # Start node uses raw distance (no 1.5x multiplier - that's only for neighbors)
+  startNode.h = startDist
+  startNode.f = startNode.h
+  startNode.walkedDist = 0.0'f32
+  startNode.cameFrom = none[Vector3[int32]]()
+  let startPos = startNode.pos.vec
+  # Map to store closed nodes for path reconstruction
+  var closedSet = initTable[int64, Node]()
+  # Reuse the navigator's open_set and neighbors_buf
+  self.openSet.clear()
+  self.openSet.insert(startNode)
+  var iterations = 0
+  var reached = false
+  let followRange = float32(entity.getAttributeValue(FOLLOW_RANGE))
+  while not self.openSet.isEmpty():
+    iterations += 1
+    if iterations >= MaxIters:
+      break
+    let currentOpt = self.openSet.pop()
+    if currentOpt.isNone:
+      break
+    let current = currentOpt.unsafeGet
+    if current.distanceManhattan(target) < 1.0'f32:
+      target.reached = true
+      reached = true
+      target.updateBest(0.0'f32, current)
+      closedSet[keyOf(current.pos.vec)] = current
+      break
+    let dx = float32(current.pos.vec.x - startPos.x)
+    let dy = float32(current.pos.vec.y - startPos.y)
+    let dz = float32(current.pos.vec.z - startPos.z)
+    let euclideanFromStart = sqrt(dx * dx + dy * dy + dz * dz)
+    if euclideanFromStart >= followRange:
+      closedSet[keyOf(current.pos.vec)] = current
+      continue
+    self.neighborsBuf.setLen(0)
+    self.evaluator.getNeighbors(current, self.neighborsBuf)
+    for i in 0 ..< self.neighborsBuf.len:
+      var neighbor = self.neighborsBuf[i]
+      let stepCost = current.distance(neighbor)
+      neighbor.walkedDist = current.walkedDist + stepCost
+      let tentativeG = current.g + stepCost + neighbor.costMalus
+      let inHeap = self.openSet.contains(neighbor.pos.vec)
+      var better = not inHeap
+      if inHeap:
+        let existing = self.openSet.getNode(neighbor.pos.vec)
+        better = existing.isSome and tentativeG < existing.unsafeGet.g
+      if neighbor.walkedDist < followRange and better:
+        neighbor.cameFrom = some(current.pos.vec)
+        neighbor.g = tentativeG
+        let distToTarget = neighbor.distance(target)
+        target.updateBest(distToTarget, neighbor)
+        neighbor.h = distToTarget * TargetDistanceMultiplier
+        neighbor.f = neighbor.g + neighbor.h
+        if inHeap:
+          self.openSet.updateNode(neighbor.pos.vec, neighbor)
+        else:
+          self.openSet.insert(neighbor)
+    self.neighborsBuf.setLen(0)
+    closedSet[keyOf(current.pos.vec)] = current
+  # Also store any remaining open set nodes for path reconstruction
+  for node in self.openSet.drain():
+    if not closedSet.hasKey(keyOf(node.pos.vec)):
+      closedSet[keyOf(node.pos.vec)] = node
+  if target.bestNode.isSome:
+    let bestNode = target.bestNode.unsafeGet
+    var pathNodes: seq[Node] = @[]
+    var currentPos = bestNode.pos.vec
+    pathNodes.add(bestNode)
+    var visited = initTable[int64, bool]()
+    visited[keyOf(currentPos)] = true
+    while closedSet.hasKey(keyOf(currentPos)):
+      let node = closedSet.getOrDefault(keyOf(currentPos))
+      if node.cameFrom.isNone:
+        break
+      let prevPos = node.cameFrom.unsafeGet
+      if prevPos == currentPos or visited.hasKey(keyOf(prevPos)):
+        break # Self-reference or cycle detected
+      visited[keyOf(prevPos)] = true
+      if not closedSet.hasKey(keyOf(prevPos)):
+        break
+      pathNodes.add(closedSet.getOrDefault(keyOf(prevPos)))
+      currentPos = prevPos
+    var ordered: seq[Node] = @[]
+    var i = pathNodes.len - 1
+    while i >= 0:
+      ordered.add(pathNodes[i])
+      dec i
+    return newPath(ordered, target.node.pos.vec, reached)
+  nil
+
+proc needsNewPath(self: Navigator; goal: NavigatorGoal): bool =
+  ## `needs_new_path`
+  let p = self.currentPath0
+  if p == nil:
+    return true
+  if self.repathCooldown > 0'u32:
+    return false
+  let pathTarget = p.getTarget()
+  let goalTarget = goal.destination.toI32()
+  let dx = float64(pathTarget.x - goalTarget.x)
+  let dy = float64(pathTarget.y - goalTarget.y)
+  let dz = float64(pathTarget.z - goalTarget.z)
+  let distanceSq = dx * dx + dy * dy + dz * dz
+  # Adaptive threshold based on remaining distance
+  let remaining = clamp(p.getRemainingDistance(), 4.0'f32, 16.0'f32)
+  let threshold = remaining * 0.5'f32
+  distanceSq > float64(threshold * threshold)
+
+proc zeroInput(entity: LivingEntity) {.inline.} =
+  entity.movementInput = Vector3[float64](x: 0.0, y: 0.0, z: 0.0)
+
+proc tick*(self: Navigator; entity: LivingEntity) =
+  ## `tick`
+  if self.currentGoal.isNone:
+    # Idle: stop the mob
+    self.isIdleFlag = true
+    zeroInput(entity)
+    return
+  let goal = self.currentGoal.unsafeGet
+  self.currentGoal = none[NavigatorGoal]()
+  if goal.currentProgress == goal.destination:
+    self.isIdleFlag = true
+    self.currentPath0 = nil
+    zeroInput(entity)
+    return
+  self.totalTicks += 1'u32
+  if self.repathCooldown > 0'u32:
+    self.repathCooldown -= 1'u32
+  if self.needsNewPath(goal):
+    self.currentPath0 = self.computePath(entity, goal.destination)
+    self.ticksOnCurrentNode = 0'u32
+    self.lastNodeIndex = 0
+    self.pathStartPos = some(entity.entity.pos)
+    self.repathCooldown = 15'u32 # ~0.75 seconds cooldown before recomputing
+  # Every path from here on leaves the goal in place, as upstream's `self.current_goal = Some(goal)`.
+  self.currentGoal = some(goal)
+  let path = self.currentPath0
+  if path == nil:
+    zeroInput(entity)
+    return
+  if path.isDone() or not path.isValid():
+    zeroInput(entity)
+    return
+  let currentNodeIndex = path.getNextNodeIndex()
+  if currentNodeIndex == self.lastNodeIndex:
+    self.ticksOnCurrentNode += 1'u32
+  else:
+    self.ticksOnCurrentNode = 0'u32
+    self.lastNodeIndex = currentNodeIndex
+  if self.ticksOnCurrentNode > 100'u32:
+    self.currentPath0 = nil
+    self.ticksOnCurrentNode = 0'u32
+    zeroInput(entity)
+    return
+  if self.totalTicks mod 100'u32 == 0'u32:
+    if self.pathStartPos.isSome:
+      let startPos = self.pathStartPos.unsafeGet
+      let currentPos = entity.entity.pos
+      let dx = currentPos.x - startPos.x
+      let dy = currentPos.y - startPos.y
+      let dz = currentPos.z - startPos.z
+      let distSq = dx * dx + dy * dy + dz * dz
+      if distSq < 2.0'f64 * 2.0'f64:
+        self.currentPath0 = nil
+        self.ticksOnCurrentNode = 0'u32
+        zeroInput(entity)
+        return
+    self.pathStartPos = some(entity.entity.pos)
+  let onGround = entity.entity.onGround
+  let nextBlock = path.getNextNodePos()
+  if nextBlock.isSome:
+    let next = nextBlock.unsafeGet
+    let targetPos = Vector3[float64](x: float64(next.x) + 0.5'f64, y: float64(next.y), z: float64(next.z) + 0.5'f64)
+    let currentPos = entity.entity.pos
+    let dx = targetPos.x - currentPos.x
+    let dy = targetPos.y - currentPos.y
+    let dz = targetPos.z - currentPos.z
+    let horizontalDistSq = dx * dx + dz * dz
+    let horizontalDist = sqrt(horizontalDistSq)
+    # Skip node if we're above it on the same XZ column and airborne (falling toward it)
+    if not onGround and horizontalDist < NodeReachXz and dy < -0.5'f64:
+      path.advance()
+      return
+    if horizontalDist < NodeReachXz and abs(dy) < NodeReachY:
+      path.advance()
+      return
+    let desiredYaw = wrapDegrees(toDegreesF32(float32(arctan2(dz, dx))) - 90.0'f32)
+    let currentYaw = entity.entity.yaw
+    let yawDiff = wrapDegrees(desiredYaw - currentYaw)
+    let targetYaw = currentYaw + clamp(yawDiff, -MaxYawTurnPerTick, MaxYawTurnPerTick)
+    entity.entity.yaw = targetYaw
+    entity.entity.headYaw = targetYaw
+    entity.entity.bodyYaw = targetYaw
+    # Get movement speed from goal and mob attributes
+    let mobSpeed = goal.speed * entity.getAttributeValue(MOVEMENT_SPEED)
+    entity.movementInput = Vector3[float64](x: 0.0, y: 0.0, z: mobSpeed)
+    let bbox = entity.entity.boundingBox
+    let width = bbox.max.x - bbox.min.x
+    let jumpDistance = max(1.0'f64, width)
+    # Jump when the next node is above step height and we're close enough horizontally
+    entity.jumping = dy > entity.getAttributeValue(STEP_HEIGHT) and horizontalDistSq < jumpDistance
+  else:
+    self.isIdleFlag = true
+    self.currentPath0 = nil
+    zeroInput(entity)

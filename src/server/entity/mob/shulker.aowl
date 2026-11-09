@@ -1,0 +1,340 @@
+## Port of pumpkin/src/entity/mob/shulker.rs
+## PARTIAL: pumpkin/src/entity/mob/shulker.rs - `ShulkerAttackGoal`'s bullet goes through `gSpawnShulkerBullet`, until entity/projectile/shulker_bullet is ported and can fill it; a shulker with a target and no hook keeps its cooldown and sound but fires nothing. `pub enum Axis` is here as upstream has it.
+
+import std/[math, options]
+from ../../../data/block_state import isSolid, isAir
+import ../../../data/block_direction
+import ../../../generated/[damage_type, meta_data_type, tracked_data]
+import ../../../nbt/tag as nbttag
+import ../../../protocol/java/client/play/entity_position_sync
+import ../../../protocol/varint
+import ../ai/aibase
+import ../ai/goal/[look_around, look_at_entity, track_target]
+import mobvts
+
+const
+  DefaultAttachFace = BlockDirection.Down
+  NoColor = 16'u8
+  PeekPerTick = 0.05'f32
+  MaxTeleportDistance = 8'i32
+
+type
+  Axis* = enum
+    ## Axis type for bullet creation (the bullet cannot start moving along this axis)
+    axisX = 0, axisY = 1, axisZ = 2
+
+  ShulkerEntity* = ref object of Mob
+    attachFace*: uint8
+    peekAmount*: uint8
+    color*: uint8
+    currentPeekAmount*: float32  ## Visual interpolation
+    prevPeekAmount*: float32
+
+  ShulkerAttackGoal* = ref object of Goal
+    shulker*: ShulkerEntity
+    attackCooldown*: int32
+
+  ShulkerPeekGoal* = ref object of Goal
+    shulker*: ShulkerEntity
+    peekTime*: int32
+
+var gSpawnShulkerBullet*: proc(shulkerEntity: Entity; targetId: int32; targetPos: Vector3[float64]; axis: Axis) {.closure.} =
+  proc(shulkerEntity: Entity; targetId: int32; targetPos: Vector3[float64]; axis: Axis) {.closure.} = discard
+  ## `ShulkerBulletEntity::new` and `world.spawn_entity`. entity/projectile/shulker_bullet fills it.
+
+proc axisOf*(self: BlockDirection): Axis =
+  case self
+  of BlockDirection.East, BlockDirection.West: axisX
+  of BlockDirection.Up, BlockDirection.Down: axisY
+  of BlockDirection.North, BlockDirection.South: axisZ
+
+proc offsetDirection(self: BlockPos; dir: BlockDirection): BlockPos =
+  let offset = dir.toOffset()
+  newBlockPos(self.x + offset.x, self.y + offset.y, self.z + offset.z)
+
+proc getAttachFace*(self: ShulkerEntity): BlockDirection =
+  let (ok, face) = tryFromI32(int32(self.attachFace))
+  if ok: face else: DefaultAttachFace
+
+proc setAttachFace*(self: ShulkerEntity; face: BlockDirection) =
+  self.attachFace = uint8(ord(face))
+  self.mobEntity.livingEntity.entity.sendMetaData(TrackedData_ATTACH_FACE_ID, DIRECTION, newVarInt(int32(ord(face))))
+
+proc getRawPeek*(self: ShulkerEntity): uint8 =
+  self.peekAmount
+
+proc setRawPeek*(self: ShulkerEntity; amount: uint8) =
+  let entity = self.mobEntity.livingEntity.entity
+  let world = entity.world
+  let pos = entity.pos
+
+  if amount == 0'u8:
+    # Closed from open state
+    playSoundFine(world, sdEntityShulkerClose, scHostile, pos, 1.0'f32, 1.0'f32)
+  elif self.peekAmount == 0'u8:
+    # Opened from closed state
+    playSoundFine(world, sdEntityShulkerOpen, scHostile, pos, 1.0'f32, 1.0'f32)
+
+  self.peekAmount = amount
+
+  entity.sendMetaData(TrackedData_PEEK_ID, BYTE, amount)
+
+proc isClosed*(self: ShulkerEntity): bool =
+  self.peekAmount == 0'u8
+
+proc updatePeekAmount*(self: ShulkerEntity): bool =
+  ## Advances `current_peek_amount` toward target by `PEEK_PER_TICK`.
+  ## Returns true if the value changed.
+  let current = self.currentPeekAmount
+  self.prevPeekAmount = current
+  let target = float32(self.getRawPeek()) * 0.01'f32
+
+  if abs(current - target) < 1e-6'f32:
+    return false
+
+  let newValue = if current > target: max(current - PeekPerTick, target) else: min(current + PeekPerTick, target)
+
+  self.currentPeekAmount = newValue
+  true
+
+proc findAttachableFace(self: ShulkerEntity; pos: BlockPos): Option[BlockDirection] =
+  ## Returns `Some(direction)` if the neighbour block in that direction from `pos` is solid (the shulker can attach there).
+  let world = self.mobEntity.livingEntity.entity.world
+  let directions = blockDirectionAll()
+  for dir in directions:
+    let neighbour = pos.offsetDirection(dir)
+    if getBlockStateAt(world, neighbour).isSolid():
+      return some(dir)
+  none[BlockDirection]()
+
+proc canStayAt*(self: ShulkerEntity; pos: BlockPos; face: BlockDirection): bool =
+  ## Check whether the shulker can stay where it is.
+  ## The block at `pos` must be free (air) and the block in the `face` direction from `pos` must be solid.
+  let world = self.mobEntity.livingEntity.entity.world
+
+  # Shulker's own block must not be occupied
+  if not getBlockStateAt(world, pos).isAir():
+    return false
+
+  # The block the shulker is attached to must still be solid
+  getBlockStateAt(world, pos.offsetDirection(face)).isSolid()
+
+proc teleportSomewhere*(self: ShulkerEntity): bool =
+  ## Attempt to teleport to a random nearby location where the shulker can attach.
+  ## Returns `true` on success.
+  let entity = self.mobEntity.livingEntity.entity
+  let basePos = entity.blockPos
+  let world = entity.world
+
+  for i in 0 ..< 20:
+    let dx = randomRangeInclusive(-MaxTeleportDistance, MaxTeleportDistance)
+    let dy = randomRangeInclusive(-MaxTeleportDistance, MaxTeleportDistance)
+    let dz = randomRangeInclusive(-MaxTeleportDistance, MaxTeleportDistance)
+    let candidate = newBlockPos(basePos.x + dx, basePos.y + dy, basePos.z + dz)
+
+    # Target block must be air and there must be an attachable adjacent solid face.
+    if not getBlockStateAt(world, candidate).isAir():
+      continue
+
+    let dir = self.findAttachableFace(candidate)
+    if dir.isSome:
+      let newPos = Vector3[float64](x: float64(candidate.x) + 0.5, y: float64(candidate.y), z: float64(candidate.z) + 0.5)
+
+      self.setAttachFace(dir.unsafeGet)
+      entity.setPos(newPos)
+
+      let chunkPos = entity.chunkPos
+      world.broadcastToChunk(chunkPos, CEntityPositionSync(entityId: newVarInt(entity.entityId), position: newPos,
+        delta: Vector3[float64](x: 0.0, y: 0.0, z: 0.0), yaw: entity.yaw, pitch: entity.pitch, onGround: entity.onGround))
+
+      entity.lastSentPos = newPos
+
+      playSoundFine(world, sdEntityShulkerTeleport, scHostile, newPos, 1.0'f32, 1.0'f32)
+
+      # Close the shulker and drop the current target after teleport.
+      self.setRawPeek(0'u8)
+      self.mobEntity.target = nil
+
+      return true
+  false
+
+proc findNewAttachment(self: ShulkerEntity) =
+  ## Try to find a new attachment point, cascading to a random teleport.
+  let pos = self.mobEntity.livingEntity.entity.blockPos
+  let dir = self.findAttachableFace(pos)
+  if dir.isSome:
+    self.setAttachFace(dir.unsafeGet)
+  else:
+    discard self.teleportSomewhere()
+
+proc onShulkerDamage*(self: ShulkerEntity; damageType: DamageType) =
+  let living = self.mobEntity.livingEntity
+  let health = living.health
+  let max0 = living.getMaxHealth()
+
+  # Teleport at half-health (random 1-in-4 chance)
+  if health < max0 * 0.5'f32 and randomRange(0'i32, 4'i32) == 0'i32:
+    discard self.teleportSomewhere()
+
+  # pre_damage for arrow blocking below.
+
+proc targetAlive(mob: Mob): bool =
+  let target = mob.mobEntity.target
+  if target == nil:
+    return false
+  let living = target.getLivingEntity()
+  if living == nil:
+    return false
+  living.entity.isAlive()
+
+proc makeShulkerAttackVt(): GoalVt =
+  result = newGoalVt()
+  result.controls = proc(self: Goal): Controls {.closure.} = ControlsMove or ControlsLook
+  result.canStart = proc(self: Goal; mob: Mob): bool {.closure.} = targetAlive(mob)
+  result.shouldContinue = proc(self: Goal; mob: Mob): bool {.closure.} = targetAlive(mob)
+  result.start = proc(self: Goal; mob: Mob) {.closure.} =
+    let g = ShulkerAttackGoal(self)
+    g.attackCooldown = 20'i32
+    g.shulker.setRawPeek(100'u8)
+  result.stop = proc(self: Goal; mob: Mob) {.closure.} =
+    let g = ShulkerAttackGoal(self)
+    g.shulker.setRawPeek(0'u8)
+  result.shouldRunEveryTick = proc(self: Goal): bool {.closure.} = true
+  result.tick = proc(self: Goal; mob: Mob) {.closure.} =
+    let g = ShulkerAttackGoal(self)
+    let mobEntity = mob.mobEntity
+    let target = mobEntity.target
+    if target == nil:
+      return
+
+    if not target.entity.isAlive():
+      return
+
+    let entity = mobEntity.livingEntity.entity
+    let shulkerPos = entity.pos
+    let targetPos0 = target.entity.pos
+    let distSq = shulkerPos.squaredDistanceToVec(targetPos0)
+
+    # De-target if too far (>20 blocks)
+    if distSq > 400.0:
+      mobEntity.target = nil
+      return
+
+    g.attackCooldown = g.attackCooldown - 1'i32
+    let cooldown = g.attackCooldown
+    if cooldown <= 0'i32:
+      # Reset cooldown
+      g.attackCooldown = 20'i32 + randomRange(0'i32, 5'i32) * 10'i32
+
+      # Spawn bullet
+      gSpawnShulkerBullet(entity, target.entity.entityId, target.entity.pos, g.shulker.getAttachFace().axisOf())
+
+      # Shoot sound (random pitch)
+      let pitch = 1.0'f32 + (randomF32() - randomF32()) * 0.2'f32
+      playSoundFine(entity.world, sdEntityShulkerShoot, scHostile, shulkerPos, 2.0'f32, pitch)
+
+proc makeShulkerPeekVt(): GoalVt =
+  result = newGoalVt()
+  result.canStart = proc(self: Goal; mob: Mob): bool {.closure.} =
+    let g = ShulkerPeekGoal(self)
+    if mob.mobEntity.target != nil:
+      return false
+    if randomRange(0'i32, 40'i32) != 0'i32:
+      return false
+    let pos = mob.mobEntity.livingEntity.entity.blockPos
+    let face = g.shulker.getAttachFace()
+    g.shulker.canStayAt(pos, face)
+  result.shouldContinue = proc(self: Goal; mob: Mob): bool {.closure.} =
+    let g = ShulkerPeekGoal(self)
+    mob.mobEntity.target == nil and g.peekTime > 0'i32
+  result.start = proc(self: Goal; mob: Mob) {.closure.} =
+    let g = ShulkerPeekGoal(self)
+    g.peekTime = 20'i32 * (1'i32 + randomRange(0'i32, 3'i32))
+    g.shulker.setRawPeek(30'u8)
+  result.stop = proc(self: Goal; mob: Mob) {.closure.} =
+    let g = ShulkerPeekGoal(self)
+    if g.shulker.mobEntity.target == nil:
+      g.shulker.setRawPeek(0'u8)
+  result.tick = proc(self: Goal; mob: Mob) {.closure.} =
+    let g = ShulkerPeekGoal(self)
+    g.peekTime = g.peekTime - 1'i32
+
+let shulkerAttackVt* = makeShulkerAttackVt()
+let shulkerPeekVt* = makeShulkerPeekVt()
+
+proc makeShulkerMobVt(): MobVt =
+  result = newMobVt()
+  result.getMobGravity = proc(self: Mob): float64 {.closure.} = 0.0
+  result.mobTick = proc(self: Mob; caller: EntityBase) {.closure.} =
+    let shulker = ShulkerEntity(self)
+    let entity = self.mobEntity.livingEntity.entity
+
+    if not entity.isAlive():
+      return
+
+    entity.velocity = Vector3[float64](x: 0.0, y: 0.0, z: 0.0)
+
+    # Advance peek interpolation
+    discard shulker.updatePeekAmount()
+
+    # Ensure the current attachment face still has a solid block behind it.
+    let pos = entity.blockPos
+    let face = shulker.getAttachFace()
+    if not shulker.canStayAt(pos, face):
+      shulker.findNewAttachment()
+  result.onDamage = proc(self: Mob; damageType: DamageType; source: nil EntityBase) {.closure.} =
+    let shulker = ShulkerEntity(self)
+    shulker.onShulkerDamage(damageType)
+  # When closed, block arrows entirely.
+  result.preDamage = proc(self: Mob; damageType: DamageType; source: nil EntityBase): bool {.closure.} =
+    let shulker = ShulkerEntity(self)
+    not (shulker.isClosed() and damageType.id == damage_type.ARROW.id)
+  # Apply armor modifier (20 armor) reduction when closed.
+  result.modifyIncomingDamage = proc(self: Mob; amount: float32; damageType: DamageType): float32 {.closure.} =
+    let shulker = ShulkerEntity(self)
+    if shulker.isClosed() and not bypassesArmorDurability(damageType):
+      const Armor = 20.0'f32
+      let f1 = clamp(Armor - amount * 0.5'f32, Armor * 0.2'f32, 20.0'f32)
+      max(amount * (1.0'f32 - f1 / 25.0'f32), 0.0'f32)
+    else:
+      amount
+
+proc makeShulkerVt(): EntityVt =
+  result = copyVt(mobEntityVt())
+  result.writeNbt = proc(self: EntityBase; nbt: var NbtCompound) {.closure.} =
+    let shulker = ShulkerEntity(self)
+    Mob(self).mobEntity.livingEntity.writeLivingNbt(nbt)
+    nbt.putByte("AttachFace", cast[int8](shulker.attachFace))
+    nbt.putByte("PeekAmount", cast[int8](shulker.peekAmount))
+    nbt.putByte("Color", cast[int8](shulker.color))
+  result.readNbt = proc(self: EntityBase; nbt: NbtCompound) {.closure.} =
+    let shulker = ShulkerEntity(self)
+    Mob(self).mobEntity.livingEntity.readLivingNbt(nbt)
+    let face = nbt.getByte("AttachFace")
+    if face.isSome:
+      shulker.attachFace = cast[uint8](face.unsafeGet)
+    let peek = nbt.getByte("PeekAmount")
+    if peek.isSome:
+      shulker.peekAmount = cast[uint8](peek.unsafeGet)
+    let color = nbt.getByte("Color")
+    if color.isSome:
+      shulker.color = cast[uint8](color.unsafeGet)
+
+let shulkerMobVt = makeShulkerMobVt()
+let shulkerVt = makeShulkerVt()
+
+proc newShulkerEntity*(entity: Entity): ShulkerEntity =
+  result = ShulkerEntity(attachFace: uint8(ord(DefaultAttachFace)), peekAmount: 0'u8, color: NoColor,
+    currentPeekAmount: 0.0'f32, prevPeekAmount: 0.0'f32)
+  result.initMob(newMobEntity(entity), shulkerMobVt, shulkerVt)
+
+  let goalSelector = result.mobEntity.goalsSelector
+  let targetSelector = result.mobEntity.targetSelector
+
+  goalSelector.addGoal(1'u8, lookAtEntityGoalWithDefault(result, EntityType.PLAYER, 8.0'f32))
+  goalSelector.addGoal(4'u8, ShulkerAttackGoal(vt: shulkerAttackVt, shulker: result, attackCooldown: 20'i32))
+  goalSelector.addGoal(7'u8, ShulkerPeekGoal(vt: shulkerPeekVt, shulker: result, peekTime: 0'i32))
+  goalSelector.addGoal(8'u8, newRandomLookAroundGoal())
+
+  targetSelector.addGoal(1'u8, newRevengeGoal(true))
+  targetSelector.addGoal(2'u8, activeTargetGoalWithDefault(result.mobEntity, EntityType.PLAYER, true))

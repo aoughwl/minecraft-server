@@ -1,38 +1,78 @@
 ## Port of pumpkin/src/entity/player.rs
-## PARTIAL: pumpkin/src/entity/player.rs - the `Player` and `ChunkManager` a client needs to spawn, stand and receive chunks, which are only those already on disk, with no generation. No inventory, screen handlers, health, hunger, mining, chat sessions, NBT read and write, permissions beyond level zero, or any of the rest of its 5300 lines.
+## Port of pumpkin/src/entity/living.rs
+## Port of pumpkin/src/entity/hunger.rs
+## PARTIAL: pumpkin/src/entity/player.rs - the player a client plays as: `ChunkManager`, `Abilities`, chat sessions, health and hunger, mining, screen handlers, gamemode, NBT, `impl InventoryPlayer`. Missing, each needing what is not ported: `attack` and damage (pumpkin/src/entity/living.rs, `damage_with_context`), status effects and attributes (the mining speed reads no haste or fatigue), advancements and the statistics counters (`increment_stat` is a no-op until entity/player/statistics.rs), sleeping and bed respawn points, item cooldowns, maps, breath, titles, particles and sounds, `drop_item` (an item entity is the later entity batch, so a dropped stack is lost and `dropItem` logs it), and portals (`teleport_world` is only the half a respawn needs).
+## PARTIAL: pumpkin/src/entity/living.rs - what a player reads of it: health, absorption, `fall` up to the `handle_fall_damage` it would call (no damage yet), `send_equipment_changes`, NBT.
+## PARTIAL: pumpkin/src/entity/hunger.rs - `tick` and `eat`; a starving player takes no damage, since there is no damage yet.
 ##
-## The types are in ../serverbase.aowl.
+## The types are in ../serverbase.aowl. Everything sent here goes through the client's single outgoing buffer, so
+## upstream's `send_packet_now` and `enqueue_packet` are the same call.
 
-import std/[options, tables, algorithm, math]
+{.feature: "untyped".}
+
+import std/[assertions, options, tables, algorithm, math, syncio]
 import ../../protocol/java/client/play/[player_abilities, player_position, change_difficulty, set_time,
-  entity_metadata, chunk_batch_start, chunk_batch_end, chunk_data, entity_status]
+  entity_metadata, chunk_batch_start, chunk_batch_end, chunk_data, entity_status, set_health, system_chat_message,
+  set_equipment, set_container_content, set_container_slot, set_container_property, set_cursor_slot,
+  set_player_inventory, set_held_item, entity_animation, acknowledge_block, game_event, set_camera, set_experience,
+  close_container, player_action]
+import ../../protocol/java/client/play/player_info_update except Player
+import ../../protocol/itemstackserializer
 import ../../generated/tracked_data
 from ../../generated/meta_data_type import BYTE, HUMANOID_ARM
 import ../../generated/entity_status as entitystatusdata
+import ../../generated/statistic
+import ../../generated/game_rules
+import ../../generated/screen as screendata
+import "../../data/item_stack/mod"
+import ../../data/block_ext
+import ../../inventory/[entity_equipment, ender_chest_inventory, inventory, player_inventory, player_screen_handler,
+  screenhandler, stackbridge, sync_handler]
+import ../../inventory/lib as inventorylib
+import ../../nbt/tag
 import ../../util/difficulty
+import ../../util/math/boundingbox
+import ../../util/math/experience
+import ../../util/math/mathmod
+import ../../util/text/text
 import ../../world/chunkdata
+import ../../world/chunk_system/chunk_system
 import ../serverbase
 import ../net/winsock
 
 const
   NotchianBatchesWithoutAckUntilPause = 10'u8
   AckStallFallbackDelay = 250'i64
+  MaxFood = 20'u8
+  ExhaustionCost = 4.0'f32
+  MaxExhaustion = 40.0'f32
+  PlayerEyeHeight* = 1.62'f64
+  PlayerWidth* = 0.6'f64
+  PlayerHeight* = 1.8'f64
+
+  FlagSneaking = 1'u8
+  FlagSprinting = 3'u8
+  FlagFallFlying = 7'u8
 
 proc chunkPosKey*(x, z: int32): int64 {.inline.} = chunkKey(x, z)
 
+proc keyPos(key: int64): Vector2[int32] {.inline.} =
+  Vector2[int32](x: int32(key shr 32), y: cast[int32](uint32(cast[uint64](key) and 0xFFFFFFFF'u64)))
+
 # --- ChunkManager ----------------------------------------------------------------------------------
 
-proc newChunkManager*(chunksPerTick: int): ChunkManager =
+proc newChunkManager*(chunksPerTick: int; chunkListener: nil GlobalChunkListener): ChunkManager =
+  ## `ChunkManager::new`
   ChunkManager(chunksPerTick: chunksPerTick, center: Vector2[int32](x: 0'i32, y: 0'i32), viewDistance: 0'u8,
-    chunkSent: initTable[int64, bool](), chunkQueue: @[], batchesSentSinceAck: 0'u8,
+    chunkListener: chunkListener, chunkSent: initTable[int64, ChunkData](), chunkQueue: @[], batchesSentSinceAck: 0'u8,
     lastChunkBatchSentAt: nowMs())
 
 proc chebyshev(a, b: Vector2[int32]): int32 =
   max(abs(a.x - b.x), abs(a.y - b.y))
 
-proc byDistance(a, b: (int32, Vector2[int32])): int =
+proc byDistance(a, b: ChunkQueueNode): int =
   ## Upstream's `HeapNode` order for its `BinaryHeap`: nearest first.
-  cmp(a[0], b[0])
+  cmp(a.distance, b.distance)
 
 proc ackWindowOpen(self: ChunkManager): bool =
   self.batchesSentSinceAck < NotchianBatchesWithoutAckUntilPause
@@ -40,10 +80,53 @@ proc ackWindowOpen(self: ChunkManager): bool =
 proc ackFallbackReady(self: ChunkManager): bool =
   not self.ackWindowOpen() and nowMs() - self.lastChunkBatchSentAt >= AckStallFallbackDelay
 
-proc updateCenterAndViewDistance*(self: var ChunkManager; center: Vector2[int32]; viewDistance: uint8;
+proc sentChunksCount*(self: ChunkManager): int = self.chunkSent.len
+
+proc shouldEnqueueChunk(self: var ChunkManager; position: Vector2[int32]; chunk: ChunkData): bool =
+  let key = chunkPosKey(position.x, position.y)
+  let old = self.chunkSent.getOrDefault(key, nil)
+  self.chunkSent[key] = chunk
+  old == nil or old != chunk
+
+proc insertQueued(self: var ChunkManager; node: ChunkQueueNode) =
+  ## `BinaryHeap::push`, on a sorted seq.
+  var at = self.chunkQueue.len
+  self.chunkQueue.add(node)
+  while at > 0 and self.chunkQueue[at - 1].distance > node.distance:
+    let moved = self.chunkQueue[at - 1]
+    self.chunkQueue[at] = moved
+    dec at
+  self.chunkQueue[at] = node
+
+proc pullNewChunks*(self: var ChunkManager) =
+  ## `pull_new_chunks`: drains what the chunk system published.
+  let listener = self.chunkListener
+  if listener == nil:
+    return
+  let arrived = listener.queue
+  listener.queue = @[]
+  for item in arrived:
+    let pos = Vector2[int32](x: item[0].x, y: item[0].y)
+    let dst = chebyshev(pos, self.center)
+    if dst > int32(self.viewDistance):
+      continue
+    if self.shouldEnqueueChunk(pos, item[1]):
+      self.insertQueued(ChunkQueueNode(distance: dst, pos: pos, chunk: item[1]))
+
+proc updateCenterAndViewDistance*(self: var ChunkManager; center: Vector2[int32]; viewDistance: uint8; theLevel: GameLevel;
     loadingChunks, unloadingChunks: seq[Vector2[int32]]) =
-  ## `update_center_and_view_distance`. Chunk tickets have no equivalent: `nextChunk` reads from the level.
+  ## `update_center_and_view_distance`.
   let vd = viewDistance + 1'u8 # Margin for loading
+  let oldCenter = self.center
+  let oldViewDistance = self.viewDistance
+
+  discard ensureChunkSystem(theLevel)
+  let loading = theLevel.chunkLoading
+  addTicket(loading, chunkPos(center.x, center.y), getLevelFromViewDistance(vd))
+  if (oldCenter.x != center.x or oldCenter.y != center.y or oldViewDistance != vd) and oldViewDistance > 0'u8:
+    removeTicket(loading, chunkPos(oldCenter.x, oldCenter.y), getLevelFromViewDistance(oldViewDistance))
+  sendChange(loading)
+
   self.center = center
   self.viewDistance = vd
   let viewDistanceI32 = int32(vd)
@@ -51,73 +134,261 @@ proc updateCenterAndViewDistance*(self: var ChunkManager; center: Vector2[int32]
   for pos in unloadingChunks:
     unloading[chunkPosKey(pos.x, pos.y)] = true
 
-  var sentKeep = initTable[int64, bool]()
-  for key, _ in self.chunkSent:
-    let pos = Vector2[int32](x: int32(key shr 32), y: cast[int32](uint32(cast[uint64](key) and 0xFFFFFFFF'u64)))
-    if chebyshev(pos, center) <= viewDistanceI32 and not unloading.hasKey(key):
-      sentKeep[key] = true
+  var sentKeep = initTable[int64, ChunkData]()
+  for key, chunk in self.chunkSent:
+    if chebyshev(keyPos(key), center) <= viewDistanceI32 and not unloading.hasKey(key):
+      sentKeep[key] = chunk
   self.chunkSent = sentKeep
 
-  var tasks: seq[(int32, Vector2[int32])] = @[]
+  var tasks: seq[ChunkQueueNode] = @[]
   for node in self.chunkQueue:
-    let dst = chebyshev(node[1], center)
-    if dst <= viewDistanceI32 and not unloading.hasKey(chunkPosKey(node[1].x, node[1].y)):
-      tasks.add((dst, node[1]))
+    let dst = chebyshev(node.pos, center)
+    if dst <= viewDistanceI32 and not unloading.hasKey(chunkPosKey(node.pos.x, node.pos.y)):
+      tasks.add(ChunkQueueNode(distance: dst, pos: node.pos, chunk: node.chunk))
   for pos in loadingChunks:
-    let key = chunkPosKey(pos.x, pos.y)
-    if not self.chunkSent.hasKey(key):
-      self.chunkSent[key] = true
-      tasks.add((chebyshev(pos, center), pos))
+    if not self.chunkSent.hasKey(chunkPosKey(pos.x, pos.y)):
+      let chunk = readChunkSync(theLevel, pos.x, pos.y)
+      if chunk != nil and self.shouldEnqueueChunk(pos, chunk):
+        tasks.add(ChunkQueueNode(distance: chebyshev(pos, center), pos: pos, chunk: chunk))
   sort(tasks, byDistance)
   self.chunkQueue = tasks
+
+proc cleanUp*(self: var ChunkManager; theLevel: GameLevel) =
+  ## `clean_up`
+  if self.viewDistance > 0'u8:
+    removeTicket(theLevel.chunkLoading, chunkPos(self.center.x, self.center.y), getLevelFromViewDistance(self.viewDistance))
+    sendChange(theLevel.chunkLoading)
+  if self.chunkListener != nil:
+    removeGlobalChunkListener(theLevel.chunkListener, self.chunkListener)
+  self.chunkListener = nil
+  self.chunkSent = initTable[int64, ChunkData]()
+  self.chunkQueue = @[]
+  self.batchesSentSinceAck = 0'u8
+  self.lastChunkBatchSentAt = nowMs()
+  self.viewDistance = 0'u8
+
+proc changeWorld*(self: var ChunkManager; oldLevel, newLevel: GameLevel) =
+  ## `change_world`
+  if self.viewDistance > 0'u8:
+    removeTicket(oldLevel.chunkLoading, chunkPos(self.center.x, self.center.y),
+      getLevelFromViewDistance(self.viewDistance))
+    sendChange(oldLevel.chunkLoading)
+  if self.chunkListener != nil:
+    removeGlobalChunkListener(oldLevel.chunkListener, self.chunkListener)
+  discard ensureChunkSystem(newLevel)
+  self.chunkListener = addGlobalChunkListener(newLevel.chunkListener)
+  self.chunkSent = initTable[int64, ChunkData]()
+  self.chunkQueue = @[]
+  self.batchesSentSinceAck = 0'u8
+  self.lastChunkBatchSentAt = nowMs()
+  self.viewDistance = 0'u8
 
 proc handleAcknowledge*(self: var ChunkManager; chunksPerTick: float32) =
   self.batchesSentSinceAck = 0'u8
   self.chunksPerTick = int(ceil(chunksPerTick))
 
+proc pushChunk*(self: var ChunkManager; position: Vector2[int32]; chunk: ChunkData) =
+  ## `push_chunk`
+  if self.shouldEnqueueChunk(position, chunk):
+    self.insertQueued(ChunkQueueNode(distance: chebyshev(position, self.center), pos: position, chunk: chunk))
+
 proc canSendChunk*(self: ChunkManager): bool =
   (self.ackWindowOpen() or self.ackFallbackReady()) and self.chunkQueue.len > 0
 
-proc nextChunk*(self: var ChunkManager): seq[Vector2[int32]] =
-  ## `next_chunk`: the nearest positions, as many as the client asked for per tick.
+proc nextChunk*(self: var ChunkManager): seq[ChunkData] =
+  ## `next_chunk`: the nearest chunks, as many as the client asked for per tick.
   let take = min(self.chunkQueue.len, max(self.chunksPerTick, 1))
   result = @[]
   for i in 0 ..< take:
-    result.add(self.chunkQueue[i][1])
+    result.add(self.chunkQueue[i].chunk)
   self.chunkQueue = self.chunkQueue[take ..< self.chunkQueue.len]
-  self.batchesSentSinceAck += 1'u8
+  if self.batchesSentSinceAck < 255'u8:
+    self.batchesSentSinceAck += 1'u8
   self.lastChunkBatchSentAt = nowMs()
+
+proc sendChunks*(client: JavaClient; chunks: openArray[ChunkData]) =
+  ## `send_chunks`
+  client.writePacketFor(CChunkBatchStart())
+  for chunk in chunks:
+    client.writePacketFor(CChunkData(data: chunk))
+  client.writePacketFor(newCChunkBatchEnd(uint16(chunks.len)))
+
+# --- Abilities ---------------------------------------------------------------------------------------
+
+proc defaultAbilities*(): Abilities =
+  Abilities(invulnerable: false, flying: false, allowFlying: false, creative: false, allowModifyWorld: true,
+    flySpeed: 0.05'f32, walkSpeed: 0.1'f32)
+
+proc setForGamemode*(self: var Abilities; gamemode: GameMode) =
+  ## `set_for_gamemode`
+  case gamemode
+  of Creative:
+    self.allowFlying = true
+    self.creative = true
+    self.invulnerable = true
+  of Spectator:
+    self.flying = true
+    self.allowFlying = true
+    self.creative = false
+    self.invulnerable = true
+  else:
+    self.flying = false
+    self.allowFlying = false
+    self.creative = false
+    self.invulnerable = false
+
+proc abilitiesFor*(gamemode: GameMode): Abilities =
+  result = defaultAbilities()
+  result.setForGamemode(gamemode)
+
+# --- `impl InventoryPlayer for Player` -----------------------------------------------------------------
+
+proc ownerOf(self: InventoryPlayer): Player =
+  let owner = cast[ServerInventoryPlayer](self).owner
+  assert owner != nil
+  owner
+
+proc sendEquipmentChanges*(self: Player; equipment: openArray[(EquipmentSlot, ItemStack)]) =
+  ## `LivingEntity::send_equipment_changes`
+  if equipment.len == 0:
+    return
+  var wire: seq[(int8, ItemStackSerializer)] = @[]
+  for item in equipment:
+    wire.add((int8(ord(item[0])), toSerializer(item[1])))
+  self.world.broadcastPacketExcept(self.gameprofile.id, CSetEquipment(entityId: newVarInt(self.entityId), equipment: wire))
+
+proc ipDropItem(self: InventoryPlayer; item: ItemStack; retainOwnership: bool) =
+  ## `drop_item`: an item entity, which is the later entity batch. See the PARTIAL line.
+  let player = ownerOf(self)
+  echo "Dropped ", item.itemCount, " of ", item.item.registryKey, " from ", player.gameprofile.name,
+    ": no item entities yet, the stack is gone"
+
+proc ipGetInventory(self: InventoryPlayer): PlayerInventory = ownerOf(self).inventory
+
+proc ipHasInfiniteMaterials(self: InventoryPlayer): bool = ownerOf(self).gamemode == Creative
+
+proc ipIsCreative(self: InventoryPlayer): bool = ownerOf(self).gamemode == Creative
+
+proc ipExperienceLevel(self: InventoryPlayer): int32 = ownerOf(self).experienceLevel
+
+proc sendExperience(self: Player) =
+  self.client.writePacketFor(CSetExperience(progress: self.experienceProgress, level: newVarInt(self.experienceLevel),
+    totalExperience: newVarInt(pointsToLevel(self.experienceLevel) + self.experiencePoints)))
+
+proc ipAddExperienceLevels(self: InventoryPlayer; levels: int32) =
+  ## `add_experience_levels`
+  let player = ownerOf(self)
+  player.experienceLevel = max(player.experienceLevel + levels, 0'i32)
+  player.sendExperience()
+
+proc ipEnchantmentSeed(self: InventoryPlayer): int32 = ownerOf(self).enchantmentSeed
+
+proc ipSetEnchantmentSeed(self: InventoryPlayer; seed: int32) = ownerOf(self).enchantmentSeed = seed
+
+proc ipEnqueueInventoryPacket(self: InventoryPlayer; packet: CSetContainerContent) =
+  ownerOf(self).client.writePacketFor(packet)
+
+proc ipEnqueueSlotPacket(self: InventoryPlayer; packet: CSetContainerSlot) =
+  ownerOf(self).client.writePacketFor(packet)
+
+proc ipEnqueueCursorPacket(self: InventoryPlayer; packet: CSetCursorItem) =
+  ownerOf(self).client.writePacketFor(packet)
+
+proc ipEnqueuePropertyPacket(self: InventoryPlayer; packet: CSetContainerProperty) =
+  ownerOf(self).client.writePacketFor(packet)
+
+proc ipEnqueueSlotSetPacket(self: InventoryPlayer; packet: CSetPlayerInventory) =
+  ownerOf(self).client.writePacketFor(packet)
+
+proc ipEnqueueSetHeldItemPacket(self: InventoryPlayer; packet: CSetSelectedSlot) =
+  ownerOf(self).client.writePacketFor(packet)
+
+proc ipEnqueueEquipmentChange(self: InventoryPlayer; slot: EquipmentSlot; stack: ItemStack) =
+  ## `enqueue_equipment_change`, to those in view of the chunk. The equip sound needs sounds; see the PARTIAL line.
+  let player = ownerOf(self)
+  player.world.broadcastPacketExcept(player.gameprofile.id, CSetEquipment(entityId: newVarInt(player.entityId),
+    equipment: @[(int8(ord(slot)), toSerializer(stack))]))
+
+proc ipAwardExperience(self: InventoryPlayer; amount: int32) =
+  ## `award_experience`, adding to the points without the level-up arithmetic's sound.
+  let player = ownerOf(self)
+  if amount > 0'i32:
+    let total = pointsToLevel(player.experienceLevel) + player.experiencePoints + amount
+    let (level, points) = totalToLevelAndPoints(total)
+    player.experienceLevel = level
+    player.experiencePoints = points
+    player.experienceProgress = progressInLevel(points, level)
+    player.sendExperience()
+
+proc ipIncrementStat(self: InventoryPlayer; category: StatisticCategory; statId: int32; amount: int32) =
+  ## `increment_stat`: see the PARTIAL line.
+  discard
+
+proc newServerInventoryPlayer(): ServerInventoryPlayer =
+  result = ServerInventoryPlayer(owner: nil)
+  result.dropItemImpl = ipDropItem
+  result.getInventoryImpl = ipGetInventory
+  result.hasInfiniteMaterialsImpl = ipHasInfiniteMaterials
+  result.isCreativeImpl = ipIsCreative
+  result.experienceLevelImpl = ipExperienceLevel
+  result.addExperienceLevelsImpl = ipAddExperienceLevels
+  result.enchantmentSeedImpl = ipEnchantmentSeed
+  result.setEnchantmentSeedImpl = ipSetEnchantmentSeed
+  result.enqueueInventoryPacketImpl = ipEnqueueInventoryPacket
+  result.enqueueSlotPacketImpl = ipEnqueueSlotPacket
+  result.enqueueCursorPacketImpl = ipEnqueueCursorPacket
+  result.enqueuePropertyPacketImpl = ipEnqueuePropertyPacket
+  result.enqueueSlotSetPacketImpl = ipEnqueueSlotSetPacket
+  result.enqueueSetHeldItemPacketImpl = ipEnqueueSetHeldItemPacket
+  result.enqueueEquipmentChangeImpl = ipEnqueueEquipmentChange
+  result.awardExperienceImpl = ipAwardExperience
+  result.incrementStatImpl = ipIncrementStat
+
+template asInventoryPlayer*(self: Player): untyped =
+  ## A template, and no local of the base type, on purpose: see the report's compiler section.
+  InventoryPlayer(self.inventoryPlayer)
 
 # --- Player ----------------------------------------------------------------------------------------
 
-proc abilitiesFor*(gamemode: GameMode): Abilities =
-  ## `Abilities::default` with `set_gamemode`'s flags.
-  result = Abilities(invulnerable: false, flying: false, allowFlying: false, creative: false,
-    flySpeed: 0.05'f32, walkSpeed: 0.1'f32)
-  case gamemode
-  of Creative:
-    result.invulnerable = true
-    result.allowFlying = true
-    result.creative = true
-  of Spectator:
-    result.invulnerable = true
-    result.allowFlying = true
-    result.flying = true
-  else:
-    discard
+proc defaultHungerManager(): HungerManager =
+  HungerManager(level: MaxFood, saturation: 5.0'f32, exhaustion: 0.0'f32, tickTimer: 0'u32)
 
-proc newPlayer*(client: JavaClient; gameprofile: GameProfile; config: PlayerConfig; world: World;
+proc newChatSession*(sessionId: Uuid; expiresAt: int64; publicKey, keySignature: seq[byte]): ChatSession =
+  ## `ChatSession::new`
+  ChatSession(sessionId: sessionId, expiresAt: expiresAt, publicKey: publicKey, signature: keySignature,
+    messagesSent: 0'i32, messagesReceived: 0'i32)
+
+proc newPlayer*(client: JavaClient; gameprofile: GameProfile; config: PlayerConfig; world: World; server: Server;
     gamemode: GameMode; entityId: int32): Player =
   ## `Player::new`, default to sending 16 chunks per tick as upstream does.
-  Player(client: client, gameprofile: gameprofile, config: config, world: world, entityId: entityId,
-    gamemode: gamemode, previousGamemode: none[GameMode](),
-    pos: Vector3[float64](x: 0.0, y: 0.0, z: 0.0), lastPos: Vector3[float64](x: 0.0, y: 0.0, z: 0.0),
-    velocity: Vector3[float64](x: 0.0, y: 0.0, z: 0.0), yaw: 0.0'f32, pitch: 0.0'f32, onGround: false,
-    chunkPos: Vector2[int32](x: 0'i32, y: 0'i32), abilities: abilitiesFor(gamemode), hasPlayedBefore: false,
+  discard ensureChunkSystem(world.level)
+  let equipment = newEntityEquipment()
+  let inventory = newPlayerInventory(equipment, buildEquipmentSlots())
+  let handler = newPlayerScreenHandler(inventory, none[screendata.WindowType](), 0'u8, RecipeProvider(server.recipeManager))
+  let permissionLvl = server.data.operatorConfig.getEntry(gameprofile.id)
+  result = Player(client: client, gameprofile: gameprofile, config: config, world: world, server: server,
+    entityId: entityId, gamemode: gamemode, previousGamemode: none[GameMode](),
+    pos: Vector3[float64](x: 0.0, y: 100.0, z: 0.0), lastPos: Vector3[float64](x: 0.0, y: 100.0, z: 0.0),
+    velocity: Vector3[float64](x: 0.0, y: 0.0, z: 0.0), yaw: 0.0'f32, pitch: 0.0'f32, headYaw: 0.0'f32, onGround: false,
+    sneaking: false, sprinting: false, fallFlying: false, entityFlags: 0'i8, fallDistance: 0.0'f32,
+    chunkPos: Vector2[int32](x: 0'i32, y: 6'i32), abilities: abilitiesFor(gamemode), hasPlayedBefore: false,
     teleportIdCount: 0'i32, awaitingTeleport: none[(int32, Vector3[float64])](),
-    watchedSection: newCylindrical(Vector2[int32](x: 0'i32, y: 0'i32), 1'u8), chunkManager: newChunkManager(16),
-    selectedSlot: 0'i8, ping: 0'u32, clientLoaded: false, tabListListed: true, tabListLatency: 0'i32,
-    tabListOrder: 0'i32)
+    watchedSection: newCylindrical(Vector2[int32](x: 0'i32, y: 0'i32), 1'u8),
+    chunkManager: newChunkManager(16, addGlobalChunkListener(world.level.chunkListener)),
+    ping: 0'u32, clientLoaded: false, clientLoadedTimeout: 60'u32, tabListListed: true, tabListLatency: 0'i32,
+    tabListOrder: 0'i32, inventoryPlayer: newServerInventoryPlayer(), equipment: equipment, inventory: inventory,
+    enderChestInventory: newEnderChestInventory(), playerScreenHandler: handler, currentScreenHandler: ScreenHandler(handler),
+    screenHandlerSyncId: 0'u8, screenHandlerSyncHandler: newSyncHandler(), openContainerPos: none[BlockPos](),
+    health: 20.0'f32, maxHealth: 20.0'f32, absorption: 0.0'f32, dead: false, hungerManager: defaultHungerManager(),
+    lastSentHealth: -1'i32, lastSentFood: 0'u8, lastFoodSaturation: true, experienceLevel: 0'i32,
+    experienceProgress: 0.0'f32, experiencePoints: 0'i32, enchantmentSeed: int32(entityId * 7919'i32),
+    mining: false, miningPos: BlockPosZero, startMiningTime: 0'i32, currentBlockDestroyStage: -1'i32, tickCounter: 0'i32,
+    lastInput: 0'i8, cameraTargetId: none[int32](), lastActionTime: nowMs(),
+    permissionLvl: if permissionLvl.isSome: permissionLvl.unsafeGet.level else: server.advancedConfig.commands.defaultOpLevel,
+    subscribedDebugSample: false, chatSession: newChatSession(NilUuid, 0'i64, @[], @[]),
+    signatureCache: MessageCache(fullCache: @[], lastSeen: @[]), respawnPoint: none[RespawnPoint](),
+    lastAttackedTicks: 0'u32, pendingSpawn: PendingSpawn(active: false), removed: false)
+  result.inventoryPlayer.owner = result
 
 proc setPos*(self: Player; newPosition: Vector3[float64]) =
   ## `Entity::set_pos`: also keeps the chunk position.
@@ -127,6 +398,36 @@ proc setPos*(self: Player; newPosition: Vector3[float64]) =
 proc setRotation*(self: Player; yaw, pitch: float32) =
   self.yaw = yaw
   self.pitch = pitch
+  self.headYaw = yaw
+
+proc eyePosition*(self: Player): Vector3[float64] =
+  Vector3[float64](x: self.pos.x, y: self.pos.y + PlayerEyeHeight, z: self.pos.z)
+
+proc hasClientLoaded*(self: Player): bool =
+  self.clientLoaded or self.clientLoadedTimeout == 0'u32
+
+proc setClientLoaded*(self: Player; loaded: bool) =
+  if not loaded:
+    self.clientLoadedTimeout = 60'u32
+  self.clientLoaded = loaded
+
+proc updateLastActionTime*(self: Player) =
+  self.lastActionTime = nowMs()
+
+proc isCreative*(self: Player): bool {.inline.} = self.gamemode == Creative
+
+proc boundingBox*(self: Player): BoundingBox =
+  ## `Entity::bounding_box`, standing.
+  BoundingBox(min: Vector3[float64](x: self.pos.x - PlayerWidth / 2.0, y: self.pos.y, z: self.pos.z - PlayerWidth / 2.0),
+    max: Vector3[float64](x: self.pos.x + PlayerWidth / 2.0, y: self.pos.y + PlayerHeight, z: self.pos.z + PlayerWidth / 2.0))
+
+proc blockInteractionRange*(self: Player): float64 =
+  if self.gamemode == Creative: 5.0 else: 4.5
+
+proc canInteractWithBlockAt*(self: Player; position: BlockPos; additionalRange: float64): bool =
+  ## `can_interact_with_block_at`
+  let d = self.blockInteractionRange() + additionalRange
+  BoundingBox.fromBlock(position).squaredMagnitude(self.eyePosition()) < d * d
 
 proc sendAbilitiesUpdate*(self: Player) =
   var b = 0'i8
@@ -138,8 +439,14 @@ proc sendAbilitiesUpdate*(self: Player) =
     fieldOfView: self.abilities.walkSpeed))
 
 proc sendPermissionLvlUpdate*(self: Player) =
-  ## Permission level zero until entity/player.rs's permission code is ported.
-  self.client.writePacketFor(CEntityStatus(entityId: self.entityId, entityStatus: int8(ord(esPermissionLevelAll))))
+  ## `send_permission_lvl_update`, through `World::send_entity_status`.
+  let status = case self.permissionLvl
+    of Zero: esPermissionLevelAll
+    of One: esPermissionLevelModerators
+    of Two: esPermissionLevelGamemasters
+    of Three: esPermissionLevelAdmins
+    of Four: esPermissionLevelOwners
+  self.world.broadcastPacketAll(CEntityStatus(entityId: self.entityId, entityStatus: int8(ord(status))))
 
 proc sendDifficultyUpdate*(self: Player) =
   let info = self.world.levelInfo
@@ -147,6 +454,12 @@ proc sendDifficultyUpdate*(self: Player) =
 
 proc sendTime*(self: Player; world: World) =
   self.client.writePacketFor(newCUpdateTime(world.levelTime.worldAge, world.levelTime.timeOfDay, true))
+
+proc sendSystemMessageRaw*(self: Player; message: TextComponent; overlay: bool) =
+  self.client.writePacketFor(CSystemChatMessage(content: message, overlay: overlay))
+
+proc sendSystemMessage*(self: Player; message: TextComponent) =
+  self.sendSystemMessageRaw(message, false)
 
 proc requestTeleport*(self: Player; position: Vector3[float64]; yaw, pitch: float32) =
   let i = self.teleportIdCount
@@ -157,6 +470,15 @@ proc requestTeleport*(self: Player; position: Vector3[float64]; yaw, pitch: floa
   self.awaitingTeleport = some((teleportId, position))
   self.client.writePacketFor(CPlayerPosition(teleportId: newVarInt(teleportId), position: position,
     delta: Vector3[float64](x: 0.0, y: 0.0, z: 0.0), yaw: yaw, pitch: pitch, relatives: @[]))
+
+proc forceTp*(self: Player; position: Vector3[float64]) =
+  ## `JavaClient::force_tp` in net/java/play.rs. Sends the player's own position, as upstream does; `position` is only
+  ## what the confirmation will set.
+  let teleportId = self.teleportIdCount + 1'i32
+  self.teleportIdCount = teleportId
+  self.awaitingTeleport = some((teleportId, position))
+  self.client.writePacketFor(CPlayerPosition(teleportId: newVarInt(teleportId), position: self.pos,
+    delta: Vector3[float64](x: 0.0, y: 0.0, z: 0.0), yaw: self.yaw, pitch: self.pitch, relatives: @[]))
 
 proc sendClientInformation*(self: Player) =
   ## `send_client_information`, through `Entity::send_meta_data`, to the player itself and whoever watches it.
@@ -169,19 +491,558 @@ proc sendClientInformation*(self: Player) =
   discard newMetadata(TrackedData_PLAYER_MODE_CUSTOMIZATION_ID, BYTE, skin).write(buf, v)
   discard newMetadata(TrackedData_MAIN_ARM_ID, BYTE, hand).write(buf, v)
   writeU8(buf, 255'u8)
-  self.client.writePacketFor(CSetEntityMetadata(entityId: newVarInt(self.entityId), metadata: buf.buf))
+  self.world.broadcastPacketAll(CSetEntityMetadata(entityId: newVarInt(self.entityId), metadata: buf.buf))
+
+proc setFlag(self: Player; flag: uint8; value: bool) =
+  ## `Entity::set_flag`
+  let mask = cast[int8](1'u8 shl flag)
+  if value:
+    self.entityFlags = self.entityFlags or mask
+  else:
+    self.entityFlags = self.entityFlags and (not mask)
+  var buf = newNetWriter()
+  discard newMetadata(TrackedData_SHARED_FLAGS_ID, BYTE, self.entityFlags).write(buf, self.client.version)
+  writeU8(buf, 255'u8)
+  self.world.broadcastPacketAll(CSetEntityMetadata(entityId: newVarInt(self.entityId), metadata: buf.buf))
+
+proc setSneaking*(self: Player; sneaking: bool) =
+  self.sneaking = sneaking
+  self.setFlag(FlagSneaking, sneaking)
+
+proc setSprinting*(self: Player; sprinting: bool) =
+  self.sprinting = sprinting
+  self.setFlag(FlagSprinting, sprinting)
+
+proc setFallFlying*(self: Player; fallFlying: bool) =
+  self.fallFlying = fallFlying
+  self.setFlag(FlagFallFlying, fallFlying)
+
+proc swingHand*(self: Player; hand: Hand; all: bool) =
+  ## `swing_hand`. As upstream `Hand::Right` is the main arm here, and a packet's hand 0 reads as `Hand::Left`.
+  let animation = if hand == hRight: anSwingMainArm else: anSwingOffhand
+  let packet = newCEntityAnimation(newVarInt(self.entityId), animation)
+  if all:
+    self.world.broadcastPacketAll(packet)
+  else:
+    self.world.broadcastPacketExcept(self.gameprofile.id, packet)
+
+proc syncHandSlot*(self: Player; slotIndex: int; stack: ItemStack) =
+  ## `sync_hand_slot`
+  self.client.writePacketFor(CSetPlayerInventory(slot: newVarInt(int32(slotIndex)), item: toSerializer(stack)))
+  if slotIndex == int(self.inventory.getSelectedSlot()):
+    self.sendEquipmentChanges([(esMainHand, stack)])
+  elif slotIndex == OffHandSlot:
+    self.sendEquipmentChanges([(esOffHand, stack)])
+
+# --- Health and hunger --------------------------------------------------------------------------------
+
+proc canFoodHeal*(self: Player): bool =
+  ## `can_food_heal`
+  self.health > 0.0'f32 and self.health < self.maxHealth
+
+proc addExhaustion*(self: Player; exhaustion: float32) =
+  ## `add_exhaustion`
+  if self.abilities.invulnerable:
+    return
+  self.hungerManager.exhaustion = min(self.hungerManager.exhaustion + exhaustion, MaxExhaustion)
+
+proc sendHealth*(self: Player) =
+  ## `send_health`
+  if not self.hasClientLoaded():
+    return
+  self.client.writePacketFor(CSetHealth(health: self.health, food: newVarInt(int32(self.hungerManager.level)),
+    foodSaturation: self.hungerManager.saturation))
+
+proc heal*(self: Player; additionalHealth: float32) =
+  ## `heal`
+  self.health = max(min(self.health + additionalHealth, self.maxHealth), 0.0'f32)
+  self.sendHealth()
+
+proc tickHealth*(self: Player) =
+  ## `tick_health`
+  if not self.hasClientLoaded():
+    return
+  let health = int32(self.health)
+  let food = self.hungerManager.level
+  let saturation = self.hungerManager.saturation
+  if health != self.lastSentHealth or food != self.lastSentFood or (saturation == 0.0'f32) != self.lastFoodSaturation:
+    self.lastSentHealth = health
+    self.lastSentFood = food
+    self.lastFoodSaturation = saturation == 0.0'f32
+    self.sendHealth()
+
+proc tickHunger(self: Player) =
+  ## `HungerManager::tick`
+  var level = self.hungerManager.level
+  var saturation = self.hungerManager.saturation
+  var exhaustion = self.hungerManager.exhaustion
+  var timer = self.hungerManager.tickTimer
+  let info = self.world.levelInfo
+  let difficulty = info.difficulty
+  let naturalRegen = info.gameRules.naturalHealthRegeneration
+  let canHeal = self.canFoodHeal()
+  var needsSync = false
+  var healAmount = 0.0'f32
+
+  if exhaustion > ExhaustionCost:
+    exhaustion -= ExhaustionCost
+    if saturation > 0.0'f32:
+      saturation = max(saturation - 1.0'f32, 0.0'f32)
+    elif difficulty != Peaceful:
+      if level > 0'u8:
+        level -= 1'u8
+    needsSync = true
+
+  if naturalRegen and saturation > 0.0'f32 and canHeal and level >= 20'u8:
+    timer += 1'u32
+    if timer >= 10'u32:
+      let cost = min(saturation, 6.0'f32)
+      saturation -= cost
+      exhaustion += cost
+      healAmount = cost / 6.0'f32
+      timer = 0'u32
+      needsSync = true
+  elif naturalRegen and level >= 18'u8 and canHeal:
+    timer += 1'u32
+    if timer >= 80'u32:
+      healAmount = 1.0'f32
+      exhaustion += 6.0'f32
+      timer = 0'u32
+      needsSync = true
+  elif level == 0'u8:
+    timer += 1'u32
+    if timer >= 80'u32:
+      # Starving damage: see the PARTIAL line.
+      timer = 0'u32
+  else:
+    timer = 0'u32
+
+  self.hungerManager.level = level
+  self.hungerManager.saturation = saturation
+  self.hungerManager.exhaustion = exhaustion
+  self.hungerManager.tickTimer = timer
+  if needsSync:
+    self.sendHealth()
+  if healAmount > 0.0'f32:
+    self.heal(healAmount)
+
+proc jump*(self: Player) =
+  ## `jump`
+  if self.sprinting:
+    self.addExhaustion(0.2'f32)
+  else:
+    self.addExhaustion(0.05'f32)
+
+proc progressMotion*(self: Player; deltaPos: Vector3[float64]) =
+  ## `progress_motion`
+  if self.onGround:
+    let delta = float32(round(deltaPos.horizontalLength() * 100.0))
+    if delta > 0.0'f32:
+      if self.sprinting:
+        self.addExhaustion(0.1'f32 * delta * 0.01'f32)
+      else:
+        self.addExhaustion(0.0'f32 * delta * 0.01'f32)
+
+proc fall*(self: Player; heightDifference: float64; ground, dontDamage: bool) =
+  ## `LivingEntity::fall`, up to `handle_fall_damage`.
+  if ground:
+    self.fallDistance = 0.0'f32
+  elif heightDifference < 0.0:
+    self.fallDistance = self.fallDistance - float32(heightDifference)
+
+# --- Mining ------------------------------------------------------------------------------------------
+
+proc canHarvest*(self: Player; state: BlockState; blockRef: Block): bool =
+  ## `can_harvest`
+  not state.toolRequired() or self.inventory.heldItem().isCorrectForDrops(blockRef)
+
+proc getMiningSpeed*(self: Player; blockRef: Block): float32 =
+  ## `get_mining_speed`, without the status effects; see the PARTIAL line.
+  result = self.inventory.heldItem().getSpeed(blockRef)
+  if not self.onGround:
+    result = result / 5.0'f32
+
+proc calcBlockBreaking*(self: Player; state: BlockState; blockRef: Block): float32 =
+  ## `block::calc_block_breaking`
+  let hardness = state.hardness
+  if hardness == -1.0'f32:
+    return 0.0'f32
+  let i = if self.canHarvest(state, blockRef): 30.0'f32 else: 100.0'f32
+  self.getMiningSpeed(blockRef) / hardness / i
+
+proc applyToolDamageForBlockBreak*(self: Player; state: BlockState) =
+  ## `apply_tool_damage_for_block_break`, through `damage_item_in_slot` for the main hand.
+  if self.gamemode == Creative or self.gamemode == Spectator:
+    return
+  if state.hardness <= 0.0'f32:
+    return
+  var stack = self.inventory.heldItem()
+  let (hasTool, tool) = stack.getDataComponent(ToolImpl)
+  if not hasTool or tool.damagePerBlock <= 0'u32:
+    return
+  let outcome = stack.damageItem(int32(tool.damagePerBlock))
+  if outcome == drUntouched:
+    return
+  self.inventory.setHeldItem(stack)
+  if outcome == drBroken:
+    self.world.broadcastPacketAll(CEntityStatus(entityId: self.entityId, entityStatus: int8(ord(esMainhandBreak))))
+  self.syncHandSlot(int(self.inventory.getSelectedSlot()), stack)
+
+# --- Screen handlers ------------------------------------------------------------------------------------
+
+proc onScreenHandlerOpened*(self: Player; handler: ScreenHandler) =
+  ## `on_screen_handler_opened`. Upstream's listener has only the trait's empty defaults, so it is left out.
+  handler.updateSyncHandler(self.screenHandlerSyncHandler)
+
+proc incrementScreenHandlerSyncId*(self: Player) =
+  self.screenHandlerSyncId = uint8(int(self.screenHandlerSyncId) mod 100 + 1)
+
+proc onHandledScreenClosed*(self: Player) =
+  ## `on_handled_screen_closed`
+  let current = self.currentScreenHandler
+  current.onClosed(self.asInventoryPlayer())
+  let playerHandler = ScreenHandler(self.playerScreenHandler)
+  if playerHandler != current:
+    playerHandler.copySharedSlots(current)
+  self.currentScreenHandler = playerHandler
+  self.openContainerPos = none[BlockPos]()
+
+proc closeHandledScreen*(self: Player) =
+  ## `close_handled_screen`
+  self.client.writePacketFor(CCloseContainer(syncId: newVarInt(int32(self.currentScreenHandler.syncId()))))
+  self.onHandledScreenClosed()
+
+proc dropHeldItem*(self: Player; dropStack: bool) =
+  ## `drop_held_item`
+  var itemStack = self.inventory.heldItem()
+  if itemStack.isEmpty():
+    return
+  let dropAmount = if dropStack: itemStack.itemCount else: 1'u8
+  let dropped = itemStack.copyWithCount(dropAmount)
+  itemStack.decrement(dropAmount)
+  self.inventory.setHeldItem(itemStack)
+  self.asInventoryPlayer().dropItem(dropped, false)
+  let slotIndex = self.currentScreenHandler.getSlotIndex(Inventory(self.inventory), int(self.inventory.getSelectedSlot()))
+  if slotIndex.isSome:
+    self.currentScreenHandler.setReceivedStack(slotIndex.unsafeGet, itemStack)
+    self.currentScreenHandler.sendContentUpdates()
+
+proc swapItem*(self: Player) =
+  ## `swap_item`
+  let (mainHandItem, offHandItem) = self.inventory.swapItem()
+  self.sendEquipmentChanges([(esMainHand, mainHandItem), (esOffHand, offHandItem)])
+
+proc setGamemode*(self: Player; gamemode: GameMode): bool =
+  ## `set_gamemode`
+  if self.gamemode == gamemode:
+    return false
+  self.gamemode = gamemode
+  self.abilities.setForGamemode(gamemode)
+  self.sendAbilitiesUpdate()
+  if gamemode == Spectator:
+    if self.fallFlying:
+      self.setFallFlying(false)
+    if self.sneaking:
+      self.setSneaking(false)
+  if gamemode != Spectator and self.cameraTargetId.isSome:
+    self.cameraTargetId = none[int32]()
+    self.client.writePacketFor(CSetCamera(cameraId: newVarInt(self.entityId)))
+  self.world.broadcastPacketAll(CPlayerInfoUpdate(actions: PlayerInfoUpdateGameMode, players: @[PlayerInfoEntry(
+    uuid: self.gameprofile.id, actions: @[PlayerAction(kind: paUpdateGameMode, gameMode: newVarInt(int32(ord(gamemode))))])]))
+  self.client.writePacketFor(newCGameEvent(geChangeGameMode, float32(ord(gamemode))))
+  true
+
+# --- Secure chat ---------------------------------------------------------------------------------------
+
+proc cacheSignatures*(self: var MessageCache; signatures: seq[seq[byte]]) =
+  ## `cache_signatures`: not for caching seen messages, only for non-indexed signatures from senders.
+  var i = signatures.len - 1
+  while i >= 0:
+    var known = false
+    for s in self.fullCache:
+      if s == signatures[i]:
+        known = true
+        break
+    if not known and self.fullCache.len < MaxCachedSignatures:
+      self.fullCache.add(signatures[i])
+    dec i
+
+proc addSeenSignature*(self: var MessageCache; signature: seq[byte]) =
+  ## `add_seen_signature`
+  if self.lastSeen.len >= MaxPreviousMessages:
+    self.lastSeen.delete(0)
+  self.lastSeen.add(signature)
+  while self.fullCache.len >= MaxCachedSignatures:
+    self.fullCache.setLen(self.fullCache.len - 1)
+  # `push_front`.
+  self.fullCache.add(signature)
+  var i = self.fullCache.len - 1
+  while i > 0:
+    let moved = self.fullCache[i - 1]
+    self.fullCache[i] = moved
+    dec i
+  self.fullCache[0] = signature
+
+# --- NBT -----------------------------------------------------------------------------------------------
+
+proc writeEquipmentItem(self: PlayerInventory; target: var NbtCompound; slot: EquipmentSlot; key: string) =
+  let stack = self.entityEquipment.get(slot)
+  if not stack.isEmpty():
+    var compound = newCompound()
+    stack.writeItemStack(compound)
+    target.putCompound(key, compound)
+
+proc readEquipmentItem(self: PlayerInventory; equipment: NbtCompound; key: string; slot: int) =
+  let compound = equipment.getCompound(key)
+  if compound.isSome:
+    let stack = readItemStack(compound.unsafeGet)
+    if stack.isSome:
+      Inventory(self).setStack(slot, stack.unsafeGet)
+
+proc writeInventoryNbt(self: PlayerInventory; nbt: var NbtCompound) =
+  ## `impl NBTStorage for PlayerInventory`
+  nbt.putInt("SelectedItemSlot", int32(self.getSelectedSlot()))
+  var items: seq[NbtTag] = @[]
+  for i in 0 ..< self.mainInventory.len:
+    if not self.mainInventory[i].isEmpty():
+      var compound = newCompound()
+      compound.putByte("Slot", int8(i))
+      self.mainInventory[i].writeItemStack(compound)
+      items.add(NbtTag(kind: ntkCompound, compoundVal: compound))
+  var equipmentCompound = newCompound()
+  self.writeEquipmentItem(equipmentCompound, esOffHand, "offhand")
+  self.writeEquipmentItem(equipmentCompound, esFeet, "feet")
+  self.writeEquipmentItem(equipmentCompound, esLegs, "legs")
+  self.writeEquipmentItem(equipmentCompound, esChest, "chest")
+  self.writeEquipmentItem(equipmentCompound, esHead, "head")
+  nbt.putCompound("equipment", equipmentCompound)
+  nbt.putList("Inventory", items)
+
+proc readInventoryNbt(self: PlayerInventory; nbt: NbtCompound) =
+  let selected = nbt.getInt("SelectedItemSlot")
+  if selected.isSome and selected.unsafeGet >= 0'i32 and selected.unsafeGet < 9'i32:
+    self.setSelectedSlot(uint8(selected.unsafeGet))
+  let list = nbt.getList("Inventory")
+  if list.isSome:
+    for tag in list.unsafeGet:
+      if tag.kind == ntkCompound:
+        let slot = tag.compoundVal.getByte("Slot")
+        if slot.isSome:
+          let stack = readItemStack(tag.compoundVal)
+          let index = int(slot.unsafeGet)
+          if stack.isSome and index >= 0:
+            Inventory(self).setStack(index, stack.unsafeGet)
+  let equipment = nbt.getCompound("equipment")
+  if equipment.isSome:
+    self.readEquipmentItem(equipment.unsafeGet, "offhand", 40)
+    self.readEquipmentItem(equipment.unsafeGet, "head", 39)
+    self.readEquipmentItem(equipment.unsafeGet, "chest", 38)
+    self.readEquipmentItem(equipment.unsafeGet, "legs", 37)
+    self.readEquipmentItem(equipment.unsafeGet, "feet", 36)
+
+proc writeEnderChestNbt(self: EnderChestInventory; nbt: var NbtCompound) =
+  var items: seq[NbtTag] = @[]
+  for i in 0 ..< Inventory(self).size():
+    let stack = Inventory(self).getStack(i)
+    if not stack.isEmpty():
+      var compound = newCompound()
+      compound.putByte("Slot", int8(i))
+      stack.writeItemStack(compound)
+      items.add(NbtTag(kind: ntkCompound, compoundVal: compound))
+  nbt.putList("EnderItems", items)
+
+proc readEnderChestNbt(self: EnderChestInventory; nbt: NbtCompound) =
+  let list = nbt.getList("EnderItems")
+  if list.isSome:
+    for tag in list.unsafeGet:
+      if tag.kind == ntkCompound:
+        let slot = tag.compoundVal.getByte("Slot")
+        if slot.isSome:
+          let stack = readItemStack(tag.compoundVal)
+          if stack.isSome:
+            Inventory(self).setStack(int(slot.unsafeGet), stack.unsafeGet)
+
+proc writeNbt*(self: Player; nbt: var NbtCompound) =
+  ## `impl NBTStorage for Player`, with `Entity`'s and `LivingEntity`'s.
+  nbt.putInt("DataVersion", self.world.levelInfo.dataVersion)
+  nbt.putString("id", "minecraft:player")
+  nbt.putUuid("UUID", self.gameprofile.id.hi, self.gameprofile.id.lo)
+  nbt.putList("Pos", @[nbtTag(self.pos.x), nbtTag(self.pos.y), nbtTag(self.pos.z)])
+  nbt.putList("Motion", @[nbtTag(self.velocity.x), nbtTag(self.velocity.y), nbtTag(self.velocity.z)])
+  nbt.putList("Rotation", @[nbtTag(self.yaw), nbtTag(self.pitch)])
+  nbt.putBool("OnGround", self.onGround)
+  nbt.putBool("Invulnerable", self.abilities.invulnerable)
+  nbt.putFloat("Health", self.health)
+  nbt.putFloat("AbsorptionAmount", self.absorption)
+  nbt.putFloat("fall_distance", if self.dead: 0.0'f32 else: self.fallDistance)
+  self.inventory.writeInventoryNbt(nbt)
+  self.enderChestInventory.writeEnderChestNbt(nbt)
+  var abilities = newCompound()
+  abilities.putBool("invulnerable", self.abilities.invulnerable)
+  abilities.putBool("flying", self.abilities.flying)
+  abilities.putBool("mayfly", self.abilities.allowFlying)
+  abilities.putBool("instabuild", self.abilities.creative)
+  abilities.putBool("mayBuild", self.abilities.allowModifyWorld)
+  abilities.putFloat("flySpeed", self.abilities.flySpeed)
+  abilities.putFloat("walkSpeed", self.abilities.walkSpeed)
+  nbt.putCompound("abilities", abilities)
+  nbt.putInt("XpTotal", pointsToLevel(self.experienceLevel) + self.experiencePoints)
+  nbt.putInt("XpLevel", self.experienceLevel)
+  nbt.putFloat("XpP", self.experienceProgress)
+  nbt.putByte("playerGameType", int8(ord(self.gamemode)))
+  if self.previousGamemode.isSome:
+    nbt.putByte("previousPlayerGameType", int8(ord(self.previousGamemode.unsafeGet)))
+  nbt.putBool("HasPlayedBefore", self.hasPlayedBefore)
+  nbt.putInt("foodLevel", int32(self.hungerManager.level))
+  nbt.putFloat("foodSaturationLevel", self.hungerManager.saturation)
+  nbt.putFloat("foodExhaustionLevel", self.hungerManager.exhaustion)
+  nbt.putInt("foodTickTimer", int32(self.hungerManager.tickTimer))
+  nbt.putString("Dimension", self.world.dimension.minecraftName)
+  if self.respawnPoint.isSome:
+    let respawn = self.respawnPoint.unsafeGet
+    nbt.putInt("SpawnX", respawn.position.vec.x)
+    nbt.putInt("SpawnY", respawn.position.vec.y)
+    nbt.putInt("SpawnZ", respawn.position.vec.z)
+    nbt.putString("SpawnDimension", respawn.dimension.minecraftName)
+    nbt.putBool("SpawnForced", respawn.force)
+  nbt.putInt("XpSeed", self.enchantmentSeed)
+
+proc nbtFlag(c: NbtCompound; key: string): bool =
+  let v = c.getBool(key)
+  v.isSome and v.unsafeGet
+
+proc doubleAt(list: seq[NbtTag]; index: int): float64 =
+  if index >= list.len:
+    return 0.0
+  case list[index].kind
+  of ntkDouble: list[index].doubleVal
+  of ntkFloat: float64(list[index].floatVal)
+  else: 0.0
+
+proc floatAt(list: seq[NbtTag]; index: int): float32 =
+  if index >= list.len:
+    return 0.0'f32
+  case list[index].kind
+  of ntkFloat: list[index].floatVal
+  of ntkDouble: float32(list[index].doubleVal)
+  else: 0.0'f32
+
+proc readNbt*(self: Player; nbt: NbtCompound) =
+  ## `read_nbt`. Upstream unwraps "Pos", "Motion" and "Rotation"; a save without them keeps the defaults here.
+  let position = nbt.getList("Pos")
+  if position.isSome and position.unsafeGet.len >= 3:
+    let at = Vector3[float64](x: doubleAt(position.unsafeGet, 0), y: doubleAt(position.unsafeGet, 1),
+      z: doubleAt(position.unsafeGet, 2))
+    self.setPos(at)
+    self.lastPos = at
+  let motion = nbt.getList("Motion")
+  if motion.isSome and motion.unsafeGet.len >= 3:
+    self.velocity = Vector3[float64](x: doubleAt(motion.unsafeGet, 0), y: doubleAt(motion.unsafeGet, 1),
+      z: doubleAt(motion.unsafeGet, 2))
+  let rotation = nbt.getList("Rotation")
+  if rotation.isSome and rotation.unsafeGet.len >= 2:
+    self.setRotation(floatAt(rotation.unsafeGet, 0), floatAt(rotation.unsafeGet, 1))
+  let ground = nbt.getBool("OnGround")
+  self.onGround = ground.isSome and ground.unsafeGet
+  let health = nbt.getFloat("Health")
+  if health.isSome:
+    self.health = health.unsafeGet
+  let absorption = nbt.getFloat("AbsorptionAmount")
+  if absorption.isSome:
+    self.absorption = max(absorption.unsafeGet, 0.0'f32)
+  let fallen = nbt.getFloat("fall_distance")
+  if fallen.isSome:
+    self.fallDistance = fallen.unsafeGet
+  self.inventory.readInventoryNbt(nbt)
+  self.enderChestInventory.readEnderChestNbt(nbt)
+  let component = nbt.getCompound("abilities")
+  if component.isSome:
+    let c = component.unsafeGet
+    self.abilities.invulnerable = nbtFlag(c, "invulnerable")
+    self.abilities.flying = nbtFlag(c, "flying")
+    self.abilities.allowFlying = nbtFlag(c, "mayfly")
+    self.abilities.creative = nbtFlag(c, "instabuild")
+    self.abilities.allowModifyWorld = nbtFlag(c, "mayBuild")
+    let fly = c.getFloat("flySpeed")
+    self.abilities.flySpeed = if fly.isSome: fly.unsafeGet else: 0.05'f32
+    let walk = c.getFloat("walkSpeed")
+    self.abilities.walkSpeed = if walk.isSome: walk.unsafeGet else: 0.1'f32
+  # Vanilla keeps the level and its progress; upstream's total alone loses them when both are there.
+  let total = nbt.getInt("XpTotal")
+  let (level, points) = totalToLevelAndPoints(if total.isSome: total.unsafeGet else: 0'i32)
+  self.experienceLevel = level
+  self.experiencePoints = points
+  self.experienceProgress = progressInLevel(points, level)
+  let mode = nbt.getByte("playerGameType")
+  if mode.isSome and mode.unsafeGet >= 0'i8 and mode.unsafeGet <= 3'i8:
+    self.gamemode = GameMode(mode.unsafeGet)
+  let previous = nbt.getByte("previousPlayerGameType")
+  if previous.isSome and previous.unsafeGet >= 0'i8 and previous.unsafeGet <= 3'i8:
+    self.previousGamemode = some(GameMode(previous.unsafeGet))
+  let played = nbt.getBool("HasPlayedBefore")
+  # A save vanilla wrote has no such key and is a player who has been here: "Pos" says so.
+  self.hasPlayedBefore = if played.isSome: played.unsafeGet else: position.isSome
+  let food = nbt.getInt("foodLevel")
+  if food.isSome:
+    self.hungerManager.level = uint8(max(min(food.unsafeGet, 255'i32), 0'i32))
+  let saturation = nbt.getFloat("foodSaturationLevel")
+  if saturation.isSome:
+    self.hungerManager.saturation = saturation.unsafeGet
+  let exhaustion = nbt.getFloat("foodExhaustionLevel")
+  if exhaustion.isSome:
+    self.hungerManager.exhaustion = exhaustion.unsafeGet
+  let foodTimer = nbt.getInt("foodTickTimer")
+  if foodTimer.isSome:
+    self.hungerManager.tickTimer = uint32(max(foodTimer.unsafeGet, 0'i32))
+  let x = nbt.getInt("SpawnX")
+  let y = nbt.getInt("SpawnY")
+  let z = nbt.getInt("SpawnZ")
+  if x.isSome and y.isSome and z.isSome:
+    let dimensionName = nbt.getString("SpawnDimension")
+    var dim = self.world.dimension
+    if dimensionName.isSome:
+      let (found, named) = dimensionFromName(dimensionName.unsafeGet)
+      if found:
+        dim = named
+    let forced = nbt.getBool("SpawnForced")
+    self.respawnPoint = some(RespawnPoint(dimension: dim, position: newBlockPos(x.unsafeGet, y.unsafeGet, z.unsafeGet),
+      yaw: 0.0'f32, force: forced.isSome and forced.unsafeGet))
+  let seed = nbt.getInt("XpSeed")
+  if seed.isSome:
+    self.enchantmentSeed = seed.unsafeGet
+
+# --- tick ----------------------------------------------------------------------------------------------
+
+proc flushBlockAck*(self: Player) =
+  ## The sequence answer. Upstream sends it only on the 15-second keep-alive timer, in `progress_player_packets`; vanilla
+  ## sends it at the end of the tick, which is what a client's block prediction expects, so it is sent from the tick.
+  let client = self.client
+  let seq0 = client.packetSequence
+  client.packetSequence = -1'i32
+  if seq0 != -1'i32:
+    client.writePacketFor(CAcknowledgeBlockChange(sequenceId: newVarInt(seq0)))
 
 proc tick*(self: Player) =
-  ## `Player::tick`: of all it does, the chunk sending.
+  ## `Player::tick`. `World::tick` runs the mining half, since it needs `get_block_state` and `set_block_breaking`.
+  self.currentScreenHandler.sendContentUpdates()
+
+  self.chunkManager.pullNewChunks()
   if self.chunkManager.canSendChunk():
-    let positions = self.chunkManager.nextChunk()
-    self.client.writePacketFor(CChunkBatchStart())
-    var count = 0'u16
-    for pos in positions:
-      # From disk only, and only a finished chunk. Upstream generates what is missing on its own threads; here
-      # `fetchChunk` would do that inside the one loop that also answers every client.
-      let fetched = fetchChunkFromDisk(self.world.level, pos.x, pos.y)
-      if fetched.kind == lkLoaded and fetched.chunk.status == csFull:
-        self.client.writePacketFor(CChunkData(data: fetched.chunk))
-        count += 1'u16
-    self.client.writePacketFor(newCChunkBatchEnd(count))
+    let chunks = self.chunkManager.nextChunk()
+    sendChunks(self.client, chunks)
+
+  self.tickCounter += 1'i32
+  self.lastAttackedTicks += 1'u32
+
+  self.tickHunger()
+  self.tickHealth()
+
+  if not self.clientLoaded and self.clientLoadedTimeout > 0'u32:
+    self.clientLoadedTimeout -= 1'u32
+
+  self.flushBlockAck()
+
+proc idleTimedOut*(self: Player; server: Server): bool =
+  ## The idle timeout half of `tick`.
+  let minutes = server.playerIdleTimeout
+  minutes > 0'i32 and nowMs() - self.lastActionTime >= int64(minutes) * 60000'i64

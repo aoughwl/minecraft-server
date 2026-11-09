@@ -1,0 +1,573 @@
+## Port of pumpkin/src/entity/boss/ender_dragon.rs
+## PARTIAL: pumpkin/src/entity/boss/ender_dragon.rs - `World::dragon_fight` is not ported, so it is `gDragonFightOf`, unset being a world with no fight; `World::get_heightmap_height` is `getHeightmapHeight` in mob/mobvts.aowl.
+##
+## `EnderDragonEntity`, the `Phase` trait and `PhaseManager` refer to each other, and each phase file refers to the dragon, and
+## aowlmony types cannot be recursive across modules. So those types and the dragon's methods are here, the phases import
+## this, phase/phasemod.aowl lists them, and ../ender_dragon.aowl has the constructor, which needs that list.
+
+import std/[math, options]
+import ../../../../data/block_ext
+from ../../../../generated/block_properties import asU16
+import ../../../../generated/sound
+import ../../../../world/chunkdata
+import ../../../../world/world as worldflags
+import "../../../../data/item_stack/mod"
+from ../../../../generated/effect import StatusEffect, INSTANT_DAMAGE
+import ../../ai/aibase
+import ../../area_effect_cloud
+import ../../../item/potion
+import ../../mob/mobvts
+import flight_history
+
+export flight_history
+
+const
+  NodeCount* = 24  ## `NODE_COUNT`
+  NodeY* = 105'i32  ## `NODE_Y`
+  NodeReachSq* = 64.0'f64
+  DeathTimerMax* = 200'i32
+  GrowlCooldownBase = 200'i32
+  FlapSpeed = 0.2'f32
+  FlyAccel* = 0.1'f64
+  FlySpeed* = 0.6'f64
+  ArenaRadius = 192.0'f64
+  Tau32 = 6.2831855'f32  ## `std::f32::consts::TAU`
+  Pi32 = 3.1415927'f32   ## `std::f32::consts::PI`
+  NodeAdjacency = [6146'u32, 8197'u32, 8202'u32, 16404'u32, 32808'u32, 32848'u32, 65696'u32, 131392'u32, 131712'u32,
+    263424'u32, 526848'u32, 525313'u32, 1581057'u32, 3166214'u32, 2138120'u32, 6373424'u32, 4358208'u32, 12910976'u32,
+    9044480'u32, 9706496'u32, 15216640'u32, 13688832'u32, 11763712'u32, 8257536'u32]
+
+type
+  DragonNode* = object
+    x*, y*, z*: float64
+
+  EnderDragonPhase* = enum
+    edpCircling = 0
+    edpStrafing = 1
+    edpCharging = 2
+    edpFlyToPortal = 3
+    edpLandingApproach = 4
+    edpLanding = 5
+    edpSitAttacking = 6
+    edpSitBreathing = 7
+    edpTakingOff = 8
+    edpHovering = 9
+    edpDying = 10
+
+  Phase* = ref object
+    ## `dyn Phase`. Defaults are in `newPhase`.
+    getType*: EnderDragonPhase
+    tick*: proc(dragon: EnderDragonEntity) {.closure.}
+    begin*: proc(dragon: EnderDragonEntity) {.closure.}
+    stop*: proc(dragon: EnderDragonEntity) {.closure.}  ## `end`
+    getFlySpeed*: float32
+    getTurnSpeed*: float32
+
+  PhaseManager* = object
+    phases*: seq[Phase]  ## `[Arc<dyn Phase>; 11]`, by `EnderDragonPhase`.
+
+  DragonFight* = ref object
+    ## What the dragon asks of `World::dragon_fight`.
+    updateDragon*: proc(world: World; health, maxHealth: float32) {.closure.}
+    aliveCrystals*: proc(): int32 {.closure.}
+    hasPreviouslyKilledDragon*: proc(): bool {.closure.}
+    setDragonKilled*: proc(world: World; uuid: Uuid) {.closure.}
+
+  EnderDragonPart* = ref object of EntityBase
+    dragonUuid*: Uuid
+
+  EnderDragonEntity* = ref object of Mob
+    parts*: seq[EnderDragonPart]
+    flightHistory*: DragonFlightHistory
+    flapTime*: float32
+    oFlapTime*: float32
+    inWall*: bool
+    dragonDeathTime*: int32
+    sittingDamageReceived*: float32
+    nodesInitialized*: bool
+    fightOrigin*: BlockPos
+    phaseManager*: PhaseManager
+    phase*: EnderDragonPhase
+    growlTime*: int32
+    yawRotAccel*: float32
+    holdingPatternClockwise*: bool
+    targetLocation*: Option[Vector3[float64]]
+    fireballCharge*: int32
+    nodes*: seq[Option[DragonNode]]  ## `[Option<DragonNode>; NODE_COUNT]`
+    path*: seq[int]
+    targetNode*: int
+    strafeTarget*: Option[Vector3[float64]]
+    targetPlayer*: Option[Uuid]
+    ticksSitting*: int32
+    sitAttackTimer*: int32
+    breathingTimer*: int32
+
+var gDragonFightOf*: proc(world: World): nil DragonFight {.closure.} =
+  proc(world: World): nil DragonFight {.closure.} = nil
+  ## `world.dragon_fight`.
+
+proc dragonFightOf*(world: World): nil DragonFight =
+  gDragonFightOf(world)
+
+proc spawnDragonBreathCloud*(world: World; position: Vector3[float64]) =
+  ## The `AreaEffectCloudEntity::create` both breathing phases make, spawned.
+  let cloudEntity = newEntity(world, position, EntityType.AREA_EFFECT_CLOUD)
+  let cloud = createAreaEffectCloud(cloudEntity, newItemStack(0'u8, ITEM_DRAGON_BREATH),
+    @[EffectEntry(effectType: StatusEffect.INSTANT_DAMAGE, duration: 1'i32, amplifier: 0'u8, ambient: false,
+      showParticles: true, showIcon: true)],
+    600'i32,      # duration
+    3.0'f32,      # radius
+    20'i32,       # reapplication delay
+    20'i32,       # wait time
+    0.5'f32,      # radius on use
+    -100'i32)     # duration on use
+  spawnEntity(world, asBase(cloud))
+
+proc distanceSquared*(self, other: Vector3[float64]): float64 =
+  ## `Vector3Ext::distance_squared`
+  let dx = self.x - other.x
+  let dy = self.y - other.y
+  let dz = self.z - other.z
+  dx * dx + dy * dy + dz * dz
+
+proc isSitting*(self: EnderDragonPhase): bool =
+  self == edpLandingApproach or self == edpLanding or self == edpSitAttacking or self == edpSitBreathing or
+    self == edpTakingOff
+
+proc networkId*(self: EnderDragonPhase): int32 =
+  int32(ord(self))
+
+proc newPhase*(phaseType: EnderDragonPhase): Phase =
+  ## The trait's defaults: fly speed 0.6, turn speed 0.1. `tick` is required.
+  Phase(getType: phaseType,
+    tick: proc(dragon: EnderDragonEntity) {.closure.} = discard,
+    begin: proc(dragon: EnderDragonEntity) {.closure.} = discard,
+    stop: proc(dragon: EnderDragonEntity) {.closure.} = discard,
+    getFlySpeed: 0.6'f32, getTurnSpeed: 0.1'f32)
+
+proc getPhase*(self: PhaseManager; phaseType: EnderDragonPhase): Phase =
+  self.phases[ord(phaseType)]
+
+proc newDragonNode*(x, y, z: float64): DragonNode =
+  DragonNode(x: x, y: y, z: z)
+
+proc distSq*(self, other: DragonNode): float64 =
+  let dx = self.x - other.x
+  let dy = self.y - other.y
+  let dz = self.z - other.z
+  dx * dx + dy * dy + dz * dz
+
+proc distSqVec*(self: DragonNode; v: Vector3[float64]): float64 =
+  let dx = self.x - v.x
+  let dy = self.y - v.y
+  let dz = self.z - v.z
+  dx * dx + dy * dy + dz * dz
+
+proc asVec3*(self: DragonNode): Vector3[float64] =
+  Vector3[float64](x: self.x, y: self.y, z: self.z)
+
+proc heuristic(nodes: seq[Option[DragonNode]]; finalNode: Option[DragonNode]; to, n: int): float64 =
+  if finalNode.isSome and nodes[n].isSome:
+    return sqrt(nodes[n].unsafeGet.distSq(finalNode.unsafeGet))
+  if nodes[n].isSome and nodes[to].isSome:
+    return sqrt(nodes[n].unsafeGet.distSq(nodes[to].unsafeGet))
+  0.0
+
+proc findPath*(nodes: seq[Option[DragonNode]]; fromNode, to: int; finalNode: Option[DragonNode]): seq[int] =
+  if fromNode == to and finalNode.isNone:
+    return @[]
+
+  var g = newSeq[float64](NodeCount)
+  var cameFrom = newSeq[int](NodeCount)
+  var closed = newSeq[bool](NodeCount)
+  for i in 0 ..< NodeCount:
+    g[i] = high(float64)
+    cameFrom[i] = NodeCount
+  # `BinaryHeap<(OrderedFloat<f64>, usize)>`, a max-heap on the pair: the scan below pops what it would.
+  var open: seq[(float64, int)] = @[]
+
+  g[fromNode] = 0.0
+  open.add((-heuristic(nodes, finalNode, to, fromNode), fromNode))
+
+  while open.len > 0:
+    var best = 0
+    for i in 1 ..< open.len:
+      if open[i][0] > open[best][0] or (open[i][0] == open[best][0] and open[i][1] > open[best][1]):
+        best = i
+    let cur = open[best][1]
+    open[best] = open[open.len - 1]
+    open.setLen(open.len - 1)
+
+    if closed[cur]:
+      continue
+    if cur == to:
+      break
+    closed[cur] = true
+
+    let adj = NodeAdjacency[cur]
+    for nbr in 0 ..< NodeCount:
+      if ((adj shr uint32(nbr)) and 1'u32) == 0'u32 or closed[nbr]:
+        continue
+      if nodes[cur].isNone or nodes[nbr].isNone:
+        continue
+      let ng = g[cur] + sqrt(nodes[cur].unsafeGet.distSq(nodes[nbr].unsafeGet))
+      if ng < g[nbr]:
+        g[nbr] = ng
+        cameFrom[nbr] = cur
+        open.add((-(ng + heuristic(nodes, finalNode, to, nbr)), nbr))
+
+  var reversed: seq[int] = @[]
+  var cur = to
+  while cur != NodeCount:
+    reversed.add(cur)
+    cur = cameFrom[cur]
+  result = @[]
+  var i = reversed.len - 1
+  while i >= 0:
+    result.add(reversed[i])
+    i = i - 1
+  if result.len > 0 and result[0] == fromNode:
+    result.delete(0)
+
+proc makeEnderDragonPartVt(): EntityVt =
+  result = copyVt(entityVt())
+  result.damage = proc(self, caller: EntityBase; amount: float32; damageType: DamageType): bool {.closure.} =
+    let part = EnderDragonPart(self)
+    for candidate in allEntities(self.entity.world):
+      if candidate.entity.entityUuid == part.dragonUuid:
+        return candidate.damage(caller, amount, damageType)
+    false
+  result.canHit = proc(self: EntityBase): bool {.closure.} = true
+
+let enderDragonPartVt = makeEnderDragonPartVt()
+
+proc newEnderDragonPart*(entity: Entity; dragonUuid: Uuid): EnderDragonPart =
+  result = EnderDragonPart(dragonUuid: dragonUuid)
+  result.initEntityBase(entity, enderDragonPartVt)
+
+proc setFightOrigin*(self: EnderDragonEntity; pos: BlockPos) =
+  if not (self.fightOrigin == pos):
+    self.fightOrigin = pos
+    self.nodesInitialized = false
+
+proc setPhase*(self: EnderDragonEntity; phaseType: EnderDragonPhase) =
+  if self.phase == phaseType:
+    return
+
+  let oldPhase = self.phaseManager.getPhase(self.phase)
+  oldPhase.stop(self)
+
+  self.phase = phaseType
+
+  let newPhase0 = self.phaseManager.getPhase(phaseType)
+  newPhase0.begin(self)
+
+proc nearestNodeIn(nodes: seq[Option[DragonNode]]; pos: Vector3[float64]): int =
+  ## `min_by` keeps the first of equals.
+  result = 0
+  var bestDist = high(float64)
+  for i in 0 ..< nodes.len:
+    if nodes[i].isSome:
+      let d = nodes[i].unsafeGet.distSqVec(pos)
+      if d < bestDist:
+        bestDist = d
+        result = i
+
+proc randomNodeIdx(): int =
+  int(randomRange(0'i32, int32(NodeCount)))
+
+proc ensureNodesInitialized*(self: EnderDragonEntity) =
+  if self.nodesInitialized:
+    return
+
+  let world = self.mobEntity.livingEntity.entity.world
+  let fightOrigin = self.fightOrigin
+
+  for i in 0 ..< NodeCount:
+    var yAdjustment = 5'i32
+    var nodeX: int32
+    var nodeZ: int32
+
+    if i < 12:
+      nodeX = fightOrigin.x + int32(60.0'f32 * cosF32(float32(i) * Tau32 / 12.0'f32))
+      nodeZ = fightOrigin.z + int32(60.0'f32 * sinF32(float32(i) * Tau32 / 12.0'f32))
+    elif i < 20:
+      let multiplier = i - 12
+      nodeX = fightOrigin.x + int32(40.0'f32 * cosF32(float32(multiplier) * Tau32 / 8.0'f32))
+      nodeZ = fightOrigin.z + int32(40.0'f32 * sinF32(float32(multiplier) * Tau32 / 8.0'f32))
+      yAdjustment = yAdjustment + 10'i32
+    else:
+      let multiplier = i - 20
+      nodeX = fightOrigin.x + int32(20.0'f32 * cosF32(float32(multiplier) * Tau32 / 4.0'f32))
+      nodeZ = fightOrigin.z + int32(20.0'f32 * sinF32(float32(multiplier) * Tau32 / 4.0'f32))
+
+    let height = getHeightmapHeight(world, chmMotionBlocking, nodeX, nodeZ)
+    let nodeY = max(73'i32, height + yAdjustment)
+    self.nodes[i] = some(newDragonNode(float64(nodeX), float64(nodeY), float64(nodeZ)))
+
+  let pos = self.mobEntity.livingEntity.entity.pos
+  let nearest = nearestNodeIn(self.nodes, pos)
+  let dest = randomNodeIdx()
+  let newPath = findPath(self.nodes, nearest, dest, none[DragonNode]())
+
+  self.targetNode = dest
+  self.path = newPath
+  self.nodesInitialized = true
+
+proc findClosestNodeTo*(self: EnderDragonEntity; pos: Vector3[float64]): int =
+  self.ensureNodesInitialized()
+  nearestNodeIn(self.nodes, pos)
+
+proc findClosestNode*(self: EnderDragonEntity): int =
+  self.findClosestNodeTo(self.mobEntity.livingEntity.entity.pos)
+
+proc yawToward*(fromPos, to: Vector3[float64]): float32 =
+  float32(radToDeg(arctan2(-(to.z - fromPos.z), to.x - fromPos.x))) - 90.0'f32
+
+proc getRelativeMovement*(relativeMovement: Vector3[float64]; speed, yaw: float32): Vector3[float64] =
+  let dist = relativeMovement.lengthSquared()
+  if dist < 1.0e-7:
+    return Vector3[float64](x: 0.0, y: 0.0, z: 0.0)
+  let base = if dist > 1.0: relativeMovement.normalize() else: relativeMovement
+  let vec = base * float64(speed)
+  let sin0 = float64(sinF32(yaw * (Pi32 / 180.0'f32)))
+  let cos0 = float64(cosF32(yaw * (Pi32 / 180.0'f32)))
+  Vector3[float64](x: vec.x * cos0 - vec.z * sin0, y: vec.y, z: vec.z * cos0 + vec.x * sin0)
+
+proc moveRelative*(self: EnderDragonEntity; speed: float32; relativeMovement: Vector3[float64]) =
+  let entity = self.mobEntity.livingEntity.entity
+  let movement = getRelativeMovement(relativeMovement, speed, entity.yaw)
+  entity.velocity = entity.velocity + movement
+
+proc steerToward*(self: EnderDragonEntity; pos, target: Vector3[float64]; flySpeed0, turnSpeed: float32; yScale: float64) =
+  let xdd = target.x - pos.x
+  var ydd = target.y - pos.y
+  let zdd = target.z - pos.z
+  let distSq0 = xdd * xdd + ydd * ydd + zdd * zdd
+
+  let horizontalDist = hypot(xdd, zdd)
+  if horizontalDist > 0.0:
+    ydd = clamp(ydd / horizontalDist, -float64(flySpeed0), float64(flySpeed0))
+
+  let entity = self.mobEntity.livingEntity.entity
+  var vel = entity.velocity
+  vel.y = vel.y + ydd * 0.01
+  entity.velocity = vel
+
+  let yaw = entity.yaw
+  let aimDiff = target - pos
+  let aim = if aimDiff.lengthSquared() > 1e-6: aimDiff.normalize() else: Vector3[float64](x: 0.0, y: 0.0, z: 0.0)
+
+  let dirVec = Vector3[float64](x: float64(sinF32(yaw * (Pi32 / 180.0'f32))), y: vel.y,
+    z: float64(-cosF32(yaw * (Pi32 / 180.0'f32))))
+  let dir = if dirVec.lengthSquared() > 1e-6: dirVec.normalize() else: Vector3[float64](x: 0.0, y: 0.0, z: 0.0)
+
+  let dotValue = max(float32(dir.dot(aim)) + 0.5'f32, 0.0'f32) / 1.5'f32
+  if abs(xdd) > 1.0e-5 or abs(zdd) > 1.0e-5:
+    var yRotD = remEuclidF32(180.0'f32 - float32(radToDeg(arctan2(xdd, zdd))) - yaw, 360.0'f32)
+    if yRotD > 180.0'f32:
+      yRotD = yRotD - 360.0'f32
+    yRotD = clamp(yRotD, -50.0'f32, 50.0'f32)
+
+    self.yawRotAccel = self.yawRotAccel * 0.8'f32
+    self.yawRotAccel = self.yawRotAccel + yRotD * turnSpeed
+    entity.yaw = yaw + self.yawRotAccel * 0.1'f32
+
+  let span = float32(2.0 / (distSq0 + 1.0))
+  self.moveRelative(0.06'f32 * (dotValue * span + (1.0'f32 - span)), Vector3[float64](x: 0.0, y: 0.0, z: -1.0))
+
+  let actualVel = entity.velocity
+  let actualDir = if actualVel.lengthSquared() > 1e-6: actualVel.normalize() else: Vector3[float64](x: 0.0, y: 0.0, z: 0.0)
+  let slide = 0.8 + 0.15 * (actualDir.dot(dir) + 1.0) / 2.0
+  entity.velocity = Vector3[float64](x: actualVel.x * slide, y: actualVel.y * 0.91, z: actualVel.z * slide)
+
+proc updateFlapTime(self: EnderDragonEntity) =
+  let sitting = self.phase.isSitting()
+  self.oFlapTime = self.flapTime
+  self.flapTime = self.flapTime + (if sitting: 0.1'f32 elif self.inWall: FlapSpeed * 0.5'f32 else: FlapSpeed)
+  if self.flapTime > Tau32:
+    self.flapTime = self.flapTime - Tau32
+
+proc tickGrowl(self: EnderDragonEntity) =
+  if self.phase.isSitting():
+    return
+  if self.growlTime > 0'i32:
+    self.growlTime = self.growlTime - 1'i32
+  else:
+    self.growlTime = GrowlCooldownBase + randomRange(0'i32, 100'i32)
+
+proc findNearestPlayer*(self: EnderDragonEntity): nil Player =
+  let entity = self.mobEntity.livingEntity.entity
+  let pos = entity.pos
+  result = nil
+  var bestDist = ArenaRadius * ArenaRadius
+  for player in entity.world.players:
+    let d = playerBase(player).entity.pos.distanceSquared(pos)
+    if d < bestDist:
+      bestDist = d
+      result = player
+
+proc handlePlayerCollisions(self: EnderDragonEntity) =
+  let entity = self.mobEntity.livingEntity.entity
+  let dragonBbox = entity.boundingBox
+  let xm = (dragonBbox.min.x + dragonBbox.max.x) / 2.0
+  let zm = (dragonBbox.min.z + dragonBbox.max.z) / 2.0
+
+  for player in entity.world.players:
+    let playerEntityBase = playerBase(player)
+    let playerEntity = playerEntityBase.entity
+    if playerEntity.boundingBox.intersects(dragonBbox):
+      let playerPos = playerEntity.pos
+      let xd = playerPos.x - xm
+      let zd = playerPos.z - zm
+      let dd = max(xd * xd + zd * zd, 0.1)
+
+      playerEntity.applyKnockback(4.0, xd / dd, zd / dd)
+      playerEntity.sendVelocity()
+
+      if not self.phase.isSitting():
+        let selfBase = asBase(self)
+        discard playerEntityBase.damage(selfBase, 5.0'f32, MOB_ATTACK)
+
+proc tickCrystalHealing(self: EnderDragonEntity) =
+  let entity = self.mobEntity.livingEntity.entity
+  let pos = entity.pos
+  var found = false
+  var minDistSq = 1024.0 # 32 blocks
+  for other in allEntities(entity.world):
+    if other.entity.entityType.id == EntityType.END_CRYSTAL.id:
+      let distSq0 = pos.distanceSquared(other.entity.pos)
+      if distSq0 < minDistSq:
+        minDistSq = distSq0
+        found = true
+  if found:
+    let living = self.mobEntity.livingEntity
+    if living.health < living.getMaxHealth():
+      living.heal(1.0'f32)
+
+proc tickBlockBreaking(self: EnderDragonEntity) =
+  let phaseType = self.phase
+  if phaseType.isSitting() or phaseType == edpDying:
+    return
+
+  let entity = self.mobEntity.livingEntity.entity
+  let world = entity.world
+  let bbox = entity.boundingBox
+
+  let lo = bbox.minBlockPos()
+  let hi = bbox.maxBlockPos()
+
+  var iter = iterate(lo, hi)
+  while true:
+    let next0 = iter.next()
+    if next0.isNone:
+      break
+    let pos = next0.unsafeGet
+    let name = world.getBlock(pos).name
+    if name != "bedrock" and name != "end_stone" and name != "obsidian" and name != "iron_bars" and
+        name != "end_portal" and name != "end_portal_frame":
+      discard world.setBlockState(pos, 0'u32, BfNotifyAll)
+
+proc tickParts(self: EnderDragonEntity) =
+  let p5 = self.flightHistory.get(5'i32)
+  let p10 = self.flightHistory.get(10'i32)
+  let p0 = self.flightHistory.get(0'i32)
+
+  let tilt = float32(p5.y - p10.y) * 10.0'f32 * (Pi32 / 180.0'f32)
+  let ccTilt = float64(cosF32(tilt))
+  let ssTilt = float64(sinF32(tilt))
+
+  let entity = self.mobEntity.livingEntity.entity
+  let yaw = entity.yaw
+  let rot1 = yaw * (Pi32 / 180.0'f32)
+  let ss1 = float64(sinF32(rot1))
+  let cc1 = float64(cosF32(rot1))
+
+  let pos = entity.pos
+
+  # Body
+  self.parts[2].entity.setPos(Vector3[float64](x: pos.x + ss1 * 0.5, y: pos.y, z: pos.z - cc1 * 0.5))
+
+  # Wings
+  self.parts[6].entity.setPos(Vector3[float64](x: pos.x + cc1 * 4.5, y: pos.y + 2.0, z: pos.z + ss1 * 4.5))
+  self.parts[7].entity.setPos(Vector3[float64](x: pos.x - cc1 * 4.5, y: pos.y + 2.0, z: pos.z - ss1 * 4.5))
+
+  let headYOffset = if self.phase.isSitting(): -1.0 else: p5.y - p0.y
+
+  let rot2 = (yaw - self.yawRotAccel * 0.01'f32) * (Pi32 / 180.0'f32)
+  let ss2 = float64(sinF32(rot2))
+  let cc2 = float64(cosF32(rot2))
+
+  # Head & Neck
+  self.parts[0].entity.setPos(Vector3[float64](x: pos.x + ss2 * 6.5 * ccTilt, y: pos.y + headYOffset + ssTilt * 6.5,
+    z: pos.z - cc2 * 6.5 * ccTilt))
+  self.parts[1].entity.setPos(Vector3[float64](x: pos.x + ss2 * 5.5 * ccTilt, y: pos.y + headYOffset + ssTilt * 5.5,
+    z: pos.z - cc2 * 5.5 * ccTilt))
+
+  # Tails
+  for i in 0'i32 ..< 3'i32:
+    let pi0 = self.flightHistory.get(12'i32 + i * 2'i32)
+    let rot = yaw * (Pi32 / 180.0'f32) + toRadiansF32(remEuclidF32(pi0.yRot - p5.yRot, 360.0'f32))
+    let ss = float64(sinF32(rot))
+    let cc = float64(cosF32(rot))
+    let dd = float64(i + 1'i32) * 2.0
+
+    self.parts[3 + int(i)].entity.setPos(Vector3[float64](
+      x: pos.x - (ss1 * 1.5 + ss * dd) * ccTilt,
+      y: pos.y + (pi0.y - p5.y) - (dd + 1.5) * ssTilt + 1.5,
+      z: pos.z + (cc1 * 1.5 + cc * dd) * ccTilt))
+
+  for part in self.parts:
+    part.entity.sendPosRot()
+
+proc aiStep*(self: EnderDragonEntity) =
+  let living = self.mobEntity.livingEntity
+  let entity = living.entity
+  discard entity.updateLastPos()
+  self.ensureNodesInitialized()
+  self.updateFlapTime()
+
+  self.flightHistory.record(entity.pos.y, entity.yaw)
+
+  self.tickGrowl()
+  self.tickCrystalHealing()
+
+  let fight = dragonFightOf(entity.world)
+  if fight != nil:
+    fight.updateDragon(entity.world, living.health, living.getMaxHealth())
+
+  let phaseType = self.phase
+  let phase0 = self.phaseManager.getPhase(phaseType)
+
+  if phaseType.isSitting():
+    self.ticksSitting = self.ticksSitting + 1'i32
+  else:
+    self.handlePlayerCollisions()
+    self.tickBlockBreaking()
+
+  phase0.tick(self)
+
+  if phaseType == edpDying:
+    return
+
+  if self.targetLocation.isSome:
+    self.steerToward(entity.pos, self.targetLocation.unsafeGet, phase0.getFlySpeed, phase0.getTurnSpeed, 0.5)
+
+  entity.sendPosRot()
+  self.tickParts()
+
+proc hurt*(self: EnderDragonEntity; damage0: float32) =
+  if self.phase.isSitting():
+    self.sittingDamageReceived = self.sittingDamageReceived + damage0
+
+proc nextPathTarget*(self: EnderDragonEntity) =
+  ## The tail both `CirclingPhase` and `StrafingPhase` run: head for the path's next node, up to 20 above it.
+  if self.path.len > 0:
+    let nextNodeIdx = self.path[0]
+    self.path.delete(0)
+    let node = self.nodes[nextNodeIdx]
+    if node.isSome:
+      var yTarget = node.unsafeGet.y + randomF64() * 20.0
+      while yTarget < node.unsafeGet.y:
+        yTarget = node.unsafeGet.y + randomF64() * 20.0
+      self.targetLocation = some(Vector3[float64](x: node.unsafeGet.x, y: yTarget, z: node.unsafeGet.z))

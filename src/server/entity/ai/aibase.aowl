@@ -1,0 +1,906 @@
+## Port of pumpkin/src/entity/ai/goal/mod.rs
+## Port of pumpkin/src/entity/ai/goal/goal_selector.rs
+## Port of pumpkin/src/entity/ai/control/mod.rs
+## Port of pumpkin/src/entity/ai/control/look_control.rs
+## Port of pumpkin/src/entity/ai/control/move_control.rs
+## Port of pumpkin/src/entity/ai/target_predicate.rs
+## Port of pumpkin/src/entity/ai/mod.rs
+## Port of pumpkin/src/entity/mob/mod.rs
+## PARTIAL: pumpkin/src/entity/mob/mod.rs - everything except `equip_mob_on_spawn` and `EQUIPMENT_REGISTRY` (entity/mob/equipment.rs), reached through `gEquipMobOnSpawn`; and the two light reads, through `gGetSkyLightLevel` and `gGetBlockLightLevel`, which the world side fills.
+##
+## `Goal`, `GoalSelector`, the controls, `Mob` and `MobEntity` refer to each other, and aowlmony types cannot be recursive
+## across modules, so they share this one, as serverbase.aowl does for `Server`, `World` and `Player`.
+##
+## THE SHAPE, for entity/mob, passive, boss:
+##
+##   A mob derives from `Mob`, shares two vtables per type, and is set up with `initMob`:
+##
+##     type ZombieEntity* = ref object of Mob
+##     let zombieMobVt = newMobVt()                 # `impl Mob for ZombieEntity`
+##     zombieMobVt.mobTick = proc(self: Mob; caller: EntityBase) {.closure.} = ...
+##     let zombieVt = mobEntityVt()                 # the blanket `impl<T: Mob> EntityBase for T`; shared, so copyVt to change it
+##     proc newZombie*(entity: Entity): ZombieEntity =
+##       let mobEntity = newMobEntity(entity)
+##       result = ZombieEntity(vt: zombieVt, entity: entity, mobVt: zombieMobVt, mobEntity: mobEntity)
+##       result.initMob(mobEntity, zombieMobVt, zombieVt)   # `entity` and the three vts are required in the constructor
+##       mobEntity.goalsSelector.addGoal(2'u8, newSwimGoal())
+##
+##   A goal derives from `Goal`, with one `GoalVt` per type:
+##
+##     type SwimGoal* = ref object of Goal
+##     let swimVt = newGoalVt()
+##     swimVt.canStart = proc(self: Goal; mob: Mob): bool {.closure.} = ...
+##     proc newSwimGoal*(): SwimGoal = SwimGoal(vt: swimVt)
+##
+##   `TypeId::of::<G>()` is the vtable: `selector.removeGoal(mob, swimVt)`.
+##
+##   Upstream's `MobEntity` methods and the `Mob` trait's methods have the same names as they did there.
+
+{.feature: "untyped".}
+
+import std/[math, options, syncio, tables]
+from ../../../generated/attributes import MOVEMENT_SPEED, STEP_HEIGHT, ATTACK_DAMAGE, FOLLOW_RANGE
+import ../../../generated/[damage_type, meta_data_type, particle, tag, tracked_data]
+import "../../../data/item_stack/mod"
+import ../../../protocol/java/client/play/[head_rot, update_entity_rot]
+import ../../../util/difficulty
+import ../../../util/math/mathmod
+import ../../../util/math/rustnum
+import ../../world/chunker
+import ../entitymod
+import pathfinder/pathfindermod
+
+export pathfindermod, entitymod
+
+type
+  Controls* = object
+    ## `Controls`. We actually only use the first 4 bits.
+    bits*: uint8
+
+  GoalVt* = ref object
+    ## `trait Goal`. Defaults are in `newGoalVt`.
+    canStart*: proc(self: Goal; mob: Mob): bool {.closure.}
+    shouldContinue*: proc(self: Goal; mob: Mob): bool {.closure.}
+    start*: proc(self: Goal; mob: Mob) {.closure.}
+    stop*: proc(self: Goal; mob: Mob) {.closure.}
+    tick*: proc(self: Goal; mob: Mob) {.closure.}
+    shouldRunEveryTick*: proc(self: Goal): bool {.closure.}
+    canStop*: proc(self: Goal): bool {.closure.}
+    getTickCount*: proc(self: Goal; ticks: int32): int32 {.closure.}
+    controls*: proc(self: Goal): Controls {.closure.}
+
+  Goal* = ref object of RootObj
+    ## `dyn Goal`.
+    vt*: GoalVt
+
+  PrioritizedGoal* = ref object
+    goal*: Goal
+    running*: bool
+    priority*: uint8
+
+  GoalSelector* = ref object
+    goalsByControl: seq[int]   ## `[usize; 4]`: indices into `goals`, -1 for no goal.
+    goals*: seq[PrioritizedGoal]
+    disabledControls: Controls
+
+  PredicateFn* = proc(livingEntity: LivingEntity; world: World): bool {.closure.}
+
+  TargetPredicate* = object
+    attackable*: bool
+    baseMaxDistance*: float64
+    respectsVisibility*: bool
+    useDistanceScalingFactor*: bool
+    predicate*: nil PredicateBox
+
+  PredicateBox* = ref object
+    fn*: PredicateFn
+
+  LookControl* = ref object
+    maxYawChange*: float32
+    maxPitchChange*: float32
+    lookAtTimer*: int32
+    position*: Vector3[float64]
+
+  MoveOperation* = enum
+    ## `move_control::Operation`.
+    moWait, moMoveTo, moStrafe, moJumping
+
+  MoveControlBase* = ref object of RootObj
+    ## `dyn MoveControlTrait`.
+    tickImpl*: proc(self: MoveControlBase; mob: Mob) {.closure.}
+
+  MoveControl* = ref object of MoveControlBase
+    wantedX*, wantedY*, wantedZ*: float64
+    speedModifier*: float64
+    strafeForwards*: float32
+    strafeRight*: float32
+    operation*: MoveOperation
+
+  MobEntity* = ref object
+    livingEntity*: LivingEntity
+    goalsSelector*: GoalSelector
+    targetSelector*: GoalSelector
+    navigator*: Navigator
+    target*: nil EntityBase
+    lookControl*: LookControl
+    moveControl*: MoveControlBase
+    positionTarget*: BlockPos
+    positionTargetRange*: int32
+    loveTicks*: int32
+    breedingCooldown*: int32
+    breeder*: Option[Uuid]
+    mobFlags*: uint8
+    lastSentYaw*, lastSentPitch*, lastSentHeadYaw*: uint8
+
+  MobVt* = ref object
+    ## `trait Mob` and `trait PathAwareEntity`. Defaults are in `newMobVt`.
+    getMaxLookYawChange*: proc(self: Mob): float32 {.closure.}
+    getMaxLookPitchChange*: proc(self: Mob): float32 {.closure.}
+    getMaxHeadRotation*: proc(self: Mob): float32 {.closure.}
+    getJobSite*: proc(self: Mob): Option[BlockPos] {.closure.}
+    getHome*: proc(self: Mob): Option[BlockPos] {.closure.}
+    isPathAware*: proc(self: Mob): bool {.closure.}  ## `get_path_aware_entity` is `Some`.
+    mobTick*: proc(self: Mob; caller: EntityBase) {.closure.}
+    postTick*: proc(self: Mob) {.closure.}
+    preDamage*: proc(self: Mob; damageType: DamageType; source: nil EntityBase): bool {.closure.}
+    onDamage*: proc(self: Mob; damageType: DamageType; source: nil EntityBase) {.closure.}
+    onEatingGrass*: proc(self: Mob) {.closure.}
+    modifyIncomingDamage*: proc(self: Mob; amount: float32; damageType: DamageType): float32 {.closure.}
+    canAttackWithOwner*: proc(self: Mob; target, owner: EntityBase): bool {.closure.}
+    getMobGravity*: proc(self: Mob): float64 {.closure.}
+    getMobYVelocityDrag*: proc(self: Mob): Option[float64] {.closure.}
+    setMobTarget*: proc(self: Mob; target: nil EntityBase) {.closure.}
+    mobInteract*: proc(self: Mob; player: Player; itemStack: var ItemStack): bool {.closure.}
+    mobPlayerCollision*: proc(self: Mob; player: Player) {.closure.}
+    getOwnerUuid*: proc(self: Mob): Option[Uuid] {.closure.}
+    isSitting*: proc(self: Mob): bool {.closure.}
+    getBaseExperienceReward*: proc(self: Mob): uint32 {.closure.}
+    mobInitDataTracker*: proc(self: Mob) {.closure.}
+    mobSetVariantName*: proc(self: Mob; name: string) {.closure.}
+    # `trait PathAwareEntity`
+    getPathfindingFavor*: proc(self: Mob; blockPos: BlockPos; world: World): float32 {.closure.}
+    isPanicking*: proc(self: Mob): bool {.closure.}
+    shouldFollowLeash*: proc(self: Mob): bool {.closure.}
+    onShortLeashTick*: proc(self: Mob) {.closure.}
+    beforeLeashTick*: proc(self: Mob) {.closure.}
+    getFollowLeashSpeed*: proc(self: Mob): float32 {.closure.}
+
+  Mob* = ref object of EntityBase
+    ## `dyn Mob`. See the note at the top of this file.
+    mobVt*: MobVt
+    mobEntity*: MobEntity
+
+var gEquipMobOnSpawn*: proc(mob: Mob; world: World) {.closure.} =
+  proc(mob: Mob; world: World) {.closure.} = discard
+  ## `equip_mob_on_spawn`, and the loot-pickup half of `init_data_tracker`. entity/mob/equipment sets it.
+var gGetSkyLightLevel*: proc(world: World; pos: BlockPos): uint8 {.closure.} =
+  proc(world: World; pos: BlockPos): uint8 {.closure.} = 15'u8
+var gGetBlockLightLevel*: proc(world: World; pos: BlockPos): Option[uint8] {.closure.} =
+  proc(world: World; pos: BlockPos): Option[uint8] {.closure.} = some(0'u8)
+
+const
+  ControlsMove* = Controls(bits: 1'u8)
+  ControlsLook* = Controls(bits: 2'u8)
+  ControlsJump* = Controls(bits: 4'u8)
+  ControlsTarget* = Controls(bits: 8'u8)
+  NoGoal = -1
+  # `MobEntity`'s flags
+  AiDisabledFlag = 1'u8
+  LeftHandedFlag = 2'u8
+  AttackingFlag = 4'u8
+  CanPickUpLootFlag = 8'u8
+  NightStart = 12542'i64  ## See upstream's note: data/minecraft/timeline/day.json, `monsters_burn`.
+  NightEnd = 23459'i64
+  MinDistance = 2.0'f64   ## target_predicate.rs: `MIN_DISTANCE`.
+
+# --- Controls ------------------------------------------------------------------------------------------------------------------
+
+proc controlsIter*(): array[4, Controls] = [ControlsMove, ControlsLook, ControlsJump, ControlsTarget]
+
+proc emptyControls*(): Controls = Controls(bits: 0'u8)
+
+proc set*(self: var Controls; control: Controls; val: bool) =
+  if val:
+    self.bits = self.bits or control.bits
+  else:
+    self.bits = self.bits and (not control.bits)
+
+proc get*(self, control: Controls): bool = (self.bits and control.bits) != 0'u8
+
+proc idx*(self: Controls): int =
+  ## `idx`
+  let iter = controlsIter()
+  for i in 0 ..< 4:
+    if self.get(iter[i]):
+      return i
+  echo "Controls::idx called with no controls set"
+  0
+
+proc `or`*(a, b: Controls): Controls = Controls(bits: a.bits or b.bits)
+
+proc toGoalTicks*(serverTicks: int32): int32 =
+  ## `to_goal_ticks`: `-(-server_ticks).div_euclid(2)`
+  let n = -serverTicks
+  let q = if n >= 0'i32: n div 2'i32 else: -((-n + 1'i32) div 2'i32)
+  -q
+
+# --- Goal: the trait's dispatch and defaults -------------------------------------------------------------------------------------
+
+proc canStart*(self: Goal; mob: Mob): bool = self.vt.canStart(self, mob)
+proc shouldContinue*(self: Goal; mob: Mob): bool = self.vt.shouldContinue(self, mob)
+proc start*(self: Goal; mob: Mob) = self.vt.start(self, mob)
+proc stop*(self: Goal; mob: Mob) = self.vt.stop(self, mob)
+proc tick*(self: Goal; mob: Mob) = self.vt.tick(self, mob)
+proc shouldRunEveryTick*(self: Goal): bool = self.vt.shouldRunEveryTick(self)
+proc canStop*(self: Goal): bool = self.vt.canStop(self)
+proc getTickCount*(self: Goal; ticks: int32): int32 = self.vt.getTickCount(self, ticks)
+proc controls*(self: Goal): Controls = self.vt.controls(self)
+
+proc newGoalVt*(): GoalVt =
+  ## The trait's default methods.
+  GoalVt(
+    canStart: proc(self: Goal; mob: Mob): bool {.closure.} = false,
+    shouldContinue: proc(self: Goal; mob: Mob): bool {.closure.} = false,
+    start: proc(self: Goal; mob: Mob) {.closure.} = discard,
+    stop: proc(self: Goal; mob: Mob) {.closure.} = discard,
+    tick: proc(self: Goal; mob: Mob) {.closure.} = discard,
+    shouldRunEveryTick: proc(self: Goal): bool {.closure.} = false,
+    canStop: proc(self: Goal): bool {.closure.} = true,
+    getTickCount: proc(self: Goal; ticks: int32): int32 {.closure.} =
+      if self.shouldRunEveryTick(): ticks else: toGoalTicks(ticks),
+    controls: proc(self: Goal): Controls {.closure.} = emptyControls())
+
+proc newPrioritizedGoal*(priority: uint8; goal: Goal): PrioritizedGoal =
+  PrioritizedGoal(goal: goal, running: false, priority: priority)
+
+proc canBeReplacedBy(self, goal: PrioritizedGoal): bool =
+  ## `can_be_replaced_by`. `self.can_stop()` on `PrioritizedGoal` is the trait's default true: its impl does not forward it.
+  goal.priority < self.priority
+
+proc startPrioritized(self: PrioritizedGoal; mob: Mob) =
+  ## `impl Goal for PrioritizedGoal`: `start`
+  if not self.running:
+    self.running = true
+    self.goal.start(mob)
+
+proc stopPrioritized(self: PrioritizedGoal; mob: Mob) =
+  ## `impl Goal for PrioritizedGoal`: `stop`
+  if self.running:
+    self.running = false
+    self.goal.stop(mob)
+
+# --- GoalSelector --------------------------------------------------------------------------------------------------------------------
+
+proc newGoalSelector*(): GoalSelector =
+  ## `GoalSelector::default`
+  GoalSelector(goalsByControl: @[NoGoal, NoGoal, NoGoal, NoGoal], goals: @[], disabledControls: emptyControls())
+
+proc addGoal*(self: GoalSelector; priority: uint8; goal: Goal) =
+  ## `add_goal`
+  self.goals.add(newPrioritizedGoal(priority, goal))
+
+proc removeGoal*(self: GoalSelector; mob: Mob; vt: GoalVt) =
+  ## `remove_goal`: `vt` stands for upstream's `TypeId::of::<G>()`.
+  var goalsToRemove: seq[int] = @[]
+  for i in 0 ..< self.goals.len:
+    if self.goals[i].goal.vt == vt:
+      if self.goals[i].running:
+        stopPrioritized(self.goals[i], mob)
+      goalsToRemove.add(i)
+  for goalIdx in goalsToRemove:
+    # `swap_remove`. Upstream walks the indices it collected before any swap, and that is kept.
+    if goalIdx < self.goals.len:
+      let last = self.goals[self.goals.len - 1]
+      self.goals[goalIdx] = last
+      self.goals.setLen(self.goals.len - 1)
+    for s in 0 ..< 4:
+      if self.goalsByControl[s] == NoGoal:
+        continue
+      # Update the idx
+      if self.goalsByControl[s] == goalIdx:
+        self.goalsByControl[s] = NoGoal
+      elif self.goalsByControl[s] > goalIdx:
+        self.goalsByControl[s] -= 1
+
+proc usesAny(prioritizedGoal: PrioritizedGoal; controls: Controls): bool =
+  ## `uses_any`
+  let goalControls = prioritizedGoal.goal.controls()
+  let allControls = controlsIter()
+  for control in allControls:
+    if controls.get(control) and goalControls.get(control):
+      return true
+  false
+
+proc canReplaceAll(self: GoalSelector; goal: PrioritizedGoal): bool =
+  ## `can_replace_all`
+  let controls = goal.goal.controls()
+  let allControls = controlsIter()
+  for control in allControls:
+    if controls.get(control):
+      let goalIdx = self.goalsByControl[control.idx()]
+      if goalIdx != NoGoal and not self.goals[goalIdx].canBeReplacedBy(goal):
+        return false
+  true
+
+proc tickGoals*(self: GoalSelector; mob: Mob; tickAll: bool) =
+  ## `tick_goals`
+  for prioritizedGoal in self.goals:
+    if prioritizedGoal.running and (tickAll or prioritizedGoal.goal.shouldRunEveryTick()):
+      prioritizedGoal.goal.tick(mob)
+
+proc tick*(self: GoalSelector; mob: Mob) =
+  ## `tick`
+  for prioritizedGoal in self.goals:
+    if prioritizedGoal.running and (usesAny(prioritizedGoal, self.disabledControls) or
+        not prioritizedGoal.goal.shouldContinue(mob)):
+      stopPrioritized(prioritizedGoal, mob)
+  for s in 0 ..< 4:
+    if self.goalsByControl[s] != NoGoal and not self.goals[self.goalsByControl[s]].running:
+      self.goalsByControl[s] = NoGoal
+  for i in 0 ..< self.goals.len:
+    let candidate = self.goals[i]
+    if not candidate.running and not usesAny(candidate, self.disabledControls) and self.canReplaceAll(candidate) and
+        candidate.goal.canStart(mob):
+      let controls = candidate.goal.controls()
+      let allControls = controlsIter()
+      for control in allControls:
+        if controls.get(control):
+          # `get_goal_by_control`: `goals.get_mut(usize::MAX)` is `None`.
+          let held = self.goalsByControl[control.idx()]
+          if held != NoGoal:
+            stopPrioritized(self.goals[held], mob)
+          self.goalsByControl[control.idx()] = i
+      startPrioritized(candidate, mob)
+  self.tickGoals(mob, true)
+
+proc disableControl*(self: GoalSelector; control: Controls) = self.disabledControls.set(control, true)
+proc enableControl*(self: GoalSelector; control: Controls) = self.disabledControls.set(control, false)
+proc setControlEnabled*(self: GoalSelector; control: Controls; enabled: bool) = self.disabledControls.set(control, not enabled)
+
+# --- TargetPredicate ------------------------------------------------------------------------------------------------------------------
+
+proc newTargetPredicate(attackable: bool): TargetPredicate =
+  TargetPredicate(attackable: attackable, baseMaxDistance: -1.0'f64, respectsVisibility: true,
+    useDistanceScalingFactor: true, predicate: nil)
+
+proc createAttackable*(): TargetPredicate = newTargetPredicate(true)
+proc createNonAttackable*(): TargetPredicate = newTargetPredicate(false)
+
+proc setBaseMaxDistance*(self: TargetPredicate; baseMaxDistance: float64): TargetPredicate =
+  result = self
+  result.baseMaxDistance = baseMaxDistance
+
+proc ignoreVisibility*(self: TargetPredicate): TargetPredicate =
+  result = self
+  result.respectsVisibility = false
+
+proc ignoreDistanceScalingFactor*(self: TargetPredicate): TargetPredicate =
+  result = self
+  result.useDistanceScalingFactor = false
+
+proc setPredicate*(self: var TargetPredicate; predicate: PredicateFn) =
+  self.predicate = PredicateBox(fn: predicate)
+
+proc test*(self: TargetPredicate; world: World; tester: nil LivingEntity; target: LivingEntity): bool =
+  ## `test`. As upstream, `predicate` is stored and never consulted here.
+  if tester != nil and tester == target:
+    return false
+  if not target.isPartOfGame():
+    return false
+  if self.attackable and (not target.canTakeDamage() or world.levelInfo.difficulty == Peaceful):
+    return false
+  if tester != nil and self.baseMaxDistance > 0.0'f64:
+    # TODO upstream: use distance_scaling_factor from target
+    let maxDist = max(self.baseMaxDistance, MinDistance)
+    let distSq = tester.entity.pos.squaredDistanceToVec(target.entity.pos)
+    if distSq > maxDist * maxDist:
+      return false
+    # TODO upstream: visibility check (needs world raycast)
+  true
+
+# --- Controls: look and move -----------------------------------------------------------------------------------------------------------
+
+proc changeAngle*(start, stop, maxChange: float32): float32 =
+  ## `Control::change_angle`
+  let i = subtractAngles(start, stop)
+  let j = clamp(i, -maxChange, maxChange)
+  start + j
+
+proc getMaxLookYawChange*(self: Mob): float32 = self.mobVt.getMaxLookYawChange(self)
+proc getMaxLookPitchChange*(self: Mob): float32 = self.mobVt.getMaxLookPitchChange(self)
+proc getMaxHeadRotation*(self: Mob): float32 = self.mobVt.getMaxHeadRotation(self)
+proc getMobEntity*(self: Mob): MobEntity {.inline.} = self.mobEntity
+
+proc newLookControl*(): LookControl =
+  LookControl(maxYawChange: 0.0'f32, maxPitchChange: 0.0'f32, lookAtTimer: 0'i32,
+    position: Vector3[float64](x: 0.0, y: 0.0, z: 0.0))
+
+proc lookAtWithRange*(self: LookControl; x, y, z: float64; maxYawChange, maxPitchChange: float32) =
+  ## `look_at_with_range`
+  self.position = Vector3[float64](x: x, y: y, z: z)
+  self.maxYawChange = maxYawChange
+  self.maxPitchChange = maxPitchChange
+  self.lookAtTimer = 2'i32
+
+proc lookAt*(self: LookControl; mob: Mob; x, y, z: float64) =
+  self.lookAtWithRange(x, y, z, mob.getMaxLookYawChange(), mob.getMaxLookPitchChange())
+
+proc lookAtPosition*(self: LookControl; mob: Mob; position: Vector3[float64]) =
+  self.lookAt(mob, position.x, position.y, position.z)
+
+proc lookAtEntity*(self: LookControl; mob: Mob; entity: EntityBase) =
+  ## `look_at_entity`
+  let pos = getEyePos(entity.entity)
+  self.lookAt(mob, pos.x, pos.y, pos.z)
+
+proc lookAtEntityWithRange*(self: LookControl; entity: EntityBase; maxYawChange, maxPitchChange: float32) =
+  ## `look_at_entity_with_range`
+  let pos = entity.entity.pos
+  self.lookAtWithRange(pos.x, entity.entity.getEyeY(), pos.z, maxYawChange, maxPitchChange)
+
+proc getTargetPitch(self: LookControl; mob: MobEntity): Option[float32] =
+  ## `get_target_pitch`
+  let position = self.position
+  let mobPosition = mob.livingEntity.entity.pos
+  let d = position.x - mobPosition.x
+  let e = position.y - mob.livingEntity.entity.getEyeY()
+  let f = position.z - mobPosition.z
+  let g = hypot(d, f)
+  if abs(e) <= 1.0e-5'f64 and abs(g) <= 1.0e-5'f64:
+    none[float32]()
+  else:
+    some(-toDegreesF32(float32(arctan2(e, g))))
+
+proc getTargetYaw(self: LookControl; mob: MobEntity): Option[float32] =
+  ## `get_target_yaw`
+  let position = self.position
+  let mobPosition = mob.livingEntity.entity.pos
+  let d = position.x - mobPosition.x
+  let e = position.z - mobPosition.z
+  if abs(e) <= 1.0e-5'f64 and abs(d) <= 1.0e-5'f64:
+    none[float32]()
+  else:
+    some(toDegreesF32(float32(arctan2(e, d))) - 90.0'f32)
+
+proc clampHeadYaw(mob: Mob) =
+  ## `clamp_head_yaw`
+  let mobEntity = mob.getMobEntity()
+  if not mobEntity.navigator.isIdle():
+    let entity = mobEntity.livingEntity.entity
+    entity.headYaw = clampAngle(entity.headYaw, entity.bodyYaw, mob.getMaxHeadRotation())
+
+proc tick*(self: LookControl; mob: Mob) =
+  ## `tick`. `should_stay_horizontal` is `true`.
+  let entity = mob.entity
+  entity.setPitch(0.0'f32)
+  if self.lookAtTimer > 0'i32:
+    self.lookAtTimer -= 1'i32
+    let yaw = self.getTargetYaw(mob.getMobEntity())
+    if yaw.isSome:
+      entity.headYaw = changeAngle(entity.headYaw, yaw.unsafeGet, self.maxYawChange)
+    let pitch = self.getTargetPitch(mob.getMobEntity())
+    if pitch.isSome:
+      entity.setPitch(changeAngle(entity.pitch, pitch.unsafeGet, self.maxPitchChange))
+  else:
+    entity.headYaw = changeAngle(entity.headYaw, entity.bodyYaw, 10.0'f32)
+  clampHeadYaw(mob)
+
+proc moveControlTick(self: MoveControlBase; mob: Mob) =
+  ## `impl MoveControlTrait for MoveControl`: `tick`
+  let c = MoveControl(self)
+  let mobEntity = mob.getMobEntity()
+  let livingEntity = mobEntity.livingEntity
+  let entity = livingEntity.entity
+  if c.operation == moStrafe:
+    # TODO upstream: is_walkable check
+    livingEntity.movementInput = Vector3[float64](x: float64(c.strafeRight), y: 0.0, z: float64(c.strafeForwards))
+    # Vanilla sets speed here too
+    c.operation = moWait
+  elif c.operation == moMoveTo:
+    c.operation = moWait
+    let pos = entity.pos
+    let xd = c.wantedX - pos.x
+    let zd = c.wantedZ - pos.z
+    let yd = c.wantedY - pos.y
+    let dd = xd * xd + yd * yd + zd * zd
+    if dd < 2.5000003e-7'f64:
+      livingEntity.movementInput = Vector3[float64](x: 0.0, y: 0.0, z: 0.0)
+      return
+    let yRotD = float32(radToDeg(arctan2(zd, xd))) - 90.0'f32
+    entity.yaw = changeAngle(entity.yaw, yRotD, 90.0'f32)
+    let movementSpeed = livingEntity.getAttributeValue(MOVEMENT_SPEED)
+    let speed = c.speedModifier * movementSpeed
+    livingEntity.movementInput = Vector3[float64](x: 0.0, y: 0.0, z: speed)
+    # TODO upstream: Jump if needed (based on collision and height difference)
+    let stepHeight = livingEntity.getAttributeValue(STEP_HEIGHT)
+    if yd > stepHeight and xd * xd + zd * zd < max(1.0'f64, float64(entity.entityDimension.width)):
+      livingEntity.jumping = true
+      c.operation = moJumping
+  elif c.operation == moJumping:
+    let movementSpeed = livingEntity.getAttributeValue(MOVEMENT_SPEED)
+    let speed = c.speedModifier * movementSpeed
+    livingEntity.movementInput = Vector3[float64](x: 0.0, y: 0.0, z: speed)
+    if entity.onGround:
+      c.operation = moWait
+  # Navigator owns movement input while this controller waits.
+
+proc newMoveControl*(): MoveControl =
+  ## `MoveControl::default`
+  MoveControl(tickImpl: moveControlTick, wantedX: 0.0'f64, wantedY: 0.0'f64, wantedZ: 0.0'f64, speedModifier: 0.0'f64,
+    strafeForwards: 0.0'f32, strafeRight: 0.0'f32, operation: moWait)
+
+proc hasWanted*(self: MoveControl): bool = self.operation == moMoveTo
+proc getSpeedModifier*(self: MoveControl): float64 = self.speedModifier
+
+proc setWantedPosition*(self: MoveControl; x, y, z, speedModifier: float64) =
+  ## `set_wanted_position`
+  self.wantedX = x
+  self.wantedY = y
+  self.wantedZ = z
+  self.speedModifier = speedModifier
+  if self.operation != moJumping:
+    self.operation = moMoveTo
+
+proc strafe*(self: MoveControl; forwards, right: float32) =
+  self.operation = moStrafe
+  self.strafeForwards = forwards
+  self.strafeRight = right
+  self.speedModifier = 0.25'f64
+
+# --- MobEntity ------------------------------------------------------------------------------------------------------------------------
+
+proc newMobEntity*(entity: Entity): MobEntity =
+  ## `MobEntity::new`
+  let moveControl: MoveControlBase = newMoveControl()
+  MobEntity(livingEntity: newLivingEntity(entity), goalsSelector: newGoalSelector(), targetSelector: newGoalSelector(),
+    navigator: newNavigator(), target: nil, lookControl: newLookControl(), moveControl: moveControl,
+    positionTarget: BlockPos(vec: Vector3[int32](x: 0'i32, y: 0'i32, z: 0'i32)), positionTargetRange: -1'i32,
+    loveTicks: 0'i32, breedingCooldown: 0'i32, breeder: none[Uuid](), mobFlags: 0'u8, lastSentYaw: 0'u8,
+    lastSentPitch: 0'u8, lastSentHeadYaw: 0'u8)
+
+proc isInPositionTargetRangePos*(self: MobEntity; blockPos: BlockPos): bool =
+  ## `is_in_position_target_range_pos`
+  let positionTargetRange = self.positionTargetRange
+  if positionTargetRange == -1'i32:
+    true
+  else:
+    self.positionTarget.squaredDistance(blockPos) < positionTargetRange * positionTargetRange
+
+proc isInPositionTargetRange*(self: MobEntity): bool =
+  self.isInPositionTargetRangePos(self.livingEntity.entity.blockPos)
+
+proc setMobFlag(self: MobEntity; flag: uint8; value: bool) =
+  ## `set_mob_flag`
+  let oldB = self.mobFlags
+  let newB = if value: oldB or flag else: oldB and (not flag)
+  if newB != oldB:
+    self.mobFlags = newB
+    self.livingEntity.entity.sendMetaData(TrackedData_MOB_FLAGS_ID, BYTE, newB)
+
+proc setAttacking*(self: MobEntity; attacking: bool) = self.setMobFlag(AttackingFlag, attacking)
+proc isAttacking*(self: MobEntity): bool = (self.mobFlags and AttackingFlag) != 0'u8
+proc setLeftHanded*(self: MobEntity; leftHanded: bool) = self.setMobFlag(LeftHandedFlag, leftHanded)
+proc canPickUpLoot*(self: MobEntity): bool = (self.mobFlags and CanPickUpLootFlag) != 0'u8
+proc setCanPickUpLoot*(self: MobEntity; value: bool) = self.setMobFlag(CanPickUpLootFlag, value)
+proc isLeftHanded*(self: MobEntity): bool = (self.mobFlags and LeftHandedFlag) != 0'u8
+proc setNoAi*(self: MobEntity; noAi: bool) = self.setMobFlag(AiDisabledFlag, noAi)
+proc isNoAi*(self: MobEntity): bool = (self.mobFlags and AiDisabledFlag) != 0'u8
+proc isInLove*(self: MobEntity): bool = self.loveTicks > 0'i32
+
+proc setLoveTicks*(self: MobEntity; ticks: int32; breeder: Option[Uuid]) =
+  self.loveTicks = ticks
+  self.breeder = breeder
+
+proc resetLoveTicks*(self: MobEntity) = self.loveTicks = 0'i32
+
+proc isBreedingReady*(self: MobEntity): bool =
+  self.livingEntity.entity.age >= 0'i32 and self.breedingCooldown <= 0'i32
+
+proc getAttackBox(self: MobEntity; attackRange: float64): BoundingBox =
+  ## `get_attack_box`
+  let vehicle = self.livingEntity.entity.vehicle
+  var baseBox = self.livingEntity.entity.boundingBox
+  if vehicle != nil:
+    let vehicleBox = vehicle.entity.boundingBox
+    let myBox = baseBox
+    baseBox = BoundingBox(
+      min: Vector3[float64](x: min(myBox.min.x, vehicleBox.min.x), y: myBox.min.y, z: min(myBox.min.z, vehicleBox.min.z)),
+      max: Vector3[float64](x: max(myBox.max.x, vehicleBox.max.x), y: myBox.max.y, z: max(myBox.max.z, vehicleBox.max.z)))
+  baseBox.expand(attackRange, 0.0'f64, attackRange)
+
+proc isInAttackRange*(self: MobEntity; target: EntityBase): bool =
+  ## `is_in_attack_range`
+  const DefaultAttackRange = 0.828_427_12'f64 # sqrt(2.04) - 0.6
+  # TODO upstream: DataComponent lookup for ATTACK_RANGE. `min_range` is 0, so only the max range decides.
+  self.getAttackBox(DefaultAttackRange).intersects(target.entity.boundingBox)
+
+proc isDarkEnoughToSpawn*(world: World; pos: BlockPos; isThundering: bool): bool =
+  ## `is_dark_enough_to_spawn`
+  let skyLight = gGetSkyLightLevel(world, pos)
+  if int32(skyLight) > randomRange(0'i32, 32'i32):
+    return false
+  let dimension = world.dimension
+  let blockLightLimit = dimension.monsterSpawnBlockLightLimit
+  let blockLightOpt = gGetBlockLightLevel(world, pos)
+  let blockLight = if blockLightOpt.isSome: blockLightOpt.unsafeGet else: 0'u8
+  if blockLightLimit < 15'u8 and blockLight > blockLightLimit:
+    return false
+  let sky = if isThundering: (if skyLight >= 10'u8: skyLight - 10'u8 else: 0'u8) else: skyLight
+  let currentBrightness = max(sky, blockLight)
+  # Upstream seeds a fresh generator here: nothing depends on the sequence. Every dimension in the data has a constant
+  # or a uniform provider here.
+  let provider = dimension.monsterSpawnLightLevel
+  let limit = if provider.kind == IntProviderKind.Uniform: randomRangeInclusive(provider.minInclusive, provider.maxInclusive)
+    else: provider.value
+  int32(currentBrightness) <= limit
+
+proc checkMonsterSpawnRules*(world: World; pos: BlockPos; isThundering: bool): bool =
+  ## `check_monster_spawn_rules`
+  if world.levelInfo.difficulty == Peaceful:
+    return false
+  if not isDarkEnoughToSpawn(world, pos, isThundering):
+    return false
+  true
+
+proc tryAttack*(self: MobEntity; caller, target: EntityBase) =
+  ## `try_attack`
+  if self.livingEntity.dead:
+    return
+  let attackDamage = float32(self.livingEntity.getAttributeValue(ATTACK_DAMAGE))
+  let damaged = target.damageWithContext(target, attackDamage, MOB_ATTACK, none[Vector3[float64]](), caller, caller)
+  if damaged:
+    self.livingEntity.lastAttackingId = target.entity.entityId
+    self.livingEntity.lastAttackTime = self.livingEntity.entity.age
+
+proc isSunBurnTick(self: MobEntity): bool =
+  ## `is_sun_burn_tick`
+  let entity = self.livingEntity.entity
+  let world = entity.world
+  let dayTime = world.levelTime.timeOfDay mod 24000'i64
+  if dayTime >= NightStart and dayTime <= NightEnd:
+    return false
+  # Vanilla: getLightLevelDependentMagicValue(): sky light at eye pos, scaled 0-1.
+  let eyeBlockPos = getEyePos(entity).toBlockPos()
+  let brightness = float32(gGetSkyLightLevel(world, eyeBlockPos)) / 15.0'f32
+  if brightness <= 0.5'f32:
+    return false
+  let isInNonBurnable = entity.touchingWater or world.weather.raining or entity.isInPowderSnow or entity.wasInPowderSnow
+  if isInNonBurnable:
+    return false
+  let pos = entity.pos
+  let topY = world.getTopBlock(Vector2[int32](x: asI32(pos.x), y: asI32(pos.z)))
+  if asI32(entity.getEyeY()) < topY:
+    return false
+  randomF32() * 30.0'f32 < (brightness - 0.4'f32) * 2.0'f32
+
+proc tickSunBurn*(self: MobEntity) =
+  ## `tick_sun_burn`
+  if not hasTag(self.livingEntity.entity.entityType.id, EntityType_MINECRAFT_BURN_IN_DAYLIGHT):
+    return
+  if not self.isSunBurnTick():
+    return
+  # `apply_sun_burn`
+  self.livingEntity.entity.setOnFireFor(8.0'f32)
+
+proc mobInteractDefault*(self: MobEntity; player: Player; itemStack: var ItemStack): bool =
+  ## `MobEntity::mob_interact`
+  let entity = self.livingEntity.entity
+  # If already leashed to player, right-clicking unleashes the mob
+  if entity.leashedTo != nil:
+    entity.unleash()
+    gDropStack(entity.world, entity.blockPos, newItemStack(1'u8, ITEM_LEAD))
+    return true
+  # If holding a lead, leash the mob to the player
+  if itemStack.item.registryKey == "lead" or itemStack.item.registryKey == "minecraft:lead":
+    let diff = entity.pos - player.pos
+    let distSq = diff.lengthSquared()
+    if distSq <= LeashSnapDistance * LeashSnapDistance:
+      entity.leashTo(playerBase(player))
+      if player.gamemode != Creative:
+        itemStack.decrement(1'u8)
+      return true
+  false
+
+# --- Mob: the trait's dispatch and defaults --------------------------------------------------------------------------------------------
+
+proc getJobSite*(self: Mob): Option[BlockPos] = self.mobVt.getJobSite(self)
+proc getHome*(self: Mob): Option[BlockPos] = self.mobVt.getHome(self)
+proc isPathAware*(self: Mob): bool = self.mobVt.isPathAware(self)
+proc mobTick*(self: Mob; caller: EntityBase) = self.mobVt.mobTick(self, caller)
+proc postTick*(self: Mob) = self.mobVt.postTick(self)
+proc preDamage*(self: Mob; damageType: DamageType; source: nil EntityBase): bool = self.mobVt.preDamage(self, damageType, source)
+proc onDamage*(self: Mob; damageType: DamageType; source: nil EntityBase) = self.mobVt.onDamage(self, damageType, source)
+proc onEatingGrass*(self: Mob) = self.mobVt.onEatingGrass(self)
+proc modifyIncomingDamage*(self: Mob; amount: float32; damageType: DamageType): float32 =
+  self.mobVt.modifyIncomingDamage(self, amount, damageType)
+proc canAttackWithOwner*(self: Mob; target, owner: EntityBase): bool = self.mobVt.canAttackWithOwner(self, target, owner)
+proc getMobGravity*(self: Mob): float64 = self.mobVt.getMobGravity(self)
+proc getMobYVelocityDrag*(self: Mob): Option[float64] = self.mobVt.getMobYVelocityDrag(self)
+proc setMobTarget*(self: Mob; target: nil EntityBase) = self.mobVt.setMobTarget(self, target)
+proc mobInteract*(self: Mob; player: Player; itemStack: var ItemStack): bool = self.mobVt.mobInteract(self, player, itemStack)
+proc mobPlayerCollision*(self: Mob; player: Player) = self.mobVt.mobPlayerCollision(self, player)
+proc getOwnerUuid*(self: Mob): Option[Uuid] = self.mobVt.getOwnerUuid(self)
+proc isSitting*(self: Mob): bool = self.mobVt.isSitting(self)
+proc mobInitDataTracker*(self: Mob) = self.mobVt.mobInitDataTracker(self)
+proc mobSetVariantName*(self: Mob; name: string) = self.mobVt.mobSetVariantName(self, name)
+proc getPathfindingFavor*(self: Mob; blockPos: BlockPos; world: World): float32 =
+  self.mobVt.getPathfindingFavor(self, blockPos, world)
+proc canSpawn*(self: Mob; world: World): bool =
+  ## `PathAwareEntity::can_spawn`
+  self.getPathfindingFavor(self.mobEntity.livingEntity.entity.blockPos, world) >= 0.0'f32
+proc isNavigation*(self: Mob): bool =
+  ## `PathAwareEntity::is_navigation`
+  not self.mobEntity.navigator.isIdle()
+proc shouldFollowLeash*(self: Mob): bool = self.mobVt.shouldFollowLeash(self)
+proc onShortLeashTick*(self: Mob) = self.mobVt.onShortLeashTick(self)
+proc beforeLeashTick*(self: Mob) = self.mobVt.beforeLeashTick(self)
+proc getFollowLeashSpeed*(self: Mob): float32 = self.mobVt.getFollowLeashSpeed(self)
+
+proc newMobVt*(): MobVt =
+  ## The trait's default methods.
+  MobVt(
+    getMaxLookYawChange: proc(self: Mob): float32 {.closure.} = 10.0'f32,
+    getMaxLookPitchChange: proc(self: Mob): float32 {.closure.} = 40.0'f32,
+    getMaxHeadRotation: proc(self: Mob): float32 {.closure.} = 75.0'f32,
+    getJobSite: proc(self: Mob): Option[BlockPos] {.closure.} = none[BlockPos](),
+    getHome: proc(self: Mob): Option[BlockPos] {.closure.} = none[BlockPos](),
+    isPathAware: proc(self: Mob): bool {.closure.} = false,
+    mobTick: proc(self: Mob; caller: EntityBase) {.closure.} = discard,
+    postTick: proc(self: Mob) {.closure.} = discard,
+    preDamage: proc(self: Mob; damageType: DamageType; source: nil EntityBase): bool {.closure.} = true,
+    onDamage: proc(self: Mob; damageType: DamageType; source: nil EntityBase) {.closure.} = discard,
+    onEatingGrass: proc(self: Mob) {.closure.} = discard,
+    modifyIncomingDamage: proc(self: Mob; amount: float32; damageType: DamageType): float32 {.closure.} = amount,
+    canAttackWithOwner: proc(self: Mob; target, owner: EntityBase): bool {.closure.} = true,
+    getMobGravity: proc(self: Mob): float64 {.closure.} = getAttributeValue(self.mobEntity.livingEntity, GRAVITY),
+    getMobYVelocityDrag: proc(self: Mob): Option[float64] {.closure.} = none[float64](),
+    setMobTarget: proc(self: Mob; target: nil EntityBase) {.closure.} = self.mobEntity.target = target,
+    mobInteract: proc(self: Mob; player: Player; itemStack: var ItemStack): bool {.closure.} =
+      mobInteractDefault(self.mobEntity, player, itemStack),
+    mobPlayerCollision: proc(self: Mob; player: Player) {.closure.} = discard,
+    getOwnerUuid: proc(self: Mob): Option[Uuid] {.closure.} = none[Uuid](),
+    isSitting: proc(self: Mob): bool {.closure.} = false,
+    getBaseExperienceReward: proc(self: Mob): uint32 {.closure.} = self.entity.entityType.experienceReward,
+    mobInitDataTracker: proc(self: Mob) {.closure.} =
+      if self.entity.age < 0'i32:
+        self.entity.sendMetaData(TrackedData_BABY_ID, BOOLEAN, true),
+    mobSetVariantName: proc(self: Mob; name: string) {.closure.} = discard,
+    getPathfindingFavor: proc(self: Mob; blockPos: BlockPos; world: World): float32 {.closure.} = 0.0'f32,
+    isPanicking: proc(self: Mob): bool {.closure.} = false,
+    shouldFollowLeash: proc(self: Mob): bool {.closure.} = true,
+    onShortLeashTick: proc(self: Mob) {.closure.} = discard,
+    beforeLeashTick: proc(self: Mob) {.closure.} = discard,
+    getFollowLeashSpeed: proc(self: Mob): float32 {.closure.} = 1.0'f32)
+
+proc mobTickImpl(self: Mob; caller: EntityBase; server: Server) =
+  ## `impl<T: Mob> EntityBase for T`: `tick`
+  let mobEntity = self.mobEntity
+  mobEntity.livingEntity.entity.tickLeash()
+  mobEntity.tickSunBurn()
+  if mobEntity.breedingCooldown > 0'i32:
+    mobEntity.breedingCooldown -= 1'i32
+  if mobEntity.loveTicks > 0'i32:
+    let ticks = mobEntity.loveTicks
+    mobEntity.loveTicks = ticks - 1'i32
+    if ticks mod 10'i32 == 0'i32:
+      let entity = mobEntity.livingEntity.entity
+      entity.world.spawnParticle(entity.pos + Vector3[float64](x: 0.0, y: float64(entity.height()) + 0.5'f64, z: 0.0),
+        Vector3[float64](x: 0.5'f64, y: 0.5'f64, z: 0.5'f64), 1.0'f32, 1'i32, ptHeart)
+  self.mobTick(caller)
+  let age = mobEntity.livingEntity.entity.age
+  let entityId = mobEntity.livingEntity.entity.entityId
+  # Perform AI logic
+  if (age + entityId) mod 2'i32 != 0'i32 and age > 1'i32:
+    mobEntity.targetSelector.tickGoals(self, false)
+    mobEntity.goalsSelector.tickGoals(self, false)
+  else:
+    mobEntity.targetSelector.tick(self)
+    mobEntity.goalsSelector.tick(self)
+  mobEntity.navigator.tick(mobEntity.livingEntity)
+  mobEntity.lookControl.tick(self)
+  mobEntity.moveControl.tickImpl(mobEntity.moveControl, self)
+  livingTick(mobEntity.livingEntity, caller, server)
+  self.postTick()
+  let entity = mobEntity.livingEntity.entity
+  let yaw = angleToU8(entity.yaw)
+  let pitch = angleToU8(entity.pitch)
+  let headYaw = angleToU8(entity.headYaw)
+  # `abs_diff(..) >= 1` on a `u8` is `!=`.
+  if yaw != mobEntity.lastSentYaw or pitch != mobEntity.lastSentPitch:
+    entity.world.broadcastToChunk(entity.chunkPos, CUpdateEntityRot(entityId: newVarInt(entity.entityId), yaw: yaw,
+      pitch: pitch, onGround: entity.onGround))
+    mobEntity.lastSentYaw = yaw
+    mobEntity.lastSentPitch = pitch
+  if headYaw != mobEntity.lastSentHeadYaw:
+    entity.world.broadcastToChunk(entity.chunkPos, CHeadRot(entityId: newVarInt(entity.entityId), headYaw: headYaw))
+    mobEntity.lastSentHeadYaw = headYaw
+
+proc newMobEntityVt*(): EntityVt =
+  ## The blanket `impl<T: Mob + Send + 'static> EntityBase for T`.
+  result = copyVt(livingVt())
+  result.initDataTracker = proc(self: EntityBase) {.closure.} =
+    let mob = Mob(self)
+    mob.mobInitDataTracker()
+    gEquipMobOnSpawn(mob, mob.mobEntity.livingEntity.entity.world)
+  result.setVariantName = proc(self: EntityBase; name: string) {.closure.} =
+    let mob = Mob(self)
+    mob.mobSetVariantName(name)
+  result.tick = proc(self, caller: EntityBase; server: Server) {.closure.} =
+    let mob = Mob(self)
+    mobTickImpl(mob, caller, server)
+  result.isCollidable = proc(self: EntityBase; entity: nil EntityBase): bool {.closure.} = true
+  result.canHit = proc(self: EntityBase): bool {.closure.} = true
+  result.damageWithContext = proc(self, caller: EntityBase; amount0: float32; damageType: DamageType;
+      position: Option[Vector3[float64]]; source, cause: nil EntityBase): bool {.closure.} =
+    let mob = Mob(self)
+    # pre_damage hook: allows mobs to dodge/cancel damage (e.g. enderman projectile dodge)
+    if not mob.preDamage(damageType, source):
+      return false
+    # Mob-specific damage modifier (e.g. shulker armor when closed).
+    let amount = mob.modifyIncomingDamage(amount0, damageType)
+    let damaged = damageWithContextImpl(mob.mobEntity.livingEntity, caller, amount, damageType, position, source, cause)
+    if damaged:
+      mob.onDamage(damageType, source)
+    damaged
+  result.interact = proc(self: EntityBase; player: Player; itemStack: var ItemStack): bool {.closure.} =
+    let mob = Mob(self)
+    mob.mobInteract(player, itemStack)
+  result.onPlayerCollision = proc(self: EntityBase; player: Player) {.closure.} =
+    let mob = Mob(self)
+    mob.mobPlayerCollision(player)
+  result.isInLove = proc(self: EntityBase): bool {.closure.} =
+    let mob = Mob(self)
+    mob.mobEntity.isInLove()
+  result.isBreedingReady = proc(self: EntityBase): bool {.closure.} =
+    let mob = Mob(self)
+    mob.mobEntity.isBreedingReady()
+  result.resetLove = proc(self: EntityBase) {.closure.} =
+    let mob = Mob(self)
+    mob.mobEntity.resetLoveTicks()
+  result.setBreedingCooldown = proc(self: EntityBase; ticks: int32) {.closure.} =
+    let mob = Mob(self)
+    mob.mobEntity.breedingCooldown = ticks
+  result.isPanicking = proc(self: EntityBase): bool {.closure.} =
+    let mob = Mob(self)
+    mob.isPathAware() and mob.mobVt.isPanicking(mob)
+  result.getJobSitePos = proc(self: EntityBase): Option[BlockPos] {.closure.} =
+    let mob = Mob(self)
+    mob.getJobSite()
+  result.getHomePos = proc(self: EntityBase): Option[BlockPos] {.closure.} =
+    let mob = Mob(self)
+    mob.getHome()
+  result.getGravity = proc(self: EntityBase): float64 {.closure.} =
+    let mob = Mob(self)
+    mob.getMobGravity()
+  result.getYVelocityDrag = proc(self: EntityBase): Option[float64] {.closure.} =
+    let mob = Mob(self)
+    mob.getMobYVelocityDrag()
+  result.getExperienceReward = proc(self: EntityBase; killer: nil EntityBase): uint32 {.closure.} =
+    let mob = Mob(self)
+    if self.entity.age < 0'i32:
+      return 0'u32
+    # TODO upstream: apply enchantment processing like in vanilla
+    mob.mobVt.getBaseExperienceReward(mob)
+  result.getBaseExperienceReward = proc(self: EntityBase): uint32 {.closure.} =
+    let mob = Mob(self)
+    mob.mobVt.getBaseExperienceReward(mob)
+
+let gMobEntityVt: EntityVt = newMobEntityVt()
+let gDefaultMobVt: MobVt = newMobVt()
+
+proc mobEntityVt*(): EntityVt = gMobEntityVt
+  ## The shared blanket vtable. `copyVt` it to change anything for one mob type.
+
+proc defaultMobVt*(): MobVt = gDefaultMobVt
+
+proc initMob*(self: Mob; mobEntity: MobEntity; mobVt: MobVt; vt: EntityVt) =
+  ## Fills a derived `Mob`: what a concrete mob's constructor calls.
+  self.mobEntity = mobEntity
+  self.mobVt = mobVt
+  self.initLivingBase(mobEntity.livingEntity, vt)
+
+proc newPlainMob*(entity: Entity): Mob =
+  ## A mob with every default, for a type with no state and no overrides.
+  let mobEntity = newMobEntity(entity)
+  result = Mob(vt: gMobEntityVt, entity: entity, mobVt: gDefaultMobVt, mobEntity: mobEntity)
+  result.initMob(mobEntity, gDefaultMobVt, gMobEntityVt)

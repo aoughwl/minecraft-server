@@ -1,222 +1,1065 @@
-## `BlockBehaviour`: the per-block-type dispatch interface, plus the
-## registration table that stands in for the `#[pumpkin_block(name)]`
-## proc-macro (documented unportable in src/macros/README.md - aowlmony has
-## no derive/attribute macros, so registration becomes an explicit call
-## instead of macro-generated wiring).
-## Port of upstream/pumpkin/src/block/mod.rs's `BlockBehaviour` trait
-## (default-method bodies + the two free helper fns `stop_vertical_
-## movement_after_fall`/`bounce_entity_after_fall`) and the two blocks
-## under blocks/ that use it: structure_void.rs, slime.rs.
+## Port of pumpkin/src/block/mod.rs: `BlockBehaviour`, its argument structs and helpers. Also here, because all of it
+## refers to itself and aowlmony types cannot be recursive across modules: the dispatch half of
+## pumpkin/src/block/registry.rs (`default_registry` is in registry.aowl), `FluidBehaviour`'s trait from fluid/mod.rs,
+## the `BlockEntity` trait from entities/mod.rs, and the block half of pumpkin/src/world/mod.rs: `set_block_state`,
+## `break_block`, `update_neighbors`, `update_neighbor`, `update_from_neighbor_shapes`,
+## `replace_with_state_for_neighbor_update` and the block entity table.
 ##
-## SCOPE: upstream's `BlockBehaviour` has ~30 methods; porting all of them
-## needs `World`/`Server`/`Block`/`BlockState`/redstone types that don't
-## exist yet. This ports only the two methods the two proof-case blocks
-## actually override (`on_landed_upon`, `update_entity_movement_after_
-## fall_on`) plus their trait-default bodies, to validate the vtable +
-## registration shape end to end. Extending the vtable with more methods
-## as more blocks get ported is mechanical from here - the pattern's fixed.
+## `BlockWorld` stands where upstream passes `&Arc<World>`. A World calls the registry and the registry calls blocks that
+## call the World, and aowlmony has no import cycles, so blocks see this vtable of what a world provides, and
+## worldadapter.aowl fills it from the real `World`. testworld.aowl fills it from a table, so that redstone runs in a test.
+## `BlockActor` and `BlockPlayer` stand for `dyn EntityBase` and `Player` in the same way.
+## PARTIAL: pumpkin/src/block/registry.rs - see registry.aowl for what is not done.
 
-import ../entity/entity
-import ../item/itembehaviour
-import ../../generated/blockdata as realblock
-import blockmisc
-import blockstateid
-import std/tables
-import std/strutils
+{.feature: "untyped".}
+{.feature: "lenientnils".}
+
+import std/[options, tables]
+import ../../data/block_ext
+from ../../data/block_state import newBlockStateIdUnchecked, asU16, BlockStateId, isAir, BlockState, blockStateIdAir
+import ../../generated/[block_enums, dimension, fluid, sound, sound_category, world_event, particle, tag]
+import "../../data/item_stack/mod"
+import ../../inventory/inventory
+import ../../inventory/screenhandler
+import ../../nbt/tag as nbttag
+import ../../protocol/java/server/play/use_item_on
+import ../../util/gamemode
+import ../../util/math/position
+import ../../util/math/boundingbox
+import ../../util/vector3
+import ../../util/text/text
+import ../../world/world as worldtraits
+import ../../world/tick
+
+export worldtraits.BlockFlags, worldtraits.hasFlag, worldtraits.BfNotifyNeighbors, worldtraits.BfNotifyListeners,
+  worldtraits.BfNotifyAll, worldtraits.BfForceState, worldtraits.BfSkipDrops, worldtraits.BfMoved,
+  worldtraits.BfSkipRedstoneWireStateReplacement, worldtraits.BfSkipBlockEntityReplacedCallback,
+  worldtraits.BfSkipBlockAddedCallback
+export use_item_on, TickPriority
 
 type
-  BlockDirection* = enum
-    ## Port of `pumpkin_data::BlockDirection` (the 6-way face enum used by
-    ## `on_place`'s placement direction). Only the variant NAMES are
-    ## needed here - the real type carries id/opposite/axis helpers this
-    ## port doesn't need yet.
-    bdNorth
-    bdSouth
-    bdEast
-    bdWest
-    bdUp
-    bdDown
+  BlockActionResult* = enum
+    ## `BlockActionResult` in registry.rs.
+    barSuccess                   ## Action was successful. SUCCESS in vanilla
+    barSuccessServer             ## Successful, and the server should swing the hand. SUCCESS_SERVER in vanilla
+    barConsume                   ## Block other actions from being executed. CONSUME in vanilla
+    barFail                      ## Allow other actions to be executed, but indicate it failed. FAIL in vanilla
+    barPass                      ## Allow other actions to be executed. PASS in vanilla
+    barPassToDefaultBlockAction  ## Use default action for the block: `normal_use`
+
+  BlockIsReplacingKind* {.pure.} = enum
+    kItself, kWater, kOther, kNone
+
+  BlockIsReplacing* = object
+    ## `BlockIsReplacing`.
+    kind*: BlockIsReplacingKind
+    f0Itself*: BlockStateId
+    f0Water*: uint8
+
+  BlockActor* = ref object of RootObj
+    ## `dyn EntityBase`. What a block reads and does to an entity; worldadapter.aowl fills the closures.
+    entityId*: int32
+    entityUuid*: string
+    entityTypeName*: string
+    isLiving*: bool
+    player0*: nil BlockPlayer
+    block0Pos*: proc(): Vector3[float64] {.closure.}
+    setPos0*: proc(p: Vector3[float64]) {.closure.}
+    getVelocity0*: proc(): Vector3[float64] {.closure.}
+    setVelocity0*: proc(v: Vector3[float64]) {.closure.}
+    getBox0*: proc(): BoundingBox {.closure.}
+    sneaking0*: proc(): bool {.closure.}
+    yaw0*: proc(): float32 {.closure.}
+    pitch0*: proc(): float32 {.closure.}
+    onGround0*: proc(): bool {.closure.}
+    damage0*: proc(amount: float32; damageType: string): bool {.closure.}
+    setOnFireFor0*: proc(seconds: float32) {.closure.}
+    extinguish0*: proc() {.closure.}
+    slowMovement0*: proc(multiplier: Vector3[float64]) {.closure.}
+    handleFallDamage0*: proc(fallDistance: float32; damageMultiplier: float32) {.closure.}
+    addEffect0*: proc(effect: string; durationTicks: int32; amplifier: uint8) {.closure.}
+    remove0*: proc() {.closure.}
+
+  BlockPlayer* = ref object of BlockActor
+    ## `Player`, as far as blocks use one.
+    gamemode0*: proc(): GameMode {.closure.}
+    inventory0*: proc(): Inventory {.closure.}
+    openHandledScreen0*: proc(factory: BlockScreenFactory; position: Option[BlockPos]): bool {.closure.}
+    sendSystemMessage0*: proc(message: TextComponent; overlay: bool) {.closure.}
+    incrementStat0*: proc(stat: string; amount: int32) {.closure.}
+    allowModifyWorld0*: proc(): bool {.closure.}
+    addHunger0*: proc(food: int32; saturation: float32) {.closure.}
+    hungerLevel0*: proc(): int32 {.closure.}
+    isOp0*: proc(): bool {.closure.}
+    stackInHand0*: proc(hand: int): ItemStack {.closure.}
+    setStackInHand0*: proc(hand: int; stack: ItemStack) {.closure.}
+    setRespawnPoint0*: proc(position: BlockPos; yaw: float32) {.closure.}
+    sleep0*: proc(position: BlockPos) {.closure.}
+
+  BlockScreenFactory* = ref object
+    ## `ScreenHandlerFactory`.
+    title*: TextComponent
+    createScreenHandler*: proc(syncId: uint8; player: BlockPlayer): ScreenHandler {.closure.}
+
+  BlockEntityVt* = ref object
+    ## `BlockEntity`'s methods. One per entity type; `BlockEntity.vt` points at it.
+    writeNbtImpl*: proc(self: BlockEntity; nbt: var NbtCompound) {.closure.}
+    tickImpl*: proc(self: BlockEntity; world: BlockWorld) {.closure.}
+    resourceLocationImpl*: proc(self: BlockEntity): string {.closure.}
+    getPositionImpl*: proc(self: BlockEntity): BlockPos {.closure.}
+    takeLootTableImpl*: proc(self: BlockEntity): Option[(string, int64)] {.closure.}
+    hasLootTableImpl*: proc(self: BlockEntity): bool {.closure.}
+    chunkDataNbtImpl*: proc(self: BlockEntity): Option[NbtCompound] {.closure.}
+    getInventoryImpl*: proc(self: BlockEntity): Option[Inventory] {.closure.}
+    setBlockStateImpl*: proc(self: BlockEntity; blockState: BlockStateId) {.closure.}
+    onBlockReplacedImpl*: proc(self: BlockEntity; world: BlockWorld; position: BlockPos) {.closure.}
+    isDirtyImpl*: proc(self: BlockEntity): bool {.closure.}
+    clearDirtyImpl*: proc(self: BlockEntity) {.closure.}
+
+  BlockEntity* = ref object of RootObj
+    vt*: BlockEntityVt
+
+  BlockServer* = ref object
+    ## `Server`, as far as blocks read one. Nil-safe stand-in for `args.server`.
+    tickCount*: int64
+
+  BlockWorld* = ref object
+    ## What a block calls on `World`. The raw half is filled by whoever owns the storage; the logic above it is below.
+    getRaw*: proc(position: BlockPos): BlockStateId {.closure.}
+    setRaw*: proc(position: BlockPos; id: BlockStateId): BlockStateId {.closure.}
+      ## Writes the state, marks the chunk dirty and queues the client update; answers the replaced state.
+    isLoaded0*: proc(position: BlockPos): bool {.closure.}
+    updateLighting0*: proc(position: BlockPos) {.closure.}
+    closeContainerScreensAt0*: proc(position: BlockPos) {.closure.}
+    broadcastBlockBreakParticles0*: proc(position: BlockPos; stateId: BlockStateId; cause: nil BlockPlayer) {.closure.}
+    dropLoot0*: proc(position: BlockPos; stateId: BlockStateId; cause: nil BlockPlayer) {.closure.}
+    scheduleBlockTick0*: proc(blockRef: Block; position: BlockPos; delay: uint8; priority: TickPriority) {.closure.}
+    scheduleFluidTick0*: proc(fluid: Fluid; position: BlockPos; delay: uint8; priority: TickPriority) {.closure.}
+    isBlockTickScheduled0*: proc(position: BlockPos; blockRef: Block): bool {.closure.}
+    isFluidTickScheduled0*: proc(position: BlockPos; fluid: Fluid): bool {.closure.}
+    syncWorldEvent0*: proc(event: WorldEvent; position: BlockPos; data: int32) {.closure.}
+    playSound0*: proc(sound: Sound; category: SoundCategory; position: Vector3[float64]; volume, pitch: float32) {.closure.}
+    addSyncedBlockEvent0*: proc(position: BlockPos; kind, data: uint8) {.closure.}
+    spawnEntity0*: proc(entityType: string; position: Vector3[float64]; nbt: Option[NbtCompound]): BlockActor {.closure.}
+    spawnParticle0*: proc(position, offset: Vector3[float64]; maxSpeed: float32; count: int32; particle: Particle) {.closure.}
+    dropStack0*: proc(position: BlockPos; stack: ItemStack) {.closure.}
+    entitiesAtBox0*: proc(box: BoundingBox): seq[BlockActor] {.closure.}
+    playersAtBox0*: proc(box: BoundingBox): seq[BlockPlayer] {.closure.}
+    closestPlayer0*: proc(position: Vector3[float64]; radius: float64): Option[BlockPlayer] {.closure.}
+    playerByUuid0*: proc(uuid: string): Option[BlockPlayer] {.closure.}
+    explode0*: proc(position: Vector3[float64]; power: float32) {.closure.}
+    worldAge0*: proc(): int64 {.closure.}
+    timeOfDay0*: proc(): int64 {.closure.}
+    isRaining0*: proc(): bool {.closure.}
+    isThundering0*: proc(): bool {.closure.}
+    blockLight0*: proc(position: BlockPos): Option[uint8] {.closure.}
+    skyLight0*: proc(position: BlockPos): uint8 {.closure.}
+    biomeAt0*: proc(position: BlockPos): string {.closure.}
+    blockEntityChanged0*: proc(entity: BlockEntity) {.closure.}
+    updateBlockEntity0*: proc(entity: BlockEntity) {.closure.}
+    pendingBlockEntity0*: proc(position: BlockPos): Option[NbtCompound] {.closure.}
+    minY*: int32
+    topY*: int32
+    dimensionName*: string
+    dimension*: Dimension
+    blockRegistry*: BlockRegistry
+    blockEntities*: Table[int64, BlockEntity]
+    blockEntityFromNbt0*: proc(nbt: NbtCompound): Option[BlockEntity] {.closure.}
+    createBlockEntity0*: proc(entityType: uint16; position: BlockPos): Option[BlockEntity] {.closure.}
+
+  NormalUseArgs* = object
+    server*: BlockServer
+    world*: BlockWorld
+    block0*: Block
+    position*: BlockPos
+    player*: BlockPlayer
+    hit*: BlockHitResult
+
+  BlockHitResult* = object
+    face*: BlockDirection
+    cursorPos*: Vector3[float32]
+
+  UseWithItemArgs* = object
+    server*: BlockServer
+    world*: BlockWorld
+    block0*: Block
+    position*: BlockPos
+    player*: BlockPlayer
+    hit*: BlockHitResult
+    itemStack*: ItemStackRef
+    equipmentSlot*: int
+
+  ItemStackRef* = ref object
+    ## `Arc<Mutex<ItemStack>>`.
+    stack*: ItemStack
+
+  OnEntityCollisionArgs* = object
+    server*: BlockServer
+    world*: BlockWorld
+    block0*: Block
+    state*: BlockState
+    position*: BlockPos
+    entity*: BlockActor
+
+  OnEntityStepArgs* = object
+    world*: BlockWorld
+    block0*: Block
+    state*: BlockState
+    position*: BlockPos
+    entity*: BlockActor
+    belowSupportingBlock*: bool
+
+  ExplodeArgs* = object
+    world*: BlockWorld
+    block0*: Block
+    position*: BlockPos
+
+  OnSyncedBlockEventArgs* = object
+    world*: BlockWorld
+    block0*: Block
+    position*: BlockPos
+    kind0*: uint8
+    data*: uint8
+
+  OnPlaceArgs* = object
+    server*: BlockServer
+    world*: BlockWorld
+    block0*: Block
+    position*: BlockPos
+    direction*: BlockDirection
+    player*: BlockPlayer
+    replacing*: BlockIsReplacing
+    useItemOn*: SUseItemOn
+
+  RandomTickArgs* = object
+    world*: BlockWorld
+    block0*: Block
+    position*: BlockPos
+
+  CanPlaceAtArgs* = object
+    server*: nil BlockServer
+    world*: nil BlockWorld
+    blockAccessor*: BlockWorld
+    block0*: Block
+    state*: BlockState
+    position*: BlockPos
+    direction*: Option[BlockDirection]
+    player*: nil BlockPlayer
+    useItemOn*: Option[SUseItemOn]
+
+  CanUpdateAtArgs* = object
+    world*: BlockWorld
+    block0*: Block
+    stateId*: BlockStateId
+    position*: BlockPos
+    direction*: BlockDirection
+    player*: BlockPlayer
+    useItemOn*: SUseItemOn
+
+  PlacedArgs* = object
+    world*: BlockWorld
+    block0*: Block
+    stateId*: BlockStateId
+    oldStateId*: BlockStateId
+    position*: BlockPos
+    notify*: bool
+
+  PlayerPlacedArgs* = object
+    world*: BlockWorld
+    block0*: Block
+    stateId*: BlockStateId
+    position*: BlockPos
+    direction*: BlockDirection
+    player*: BlockPlayer
+
+  OnLandedUponArgs* = object
+    world*: BlockWorld
+    fallDistance*: float32
+    entity*: BlockActor
+
+  UpdateEntityMovementAfterFallOnArgs* = object
+    entity*: BlockActor
+
+  BrokenArgs* = object
+    block0*: Block
+    player*: BlockPlayer
+    position*: BlockPos
+    server*: BlockServer
+    world*: BlockWorld
+    state*: BlockState
+
+  OnNeighborUpdateArgs* = object
+    world*: BlockWorld
+    block0*: Block
+    position*: BlockPos
+    sourceBlock*: Block
+    notify*: bool
+
+  PrepareArgs* = object
+    world*: BlockWorld
+    block0*: Block
+    stateId*: BlockStateId
+    position*: BlockPos
+    flags*: BlockFlags
+
+  GetStateForNeighborUpdateArgs* = object
+    world*: BlockWorld
+    block0*: Block
+    stateId*: BlockStateId
+    position*: BlockPos
+    direction*: BlockDirection
+    neighborPosition*: BlockPos
+    neighborStateId*: BlockStateId
+
+  OnScheduledTickArgs* = object
+    world*: BlockWorld
+    block0*: Block
+    position*: BlockPos
+
+  OnStateReplacedArgs* = object
+    world*: BlockWorld
+    block0*: Block
+    oldStateId*: BlockStateId
+    position*: BlockPos
+    moved*: bool
+
+  EmitsRedstonePowerArgs* = object
+    block0*: Block
+    state*: BlockState
+    direction*: BlockDirection
+
+  GetRedstonePowerArgs* = object
+    world*: BlockWorld
+    block0*: Block
+    state*: BlockState
+    position*: BlockPos
+    direction*: BlockDirection
+
+  GetComparatorOutputArgs* = object
+    world*: BlockWorld
+    block0*: Block
+    state*: BlockState
+    position*: BlockPos
+
+  GetInsideCollisionShapeArgs* = object
+    world*: BlockWorld
+    block0*: Block
+    state*: BlockState
+    position*: BlockPos
 
   BlockBehaviour* = ref object
-    ## Manual-vtable interface, the same pattern as `src/inventory/
-    ## inventory.aowl`'s `Inventory` and `src/server/entity/entity.aowl`'s
-    ## `EntityBase`. KNOWN AOWLMONY COMPILER BUG: a closure (not a bare
-    ## lambda) assigned to a ref-object proc-typed field crashes the
-    ## compiler unless the field's proc type carries `{.closure.}` -
-    ## every field below has it proactively.
-    onLandedUponImpl*: proc(entity: EntityBase, fallDistance: float64) {.closure.}
-    updateEntityMovementAfterFallOnImpl*: proc(entity: EntityBase) {.closure.}
-    isPathfindableImpl*: proc(stateId: uint32, computationType: PathComputationType): bool {.closure.}
-    normalUseImpl*: proc(): BlockActionResult {.closure.}
-      ## Port of `mod.rs`'s `normal_use` - upstream's real signature takes a
-      ## `NormalUseArgs<'_>` bundling `&World`/`&Player`/`&BlockState`/etc.;
-      ## none of those exist as real types here yet, so this is scoped to
-      ## the no-argument case every current caller (fletching_table.rs)
-      ## actually needs. Extend the signature once a block needs the args.
-    onPlaceImpl*: proc(direction: BlockDirection, waterlogged: bool): int {.closure.}
-      ## Port of `mod.rs`'s `on_place`. Upstream's real `OnPlaceArgs<'_>`
-      ## bundles `&World`/`&Player`/`replacing: &BlockState`/etc.; scoped
-      ## here to the two inputs `chain.rs` (the first real state-permuting
-      ## caller) actually reads: the placement direction and whether the
-      ## replaced block was a water source. Extend once a block needs
-      ## more of the real args.
+    ## `trait BlockBehaviour`.
+    normalUseImpl*: proc(args: NormalUseArgs): BlockActionResult {.closure.}
+    useWithItemImpl*: proc(args: UseWithItemArgs): BlockActionResult {.closure.}
+    onEntityCollisionImpl*: proc(args: OnEntityCollisionArgs) {.closure.}
+    onEntityStepImpl*: proc(args: OnEntityStepArgs) {.closure.}
+    shouldDropItemsOnExplosionImpl*: proc(): bool {.closure.}
+    explodeImpl*: proc(args: ExplodeArgs) {.closure.}
+    onSyncedBlockEventImpl*: proc(args: OnSyncedBlockEventArgs): bool {.closure.}
+    onPlaceImpl*: proc(args: OnPlaceArgs): BlockStateId {.closure.}
+    randomTickImpl*: proc(args: RandomTickArgs) {.closure.}
+    canPlaceAtImpl*: proc(args: CanPlaceAtArgs): bool {.closure.}
+    canUpdateAtImpl*: proc(args: CanUpdateAtArgs): bool {.closure.}
+    placedImpl*: proc(args: PlacedArgs) {.closure.}
+    playerPlacedImpl*: proc(args: PlayerPlacedArgs) {.closure.}
+    onLandedUponImpl*: proc(args: OnLandedUponArgs) {.closure.}
+    updateEntityMovementAfterFallOnImpl*: proc(args: UpdateEntityMovementAfterFallOnArgs) {.closure.}
+    brokenImpl*: proc(args: BrokenArgs) {.closure.}
+    onNeighborUpdateImpl*: proc(args: OnNeighborUpdateArgs) {.closure.}
+    prepareImpl*: proc(args: PrepareArgs) {.closure.}
+    getStateForNeighborUpdateImpl*: proc(args: GetStateForNeighborUpdateArgs): BlockStateId {.closure.}
+    onScheduledTickImpl*: proc(args: OnScheduledTickArgs) {.closure.}
+    onStateReplacedImpl*: proc(args: OnStateReplacedArgs) {.closure.}
+    emitsRedstonePowerImpl*: proc(args: EmitsRedstonePowerArgs): bool {.closure.}
+    getWeakRedstonePowerImpl*: proc(args: GetRedstonePowerArgs): uint8 {.closure.}
+    getStrongRedstonePowerImpl*: proc(args: GetRedstonePowerArgs): uint8 {.closure.}
+    getComparatorOutputImpl*: proc(args: GetComparatorOutputArgs): Option[uint8] {.closure.}
+    getInsideCollisionShapeImpl*: proc(args: GetInsideCollisionShapeArgs): BoundingBox {.closure.}
+    mirrorImpl*: proc(blockRef: Block; stateId: BlockStateId; mirror: Mirror): BlockState {.closure.}
+    rotateImpl*: proc(blockRef: Block; stateId: BlockStateId; rotation: Rotation): BlockState {.closure.}
 
-# --- upstream's two free helper fns (mod.rs) --------------------------------
+  FluidBehaviour* = ref object
+    ## `trait FluidBehaviour` in fluid/mod.rs.
+    normalUseImpl*: proc(world: BlockWorld; fluid: Fluid; position: BlockPos; player: BlockPlayer): BlockActionResult {.closure.}
+    useWithItemImpl*: proc(world: BlockWorld; fluid: Fluid; position: BlockPos; player: BlockPlayer; item: ItemStackRef): BlockActionResult {.closure.}
+    placedImpl*: proc(world: BlockWorld; fluid: Fluid; stateId: BlockStateId; position: BlockPos; oldStateId: BlockStateId; notify: bool) {.closure.}
+    onPlaceImpl*: proc(world: BlockWorld; fluid: Fluid; player: BlockPlayer; position: BlockPos; replacing: BlockIsReplacing; useItemOn: SUseItemOn): BlockStateId {.closure.}
+    getStateForNeighbourUpdateImpl*: proc(world: BlockWorld; fluid: Fluid; position: BlockPos; notify: bool): BlockStateId {.closure.}
+    onNeighborUpdateImpl*: proc(world: BlockWorld; fluid: Fluid; position: BlockPos; notify: bool) {.closure.}
+    onEntityCollisionImpl*: proc(entity: BlockActor) {.closure.}
+    onScheduledTickImpl*: proc(world: BlockWorld; fluid: Fluid; position: BlockPos) {.closure.}
+    randomTickImpl*: proc(fluid: Fluid; world: BlockWorld; position: BlockPos) {.closure.}
+    createLegacyBlockImpl*: proc(world: BlockWorld; position: BlockPos) {.closure.}
 
-proc directionOffset*(dir: BlockDirection): (int32, int32, int32) =
-  ## Port of `pumpkin_data::BlockDirection::to_offset` - the 6-way
-  ## face-to-unit-vector table. Used to turn a `BlockDirection` into the
-  ## bare `(dx, dy, dz)` offset `src/server/world/worldstub.aowl`'s
-  ## `getNeighborBlockState` takes (that module stays direction-agnostic
-  ## on purpose - see its own doc comment).
-  case dir
-  of bdNorth: (0'i32, 0'i32, -1'i32)
-  of bdSouth: (0'i32, 0'i32, 1'i32)
-  of bdEast: (1'i32, 0'i32, 0'i32)
-  of bdWest: (-1'i32, 0'i32, 0'i32)
-  of bdUp: (0'i32, 1'i32, 0'i32)
-  of bdDown: (0'i32, -1'i32, 0'i32)
+  BlockRegistry* = ref object
+    ## `BlockRegistry`: keyed by block id and fluid id.
+    blocks*: Table[uint16, BlockBehaviour]
+    fluids*: Table[uint16, FluidBehaviour]
 
-proc stopVerticalMovementAfterFall*(entity: EntityBase) =
-  let e = getEntity(entity)
-  e.velocity.y = 0.0
+# --- BlockIsReplacing --------------------------------------------------------------------------------------------
 
-proc bounceEntityAfterFall*(entity: EntityBase, bounceMultiplier: float64) =
-  let e = getEntity(entity)
-  if e.sneaking:
-    e.velocity.y = 0.0
-  elif e.velocity.y < 0.0:
-    let entityFactor = (if getLivingEntity(entity) != nil: 1.0 else: 0.8)
-    e.velocity.y = -e.velocity.y * bounceMultiplier * entityFactor
+proc waterSource*(self: BlockIsReplacing): bool =
+  ## Whether the block was a water source block. Level 0 means the water is a source block.
+  self.kind == BlockIsReplacingKind.kWater and self.f0Water == 0'u8
 
-proc handleFallDamage*(living: LivingEntity, caller: EntityBase, fallDistance: float64, damageMultiplier: float32) =
-  ## Placeholder for `LivingEntity::handle_fall_damage` - upstream computes
-  ## real fall-damage amounts from distance/armor/effects; this just
-  ## proves the call shape (real damage math needs the unported
-  ## damage-type/effect registries).
-  discard living
-  discard caller
-  discard fallDistance
-  discard damageMultiplier
+# --- The trait's default bodies --------------------------------------------------------------------------------
 
-# --- trait-default bodies (mod.rs's `fn on_landed_upon`/`fn update_entity_ --
-# --- movement_after_fall_on` default impls) ---------------------------------
+proc pos*(e: BlockActor): Vector3[float64] =
+  let f = e.block0Pos
+  f()
+proc velocity*(e: BlockActor): Vector3[float64] =
+  let f = e.getVelocity0
+  f()
+proc `velocity=`*(e: BlockActor; v: Vector3[float64]) =
+  let f = e.setVelocity0
+  f(v)
+proc boundingBox*(e: BlockActor): BoundingBox =
+  let f = e.getBox0
+  f()
+proc isSneaking*(e: BlockActor): bool =
+  let f = e.sneaking0
+  f()
+proc getEntity*(e: BlockActor): BlockActor {.inline.} = e
+proc getLivingEntity*(e: BlockActor): Option[BlockActor] =
+  if e.isLiving: some(e) else: none[BlockActor]()
+proc getPlayer*(e: BlockActor): Option[BlockPlayer] =
+  if e.player0 != nil: some(BlockPlayer(e.player0)) else: none[BlockPlayer]()
 
-proc defaultOnLandedUpon*(entity: EntityBase, fallDistance: float64) =
-  let living = getLivingEntity(entity)
-  if living != nil:
-    handleFallDamage(living, entity, fallDistance, 1.0)
+proc stopVerticalMovementAfterFall*(entity: BlockActor) =
+  let e = entity.getEntity()
+  var velocity = e.velocity
+  velocity.y = 0.0
+  e.velocity = velocity
 
-proc defaultUpdateEntityMovementAfterFallOn*(entity: EntityBase) =
-  stopVerticalMovementAfterFall(entity)
+proc bounceEntityAfterFall*(entity: BlockActor; bounceMultiplier: float64) =
+  let baseEntity = entity.getEntity()
+  var velocity = baseEntity.velocity
+  if baseEntity.isSneaking():
+    velocity.y = 0.0
+  elif velocity.y < 0.0:
+    let entityFactor = if entity.getLivingEntity().isSome: 1.0 else: 0.8
+    velocity.y = -velocity.y * bounceMultiplier * entityFactor
+  baseEntity.velocity = velocity
 
-proc defaultNormalUse*(): BlockActionResult =
-  ## `mod.rs`'s `normal_use` trait default: `BlockActionResult::Pass`.
+proc handleFallDamage*(living: BlockActor; caller: BlockActor; fallDistance: float32; damageMultiplier: float32) =
+  let f = living.handleFallDamage0
+  if f != nil:
+    f(fallDistance, damageMultiplier)
+
+proc defNormalUse(args: NormalUseArgs): BlockActionResult = barPass
+proc defUseWithItem(args: UseWithItemArgs): BlockActionResult = barPassToDefaultBlockAction
+proc defOnEntityCollision(args: OnEntityCollisionArgs) = discard
+proc defOnEntityStep(args: OnEntityStepArgs) = discard
+proc defShouldDrop(): bool = true
+proc defExplode(args: ExplodeArgs) = discard
+proc defSynced(args: OnSyncedBlockEventArgs): bool = false
+proc defOnPlace(args: OnPlaceArgs): BlockStateId = args.block0.defaultState.id
+proc defRandomTick(args: RandomTickArgs) = discard
+proc defCanPlaceAt(args: CanPlaceAtArgs): bool = true
+proc defCanUpdateAt(args: CanUpdateAtArgs): bool = false
+proc defPlaced(args: PlacedArgs) = discard
+proc defPlayerPlaced(args: PlayerPlacedArgs) = discard
+proc defOnLandedUpon(args: OnLandedUponArgs) =
+  let living = args.entity.getLivingEntity()
+  if living.isSome:
+    handleFallDamage(living.unsafeGet, args.entity, args.fallDistance, 1.0'f32)
+proc defUpdateAfterFall(args: UpdateEntityMovementAfterFallOnArgs) = stopVerticalMovementAfterFall(args.entity)
+proc defBroken(args: BrokenArgs) = discard
+proc defNeighbor(args: OnNeighborUpdateArgs) = discard
+proc defPrepare(args: PrepareArgs) = discard
+proc defStateForNeighbor(args: GetStateForNeighborUpdateArgs): BlockStateId = args.stateId
+proc defScheduled(args: OnScheduledTickArgs) = discard
+proc defReplaced(args: OnStateReplacedArgs) = discard
+proc defEmits(args: EmitsRedstonePowerArgs): bool = false
+proc defPower(args: GetRedstonePowerArgs): uint8 = 0'u8
+proc defComparator(args: GetComparatorOutputArgs): Option[uint8] = none[uint8]()
+proc defInside(args: GetInsideCollisionShapeArgs): BoundingBox = BoundingBox.fullBlock()
+proc defMirror(blockRef: Block; stateId: BlockStateId; mirror: Mirror): BlockState = blockRef.mirror(stateId, mirror)
+proc defRotate(blockRef: Block; stateId: BlockStateId; rotation: Rotation): BlockState = blockRef.rotate(stateId, rotation)
+
+proc newBlockBehaviour*(): BlockBehaviour =
+  ## Every method at the trait's default, `impl BlockBehaviour for X {}`.
+  BlockBehaviour(normalUseImpl: defNormalUse, useWithItemImpl: defUseWithItem, onEntityCollisionImpl: defOnEntityCollision,
+    onEntityStepImpl: defOnEntityStep, shouldDropItemsOnExplosionImpl: defShouldDrop, explodeImpl: defExplode,
+    onSyncedBlockEventImpl: defSynced, onPlaceImpl: defOnPlace, randomTickImpl: defRandomTick, canPlaceAtImpl: defCanPlaceAt,
+    canUpdateAtImpl: defCanUpdateAt, placedImpl: defPlaced, playerPlacedImpl: defPlayerPlaced, onLandedUponImpl: defOnLandedUpon,
+    updateEntityMovementAfterFallOnImpl: defUpdateAfterFall, brokenImpl: defBroken, onNeighborUpdateImpl: defNeighbor,
+    prepareImpl: defPrepare, getStateForNeighborUpdateImpl: defStateForNeighbor, onScheduledTickImpl: defScheduled,
+    onStateReplacedImpl: defReplaced, emitsRedstonePowerImpl: defEmits, getWeakRedstonePowerImpl: defPower,
+    getStrongRedstonePowerImpl: defPower, getComparatorOutputImpl: defComparator, getInsideCollisionShapeImpl: defInside,
+    mirrorImpl: defMirror, rotateImpl: defRotate)
+
+proc newBlockRegistry*(): BlockRegistry =
+  BlockRegistry(blocks: initTable[uint16, BlockBehaviour](), fluids: initTable[uint16, FluidBehaviour]())
+
+proc register*(r: BlockRegistry; name: string; behaviour: BlockBehaviour) =
+  ## `#[pumpkin_block("minecraft:x")]`
+  let b = Block.fromRegistryKey(name)
+  if b != nil:
+    r.blocks[asU16(b.id)] = behaviour
+
+proc registerTag*(r: BlockRegistry; tagName: string; behaviour: BlockBehaviour) =
+  ## `#[pumpkin_block_from_tag("minecraft:x")]`
+  let (found, ids) = getTagIds(rkBlock, tagName)
+  if found:
+    for id in ids:
+      r.blocks[id] = behaviour
+
+proc registerIds*(r: BlockRegistry; ids: seq[BlockId]; behaviour: BlockBehaviour) =
+  ## `manager.register` of a block with a hand-written `BlockMetadata`.
+  for id in ids:
+    r.blocks[asU16(id)] = behaviour
+
+proc registerFluidIds*(r: BlockRegistry; ids: seq[uint16]; behaviour: FluidBehaviour) =
+  for id in ids:
+    r.fluids[id] = behaviour
+
+proc behaviourOf*(r: BlockRegistry; id: BlockId): nil BlockBehaviour =
+  r.blocks.getOrDefault(asU16(id), nil)
+
+proc fluidBehaviourOf*(r: BlockRegistry; id: uint16): nil FluidBehaviour =
+  r.fluids.getOrDefault(id, nil)
+
+proc getPumpkinBlock*(r: BlockRegistry; id: BlockId): Option[BlockBehaviour] =
+  ## `get_pumpkin_block`
+  let b = r.behaviourOf(id)
+  if b != nil: some(BlockBehaviour(b)) else: none[BlockBehaviour]()
+
+proc getPumpkinFluid*(r: BlockRegistry; id: uint16): Option[FluidBehaviour] =
+  ## `get_pumpkin_fluid`
+  let b = r.fluidBehaviourOf(id)
+  if b != nil: some(FluidBehaviour(b)) else: none[FluidBehaviour]()
+
+# --- World: reads --------------------------------------------------------------------------------------------
+
+proc getBlockStateId*(w: BlockWorld; position: BlockPos): BlockStateId =
+  let f = w.getRaw
+  f(position)
+proc getBlockState*(w: BlockWorld; position: BlockPos): BlockState = BlockState.fromId(w.getBlockStateId(position))
+proc getBlock*(w: BlockWorld; position: BlockPos): Block = Block.fromStateId(w.getBlockStateId(position))
+proc getBlockAndState*(w: BlockWorld; position: BlockPos): (Block, BlockState) =
+  let id = w.getBlockStateId(position)
+  (Block.fromStateId(id), BlockState.fromId(id))
+proc getBlockAndStateId*(w: BlockWorld; position: BlockPos): (Block, BlockStateId) =
+  let id = w.getBlockStateId(position)
+  (Block.fromStateId(id), id)
+proc fluidOf(id: BlockStateId): Fluid =
+  ## `Fluid::from_state_id(..).unwrap_or(&Fluid::EMPTY)`
+  let f = Fluid.fromStateId(id)
+  if f.isSome: f.unsafeGet else: Fluid.EMPTY
+proc getFluid*(w: BlockWorld; position: BlockPos): Fluid = fluidOf(w.getBlockStateId(position))
+proc getBlockAndFluid*(w: BlockWorld; position: BlockPos): (Block, Fluid) =
+  let id = w.getBlockStateId(position)
+  (Block.fromStateId(id), fluidOf(id))
+proc isLoaded*(w: BlockWorld; position: BlockPos): bool =
+  let f = w.isLoaded0
+  f(position)
+proc getBlockStateIfLoaded*(w: BlockWorld; position: BlockPos): Option[BlockState] =
+  if w.isLoaded(position): some(w.getBlockState(position)) else: none[BlockState]()
+proc getBottomY*(w: BlockWorld): int32 {.inline.} = w.minY
+proc getTopY*(w: BlockWorld): int32 {.inline.} = w.topY
+
+# --- The registry's dispatch -------------------------------------------------------------------------------
+
+proc onNeighborUpdate*(r: BlockRegistry; world: BlockWorld; blockRef: Block; position: BlockPos; sourceBlock: Block; notify: bool) =
+  let b = r.behaviourOf(blockRef.id)
+  if b != nil:
+    let f = b.onNeighborUpdateImpl
+    f(OnNeighborUpdateArgs(world: world, block0: blockRef, position: position, sourceBlock: sourceBlock, notify: notify))
+
+proc getStateForNeighborUpdate*(r: BlockRegistry; world: BlockWorld; blockRef: Block; stateId: BlockStateId; position: BlockPos;
+    direction: BlockDirection; neighborLocation: BlockPos; neighborStateId: BlockStateId): BlockStateId =
+  let b = r.behaviourOf(blockRef.id)
+  if b != nil:
+    let f = b.getStateForNeighborUpdateImpl
+    return f(GetStateForNeighborUpdateArgs(world: world, block0: blockRef, stateId: stateId, position: position,
+      direction: direction, neighborPosition: neighborLocation, neighborStateId: neighborStateId))
+  stateId
+
+proc emitsRedstonePower*(r: BlockRegistry; blockRef: Block; state: BlockState; direction: BlockDirection): bool =
+  let b = r.behaviourOf(blockRef.id)
+  if b != nil:
+    let f = b.emitsRedstonePowerImpl
+    return f(EmitsRedstonePowerArgs(block0: blockRef, state: state, direction: direction))
+  false
+
+proc getWeakRedstonePower*(r: BlockRegistry; blockRef: Block; world: BlockWorld; position: BlockPos; state: BlockState; direction: BlockDirection): uint8 =
+  let b = r.behaviourOf(blockRef.id)
+  if b != nil:
+    let f = b.getWeakRedstonePowerImpl
+    return f(GetRedstonePowerArgs(world: world, block0: blockRef, state: state, position: position, direction: direction))
+  0'u8
+
+proc getStrongRedstonePower*(r: BlockRegistry; blockRef: Block; world: BlockWorld; position: BlockPos; state: BlockState; direction: BlockDirection): uint8 =
+  let b = r.behaviourOf(blockRef.id)
+  if b != nil:
+    let f = b.getStrongRedstonePowerImpl
+    return f(GetRedstonePowerArgs(world: world, block0: blockRef, state: state, position: position, direction: direction))
+  0'u8
+
+proc canPlaceAt*(r: BlockRegistry; server: nil BlockServer; world: nil BlockWorld; blockAccessor: BlockWorld; player: nil BlockPlayer;
+    blockRef: Block; state: BlockState; position: BlockPos; direction: Option[BlockDirection]; useItemOn: Option[SUseItemOn]): bool =
+  let b = r.behaviourOf(blockRef.id)
+  if b != nil:
+    let f = b.canPlaceAtImpl
+    return f(CanPlaceAtArgs(server: server, world: world, blockAccessor: blockAccessor, block0: blockRef, state: state,
+      position: position, direction: direction, player: player, useItemOn: useItemOn))
+  true
+
+proc onStateReplaced*(r: BlockRegistry; world: BlockWorld; blockRef: Block; position: BlockPos; oldStateId: BlockStateId; moved: bool) =
+  let b = r.behaviourOf(blockRef.id)
+  if b != nil:
+    let f = b.onStateReplacedImpl
+    f(OnStateReplacedArgs(world: world, block0: blockRef, oldStateId: oldStateId, position: position, moved: moved))
+
+proc prepare*(r: BlockRegistry; world: BlockWorld; position: BlockPos; blockRef: Block; stateId: BlockStateId; flags: BlockFlags) =
+  let b = r.behaviourOf(blockRef.id)
+  if b != nil:
+    let f = b.prepareImpl
+    f(PrepareArgs(world: world, block0: blockRef, stateId: stateId, position: position, flags: flags))
+
+# --- Block entities ----------------------------------------------------------------------------------------
+
+proc newBlockEntityVt*(): BlockEntityVt =
+  BlockEntityVt(
+    tickImpl: proc(self: BlockEntity; world: BlockWorld) {.closure.} = discard,
+    takeLootTableImpl: proc(self: BlockEntity): Option[(string, int64)] {.closure.} = none[(string, int64)](),
+    hasLootTableImpl: proc(self: BlockEntity): bool {.closure.} = false,
+    chunkDataNbtImpl: proc(self: BlockEntity): Option[NbtCompound] {.closure.} = none[NbtCompound](),
+    getInventoryImpl: proc(self: BlockEntity): Option[Inventory] {.closure.} = none[Inventory](),
+    setBlockStateImpl: proc(self: BlockEntity; blockState: BlockStateId) {.closure.} = discard,
+    isDirtyImpl: proc(self: BlockEntity): bool {.closure.} = false,
+    clearDirtyImpl: proc(self: BlockEntity) {.closure.} = discard)
+
+proc getPosition*(self: BlockEntity): BlockPos =
+  let f = self.vt.getPositionImpl
+  f(self)
+proc resourceLocation*(self: BlockEntity): string =
+  let f = self.vt.resourceLocationImpl
+  f(self)
+proc writeNbt*(self: BlockEntity; nbt: var NbtCompound) =
+  let f = self.vt.writeNbtImpl
+  f(self, nbt)
+proc tick*(self: BlockEntity; world: BlockWorld) =
+  let f = self.vt.tickImpl
+  f(self, world)
+proc getInventory*(self: BlockEntity): Option[Inventory] =
+  let f = self.vt.getInventoryImpl
+  f(self)
+proc chunkDataNbt*(self: BlockEntity): Option[NbtCompound] =
+  let f = self.vt.chunkDataNbtImpl
+  f(self)
+proc isDirty*(self: BlockEntity): bool =
+  let f = self.vt.isDirtyImpl
+  f(self)
+proc clearDirty*(self: BlockEntity) =
+  let f = self.vt.clearDirtyImpl
+  f(self)
+
+proc scatterInventory*(w: BlockWorld; position: BlockPos; inventory: Inventory) =
+  ## `scatter_inventory`
+  let f = w.dropStack0
+  for i in 0 ..< inventory.size():
+    let stack = inventory.getStack(i)
+    if not stack.isEmpty():
+      f(position, stack)
+
+proc onBlockReplaced*(self: BlockEntity; world: BlockWorld; position: BlockPos) =
+  let f = self.vt.onBlockReplacedImpl
+  if f != nil:
+    f(self, world, position)
+  else:
+    let inventory = self.getInventory()
+    if inventory.isSome:
+      world.scatterInventory(position, inventory.unsafeGet)
+
+proc getBlockEntity*(w: BlockWorld; position: BlockPos): Option[BlockEntity] =
+  ## `get_block_entity`
+  let key = position.asLong()
+  if w.blockEntities.hasKey(key):
+    return some(w.blockEntities.getOrDefault(key, nil))
+  let pending = w.pendingBlockEntity0
+  if pending != nil and w.blockEntityFromNbt0 != nil:
+    let nbt = pending(position)
+    if nbt.isSome:
+      let g = w.blockEntityFromNbt0
+      let entity = g(nbt.unsafeGet)
+      if entity.isSome:
+        w.blockEntities[key] = entity.unsafeGet
+      return entity
+  none[BlockEntity]()
+
+proc addBlockEntity*(w: BlockWorld; entity: BlockEntity) =
+  ## `add_block_entity`
+  w.blockEntities[entity.getPosition().asLong()] = entity
+  let f = w.blockEntityChanged0
+  if f != nil:
+    f(entity)
+
+proc removeBlockEntity*(w: BlockWorld; position: BlockPos) =
+  ## `remove_block_entity`
+  w.blockEntities.del(position.asLong())
+
+proc updateBlockEntity*(w: BlockWorld; entity: BlockEntity) =
+  let f = w.updateBlockEntity0
+  if f != nil:
+    f(entity)
+
+# --- World: neighbour updates and state changes -----------------------------------------------------------
+
+proc updateNeighbors*(w: BlockWorld; blockPos: BlockPos; except0: Option[BlockDirection]) =
+  ## `update_neighbors`
+  let sourceBlock = w.getBlock(blockPos)
+  let dirs1 = blockDirectionUpdateOrder()
+  for direction in dirs1:
+    if except0.isSome and except0.unsafeGet == direction:
+      continue
+    let neighborPos = blockPos.offset(direction.toOffset())
+    let (neighborBlock, neighborFluid) = w.getBlockAndFluid(neighborPos)
+    let b = w.blockRegistry.behaviourOf(neighborBlock.id)
+    if b != nil:
+      let f = b.onNeighborUpdateImpl
+      f(OnNeighborUpdateArgs(world: w, block0: neighborBlock, position: neighborPos, sourceBlock: sourceBlock, notify: false))
+    let fl = w.blockRegistry.fluidBehaviourOf(neighborFluid.id)
+    if fl != nil:
+      let f = fl.onNeighborUpdateImpl
+      f(w, neighborFluid, neighborPos, false)
+
+proc updateNeighbor*(w: BlockWorld; neighborBlockPos: BlockPos; sourceBlock: Block) =
+  ## `update_neighbor`
+  let neighborBlock = w.getBlock(neighborBlockPos)
+  let b = w.blockRegistry.behaviourOf(neighborBlock.id)
+  if b != nil:
+    let f = b.onNeighborUpdateImpl
+    f(OnNeighborUpdateArgs(world: w, block0: neighborBlock, position: neighborBlockPos, sourceBlock: sourceBlock, notify: false))
+
+proc registryUpdateNeighbors(w: BlockWorld; position: BlockPos; blockRef: Block; flags: BlockFlags)
+
+proc setBlockState*(w: BlockWorld; position: BlockPos; blockStateId: BlockStateId; flags: BlockFlags): BlockStateId {.discardable.} =
+  ## `set_block_state`
+  let setter = w.setRaw
+  let replacedBlockStateId = setter(position, blockStateId)
+  if replacedBlockStateId == blockStateId:
+    return blockStateId
+  let oldBlock = Block.fromStateId(replacedBlockStateId)
+  let newBlock = Block.fromStateId(blockStateId)
+  let blockMoved = flags.hasFlag(BfMoved)
+  let isNewBlock = not sameBlock(oldBlock, newBlock)
+  # WorldChunk.java line 305-314
+  if isNewBlock and oldBlock.defaultState.blockEntityType != high(uint16):
+    let entity = w.getBlockEntity(position)
+    if entity.isSome:
+      entity.unsafeGet.onBlockReplaced(w, position)
+      w.removeBlockEntity(position)
+  # WorldChunk.java line 317
+  if isNewBlock and (flags.hasFlag(BfNotifyNeighbors) or blockMoved):
+    w.blockRegistry.onStateReplaced(w, oldBlock, position, replacedBlockStateId, blockMoved)
+  # WorldChunk.java line 318
+  if not flags.hasFlag(BfSkipBlockAddedCallback) and isNewBlock:
+    # `on_placed`
+    let state = w.getBlockState(position)
+    if state.blockEntityType != high(uint16) and w.getBlockEntity(position).isNone and w.createBlockEntity0 != nil:
+      let create = w.createBlockEntity0
+      let entity = create(state.blockEntityType, position)
+      if entity.isSome:
+        w.addBlockEntity(entity.unsafeGet)
+    let b = w.blockRegistry.behaviourOf(newBlock.id)
+    if b != nil:
+      let f = b.placedImpl
+      f(PlacedArgs(world: w, block0: newBlock, stateId: blockStateId, oldStateId: replacedBlockStateId, position: position, notify: blockMoved))
+    let newFluid = w.getFluid(position)
+    let fl = w.blockRegistry.fluidBehaviourOf(newFluid.id)
+    if fl != nil:
+      let f = fl.placedImpl
+      f(w, newFluid, blockStateId, position, replacedBlockStateId, blockMoved)
+  # Ig they do this cause it could be modified in chunkPos.setBlockState?
+  if w.getBlockStateId(position) == blockStateId:
+    if flags.hasFlag(BfNotifyNeighbors):
+      w.updateNeighbors(position, none[BlockDirection]())
+    if not flags.hasFlag(BfForceState):
+      let newFlags = flags and not (BfNotifyNeighbors or BfNotifyListeners)
+      w.blockRegistry.prepare(w, position, oldBlock, replacedBlockStateId, newFlags)
+      w.registryUpdateNeighbors(position, newBlock, newFlags)
+      w.blockRegistry.prepare(w, position, newBlock, blockStateId, newFlags)
+  let light = w.updateLighting0
+  if light != nil:
+    light(position)
+  replacedBlockStateId
+
+proc breakBlock*(w: BlockWorld; position: BlockPos; cause: nil BlockPlayer; flags: BlockFlags): Option[BlockStateId] {.discardable.} =
+  ## `break_block`. The block break event is not fired: no plugin hears of it from here yet.
+  let (brokenBlock, brokenBlockState) = w.getBlockAndStateId(position)
+  if isAir(brokenBlockState):
+    return none[BlockStateId]()
+  var newStateId = blockStateIdAir
+  if brokenBlock.isWaterlogged(brokenBlockState):
+    # FlowingFluidProperties of flowing water at level 8, not falling: a water source.
+    var waterProps = FlowingWaterLikeFluidProperties.default(Fluid.FLOWING_WATER)
+    waterProps.level = Level.L8
+    waterProps.falling = Falling.False
+    newStateId = waterProps.toStateId(Fluid.FLOWING_WATER)
+  let brokenStateId = w.setBlockState(position, newStateId, flags)
+  let closer = w.closeContainerScreensAt0
+  if closer != nil:
+    closer(position)
+  if not sameBlock(Block.fromStateId(brokenStateId), blockFire()):
+    let particles = w.broadcastBlockBreakParticles0
+    if particles != nil:
+      particles(position, brokenStateId, cause)
+  if not flags.hasFlag(BfSkipDrops):
+    let drop = w.dropLoot0
+    if drop != nil:
+      drop(position, brokenStateId, cause)
+  some(newStateId)
+
+proc replaceWithStateForNeighborUpdate*(w: BlockWorld; blockPos: BlockPos; direction: BlockDirection; flags: BlockFlags) =
+  ## `replace_with_state_for_neighbor_update`
+  let (blockRef, blockStateId) = w.getBlockAndStateId(blockPos)
+  if flags.hasFlag(BfSkipRedstoneWireStateReplacement) and sameBlock(blockRef, blockRedstoneWire()):
+    return
+  let neighborPos = blockPos.offset(direction.toOffset())
+  let neighborStateId = w.getBlockStateId(neighborPos)
+  let newStateId = w.blockRegistry.getStateForNeighborUpdate(w, blockRef, blockStateId, blockPos, direction, neighborPos, neighborStateId)
+  if newStateId != blockStateId:
+    if isAir(newStateId):
+      discard w.breakBlock(blockPos, nil, flags)
+    else:
+      discard w.setBlockState(blockPos, newStateId, flags)
+
+proc registryUpdateNeighbors(w: BlockWorld; position: BlockPos; blockRef: Block; flags: BlockFlags) =
+  ## `BlockRegistry::update_neighbors`
+  let dirs2 = blockDirectionAbstractBlockUpdateOrder()
+  for direction in dirs2:
+    let pos = position.offset(direction.toOffset())
+    w.replaceWithStateForNeighborUpdate(pos, direction.opposite(), flags)
+
+proc updateFromNeighborShapes*(w: BlockWorld; stateId: BlockStateId; pos: BlockPos): BlockStateId =
+  ## `update_from_neighbor_shapes`
+  var currentStateId = stateId
+  let blockRef = Block.fromStateId(stateId)
+  let dirs3 = blockDirectionAll()
+  for direction in dirs3:
+    let neighborPos = pos.offset(direction.toOffset())
+    let neighborStateId = w.getBlockStateId(neighborPos)
+    currentStateId = w.blockRegistry.getStateForNeighborUpdate(w, blockRef, currentStateId, pos, direction, neighborPos, neighborStateId)
+  currentStateId
+
+# --- World: what is passed straight through -----------------------------------------------------------------
+
+proc scheduleBlockTick*(w: BlockWorld; blockRef: Block; position: BlockPos; delay: uint8; priority: TickPriority = tpNormal) =
+  let f = w.scheduleBlockTick0
+  f(blockRef, position, delay, priority)
+proc scheduleFluidTick*(w: BlockWorld; fluid: Fluid; position: BlockPos; delay: uint8; priority: TickPriority = tpNormal) =
+  let f = w.scheduleFluidTick0
+  f(fluid, position, delay, priority)
+proc isBlockTickScheduled*(w: BlockWorld; position: BlockPos; blockRef: Block): bool =
+  let f = w.isBlockTickScheduled0
+  f(position, blockRef)
+proc isFluidTickScheduled*(w: BlockWorld; position: BlockPos; fluid: Fluid): bool =
+  let f = w.isFluidTickScheduled0
+  f(position, fluid)
+proc syncWorldEvent*(w: BlockWorld; event: WorldEvent; position: BlockPos; data: int32) =
+  let f = w.syncWorldEvent0
+  if f != nil: f(event, position, data)
+proc playSoundFine*[V, P](w: BlockWorld; sound: Sound; category: SoundCategory; position: Vector3[float64]; volume: V; pitch: P) =
+  let f = w.playSound0
+  if f != nil: f(sound, category, position, float32(volume), float32(pitch))
+proc playSound*(w: BlockWorld; sound: Sound; category: SoundCategory; position: Vector3[float64]) =
+  w.playSoundFine(sound, category, position, 1.0'f32, 1.0'f32)
+proc playSoundRaw*[V, P](w: BlockWorld; sound: uint16; category: SoundCategory; position: Vector3[float64]; volume: V; pitch: P) =
+  let f = w.playSound0
+  if f != nil: f(Sound(sound), category, position, float32(volume), float32(pitch))
+proc playBlockSound*(w: BlockWorld; sound: Sound; category: SoundCategory; position: BlockPos) =
+  w.playSoundFine(sound, category, position.toCenteredF64(), 1.0'f32, 1.0'f32)
+proc addSyncedBlockEvent*(w: BlockWorld; position: BlockPos; kind, data: uint8) =
+  let f = w.addSyncedBlockEvent0
+  if f != nil: f(position, kind, data)
+proc dropStack*(w: BlockWorld; position: BlockPos; stack: ItemStack) =
+  let f = w.dropStack0
+  if f != nil: f(position, stack)
+proc getEntitiesAtBox*(w: BlockWorld; box: BoundingBox): seq[BlockActor] =
+  let f = w.entitiesAtBox0
+  if f != nil: f(box) else: @[]
+proc getPlayersAtBox*(w: BlockWorld; box: BoundingBox): seq[BlockPlayer] =
+  let f = w.playersAtBox0
+  if f != nil: f(box) else: @[]
+proc getWorldAge*(w: BlockWorld): int64 =
+  let f = w.worldAge0
+  if f != nil: f() else: 0'i64
+proc getTimeOfDay*(w: BlockWorld): int64 =
+  let f = w.timeOfDay0
+  if f != nil: f() else: 0'i64
+proc isRaining*(w: BlockWorld): bool =
+  let f = w.isRaining0
+  f != nil and f()
+proc isThundering*(w: BlockWorld): bool =
+  let f = w.isThundering0
+  f != nil and f()
+proc getBlockLightLevel*(w: BlockWorld; position: BlockPos): Option[uint8] =
+  let f = w.blockLight0
+  if f != nil: f(position) else: none[uint8]()
+proc getSkyLightLevel*(w: BlockWorld; position: BlockPos): uint8 =
+  let f = w.skyLight0
+  if f != nil: f(position) else: 15'u8
+proc getMaxLocalRawBrightness*(w: BlockWorld; pos: BlockPos): uint8 =
+  ## `get_max_local_raw_brightness`
+  let blockLight = w.getBlockLightLevel(pos)
+  max(w.getSkyLightLevel(pos), if blockLight.isSome: blockLight.unsafeGet else: 0'u8)
+
+# --- A trait method through a `dyn BlockBehaviour` -----------------------------------------------------------
+
+proc normalUse*(b: BlockBehaviour; args: NormalUseArgs): BlockActionResult =
+  let f = b.normalUseImpl
+  f(args)
+proc useWithItem*(b: BlockBehaviour; args: UseWithItemArgs): BlockActionResult =
+  let f = b.useWithItemImpl
+  f(args)
+proc onEntityCollision*(b: BlockBehaviour; args: OnEntityCollisionArgs) =
+  let f = b.onEntityCollisionImpl
+  f(args)
+proc onEntityStep*(b: BlockBehaviour; args: OnEntityStepArgs) =
+  let f = b.onEntityStepImpl
+  f(args)
+proc shouldDropItemsOnExplosion*(b: BlockBehaviour): bool =
+  let f = b.shouldDropItemsOnExplosionImpl
+  f()
+proc explode*(b: BlockBehaviour; args: ExplodeArgs) =
+  let f = b.explodeImpl
+  f(args)
+proc onSyncedBlockEvent*(b: BlockBehaviour; args: OnSyncedBlockEventArgs): bool =
+  let f = b.onSyncedBlockEventImpl
+  f(args)
+proc onPlace*(b: BlockBehaviour; args: OnPlaceArgs): BlockStateId =
+  let f = b.onPlaceImpl
+  f(args)
+proc randomTick*(b: BlockBehaviour; args: RandomTickArgs) =
+  let f = b.randomTickImpl
+  f(args)
+proc canPlaceAt*(b: BlockBehaviour; args: CanPlaceAtArgs): bool =
+  let f = b.canPlaceAtImpl
+  f(args)
+proc canUpdateAt*(b: BlockBehaviour; args: CanUpdateAtArgs): bool =
+  let f = b.canUpdateAtImpl
+  f(args)
+proc placed*(b: BlockBehaviour; args: PlacedArgs) =
+  let f = b.placedImpl
+  f(args)
+proc playerPlaced*(b: BlockBehaviour; args: PlayerPlacedArgs) =
+  let f = b.playerPlacedImpl
+  f(args)
+proc onLandedUpon*(b: BlockBehaviour; args: OnLandedUponArgs) =
+  let f = b.onLandedUponImpl
+  f(args)
+proc updateEntityMovementAfterFallOn*(b: BlockBehaviour; args: UpdateEntityMovementAfterFallOnArgs) =
+  let f = b.updateEntityMovementAfterFallOnImpl
+  f(args)
+proc broken*(b: BlockBehaviour; args: BrokenArgs) =
+  let f = b.brokenImpl
+  f(args)
+proc onNeighborUpdate*(b: BlockBehaviour; args: OnNeighborUpdateArgs) =
+  let f = b.onNeighborUpdateImpl
+  f(args)
+proc prepare*(b: BlockBehaviour; args: PrepareArgs) =
+  let f = b.prepareImpl
+  f(args)
+proc getStateForNeighborUpdate*(b: BlockBehaviour; args: GetStateForNeighborUpdateArgs): BlockStateId =
+  let f = b.getStateForNeighborUpdateImpl
+  f(args)
+proc onScheduledTick*(b: BlockBehaviour; args: OnScheduledTickArgs) =
+  let f = b.onScheduledTickImpl
+  f(args)
+proc onStateReplaced*(b: BlockBehaviour; args: OnStateReplacedArgs) =
+  let f = b.onStateReplacedImpl
+  f(args)
+proc emitsRedstonePower*(b: BlockBehaviour; args: EmitsRedstonePowerArgs): bool =
+  let f = b.emitsRedstonePowerImpl
+  f(args)
+proc getWeakRedstonePower*(b: BlockBehaviour; args: GetRedstonePowerArgs): uint8 =
+  let f = b.getWeakRedstonePowerImpl
+  f(args)
+proc getStrongRedstonePower*(b: BlockBehaviour; args: GetRedstonePowerArgs): uint8 =
+  let f = b.getStrongRedstonePowerImpl
+  f(args)
+proc getComparatorOutput*(b: BlockBehaviour; args: GetComparatorOutputArgs): Option[uint8] =
+  let f = b.getComparatorOutputImpl
+  f(args)
+proc getInsideCollisionShape*(b: BlockBehaviour; args: GetInsideCollisionShapeArgs): BoundingBox =
+  let f = b.getInsideCollisionShapeImpl
+  f(args)
+proc mirror*(b: BlockBehaviour; blockRef: Block; stateId: BlockStateId; mirror: Mirror): BlockState =
+  let f = b.mirrorImpl
+  f(blockRef, stateId, mirror)
+proc rotate*(b: BlockBehaviour; blockRef: Block; stateId: BlockStateId; rotation: Rotation): BlockState =
+  let f = b.rotateImpl
+  f(blockRef, stateId, rotation)
+
+# --- The rest of `BlockRegistry` ------------------------------------------------------------------------------
+
+proc onSyncedBlockEvent*(r: BlockRegistry; blockRef: Block; world: BlockWorld; position: BlockPos; kind, data: uint8): bool =
+  let b = r.behaviourOf(blockRef.id)
+  if b != nil:
+    return b.onSyncedBlockEvent(OnSyncedBlockEventArgs(world: world, block0: blockRef, position: position, kind0: kind, data: data))
+  false
+
+proc onEntityCollision*(r: BlockRegistry; blockRef: Block; world: BlockWorld; entity: BlockActor; position: BlockPos; state: BlockState; server: BlockServer) =
+  let b = r.behaviourOf(blockRef.id)
+  if b != nil:
+    b.onEntityCollision(OnEntityCollisionArgs(server: server, world: world, block0: blockRef, state: state, position: position, entity: entity))
+
+proc onEntityStep*(r: BlockRegistry; blockRef: Block; world: BlockWorld; entity: BlockActor; position: BlockPos; state: BlockState; belowSupportingBlock: bool) =
+  let b = r.behaviourOf(blockRef.id)
+  if b != nil:
+    b.onEntityStep(OnEntityStepArgs(world: world, block0: blockRef, state: state, position: position, entity: entity, belowSupportingBlock: belowSupportingBlock))
+
+proc onUse*(r: BlockRegistry; blockRef: Block; player: BlockPlayer; position: BlockPos; hit: BlockHitResult; server: BlockServer; world: BlockWorld): BlockActionResult =
+  let b = r.behaviourOf(blockRef.id)
+  if b != nil:
+    return b.normalUse(NormalUseArgs(server: server, world: world, block0: blockRef, position: position, player: player, hit: hit))
   barPass
 
-proc defaultOnPlace*(blockName: string): int =
-  ## `mod.rs`'s `on_place` trait default: `args.block.default_state.id`.
-  let (found, id) = blockstateid.defaultStateId(blockName)
-  if found: id else: 0
+proc explode*(r: BlockRegistry; blockRef: Block; world: BlockWorld; position: BlockPos) =
+  let b = r.behaviourOf(blockRef.id)
+  if b != nil:
+    b.explode(ExplodeArgs(world: world, block0: blockRef, position: position))
 
-proc defaultIsPathfindable*(stateId: uint32, computationType: PathComputationType): bool =
-  ## Simplified stand-in for mod.rs's real default, which branches on
-  ## `state.is_waterlogged()`/`Fluid::from_state_id(...).has_tag(...)` for
-  ## `Water` and `state.is_full_cube()` for `Land`/`Air` - none of which
-  ## exist yet (no `BlockState`/`Fluid`/tag registry in this port). This
-  ## approximates "solid full blocks aren't pathfindable, nothing is a
-  ## fluid" until those land; every concrete block below that needs real
-  ## pathfinding behavior overrides this directly rather than relying on
-  ## the approximation.
-  discard stateId
-  case computationType
-  of pctWater: false
-  of pctLand, pctAir: true
+proc useWithItem*(r: BlockRegistry; blockRef: Block; player: BlockPlayer; position: BlockPos; hit: BlockHitResult; itemStack: ItemStackRef; equipmentSlot: int; server: BlockServer; world: BlockWorld): BlockActionResult =
+  let b = r.behaviourOf(blockRef.id)
+  if b != nil:
+    return b.useWithItem(UseWithItemArgs(server: server, world: world, block0: blockRef, position: position, player: player, hit: hit, itemStack: itemStack, equipmentSlot: equipmentSlot))
+  barPassToDefaultBlockAction
 
-proc newBlockBehaviour*(blockName: string = ""): BlockBehaviour =
-  ## A `BlockBehaviour` with every method at its trait-default body -
-  ## matches upstream's `impl BlockBehaviour for X {}` (an empty impl
-  ## block, which just inherits every default). `blockName` is only
-  ## needed for `defaultOnPlace`'s real-default-state lookup; blocks that
-  ## don't need it (nothing calls `onPlace`) can omit it.
-  BlockBehaviour(
-    onLandedUponImpl: (proc(entity: EntityBase, fallDistance: float64) {.closure.} =
-      defaultOnLandedUpon(entity, fallDistance)),
-    updateEntityMovementAfterFallOnImpl: (proc(entity: EntityBase) {.closure.} =
-      defaultUpdateEntityMovementAfterFallOn(entity)),
-    isPathfindableImpl: (proc(stateId: uint32, computationType: PathComputationType): bool {.closure.} =
-      defaultIsPathfindable(stateId, computationType)),
-    normalUseImpl: (proc(): BlockActionResult {.closure.} =
-      defaultNormalUse()),
-    onPlaceImpl: (proc(direction: BlockDirection, waterlogged: bool): int {.closure.} =
-      discard direction
-      discard waterlogged
-      defaultOnPlace(blockName)),
-  )
+proc canUpdateAt*(r: BlockRegistry; world: BlockWorld; blockRef: Block; stateId: BlockStateId; position: BlockPos; direction: BlockDirection; useItemOn: SUseItemOn; player: BlockPlayer): bool =
+  let b = r.behaviourOf(blockRef.id)
+  if b != nil:
+    return b.canUpdateAt(CanUpdateAtArgs(world: world, block0: blockRef, stateId: stateId, position: position, direction: direction, player: player, useItemOn: useItemOn))
+  false
 
-proc onLandedUpon*(b: BlockBehaviour, entity: EntityBase, fallDistance: float64) {.inline.} =
-  b.onLandedUponImpl(entity, fallDistance)
+proc onPlace*(r: BlockRegistry; server: BlockServer; world: BlockWorld; player: BlockPlayer; blockRef: Block; position: BlockPos; direction: BlockDirection; replacing: BlockIsReplacing; useItemOn: SUseItemOn): BlockStateId =
+  let b = r.behaviourOf(blockRef.id)
+  if b != nil:
+    return b.onPlace(OnPlaceArgs(server: server, world: world, block0: blockRef, position: position, direction: direction, player: player, replacing: replacing, useItemOn: useItemOn))
+  blockRef.defaultState.id
 
-proc updateEntityMovementAfterFallOn*(b: BlockBehaviour, entity: EntityBase) {.inline.} =
-  b.updateEntityMovementAfterFallOnImpl(entity)
+proc playerPlaced*(r: BlockRegistry; world: BlockWorld; blockRef: Block; stateId: BlockStateId; position: BlockPos; direction: BlockDirection; player: BlockPlayer) =
+  let b = r.behaviourOf(blockRef.id)
+  if b != nil:
+    b.playerPlaced(PlayerPlacedArgs(world: world, block0: blockRef, stateId: stateId, position: position, direction: direction, player: player))
 
-proc isPathfindable*(b: BlockBehaviour, stateId: uint32, computationType: PathComputationType): bool {.inline.} =
-  b.isPathfindableImpl(stateId, computationType)
+proc broken*(r: BlockRegistry; blockRef: Block; player: BlockPlayer; position: BlockPos; server: BlockServer; world: BlockWorld; state: BlockState) =
+  let b = r.behaviourOf(blockRef.id)
+  if b != nil:
+    b.broken(BrokenArgs(block0: blockRef, player: player, position: position, server: server, world: world, state: state))
 
-proc normalUse*(b: BlockBehaviour): BlockActionResult {.inline.} =
-  b.normalUseImpl()
+proc getInsideCollisionShape*(r: BlockRegistry; blockRef: Block; world: BlockWorld; state: BlockState; position: BlockPos): BoundingBox =
+  let b = r.behaviourOf(blockRef.id)
+  if b != nil:
+    return b.getInsideCollisionShape(GetInsideCollisionShapeArgs(world: world, block0: blockRef, state: state, position: position))
+  BoundingBox.fullBlock()
 
-proc onPlace*(b: BlockBehaviour, direction: BlockDirection, waterlogged: bool): int {.inline.} =
-  b.onPlaceImpl(direction, waterlogged)
+proc mirrorState*(r: BlockRegistry; blockRef: Block; stateId: BlockStateId; mirror: Mirror): BlockState =
+  let b = r.behaviourOf(blockRef.id)
+  if b != nil: b.mirror(blockRef, stateId, mirror) else: blockRef.mirror(stateId, mirror)
 
-# --- registration: replaces `#[pumpkin_block(name)]` ------------------------
-
-var blockRegistry: Table[string, BlockBehaviour] = initTable[string, BlockBehaviour]()
-var unknownRegistrations: seq[string] = @[]
-  ## Block names registered that don't resolve against the real block
-  ## table (src/generated/blockdata.aowl). Kept as a plain diagnostic list
-  ## rather than a hard failure, since a block file's own name might
-  ## legitimately predate the generated table's snapshot of blocks.json
-  ## (a modded/future block, or a test fixture) - `registerBlock` still
-  ## registers it, `unresolvedBlockRegistrations()` exposes the list for
-  ## whoever wants to assert on it (e.g. a startup-sanity test).
-
-proc stripMcPrefix(name: string): string {.inline.} =
-  ## Block files register with the wire-format "minecraft:" namespace
-  ## prefix (matching upstream's registration strings); the generated
-  ## table's `name` field is unprefixed.
-  if name.startsWith("minecraft:"): name[10 .. ^1] else: name
-
-proc findRealBlock*(name: string): (bool, realblock.Block) =
-  let bare = stripMcPrefix(name)
-  for b in realblock.AllBlocks:
-    if b.name == bare:
-      return (true, b)
-  (false, realblock.Block())
-
-proc registerBlock*(name: string, behaviour: BlockBehaviour) =
-  ## Each block file calls this at load time in place of the macro's
-  ## registration codegen (upstream's `registry.rs` builds the equivalent
-  ## table at compile-derived startup by instantiating every `impl
-  ## BlockBehaviour` block - here it's an explicit call per block).
-  let (found, _) = findRealBlock(name)
-  if not found:
-    unknownRegistrations.add(name)
-  blockRegistry[name] = behaviour
-
-proc unresolvedBlockRegistrations*(): seq[string] {.inline.} =
-  unknownRegistrations
-
-proc lookupBlock*(name: string): nil BlockBehaviour =
-  ## `nil` = not registered, matching `entity.aowl`'s established
-  ## nilable-ref-for-optional convention (a `(bool, T)` tuple doesn't
-  ## coerce a non-nilable ref into a nilable slot cleanly, per that
-  ## file's own note).
-  if blockRegistry.hasKey(name):
-    try:
-      let found: BlockBehaviour = blockRegistry[name]
-      result = found
-    except ErrorCode:
-      result = nil
-  else:
-    result = nil
+proc rotateState*(r: BlockRegistry; blockRef: Block; stateId: BlockStateId; rotation: Rotation): BlockState =
+  let b = r.behaviourOf(blockRef.id)
+  if b != nil: b.rotate(blockRef, stateId, rotation) else: blockRef.rotate(stateId, rotation)

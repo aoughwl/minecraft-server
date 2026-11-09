@@ -1,34 +1,237 @@
 ## Port of pumpkin/src/world/mod.rs
-## PARTIAL: pumpkin/src/world/mod.rs - `spawn_java_player`, `get_top_block`, `add_player`, `remove_player`'s tab-list half and the time part of `tick_environment`. Of `spawn_java_player`, the commands packet is an empty tree (src/command has no wire form yet), and the inventory (`on_screen_handler_opened`, `CSetEquipment`), effects, recipes, bossbars and plugin events are missing. Everything else in its 5500 lines is not ported: blocks, entities, ticking, weather changes, explosions. The types are in ../serverbase.aowl.
+## PARTIAL: pumpkin/src/world/mod.rs - players, blocks and chunks: broadcasts, `tick`, `tick_environment`, `spawn_java_player`, `respawn_player`, `remove_player`, block get and set, `set_block_breaking`, `break_block`, `flush_block_updates`, active chunks, tick data. Missing, because what they call is a later batch: entities, block entities, block and fluid behaviour (`tick_chunks` computes the ticks and random ticks and has nobody to hand them to, `on_placed` and neighbour updates are the hook `blockHooks` below), sounds, particles, natural spawning, dragon fight, portals, explosions' block side, and the commands packet, an empty tree (src/command has no wire form yet). `drop_loot` needs item entities: a block's drops are not spawned. See ../block/block_place.aowl for `place_block`.
+##
+## The types are in ../serverbase.aowl.
+##
+## Upstream makes a joining client wait inside `spawn_java_player` until the chunk under it exists. Here one thread also
+## answers every client, so that wait is a state, `Player.pendingSpawn`: `spawnJavaPlayer` sends what comes before the
+## position and adds a ticket, and `continueSpawn` runs the rest when the chunk has arrived. A spawn chunk that does
+## not arrive within `SpawnChunkPatienceMs` goes on without it, so a client is never left hanging: it gets its position
+## and the chunk when there is one.
 
-import std/options
+{.feature: "untyped".}
+{.feature: "lenientnils".}
+
+import std/[options, tables, math, syncio]
 import ../../protocol/java/client/play/[login, player_spawn_data, ticking_state, ticking_step, commands,
   chunk_batch_start, chunk_batch_end, chunk_data, player_action, spawn_entity, set_held_item,
-  game_event, initialize_world_border, player_spawn_position, system_chat_message, player_remove, remove_entities]
+  game_event, player_spawn_position, system_chat_message, player_remove, remove_entities, block_update,
+  multi_block_update, block_destroy_stage, worldevent, set_equipment, respawn, entity_metadata, block_event,
+  player_chat_message, update_entity_pos, update_entity_pos_rot, update_entity_rot, head_rot, entity_position_sync]
 import ../../protocol/java/client/play/player_info_update except Player
+import ../../protocol/itemstackserializer
 import ../../generated/translation as tr
 import ../../generated/entity_type
+import ../../generated/tracked_data
+import ../../generated/world_event as worldeventdata
+from ../../generated/meta_data_type import BYTE
+import ../../data/block_ext
+from ../../data/block_state import newBlockStateIdUnchecked, asU16, isAir
+import "../../data/item_stack/mod"
+import ../../inventory/[entity_equipment, inventory, player_inventory, player_screen_handler, stackbridge, screenhandler]
 import ../../util/math/position
+import ../../util/math/mathmod
 import ../../util/text/text
-import ../../world/[biomeparam, blockstates, chunkdata]
+import ../../world/[biomeparam, blockstates, chunkdata, world as worldtraits]
+import ../../world/chunk_system/chunk_system
 import ../serverbase
 import ../entity/player as playermod
-import chunker
+import ../net/winsock
+import chunker, time, weather, border
 
-proc newWorldborder(centerX, centerZ, diameter: float64; speed: int64; warningBlocks, warningTime: int32): Worldborder =
-  ## `Worldborder::new`
-  Worldborder(centerX: centerX, centerZ: centerZ, oldDiameter: diameter, newDiameter: diameter, speed: speed,
-    portalTeleportBoundary: 29_999_984'i32, warningBlocks: warningBlocks, warningTime: warningTime)
+export border, time, weather
 
-proc loadWorld*(theLevel: Level; levelInfo: LevelData; theDimension: Dimension; seaLevel: int32): World =
+const SpawnChunkPatienceMs = 20000'i64
+
+proc dataStateOf(id: uint32): block_ext.BlockState =
+  BlockState.fromId(newBlockStateIdUnchecked(uint16(id)))
+
+proc dataBlockOf*(id: uint32): block_ext.Block =
+  ## `Block::from_state_id`
+  block_ext.Block.fromStateId(newBlockStateIdUnchecked(uint16(id)))
+
+proc loadWorld*(theLevel: GameLevel; levelInfo: LevelData; theDimension: Dimension; seaLevel, minY: int32;
+    server: Server): World =
   ## `World::load`.
-  World(level: theLevel, levelInfo: levelInfo, dimension: theDimension, players: @[], seaLevel: seaLevel,
-    worldborder: newWorldborder(0.0, 0.0, 5.999_996_8e7, 0'i64, 5'i32, 300'i32),
-    levelTime: LevelTime(worldAge: 0'i64, timeOfDay: levelInfo.dayTime),
-    weather: Weather(raining: false, rainLevel: 0.0'f32, thunderLevel: 0.0'f32))
+  World(level: theLevel, levelInfo: levelInfo, dimension: theDimension, players: @[], seaLevel: seaLevel, minY: minY,
+    server: server, worldborder: newWorldborder(0.0, 0.0, 5.999_996_8e7, 0'i64, 5'i32, 300'i32),
+    levelTime: LevelTime(worldAge: 0'i64, timeOfDay: levelInfo.dayTime, rainTime: 0'i64),
+    weather: newWeather(), unsentBlockChanges: initTable[int64, BlockChange](), syncedBlockEventQueue: @[],
+    activeChunks: @[], forcedChunks: @[])
 
 proc addPlayer*(self: World; player: Player) =
   self.players.add(player)
+
+# --- Broadcasts ----------------------------------------------------------------------------------------
+
+proc broadcastSystemMessage*(self: World; message: TextComponent; overlay: bool) =
+  for p in self.players:
+    p.client.writePacketFor(CSystemChatMessage(content: message, overlay: overlay))
+
+template broadcastToChunk*(self: World; chunkPos0: Vector2[int32]; packet: untyped) =
+  ## `broadcast_to_chunk`
+  let btPacket = packet
+  for btPlayer in self.players:
+    if isWithinViewDistance(chunkPos0, btPlayer.chunkPos, int32(getViewDistance(btPlayer, self.server))):
+      btPlayer.client.writePacketFor(btPacket)
+
+template broadcastToChunkExcept*(self: World; chunkPos0: Vector2[int32]; except0: Uuid; packet: untyped) =
+  ## `broadcast_to_chunk_except`
+  let btPacket = packet
+  for btPlayer in self.players:
+    if btPlayer.gameprofile.id != except0 and
+        isWithinViewDistance(chunkPos0, btPlayer.chunkPos, int32(getViewDistance(btPlayer, self.server))):
+      btPlayer.client.writePacketFor(btPacket)
+
+proc indexedFor(lastSeen: seq[seq[byte]]; recipient: Player): seq[PreviousMessage] =
+  ## `LastSeen::indexed_for`
+  result = @[]
+  for signature in lastSeen:
+    var index = -1
+    for i in 0 ..< recipient.signatureCache.fullCache.len:
+      if recipient.signatureCache.fullCache[i] == signature:
+        index = i
+        break
+    if index >= 0:
+      result.add(PreviousMessage(id: newVarInt(int32(1 + index)), signature: none[seq[byte]]()))
+    else:
+      result.add(PreviousMessage(id: newVarInt(0'i32), signature: some(signature)))
+
+proc broadcastSecurePlayerChat*(self: World; sender: Player; message: string; timestamp, salt: int64;
+    signature: Option[seq[byte]]; decoratedMessage: TextComponent) =
+  ## `broadcast_secure_player_chat`
+  const Raw = 0'i32  # `chat_type::RAW`; upstream's custom type with no sender name is the one after it.
+  let messagesSent = sender.chatSession.messagesSent
+  let senderLastSeen = sender.signatureCache.lastSeen
+  for recipient in self.players:
+    let previous = indexedFor(senderLastSeen, recipient)
+    recipient.client.writePacketFor(CPlayerChatMessage(globalIndex: newVarInt(recipient.chatSession.messagesReceived),
+      sender: sender.gameprofile.id, index: newVarInt(messagesSent), messageSignature: signature, message: message,
+      timestamp: timestamp, salt: salt, previousMessages: previous, unsignedContent: some(decoratedMessage),
+      filterType: FilterType(kind: ftPassThrough), chatType: newVarInt(Raw + 1'i32), senderName: empty(),
+      targetName: none[TextComponent]()))
+    if signature.isSome:
+      recipient.signatureCache.addSeenSignature(signature.unsafeGet)
+    if recipient.gameprofile.id != sender.gameprofile.id:
+      recipient.signatureCache.cacheSignatures(senderLastSeen)
+    recipient.chatSession.messagesReceived += 1'i32
+  sender.chatSession.messagesSent += 1'i32
+
+# --- Blocks --------------------------------------------------------------------------------------------
+
+proc blockKey(position: BlockPos): int64 =
+  ## `BlockPos::as_long`'s packing, as a table key.
+  (int64(position.vec.x and 0x3FFFFFF'i32) shl 38) or (int64(position.vec.z and 0x3FFFFFF'i32) shl 12) or
+    int64(position.vec.y and 0xFFF'i32)
+
+proc getBlockStateId*(self: World; position: BlockPos): uint32 =
+  ## `get_block_state_id`
+  getBlockState(self.level, position)
+
+proc getBlockAndState*(self: World; position: BlockPos): (block_ext.Block, block_ext.BlockState) =
+  ## `get_block_and_state`
+  let id = self.getBlockStateId(position)
+  (dataBlockOf(id), dataStateOf(id))
+
+proc getBlock*(self: World; position: BlockPos): block_ext.Block =
+  dataBlockOf(self.getBlockStateId(position))
+
+proc isLoaded*(self: World; position: BlockPos): bool =
+  let chunk = position.chunkPosition()
+  isChunkLoaded(self.level, chunk.x, chunk.y)
+
+proc getBottomY*(self: World): int32 {.inline.} = self.dimension.minY
+
+proc getTopY*(self: World): int32 {.inline.} = self.dimension.minY + self.dimension.height - 1'i32
+
+proc isInBuildLimit*(self: World; dest: BlockPos): bool =
+  ## `is_in_build_limit`
+  let y = dest.vec.y
+  y >= self.getBottomY() and y <= self.getTopY() and dest.vec.x >= -30000000'i32 and dest.vec.x < 30000000'i32 and
+    dest.vec.z >= -30000000'i32 and dest.vec.z < 30000000'i32
+
+proc registerBlockChange*(self: World; position: BlockPos; blockStateId: uint32) =
+  self.unsentBlockChanges[blockKey(position)] = BlockChange(position: position, stateId: blockStateId)
+
+proc setBlockState*(self: World; position: BlockPos; blockStateId: uint32; flags: BlockFlags): uint32 =
+  ## `set_block_state`. What block behaviour would do with the change is left to the later block batch: see the PARTIAL
+  ## line. Neighbours and lighting still hear of it through the level.
+  let replaced = setBlockState(self.level, position, blockStateId)
+  if replaced == blockStateId:
+    return blockStateId
+  self.registerBlockChange(position, blockStateId)
+  updateLightingAt(self.level, position)
+  replaced
+
+proc setBlockBreaking*(self: World; fromPlayer: Player; location: BlockPos; progress: int32) =
+  ## `set_block_breaking`
+  self.broadcastToChunkExcept(location.chunkPosition(), fromPlayer.gameprofile.id,
+    CSetBlockDestroyStage(entityId: newVarInt(fromPlayer.entityId), location: location, destroyStage: int8(progress)))
+
+proc closeContainerScreensAt*(self: World; position: BlockPos) =
+  ## `close_container_screens_at`
+  for p in self.players:
+    if p.openContainerPos.isSome and p.openContainerPos.unsafeGet == position:
+      p.closeHandledScreen()
+
+proc breakBlock*(self: World; position: BlockPos; cause: nil Player; flags: BlockFlags): Option[uint32] =
+  ## `break_block`. The drop at its end needs item entities and is left out; see the PARTIAL line.
+  let brokenStateId = self.getBlockStateId(position)
+  if isAir(brokenStateId):
+    return none[uint32]()
+  let brokenBlock = dataBlockOf(brokenStateId)
+  var newStateId = 0'u32
+  if brokenBlock.isWaterlogged(newBlockStateIdUnchecked(uint16(brokenStateId))):
+    # `FlowingFluidProperties` of flowing water at level 8, not falling: a water source.
+    let (_, water) = defaultStateByName("water")
+    newStateId = water
+  discard self.setBlockState(position, newStateId, flags)
+  self.closeContainerScreensAt(position)
+  if brokenBlock.name != "fire":
+    let particles = CWorldEvent(event: int32(ord(weParticlesDestroyBlock)), location: position, data: int32(brokenStateId),
+      disableRelativeVolume: false)
+    if cause != nil:
+      self.broadcastToChunkExcept(position.chunkPosition(), cause.gameprofile.id, particles)
+    else:
+      self.broadcastToChunk(position.chunkPosition(), particles)
+  some(newStateId)
+
+proc flushBlockUpdates*(self: World) =
+  ## `flush_block_updates`
+  if self.unsentBlockChanges.len == 0:
+    return
+  var bySection = initTable[int64, seq[(BlockPos, uint32)]]()
+  for _, change in self.unsentBlockChanges:
+    let p = change.position.vec
+    let key = (int64(p.x shr 4) shl 42) or (int64((p.z shr 4) and 0x3FFFFF'i32) shl 20) or int64((p.y shr 4) and 0xFFFFF'i32)
+    var updates = bySection.getOrDefault(key, @[])
+    updates.add((change.position, change.stateId))
+    bySection[key] = updates
+  self.unsentBlockChanges = initTable[int64, BlockChange]()
+  for _, updates in bySection:
+    let chunk = updates[0][0].chunkPosition()
+    if updates.len == 1:
+      self.broadcastToChunk(chunk, CBlockUpdate(location: updates[0][0], stateId: newVarInt(int32(updates[0][1]))))
+    else:
+      var wire: seq[(BlockPos, block_ext.BlockStateId)] = @[]
+      for update in updates:
+        wire.add((update[0], newBlockStateIdUnchecked(uint16(update[1]))))
+      self.broadcastToChunk(chunk, newCMultiBlockUpdate(wire))
+
+proc addSyncedBlockEvent*(self: World; pos: BlockPos; eventType, data: uint8) =
+  ## `add_synced_block_event`
+  self.syncedBlockEventQueue.add(BlockEvent(position: pos, eventType: eventType, data: data))
+
+proc flushSyncedBlockEvents*(self: World) =
+  ## `flush_synced_block_events`, without `on_synced_block_event`'s veto, which is block behaviour.
+  if self.syncedBlockEventQueue.len == 0:
+    return
+  let events = self.syncedBlockEventQueue
+  self.syncedBlockEventQueue = @[]
+  for event in events:
+    let blockRef = self.getBlock(event.position)
+    self.broadcastToChunk(event.position.chunkPosition(), CBlockEvent(location: event.position, actionId: event.eventType,
+      actionParameter: event.data, blockType: newVarInt(int32(uint16(blockRef.id)))))
 
 proc getTopBlock*(self: World; position: Vector2[int32]): int32 =
   let chunkPos = Vector2[int32](x: position.x shr 4, y: position.y shr 4)
@@ -47,6 +250,8 @@ proc getTopBlock*(self: World; position: Vector2[int32]): int32 =
       return y
     dec y
   self.dimension.minY
+
+# --- Joining --------------------------------------------------------------------------------------------
 
 proc playerActionsFor(p: Player; selfJoin: bool): seq[PlayerAction] =
   ## The five actions both of `spawn_java_player`'s tab-list packets send.
@@ -67,13 +272,47 @@ const TabListFlags = PlayerInfoAddPlayer or PlayerInfoUpdateGameMode or PlayerIn
 proc spawnEntityPacket(p: Player): CSpawnEntity =
   let (_, playerType) = entityTypeByName("player")
   newCSpawnEntity(newVarInt(p.entityId), p.gameprofile.id, newVarInt(int32(playerType.id)), p.pos, p.pitch, p.yaw,
-    p.yaw, newVarInt(0'i32), p.velocity)
+    p.headYaw, newVarInt(0'i32), p.velocity)
 
-proc broadcastSystemMessage*(self: World; message: TextComponent; overlay: bool) =
-  for p in self.players:
-    p.client.writePacketFor(CSystemChatMessage(content: message, overlay: overlay))
+proc skinMetadata(p: Player; v: JavaMinecraftVersion): seq[byte] =
+  var buf = newNetWriter()
+  discard newMetadata(TrackedData_PLAYER_MODE_CUSTOMISATION, BYTE, p.config.skinParts).write(buf, v)
+  writeU8(buf, 255'u8)
+  buf.buf
+
+proc equipmentPacket(p: Player): CSetEquipment =
+  ## `send_player_equipment`'s list.
+  var wire: seq[(int8, ItemStackSerializer)] = @[]
+  wire.add((int8(ord(esMainHand)), toSerializer(p.inventory.heldItem())))
+  for slot in [esFeet, esLegs, esChest, esHead, esOffHand]:
+    wire.add((int8(ord(slot)), toSerializer(p.equipment.get(slot))))
+  CSetEquipment(entityId: newVarInt(p.entityId), equipment: wire)
+
+proc sendCenterChunk(client: JavaClient; chunk: nil ChunkData) =
+  ## The synchronous center chunk upstream sends before the teleport.
+  client.writePacketFor(CChunkBatchStart())
+  if chunk != nil:
+    client.writePacketFor(CChunkData(data: chunk))
+    client.writePacketFor(newCChunkBatchEnd(1'u16))
+  else:
+    client.writePacketFor(newCChunkBatchEnd(0'u16))
+
+proc requestSpawnChunk(self: World; player: Player; position: Vector3[float64]; yaw, pitch: float32;
+    needsTopBlock, isRespawn: bool) =
+  ## Where upstream awaits `get_or_fetch_chunk`: a ticket and a listener, polled by `continueSpawn`.
+  let x = int32(floor(position.x)) shr 4
+  let z = int32(floor(position.z)) shr 4
+  let center = Vector2[int32](x: x, y: z)
+  discard ensureChunkSystem(self.level)
+  let held = readChunkSync(self.level, x, z)
+  let listener = if held == nil: addSingleChunkListener(self.level.chunkListener, chunkPos(x, z)) else: nil
+  addTicket(self.level.chunkLoading, chunkPos(x, z), FullChunkLevel)
+  sendChange(self.level.chunkLoading)
+  player.pendingSpawn = PendingSpawn(active: true, center: center, listener: listener, since: nowMs(),
+    position: position, yaw: yaw, pitch: pitch, needsTopBlock: needsTopBlock, respawn: isRespawn)
 
 proc spawnJavaPlayer*(self: World; baseConfig: BasicConfiguration; player: Player; server: Server) =
+  ## The first half of `spawn_java_player`: up to where upstream waits for the spawn chunk.
   var dimensions: seq[string] = @[]
   for d in server.dimensions:
     dimensions.add(d.minecraftName)
@@ -106,13 +345,14 @@ proc spawnJavaPlayer*(self: World; baseConfig: BasicConfiguration; player: Playe
       portalCooldown: newVarInt(0'i32),
       sealevel: newVarInt(self.seaLevel)),
     onlineMode: java.onlineMode,
-    # This should stay true even when reports are disabled.
-    # It prevents the annoying popup when joining the server.
-    enforceSecureChat: true))
+    # Upstream always sends true here, to stop the popup vanilla shows on joining. The game client (aoughwl.mcnet,
+    # `sendChat`) refuses to send an unsigned message while this is true, and upstream's own unsigned path below is the
+    # one taken when `allow_chat_reports` is off, so the flag follows that setting: chat has to work in the client we ship.
+    enforceSecureChat: baseConfig.allowChatReports))
 
   # Send the current ticking state to the new player so they are in sync.
-  client.writePacketFor(CTickingState(tickRate: baseConfig.tps, isFrozen: false))
-  client.writePacketFor(CTickingStep(tickSteps: newVarInt(0'i32)))
+  client.writePacketFor(CTickingState(tickRate: server.tickRateManager.tickrate, isFrozen: server.tickRateManager.isFrozen))
+  client.writePacketFor(CTickingStep(tickSteps: newVarInt(server.tickRateManager.frozenTicksToRun)))
 
   # Permissions, i.e. the commands a player may use.
   player.sendPermissionLvlUpdate()
@@ -121,20 +361,17 @@ proc spawnJavaPlayer*(self: World; baseConfig: BasicConfiguration; player: Playe
   player.sendDifficultyUpdate()
   client.writePacketFor(emptyCommandTree())
 
-  var position: Vector3[float64]
-  var yaw: float32
-  var pitch: float32
   if player.hasPlayedBefore:
-    position = player.pos
-    yaw = player.yaw
-    pitch = player.pitch
+    self.requestSpawnChunk(player, player.pos, player.yaw, player.pitch, false, false)
   else:
     let info = self.levelInfo
-    discard fetchChunkFromDisk(self.level, info.spawnX shr 4, info.spawnZ shr 4)
-    let posY = self.getTopBlock(Vector2[int32](x: info.spawnX, y: info.spawnZ)) + 1'i32 # +1 to spawn on top of the block
-    position = Vector3[float64](x: float64(info.spawnX) + 0.5, y: float64(posY), z: float64(info.spawnZ) + 0.5)
-    yaw = info.spawnYaw
-    pitch = info.spawnPitch
+    let at = Vector3[float64](x: float64(info.spawnX) + 0.5, y: float64(info.spawnY), z: float64(info.spawnZ) + 0.5)
+    self.requestSpawnChunk(player, at, info.spawnYaw, info.spawnPitch, true, false)
+
+proc finishJoin(self: World; player: Player; server: Server; position: Vector3[float64]; yaw, pitch: float32;
+    centerChunk: nil ChunkData) =
+  ## The second half of `spawn_java_player`, from the spawn chunk on.
+  let client = player.client
 
   # Load chunks around the real spawn position before teleporting the client there.
   player.setPos(position)
@@ -142,20 +379,12 @@ proc spawnJavaPlayer*(self: World; baseConfig: BasicConfiguration; player: Playe
   player.lastPos = position
   updatePosition(player, server)
 
-  let centerChunk = player.chunkPos
-  let fetched = fetchChunkFromDisk(self.level, centerChunk.x, centerChunk.y)
-  client.writePacketFor(CChunkBatchStart())
-  var centerCount = 0'u16
-  if fetched.kind == lkLoaded and fetched.chunk.status == csFull:
-    client.writePacketFor(CChunkData(data: fetched.chunk))
-    centerCount = 1'u16
-  client.writePacketFor(newCChunkBatchEnd(centerCount))
+  sendCenterChunk(client, centerChunk)
 
   player.requestTeleport(position, yaw, pitch)
 
   let joined = @[PlayerInfoEntry(uuid: player.gameprofile.id, actions: playerActionsFor(player, true))]
-  for p in self.players:
-    p.client.writePacketFor(CPlayerInfoUpdate(actions: TabListFlags, players: joined))
+  self.broadcastPacketAll(CPlayerInfoUpdate(actions: TabListFlags, players: joined))
 
   # Here, we send all the infos of players who already joined.
   var others: seq[PlayerInfoEntry] = @[]
@@ -165,30 +394,28 @@ proc spawnJavaPlayer*(self: World; baseConfig: BasicConfiguration; player: Playe
   client.writePacketFor(CPlayerInfoUpdate(actions: TabListFlags, players: others))
 
   # Spawn the player for every client.
-  for p in self.players:
-    if p.gameprofile.id != player.gameprofile.id:
-      p.client.writePacketFor(spawnEntityPacket(player))
+  self.broadcastPacketExcept(player.gameprofile.id, spawnEntityPacket(player))
+  self.broadcastPacketExcept(player.gameprofile.id, CSetEntityMetadata(entityId: newVarInt(player.entityId),
+    metadata: skinMetadata(player, client.version)))
 
   # Spawn players for our client.
   for p in self.players:
     if p.gameprofile.id != player.gameprofile.id:
       client.writePacketFor(spawnEntityPacket(p))
+      client.writePacketFor(CSetEntityMetadata(entityId: newVarInt(p.entityId), metadata: skinMetadata(p, client.version)))
+      client.writePacketFor(equipmentPacket(p))
 
   player.sendClientInformation()
 
   player.sendAbilitiesUpdate()
 
   # Sync selected slot
-  client.writePacketFor(CSetSelectedSlot(slot: player.selectedSlot))
+  client.writePacketFor(CSetSelectedSlot(slot: int8(player.inventory.getSelectedSlot())))
 
   # Start waiting for level chunks. Sets the "Loading Terrain" screen
   client.writePacketFor(newCGameEvent(geStartWaitingChunks, 0.0'f32))
 
-  let border = self.worldborder
-  client.writePacketFor(CInitializeWorldBorder(x: border.centerX, z: border.centerZ, oldDiameter: border.oldDiameter,
-    newDiameter: border.newDiameter, speed: newVarLong(border.speed),
-    portalTeleportBoundary: newVarInt(border.portalTeleportBoundary), warningBlocks: newVarInt(border.warningBlocks),
-    warningTime: newVarInt(border.warningTime)))
+  self.worldborder.initClient(client)
 
   # Sends initial time
   player.sendTime(self)
@@ -204,31 +431,218 @@ proc spawnJavaPlayer*(self: World; baseConfig: BasicConfiguration; player: Playe
     client.writePacketFor(newCGameEvent(geThunderLevelChange, max(min(self.weather.thunderLevel, 1.0'f32), 0.0'f32)))
 
   player.hasPlayedBefore = true
+  player.onScreenHandlerOpened(ScreenHandler(player.playerScreenHandler))
+  # The inventory the client starts with. Upstream reaches the same through the handler's first `send_content_updates`
+  # after `store_player`: `syncState` says all of it at once, and is what the client's window 0 is built from.
+  player.playerScreenHandler.syncState()
+
+  # `send_player_equipment`
+  self.broadcastToChunkExcept(player.chunkPos, player.gameprofile.id, equipmentPacket(player))
 
   let msgComp = translateCross(tr.JAVA_MULTIPLAYER_PLAYER_JOINED, tr.BEDROCK_MULTIPLAYER_PLAYER_JOINED,
     [text(player.gameprofile.name)]).colorNamed(ncYellow)
   self.broadcastSystemMessage(msgComp, false)
 
-proc removePlayer*(self: World; player: Player) =
-  ## The half of `remove_player` a joined client can see.
+proc sendWorldInfo(self: World; player: Player; position: Vector3[float64]; yaw, pitch: float32) =
+  ## `send_world_info`
+  let client = player.client
+  self.worldborder.initClient(client)
+  client.writePacketFor(newCGameEvent(geStartWaitingChunks, 0.0'f32))
+  let (_, playerType) = entityTypeByName("player")
+  self.broadcastPacketExcept(player.gameprofile.id, newCSpawnEntity(newVarInt(player.entityId), player.gameprofile.id,
+    newVarInt(int32(playerType.id)), position, pitch, yaw, yaw, newVarInt(0'i32), Vector3[float64](x: 0.0, y: 0.0, z: 0.0)))
+  player.sendClientInformation()
+  updatePosition(player, player.server)
+  player.health = 20.0'f32
+  player.sendHealth()
+
+proc finishRespawn(self: World; player: Player; position: Vector3[float64]; yaw, pitch: float32; centerChunk: nil ChunkData) =
+  ## The end of `respawn_player`, from the spawn chunk on.
+  player.setPos(position)
+  player.setRotation(yaw, pitch)
+  player.lastPos = position
+  self.sendWorldInfo(player, position, yaw, pitch)
+  sendCenterChunk(player.client, centerChunk)
+  player.requestTeleport(position, yaw, pitch)
+
+proc continueSpawn*(self: World; player: Player; server: Server) =
+  ## Runs the rest of a join or respawn when the chunk under the player has arrived, or the wait has gone on too long.
+  if not player.pendingSpawn.active:
+    return
+  let pending = player.pendingSpawn
+  var chunk = readChunkSync(self.level, pending.center.x, pending.center.y)
+  let listener = pending.listener
+  if chunk == nil and listener != nil and listener.received != nil:
+    chunk = listener.received
+  if chunk == nil and nowMs() - pending.since < SpawnChunkPatienceMs:
+    return
+  player.pendingSpawn.active = false
+  removeTicket(self.level.chunkLoading, chunkPos(pending.center.x, pending.center.y), FullChunkLevel)
+  sendChange(self.level.chunkLoading)
+  var position = pending.position
+  if pending.needsTopBlock and chunk != nil:
+    let info = self.levelInfo
+    position.y = float64(self.getTopBlock(Vector2[int32](x: info.spawnX, y: info.spawnZ)) + 1'i32) # +1 to spawn on top of the block
+  if chunk == nil:
+    echo "Spawn chunk ", pending.center.x, ",", pending.center.y, " is not ready after ", SpawnChunkPatienceMs,
+      "ms: spawning ", player.gameprofile.name, " without it"
+  if pending.respawn:
+    self.finishRespawn(player, position, pending.yaw, pending.pitch, chunk)
+  else:
+    self.finishJoin(player, server, position, pending.yaw, pending.pitch, chunk)
+
+proc respawnPlayer*(self: World; player: Player; alive: bool) =
+  ## `respawn_player`, for this world's spawn: bed and anchor points (`calculate_respawn_point`) and the cross-dimension
+  ## transfer need sleeping and portals, a later batch.
+  let lastPos = player.lastPos
+  let deathDimension = player.world.dimension.minecraftName
+  let deathLocation = newBlockPos(int32(round(lastPos.x)), int32(round(lastPos.y)), int32(round(lastPos.z)))
+  let info = self.levelInfo
+  player.client.writePacketFor(newCGameEvent(geNoRespawnBlockAvailable, 0.0'f32))
+
+  player.client.writePacketFor(CRespawn(playerSpawnInfo: PlayerSpawnData(
+    dimension: self.dimension,
+    hashedSeed: hashSeed(self.level.seed),
+    gameMode: uint8(ord(player.gamemode)),
+    previousGamemode: int8(ord(player.gamemode)),
+    debug: false,
+    isFlat: false,
+    deathDimensionName: some((deathDimension, deathLocation)),
+    portalCooldown: newVarInt(0'i32),
+    sealevel: newVarInt(self.seaLevel)), dataKept: if alive: 1'u8 else: 0'u8))
+
+  let at = Vector3[float64](x: float64(info.spawnX) + 0.5, y: float64(info.spawnY), z: float64(info.spawnZ) + 0.5)
+  player.client.writePacketFor(CPlayerSpawnPosition(dimensionName: self.dimension.minecraftName,
+    location: newBlockPos(info.spawnX, info.spawnY, info.spawnZ), yaw: info.spawnYaw, pitch: info.spawnPitch))
+
+  # `LivingEntity::reset_state` and what follows it.
+  player.health = player.maxHealth
+  player.absorption = 0.0'f32
+  player.dead = false
+  player.fallDistance = 0.0'f32
+  player.sendPermissionLvlUpdate()
+  player.hungerManager = HungerManager(level: 20'u8, saturation: 5.0'f32, exhaustion: 0.0'f32, tickTimer: 0'u32)
+  if not info.gameRules.keepInventory:
+    player.experienceLevel = 0'i32
+    player.experiencePoints = 0'i32
+    player.experienceProgress = 0.0'f32
+    Inventory(player.inventory).clear()
+
+  self.requestSpawnChunk(player, at, info.spawnYaw, info.spawnPitch, true, true)
+
+proc removePlayer*(self: World; player: Player; fireEvent: bool) =
+  ## `remove_player`
   var kept: seq[Player] = @[]
   for p in self.players:
     if p != player:
       kept.add(p)
   self.players = kept
-  for p in self.players:
-    p.client.writePacketFor(CRemovePlayerInfo(players: @[player.gameprofile.id]))
-    p.client.writePacketFor(CRemoveEntities(entityIds: @[newVarInt(player.entityId)]))
+  self.broadcastPacketAll(CRemovePlayerInfo(players: @[player.gameprofile.id]))
+  self.broadcastPacketAll(CRemoveEntities(entityIds: @[newVarInt(player.entityId)]))
+  if fireEvent:
+    let msgComp = translateCross(tr.JAVA_MULTIPLAYER_PLAYER_LEFT, tr.BEDROCK_MULTIPLAYER_PLAYER_LEFT,
+      [text(player.gameprofile.name)]).colorNamed(ncYellow)
+    self.broadcastSystemMessage(msgComp, false)
+
+# --- Ticking --------------------------------------------------------------------------------------------
+
+proc updateActiveChunks*(self: World) =
+  ## `update_active_chunks`, without the spawn state natural spawning reads.
+  var seen = initTable[int64, bool]()
+  var active: seq[Vector2[int32]] = @[]
+  for player in self.players:
+    let center = player.chunkPos
+    # TODO upstream: gamerule for view distance/ticking distance
+    var dx = -8'i32
+    while dx <= 8'i32:
+      var dy = -8'i32
+      while dy <= 8'i32:
+        let key = chunkKey(center.x + dx, center.y + dy)
+        if not seen.hasKey(key):
+          seen[key] = true
+          active.add(Vector2[int32](x: center.x + dx, y: center.y + dy))
+        inc dy
+      inc dx
+  for pos in self.forcedChunks:
+    let key = chunkKey(pos.x, pos.y)
+    if not seen.hasKey(key):
+      seen[key] = true
+      active.add(pos)
+  self.activeChunks = active
 
 proc tickEnvironment*(self: World) =
-  ## `tick_environment`'s time. `LevelTime::tick_time`, then the broadcast `tick_time`'s caller does.
-  self.levelTime.worldAge += 1'i64
-  self.levelTime.timeOfDay += 1'i64
-  if self.levelTime.worldAge mod 20'i64 == 0'i64:
-    for p in self.players:
-      p.sendTime(self)
+  ## `tick_environment`
+  let rules = self.levelInfo.gameRules
+  self.levelTime.tickTime(rules.advanceTime, rules.advanceWeather)
+  let worldAge = self.levelTime.worldAge
+  let theLevel = self.level
 
-proc tick*(self: World) =
+  # Auto-save logic
+  if worldAge mod 100'i64 == 0'i64:
+    theLevel.shouldUnload = true
+    let cleaned = cleanMemory(theLevel)
+    if cleaned.len > 0:
+      discard cleanEntityChunks(theLevel, cleaned)
+  if theLevel.autosaveTicks > 0'u64 and theLevel.saveEnabled:
+    if worldAge mod int64(theLevel.autosaveTicks) == 0'i64:
+      theLevel.shouldSave = true
+
+  var weather0 = self.weather
+  weather0.tickWeather(self)
+  self.weather = weather0
+
+  if worldAge mod 20'i64 == 0'i64:
+    self.levelTime.sendTime(self)
+
+proc tickChunks*(self: World) =
+  ## `tick_chunks`: scheduled and random ticks are drawn and have no behaviour to go to yet; see the PARTIAL line.
+  var active: seq[(int32, int32)] = @[]
+  for pos in self.activeChunks:
+    active.add((pos.x, pos.y))
+  discard getTickData(self.level, active)
+
+proc tickPlayerMining(self: World; player: Player) =
+  ## The mining half of `Player::tick`.
+  if not player.mining:
+    return
+  let pos = player.miningPos
+  let id = self.getBlockStateId(pos)
+  # Is the block broken?
+  if isAir(id):
+    self.setBlockBreaking(player, pos, -1'i32)
+    player.currentBlockDestroyStage = -1'i32
+    player.mining = false
+  else:
+    # `continue_mining`
+    let time = player.tickCounter - player.startMiningTime
+    let speed = player.calcBlockBreaking(dataStateOf(id), dataBlockOf(id)) * float32(time + 1'i32)
+    let progress = int32(speed * 10.0'f32)
+    if progress != player.currentBlockDestroyStage:
+      self.setBlockBreaking(player, pos, progress)
+      player.currentBlockDestroyStage = progress
+
+proc tickPlayers*(self: World; server: Server) =
+  let players = self.players
+  for p in players:
+    if p.pendingSpawn.active:
+      self.continueSpawn(p, server)
+    else:
+      p.tick()
+      self.tickPlayerMining(p)
+      if p.idleTimedOut(server):
+        p.client.kick(translateCross(tr.JAVA_MULTIPLAYER_DISCONNECT_IDLING, tr.JAVA_MULTIPLAYER_DISCONNECT_IDLING))
+
+proc tick*(self: World; server: Server) =
+  ## `tick`
+  self.flushBlockUpdates()
+  self.flushSyncedBlockEvents()
+  self.updateActiveChunks()
   self.tickEnvironment()
-  for p in self.players:
-    p.tick()
+  self.tickChunks()
+  self.tickPlayers(server)
+  if self.level.schedule != nil:
+    sendChange(self.level.chunkLoading)
+
+proc shutdown*(self: World) =
+  ## `shutdown`: saves what the chunk system holds.
+  discard shutdown(self.level)

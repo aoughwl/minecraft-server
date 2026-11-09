@@ -1,0 +1,351 @@
+## Port of pumpkin/src/entity/ai/pathfinder/walk_node_evaluator.rs
+
+import std/[math, options, tables]
+import ../../../../util/math/rustnum
+import node, node_evaluator, pathfinding_context
+
+const
+  DefaultMobJumpHeight = 1.125'f64
+
+type
+  WalkNodeEvaluator* = ref object
+    base*: BaseNodeEvaluator
+    pathTypesCache: Table[int64, PathType]
+    reusableNeighbors: seq[Option[Node]]
+
+proc directions(): seq[(int32, int32)] =
+  ## `DIRECTIONS`
+  @[(1'i32, 0'i32), (-1'i32, 0'i32), (0'i32, 1'i32), (0'i32, -1'i32)]
+
+proc diagonalDirections(): seq[(int32, int32)] =
+  ## `DIAGONAL_DIRECTIONS`
+  @[(1'i32, 1'i32), (1'i32, -1'i32), (-1'i32, 1'i32), (-1'i32, -1'i32)]
+
+proc newWalkNodeEvaluator*(): WalkNodeEvaluator =
+  WalkNodeEvaluator(base: newBaseNodeEvaluator(), pathTypesCache: initTable[int64, PathType](),
+    reusableNeighbors: @[none[Node](), none[Node](), none[Node](), none[Node]()])
+
+proc isAmphibious(self: WalkNodeEvaluator): bool = self.base.canFloat
+
+proc getFloorLevel(self: WalkNodeEvaluator; pos: Vector3[int32]): float64 =
+  ## TODO upstream: check collision shapes for partial blocks (slabs/stairs)
+  float64(pos.y)
+
+proc getMobJumpHeight(self: WalkNodeEvaluator): float64 =
+  if self.base.hasMobData: max(float64(self.base.mobData.maxStepHeight), DefaultMobJumpHeight) else: DefaultMobJumpHeight
+
+proc isNeighborValid(neighbor: Option[Node]; current: Node): bool =
+  if neighbor.isSome:
+    let n = neighbor.unsafeGet
+    if n.closed:
+      return false
+    return n.costMalus >= 0.0'f32 or current.costMalus < 0.0'f32
+  false
+
+proc isDiagonalValid(self: WalkNodeEvaluator; current: Node; adjX0, adjZ0: Option[Node]): bool =
+  if adjX0.isNone or adjZ0.isNone:
+    return false
+  let adjX = adjX0.unsafeGet
+  let adjZ = adjZ0.unsafeGet
+  if adjX.pos.vec.y > current.pos.vec.y or adjZ.pos.vec.y > current.pos.vec.y:
+    return false
+  if adjZ.pathType == ptWalkableDoor or adjX.pathType == ptWalkableDoor:
+    return false
+  let mobWidth = if self.base.hasMobData: self.base.mobData.width else: 0.6'f32
+  let bothFence = adjX.pathType == ptFence and adjZ.pathType == ptFence
+  let fenceException = bothFence and mobWidth < 0.5'f32
+  (adjX.pos.vec.y < current.pos.vec.y or adjX.costMalus >= 0.0'f32 or fenceException) and
+    (adjZ.pos.vec.y < current.pos.vec.y or adjZ.costMalus >= 0.0'f32 or fenceException)
+
+proc isDiagonalNodeValid(diagonal: Option[Node]): bool =
+  if diagonal.isNone:
+    return false
+  let n = diagonal.unsafeGet
+  not n.closed and n.pathType != ptWalkableDoor and n.costMalus >= 0.0'f32
+
+proc getMobPenalty(self: WalkNodeEvaluator; pathType: PathType): float32 =
+  if self.base.hasMobData: self.base.mobData.getPathfindingMalus(pathType) else: pathType.getMalus()
+
+proc isBlockedType(pathType: PathType): bool =
+  pathType == ptFence or pathType == ptDoorWoodClosed or pathType == ptDoorIronClosed
+
+proc getPathTypeOfMob*(self: WalkNodeEvaluator; context: PathfindingContext; pos: Vector3[int32]; mobData: MobData): PathType =
+  ## `get_path_type_of_mob`
+  var pathTypes: seq[PathType] = @[]
+  let mobBlockPos = mobData.blockPosition()
+  for dy in 0'i32 ..< mobData.getBbHeight():
+    for dx in 0'i32 ..< mobData.getBbWidth():
+      for dz in 0'i32 ..< mobData.getBbWidth():
+        let checkPos = pos.addRaw(dx, dy, dz)
+        var cellType = context.getLandNodeType(checkPos)
+        if cellType == ptDoorWoodClosed and self.base.canOpenDoors and self.base.canPassDoors:
+          cellType = ptWalkableDoor
+        if cellType == ptDoorOpen and not self.base.canPassDoors:
+          cellType = ptBlocked
+        if cellType == ptRail:
+          let mobPos = Vector3[int32](x: mobBlockPos[0], y: mobBlockPos[1], z: mobBlockPos[2])
+          let mobBelow = Vector3[int32](x: mobBlockPos[0], y: mobBlockPos[1] - 1'i32, z: mobBlockPos[2])
+          let mobType = context.getLandNodeType(mobPos)
+          let mobBelowType = context.getLandNodeType(mobBelow)
+          if mobType != ptRail and mobBelowType != ptRail:
+            cellType = ptUnpassableRail
+        pathTypes.add(cellType)
+  # Sort+dedup to match vanilla's EnumSet ordinal iteration order
+  var ordered: seq[PathType] = @[]
+  for candidate in low(PathType) .. high(PathType):
+    for have in pathTypes:
+      if have == candidate:
+        ordered.add(candidate)
+        break
+  for have in ordered:
+    if have == ptFence:
+      return ptFence
+  for have in ordered:
+    if have == ptUnpassableRail:
+      return ptUnpassableRail
+  var found = ptBlocked
+  for pathType in ordered:
+    let penalty = mobData.getPathfindingMalus(pathType)
+    if penalty < 0.0'f32:
+      return pathType
+    let resultPenalty = mobData.getPathfindingMalus(found)
+    if penalty >= resultPenalty:
+      found = pathType
+  if self.base.entityWidth <= 1'i32 and found != ptOpen and mobData.getPathfindingMalus(found) == 0.0'f32:
+    let rawCenter = context.getLandNodeType(pos)
+    if rawCenter == ptOpen:
+      return ptOpen
+  found
+
+proc getPathType*(self: WalkNodeEvaluator; context: PathfindingContext; pos: Vector3[int32]): PathType =
+  context.getPathTypeFromState(pos)
+
+proc getCachedPathType(self: WalkNodeEvaluator; pos: Vector3[int32]): PathType =
+  ## `get_cached_path_type`
+  if self.pathTypesCache.hasKey(keyOf(pos)):
+    return self.pathTypesCache.getOrDefault(keyOf(pos))
+  let ctx = self.base.context
+  var pathType = ptBlocked
+  if ctx != nil and self.base.hasMobData:
+    pathType = self.getPathTypeOfMob(ctx, pos, self.base.mobData)
+  self.pathTypesCache[keyOf(pos)] = pathType
+  pathType
+
+proc getOpenNode(self: WalkNodeEvaluator; pos: Vector3[int32]): Node =
+  ## `get_open_node`: searches downward for the first non-`OPEN` block, respecting safe fall distance.
+  let safeFallDistance = if self.base.hasMobData: asI32(self.base.mobData.maxFallDistance) else: 3'i32
+  var checkY = pos.y - 1'i32
+  let bottomY = pos.y - safeFallDistance - 2'i32
+  while checkY >= bottomY:
+    let fallDist = pos.y - checkY
+    let here = BlockPos(vec: Vector3[int32](x: pos.x, y: checkY, z: pos.z))
+    if fallDist > safeFallDistance:
+      var n = self.base.getNode(here)
+      n.pathType = ptBlocked
+      n.costMalus = -1.0'f32
+      return n
+    let pathType = self.getCachedPathType(here.vec)
+    let penalty = self.getMobPenalty(pathType)
+    if pathType != ptOpen:
+      var n = self.base.getNode(here)
+      if penalty >= 0.0'f32:
+        n.pathType = pathType
+        n.costMalus = max(penalty, n.costMalus)
+      else:
+        n.pathType = ptBlocked
+        n.costMalus = -1.0'f32
+      return n
+    checkY -= 1'i32
+  var n = self.base.getNode(pos.asBlockPos())
+  n.pathType = ptBlocked
+  n.costMalus = -1.0'f32
+  n
+
+proc getJumpOnTopNode(self: WalkNodeEvaluator; pos: Vector3[int32]; maxYStep: int32; lastFeetY: float64): Option[Node] =
+  ## `get_jump_on_top_node`: tries stepping up one block at a time.
+  for dy in 1'i32 .. maxYStep:
+    let stepPos = Vector3[int32](x: pos.x, y: pos.y + dy, z: pos.z)
+    let remainingSteps = maxYStep - dy
+    let feetY = self.getFloorLevel(stepPos)
+    if feetY - lastFeetY > self.getMobJumpHeight():
+      return none[Node]()
+    let pathType = self.getCachedPathType(stepPos)
+    let penalty = self.getMobPenalty(pathType)
+    if penalty >= 0.0'f32 and (pathType == ptWalkable or (self.isAmphibious() and pathType == ptWater)):
+      var n = self.base.getNode(stepPos.asBlockPos())
+      n.pathType = pathType
+      n.costMalus = max(penalty, n.costMalus)
+      return some(n)
+    if remainingSteps > 0'i32 and (pathType != ptFence or self.base.canWalkOverFences) and
+        pathType != ptUnpassableRail and pathType != ptTrapdoor and pathType != ptPowderSnow:
+      continue
+    if pathType == ptOpen:
+      return some(self.getOpenNode(stepPos))
+    return none[Node]()
+  none[Node]()
+
+proc getNonWaterNodeBelow(self: WalkNodeEvaluator; pos: Vector3[int32]; node0: Option[Node]): Option[Node] =
+  ## `get_non_water_node_below`
+  var node = node0
+  var y = pos.y - 1'i32
+  while y > pos.y - 16'i32:
+    let pathType = self.getCachedPathType(Vector3[int32](x: pos.x, y: y, z: pos.z))
+    if pathType != ptWater:
+      return node
+    let penalty = self.getMobPenalty(pathType)
+    var n = self.base.getNode(BlockPos(vec: Vector3[int32](x: pos.x, y: y, z: pos.z)))
+    n.pathType = pathType
+    n.costMalus = max(penalty, n.costMalus)
+    node = some(n)
+    y -= 1'i32
+  node
+
+proc findAcceptedNode(self: WalkNodeEvaluator; pos: Vector3[int32]; maxYStep: int32; lastFeetY: float64): Option[Node] =
+  ## `find_accepted_node`: the best path node for the given position, handling step-ups, falls, and blocked nodes.
+  let feetY = self.getFloorLevel(pos)
+  if feetY - lastFeetY > self.getMobJumpHeight():
+    return none[Node]()
+  let pathType = self.getCachedPathType(pos)
+  let penalty = self.getMobPenalty(pathType)
+  var node = none[Node]()
+  if penalty >= 0.0'f32:
+    var n = self.base.getNode(pos.asBlockPos())
+    n.pathType = pathType
+    n.costMalus = max(penalty, n.costMalus)
+    node = some(n)
+  # TODO upstream: add ray-march collision check for blocked types (fence/door)
+  if pathType != ptWalkable and not (self.isAmphibious() and pathType == ptWater):
+    if (node.isNone or node.unsafeGet.costMalus < 0.0'f32) and maxYStep > 0'i32 and
+        (pathType != ptFence or self.base.canWalkOverFences) and pathType != ptUnpassableRail and
+        pathType != ptTrapdoor and pathType != ptPowderSnow:
+      let jumpNode = self.getJumpOnTopNode(pos, maxYStep, lastFeetY)
+      if jumpNode.isSome:
+        node = jumpNode
+    elif not self.isAmphibious() and pathType == ptWater and not self.base.canFloat:
+      node = self.getNonWaterNodeBelow(pos, node)
+    elif pathType == ptOpen:
+      node = some(self.getOpenNode(pos))
+    elif isBlockedType(pathType) and node.isNone:
+      var n = self.base.getNode(pos.asBlockPos())
+      n.closed = true
+      n.pathType = pathType
+      n.costMalus = pathType.getMalus()
+      node = some(n)
+  node
+
+proc hasCollisions(self: WalkNodeEvaluator; center: Vector3[int32]): bool =
+  let ctx = self.base.context
+  ctx != nil and ctx.hasCollisions(center)
+
+proc canStartAt(self: WalkNodeEvaluator; pos: Vector3[int32]): bool =
+  self.getCachedPathType(pos).isPassable() and not self.hasCollisions(pos)
+
+proc getStartNode(self: WalkNodeEvaluator; pos: Vector3[int32]): Option[Node] =
+  ## `get_start_node`
+  if not self.canStartAt(pos):
+    return none[Node]()
+  var node = self.base.getNode(pos.asBlockPos())
+  let pathType = self.getCachedPathType(pos)
+  node.pathType = pathType
+  node.costMalus = self.getMobPenalty(pathType)
+  some(node)
+
+proc prepare*(self: WalkNodeEvaluator; context: PathfindingContext; mobData: MobData) =
+  ## `NodeEvaluator::prepare`
+  self.base.entityWidth = mobData.getBbWidth()
+  self.base.entityHeight = mobData.getBbHeight()
+  self.base.entityDepth = mobData.getBbWidth()
+  self.base.context = context
+  self.base.mobData = mobData
+  self.base.hasMobData = true
+  self.pathTypesCache = initTable[int64, PathType]()
+
+proc done*(self: WalkNodeEvaluator) =
+  self.base.context = nil
+  self.base.hasMobData = false
+  self.pathTypesCache = initTable[int64, PathType]()
+
+proc getStart*(self: WalkNodeEvaluator): Option[Node] =
+  ## `get_start`
+  if not self.base.hasMobData:
+    return none[Node]()
+  let mobX = self.base.mobData.position.x
+  let mobYF64 = self.base.mobData.position.y
+  let mobZ = self.base.mobData.position.z
+  let onGround = self.base.mobData.onGround
+  # TODO upstream: add swimming support
+  var y: int32
+  if onGround:
+    y = asI32(floor(mobYF64 + 0.5'f64))
+  else:
+    let startY = asI32(floor(mobYF64 + 1.0'f64))
+    let bottomY = startY - 64'i32
+    var foundY = startY
+    var checkY = startY - 1'i32
+    while checkY >= bottomY:
+      let pathType = self.getCachedPathType(Vector3[int32](x: asI32(floor(mobX)), y: checkY, z: asI32(floor(mobZ))))
+      if pathType != ptOpen and pathType != ptWater:
+        foundY = checkY + 1'i32
+        break
+      checkY -= 1'i32
+    y = foundY
+  let blockX = asI32(floor(mobX))
+  let blockZ = asI32(floor(mobZ))
+  let startNode = self.getStartNode(Vector3[int32](x: blockX, y: y, z: blockZ))
+  if startNode.isSome:
+    return startNode
+  let dirsToTry = directions()
+  for dir in dirsToTry:
+    let node = self.getStartNode(Vector3[int32](x: blockX + dir[0], y: y, z: blockZ + dir[1]))
+    if node.isSome:
+      return node
+  self.getStartNode(Vector3[int32](x: blockX, y: y + 1'i32, z: blockZ))
+
+proc getTarget*(self: WalkNodeEvaluator; pos: BlockPos): Target =
+  newTarget(self.base.getNode(pos))
+
+proc getNeighbors*(self: WalkNodeEvaluator; current: Node; outNeighbors: var seq[Node]) =
+  ## `get_neighbors`
+  let headroomType = self.getCachedPathType(current.pos.vec.addRaw(0'i32, 1'i32, 0'i32))
+  let currentType = self.getCachedPathType(current.pos.vec)
+  let headroomPenalty = self.getMobPenalty(headroomType)
+  let maxYStep = if headroomPenalty >= 0.0'f32 and currentType != ptStickyHoney: asI32(floor(self.getMobJumpHeight())) else: 0'i32
+  let floorLevel = self.getFloorLevel(current.pos.vec)
+  for i in 0 ..< 4:
+    self.reusableNeighbors[i] = none[Node]()
+  let dirs = directions()
+  for i in 0 ..< 4:
+    let neighborPos = current.pos.vec.addRaw(dirs[i][0], 0'i32, dirs[i][1])
+    let neighborOpt = self.findAcceptedNode(neighborPos, maxYStep, floorLevel)
+    if neighborOpt.isSome:
+      self.reusableNeighbors[i] = neighborOpt
+      if isNeighborValid(neighborOpt, current):
+        outNeighbors.add(neighborOpt.unsafeGet)
+  let diagonals = diagonalDirections()
+  for diag in diagonals:
+    let dx = diag[0]
+    let dz = diag[1]
+    var dir1Idx = 0
+    var dir2Idx = 1
+    for i in 0 ..< 4:
+      if dirs[i][0] == dx and dirs[i][1] == 0'i32:
+        dir1Idx = i
+        break
+    for i in 0 ..< 4:
+      if dirs[i][0] == 0'i32 and dirs[i][1] == dz:
+        dir2Idx = i
+        break
+    if self.isDiagonalValid(current, self.reusableNeighbors[dir1Idx], self.reusableNeighbors[dir2Idx]):
+      let diagonalPos = current.pos.vec.addRaw(dx, 0'i32, dz)
+      let diagonalOpt = self.findAcceptedNode(diagonalPos, maxYStep, floorLevel)
+      if diagonalOpt.isSome and isDiagonalNodeValid(diagonalOpt):
+        outNeighbors.add(diagonalOpt.unsafeGet)
+
+proc setCanPassDoors*(self: WalkNodeEvaluator; v: bool) = self.base.canPassDoors = v
+proc setCanOpenDoors*(self: WalkNodeEvaluator; v: bool) = self.base.canOpenDoors = v
+proc setCanFloat*(self: WalkNodeEvaluator; v: bool) = self.base.canFloat = v
+proc setCanWalkOverFences*(self: WalkNodeEvaluator; v: bool) = self.base.canWalkOverFences = v
+proc canPassDoors*(self: WalkNodeEvaluator): bool = self.base.canPassDoors
+proc canOpenDoors*(self: WalkNodeEvaluator): bool = self.base.canOpenDoors
+proc canFloat*(self: WalkNodeEvaluator): bool = self.base.canFloat
+proc canWalkOverFences*(self: WalkNodeEvaluator): bool = self.base.canWalkOverFences

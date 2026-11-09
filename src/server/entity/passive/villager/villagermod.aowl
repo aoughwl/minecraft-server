@@ -1,0 +1,684 @@
+## Port of pumpkin/src/entity/passive/villager/mod.rs
+## PARTIAL: pumpkin/src/entity/passive/villager/mod.rs - three calls are hooks others fill: `gOpenHandledScreen` (`Player::open_handled_screen`, src/server/entity/player.aowl), `gBedSetOccupied` (`BedBlock::set_occupied`, which takes src/server/block's `BlockWorld`), and `gPlayerHooks.incrementStat` for `TalkedToVillager`. Unset, a villager has no screen to open, and a bed it sleeps in stays unoccupied in its block state.
+##
+## `set_occupied` needs a `BlockWorld` this module cannot build: src/server/block imports the entity layer.
+
+import std/[options, tables]
+import ../../../../data/block_ext
+from ../../../../data/block_state import BlockStateId, asU16
+import ../../../../data/block_ext as blockext0
+import "../../../../data/item_stack/mod"
+import ../../../../generated/[meta_data_type, tag, tracked_data, entity_status as entitystatusdata]
+from ../../../../generated/statistic import csTalkedToVillager
+from ../../../../generated/sound import fromName
+import ../../../../inventory/[inventory, merchant_screen_handler, player_inventory, screenhandler]
+import ../../../../nbt/tag as nbttag
+import ../../../../protocol/itemstackserializer
+import ../../../../protocol/java/client/play/merchant_offers
+import ../../../../protocol/varint
+import ../../../../util/math/boundingbox
+import ../../../../util/text/text
+import ../../../../world/simpleinventory
+import ../../ai/aibase
+import ../../ai/goal/[look_around, look_at_entity, misc_goals, swim, wander_around]
+import ../../mob/mobvts
+import data
+
+export data
+
+type
+  GossipEntry* = object
+    target*: Uuid
+    gossipType*: GossipType
+    value*: int32
+
+  VillagerEntity* = ref object of Mob
+    villagerData*: VillagerData
+    foodLevel*: int32
+    xp*: int32
+    lastRestockTime*: int64
+    restocksToday*: int32
+    gossips*: seq[GossipEntry]
+    inventory*: seq[ItemStack]
+    merchantInventory*: SimpleInventory
+    offers*: seq[MerchantOffer]
+    jobSite*: Option[BlockPos]
+    homePos*: Option[BlockPos]
+
+  VillagerScreenFactory* = ref object of ScreenHandlerFactory
+    villager*: VillagerEntity
+
+var gOpenHandledScreen*: proc(player: Player; factory: ScreenHandlerFactory; pos: Option[BlockPos]): Option[uint8] {.closure.} =
+  proc(player: Player; factory: ScreenHandlerFactory; pos: Option[BlockPos]): Option[uint8] {.closure.} = none[uint8]()
+  ## `Player::open_handled_screen`.
+var gBedSetOccupied*: proc(occupied: bool; world: World; blockRef: Block; pos: BlockPos; stateId: BlockStateId) {.closure.} =
+  proc(occupied: bool; world: World; blockRef: Block; pos: BlockPos; stateId: BlockStateId) {.closure.} = discard
+  ## `BedBlock::set_occupied`.
+
+proc countFoodPointsInInventory*(self: VillagerEntity): int32 =
+  result = 0'i32
+  for stack in self.inventory:
+    if not stack.isEmpty():
+      result = result + getFoodPoints(stack.getItem()) * int32(stack.itemCount)
+
+proc eatUntilFull*(self: VillagerEntity) =
+  if self.foodLevel >= BreedingFoodThreshold:
+    return
+  for i in 0 ..< self.inventory.len:
+    if not self.inventory[i].isEmpty():
+      let points = getFoodPoints(self.inventory[i].getItem())
+      if points > 0'i32:
+        while self.inventory[i].itemCount > 0'u8 and self.foodLevel < BreedingFoodThreshold:
+          self.foodLevel = self.foodLevel + points
+          self.inventory[i].itemCount = self.inventory[i].itemCount - 1'u8
+        if self.inventory[i].itemCount == 0'u8:
+          self.inventory[i] = emptyItemStack()
+        if self.foodLevel >= BreedingFoodThreshold:
+          break
+
+proc stackOf(item: VillagerTradeItem): ItemStack =
+  let found = fromRegistryKey(Item, item.item)
+  if found == nil: emptyItemStack() else: newItemStack(uint8(item.count), found)
+
+proc addTrades*(self: VillagerEntity; profession: VillagerProfession; level: int32) =
+  let tradeSet = profession.tradeSet(level)
+  if tradeSet.isNone:
+    return
+  let trades = tradeSet.unsafeGet.trades
+  # `sample(rng, amount)`: `amount` distinct picks, or all of them if there are fewer.
+  var pool: seq[int] = @[]
+  for i in 0 ..< trades.len:
+    pool.add(i)
+  var left = min(int(tradeSet.unsafeGet.amount), trades.len)
+  while left > 0:
+    let at = int(randomRange(0'i32, int32(pool.len)))
+    let trade = trades[pool[at]]
+    pool[at] = pool[pool.len - 1]
+    pool.setLen(pool.len - 1)
+    var costB = none[ItemStackSerializer]()
+    if trade.wantsB.isSome:
+      costB = some(toSerializer(stackOf(trade.wantsB.unsafeGet)))
+    self.offers.add(MerchantOffer(
+      baseCostA: toSerializer(stackOf(trade.wants)),
+      output: toSerializer(stackOf(trade.gives)),
+      costB: costB,
+      isDisabled: false,
+      uses: 0'i32,
+      maxUses: trade.maxUses,
+      xp: trade.xp,
+      specialPrice: 0'i32,
+      priceMultiplier: trade.priceMultiplier,
+      demand: 0'i32))
+    left = left - 1
+
+proc generateTrades*(self: VillagerEntity; profession: VillagerProfession; level: int32) =
+  self.offers.setLen(0)
+  self.addTrades(profession, level)
+
+proc setVillagerData*(self: VillagerEntity; data: VillagerData) =
+  let oldProfession = self.villagerData.profession
+  self.villagerData = data
+  self.entity.sendMetaData(TrackedData_VILLAGER_DATA, VILLAGER_DATA, data)
+
+  if oldProfession != data.profession:
+    self.generateTrades(data.professionEnum(), data.level.value)
+    let sound0 = data.professionEnum().workSound()
+    if sound0.isSome:
+      let (found, soundRef) = fromName(sound0.unsafeGet)
+      if found:
+        self.entity.playSound(soundRef)
+
+proc setUnhappy*(self: VillagerEntity) =
+  let entity = self.entity
+  entity.world.sendEntityStatus(entity, esVillagerAngry)
+  entity.playSound(sdEntityVillagerNo)
+
+proc sendOffers(self: VillagerEntity; player: Player; syncId: uint8) =
+  player.client.writePacketFor(CMerchantOffers(windowId: newVarInt(int32(syncId)), offers: self.offers,
+    villagerLevel: self.villagerData.level, experience: newVarInt(self.xp), isRegularVillager: true, canRestock: true))
+
+proc onTrade(self: VillagerEntity; player: nil Player; syncId: uint8; offerIndex: int) =
+  if player == nil or offerIndex >= self.offers.len:
+    return
+  self.offers[offerIndex].uses = self.offers[offerIndex].uses + 1'i32
+
+  let xpGain = self.offers[offerIndex].xp
+  self.xp = self.xp + xpGain
+  let currentXp = self.xp
+
+  let currentLevel = self.villagerData.level.value
+  if currentLevel < 5'i32:
+    let maxXp =
+      case currentLevel
+      of 1'i32: 10'i32
+      of 2'i32: 70'i32
+      of 3'i32: 150'i32
+      of 4'i32: 250'i32
+      else: 0'i32
+    if currentXp >= maxXp:
+      self.villagerData.level = newVarInt(currentLevel + 1'i32)
+      let newLevel = self.villagerData.level.value
+      let prof = self.villagerData.professionEnum()
+
+      # Level up! Add new trades for the new level
+      self.addTrades(prof, newLevel)
+
+      # Play sound & particles for level up!
+      let entity = self.entity
+      entity.world.sendEntityStatus(entity, esVillagerHappy)
+      entity.playSound(sdEntityVillagerCelebrate)
+
+  self.sendOffers(player, syncId)
+
+proc makeVillagerScreenFactory(villager: VillagerEntity): VillagerScreenFactory =
+  result = VillagerScreenFactory(villager: villager)
+  result.createScreenHandlerImpl = proc(self: ScreenHandlerFactory; syncId: uint8; playerInventory: PlayerInventory;
+      player: InventoryPlayer): nil ScreenHandler {.closure.} =
+    let factory = VillagerScreenFactory(self)
+    let v = factory.villager
+    let world = v.entity.world
+    # Upstream reads the uuid through `as_any().downcast_ref::<Player>()`, and nil if it is not a player. The world's
+    # player whose InventoryPlayer this is, is the same player.
+    var playerUuid = NilUuid
+    for candidate in world.players:
+      if candidate.inventoryPlayer == player:
+        playerUuid = candidate.gameprofile.id
+    let handler = newMerchantScreenHandler(syncId, playerInventory, v.merchantInventory, v.offers)
+    handler.onTrade = proc(offerIndex: int) {.closure.} =
+      onTrade(v, getPlayerByUuid(world, playerUuid), syncId, offerIndex)
+    handler
+  result.getDisplayNameImpl = proc(self: ScreenHandlerFactory): TextComponent {.closure.} =
+    # TODO upstream: Localized name based on profession
+    text("Villager")
+
+proc openTradingScreen*(self: VillagerEntity; player: Player) =
+  # Open the merchant screen and then send the current offers packet
+  let syncId = gOpenHandledScreen(player, makeVillagerScreenFactory(self), none[BlockPos]())
+  if syncId.isSome:
+    self.sendOffers(player, syncId.unsafeGet)
+
+proc blockToProfession*(block0: Block): Option[VillagerProfession] =
+  case block0.name
+  of "composter": some(VillagerProfession.Farmer)
+  of "lectern": some(VillagerProfession.Librarian)
+  of "blast_furnace": some(VillagerProfession.Armorer)
+  of "smoker": some(VillagerProfession.Butcher)
+  of "cartography_table": some(VillagerProfession.Cartographer)
+  of "brewing_stand": some(VillagerProfession.Cleric)
+  of "barrel": some(VillagerProfession.Fisherman)
+  of "fletching_table": some(VillagerProfession.Fletcher)
+  of "cauldron", "water_cauldron", "lava_cauldron", "powder_snow_cauldron": some(VillagerProfession.Leatherworker)
+  of "stonecutter": some(VillagerProfession.Mason)
+  of "loom": some(VillagerProfession.Shepherd)
+  of "smithing_table": some(VillagerProfession.Toolsmith)
+  of "grindstone": some(VillagerProfession.Weaponsmith)
+  else: none[VillagerProfession]()
+
+proc professionMatchesBlock*(profession: VillagerProfession; block0: Block): bool =
+  case profession
+  of VillagerProfession.Farmer: block0.name == "composter"
+  of VillagerProfession.Librarian: block0.name == "lectern"
+  of VillagerProfession.Armorer: block0.name == "blast_furnace"
+  of VillagerProfession.Butcher: block0.name == "smoker"
+  of VillagerProfession.Cartographer: block0.name == "cartography_table"
+  of VillagerProfession.Cleric: block0.name == "brewing_stand"
+  of VillagerProfession.Fisherman: block0.name == "barrel"
+  of VillagerProfession.Fletcher: block0.name == "fletching_table"
+  of VillagerProfession.Leatherworker:
+    block0.name == "cauldron" or block0.name == "water_cauldron" or block0.name == "lava_cauldron" or
+      block0.name == "powder_snow_cauldron"
+  of VillagerProfession.Mason: block0.name == "stonecutter"
+  of VillagerProfession.Shepherd: block0.name == "loom"
+  of VillagerProfession.Toolsmith: block0.name == "smithing_table"
+  of VillagerProfession.Weaponsmith: block0.name == "grindstone"
+  else: false
+
+proc claimedBy(self: VillagerEntity; world: World; pos: BlockPos; home: bool): seq[BlockPos] =
+  ## The homes or job sites other villagers within 32 x 16 x 32 hold.
+  result = @[]
+  let aabb = newBoundingBox(
+    Vector3[float64](x: float64(pos.x) - 32.0, y: float64(pos.y) - 16.0, z: float64(pos.z) - 32.0),
+    Vector3[float64](x: float64(pos.x) + 32.0, y: float64(pos.y) + 16.0, z: float64(pos.z) + 32.0))
+  for other in getAllAtBox(world, aabb):
+    if other.entity.entityId != self.entity.entityId and other.entity.entityType.id == EntityType.VILLAGER.id:
+      let held = if home: other.getHomePos() else: other.getJobSitePos()
+      if held.isSome:
+        result.add(held.unsafeGet)
+
+proc bedProps(state: BlockState; block0: Block): WhiteBedLikeProperties =
+  fromStateId(WhiteBedLikeProperties, state.id, block0)
+
+proc sendSleepingPos(self: VillagerEntity; pos: Option[BlockPos]) =
+  self.entity.sendMetaData(TrackedData_SLEEPING_POS_ID, OPTIONAL_BLOCK_POS, pos)
+
+proc villagerMobTick(self: VillagerEntity) =
+  let entity = self.entity
+  let age = entity.age
+  if age mod 20'i32 != 0'i32:
+    return
+
+  let world = entity.world
+
+  # 1. Bed / Sleeping logic (for all villagers: babies, nitwits, adults)
+  let isSleeping0 = entity.pose == epSleeping
+
+  # Check if current bed is still valid
+  if self.homePos.isSome:
+    let (block0, state) = world.getBlockAndState(self.homePos.unsafeGet)
+    let valid =
+      if hasTag(asU16(block0.id), Block_MINECRAFT_BEDS):
+        bedProps(state, block0).part == BedPart.Head
+      else:
+        false
+
+    if not valid:
+      self.homePos = none[BlockPos]()
+      if isSleeping0:
+        # Wake up if bed was broken
+        entity.setPose(epStanding)
+        self.sendSleepingPos(none[BlockPos]())
+
+  # If no bed, search for one
+  if self.homePos.isNone:
+    let pos = entity.blockPos
+    let claimedHomes = self.claimedBy(world, pos, true)
+
+    var bestHome = none[BlockPos]()
+    var bestDist = high(float64)
+
+    var iter = iterateBlockPos(pos.x - 16'i32, pos.y - 4'i32, pos.z - 16'i32, pos.x + 16'i32, pos.y + 4'i32, pos.z + 16'i32)
+    while true:
+      let next0 = iter.next()
+      if next0.isNone:
+        break
+      let p = next0.unsafeGet
+      let (block0, state) = world.getBlockAndState(p)
+      if hasTag(asU16(block0.id), Block_MINECRAFT_BEDS):
+        let props = bedProps(state, block0)
+        let bedHeadPos = if props.part == BedPart.Head: p else: p.offset(props.facing.toOffset())
+
+        if bedHeadPos in claimedHomes:
+          continue
+
+        let dist = bedHeadPos.toF64().squaredDistanceToVec(entity.pos)
+        if dist < bestDist:
+          bestDist = dist
+          bestHome = some(bedHeadPos)
+
+    if bestHome.isSome:
+      self.homePos = bestHome
+
+  # Handle Sleeping/Waking up based on time
+  let isSleeping1 = entity.pose == epSleeping
+  if self.homePos.isSome:
+    let homePos = self.homePos.unsafeGet
+    let time0 = world.levelTime.timeOfDay
+    let isNight = time0 >= 12000'i64 and time0 <= 23000'i64
+
+    if isNight:
+      if not isSleeping1:
+        # Check distance to bed. If close enough, go to sleep
+        let dist = homePos.toF64().squaredDistanceToVec(entity.pos)
+        if dist <= 4.0:
+          # Within 2 blocks (squared distance 4.0)
+          let (block0, state) = world.getBlockAndState(homePos)
+          if hasTag(asU16(block0.id), Block_MINECRAFT_BEDS):
+            if not bedProps(state, block0).occupied:
+              # Make bed occupied
+              gBedSetOccupied(true, world, block0, homePos, state.id)
+
+              entity.setPose(epSleeping)
+              self.sendSleepingPos(some(homePos))
+    elif isSleeping1:
+      # It is day, wake up!
+      let (block0, state) = world.getBlockAndState(homePos)
+      if hasTag(asU16(block0.id), Block_MINECRAFT_BEDS):
+        if bedProps(state, block0).occupied:
+          gBedSetOccupied(false, world, block0, homePos, state.id)
+
+      entity.setPose(epStanding)
+      self.sendSleepingPos(none[BlockPos]())
+
+  # 2. Job / Profession logic (skip for Nitwits and babies)
+  let isAdult = entity.age >= 0'i32
+  let xp0 = self.xp
+  let profession = self.villagerData.professionEnum()
+
+  if profession == VillagerProfession.Nitwit or not isAdult:
+    return
+
+  if self.jobSite.isSome:
+    let (block0, _) = world.getBlockAndState(self.jobSite.unsafeGet)
+    let valid =
+      if profession == VillagerProfession.None: blockToProfession(block0).isSome
+      else: professionMatchesBlock(profession, block0)
+
+    if not valid:
+      self.jobSite = none[BlockPos]()
+      if xp0 == 0'i32 and profession != VillagerProfession.None:
+        let typeId = self.villagerData.typeEnum()
+        self.setVillagerData(newVillagerData(typeId, VillagerProfession.None, 1'i32))
+        self.offers.setLen(0)
+
+  if self.jobSite.isNone:
+    let pos = entity.blockPos
+    let claimedSites = self.claimedBy(world, pos, false)
+
+    var bestSite = none[BlockPos]()
+    var bestDist = high(float64)
+    var bestProfession = VillagerProfession.None
+
+    var iter = iterateBlockPos(pos.x - 10'i32, pos.y - 4'i32, pos.z - 10'i32, pos.x + 10'i32, pos.y + 4'i32, pos.z + 10'i32)
+    while true:
+      let next0 = iter.next()
+      if next0.isNone:
+        break
+      let p = next0.unsafeGet
+      if p in claimedSites:
+        continue
+
+      let (block0, _) = world.getBlockAndState(p)
+      let prof = blockToProfession(block0)
+      if prof.isSome:
+        if profession != VillagerProfession.None and prof.unsafeGet != profession:
+          continue
+
+        let dist = p.toF64().squaredDistanceToVec(entity.pos)
+        if dist < bestDist:
+          bestDist = dist
+          bestSite = some(p)
+          bestProfession = prof.unsafeGet
+
+    if bestSite.isSome:
+      self.jobSite = bestSite
+      if profession == VillagerProfession.None:
+        let typeId = self.villagerData.typeEnum()
+        self.setVillagerData(newVillagerData(typeId, bestProfession, 1'i32))
+  else:
+    let currentProf = self.villagerData.professionEnum()
+    if currentProf == VillagerProfession.None and self.jobSite.isSome:
+      let (block0, _) = world.getBlockAndState(self.jobSite.unsafeGet)
+      let prof = blockToProfession(block0)
+      if prof.isSome:
+        let typeId = self.villagerData.typeEnum()
+        self.setVillagerData(newVillagerData(typeId, prof.unsafeGet, 1'i32))
+
+proc makeVillagerMobVt(): MobVt =
+  result = newMobVt()
+  result.getJobSite = proc(self: Mob): Option[BlockPos] {.closure.} =
+    let v = VillagerEntity(self)
+    v.jobSite
+  result.getHome = proc(self: Mob): Option[BlockPos] {.closure.} =
+    let v = VillagerEntity(self)
+    v.homePos
+  result.mobTick = proc(self: Mob; caller: EntityBase) {.closure.} =
+    let v = VillagerEntity(self)
+    villagerMobTick(v)
+  result.mobInteract = proc(self: Mob; player: Player; itemStack: var ItemStack): bool {.closure.} =
+    let v = VillagerEntity(self)
+    if v.entity.age < 0'i32:
+      v.setUnhappy()
+      return true
+
+    if v.offers.len == 0:
+      let prof = v.villagerData.professionEnum()
+      if prof != VillagerProfession.None and prof != VillagerProfession.Nitwit:
+        v.generateTrades(prof, v.villagerData.level.value)
+
+    if v.offers.len == 0:
+      v.setUnhappy()
+      return true
+
+    gPlayerHooks.incrementStat(player, scatCustom, int32(ord(csTalkedToVillager)), 1'i32)
+
+    v.openTradingScreen(player)
+
+    true
+
+proc writeOffers(self: VillagerEntity; nbt: var NbtCompound) =
+  var recipes: seq[NbtTag] = @[]
+  for offer in self.offers:
+    var recipe = newCompound()
+
+    var buy = newCompound()
+    offer.baseCostA.stack.writeItemStack(buy)
+    recipe.putCompound("buy", buy)
+
+    if offer.costB.isSome and not offer.costB.unsafeGet.stack.isEmpty():
+      var buyB = newCompound()
+      offer.costB.unsafeGet.stack.writeItemStack(buyB)
+      recipe.putCompound("buyB", buyB)
+
+    var sellItem = newCompound()
+    offer.output.stack.writeItemStack(sellItem)
+    recipe.putCompound("sell", sellItem)
+
+    recipe.putInt("uses", offer.uses)
+    recipe.putInt("maxUses", offer.maxUses)
+    recipe.putBool("rewardExp", not offer.isDisabled)
+    recipe.putInt("xp", offer.xp)
+    recipe.putFloat("priceMultiplier", offer.priceMultiplier)
+    recipe.putInt("specialPrice", offer.specialPrice)
+    recipe.putInt("demand", offer.demand)
+
+    recipes.add(NbtTag(kind: ntkCompound, compoundVal: recipe))
+  var offersCompound = newCompound()
+  offersCompound.putList("Recipes", recipes)
+  nbt.putCompound("Offers", offersCompound)
+
+proc readOffers(self: VillagerEntity; nbt: NbtCompound) =
+  let offersCompound = nbt.getCompound("Offers")
+  if offersCompound.isNone:
+    return
+  let recipes = offersCompound.unsafeGet.getList("Recipes")
+  if recipes.isNone:
+    return
+  self.offers.setLen(0)
+  for tag0 in recipes.unsafeGet:
+    if tag0.kind != ntkCompound:
+      continue
+    let recipe = tag0.compoundVal
+    let buy0 = recipe.getCompound("buy")
+    let sell0 = recipe.getCompound("sell")
+    let buyB0 = recipe.getCompound("buyB")
+    let buy = if buy0.isSome: readItemStack(buy0.unsafeGet) else: none[ItemStack]()
+    let sellItem = if sell0.isSome: readItemStack(sell0.unsafeGet) else: none[ItemStack]()
+    let buyB = if buyB0.isSome: readItemStack(buyB0.unsafeGet) else: none[ItemStack]()
+
+    if buy.isSome and sellItem.isSome:
+      let uses = recipe.getInt("uses")
+      let maxUses = recipe.getInt("maxUses")
+      let rewardExp = recipe.getBool("rewardExp")
+      let xp1 = recipe.getInt("xp")
+      let priceMultiplier = recipe.getFloat("priceMultiplier")
+      let specialPrice = recipe.getInt("specialPrice")
+      let demand = recipe.getInt("demand")
+
+      var costB = none[ItemStackSerializer]()
+      if buyB.isSome:
+        costB = some(toSerializer(buyB.unsafeGet))
+
+      self.offers.add(MerchantOffer(
+        baseCostA: toSerializer(buy.unsafeGet),
+        output: toSerializer(sellItem.unsafeGet),
+        costB: costB,
+        isDisabled: not (if rewardExp.isSome: rewardExp.unsafeGet else: true),
+        uses: if uses.isSome: uses.unsafeGet else: 0'i32,
+        maxUses: if maxUses.isSome: maxUses.unsafeGet else: 12'i32,
+        xp: if xp1.isSome: xp1.unsafeGet else: 2'i32,
+        specialPrice: if specialPrice.isSome: specialPrice.unsafeGet else: 0'i32,
+        priceMultiplier: if priceMultiplier.isSome: priceMultiplier.unsafeGet else: 0.05'f32,
+        demand: if demand.isSome: demand.unsafeGet else: 0'i32))
+
+proc makeVillagerVt(): EntityVt =
+  result = copyVt(mobEntityVt())
+  # Upstream's impl calls `living_entity.entity`, not `living_entity`: no health or effects are saved.
+  result.writeNbt = proc(self: EntityBase; nbt: var NbtCompound) {.closure.} =
+    let v = VillagerEntity(self)
+    self.entity.writeEntityNbt(nbt)
+    var villagerDataNbt = newCompound()
+    villagerDataNbt.putInt("Type", v.villagerData.typeId.value)
+    villagerDataNbt.putInt("Profession", v.villagerData.profession.value)
+    villagerDataNbt.putInt("Level", v.villagerData.level.value)
+    nbt.putCompound("VillagerData", villagerDataNbt)
+
+    nbt.putInt("FoodLevel", v.foodLevel)
+    nbt.putInt("Xp", v.xp)
+    nbt.putLong("LastRestock", v.lastRestockTime)
+    nbt.putInt("RestocksToday", v.restocksToday)
+
+    if v.jobSite.isSome:
+      let pos = v.jobSite.unsafeGet
+      nbt.putInt("JobSiteX", pos.x)
+      nbt.putInt("JobSiteY", pos.y)
+      nbt.putInt("JobSiteZ", pos.z)
+
+    if v.homePos.isSome:
+      let pos = v.homePos.unsafeGet
+      nbt.putInt("HomeX", pos.x)
+      nbt.putInt("HomeY", pos.y)
+      nbt.putInt("HomeZ", pos.z)
+
+    # Save Offers
+    writeOffers(v, nbt)
+
+    # Inventory
+    var inventoryList: seq[NbtTag] = @[]
+    for stack in v.inventory:
+      if not stack.isEmpty():
+        var itemNbt = newCompound()
+        stack.writeItemStack(itemNbt)
+        inventoryList.add(NbtTag(kind: ntkCompound, compoundVal: itemNbt))
+    nbt.putList("Inventory", inventoryList)
+
+    # Gossips
+    var gossipList: seq[NbtTag] = @[]
+    for gossip in v.gossips:
+      var gossipNbt = newCompound()
+      gossipNbt.putUuid("Target", gossip.target.hi, gossip.target.lo)
+      gossipNbt.putInt("Type", int32(ord(gossip.gossipType)))
+      gossipNbt.putInt("Value", gossip.value)
+      gossipList.add(NbtTag(kind: ntkCompound, compoundVal: gossipNbt))
+    nbt.putList("Gossips", gossipList)
+  result.readNbt = proc(self: EntityBase; nbt: NbtCompound) {.closure.} =
+    let v = VillagerEntity(self)
+    self.entity.readEntityNbt(nbt)
+    let dataNbt = nbt.getCompound("VillagerData")
+    if dataNbt.isSome:
+      let t = dataNbt.unsafeGet.getInt("Type")
+      if t.isSome:
+        v.villagerData.typeId = newVarInt(t.unsafeGet)
+      let p = dataNbt.unsafeGet.getInt("Profession")
+      if p.isSome:
+        v.villagerData.profession = newVarInt(p.unsafeGet)
+      let l = dataNbt.unsafeGet.getInt("Level")
+      if l.isSome:
+        v.villagerData.level = newVarInt(l.unsafeGet)
+
+    let food = nbt.getInt("FoodLevel")
+    if food.isSome:
+      v.foodLevel = food.unsafeGet
+    let xp1 = nbt.getInt("Xp")
+    if xp1.isSome:
+      v.xp = xp1.unsafeGet
+    let restock = nbt.getLong("LastRestock")
+    if restock.isSome:
+      v.lastRestockTime = restock.unsafeGet
+    let today = nbt.getInt("RestocksToday")
+    if today.isSome:
+      v.restocksToday = today.unsafeGet
+
+    let jx = nbt.getInt("JobSiteX")
+    let jy = nbt.getInt("JobSiteY")
+    let jz = nbt.getInt("JobSiteZ")
+    if jx.isSome and jy.isSome and jz.isSome:
+      v.jobSite = some(newBlockPos(jx.unsafeGet, jy.unsafeGet, jz.unsafeGet))
+    else:
+      v.jobSite = none[BlockPos]()
+
+    var hx = nbt.getInt("HomeX")
+    if hx.isNone:
+      hx = nbt.getInt("BedX")
+    var hy = nbt.getInt("HomeY")
+    if hy.isNone:
+      hy = nbt.getInt("BedY")
+    var hz = nbt.getInt("HomeZ")
+    if hz.isNone:
+      hz = nbt.getInt("BedZ")
+    if hx.isSome and hy.isSome and hz.isSome:
+      v.homePos = some(newBlockPos(hx.unsafeGet, hy.unsafeGet, hz.unsafeGet))
+    else:
+      v.homePos = none[BlockPos]()
+
+    readOffers(v, nbt)
+
+    # Inventory
+    let inventoryList = nbt.getList("Inventory")
+    if inventoryList.isSome:
+      v.inventory.setLen(0)
+      for tag0 in inventoryList.unsafeGet:
+        if tag0.kind == ntkCompound:
+          let stack = readItemStack(tag0.compoundVal)
+          if stack.isSome:
+            v.inventory.add(stack.unsafeGet)
+
+    # Gossips
+    let gossipList = nbt.getList("Gossips")
+    if gossipList.isSome:
+      v.gossips.setLen(0)
+      for tag0 in gossipList.unsafeGet:
+        if tag0.kind != ntkCompound:
+          continue
+        let gossipNbt = tag0.compoundVal
+        let uuid0 = gossipNbt.getUuid("Target")
+        let gtype = gossipNbt.getInt("Type")
+        let value = gossipNbt.getInt("Value")
+        if uuid0.isSome and gtype.isSome and value.isSome:
+          if gtype.unsafeGet < 0'i32 or gtype.unsafeGet > 4'i32:
+            continue
+          let target = Uuid(hi: uuid0.unsafeGet[0], lo: uuid0.unsafeGet[1])
+          let gossipType = GossipType(gtype.unsafeGet)
+          var replaced = false
+          for at in 0 ..< v.gossips.len:
+            if v.gossips[at].target == target and v.gossips[at].gossipType == gossipType:
+              v.gossips[at].value = value.unsafeGet
+              replaced = true
+          if not replaced:
+            v.gossips.add(GossipEntry(target: target, gossipType: gossipType, value: value.unsafeGet))
+
+let villagerMobVt = makeVillagerMobVt()
+let villagerVt = makeVillagerVt()
+
+proc newVillagerEntity*(entity: Entity): VillagerEntity =
+  var inventory0: seq[ItemStack] = @[]
+  for i in 0 ..< 8:
+    inventory0.add(emptyItemStack())
+  result = VillagerEntity(
+    villagerData: newVillagerData(VillagerType.Plains, VillagerProfession.None, 1'i32),
+    foodLevel: 0'i32, xp: 0'i32, lastRestockTime: 0'i64, restocksToday: 0'i32, gossips: @[], inventory: inventory0,
+    merchantInventory: newSimpleInventory(3), offers: @[], jobSite: none[BlockPos](), homePos: none[BlockPos]())
+  # Upstream's impl has its own write and read; see `makeVillagerVt`.
+  result.initMob(newMobEntity(entity), villagerMobVt, villagerVt)
+
+  let goalSelector = result.mobEntity.goalsSelector
+
+  goalSelector.addGoal(0'u8, newSwimGoal())
+  # Villagers avoid threats
+  goalSelector.addGoal(1'u8, newAvoidEntityGoal(EntityType.ZOMBIE, 8.0, 0.5, 0.5))
+  goalSelector.addGoal(1'u8, newAvoidEntityGoal(EntityType.ZOMBIE_VILLAGER, 8.0, 0.5, 0.5))
+  goalSelector.addGoal(1'u8, newAvoidEntityGoal(EntityType.HUSK, 8.0, 0.5, 0.5))
+  goalSelector.addGoal(1'u8, newAvoidEntityGoal(EntityType.DROWNED, 8.0, 0.5, 0.5))
+  goalSelector.addGoal(1'u8, newAvoidEntityGoal(EntityType.PILLAGER, 12.0, 0.5, 0.5))
+  goalSelector.addGoal(1'u8, newAvoidEntityGoal(EntityType.VINDICATOR, 12.0, 0.5, 0.5))
+  goalSelector.addGoal(1'u8, newAvoidEntityGoal(EntityType.EVOKER, 12.0, 0.5, 0.5))
+  goalSelector.addGoal(1'u8, newAvoidEntityGoal(EntityType.RAVAGER, 12.0, 0.5, 0.5))
+  goalSelector.addGoal(1'u8, newAvoidEntityGoal(EntityType.VEX, 12.0, 0.5, 0.5))
+
+  # Basic movement and looking (Vanilla uses 0.5 speed)
+  goalSelector.addGoal(2'u8, newWanderAroundGoal(0.5))
+  goalSelector.addGoal(3'u8, lookAtEntityGoalWithDefault(result, EntityType.PLAYER, 8.0'f32))
+  goalSelector.addGoal(4'u8, lookAtEntityGoalWithDefault(result, EntityType.VILLAGER, 8.0'f32))
+  goalSelector.addGoal(5'u8, newRandomLookAroundGoal())
+
+  # Send initial metadata
+  result.entity.sendMetaData(TrackedData_VILLAGER_DATA, VILLAGER_DATA, result.villagerData)

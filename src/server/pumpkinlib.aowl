@@ -1,20 +1,39 @@
 ## Port of pumpkin/src/lib.rs
 ## PARTIAL: pumpkin/src/lib.rs - `PumpkinServer` with the Java listener and the tick loop. No Bedrock socket, console, RCON, query, LAN broadcast, plugins or logger.
 ##
-## Upstream runs an accept task, tasks per client and a separate tick task. Here `serverLoop` is all of them in
-## turn, on one thread, over non-blocking sockets; see src/server/net/winsock.aowl.
+## Upstream runs an accept task, tasks per client, a tick task and chunk generation threads. Here `serverLoop` is all of
+## them in turn, on one thread, over non-blocking sockets; see src/server/net/winsock.aowl. Generation is time-sliced: a
+## pass of the loop runs at most one stage of one chunk, then goes back to the sockets, so a slow chunk cannot stall a
+## keep-alive for longer than that stage. A worker thread is not possible on this data flow: the chunk system shares
+## refcounted chunks with the level the handlers read, and refcounts here are not atomic.
 
 import std/[options, syncio]
-import serverbase, servermod
+import serverbase, servermod, ticker
 import entity/player as playermod
 import world/worldmod
 import net/java/[dispatch]
 import net/winsock
 import ../util/text/text
 
+type ConsoleCtrlHandler = proc(ctrlType: uint32): int32 {.stdcall.}
+
+proc setConsoleCtrlHandler(handler: ConsoleCtrlHandler; add: int32): int32
+  {.stdcall, importc: "SetConsoleCtrlHandler", dynlib: "kernel32.dll".}
+
+var stopFlag: int32 = 0'i32
+  ## Set from the console's handler thread; the loop only reads it. A plain word, so no refcounts cross threads.
+
+proc onConsoleCtrl(ctrlType: uint32): int32 {.stdcall.} =
+  stopFlag = 1'i32
+  1'i32
+
+proc installStopHandler*(server: Server) =
+  ## `STOP_INTERRUPT`: a console interrupt ends the loop, which then saves.
+  discard setConsoleCtrlHandler(onConsoleCtrl, 1'i32)
+
 const
-  TickMs = 50'i64
   FlushGraceMs = 2000'i64     ## How long a closed client's queued bytes may take to drain.
+  ChunkBudgetMs = 5'i64       ## How long one pass of the loop keeps running the chunk system when there is IO to do.
 
 type
   Connection = ref object
@@ -69,7 +88,7 @@ proc finished(conn: Connection; now: int64): bool =
   conn.client.gone or not conn.client.hasOutgoing() or now - conn.closingSince > FlushGraceMs
 
 proc serverLoop*(server: Server; port: uint16): bool =
-  ## `PumpkinServer::start`. Returns false when the socket cannot be opened; otherwise it does not return.
+  ## `PumpkinServer::start`. Returns false when the socket cannot be opened; otherwise when asked to stop.
   if not initWinsock():
     echo "FATAL: WSAStartup failed"
     return false
@@ -78,10 +97,13 @@ proc serverLoop*(server: Server; port: uint16): bool =
     echo "FATAL: could not bind/listen on port ", port, " (already in use?)"
     return false
   echo "aowlmony Minecraft server listening on port ", port
+  stdout.flushFile()
   var connections: seq[Connection] = @[]
   var masterClientIdCounter = 0'u64
-  var nextTick = nowMs() + TickMs
-  while true:
+  var ticker = newTickerState()
+  while not server.stopRequested and stopFlag == 0'i32:
+    if server.stopAtMs != 0'i64 and nowMs() >= server.stopAtMs:
+      break
     while true:
       let socket = tryAccept(listener)
       if int(socket) == int(InvalidSocket):
@@ -93,13 +115,11 @@ proc serverLoop*(server: Server; port: uint16): bool =
     for conn in connections:
       pumpConnection(conn, server)
 
-    let now = nowMs()
-    if now >= nextTick:
-      nextTick = now + TickMs
-      server.tick()
+    if ticker.stepTicker(server):
       for conn in connections:
         conn.client.flushOutgoing()
 
+    let now = nowMs()
     var kept: seq[Connection] = @[]
     for conn in connections:
       if finished(conn, now):
@@ -111,5 +131,26 @@ proc serverLoop*(server: Server; port: uint16): bool =
         kept.add(conn)
     connections = kept
 
-    sleepMs(1)
+    # The chunk system: IO for up to the budget, and at most one generation stage. Its work ends in `chunk_listener`,
+    # which the player tick above picks up.
+    let budgetEnd = nowMs() + ChunkBudgetMs
+    var worked = false
+    while nowMs() < budgetEnd:
+      if not server.pumpChunkSystems(1):
+        break
+      worked = true
+      if nowMs() >= budgetEnd:
+        break
+
+    if not worked:
+      sleepMs(1)
+
+  for conn in connections:
+    if conn.player.isSome:
+      server.removePlayer(conn.player.unsafeGet)
+      conn.player = none[Player]()
+    conn.client.close()
+    conn.client.flushOutgoing()
+    closeClient(conn.client.socket)
+  server.shutdown()
   true

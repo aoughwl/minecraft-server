@@ -1,0 +1,116 @@
+## Port of pumpkin/src/server/ticker.rs, and the half of pumpkin/src/server/tick_rate_manager.rs that talks to clients.
+## PARTIAL: pumpkin/src/server/ticker.rs - no plugin tick events. Upstream's `Ticker::run` is its own task sleeping between ticks; `TickerState` is the same logic as a step `serverLoop` polls, since one thread also answers the clients.
+
+import std/syncio
+import ../generated/translation as tr
+import ../protocol/java/client/play/[system_chat_message, ticking_state, ticking_step]
+import ../util/text/text
+import net/winsock
+import serverbase, servermod
+import world/worldmod
+
+type
+  TickerState* = object
+    nextTickMs*: int64
+
+template broadcastAll(server: Server; packet: untyped) =
+  ## `Server::broadcast_packet_all`
+  for baWorld in server.worlds:
+    baWorld.broadcastPacketAll(packet)
+
+proc updateStateToClients(self: TickRateManager; server: Server) =
+  server.broadcastAll(CTickingState(tickRate: self.tickrate, isFrozen: self.isFrozen))
+
+proc updateStepTicks(self: TickRateManager; server: Server) =
+  server.broadcastAll(CTickingStep(tickSteps: newVarInt(self.frozenTicksToRun)))
+
+proc setTickRate*(self: TickRateManager; server: Server; rate: float32) =
+  self.tickrate = max(rate, 1.0'f32)
+  self.nanosecondsPerTick = int64(1000000000.0 / float64(self.tickrate))
+  self.updateStateToClients(server)
+
+proc setFrozen*(self: TickRateManager; server: Server; frozen: bool) =
+  self.isFrozen = frozen
+  self.updateStateToClients(server)
+
+proc stepGameIfPaused*(self: TickRateManager; server: Server; ticks: int32): bool =
+  if not self.isFrozen:
+    return false
+  self.frozenTicksToRun = ticks
+  self.updateStepTicks(server)
+  true
+
+proc stopStepping*(self: TickRateManager; server: Server): bool =
+  if self.isSteppingForward():
+    self.frozenTicksToRun = 0'i32
+    self.updateStepTicks(server)
+    true
+  else:
+    false
+
+proc requestGameToSprint*(self: TickRateManager; server: Server; ticks: int64): bool =
+  let wasSprinting = self.isSprinting()
+  self.sprintTimeSpendNanos = 0'i64
+  self.scheduledCurrentSprintTicks = ticks
+  self.remainingSprintTicks = ticks
+  self.previousIsFrozen = self.isFrozen
+  self.setFrozen(server, false)
+  wasSprinting
+
+proc twoDecimals(v: float64): string =
+  ## `format!("{:.2}")`
+  let scaled = int64(v * 100.0 + 0.5)
+  let frac = scaled mod 100'i64
+  $(scaled div 100'i64) & "." & (if frac < 10'i64: "0" else: "") & $frac
+
+proc finishTickSprint*(self: TickRateManager; server: Server) =
+  let totalSprintedTicks = self.scheduledCurrentSprintTicks - self.remainingSprintTicks
+  let timeSpentNanos = self.sprintTimeSpendNanos
+  var innerMessage = translateCross(tr.JAVA_COMMANDS_TICK_SPRINT_STOP_SUCCESS, tr.JAVA_COMMANDS_TICK_SPRINT_STOP_SUCCESS)
+  if totalSprintedTicks > 0'i64 and timeSpentNanos > 0'i64:
+    let timeSpentMs = float64(timeSpentNanos) / 1000000.0
+    let tps = float64(totalSprintedTicks) * 1000.0 / timeSpentMs
+    let mspt = timeSpentMs / float64(totalSprintedTicks)
+    innerMessage = translateCross(tr.JAVA_COMMANDS_TICK_SPRINT_REPORT, tr.JAVA_COMMANDS_TICK_SPRINT_REPORT,
+      [text(twoDecimals(tps)), text(twoDecimals(mspt))])
+  # Construct the final component with the [Server: ...] wrapper
+  let finalReport = text("[Server: ").addChild(innerMessage).addChild(text("]")).italic().colorNamed(ncGray)
+  # Send as a system chat message, which does not add a sender prefix.
+  server.broadcastAll(CSystemChatMessage(content: finalReport, overlay: false))
+  # Reset state after sending the report
+  self.scheduledCurrentSprintTicks = 0'i64
+  self.sprintTimeSpendNanos = 0'i64
+  self.remainingSprintTicks = 0'i64
+  self.setFrozen(server, self.previousIsFrozen)
+
+proc stopSprinting*(self: TickRateManager; server: Server): bool =
+  if self.isSprinting():
+    self.finishTickSprint(server)
+    true
+  else:
+    false
+
+proc newTickerState*(): TickerState =
+  TickerState(nextTickMs: nowMs())
+
+proc stepTicker*(self: var TickerState; server: Server): bool =
+  ## One round of `Ticker::run`'s loop, when it is due. True if a tick ran.
+  let now = nowMs()
+  let manager = server.tickRateManager
+  if now < self.nextTickMs and not manager.isSprinting():
+    return false
+  manager.tick()
+  if manager.isSprinting():
+    manager.startSprintTickWork()
+    servermod.tick(server)
+    if manager.endSprintTickWork():
+      manager.finishTickSprint(server)
+  else:
+    servermod.tick(server)
+  let tickIntervalMs = if manager.isSprinting(): 0'i64 else: manager.nanosecondsPerTick div 1000000'i64
+  self.nextTickMs += tickIntervalMs
+  # Death Spiral Prevention
+  let late = nowMs()
+  if late - self.nextTickMs > 5000'i64:
+    self.nextTickMs = late
+  true

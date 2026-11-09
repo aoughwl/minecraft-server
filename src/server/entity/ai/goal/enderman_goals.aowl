@@ -1,0 +1,284 @@
+## Port of pumpkin/src/entity/ai/goal/chase_player.rs
+## Port of pumpkin/src/entity/ai/goal/pick_up_block.rs
+## Port of pumpkin/src/entity/ai/goal/place_block.rs
+## Port of pumpkin/src/entity/ai/goal/teleport_towards_player.rs
+##
+## Upstream's goals hold an `Arc<EndermanEntity>`, and entity/mob/enderman imports the goals. Here `EndermanAccess` carries
+## the calls these goals make, and entity/mob/enderman fills it.
+
+import std/[math, options]
+import ../../../../data/block_ext
+from ../../../../data/block_state import isSolid, isFullCube, isAir, BlockState, asU16, BlockStateId
+import ../../../../generated/tag
+from ../../../../generated/attributes import FOLLOW_RANGE
+import ../../../../util/math/rustnum
+import ../../../../world/world as worldtraits
+import ../../raycast
+import ../aibase
+import track_target
+
+const
+  PlayerEyeHeight* = 1.62'f64  ## entity/mob/enderman.rs: `PLAYER_EYE_HEIGHT`
+  StareCloseDistanceSq = 16.0'f64
+  TeleportFarDistanceSq = 256.0'f64
+
+type
+  EndermanAccess* = ref object
+    getCarriedBlock*: proc(): Option[uint16] {.closure.}
+    setCarriedBlock*: proc(state: Option[uint16]) {.closure.}
+    isPlayerStaring*: proc(player: Player): bool {.closure.}
+    isAngry*: proc(): bool {.closure.}
+    setProvoked*: proc(provoked: bool) {.closure.}
+    setTarget*: proc(target: nil EntityBase) {.closure.}
+    teleportRandomly*: proc() {.closure.}
+    teleportTowards*: proc(target: EntityBase) {.closure.}
+
+  ChasePlayerGoal* = ref object of Goal
+    enderman: EndermanAccess
+    target: nil Player
+
+  PickUpBlockGoal* = ref object of Goal
+    enderman: EndermanAccess
+
+  PlaceBlockGoal* = ref object of Goal
+    enderman: EndermanAccess
+
+  TeleportTowardsPlayerGoal* = ref object of Goal
+    enderman: EndermanAccess
+    mobEntity: MobEntity
+    trackTargetGoal: TrackTargetGoal
+    targetPlayer: nil EntityBase
+    committedTarget: nil EntityBase
+    targetPredicate: TargetPredicate
+    warmup: int32
+    unseenTicks: int32
+
+# --- ChasePlayerGoal --------------------------------------------------------------------------------------------------------------
+
+proc makeChaseVt(): GoalVt =
+  result = newGoalVt()
+  result.canStart = proc(self: Goal; mob: Mob): bool {.closure.} =
+    let s = ChasePlayerGoal(self)
+    let mobEntity = mob.mobEntity
+    let target = mobEntity.target
+    s.target = nil
+    if target == nil:
+      return false
+    let player = target.player
+    if player == nil:
+      return false
+    let entity = mobEntity.livingEntity.entity
+    let mobPos = entity.pos
+    if mobPos.squaredDistanceToVec(target.entity.pos) > 256.0'f64:
+      return false
+    if not s.enderman.isPlayerStaring(player):
+      return false
+    let closest = entity.world.getClosestPlayer(mobPos, 256.0'f64)
+    if closest != nil and closest.entityId == target.entity.entityId:
+      s.target = closest
+      return true
+    false
+  result.shouldContinue = proc(self: Goal; mob: Mob): bool {.closure.} =
+    let s = ChasePlayerGoal(self)
+    let player = s.target
+    if player == nil:
+      return false
+    if mob.mobEntity.livingEntity.entity.pos.squaredDistanceToVec(player.pos) > 256.0'f64:
+      return false
+    s.enderman.isPlayerStaring(player)
+  result.start = proc(self: Goal; mob: Mob) {.closure.} = mob.mobEntity.navigator.stop()
+  result.tick = proc(self: Goal; mob: Mob) {.closure.} =
+    let s = ChasePlayerGoal(self)
+    let player = s.target
+    if player != nil:
+      let playerPos = player.pos
+      mob.mobEntity.lookControl.lookAt(mob, playerPos.x, playerPos.y + PlayerEyeHeight, playerPos.z)
+  result.controls = proc(self: Goal): Controls {.closure.} = ControlsJump or ControlsMove
+
+let chasePlayerGoalVt* = makeChaseVt()
+
+proc newChasePlayerGoal*(enderman: EndermanAccess): ChasePlayerGoal =
+  ChasePlayerGoal(vt: chasePlayerGoalVt, enderman: enderman, target: nil)
+
+# --- PickUpBlockGoal --------------------------------------------------------------------------------------------------------------
+
+proc makePickUpVt(): GoalVt =
+  result = newGoalVt()
+  result.canStart = proc(self: Goal; mob: Mob): bool {.closure.} =
+    let s = PickUpBlockGoal(self)
+    if s.enderman.getCarriedBlock().isSome:
+      return false
+    if not mob.mobEntity.livingEntity.entity.world.levelInfo.gameRules.mobGriefing:
+      return false
+    randomRange(0'i32, toGoalTicks(20'i32)) == 0'i32
+  result.tick = proc(self: Goal; mob: Mob) {.closure.} =
+    let s = PickUpBlockGoal(self)
+    let entity = mob.mobEntity.livingEntity.entity
+    let pos = entity.pos
+    let bx = asI32(floor(pos.x)) + randomRangeInclusive(-2'i32, 2'i32)
+    let by = asI32(floor(pos.y)) + randomRangeInclusive(0'i32, 2'i32)
+    let bz = asI32(floor(pos.z)) + randomRangeInclusive(-2'i32, 2'i32)
+    let world = entity.world
+    let targetPos = BlockPos(vec: Vector3[int32](x: bx, y: by, z: bz))
+    let blockRef = world.getBlock(targetPos)
+    if not hasTag(asU16(blockRef.id), Block_MINECRAFT_ENDERMAN_HOLDABLE):
+      return
+    let endermanBlock = entity.blockPos
+    let endermanCenter = Vector3[float64](x: float64(endermanBlock.vec.x) + 0.5'f64, y: float64(by) + 0.5'f64,
+      z: float64(endermanBlock.vec.z) + 0.5'f64)
+    let blockCenter = Vector3[float64](x: float64(bx) + 0.5'f64, y: float64(by) + 0.5'f64, z: float64(bz) + 0.5'f64)
+    let hit = raycast(world, endermanCenter, blockCenter, proc(blockPos: BlockPos; w: World): bool {.closure.} =
+      BlockState.fromId(w.stateIdAt(blockPos)).isSolid)
+    if hit.isSome and not (hit.unsafeGet[0].vec == targetPos.vec):
+      return
+    # TODO upstream: Emit game event (BLOCK_DESTROY)
+    discard world.setBlockState(targetPos, 0'u32, BfNotifyAll)
+    s.enderman.setCarriedBlock(some(asU16(blockRef.defaultState.id)))
+  result.shouldContinue = proc(self: Goal; mob: Mob): bool {.closure.} = false
+
+let pickUpBlockGoalVt* = makePickUpVt()
+
+proc newPickUpBlockGoal*(enderman: EndermanAccess): PickUpBlockGoal =
+  PickUpBlockGoal(vt: pickUpBlockGoalVt, enderman: enderman)
+
+# --- PlaceBlockGoal ---------------------------------------------------------------------------------------------------------------
+
+proc makePlaceVt(): GoalVt =
+  result = newGoalVt()
+  result.canStart = proc(self: Goal; mob: Mob): bool {.closure.} =
+    let s = PlaceBlockGoal(self)
+    if s.enderman.getCarriedBlock().isNone:
+      return false
+    if not mob.mobEntity.livingEntity.entity.world.levelInfo.gameRules.mobGriefing:
+      return false
+    randomRange(0'i32, toGoalTicks(2000'i32)) == 0'i32
+  result.tick = proc(self: Goal; mob: Mob) {.closure.} =
+    let s = PlaceBlockGoal(self)
+    let blockStateId = s.enderman.getCarriedBlock()
+    if blockStateId.isNone:
+      return
+    let entity = mob.mobEntity.livingEntity.entity
+    let pos = entity.pos
+    let bx = asI32(floor(pos.x)) + randomRangeInclusive(-1'i32, 1'i32)
+    let by = asI32(floor(pos.y)) + randomRangeInclusive(0'i32, 2'i32)
+    let bz = asI32(floor(pos.z)) + randomRangeInclusive(-1'i32, 1'i32)
+    let world = entity.world
+    let targetPos = BlockPos(vec: Vector3[int32](x: bx, y: by, z: bz))
+    if not BlockState.fromId(world.stateIdAt(targetPos)).isAir:
+      return
+    let belowPos = BlockPos(vec: Vector3[int32](x: bx, y: by - 1'i32, z: bz))
+    let belowId = world.stateIdAt(belowPos)
+    let belowState = BlockState.fromId(belowId)
+    if not belowState.isSolid or not belowState.isFullCube or Block.fromStateId(belowId).id == blockIdBedrock:
+      return
+    # TODO upstream: Validate canPlaceAt and check entity collisions at target position
+    discard world.setBlockState(targetPos, uint32(blockStateId.unsafeGet), BfNotifyAll)
+    s.enderman.setCarriedBlock(none[uint16]())
+  result.shouldContinue = proc(self: Goal; mob: Mob): bool {.closure.} = false
+
+let placeBlockGoalVt* = makePlaceVt()
+
+proc newPlaceBlockGoal*(enderman: EndermanAccess): PlaceBlockGoal =
+  PlaceBlockGoal(vt: placeBlockGoalVt, enderman: enderman)
+
+# --- TeleportTowardsPlayerGoal ----------------------------------------------------------------------------------------------------
+
+proc findStaringPlayer(self: TeleportTowardsPlayerGoal): nil Player =
+  ## `find_staring_player`
+  let living = self.mobEntity.livingEntity
+  let entity = living.entity
+  let followRange = living.getAttributeValue(FOLLOW_RANGE)
+  let player = entity.world.getClosestPlayer(entity.pos, followRange)
+  if player == nil:
+    return nil
+  let adapter = playerBase(player)
+  if not adapter.entity.isAlive():
+    return nil
+  if not self.targetPredicate.test(entity.world, living, mustLiving(adapter)):
+    return nil
+  if self.enderman.isPlayerStaring(player) or self.enderman.isAngry():
+    return player
+  nil
+
+proc makeTeleportVt(): GoalVt =
+  result = newGoalVt()
+  result.canStart = proc(self: Goal; mob: Mob): bool {.closure.} =
+    let s = TeleportTowardsPlayerGoal(self)
+    let player = s.findStaringPlayer()
+    if player == nil:
+      return false
+    s.targetPlayer = playerBase(player)
+    true
+  result.shouldContinue = proc(self: Goal; mob: Mob): bool {.closure.} =
+    let s = TeleportTowardsPlayerGoal(self)
+    let tp = s.targetPlayer
+    if tp != nil and tp.player != nil:
+      let player = mustPlayer(tp)
+      if not s.enderman.isPlayerStaring(player) and not s.enderman.isAngry():
+        return false
+      let playerPos = player.pos
+      mob.mobEntity.lookControl.lookAtWithRange(playerPos.x, playerPos.y + PlayerEyeHeight, playerPos.z, 10.0'f32, 10.0'f32)
+      return true
+    if tp != nil:
+      return false
+    let committed = s.committedTarget
+    if committed != nil:
+      if not committed.entity.isAlive():
+        return false
+      let mobEntity = mob.mobEntity
+      let distSq = mobEntity.livingEntity.entity.pos.squaredDistanceToVec(committed.entity.pos)
+      let followRange = mobEntity.livingEntity.getAttributeValue(FOLLOW_RANGE)
+      if distSq > followRange * followRange:
+        return false
+      if mobEntity.target == nil:
+        mob.setMobTarget(committed)
+      return true
+    s.trackTargetGoal.shouldContinue(mob)
+  result.start = proc(self: Goal; mob: Mob) {.closure.} =
+    let s = TeleportTowardsPlayerGoal(self)
+    s.warmup = toGoalTicks(5'i32)
+    s.unseenTicks = 0'i32
+    s.enderman.setProvoked(true)
+  result.tick = proc(self: Goal; mob: Mob) {.closure.} =
+    let s = TeleportTowardsPlayerGoal(self)
+    let externalTarget = mob.mobEntity.target
+    if externalTarget == nil and s.targetPlayer == nil and s.committedTarget == nil:
+      return
+    if s.targetPlayer != nil:
+      s.warmup -= 1'i32
+      if s.warmup <= 0'i32:
+        let target = s.targetPlayer
+        s.targetPlayer = nil
+        s.committedTarget = target
+        s.enderman.setTarget(target)
+        s.trackTargetGoal.start(mob)
+      return
+    let target = if s.committedTarget != nil: s.committedTarget else: externalTarget
+    if target == nil:
+      return
+    let distSq = mob.mobEntity.livingEntity.entity.pos.squaredDistanceToVec(target.entity.pos)
+    if target.player != nil and s.enderman.isPlayerStaring(mustPlayer(target)):
+      if distSq < StareCloseDistanceSq:
+        s.enderman.teleportRandomly()
+      s.unseenTicks = 0'i32
+    elif distSq > TeleportFarDistanceSq:
+      s.unseenTicks += 1'i32
+      if s.unseenTicks >= toGoalTicks(30'i32):
+        s.enderman.teleportTowards(target)
+        s.unseenTicks = 0'i32
+  result.stop = proc(self: Goal; mob: Mob) {.closure.} =
+    let s = TeleportTowardsPlayerGoal(self)
+    s.targetPlayer = nil
+    s.committedTarget = nil
+    s.enderman.setTarget(nil)
+  result.controls = proc(self: Goal): Controls {.closure.} = ControlsTarget
+
+let teleportTowardsPlayerGoalVt* = makeTeleportVt()
+
+proc newTeleportTowardsPlayerGoal*(enderman: EndermanAccess; mobEntity: MobEntity): TeleportTowardsPlayerGoal =
+  ## `TeleportTowardsPlayerGoal::new`
+  var targetPredicate = createAttackable()
+  targetPredicate.baseMaxDistance = mobEntity.livingEntity.getAttributeValue(FOLLOW_RANGE)
+  TeleportTowardsPlayerGoal(vt: teleportTowardsPlayerGoalVt, enderman: enderman, mobEntity: mobEntity,
+    trackTargetGoal: trackTargetGoalWithDefault(false), targetPlayer: nil, committedTarget: nil,
+    targetPredicate: targetPredicate, warmup: 0'i32, unseenTicks: 0'i32)

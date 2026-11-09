@@ -1,0 +1,293 @@
+## Port of pumpkin/src/entity/mob/enderman.rs
+##
+import std/[math, options]
+from ../../../data/block_state import isSolid
+from ../../../generated/block_properties import STATE_COUNT
+import ../../../data/data_component_impl/impl_base
+import "../../../data/item_stack/mod"
+from ../../../generated/attributes import MOVEMENT_SPEED
+import ../../../generated/[item_full, meta_data_type, particle, tag, tracked_data]
+import ../../../nbt/tag as nbttag
+import ../../../protocol/java/client/play/entity_position_sync
+import ../../../protocol/varint
+import ../../../util/math/boundingbox
+import ../ai/aibase
+import ../ai/goal/[enderman_goals, look_around, look_at_entity, melee_attack, swim, track_target, wander_around]
+import ../attributes as entityattrs
+import ../raycast as worldraycast
+import mobvts
+
+const
+  SpeedBoost = 0.15'f64
+  EndermanSpeedBoostId = "minecraft:attacking"
+  EndermanEyeHeight* = 2.55'f64
+  EndermanBodyYOffset* = 1.45'f64
+  PlayerEyeHeight* = 1.62'f64
+
+type
+  EndermanEntity* = ref object of Mob
+    carriedBlock*: Option[uint16]
+    angry*: bool
+    provoked*: bool
+    speedBoosted*: bool
+    access*: EndermanAccess
+
+proc isProjectileDamage*(dt: DamageType): bool =
+  ## The tag's names against `message_id`, upstream's test. Its ids are what is stored here.
+  hasTag(uint16(dt.id), DamageType_MINECRAFT_IS_PROJECTILE)
+
+proc teleportTo*(self: EndermanEntity; x, y, z: float64): bool =
+  let entity = self.mobEntity.livingEntity.entity
+  let origin = entity.pos
+  let world = entity.world
+
+  let minY = float64(world.dimension.minY)
+  let maxY = float64(world.dimension.minY + world.dimension.height - 1'i32)
+  var targetY = clamp(y, minY, maxY)
+
+  let blockX = int32(floor(x))
+  var blockY = int32(floor(targetY))
+  let blockZ = int32(floor(z))
+  var foundGround = false
+  while true:
+    let belowPos = newBlockPos(blockX, blockY - 1'i32, blockZ)
+    let belowState = getBlockStateAt(world, belowPos)
+    if belowState.isSolid():
+      foundGround = true
+      break
+    if blockY <= world.dimension.minY:
+      break
+    blockY = blockY - 1'i32
+    targetY = float64(blockY)
+
+  if not foundGround:
+    return false
+
+  let destPos = newBlockPos(blockX, blockY, blockZ)
+  let destFluid = getFluid(world, destPos)
+  if hasTag(destFluid.id, Fluid_MINECRAFT_WATER):
+    return false
+
+  let halfWidth = 0.3
+  let height = 2.9
+  let bb = newBoundingBox(Vector3[float64](x: x - halfWidth, y: targetY, z: z - halfWidth),
+    Vector3[float64](x: x + halfWidth, y: targetY + height, z: z + halfWidth))
+  if not isSpaceEmpty(world, bb):
+    return false
+
+  let newPos = Vector3[float64](x: x, y: targetY, z: z)
+
+  for pos in [origin, newPos]:
+    world.spawnParticle(pos, Vector3[float64](x: 0.0, y: 0.0, z: 0.0), 0.0'f32, 128'i32, ptPortal)
+    world.playSound(sdEntityEndermanTeleport, scHostile, pos)
+
+  entity.setPos(newPos)
+  let chunkPos = entity.chunkPos
+  world.broadcastToChunk(chunkPos, CEntityPositionSync(entityId: newVarInt(entity.entityId), position: newPos,
+    delta: Vector3[float64](x: 0.0, y: 0.0, z: 0.0), yaw: entity.yaw, pitch: entity.pitch, onGround: entity.onGround))
+
+  self.mobEntity.navigator.stop()
+
+  true
+
+proc teleportRandomly*(self: EndermanEntity): bool =
+  let pos = self.mobEntity.livingEntity.entity.pos
+  let x = pos.x + (randomF64() - 0.5) * 64.0
+  let y = pos.y + float64(randomRange(0'i32, 64'i32) - 32'i32)
+  let z = pos.z + (randomF64() - 0.5) * 64.0
+  self.teleportTo(x, y, z)
+
+proc teleportTowards*(self: EndermanEntity; target: EntityBase): bool =
+  let pos = self.mobEntity.livingEntity.entity.pos
+  let targetPos = target.entity.pos
+
+  let dx = pos.x - targetPos.x
+  let dy = (pos.y + EndermanBodyYOffset) - (targetPos.y + PlayerEyeHeight)
+  let dz = pos.z - targetPos.z
+  let dist = sqrt(dx * dx + dy * dy + dz * dz)
+
+  if dist < 1e-6:
+    return false
+
+  let nx = dx / dist
+  let ny = dy / dist
+  let nz = dz / dist
+  let x = pos.x + (randomF64() - 0.5) * 8.0 - nx * 16.0
+  let y = pos.y + float64(randomRange(0'i32, 16'i32) - 8'i32) - ny * 16.0
+  let z = pos.z + (randomF64() - 0.5) * 8.0 - nz * 16.0
+
+  self.teleportTo(x, y, z)
+
+proc setAngry*(self: EndermanEntity; angry: bool) =
+  self.angry = angry
+  self.mobEntity.livingEntity.entity.sendMetaData(TrackedData_CREEPY, BOOLEAN, angry)
+
+proc isAngry*(self: EndermanEntity): bool =
+  self.angry
+
+proc setProvoked*(self: EndermanEntity; provoked: bool) =
+  self.provoked = provoked
+  self.mobEntity.livingEntity.entity.sendMetaData(TrackedData_STARED_AT, BOOLEAN, provoked)
+
+proc setTarget*(self: EndermanEntity; target: nil EntityBase) =
+  self.mobEntity.target = target
+
+  if target != nil:
+    self.setAngry(true)
+    # Use attribute modifier instead of direct speed arithmetic
+    if not self.speedBoosted:
+      self.speedBoosted = true
+      let living = self.mobEntity.livingEntity
+      let modifier = AttrModifier(id: EndermanSpeedBoostId, amount: SpeedBoost, operation: moAdd)
+      living.updateAttributeInstance(MOVEMENT_SPEED).addOrReplaceModifier(modifier)
+      sendAttributeUpdatesForLiving(living, [MOVEMENT_SPEED])
+  else:
+    self.setAngry(false)
+    self.setProvoked(false)
+    if self.speedBoosted:
+      self.speedBoosted = false
+      let living = self.mobEntity.livingEntity
+      living.updateAttributeInstance(MOVEMENT_SPEED).removeModifier(EndermanSpeedBoostId)
+      sendAttributeUpdatesForLiving(living, [MOVEMENT_SPEED])
+
+proc setCarriedBlock*(self: EndermanEntity; blockState: Option[uint16]) =
+  self.carriedBlock = blockState
+  let value = if blockState.isSome: newVarInt(int32(blockState.unsafeGet)) else: newVarInt(0'i32)
+  self.mobEntity.livingEntity.entity.sendMetaData(TrackedData_CARRY_STATE, OPTIONAL_BLOCK_STATE, value)
+
+proc getCarriedBlock*(self: EndermanEntity): Option[uint16] =
+  self.carriedBlock
+
+proc isPlayerStaring*(self: EndermanEntity; player: Player): bool =
+  let headStack = player.equipment.get(esHead)
+  if not headStack.isEmpty() and headStack.item.id == ITEM_CARVED_PUMPKIN.id:
+    return false
+
+  let entity = self.mobEntity.livingEntity.entity
+  let endermanPos = entity.pos
+  let endermanEyeY = endermanPos.y + EndermanEyeHeight
+
+  let playerEntity = playerBase(player).entity
+  let playerPos = playerEntity.pos
+  let playerEyeY = playerPos.y + PlayerEyeHeight
+
+  let pitch = toRadiansF32(playerEntity.pitch)
+  let yaw = -toRadiansF32(playerEntity.yaw)
+
+  let cosPitch = cosF32(pitch)
+  let lookX = float64(sinF32(yaw) * cosPitch)
+  let lookY = float64(-sinF32(pitch))
+  let lookZ = float64(cosF32(yaw) * cosPitch)
+
+  let dx = endermanPos.x - playerPos.x
+  let dy = endermanEyeY - playerEyeY
+  let dz = endermanPos.z - playerPos.z
+  let distance = sqrt(dx * dx + dy * dy + dz * dz)
+
+  if distance < 0.1:
+    return false
+
+  let dirX = dx / distance
+  let dirY = dy / distance
+  let dirZ = dz / distance
+
+  let dot = lookX * dirX + lookY * dirY + lookZ * dirZ
+
+  if dot <= 1.0 - 0.025 / distance:
+    return false
+
+  let endermanEyePos = Vector3[float64](x: endermanPos.x, y: endermanEyeY, z: endermanPos.z)
+  let playerEyePos = Vector3[float64](x: playerPos.x, y: playerEyeY, z: playerPos.z)
+  proc blocks(blockPos: BlockPos; world: World): bool {.closure.} =
+    getBlockStateAt(world, blockPos).isSolid()
+  raycast(entity.world, endermanEyePos, playerEyePos, blocks).isNone
+
+proc makeEndermanMobVt(): MobVt =
+  result = newMobVt()
+  result.setMobTarget = proc(self: Mob; target: nil EntityBase) {.closure.} =
+    let enderman = EndermanEntity(self)
+    enderman.setTarget(target)
+  # TODO upstream: sunlight avoidance, carried block drop on death, angerable system, ambient sound override
+  result.mobTick = proc(self: Mob; caller: EntityBase) {.closure.} =
+    let entity = self.mobEntity.livingEntity.entity
+    if not entity.isAlive():
+      return
+
+    # TODO upstream: also check rain
+    if entity.touchingWater:
+      discard damageWithContextImpl(self.mobEntity.livingEntity, self, 1.0'f32, DROWN, none[Vector3[float64]](), nil, nil)
+
+    # NOTE upstream: Enderman ambient portal particles are intentionally NOT sent server-side.
+    # The vanilla Minecraft client generates these particles locally in the entity renderer.
+  result.preDamage = proc(self: Mob; damageType: DamageType; source: nil EntityBase): bool {.closure.} =
+    let enderman = EndermanEntity(self)
+    if isProjectileDamage(damageType):
+      for i in 0 ..< 64:
+        if enderman.teleportRandomly():
+          return false
+    true
+  result.onDamage = proc(self: Mob; damageType: DamageType; source: nil EntityBase) {.closure.} =
+    let enderman = EndermanEntity(self)
+    if source != nil and source.getLivingEntity() != nil:
+      return
+    let shouldTeleport = randomRange(0'i32, 10'i32) != 0'i32
+    if shouldTeleport:
+      discard enderman.teleportRandomly()
+
+proc makeEndermanVt(): EntityVt =
+  result = copyVt(mobEntityVt())
+  result.writeNbt = proc(self: EntityBase; nbt: var NbtCompound) {.closure.} =
+    let enderman = EndermanEntity(self)
+    Mob(self).mobEntity.livingEntity.writeLivingNbt(nbt)
+    if enderman.carriedBlock.isSome:
+      nbt.putInt("carriedBlockState", int32(enderman.carriedBlock.unsafeGet))
+  result.readNbt = proc(self: EntityBase; nbt: NbtCompound) {.closure.} =
+    let enderman = EndermanEntity(self)
+    Mob(self).mobEntity.livingEntity.readLivingNbt(nbt)
+    let blockState = nbt.getInt("carriedBlockState")
+    if blockState.isSome:
+      # `BlockStateId::new(block_state as u16)`: `None` past the table's end.
+      let value = uint16(cast[uint32](blockState.unsafeGet) and 0xFFFF'u32)
+      enderman.setCarriedBlock(if value < STATE_COUNT: some(value) else: none[uint16]())
+
+let endermanMobVt = makeEndermanMobVt()
+let endermanVt = makeEndermanVt()
+
+proc newEndermanAccess(self: EndermanEntity): EndermanAccess =
+  ## What upstream's goals call on their `Arc<EndermanEntity>`.
+  EndermanAccess(
+    getCarriedBlock: proc(): Option[uint16] {.closure.} = self.getCarriedBlock(),
+    setCarriedBlock: proc(state: Option[uint16]) {.closure.} = self.setCarriedBlock(state),
+    isPlayerStaring: proc(player: Player): bool {.closure.} = self.isPlayerStaring(player),
+    isAngry: proc(): bool {.closure.} = self.isAngry(),
+    setProvoked: proc(provoked: bool) {.closure.} = self.setProvoked(provoked),
+    setTarget: proc(target: nil EntityBase) {.closure.} = self.setTarget(target),
+    teleportRandomly: proc() {.closure.} =
+      discard self.teleportRandomly(),
+    teleportTowards: proc(target: EntityBase) {.closure.} =
+      discard self.teleportTowards(target))
+
+proc newEndermanEntity*(entity: Entity): EndermanEntity =
+  result = EndermanEntity(carriedBlock: none[uint16](), angry: false, provoked: false, speedBoosted: false)
+  result.initMob(newMobEntity(entity), endermanMobVt, endermanVt)
+  let access = newEndermanAccess(result)
+  result.access = access
+
+  result.mobEntity.navigator.setMobDimensions(0.6'f32, 2.9'f32)
+  result.mobEntity.navigator.setPathfindingMalus(ptWater, -1.0'f32)
+
+  let goalSelector = result.mobEntity.goalsSelector
+  let targetSelector = result.mobEntity.targetSelector
+
+  goalSelector.addGoal(0'u8, newSwimGoal())
+  goalSelector.addGoal(1'u8, newChasePlayerGoal(access))
+  goalSelector.addGoal(2'u8, newMeleeAttackGoal(1.0, false))
+  goalSelector.addGoal(7'u8, newWanderAroundGoal(1.0))
+  goalSelector.addGoal(8'u8, lookAtEntityGoalWithDefault(result, EntityType.PLAYER, 8.0'f32))
+  goalSelector.addGoal(8'u8, newRandomLookAroundGoal())
+  goalSelector.addGoal(10'u8, newPlaceBlockGoal(access))
+  goalSelector.addGoal(11'u8, newPickUpBlockGoal(access))
+
+  targetSelector.addGoal(1'u8, newTeleportTowardsPlayerGoal(access, result.mobEntity))
+  targetSelector.addGoal(2'u8, newRevengeGoal(true))
+  targetSelector.addGoal(3'u8, activeTargetGoalWithDefault(result.mobEntity, EntityType.ENDERMITE, true))

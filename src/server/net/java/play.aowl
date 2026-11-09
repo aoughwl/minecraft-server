@@ -1,16 +1,99 @@
 ## Port of pumpkin/src/net/java/play.rs
-## PARTIAL: pumpkin/src/net/java/play.rs - only what standing in a world takes: teleport confirm, keep-alive, chunk batch acknowledgements, client information, and movement without its checks or the broadcast of it to other players. Chat, commands, block and item use, inventory and the other 2800 lines are not ported.
+## PARTIAL: pumpkin/src/net/java/play.rs - every handler is here and routed; what each calls that is not ported stops at a hook and says so in place. No plugin events anywhere (`send_cancellable!` runs its `after`). `handle_chat_command`, `handle_command_suggestion` wait on src/command's dispatcher, held back by the compiler bug. `handle_attack` and the attack half of `handle_interact` reach `Player::attack`, which needs damage (living.rs). `handle_use_item` and `prepare_hand_item_for_use` need `item_registry`, status effects and cooldowns. `handle_set_command_block`, `handle_set_jigsaw_block`, `handle_jigsaw_generate` and `handle_sign_update` need block entities. `handle_place_recipe` needs a crafting grid recipe placement against `generated/recipes`, `handle_pick_item_from_entity` entities, `handle_select_trade` a merchant, `handle_move_vehicle` and `handle_paddle_boat` vehicles. `validate_chat_session` has no Mojang public keys to check against, since they come over the HTTP that is missing, and refuses.
+##
+## Upstream's movement handlers differ in one place that is kept: `handle_position` jumps when the client left the
+## ground, `handle_position_rotation` when it did not. Both are as upstream wrote them.
 
-import std/[options, syncio]
-import ../../../protocol/java/server/play/[confirm_teleport, keep_alive, chunk_batch, player_position, player_position_rotation,
-  player_rotation, client_information]
+import std/[options, tables, math, syncio]
+import ../../../protocol/java/client/play/[block_update, center_chunk, command_suggestions, entity_position_sync, head_rot,
+  open_sign_editor, ping_response, player_position as cplayerposition, set_camera, set_held_item, system_chat_message,
+  update_entity_pos, update_entity_pos_rot, update_entity_rot, close_container]
+import ../../../protocol/java/client/play/player_info_update except Player
+import ../../../protocol/java/server/play/[attack, bundle_item_selected, change_game_mode, chat_command, chat_message,
+  chunk_batch, click_container, client_command, client_information, close_container as scloseconatiner, command_suggestion,
+  confirm_teleport, container_button_click, cookie_response, debug_sample_subscription, debug_subscription_request, interact,
+  jigsaw_generate, keep_alive, move_vehicle, paddle_boat, pick_item, ping_request, place_recipe, player_abilities,
+  player_action, player_command, player_ground, player_input, player_position, player_position_rotation, player_rotation,
+  player_session, recipe_book_change_settings, recipe_book_seen_recipe, rename_item, seen_advancement, select_trade,
+  set_command_block, set_creative_slot, set_held_item as ssetheld, set_jigsaw_block, set_test_block, swing_arm,
+  teleport_to_entity, test_instance_block_action, update_sign, use_item, use_item_on]
+import ../../../data/block_ext
+from ../../../data/block_state import asU16, isAir
+import "../../../data/item_stack/mod"
+import ../../../generated/screen
 import ../../../generated/translation as tr
+import ../../../inventory/[entity_equipment, inventory, player_inventory, player_screen_handler, screenhandler, stackbridge, slot]
+import ../../../util/difficulty
+import ../../../util/math/mathmod
 import ../../../util/text/text
-import ../../serverbase
+import ../../../world/world as worldtraits
+import "../../block/block_place"
 import ../../entity/player as playermod
-import ../../world/chunker
+import ../../data/banlist_serializer
+import ../../seasonal_events
+import ../../serverbase
+import ../../world/[chunker, worldmod]
 import ../winsock
 import javamod
+
+const
+  ChatMessageMaxAge = 120000'i64  ## `CHAT_MESSAGE_MAX_AGE`: vanilla's two minutes, in ms.
+  FlagOnGround = 1'u8             ## `FLAG_ON_GROUND`
+
+type
+  ChatError = enum
+    ceOversizedMessage
+    ceIllegalCharacters
+    ceUnsignedChat
+    ceTooManyPendingChats
+    ceChatValidationFailed
+    ceOutOfOrderChat
+    ceExpiredPublicKey
+    ceInvalidPublicKey
+
+  BlockPlacingError* = enum
+    ## `BlockPlacingError`
+    bpBlockOutOfReach
+    bpInvalidHand
+    bpInvalidBlockFace
+    bpBlockOutOfWorld
+    bpInvalidGamemode
+
+proc clientKickReason(err: ChatError): TextComponent =
+  ## `impl PumpkinError for ChatError`
+  case err
+  of ceOversizedMessage: text("Chat message too long")
+  of ceIllegalCharacters: translateCross(tr.JAVA_MULTIPLAYER_DISCONNECT_ILLEGAL_CHARACTERS, tr.JAVA_MULTIPLAYER_DISCONNECT_ILLEGAL_CHARACTERS)
+  of ceUnsignedChat: translateCross(tr.JAVA_MULTIPLAYER_DISCONNECT_UNSIGNED_CHAT, tr.JAVA_MULTIPLAYER_DISCONNECT_UNSIGNED_CHAT)
+  of ceTooManyPendingChats: translateCross(tr.JAVA_MULTIPLAYER_DISCONNECT_TOO_MANY_PENDING_CHATS, tr.JAVA_MULTIPLAYER_DISCONNECT_TOO_MANY_PENDING_CHATS)
+  of ceChatValidationFailed: translateCross(tr.JAVA_MULTIPLAYER_DISCONNECT_CHAT_VALIDATION_FAILED, tr.JAVA_MULTIPLAYER_DISCONNECT_CHAT_VALIDATION_FAILED)
+  of ceOutOfOrderChat: translateCross(tr.JAVA_MULTIPLAYER_DISCONNECT_OUT_OF_ORDER_CHAT, tr.JAVA_MULTIPLAYER_DISCONNECT_OUT_OF_ORDER_CHAT)
+  of ceExpiredPublicKey: translateCross(tr.JAVA_MULTIPLAYER_DISCONNECT_EXPIRED_PUBLIC_KEY, tr.JAVA_MULTIPLAYER_DISCONNECT_EXPIRED_PUBLIC_KEY)
+  of ceInvalidPublicKey: translateCross(tr.JAVA_MULTIPLAYER_DISCONNECT_INVALID_PUBLIC_KEY_SIGNATURE, tr.JAVA_MULTIPLAYER_DISCONNECT_INVALID_PUBLIC_KEY_SIGNATURE)
+
+proc invalidMovement(): TextComponent =
+  translateCross(tr.JAVA_MULTIPLAYER_DISCONNECT_INVALID_PLAYER_MOVEMENT, tr.JAVA_MULTIPLAYER_DISCONNECT_INVALID_PLAYER_MOVEMENT)
+
+proc invalidEntityAttacked(): TextComponent =
+  translateCross(tr.JAVA_MULTIPLAYER_DISCONNECT_INVALID_ENTITY_ATTACKED, tr.JAVA_MULTIPLAYER_DISCONNECT_INVALID_ENTITY_ATTACKED)
+
+proc isFiniteF(v: float64): bool {.inline.} =
+  v == v and v != Inf and v != -Inf
+
+proc isFiniteF(v: float32): bool {.inline.} =
+  v == v and v != Inf and v != -Inf
+
+proc clampHorizontal(pos: float64): float64 {.inline.} = max(min(pos, 3.0e7), -3.0e7)
+
+proc clampVertical(pos: float64): float64 {.inline.} = max(min(pos, 2.0e7), -2.0e7)
+
+proc nowUnixMs(): int64 =
+  ## `SystemTime::now()` in ms, the seconds rounded up: a timestamp just made is never in the future.
+  (nowUtcSeconds() + 1'i64) * 1000'i64
+
+proc remEuclid(a, b: float32): float32 =
+  let r = a - b * trunc(a / b)
+  if r < 0.0'f32: r + abs(b) else: r
 
 proc handleConfirmTeleport*(self: JavaClient; player: Player; confirmTeleport: SConfirmTeleport) =
   if player.awaitingTeleport.isSome:
@@ -25,6 +108,511 @@ proc handleConfirmTeleport*(self: JavaClient; player: Player; confirmTeleport: S
   else:
     self.kick(text("Send Teleport confirm, but we did not teleport"))
 
+proc handleChangeGameMode*(self: JavaClient; player: Player; packet: SChangeGameMode) =
+  if player.permissionLvl >= Two:
+    discard player.setGamemode(packet.gameMode)
+    let gamemodeString = "gameMode." & toStr(packet.gameMode)
+    player.sendSystemMessage(translateCross(tr.JAVA_COMMANDS_GAMEMODE_SUCCESS_SELF, tr.BEDROCK_COMMANDS_GAMEMODE_SUCCESS_SELF,
+      [translateCross(gamemodeString, gamemodeString)]))
+
+proc handlePlayerLoaded*(player: Player) =
+  player.setClientLoaded(true)
+
+proc syncPosition(player: Player; world: World; pos, lastPos: Vector3[float64]; yaw, pitch: float32; onGround: bool): bool =
+  ## `sync_position`: whether syncing the position was needed. Teleport when more than 8 blocks (-8..=7.999755859375).
+  let delta = Vector3[float64](x: pos.x - lastPos.x, y: pos.y - lastPos.y, z: pos.z - lastPos.z)
+  if delta.lengthSquared() < 64.0:
+    return false
+  world.broadcastPacketExcept(player.gameprofile.id, CEntityPositionSync(entityId: newVarInt(player.entityId), position: pos,
+    delta: Vector3[float64](x: 0.0, y: 0.0, z: 0.0), yaw: yaw, pitch: pitch, onGround: onGround))
+  true
+
+proc deltaOf(pos, lastPos: Vector3[float64]): Vector3[int16] =
+  Vector3[int16](x: int16(pos.x * 4096.0 - lastPos.x * 4096.0), y: int16(pos.y * 4096.0 - lastPos.y * 4096.0),
+    z: int16(pos.z * 4096.0 - lastPos.z * 4096.0))
+
+proc afterMove(player: Player; server: Server; pos, lastPos: Vector3[float64]; heightDifference: float64; onGround: bool) =
+  ## What both movement handlers do after the broadcast.
+  # Only process fall damage if player is alive
+  if not player.abilities.flying and player.health > 0.0'f32 and not player.dead:
+    player.fall(heightDifference, onGround, player.gamemode == Creative)
+  updatePosition(player, server)
+  let delta = Vector3[float64](x: pos.x - lastPos.x, y: pos.y - lastPos.y, z: pos.z - lastPos.z)
+  # Only update idle timeout if there's actual movement (vanilla threshold)
+  if delta.lengthSquared() > 1.0e-5:
+    player.updateLastActionTime()
+  player.progressMotion(delta)
+
+proc handlePosition*(self: JavaClient; player: Player; server: Server; packet: SPlayerPosition) =
+  if not player.hasClientLoaded():
+    return
+  # `has_vehicle`: no vehicles yet.
+  # Ignore movement packets while awaiting a teleport confirmation (vanilla behavior)
+  if player.awaitingTeleport.isSome:
+    return
+  # y = feet Y
+  let position = packet.position
+  if position.x != position.x or position.y != position.y or position.z != position.z:
+    self.kick(invalidMovement())
+    return
+  let pos = Vector3[float64](x: clampHorizontal(position.x), y: clampVertical(position.y), z: clampHorizontal(position.z))
+  let lastPos = player.pos
+  player.lastPos = lastPos
+  player.setPos(pos)
+
+  let heightDifference = pos.y - lastPos.y
+  let onGround = (packet.collision and FlagOnGround) != 0'u8
+  if player.onGround and not onGround and heightDifference > 0.0:
+    player.jump()
+  player.onGround = onGround
+  if onGround and player.fallFlying:
+    player.setFallFlying(false)
+  let world = player.world
+
+  # TODO upstream: Warn when player moves to quickly
+  if not syncPosition(player, world, pos, lastPos, player.yaw, player.pitch, onGround):
+    # Send the new position to all other players.
+    world.broadcastPacketExcept(player.gameprofile.id, CUpdateEntityPos(entityId: newVarInt(player.entityId),
+      delta: deltaOf(pos, lastPos), onGround: onGround))
+  afterMove(player, server, pos, lastPos, heightDifference, onGround)
+
+proc handlePositionRotation*(self: JavaClient; player: Player; server: Server; packet: SPlayerPositionRotation) =
+  if not player.hasClientLoaded():
+    return
+  # Ignore movement packets while awaiting a teleport confirmation (vanilla behavior)
+  if player.awaitingTeleport.isSome:
+    return
+  # y = feet Y
+  let position = packet.position
+  if not isFiniteF(position.x) or not isFiniteF(position.y) or not isFiniteF(position.z) or
+      not isFiniteF(packet.yaw) or not isFiniteF(packet.pitch):
+    self.kick(invalidMovement())
+    return
+  let pos = Vector3[float64](x: clampHorizontal(position.x), y: clampVertical(position.y), z: clampHorizontal(position.z))
+  let lastPos = player.pos
+  player.lastPos = lastPos
+  player.setPos(pos)
+
+  let heightDifference = pos.y - lastPos.y
+  let onGround = (packet.collision and FlagOnGround) != 0'u8
+  if player.onGround and onGround and heightDifference > 0.0:
+    player.jump()
+  player.onGround = onGround
+  player.setRotation(wrapDegrees(packet.yaw), wrapDegrees(packet.pitch))
+
+  let yaw = remEuclid(player.yaw * 256.0'f32 / 360.0'f32, 256.0'f32)
+  let pitch = remEuclid(player.pitch * 256.0'f32 / 360.0'f32, 256.0'f32)
+  let world = player.world
+  if not syncPosition(player, world, pos, lastPos, yaw, pitch, onGround):
+    # Send the new position to all other players.
+    world.broadcastPacketExcept(player.gameprofile.id, CUpdateEntityPosRot(entityId: newVarInt(player.entityId),
+      delta: deltaOf(pos, lastPos), yaw: uint8(yaw), pitch: uint8(pitch), onGround: onGround))
+  world.broadcastPacketExcept(player.gameprofile.id, CHeadRot(entityId: newVarInt(player.entityId), headYaw: uint8(yaw)))
+  afterMove(player, server, pos, lastPos, heightDifference, onGround)
+
+proc handleRotation*(self: JavaClient; player: Player; rotation: SPlayerRotation) =
+  if not player.hasClientLoaded():
+    return
+  if not isFiniteF(rotation.yaw) or not isFiniteF(rotation.pitch):
+    self.kick(invalidMovement())
+    return
+  player.onGround = rotation.ground
+  player.setRotation(wrapDegrees(rotation.yaw), wrapDegrees(rotation.pitch))
+  # Send the new position to all other players.
+  let yaw = remEuclid(player.yaw * 256.0'f32 / 360.0'f32, 256.0'f32)
+  let pitch = remEuclid(player.pitch * 256.0'f32 / 360.0'f32, 256.0'f32)
+  let world = player.world
+  world.broadcastPacketExcept(player.gameprofile.id, CUpdateEntityRot(entityId: newVarInt(player.entityId), yaw: uint8(yaw),
+    pitch: uint8(pitch), onGround: rotation.ground))
+  world.broadcastPacketExcept(player.gameprofile.id, CHeadRot(entityId: newVarInt(player.entityId), headYaw: uint8(yaw)))
+
+proc handleChatCommand*(self: JavaClient; player: Player; server: Server; command: SChatCommand) =
+  ## `handle_chat_command`. The dispatcher is src/command, not wired yet: see the PARTIAL line. The client gets told.
+  player.updateLastActionTime()
+  if server.advancedConfig.commands.logConsole:
+    echo "Player (", player.gameprofile.name, "): executed command /", command.command
+  player.sendSystemMessage(text("Unknown command: /" & command.command).colorNamed(ncRed))
+
+proc handlePlayerGround*(self: JavaClient; player: Player; ground: SSetPlayerGround) =
+  player.onGround = ground.onGround
+
+proc handlePickItemFromBlock*(self: JavaClient; player: Player; pickItem: SPickItemFromBlock) =
+  if not player.canInteractWithBlockAt(pickItem.pos, 1.0):
+    return
+  let blockRef = player.world.getBlock(pickItem.pos)
+  if blockRef.itemId == 0'u16:
+    # Invalid block id (blocks such as tall seagrass)
+    return
+  let item = Item.fromId(blockRef.itemId)
+  if item == nil:
+    return
+  let stack = newItemStack(1'u8, item)
+  let slotWithStack = player.inventory.getSlotWithStack(stack)
+  if slotWithStack != -1'i16:
+    if isValidHotbarIndex(int(slotWithStack)):
+      player.inventory.setSelectedSlot(uint8(slotWithStack))
+    else:
+      player.inventory.swapSlotWithHotbar(int(slotWithStack))
+  elif player.gamemode == Creative:
+    player.inventory.swapStackWithHotbar(stack)
+  self.writePacketFor(CSetSelectedSlot(slot: int8(player.inventory.getSelectedSlot())))
+  ScreenHandler(player.playerScreenHandler).sendContentUpdates()
+
+proc handlePickItemFromEntity*(self: JavaClient; player: Player; pickItem: SPickItemFromEntity) =
+  ## `handle_pick_item_from_entity`: no entity but a player exists yet, and players have no spawn egg.
+  discard
+
+proc handleSetCommandBlock*(self: JavaClient; player: Player; command: SSetCommandBlock) =
+  ## `handle_set_command_block`: `get_block_entity` is the later block batch, and finds nothing.
+  discard
+
+proc handleSetJigsawBlock*(self: JavaClient; player: Player; jigsaw: SSetJigsawBlock) =
+  ## `handle_set_jigsaw_block`: as `handleSetCommandBlock`.
+  discard
+
+proc handleJigsawGenerate*(self: JavaClient; player: Player; generate: SJigsawGenerate) =
+  ## `handle_jigsaw_generate`: as `handleSetCommandBlock`.
+  discard
+
+proc handlePlayerCommand*(self: JavaClient; player: Player; command: SPlayerCommand) =
+  if command.entityId.value != player.entityId:
+    return
+  if not player.hasClientLoaded():
+    return
+  player.updateLastActionTime()
+  case command.action
+  of acStartSprinting:
+    if not player.sprinting:
+      player.setSprinting(true)
+  of acStopSprinting:
+    if player.sprinting:
+      player.setSprinting(false)
+  of acLeaveBed:
+    discard  # `wake_up`: sleeping is a later batch.
+  of acStartHorseJump, acStopHorseJump, acOpenVehicleInventory:
+    discard  # Upstream's `debug!("todo")`.
+  of acStartFlyingElytra:
+    let fallFlying = not player.onGround  # `check_fall_flying`
+    if player.fallFlying != fallFlying:
+      player.setFallFlying(fallFlying)
+  of acStartSneaking, acStopSneaking:
+    # <= 1.21.5
+    discard
+
+proc handlePlayerInput*(self: JavaClient; player: Player; input: SPlayerInput) =
+  player.lastInput = input.input
+  let sneak = (input.input and PlayerInputSneak) != 0'i8
+  if sneak and player.gamemode == Spectator and player.cameraTargetId.isSome:
+    player.cameraTargetId = none[int32]()
+    self.writePacketFor(CSetCamera(cameraId: newVarInt(player.entityId)))
+  if player.sneaking != sneak:
+    player.setSneaking(sneak)
+    # Getting off a vehicle: no vehicles yet.
+
+proc handleMoveVehicle*(self: JavaClient; player: Player; server: Server; packet: SMoveVehicle) =
+  ## `handle_move_vehicle`. The vehicle half needs vehicles.
+  player.setPos(Vector3[float64](x: packet.x, y: packet.y, z: packet.z))
+  updatePosition(player, server)
+
+proc handlePaddleBoat*(self: JavaClient; player: Player; packet: SPaddleBoat) =
+  ## `handle_paddle_boat`: needs vehicles.
+  discard
+
+proc handleRecipeBookChangeSettings*(self: JavaClient; player: Player; packet: SRecipeBookChangeSettings) =
+  ## Client is updating its recipe book filter/open state; no server action needed.
+  discard
+
+proc handleRecipeBookSeenRecipe*(self: JavaClient; player: Player; packet: SRecipeBookSeenRecipe) =
+  ## Client acknowledged a recipe display; no server action needed.
+  discard
+
+proc handlePlaceRecipe*(self: JavaClient; player: Player; packet: SPlaceRecipe) =
+  ## `handle_place_recipe`: filling the grid from the recipe needs net/java/recipe_helper.rs; see the PARTIAL line. The
+  ## client is resynced, so a click does nothing rather than desyncs.
+  player.currentScreenHandler.sendContentUpdates()
+
+proc handleSwingArm*(self: JavaClient; player: Player; swingArm: SSwingArm) =
+  player.updateLastActionTime()
+  if swingArm.hand.value != 0'i32 and swingArm.hand.value != 1'i32:
+    self.kick(text("Invalid hand"))
+    return
+  # Upstream raycasts here only for `PlayerInteractEvent`, and there are no plugin events.
+  player.swingHand(Hand(swingArm.hand.value), false)
+
+proc utf16Length(s: string): int =
+  ## `encode_utf16().count()`
+  result = 0
+  var i = 0
+  while i < s.len:
+    let b = ord(s[i])
+    if b < 0x80:
+      i += 1
+      result += 1
+    elif b < 0xE0:
+      i += 2
+      result += 1
+    elif b < 0xF0:
+      i += 3
+      result += 1
+    else:
+      i += 4
+      result += 2
+
+proc validateChatMessage(self: JavaClient; server: Server; player: Player; chatMessage: SChatMessage): (bool, ChatError) =
+  ## `validate_chat_message`: runs all vanilla checks for a valid chat message.
+  # Check for oversized messages. If we're able to find the 257th UTF-16 character, the message is too big.
+  if utf16Length(chatMessage.message) > 256:
+    return (false, ceOversizedMessage)
+  # Check for illegal characters: the section sign in UTF-8, a control character or delete.
+  let m = chatMessage.message
+  for i in 0 ..< m.len:
+    let b = ord(m[i])
+    if b < 0x20 or b == 0x7F or (b == 0xC2 and i + 1 < m.len and ord(m[i + 1]) == 0xA7):
+      return (false, ceIllegalCharacters)
+  # These checks are only run in secure chat mode
+  if server.basicConfig.allowChatReports:
+    # Check for unsigned chat
+    if chatMessage.signature.isSome:
+      if chatMessage.signature.unsafeGet.len != 256:
+        return (false, ceUnsignedChat) # Signature is the wrong length
+    else:
+      return (false, ceUnsignedChat) # There is no signature
+    let now = nowUnixMs()
+    # Verify message timestamp
+    if chatMessage.timestamp > now or chatMessage.timestamp < now - ChatMessageMaxAge:
+      return (false, ceOutOfOrderChat)
+    # Verify session expiry
+    if player.chatSession.expiresAt < now:
+      return (false, ceExpiredPublicKey)
+    # Validate previous signature checksum (new in 1.21.5). The client can bypass this check by sending 0.
+    if chatMessage.checksum != 0'u8:
+      if polynomialRollingHash(player.signatureCache.lastSeen) != chatMessage.checksum:
+        return (false, ceChatValidationFailed)
+  (true, ceOversizedMessage)
+
+proc handleChatMessage*(self: JavaClient; server: Server; player: Player; chatMessage: SChatMessage) =
+  player.updateLastActionTime()
+  let gameprofile = player.gameprofile
+  let (valid, err) = self.validateChatMessage(server, player, chatMessage)
+  if not valid:
+    echo gameprofile.name, " (uuid ", $gameprofile.id, ") ", $err
+    self.kick(clientKickReason(err))
+    return
+  echo "<chat> ", gameprofile.name, ": ", chatMessage.message
+  let config = server.advancedConfig
+  let modified = modifyChatMessage(chatMessage.message, config.fun)
+  let message = if modified.isSome: modified.unsafeGet else: chatMessage.message
+  let decorated = chatDecorated(config.chat.format, gameprofile.name, message)
+  let world = player.world
+  if server.basicConfig.allowChatReports:
+    world.broadcastSecurePlayerChat(player, chatMessage.message, chatMessage.timestamp, chatMessage.salt,
+      chatMessage.signature, decorated)
+  else:
+    world.broadcastPacketAll(CSystemChatMessage(content: decorated, overlay: false))
+
+proc validateChatSession(self: JavaClient; player: Player; server: Server; session: SPlayerSession): (bool, ChatError) =
+  ## `validate_chat_session`. Upstream checks the key's signature against `mojang_public_keys`, which come from Mojang's
+  ## services over HTTP; with none of them, as upstream's own list before it has loaded, every signature fails.
+  let now = nowUnixMs()
+  if session.expiresAt < now:
+    return (false, ceInvalidPublicKey)
+  (false, ceInvalidPublicKey)
+
+proc handleChatSessionUpdate*(self: JavaClient; player: Player; server: Server; session: SPlayerSession) =
+  # Keep the chat session default if we don't want reports
+  if not server.basicConfig.allowChatReports:
+    return
+  let (valid, err) = self.validateChatSession(player, server, session)
+  if not valid:
+    echo player.gameprofile.name, " (uuid ", $player.gameprofile.id, ") ", $err
+    self.kick(clientKickReason(err))
+    return
+  # Update the chat session fields
+  player.chatSession = newChatSession(session.sessionId, session.expiresAt, session.publicKey, session.keySignature)
+
+proc handleClientInformation*(self: JavaClient; player: Player; server: Server; info: SClientInformationPlay) =
+  let (ok, config) = playerConfigFrom(info.locale, info.viewDistance, info.chatMode.value, info.chatColors,
+    info.skinParts, info.mainHand.value, info.textFiltering, info.serverListing)
+  if not ok:
+    self.kick(text("Invalid hand or chat type"))
+    return
+  if info.viewDistance <= 0'i8:
+    self.kick(text("Cannot have zero or negative view distance!"))
+    return
+  let updateWatched = player.config.viewDistance != config.viewDistance
+  let updateSettings = player.config.mainHand != config.mainHand or player.config.skinParts != config.skinParts
+  player.config = config
+  if updateWatched:
+    updatePosition(player, server)
+  if updateSettings:
+    player.sendClientInformation()
+
+proc handleClientStatus*(self: JavaClient; player: Player; clientStatus: SClientCommand) =
+  player.updateLastActionTime()
+  case clientStatus.actionId.value
+  of 0'i32:
+    # Perform respawn
+    if player.health > 0.0'f32:
+      return
+    player.world.respawnPlayer(player, false)
+    player.currentScreenHandler.syncState()
+    # Restore abilities based on gamemode after respawn
+    player.abilities.setForGamemode(player.gamemode)
+    player.sendAbilitiesUpdate()
+  of 1'i32:
+    # Request stats: `send_stats` needs entity/player/statistics.rs.
+    discard
+  else:
+    self.kick(text("Invalid client status"))
+
+proc handleAttack*(self: JavaClient; player: Player; attack: SAttack; server: Server) =
+  if not player.hasClientLoaded():
+    return
+  player.updateLastActionTime()
+  let config = server.advancedConfig.pvp
+  if not config.enabled:
+    return
+  if attack.entityId.value == player.entityId:
+    self.kick(invalidEntityAttacked())
+    return
+  let world = player.world
+  var target: nil Player = nil
+  for p in world.players:
+    if p.entityId == attack.entityId.value:
+      target = p
+  # `get_entity_by_id`: no entity but a player exists yet.
+  if target == nil:
+    self.kick(invalidEntityAttacked())
+    return
+  if target.health <= 0.0'f32:
+    return
+  if config.protectCreative and target.gamemode == Creative:
+    return
+  # `Player::attack` needs damage: see the PARTIAL line.
+
+proc handleInteract*(self: JavaClient; player: Player; packet: SInteract; server: Server) =
+  if not player.hasClientLoaded():
+    return
+  player.updateLastActionTime()
+  let entityId = packet.entityId.value
+  let sneaking = packet.sneaking
+  if player.sneaking != sneaking:
+    player.setSneaking(sneaking)
+  if packet.interactType.value < 0'i32 or packet.interactType.value > 2'i32:
+    self.kick(text("Invalid action type"))
+    return
+  let action = ActionType(packet.interactType.value)
+  var target: nil Player = nil
+  for p in player.world.players:
+    if p.entityId == entityId:
+      target = p
+  if target != nil:
+    if player.gamemode == Spectator:
+      player.cameraTargetId = some(entityId)
+      self.writePacketFor(CSetCamera(cameraId: packet.entityId))
+      return
+    case action
+    of atAttack:
+      self.handleAttack(player, SAttack(entityId: packet.entityId), server)
+    of atInteract, atInteractAt:
+      # `target.interact` and `item_registry.use_on_entity`: entity and item behaviour are later batches.
+      discard
+  elif action == atAttack:
+    echo "Player id ", player.entityId, " interacted with entity id ", entityId, ", which was not found."
+    self.kick(invalidEntityAttacked())
+
+proc updateSequence*(self: JavaClient; player: Player; sequence: int32) =
+  ## `update_sequence`
+  if sequence < 0'i32:
+    echo "Expected packet sequence >= 0"
+  self.packetSequence = max(self.packetSequence, sequence)
+
+proc syncBlockStateToClient(self: JavaClient; world: World; position: BlockPos) =
+  self.writePacketFor(CBlockUpdate(location: position, stateId: newVarInt(int32(world.getBlockStateId(position)))))
+
+proc handlePlayerAction*(self: JavaClient; player: Player; playerAction: SPlayerAction; server: Server) =
+  if not player.hasClientLoaded():
+    return
+  player.updateLastActionTime()
+  let statusValue = playerAction.status.value
+  if statusValue < 0'i32 or statusValue > 7'i32:
+    self.kick(text("Invalid status"))
+    return
+  let position = playerAction.position
+  let world = player.world
+  case Status(statusValue)
+  of stStartedDigging:
+    if not player.canInteractWithBlockAt(position, 1.0):
+      echo "Player ", player.gameprofile.name, " tried to interact with block out of reach at ", $position
+      self.updateSequence(player, playerAction.sequence.value)
+      return
+    let (blockRef, state) = world.getBlockAndState(position)
+    # A note block's note and `item_registry.can_mine`: block and item behaviour are later batches; `can_mine` is true.
+    # TODO upstream: do validation
+    # TODO upstream: Config
+    if player.gamemode == Creative:
+      # Block break & play sound
+      discard world.breakBlock(position, player, BfNotifyNeighbors or BfSkipDrops)
+      self.syncBlockStateToClient(world, position)
+      self.updateSequence(player, playerAction.sequence.value)
+      return
+    player.startMiningTime = player.tickCounter
+    if not state.isAir():
+      let speed = player.calcBlockBreaking(state, blockRef)
+      # Instant break
+      if speed >= 1.0'f32:
+        let canHarvest0 = player.canHarvest(state, blockRef)
+        let newState = world.breakBlock(position, player, BfNotifyNeighbors)
+        if newState.isSome:
+          player.applyToolDamageForBlockBreak(state)
+          if canHarvest0:
+            player.addExhaustion(MineBlockExhaustion)
+        self.syncBlockStateToClient(world, position)
+      else:
+        player.mining = true
+        player.miningPos = position
+        let progress = int32(speed * 10.0'f32)
+        world.setBlockBreaking(player, position, progress)
+        player.currentBlockDestroyStage = progress
+    self.updateSequence(player, playerAction.sequence.value)
+  of stCancelledDigging:
+    if not player.canInteractWithBlockAt(position, 1.0):
+      echo "Player ", player.gameprofile.name, " tried to interact with block out of reach at ", $position
+      self.updateSequence(player, playerAction.sequence.value)
+      return
+    player.mining = false
+    world.setBlockBreaking(player, position, -1'i32)
+    self.updateSequence(player, playerAction.sequence.value)
+  of stFinishedDigging:
+    # TODO upstream: do validation
+    if not player.canInteractWithBlockAt(position, 1.0):
+      echo "Player ", player.gameprofile.name, " tried to interact with block out of reach at ", $position
+      self.updateSequence(player, playerAction.sequence.value)
+      return
+    # Block break & play sound
+    player.mining = false
+    world.setBlockBreaking(player, position, -1'i32)
+    let (blockRef, state) = world.getBlockAndState(position)
+    let blockDrop = player.gamemode != Creative and player.canHarvest(state, blockRef)
+    let flags = if blockDrop: BfNotifyNeighbors else: BfSkipDrops or BfNotifyNeighbors
+    let newState = world.breakBlock(position, player, flags)
+    if newState.isSome:
+      player.applyToolDamageForBlockBreak(state)
+      if blockDrop:
+        player.addExhaustion(MineBlockExhaustion)
+    self.syncBlockStateToClient(world, position)
+    self.updateSequence(player, playerAction.sequence.value)
+  of stDropItem:
+    player.dropHeldItem(false)
+  of stDropItemStack:
+    player.dropHeldItem(true)
+  of stReleaseItemInUse:
+    discard  # `item_in_use` and `on_stopped_using`: item behaviour is a later batch.
+  of stSwapItem:
+    player.swapItem()
+  of stSpearJab:
+    discard  # Upstream's `debug!("todo")`.
+
 proc handleKeepAlive*(self: JavaClient; player: Player; keepAlive: keep_alive.SKeepAlive) =
   if self.waitForKeepAlive and keepAlive.keepAliveId == self.keepAliveId:
     let ping = uint32(nowMs() - self.lastKeepAliveTime)
@@ -34,41 +622,319 @@ proc handleKeepAlive*(self: JavaClient; player: Player; keepAlive: keep_alive.SK
   else:
     self.kick(translate(tr.JAVA_DISCONNECT_TIMEOUT))
 
+proc handlePlayerAbilities*(self: JavaClient; player: Player; packet: SPlayerAbilities) =
+  # Set the flying ability
+  let newFlying = (packet.flags and 0x02'i8) != 0'i8 and player.abilities.allowFlying
+  if player.abilities.flying != newFlying:
+    if newFlying:
+      player.fallDistance = 0.0'f32
+    player.abilities.flying = newFlying
+
+proc handlePlayPingRequest*(self: JavaClient; request: SPlayPingRequest) =
+  self.writePacketFor(CPingResponse(payload: request.payload))
+
+proc faceFrom(value: int32): (bool, BlockDirection) =
+  ## `BlockDirection::try_from`
+  case value
+  of 0'i32: (true, BlockDirection.Down)
+  of 1'i32: (true, BlockDirection.Up)
+  of 2'i32: (true, BlockDirection.North)
+  of 3'i32: (true, BlockDirection.South)
+  of 4'i32: (true, BlockDirection.West)
+  of 5'i32: (true, BlockDirection.East)
+  else: (false, BlockDirection.Down)
+
+proc handleUseItemOn*(self: JavaClient; player: Player; useItemOn: SUseItemOn; server: Server): (bool, BlockPlacingError) =
+  ## `handle_use_item_on`. `call_use_item_on` is `use_with_item` and `on_use`, block behaviour, which is `Pass` for every
+  ## block for now, and `item_registry.use_on_block` likewise: see block_place.aowl.
+  result = (true, bpBlockOutOfReach)
+  if not player.hasClientLoaded():
+    return
+  player.updateLastActionTime()
+  self.updateSequence(player, useItemOn.sequence.value)
+  let position = useItemOn.position
+
+  if not player.canInteractWithBlockAt(position, 1.0):
+    # TODO upstream: maybe log?
+    return (false, bpBlockOutOfReach)
+  let (faceOk, face) = faceFrom(useItemOn.face.value)
+  if not faceOk:
+    return (false, bpInvalidBlockFace)
+  if useItemOn.hand.value != 0'i32 and useItemOn.hand.value != 1'i32:
+    return (false, bpInvalidHand)
+  let mainHand = useItemOn.hand.value == 0'i32
+  if player.gamemode == Spectator:
+    # TODO upstream: openMenu
+    return
+
+  let slotIndex = if mainHand: int(player.inventory.getSelectedSlot()) else: OffHandSlot
+  var stack = if mainHand: player.inventory.heldItem() else: player.inventory.offHandItem()
+  if stack.isEmpty():
+    # TODO upstream: item cool down
+    # If the hand is empty we stop here
+    return
+  let before = stack
+
+  # Check if the item is a block, because not every item can be placed :D
+  var shouldTryDecrement = false
+  let placed = Block.fromItemId(stack.item.id)
+  if placed != nil:
+    # `run_is_block_place`
+    let outcome = placeBlock(player, placed, useItemOn, position, face)
+    if not outcome.ok:
+      case outcome.error
+      of bpeInvalidGamemode: return (false, bpInvalidGamemode)
+      of bpeBlockOutOfWorld: return (false, bpBlockOutOfWorld)
+    if outcome.placed:
+      self.writePacketFor(CBlockUpdate(location: outcome.position, stateId: newVarInt(int32(outcome.newState))))
+      shouldTryDecrement = true
+
+  if shouldTryDecrement:
+    # TODO upstream: Config
+    # Decrease block count
+    if player.gamemode != Creative:
+      stack.decrement(1'u8)
+
+  if mainHand:
+    player.inventory.setHeldItem(stack)
+  else:
+    player.inventory.setOffHandItem(stack)
+
+  if not stack.areEqual(before):
+    player.syncHandSlot(slotIndex, stack)
+
+proc handleSignUpdate*(self: JavaClient; player: Player; signData: SUpdateSign) =
+  ## `handle_sign_update`: `get_block_entity` is the later block batch, and finds nothing.
+  discard
+
+proc prepareHandItemForUse(player: Player; mainHand: bool) =
+  ## `prepare_hand_item_for_use`: the equippable half. Food and the use cooldown need status effects, `set_active_hand`
+  ## and cooldowns, a later batch: see the PARTIAL line.
+  var held = if mainHand: player.inventory.heldItem() else: player.inventory.offHandItem()
+  let (hasEquippable, equippable) = held.getDataComponent(EquippableImpl)
+  if not hasEquippable:
+    return
+  let slot = equippable.slot
+  # Skip if the item is already in the target equipment slot.
+  if (mainHand and slot == esMainHand) or (not mainHand and slot == esOffHand):
+    return
+  # If it can be equipped we want to make sure we can actually equip it
+  player.asInventoryPlayer().enqueueEquipmentChange(slot, held)
+  let equipped = player.equipment.get(slot)
+  if equipped.isEmpty():
+    discard player.equipment.put(slot, held)
+    held.decrementUnlessCreative(player.gamemode, 1'u8)
+  else:
+    discard player.equipment.put(slot, held)
+    held = equipped
+  if mainHand:
+    player.inventory.setHeldItem(held)
+  else:
+    player.inventory.setOffHandItem(held)
+  player.currentScreenHandler.sendContentUpdates()
+
+proc handleUseItem*(self: JavaClient; player: Player; useItem: SUseItem; server: Server) =
+  ## `handle_use_item`, up to `item_registry.on_use`: see the PARTIAL line.
+  if not player.hasClientLoaded():
+    return
+  player.updateLastActionTime()
+  if useItem.hand.value != 0'i32 and useItem.hand.value != 1'i32:
+    self.kick(text("InvalidHand"))
+    return
+  self.updateSequence(player, useItem.sequence.value)
+  prepareHandItemForUse(player, useItem.hand.value == 0'i32)
+
+proc handleSetHeldItem*(self: JavaClient; player: Player; held: SSetHeldItem) =
+  player.updateLastActionTime()
+  let slot = held.slot
+  if slot < 0'i16 or slot > 8'i16:
+    self.kick(text("Invalid held slot"))
+    return
+  player.inventory.setSelectedSlot(uint8(slot))
+  player.sendEquipmentChanges([(esMainHand, player.inventory.heldItem())])
+
+proc handleSetCreativeSlot*(self: JavaClient; player: Player; packet: SSetCreativeSlot): bool =
+  ## `handle_set_creative_slot`. False is `InventoryError::PermissionError`.
+  if player.gamemode != Creative:
+    return false
+  let isNegative = packet.slot < 0'i16
+  let validSlot = packet.slot >= 1'i16 and int(packet.slot) <= 45
+  let itemStack = fromSerializer(packet.clickedItem)
+  let isLegal = itemStack.isEmpty() or itemStack.itemCount <= itemStack.getMaxStackSize()
+  if validSlot and isLegal:
+    let handler = player.playerScreenHandler
+    let slotIndex = int(packet.slot)
+    let isArmorEquipped = handler.getSlot(slotIndex).getStack().areEqual(itemStack)
+    if not isArmorEquipped:
+      if packet.slot >= 5'i16 and packet.slot < 9'i16:
+        let equipmentSlot = case packet.slot
+          of 5'i16: esHead
+          of 6'i16: esChest
+          of 7'i16: esLegs
+          else: esFeet
+        player.asInventoryPlayer().enqueueEquipmentChange(equipmentSlot, itemStack)
+      elif packet.slot >= 36'i16 and packet.slot < 45'i16:
+        if int(player.inventory.getSelectedSlot()) == slotIndex - 36:
+          player.sendEquipmentChanges([(esMainHand, itemStack)])
+    handler.getSlot(slotIndex).setStack(itemStack)
+    ScreenHandler(handler).setReceivedStack(slotIndex, itemStack)
+    ScreenHandler(handler).sendContentUpdates()
+  elif isNegative and isLegal:
+    # Item drop
+    player.asInventoryPlayer().dropItem(itemStack, false)
+  true
+
 proc handleChunkBatch*(self: JavaClient; player: Player; packet: SChunkBatch) =
   player.chunkManager.handleAcknowledge(packet.chunksPerTick)
 
-proc handleClientInformation*(self: JavaClient; player: Player; server: Server; info: SClientInformationPlay) =
-  if info.viewDistance <= 0'i8:
-    self.kick(text("Cannot have zero or negative view distance!"))
+proc handleCloseContainer*(self: JavaClient; player: Player) =
+  player.onHandledScreenClosed()
+
+proc handleCommandSuggestion*(self: JavaClient; player: Player; packet: SCommandSuggestion) =
+  ## `handle_command_suggestion`. The dispatcher's `suggest` is src/command, so it answers with none.
+  if packet.command.len < 1:
     return
-  let (ok, config) = playerConfigFrom(info.locale, info.viewDistance, info.chatMode.value, info.chatColors,
-    info.skinParts, info.mainHand.value, info.textFiltering, info.serverListing)
-  if not ok:
-    self.kick(text("Invalid hand or chat type"))
+  let cmd = packet.command[1 .. packet.command.len - 1]
+  var lastWordStart = -1
+  for i in 0 ..< cmd.len:
+    if cmd[i] == ' ' or cmd[i] == '\t':
+      lastWordStart = i
+  if lastWordStart < 0:
     return
-  let updateWatched = player.config.viewDistance != config.viewDistance
-  let updateSettings = player.config.mainHand != config.mainHand or player.config.skinParts != config.skinParts
-  player.config = config
-  if updateSettings:
-    player.sendClientInformation()
-  if updateWatched:
-    updatePosition(player, server)
+  self.writePacketFor(CCommandSuggestions(id: packet.id, start: newVarInt(int32(lastWordStart + 2)),
+    length: newVarInt(int32(cmd.len - lastWordStart - 1)), matches: @[]))
 
-proc moved(player: Player; server: Server; position: Vector3[float64]) =
-  if player.awaitingTeleport.isSome:
-    return  # The client has not seen the teleport yet, so what it says now is stale.
-  player.lastPos = player.pos
-  let oldChunk = player.chunkPos
-  player.setPos(position)
-  if oldChunk.x != player.chunkPos.x or oldChunk.y != player.chunkPos.y:
-    updatePosition(player, server)
+proc handleCookieResponse*(self: JavaClient; packet: SCookieResponse) =
+  ## TODO upstream: allow plugins to access this
+  discard
 
-proc handlePosition*(self: JavaClient; player: Player; server: Server; packet: SPlayerPosition) =
-  moved(player, server, packet.position)
+proc sendSignPacket*(self: JavaClient; blockPosition: BlockPos; isFrontText: bool) =
+  ## `send_sign_packet`
+  self.writePacketFor(COpenSignEditor(location: blockPosition, isFrontText: isFrontText))
 
-proc handlePositionRotation*(self: JavaClient; player: Player; server: Server; packet: SPlayerPositionRotation) =
-  moved(player, server, packet.position)
-  player.setRotation(packet.yaw, packet.pitch)
+proc handleSelectTrade*(self: JavaClient; player: Player; packet: SSelectTrade) =
+  ## `handle_select_trade`: a merchant is an entity, a later batch.
+  discard
 
-proc handleRotation*(self: JavaClient; player: Player; packet: SPlayerRotation) =
-  player.setRotation(packet.yaw, packet.pitch)
+proc handleSeenAdvancement*(self: JavaClient; player: Player; packet: SSeenAdvancement) =
+  ## `handle_seen_advancement`: needs entity/player/advancement.rs.
+  discard
+
+proc handleBundleItemSelected*(self: JavaClient; player: Player; packet: SBundleItemSelected) =
+  if not player.hasClientLoaded():
+    return
+  player.updateLastActionTime()
+  let selectedItemIndex = packet.selectedItemIndex.value
+  if selectedItemIndex < 0'i32 and selectedItemIndex != -1'i32:
+    self.kick(text("Invalid selected item index"))
+
+proc handleTeleportToEntity*(self: JavaClient; player: Player; packet: STeleportToEntity; server: Server) =
+  if not player.hasClientLoaded():
+    return
+  player.updateLastActionTime()
+  if player.gamemode != Spectator:
+    return
+  for world in server.worlds:
+    for target in world.players:
+      if target.gameprofile.id == packet.target:
+        player.cameraTargetId = some(target.entityId)
+        self.writePacketFor(CSetCamera(cameraId: newVarInt(target.entityId)))
+        player.requestTeleport(target.pos, target.yaw, target.pitch)
+        return
+
+proc handleTestInstanceBlockAction*(self: JavaClient; player: Player; packet: STestInstanceBlockAction) =
+  if not player.hasClientLoaded():
+    return
+  player.updateLastActionTime()
+
+proc handleSetTestBlock*(self: JavaClient; player: Player; packet: SSetTestBlock) =
+  if not player.hasClientLoaded():
+    return
+  player.updateLastActionTime()
+
+proc handleDebugSubscriptionRequest*(self: JavaClient; player: Player; sampleType: int32) =
+  if player.permissionLvl >= Two and sampleType == 0'i32:
+    player.subscribedDebugSample = true
+
+proc handleDebugSampleSubscription*(self: JavaClient; player: Player; sampleType: int32) =
+  if player.permissionLvl >= Two and sampleType == 0'i32:
+    player.subscribedDebugSample = true
+
+proc onSlotClick*(player: Player; packet: SClickSlot) =
+  ## `Player::on_slot_click`
+  player.updateLastActionTime()
+  let handler = player.currentScreenHandler
+  let b = handler.getBehaviour()
+  let syncId = b.syncId
+  let containerSlots = b.containerSlots
+  let allowGrabItems = b.allowGrabItems
+  let allowPutItems = b.allowPutItems
+  if int32(syncId) != packet.syncId.value:
+    return
+  if player.gamemode == Spectator:
+    handler.syncState()
+    return
+  if not handler.canUse(player.asInventoryPlayer()):
+    echo "Player ", player.gameprofile.name, " interacted with invalid menu"
+    return
+  let slotIndex = packet.slot
+  if not handler.isSlotValid(int32(slotIndex)):
+    echo "Player ", player.gameprofile.name, " clicked invalid slot index: ", slotIndex, ", available slots: ", b.slots.len
+    return
+
+  # Enforce flags
+  let isContainerSlot = slotIndex >= 0'i16 and int(slotIndex) < containerSlots
+  var cancelled = false
+  case packet.mode
+  of satPickup:
+    let cursorEmpty = b.cursorStack.isEmpty()
+    if isContainerSlot:
+      if not cursorEmpty and not allowPutItems:
+        cancelled = true
+      if cursorEmpty and not allowGrabItems:
+        cancelled = true
+  of satQuickMove:
+    if isContainerSlot and not allowGrabItems:
+      cancelled = true
+    if not isContainerSlot and not allowPutItems:
+      cancelled = true
+  of satSwap:
+    if isContainerSlot and (not allowGrabItems or not allowPutItems):
+      cancelled = true
+  of satThrow:
+    if isContainerSlot and not allowGrabItems:
+      cancelled = true
+  of satQuickCraft:
+    if not allowPutItems:
+      cancelled = true
+  of satPickupAll:
+    if not allowGrabItems:
+      cancelled = true
+  of satClone:
+    discard
+  if cancelled:
+    handler.cancel()
+    return
+
+  let notInSync = packet.revision.value != int32(b.revision)
+  handler.disableSync()
+  handler.onSlotClick(int32(slotIndex), int32(packet.button), packet.mode, player.asInventoryPlayer())
+  for changed in packet.arrayOfChangedSlots:
+    handler.setReceivedHash(int(changed[0]), changed[1])
+  handler.setReceivedCursorHash(packet.carriedItem)
+  handler.enableSync()
+  if notInSync:
+    handler.updateToClient()
+  else:
+    handler.sendContentUpdates()
+
+proc onContainerButtonClick*(player: Player; packet: SContainerButtonClick) =
+  ## `Player::on_container_button_click`
+  let handler = player.currentScreenHandler
+  if int32(handler.syncId()) != packet.windowId.value:
+    return
+  discard handler.onButtonClick(player.asInventoryPlayer(), packet.buttonId.value)
+
+proc onRenameItem*(player: Player; packet: SRenameItem) =
+  ## `Player::on_rename_item`: an anvil's rename needs a way to open one, which is block behaviour.
+  player.updateLastActionTime()

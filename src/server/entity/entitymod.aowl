@@ -1,0 +1,3847 @@
+## Port of pumpkin/src/entity/mod.rs
+## Port of pumpkin/src/entity/living.rs
+## Port of pumpkin/src/entity/effect/mod.rs
+## PARTIAL: pumpkin/src/entity/mod.rs - no portals (`tick_portal`, `try_use_portal`, `PortalProcessor`: pumpkin/src/world/portal is not ported; `portalCooldown` is kept and ticks down), no Bedrock half of any packet. Block behaviour runs through `gBlockHooks`, which pumpkin/src/block's adapter fills.
+## PARTIAL: pumpkin/src/entity/living.rs - statistics and advancements go through `gPlayerHooks`, no-ops until entity/player/statistics.rs and advancement.rs are ported; drop_loot runs through `gLootHook` (pumpkin/src/world/loot is not ported to this signature); the entity half of `drop_item` for a player needs the hook listed in src/server/entity/README.md.
+##
+## The entity half of pumpkin/src/world/mod.rs also lives here, because src/server/serverbase.aowl's `World` cannot name
+## `EntityBase` without a cycle: `spawn_entity`, `remove_entity`, `get_entity_by_id`, `get_entities_at_box`,
+## `get_block_collisions`, `is_space_empty`, `get_fluid_and_fluid_state`, `get_fluid_velocity`, `check_collision`,
+## `get_dismount_height`, `play_sound`, `send_entity_status`, `spawn_particle`, and the entity half of `tick` as
+## `tickEntities`. A world's entity list is keyed off the `World` in a table.
+##
+## THE SHAPE, which entity/ai, entity/mob, passive, boss, vehicle and decoration build on:
+##
+##   `EntityBase` is `dyn EntityBase`: a `ref object of RootObj` with `vt` (every trait method, a closure taking `self`)
+##   and direct `entity`, `living` and `player` fields for `get_entity`, `get_living_entity`, `get_player`.
+##
+##   A concrete type derives from it and shares one vtable per type, made once at module level:
+##
+##     type SnowballEntity* = ref object of EntityBase
+##       thrown*: ThrownItemEntity
+##     let snowballVt = newEntityVt()         # or copyVt(livingVt()) for something alive
+##     snowballVt.tick = proc(self, caller: EntityBase; server: Server) {.closure.} = ...
+##     let s = SnowballEntity(vt: snowballVt, entity: entity, thrown: ...)  # `vt` and `entity` are required
+##     entity.base = s                        # `initEntityBase` for a value you already have
+##
+##   Inside a closure, `let s = SnowballEntity(self)` gets back the derived type; `self of SnowballEntity` tests it,
+##   which is `cast_any` + `downcast_ref`. Call a trait method as `base.tick(caller, server)`: the procs below dispatch.
+##
+##   Entity carries a `base` back pointer. Upstream's `Entity` also implements `EntityBase` with the trait's defaults, so
+##   `self.get_living_entity()` *on an `Entity`* is `None` there. Those few upstream call sites keep that meaning here
+##   (see `slowMovement`), rather than quietly starting to work.
+##
+## Everything is a plain field: one thread ticks everything. `Arc<Mutex<ItemStack>>` handles do not exist; a slot is read
+## with `get` and written back with `put`.
+
+{.feature: "untyped".}
+
+import std/[assertions, math, options, tables, syncio]
+import ../../data/block_ext
+from ../../data/block_state import newBlockStateIdUnchecked, asU16, isAir, isSolid, isFullCube, isSideSolid, BlockState,
+  BlockStateId
+import "../../data/item_stack/mod"
+import ../../data/item_stack/categories
+import ../../generated/[entity_type, fluid, particle, sound, sound_category, sound_id_remap, tag, tracked_data,
+  meta_data_type, potion, damage_type, entity_pose, enchantment, statistic]
+from ../../generated/attributes import Attribute, ARMOR, ARMOR_TOUGHNESS, MAX_HEALTH, MAX_ABSORPTION, MOVEMENT_SPEED, WATER_MOVEMENT_EFFICIENCY,
+  SAFE_FALL_DISTANCE, JUMP_STRENGTH, GRAVITY, KNOCKBACK_RESISTANCE, STEP_HEIGHT, FOLLOW_RANGE, ATTACK_DAMAGE
+import ../../generated/entity_status as entitystatusdata
+import ../../inventory/[entity_equipment, player_inventory, stackbridge]
+import ../../inventory/lib as inventorylib
+import ../../nbt/tag as nbttag
+import ../../protocol/java/client/play/[entity_metadata, entity_position_sync, entity_status, entity_velocity, head_rot,
+  remove_entities, remove_mob_effect, set_entity_link, set_passengers, sound_effect, spawn_entity, take_item,
+  update_attributes, update_entity_pos, update_entity_pos_rot, update_entity_rot, update_mob_effect, damage_event,
+  hurt_animation, set_equipment, set_player_inventory, entity_animation, particle, player_position]
+import ../../protocol/itemstackserializer
+import ../../protocol/proto
+import ../../util/gamemode
+import ../../util/math/boundingbox
+import ../../util/math/mathmod
+import ../../util/math/position
+import ../../util/math/rustnum
+import ../../util/text/text
+import ../../util/text/textbase
+import ../serverbase
+import ../net/netbase
+import ../net/winsock
+import ../world/chunker
+import ../world/worldmod
+import ../entity/player as playermod
+import attributes as entityattributes
+
+export entityattributes, boundingbox, position, entity_type, damage_type, entity_pose, potion, serverbase, worldmod, rustnum, nbttag
+
+const
+  MaxScoreboardTags* = 1024
+  MaxFrozenTicks* = 140'i32      ## `Entity::MAX_FROZEN_TICKS`
+  FreezeDamageInterval = 40'i32  ## `Entity::FREEZE_DAMAGE_INTERVAL`
+  LeashSnapDistance* = 12.0'f64
+  LeashElasticDistance* = 6.0'f64
+  DefaultEquipmentDropChance* = 0.085'f32  ## From vanilla `Mob.DEFAULT_EQUIPMENT_DROP_CHANCE`: entity/mob/equipment.rs.
+  UsingItemFlag = 1'u8
+  OffHandActiveFlag = 2'u8
+  EmptyPos = BlockPos(vec: Vector3[int32](x: 0'i32, y: 0'i32, z: 0'i32))
+
+type
+  RemovalReason* = enum
+    rrKilled, rrDiscarded, rrUnloadedToChunk, rrUnloadedWithPlayer, rrChangedDimension
+
+  EntityFlag* = enum
+    ## `Flag`.
+    flagOnFire = 0, flagSneaking = 1, flagSprinting = 3, flagSwimming = 4, flagInvisible = 5, flagGlowing = 6,
+    flagFallFlying = 7
+
+  ProjectileHitKind* = enum
+    phBlock, phEntity
+
+  ProjectileHit* = object
+    ## `ProjectileHit` in entity/projectile/mod.rs. It sits here because `EntityBase::on_hit` names it.
+    hitPos*: Vector3[float64]
+    normal*: Vector3[float64]
+    case kind*: ProjectileHitKind
+    of phBlock:
+      pos*: BlockPos
+      face*: BlockDirection
+    of phEntity:
+      entity*: EntityBase
+
+  EntityVt* = ref object
+    ## `trait EntityBase`, one closure per overridable method. Defaults are in `newEntityVt`.
+    tick*: proc(self, caller: EntityBase; server: Server) {.closure.}
+    getJobSitePos*: proc(self: EntityBase): Option[BlockPos] {.closure.}
+    getHomePos*: proc(self: EntityBase): Option[BlockPos] {.closure.}
+    getEyePos*: proc(self: EntityBase): Vector3[float64] {.closure.}
+    initDataTracker*: proc(self: EntityBase) {.closure.}
+    setVariantName*: proc(self: EntityBase; name: string) {.closure.}
+    teleport*: proc(self: EntityBase; position: Vector3[float64]; yaw, pitch: Option[float32]; world: World) {.closure.}
+    isPushedByFluids*: proc(self: EntityBase): bool {.closure.}
+    isImmuneToExplosion*: proc(self: EntityBase): bool {.closure.}
+    getGravity*: proc(self: EntityBase): float64 {.closure.}
+    tickInVoid*: proc(self, dynSelf: EntityBase) {.closure.}
+    damage*: proc(self, caller: EntityBase; amount: float32; damageType: DamageType): bool {.closure.}
+    isSpectator*: proc(self: EntityBase): bool {.closure.}
+    isCollidable*: proc(self: EntityBase; entity: nil EntityBase): bool {.closure.}
+    canHit*: proc(self: EntityBase): bool {.closure.}
+    isFlutterer*: proc(self: EntityBase): bool {.closure.}
+    getYVelocityDrag*: proc(self: EntityBase): Option[float64] {.closure.}
+    damageWithContext*: proc(self, caller: EntityBase; amount: float32; damageType: DamageType;
+      position: Option[Vector3[float64]]; source, cause: nil EntityBase): bool {.closure.}
+    interact*: proc(self: EntityBase; player: Player; itemStack: var ItemStack): bool {.closure.}
+    setOnFireFor*: proc(self: EntityBase; seconds: float32) {.closure.}
+    setOnFireForTicks*: proc(self: EntityBase; ticks: uint32) {.closure.}
+    onPlayerCollision*: proc(self: EntityBase; player: Player) {.closure.}
+    moveEntity*: proc(self, caller: EntityBase; motion: Vector3[float64]) {.closure.}
+    isPushable*: proc(self: EntityBase): bool {.closure.}
+    push*: proc(self, entity: EntityBase) {.closure.}
+    pushEntities*: proc(self, dynSelf: EntityBase): bool {.closure.}
+    onHit*: proc(self: EntityBase; hit: ProjectileHit) {.closure.}
+    setPaddleState*: proc(self: EntityBase; left, right: bool) {.closure.}
+    isInLove*: proc(self: EntityBase): bool {.closure.}
+    isBreedingReady*: proc(self: EntityBase): bool {.closure.}
+    resetLove*: proc(self: EntityBase) {.closure.}
+    setBreedingCooldown*: proc(self: EntityBase; ticks: int32) {.closure.}
+    isPanicking*: proc(self: EntityBase): bool {.closure.}
+    getName*: proc(self: EntityBase): TextComponent {.closure.}
+    getDisplayName*: proc(self: EntityBase): TextComponent {.closure.}
+    kill*: proc(self, caller: EntityBase) {.closure.}
+    getExperienceReward*: proc(self: EntityBase; killer: nil EntityBase): uint32 {.closure.}
+    getBaseExperienceReward*: proc(self: EntityBase): uint32 {.closure.}
+    writeNbt*: proc(self: EntityBase; nbt: var NbtCompound) {.closure.}
+    readNbt*: proc(self: EntityBase; nbt: NbtCompound) {.closure.}
+
+  EntityBase* = ref object of RootObj
+    ## `dyn EntityBase`. See the note at the top of this file.
+    vt*: EntityVt
+    entity*: Entity
+    living*: nil LivingEntity
+    player*: nil Player
+
+  Entity* = ref object
+    ## `Entity`.
+    base*: nil EntityBase            ## This entity's `dyn EntityBase`.
+    entityId*: int32
+    entityUuid*: Uuid
+    entityType*: EntityType
+    world*: World
+    pos*: Vector3[float64]
+    lastPos*: Vector3[float64]
+    movement*: Vector3[float64]
+    blockPos*: BlockPos
+    supportingBlockPos*: Option[BlockPos]
+    chunkPos*: Vector2[int32]
+    sneaking*, sprinting*, swimming*, invisible*, glowing*, fallFlying*: bool
+    velocity*: Vector3[float64]
+    horizontalCollision*: bool
+    onGround*: bool
+    touchingWater*: bool
+    waterHeight*: float64
+    touchingLava*: bool
+    lavaHeight*: float64
+    yaw*, headYaw*, bodyYaw*, pitch*: float32
+    pose*: EntityPose
+    boundingBox*: BoundingBox
+    entityDimension*: EntityDimensions
+    invulnerable*: bool
+    damageImmunities*: seq[DamageType]
+    fireImmune*: bool
+    fireTicks*: int32
+    hasVisualFire*: bool
+    frozenTicks*: int32
+    isInPowderSnow*: bool
+    wasInPowderSnow*: bool
+    removalReason*: Option[RemovalReason]
+    passengers*: seq[EntityBase]
+    vehicle*: nil EntityBase
+    leashedTo*: nil EntityBase
+    ridingCooldown*: int32
+    age*: int32                      ## Ticks. Negative values indicate a baby.
+    currentBiome*: int               ## `get_rough_biome`'s index.
+    lastBiomeUpdatePos*: BlockPos
+    portalCooldown*: uint32
+    customName*: Option[TextComponent]
+    customNameVisible*: bool
+    scoreboardTags*: seq[string]
+    data*: int32                     ## What the spawn packet sends.
+    flags*: int8
+    noClip*: bool
+    movementMultiplier*: Vector3[float64]
+    velocityDirty*: bool
+    removed*: bool
+    lastSentYaw*, lastSentPitch*, lastSentHeadYaw*: uint8
+    lastSentPos*: Vector3[float64]
+
+  LivingEntity* = ref object
+    ## `LivingEntity`.
+    entity*: Entity
+    hurtCooldown*: int32
+    lastDamageTaken*: float32
+    health*: float32
+    absorption*: float32
+    itemUseTime*: int32
+    itemInUse*: Option[ItemStack]
+    activeHand*: Option[netbase.Hand]
+    deathTime*: uint8
+    dead*: bool
+    fallDistance*: float32
+    activeEffects*: seq[Effect]      ## At most one per `StatusEffect`.
+    entityEquipment*: EntityEquipment
+    equipmentDropChances*: Table[int, float32]  ## By `ord(EquipmentSlot)`.
+    movementInput*: Vector3[float64]
+    equipmentSlots*: EquipmentSlots
+    jumping*: bool
+    jumpingCooldown*: uint8
+    climbing*: bool
+    climbingPos*: Option[BlockPos]
+    lastAttackerId*: int32
+    lastAttackedTime*: int32
+    lastAttackingId*: int32
+    lastAttackTime*: int32
+    waterMovementSpeedMultiplier*: float32
+    livingsFlags*: uint8
+    attributes*: Table[uint8, AttributeInstance]
+
+  BlockHooks* = ref object
+    ## The calls into `world.block_registry`. pumpkin/src/block's adapter fills these; the defaults are what a block
+    ## with no behaviour does.
+    onEntityCollision*: proc(blockRef: Block; world: World; entity: EntityBase; position: BlockPos; state: BlockState;
+      server: Server) {.closure.}
+    onEntityCollisionFluid*: proc(fluid: Fluid; entity: EntityBase) {.closure.}
+    onEntityStep*: proc(blockRef: Block; world: World; entity: EntityBase; position: BlockPos; state: BlockState;
+      belowSupportingBlock: bool) {.closure.}
+    updateEntityMovementAfterFallOn*: proc(blockRef: Block; entity: EntityBase) {.closure.}
+    getInsideCollisionShape*: proc(blockRef: Block; world: World; state: BlockState; position: BlockPos): BoundingBox {.closure.}
+    onLandedUpon*: proc(blockRef: Block; world: World; fallDistance: float32; entity: EntityBase): bool {.closure.}
+      ## True when the block has a behaviour and handled it: `get_pumpkin_block` was `Some`.
+
+  PlayerHooks* = ref object
+    ## What living.rs asks of `Player` beyond src/server/entity/player.aowl. The gameplay core fills these.
+    incrementStat*: proc(player: Player; category: StatisticCategory; id, amount: int32) {.closure.}
+    setStat*: proc(player: Player; category: StatisticCategory; id, value: int32) {.closure.}
+    triggerAdvancement*: proc(player: Player; trigger, argument: string) {.closure.}
+    startCooldown*: proc(player: Player; group: string; ticks: int32) {.closure.}
+    handleKilled*: proc(player: Player; deathMessage: TextComponent) {.closure.}
+    getOffGroundSpeed*: proc(player: Player): float64 {.closure.}
+    getSupportingBlockPos*: proc(player: Player): Option[BlockPos] {.closure.}
+    experiencePickUpDelay*: proc(player: Player): uint32 {.closure.}
+    setExperiencePickUpDelay*: proc(player: Player; delay: uint32) {.closure.}
+    applyMendingFromXp*: proc(player: Player; amount: int32): int32 {.closure.}
+    addExperiencePoints*: proc(player: Player; amount: int32) {.closure.}
+
+  LootContextParams* = object
+    ## `LootContextParameters`, as far as `on_death` fills it.
+    killedByPlayer*: Option[bool]
+    thisEntity*: Option[EntityType]
+    killerEntity*: Option[EntityType]
+    directKillerEntity*: Option[EntityType]
+    position*: Option[Vector3[float64]]
+    worldTime*: uint64
+    damageType*: Option[DamageType]
+    tool*: Option[ItemStack]
+    isRaining*: Option[bool]
+    isThundering*: Option[bool]
+    isOnFire*: Option[bool]
+
+  WorldEntities* = ref object
+    entities*: seq[EntityBase]
+
+var gBlockHooks* = BlockHooks()
+var gPlayerHooks* = PlayerHooks()
+
+var gDropStack*: proc(world: World; position: BlockPos; stack: ItemStack) {.closure.} =
+  proc(world: World; position: BlockPos; stack: ItemStack) {.closure.} = echo "drop_stack: entity/item.aowl is not imported"
+  ## `World::drop_stack`. item.aowl sets it when imported: `ItemEntity` builds on this module.
+var gScatterStack*: proc(world: World; x, y, z: float64; stack: ItemStack) {.closure.} =
+  proc(world: World; x, y, z: float64; stack: ItemStack) {.closure.} = echo "scatter_stack: entity/item.aowl is not imported"
+var gSpawnExperienceOrb*: proc(world: World; position: Vector3[float64]; amount: uint32) {.closure.} =
+  proc(world: World; position: Vector3[float64]; amount: uint32) {.closure.} = echo "ExperienceOrbEntity::spawn: entity/experienceorb.aowl is not imported"
+  ## `ExperienceOrbEntity::spawn`. experienceorb.aowl sets it when imported.
+var gFromType*: proc(entityType: EntityType; position: Vector3[float64]; world: World; uuid: Uuid): nil EntityBase {.closure.} =
+  proc(entityType: EntityType; position: Vector3[float64]; world: World; uuid: Uuid): nil EntityBase {.closure.} = nil
+  ## `entity::type::from_type`, nil for a type nobody can build. entitytype.aowl sets it when imported.
+var gLootHook*: proc(entityType: EntityType; params: LootContextParams): seq[ItemStack] {.closure.} =
+  proc(entityType: EntityType; params: LootContextParams): seq[ItemStack] {.closure.} = @[]
+  ## `loot_table.get_loot(params)`.
+var gEatHook*: proc(player: Player; nutrition: uint8; saturation: float32) {.closure.} =
+  proc(player: Player; nutrition: uint8; saturation: float32) {.closure.} = discard
+  ## `HungerManager::eat`. hunger.aowl sets it when imported.
+var gDrinkPotionHook*: proc(living: LivingEntity; item: ItemStack) {.closure.} =
+  proc(living: LivingEntity; item: ItemStack) {.closure.} = discard
+  ## `PotionContents::read_potion_effects` then `apply_effects_to`. item/potion.aowl sets it when imported.
+
+# --- Random numbers: `rand::random`. Nothing depends on the sequence; tests can fix the seed. ---------------------------
+
+var gEntityRandomState = uint64(nowMs()) xor 0x2545F4914F6CDD1D'u64
+
+proc setEntityRandomSeed*(seed: uint64) =
+  gEntityRandomState = if seed == 0'u64: 1'u64 else: seed
+
+proc nextU64(): uint64 =
+  gEntityRandomState = gEntityRandomState xor (gEntityRandomState shl 13)
+  gEntityRandomState = gEntityRandomState xor (gEntityRandomState shr 7)
+  gEntityRandomState = gEntityRandomState xor (gEntityRandomState shl 17)
+  gEntityRandomState
+
+proc randomF32*(): float32 =
+  ## `rand::random::<f32>()`: in [0, 1).
+  float32(nextU64() shr 40) / 16777216.0'f32
+
+proc randomF64*(): float64 =
+  ## `rand::random::<f64>()`: in [0, 1).
+  float64(nextU64() shr 11) / 9007199254740992.0'f64
+
+proc randomRange*(lo, hi: int32): int32 =
+  ## `random_range(lo..hi)`, hi excluded.
+  lo + int32(nextU64() mod uint64(hi - lo))
+
+proc randomRangeInclusive*(lo, hi: int32): int32 =
+  ## `random_range(lo..=hi)`.
+  lo + int32(nextU64() mod uint64(hi - lo + 1'i32))
+
+proc randomRangeF64*(lo, hi: float64): float64 =
+  lo + (hi - lo) * randomF64()
+
+proc randomBool*(): bool =
+  (nextU64() and 1'u64) == 0'u64
+
+# --- Rust's numeric conversions -----------------------------------------------------------------------------------------
+
+proc remEuclidF32*(a, b: float32): float32 =
+  ## `f32::rem_euclid`.
+  let r = a - b * trunc(a / b)
+  if r < 0.0'f32: r + abs(b) else: r
+
+proc asU8*(value: float32): uint8 =
+  ## `as u8`: saturating, NaN is 0.
+  if isNaN(value) or value <= 0.0'f32: 0'u8
+  elif value >= 255.0'f32: 255'u8
+  else: uint8(value)
+
+proc asI16*(value: float64): int16 =
+  ## `as i16`: saturating, NaN is 0.
+  if isNaN(value): 0'i16
+  elif value <= -32768.0: low(int16)
+  elif value >= 32767.0: high(int16)
+  else: int16(value)
+
+proc angleToU8*(angle: float32): uint8 =
+  ## `(angle * 256.0 / 360.0).rem_euclid(256.0) as u8`
+  asU8(remEuclidF32(angle * 256.0'f32 / 360.0'f32, 256.0'f32))
+
+proc toRadiansF32*(v: float32): float32 {.inline.} = v * (float32(PI) / 180.0'f32)
+  ## `f32::to_radians`, which multiplies by the constant `PI / 180`.
+
+proc toDegreesF32*(v: float32): float32 {.inline.} = v * (180.0'f32 / float32(PI))
+  ## `f32::to_degrees`, which multiplies by the constant `180 / PI`.
+
+proc fmodF32*(a, b: float32): float32 {.importc: "fmodf", header: "<math.h>".}
+  ## Rust's `%` on `f32`.
+proc sinF32*(v: float32): float32 {.importc: "sinf", header: "<math.h>".}
+proc cosF32*(v: float32): float32 {.importc: "cosf", header: "<math.h>".}
+
+proc equipmentBreakStatus*(slot: EquipmentSlot): EntityStatus =
+  ## `equipment_break_status`
+  case slot
+  of esMainHand: esMainhandBreak
+  of esOffHand: esOffhandBreak
+  of esHead: esHeadBreak
+  of esChest: esChestBreak
+  of esLegs: esLegsBreak
+  of esFeet: esFeetBreak
+  of esBody: esBodyBreak
+  of esSaddle: esSaddleBreak
+
+proc shouldDestroy*(self: RemovalReason): bool =
+  self == rrKilled or self == rrDiscarded
+
+proc shouldSave*(self: RemovalReason): bool =
+  self == rrUnloadedToChunk
+
+proc getEntityDimensions*(pose: EntityPose): EntityDimensions =
+  ## `Entity::get_entity_dimensions`
+  case pose
+  of epSleeping: newEntityDimensions(0.2'f32, 0.2'f32, 0.2'f32)
+  of epFallFlying, epSwimming, epSpinAttack: newEntityDimensions(0.6'f32, 0.6'f32, 0.4'f32)
+  of epCrouching: newEntityDimensions(0.6'f32, 1.5'f32, 1.27'f32)
+  of epDying: newEntityDimensions(0.2'f32, 0.2'f32, 1.62'f32)
+  else: newEntityDimensions(0.6'f32, 1.8'f32, 1.62'f32)
+
+proc atPos*(shape: ShapeBox; position: BlockPos): BoundingBox =
+  ## `CollisionShape::at_pos`
+  let p = position.vec
+  BoundingBox(
+    min: Vector3[float64](x: float64(shape.minX) + float64(p.x), y: float64(shape.minY) + float64(p.y),
+      z: float64(shape.minZ) + float64(p.z)),
+    max: Vector3[float64](x: float64(shape.maxX) + float64(p.x), y: float64(shape.maxY) + float64(p.y),
+      z: float64(shape.maxZ) + float64(p.z)))
+
+proc isPlayerType(e: Entity): bool {.inline.} =
+  e.entityType.id == EntityType.PLAYER.id
+
+# --- The trait's dispatch: what upstream writes `base.method(...)` ----------------------------------------------------------
+
+proc getEntity*(self: EntityBase): Entity {.inline.} = self.entity
+proc getLivingEntity*(self: EntityBase): nil LivingEntity {.inline.} = self.living
+proc getPlayer*(self: EntityBase): nil Player {.inline.} = self.player
+
+proc tick*(self, caller: EntityBase; server: Server) = self.vt.tick(self, caller, server)
+proc getJobSitePos*(self: EntityBase): Option[BlockPos] = self.vt.getJobSitePos(self)
+proc getHomePos*(self: EntityBase): Option[BlockPos] = self.vt.getHomePos(self)
+proc getEyePos*(self: EntityBase): Vector3[float64] = self.vt.getEyePos(self)
+proc initDataTracker*(self: EntityBase) = self.vt.initDataTracker(self)
+proc setVariantName*(self: EntityBase; name: string) = self.vt.setVariantName(self, name)
+proc teleport*(self: EntityBase; position: Vector3[float64]; yaw, pitch: Option[float32]; world: World) =
+  self.vt.teleport(self, position, yaw, pitch, world)
+proc isPushedByFluids*(self: EntityBase): bool = self.vt.isPushedByFluids(self)
+proc isImmuneToExplosion*(self: EntityBase): bool = self.vt.isImmuneToExplosion(self)
+proc getGravity*(self: EntityBase): float64 = self.vt.getGravity(self)
+proc tickInVoid*(self, dynSelf: EntityBase) = self.vt.tickInVoid(self, dynSelf)
+proc damage*(self, caller: EntityBase; amount: float32; damageType: DamageType): bool {.discardable.} =
+  self.vt.damage(self, caller, amount, damageType)
+proc isSpectator*(self: EntityBase): bool = self.vt.isSpectator(self)
+proc isCollidable*(self: EntityBase; entity: nil EntityBase): bool = self.vt.isCollidable(self, entity)
+proc canHit*(self: EntityBase): bool = self.vt.canHit(self)
+proc isFlutterer*(self: EntityBase): bool = self.vt.isFlutterer(self)
+proc getYVelocityDrag*(self: EntityBase): Option[float64] = self.vt.getYVelocityDrag(self)
+proc damageWithContext*(self, caller: EntityBase; amount: float32; damageType: DamageType;
+    position: Option[Vector3[float64]]; source, cause: nil EntityBase): bool {.discardable.} =
+  self.vt.damageWithContext(self, caller, amount, damageType, position, source, cause)
+proc interact*(self: EntityBase; player: Player; itemStack: var ItemStack): bool =
+  self.vt.interact(self, player, itemStack)
+proc setOnFireFor*(self: EntityBase; seconds: float32) = self.vt.setOnFireFor(self, seconds)
+proc setOnFireForTicks*(self: EntityBase; ticks: uint32) = self.vt.setOnFireForTicks(self, ticks)
+proc onPlayerCollision*(self: EntityBase; player: Player) = self.vt.onPlayerCollision(self, player)
+proc moveEntity*(self, caller: EntityBase; motion: Vector3[float64]) = self.vt.moveEntity(self, caller, motion)
+proc isPushable*(self: EntityBase): bool = self.vt.isPushable(self)
+proc push*(self, entity: EntityBase) = self.vt.push(self, entity)
+proc pushEntities*(self, dynSelf: EntityBase): bool {.discardable.} = self.vt.pushEntities(self, dynSelf)
+proc onHit*(self: EntityBase; hit: ProjectileHit) = self.vt.onHit(self, hit)
+proc setPaddleState*(self: EntityBase; left, right: bool) = self.vt.setPaddleState(self, left, right)
+proc isInLove*(self: EntityBase): bool = self.vt.isInLove(self)
+proc isBreedingReady*(self: EntityBase): bool = self.vt.isBreedingReady(self)
+proc resetLove*(self: EntityBase) = self.vt.resetLove(self)
+proc setBreedingCooldown*(self: EntityBase; ticks: int32) = self.vt.setBreedingCooldown(self, ticks)
+proc isPanicking*(self: EntityBase): bool = self.vt.isPanicking(self)
+proc getName*(self: EntityBase): TextComponent = self.vt.getName(self)
+proc getDisplayName*(self: EntityBase): TextComponent = self.vt.getDisplayName(self)
+proc kill*(self, caller: EntityBase) = self.vt.kill(self, caller)
+proc getExperienceReward*(self: EntityBase; killer: nil EntityBase): uint32 = self.vt.getExperienceReward(self, killer)
+proc getBaseExperienceReward*(self: EntityBase): uint32 = self.vt.getBaseExperienceReward(self)
+proc writeNbt*(self: EntityBase; nbt: var NbtCompound) = self.vt.writeNbt(self, nbt)
+proc readNbt*(self: EntityBase; nbt: NbtCompound) = self.vt.readNbt(self, nbt)
+
+proc getLookingVector*(self: EntityBase): Vector3[float64] =
+  ## `get_looking_vector`
+  let entity = self.entity
+  fromYawPitch(entity.yaw, entity.pitch)
+
+proc isPassenger*(self: EntityBase): bool =
+  self.entity.vehicle != nil
+
+proc isVehicle*(self: EntityBase): bool =
+  self.entity.passengers.len > 0
+
+proc hasPassenger*(self, other: EntityBase): bool =
+  ## `has_passenger`
+  for p in self.entity.passengers:
+    if p.entity.entityId == other.entity.entityId:
+      return true
+  false
+
+# --- The world's entity list: the entity half of `World` -------------------------------------------------------------------
+
+var gWorlds: seq[(World, WorldEntities)] = @[]
+
+proc entitiesOf*(world: World): WorldEntities =
+  ## `world.entities`.
+  for entry in gWorlds:
+    if entry[0] == world:
+      return entry[1]
+  result = WorldEntities(entities: @[])
+  gWorlds.add((world, result))
+
+var gPlayerBases = initTable[int32, EntityBase]()
+var gExperienceDelays = initTable[int32, uint32]()
+
+proc mustLiving*(self: EntityBase): LivingEntity {.inline.} =
+  ## `get_living_entity().unwrap()`, for a closure in a living type's vtable. The nil check is the caller's knowledge.
+  cast[LivingEntity](self.living)
+
+proc mustPlayer*(self: EntityBase): Player {.inline.} =
+  cast[Player](self.player)
+
+proc syncFromPlayer*(self: EntityBase) =
+  ## The view of a `Player` as a `dyn EntityBase`. serverbase.aowl's `Player` keeps its own fields rather than wrapping
+  ## a `LivingEntity`; this copies them onto the adapter's before anything reads it. See `playerBase`.
+  let p = mustPlayer(self)
+  let e = self.entity
+  e.world = p.world
+  if not (e.pos == p.pos):
+    e.pos = p.pos
+    e.blockPos = flooredV(p.pos)
+  e.chunkPos = p.chunkPos
+  e.lastPos = p.lastPos
+  e.velocity = p.velocity
+  e.yaw = p.yaw
+  e.pitch = p.pitch
+  e.headYaw = p.headYaw
+  e.bodyYaw = p.yaw
+  e.onGround = p.onGround
+  e.sneaking = p.sneaking
+  e.sprinting = p.sprinting
+  e.fallFlying = p.fallFlying
+  e.boundingBox = playermod.boundingBox(p)
+  let le = mustLiving(self)
+  le.health = p.health
+  le.absorption = p.absorption
+  le.dead = p.dead
+  le.fallDistance = p.fallDistance
+
+proc syncToPlayer*(self: EntityBase) =
+  ## What damage and knockback change, written back to the `Player`.
+  let p = mustPlayer(self)
+  let le = mustLiving(self)
+  p.velocity = self.entity.velocity
+  p.health = le.health
+  p.absorption = le.absorption
+  p.dead = le.dead
+  p.fallDistance = le.fallDistance
+
+proc getPlayerById*(world: World; id: int32): nil Player =
+  ## `get_player_by_id`
+  for player in world.players:
+    if player.entityId == id:
+      return player
+  nil
+
+proc getPlayerByUuid*(world: World; id: Uuid): nil Player =
+  for player in world.players:
+    if player.gameprofile.id == id:
+      return player
+  nil
+
+# --- `World` reads: blocks, fluids, shapes ---------------------------------------------------------------------------------
+
+proc stateIdAt*(world: World; position: BlockPos): BlockStateId {.inline.} =
+  newBlockStateIdUnchecked(uint16(world.getBlockStateId(position)))
+
+proc getFluidAndFluidState*(world: World; position: BlockPos): (Fluid, FluidState) =
+  ## `get_fluid_and_fluid_state`. As upstream the state is the fluid's first, not the level this block is at.
+  let id = world.stateIdAt(position)
+  let rawFluid = Fluid.fromStateId(id)
+  if rawFluid.isNone:
+    let blockRef = Block.fromStateId(id)
+    let (has, properties) = blockRef.properties(id)
+    if has:
+      for entry in properties.toProps():
+        if entry[0] == "waterlogged":
+          if entry[1] == "true":
+            return (Fluid.FLOWING_WATER, Fluid.FLOWING_WATER.states[0])
+          break
+    return (Fluid.EMPTY, Fluid.EMPTY.states[0])
+  let flowing = rawFluid.unsafeGet.toFlowing()
+  (flowing, flowing.states[0])
+
+proc getFluid*(world: World; position: BlockPos): Fluid =
+  ## `get_fluid`
+  let id = world.stateIdAt(position)
+  let raw = Fluid.fromStateId(id)
+  if raw.isSome:
+    return raw.unsafeGet.toFlowing()
+  let blockRef = Block.fromStateId(id)
+  let (has, properties) = blockRef.properties(id)
+  if has:
+    for entry in properties.toProps():
+      if entry[0] == "waterlogged":
+        return if entry[1] == "true": Fluid.FLOWING_WATER else: Fluid.EMPTY
+  Fluid.EMPTY
+
+proc isSolidFace(world: World; fluid0Id: uint16; pos: BlockPos; direction: BlockDirection): bool =
+  ## `is_solid_face`: FlowingFluid.isSolidFace()
+  let id = world.stateIdAt(pos)
+  let raw = Fluid.fromStateId(id)
+  let fluidId = if raw.isSome: raw.unsafeGet.id else: Fluid.EMPTY.id
+  if Fluid.sameFluidType(fluidId, fluid0Id):
+    return false
+  if direction == BlockDirection.Up:
+    return true
+  let blockRef = Block.fromStateId(id)
+  let state = BlockState.fromId(id)
+  # Doesn't count blue ice or packed ice
+  if blockRef.id == blockIdIce or blockRef.id == blockIdFrostedIce:
+    return false
+  state.isSideSolid(direction)
+
+proc getFluidVelocity*(world: World; pos0: BlockPos; fluid0: Fluid; state0: FluidState): Vector3[float64] =
+  ## `get_fluid_velocity`: FlowingFluid.getFlow()
+  var velo = Vector3[float64](x: 0.0, y: 0.0, z: 0.0)
+  let horizontals = blockDirectionHorizontal()
+  for dir in horizontals:
+    let offset = dir.toBlockDirection().toOffset()
+    let pos = pos0.offset(offset)
+    let (neighborFluid, neighborState) = world.getFluidAndFluidState(pos)
+    if neighborFluid.matchesType(fluid0):
+      var neighborHeight = neighborState.height
+      var amplitude = 0.0'f64
+      if neighborHeight == 0.0'f32:
+        let stateId = world.stateIdAt(pos)
+        let blockState = BlockState.fromId(stateId)
+        if not blocksMovement(blockState, Block.fromStateId(stateId).id):
+          let (downFluid, downState) = world.getFluidAndFluidState(pos.down())
+          if downFluid.matchesType(fluid0):
+            neighborHeight = downState.height
+            if neighborHeight > 0.0'f32:
+              amplitude = float64(state0.height) - (float64(neighborHeight) - 0.888_888_9'f64)
+      elif neighborHeight > 0.0'f32:
+        amplitude = float64(state0.height) - float64(neighborHeight)
+      if amplitude != 0.0'f64:
+        velo.x += float64(offset.x) * amplitude
+        velo.z += float64(offset.z) * amplitude
+  if state0.falling:
+    for dir in horizontals:
+      let direction = dir.toBlockDirection()
+      let pos = pos0.offset(direction.toOffset())
+      if world.isSolidFace(fluid0.id, pos, direction) or world.isSolidFace(fluid0.id, pos.up(), direction):
+        if velo.lengthSquared() != 0.0'f64:
+          velo = velo.normalize()
+        velo.y -= 6.0'f64
+        break
+  if velo.lengthSquared() == 0.0'f64: velo else: velo.normalize()
+
+proc checkFluidCollision*(world: World; boundingBox: BoundingBox): bool =
+  ## `check_fluid_collision`
+  let lo = boundingBox.minBlockPos()
+  let hi = boundingBox.maxBlockPos()
+  for x in lo.vec.x .. hi.vec.x:
+    for y in lo.vec.y .. hi.vec.y:
+      for z in lo.vec.z .. hi.vec.z:
+        let (fluid, state) = world.getFluidAndFluidState(BlockPos(vec: Vector3[int32](x: x, y: y, z: z)))
+        if fluid.id != Fluid.EMPTY.id:
+          let height = float64(state.height)
+          if height >= boundingBox.min.y:
+            return true
+  false
+
+proc checkCollision*(boundingBox: BoundingBox; pos: BlockPos; state: BlockState): bool =
+  ## `check_collision` with `use_collision_shape` false.
+  if state.isAir or not state.isSolid:
+    return false
+  for shape in state.getBlockCollisionShapes():
+    if shape.atPos(pos).intersects(boundingBox):
+      return true
+  false
+
+proc checkCollisionShapes*(boundingBox: BoundingBox; pos: BlockPos; state: BlockState): seq[BoundingBox] =
+  ## `check_collision` with `use_collision_shape` true: the boxes the callback would have seen.
+  result = @[]
+  if state.isAir or not state.isSolid:
+    return
+  for shape in state.getBlockCollisionShapes():
+    let box = shape.atPos(pos)
+    if box.intersects(boundingBox):
+      result.add(box)
+
+proc isSpaceEmpty*(world: World; boundingBox: BoundingBox): bool =
+  ## `is_space_empty`
+  let lo = boundingBox.minBlockPos()
+  let hi = boundingBox.maxBlockPos()
+  for x in lo.vec.x .. hi.vec.x:
+    for y in lo.vec.y .. hi.vec.y:
+      for z in lo.vec.z .. hi.vec.z:
+        let pos = BlockPos(vec: Vector3[int32](x: x, y: y, z: z))
+        if checkCollision(boundingBox, pos, BlockState.fromId(world.stateIdAt(pos))):
+          return false
+  true
+
+proc highestShapeTop(state: BlockState): float64 =
+  result = -Inf
+  for shape in state.getBlockCollisionShapes():
+    result = max(result, float64(shape.maxY))
+
+proc getDismountHeight*(world: World; pos: BlockPos): float64 =
+  ## `get_dismount_height`: Vanilla's `BlockView.getDismountHeight()`.
+  let maxY = highestShapeTop(BlockState.fromId(world.stateIdAt(pos)))
+  if maxY != -Inf:
+    return maxY
+  let belowMaxY = highestShapeTop(BlockState.fromId(world.stateIdAt(pos.down())))
+  if belowMaxY >= 1.0'f64: belowMaxY - 1.0'f64 else: -Inf
+
+# --- Powder snow: the three helpers entity code calls in pumpkin/src/block/blocks/powder_snow.rs -----------------------------
+
+proc canEntityWalkOnPowderSnow*(entity: EntityBase): bool =
+  ## `can_entity_walk_on_powder_snow`
+  let base = entity.entity
+  if hasTag(base.entityType.id, EntityType_MINECRAFT_POWDER_SNOW_WALKABLE_MOBS):
+    return true
+  let living = entity.living
+  if living == nil:
+    return false
+  living.entityEquipment.get(esFeet).item.id == ITEM_LEATHER_BOOTS.id
+
+proc collisionShapeForEntity*(entity: EntityBase; position: BlockPos): Option[BoundingBox] =
+  ## `collision_shape_for_entity`
+  let living = entity.living
+  let fallDistance = if living != nil: living.fallDistance else: 0.0'f32
+  if fallDistance > 2.5'f32:
+    return some(BoundingBox.newArray([0.0'f64, 0.0'f64, 0.0'f64], [1.0'f64, 0.9'f64, 1.0'f64]))
+  let base = entity.entity
+  if base.entityType.id == EntityType.FALLING_BLOCK.id:
+    return some(BoundingBox.fullBlock())
+  # `is_entity_above_block` and `is_entity_descending`
+  let aboveBlock = base.boundingBox.min.y >= float64(position.vec.y) + 1.0'f64 - 1.0e-7'f64
+  if canEntityWalkOnPowderSnow(entity) and aboveBlock and not (base.velocity.y < 0.0'f64):
+    return some(BoundingBox.fullBlock())
+  none[BoundingBox]()
+
+proc getBlockCollisions*(world: World; boundingBox: BoundingBox; entity: EntityBase): (seq[BoundingBox], seq[(int, BlockPos)]) =
+  ## `get_block_collisions`, for adjusting movement.
+  var collisions: seq[BoundingBox] = @[]
+  var positions: seq[(int, BlockPos)] = @[]
+  let lo = flooredV(boundingBox.min.addRaw(0.0'f64, -0.50001'f64, 0.0'f64))
+  let hi = boundingBox.maxBlockPos()
+  for x in lo.vec.x .. hi.vec.x:
+    for y in lo.vec.y .. hi.vec.y:
+      for z in lo.vec.z .. hi.vec.z:
+        let pos = BlockPos(vec: Vector3[int32](x: x, y: y, z: z))
+        let stateId = world.stateIdAt(pos)
+        let state = BlockState.fromId(stateId)
+        if state.isAir:
+          continue
+        var collided = false
+        if Block.fromStateId(stateId).id == blockIdPowderSnow:
+          let shape = collisionShapeForEntity(entity, pos)
+          if shape.isSome:
+            let box = shape.unsafeGet.atPos(pos)
+            if box.intersects(boundingBox):
+              collided = true
+              collisions.add(box)
+        else:
+          for shape in state.getBlockCollisionShapes():
+            let box = shape.atPos(pos)
+            if box.intersects(boundingBox):
+              collided = true
+              collisions.add(box)
+        if collided:
+          positions.add((collisions.len, pos))
+  (collisions, positions)
+
+# --- `World` writes: sounds, statuses, broadcasts --------------------------------------------------------------------------
+
+proc playSoundRaw*(world: World; soundId: uint16; category: SoundCategory; position: Vector3[float64]; volume, pitch: float32) =
+  ## `play_sound_raw`
+  let seed = randomF64()
+  # Calculate the number of chunks the sound can be heard from based on its volume.
+  let audibleChunks = asI32(ceil(float64(max(volume, 1.0'f32))))
+  let chunkPos = flooredV(position).chunkPosition()
+  for player in world.players:
+    # If the sound reaches their chunk, send it!
+    if isWithinViewDistance(chunkPos, player.chunkPos, audibleChunks):
+      let remapped = remapSoundIdForVersion(soundId, player.client.version)
+      let soundOrId = proto.IdOr[proto.SoundEvent](kind: iokId, id: remapped)
+      player.client.writePacketFor(newCSoundEffect(soundOrId, category, position, volume, pitch, seed))
+
+proc playSound*(world: World; soundRef: Sound; category: SoundCategory; position: Vector3[float64]) =
+  ## `play_sound`
+  world.playSoundRaw(uint16(ord(soundRef)), category, position, 1.0'f32, 1.0'f32)
+
+proc sendEntityStatus*(world: World; entity: Entity; status: EntityStatus) =
+  ## `send_entity_status`
+  world.broadcastToChunk(entity.chunkPos, CEntityStatus(entityId: entity.entityId, entityStatus: int8(ord(status))))
+
+proc sendRemoveMobEffect*(world: World; entity: Entity; effectType: StatusEffect) =
+  ## `send_remove_mob_effect`
+  world.broadcastToChunk(entity.chunkPos, CRemoveMobEffect(entityId: newVarInt(entity.entityId),
+    effectId: newVarInt(int32(effectType.id))))
+
+proc spawnParticle*(world: World; position: Vector3[float64]; offset: Vector3[float64]; maxSpeed: float32;
+    particleCount: int32; pa: Particle) =
+  ## `spawn_particle`
+  world.broadcastPacketAll(CParticle(forceSpawn: false, important: false, position: position, offset: offset.toF32Lossy(),
+    maxSpeed: maxSpeed, particleCount: particleCount, particleId: newVarInt(int32(ord(pa)))))
+
+# --- `impl Entity` -----------------------------------------------------------------------------------------------------------
+
+proc reserveIds*(server: Server; count: int32): int32 =
+  ## `Entity::reserve_ids`. The counter is the server's, shared with players.
+  result = server.nextEntityId
+  server.nextEntityId = result + count
+
+proc fromUuidWithId*(entityId: int32; entityUuid: Uuid; world: World; position: Vector3[float64]; entityType: EntityType): Entity =
+  ## `Entity::from_uuid_with_id`
+  let floorX = asI32(floor(position.x))
+  let floorY = asI32(floor(position.y))
+  let floorZ = asI32(floor(position.z))
+  let boundingBoxSize = newEntityDimensions(entityType.dimension[0], entityType.dimension[1], entityType.eyeHeight)
+  Entity(base: nil, entityId: entityId, entityUuid: entityUuid, entityType: entityType, world: world,
+    pos: position, lastPos: position, movement: Vector3[float64](x: 0.0, y: 0.0, z: 0.0),
+    blockPos: BlockPos(vec: Vector3[int32](x: floorX, y: floorY, z: floorZ)), supportingBlockPos: none[BlockPos](),
+    chunkPos: Vector2[int32](x: getSectionCord(floorX), y: getSectionCord(floorZ)),
+    velocity: Vector3[float64](x: 0.0, y: 0.0, z: 0.0), pose: epStanding,
+    boundingBox: BoundingBox.newFromPos(position.x, position.y, position.z, boundingBoxSize),
+    entityDimension: boundingBoxSize, damageImmunities: @[], fireTicks: -1'i32, removalReason: none[RemovalReason](),
+    passengers: @[], vehicle: nil, leashedTo: nil, currentBiome: 0,
+    lastBiomeUpdatePos: BlockPos(vec: Vector3[int32](x: floorX, y: floorY, z: floorZ)),
+    customName: none[TextComponent](), scoreboardTags: @[],
+    movementMultiplier: Vector3[float64](x: 0.0, y: 0.0, z: 0.0), velocityDirty: true, lastSentPos: position)
+
+proc fromUuid*(entityUuid: Uuid; world: World; position: Vector3[float64]; entityType: EntityType): Entity =
+  ## `Entity::from_uuid`
+  fromUuidWithId(reserveIds(world.server, 1'i32), entityUuid, world, position, entityType)
+
+proc randomUuid*(): Uuid =
+  ## `Uuid::new_v4`
+  let (ok, id) = newV4()
+  assert ok
+  id
+
+proc newEntity*(world: World; position: Vector3[float64]; entityType: EntityType): Entity =
+  ## `Entity::new`
+  fromUuid(randomUuid(), world, position, entityType)
+
+template sendMetaData*(self: Entity; index: TrackedId; typ: MetaDataType; value: untyped) =
+  ## `send_meta_data`, one entry at a time: the only call with more than one is `send_client_information`, in player.aowl.
+  let smEntity = self
+  let smWorld = smEntity.world
+  for smPlayer in smWorld.players:
+    if isWithinViewDistance(smEntity.chunkPos, smPlayer.chunkPos, int32(getViewDistance(smPlayer, smWorld.server))):
+      var smBuf = newNetWriter()
+      discard newMetadata(index, typ, value).write(smBuf, smPlayer.client.version)
+      writeU8(smBuf, 255'u8)
+      smPlayer.client.writePacketFor(CSetEntityMetadata(entityId: newVarInt(smEntity.entityId), metadata: smBuf.buf))
+
+template sendMetaData2*(self: Entity; index1: TrackedId; typ1: MetaDataType; value1: untyped; index2: TrackedId;
+    typ2: MetaDataType; value2: untyped) =
+  ## `send_meta_data` with two entries, in one packet.
+  let smEntity = self
+  let smWorld = smEntity.world
+  for smPlayer in smWorld.players:
+    if isWithinViewDistance(smEntity.chunkPos, smPlayer.chunkPos, int32(getViewDistance(smPlayer, smWorld.server))):
+      var smBuf = newNetWriter()
+      discard newMetadata(index1, typ1, value1).write(smBuf, smPlayer.client.version)
+      discard newMetadata(index2, typ2, value2).write(smBuf, smPlayer.client.version)
+      writeU8(smBuf, 255'u8)
+      smPlayer.client.writePacketFor(CSetEntityMetadata(entityId: newVarInt(smEntity.entityId), metadata: smBuf.buf))
+
+proc sendVelocity*(self: Entity) =
+  ## `send_velocity`
+  self.world.broadcastToChunk(self.chunkPos, newCEntityVelocity(newVarInt(self.entityId), self.velocity))
+
+proc setVelocity*(self: Entity; velocity: Vector3[float64]) =
+  self.velocity = velocity
+  self.sendVelocity()
+
+proc addVelocity*(self: Entity; velocity: Vector3[float64]) =
+  self.setVelocity(self.velocity + velocity)
+
+proc setWorld*(self: Entity; world: World) =
+  self.world = world
+
+proc setAge*(self: Entity; age: int32) =
+  self.age = age
+
+proc addScoreboardTag*(self: Entity; tag: string): bool =
+  ## `add_scoreboard_tag`
+  if self.scoreboardTags.len >= MaxScoreboardTags:
+    return false
+  for existing in self.scoreboardTags:
+    if existing == tag:
+      return false
+  self.scoreboardTags.add(tag)
+  true
+
+proc removeScoreboardTag*(self: Entity; tag: string): bool =
+  ## `remove_scoreboard_tag`
+  for i in 0 ..< self.scoreboardTags.len:
+    if self.scoreboardTags[i] == tag:
+      self.scoreboardTags.delete(i)
+      return true
+  false
+
+proc setCustomName*(self: Entity; name: TextComponent) =
+  ## `set_custom_name`
+  self.customName = some(name)
+  self.sendMetaData(TrackedData_CUSTOM_NAME, OPTIONAL_TEXT_COMPONENT, some(name))
+
+proc setCustomNameVisible*(self: Entity; visible: bool) =
+  ## `set_custom_name_visible`
+  self.customNameVisible = visible
+  self.sendMetaData(TrackedData_CUSTOM_NAME_VISIBLE, BOOLEAN, visible)
+
+proc getEyeHeight*(self: Entity): float64 =
+  ## `get_eye_height`
+  float64(getEntityDimensions(self.pose).eyeHeight)
+
+proc setPos*(self: Entity; newPosition: Vector3[float64]) =
+  ## `set_pos`
+  let pos = self.pos
+  if not (pos == newPosition):
+    self.pos = newPosition
+    self.boundingBox = BoundingBox.newFromPos(newPosition.x, newPosition.y, newPosition.z, self.entityDimension)
+    let floorX = asI32(floor(newPosition.x))
+    let floorY = asI32(floor(newPosition.y))
+    let floorZ = asI32(floor(newPosition.z))
+    let blockPosVec = self.blockPos.vec
+    if floorX != blockPosVec.x or floorY != blockPosVec.y or floorZ != blockPosVec.z:
+      self.blockPos = BlockPos(vec: Vector3[int32](x: floorX, y: floorY, z: floorZ))
+      let chunkPos = self.chunkPos
+      if getSectionCord(floorX) != chunkPos.x or getSectionCord(floorZ) != chunkPos.y:
+        self.chunkPos = Vector2[int32](x: getSectionCord(floorX), y: getSectionCord(floorZ))
+
+proc rotation*(self: Entity): Vector3[float32] =
+  ## `rotation`
+  let pitchRad = toRadiansF32(self.pitch)
+  let yawRad = -toRadiansF32(self.yaw)
+  let cosYaw = cosF32(yawRad)
+  let sinYaw = sinF32(yawRad)
+  let cosPitch = cosF32(pitchRad)
+  let sinPitch = sinF32(pitchRad)
+  Vector3[float32](x: sinYaw * cosPitch, y: -sinPitch, z: cosYaw * cosPitch)
+
+proc lookAt*(self: Entity; target: Vector3[float64]) =
+  ## `look_at`
+  let delta = target.sub(self.pos)
+  let root = hypot(delta.x, delta.z)
+  let pitch = wrapDegrees(toDegreesF32(float32(-arctan2(delta.y, root))))
+  let yaw = wrapDegrees(toDegreesF32(float32(arctan2(delta.z, delta.x))) - 90.0'f32)
+  self.pitch = pitch
+  self.yaw = yaw
+
+proc sendHeadRot*(self: Entity; headYaw: uint8) =
+  ## `send_head_rot`
+  if headYaw == self.lastSentHeadYaw:
+    return
+  self.lastSentHeadYaw = headYaw
+  self.world.broadcastToChunk(self.chunkPos, CHeadRot(entityId: newVarInt(self.entityId), headYaw: headYaw))
+
+proc sendRotation*(self: Entity) =
+  ## `send_rotation`
+  let yaw = angleToU8(self.yaw)
+  let pitch = angleToU8(self.pitch)
+  if yaw == self.lastSentYaw and pitch == self.lastSentPitch:
+    return
+  self.lastSentYaw = yaw
+  self.lastSentPitch = pitch
+  self.world.broadcastToChunk(self.chunkPos, CUpdateEntityRot(entityId: newVarInt(self.entityId), yaw: yaw, pitch: pitch,
+    onGround: self.onGround))
+  self.sendHeadRot(yaw)
+
+proc defaultPortalCooldown(self: Entity): uint32 =
+  if self.isPlayerType(): 10'u32 else: 300'u32
+
+proc getSupportingBlockPos*(self: Entity): Option[BlockPos] =
+  ## `get_supporting_block_pos`
+  if not self.onGround:
+    return none[BlockPos]()
+  self.supportingBlockPos
+
+proc adjustMovementForCollisions*(self: Entity; movement: Vector3[float64]; caller: EntityBase): Vector3[float64] =
+  ## `adjust_movement_for_collisions`
+  if movement.lengthSquared() == 0.0'f64:
+    return movement
+  self.onGround = false
+  self.supportingBlockPos = none[BlockPos]()
+  self.horizontalCollision = false
+  let boundingBox = self.boundingBox
+  let (collisions, blockPositions) = self.world.getBlockCollisions(boundingBox.stretch(movement), caller)
+  if collisions.len == 0:
+    return movement
+  var adjustedMovement = movement
+  # Y-Axis adjustment
+  if movement.getAxis(axisY) != 0.0'f64:
+    var maxTime = 1.0'f64
+    var next = 0
+    var collisionsLen = blockPositions[0][0]
+    var position = blockPositions[0][1]
+    inc next
+    var supportingBlockPos = none[BlockPos]()
+    for i in 0 ..< collisions.len:
+      if i == collisionsLen:
+        collisionsLen = blockPositions[next][0]
+        position = blockPositions[next][1]
+        inc next
+      let collisionTime = boundingBox.calculateCollisionTime(collisions[i], adjustedMovement, axisY, maxTime)
+      if collisionTime.isSome:
+        maxTime = collisionTime.unsafeGet
+        # If the entity is moving downwards and collides, set the supporting block position
+        if movement.getAxis(axisY) < 0.0'f64:
+          supportingBlockPos = some(position)
+    if maxTime != 1.0'f64:
+      let changedComponent = adjustedMovement.getAxis(axisY) * maxTime
+      adjustedMovement.setAxis(axisY, changedComponent)
+    self.onGround = supportingBlockPos.isSome
+    self.supportingBlockPos = supportingBlockPos
+  var horizontalCollision = false
+  let horizontalAxes = axisHorizontal()
+  for axis in horizontalAxes:
+    if movement.getAxis(axis) == 0.0'f64:
+      continue
+    var maxTime = 1.0'f64
+    for inertBox in collisions:
+      let collisionTime = boundingBox.calculateCollisionTime(inertBox, adjustedMovement, axis, maxTime)
+      if collisionTime.isSome:
+        maxTime = collisionTime.unsafeGet
+    if maxTime != 1.0'f64:
+      let changedComponent = adjustedMovement.getAxis(axis) * maxTime
+      adjustedMovement.setAxis(axis, changedComponent)
+      horizontalCollision = true
+  self.horizontalCollision = horizontalCollision
+  adjustedMovement
+
+proc knockbackVelocity(self: Entity; strength, x0, z0: float64) =
+  ## The shared body of `apply_knockback` and `knockback`.
+  var x = x0
+  var z = z0
+  while mulAdd(x, x, z * z) < 1.0e-5'f64:
+    x = (randomF64() - randomF64()) * 0.01'f64
+    z = (randomF64() - randomF64()) * 0.01'f64
+  let var8 = Vector3[float64](x: x, y: 0.0, z: z).normalize() * strength
+  let velocity = self.velocity
+  self.velocity = Vector3[float64](
+    x: velocity.x / 2.0'f64 - var8.x,
+    y: if self.onGround: min(velocity.y / 2.0'f64 + strength, 0.4'f64) else: velocity.y,
+    z: velocity.z / 2.0'f64 - var8.z)
+
+proc applyKnockback*(self: Entity; strength, x, z: float64) =
+  ## `apply_knockback`: `LivingEntity.takeKnockback()`. Knockback resistance is the caller's: see combat.aowl.
+  if strength <= 0.0'f64:
+    return
+  self.velocityDirty = true
+  self.knockbackVelocity(strength, x, z)
+
+proc knockback*(self: Entity; strength, x, z: float64) =
+  ## `knockback`
+  self.knockbackVelocity(strength, x, z)
+
+proc checkZeroVelo*(self: Entity) =
+  ## `check_zero_velo`: part of LivingEntity.tickMovement() in yarn.
+  var motion = self.velocity
+  if self.isPlayerType():
+    if motion.horizontalLengthSquared() < 9.0e-6'f64:
+      motion.x = 0.0'f64
+      motion.z = 0.0'f64
+  else:
+    if abs(motion.x) < 0.003'f64:
+      motion.x = 0.0'f64
+    if abs(motion.z) < 0.003'f64:
+      motion.z = 0.0'f64
+  if abs(motion.y) < 0.003'f64:
+    motion.y = 0.0'f64
+  self.velocity = motion
+
+proc tickBlockCollisions*(self: Entity; caller: EntityBase; server: Server): bool =
+  ## `tick_block_collisions`
+  let boundingBox = self.boundingBox
+  let aabb = boundingBox.expand(-1.0e-7'f64, -1.0e-7'f64, -1.0e-7'f64)
+  let lo = aabb.minBlockPos()
+  let hi = aabb.maxBlockPos()
+  let eyeHeight = self.getEyeHeight()
+  var eyeLevelBox = aabb
+  eyeLevelBox.min.y += eyeHeight
+  eyeLevelBox.max.y = eyeLevelBox.min.y
+  var suffocating = false
+  let world = self.world
+  for x in lo.vec.x .. hi.vec.x:
+    for y in lo.vec.y .. hi.vec.y:
+      for z in lo.vec.z .. hi.vec.z:
+        let pos = BlockPos(vec: Vector3[int32](x: x, y: y, z: z))
+        let stateId = world.stateIdAt(pos)
+        let state = BlockState.fromId(stateId)
+        if state.isAir:
+          continue
+        let blockRef = Block.fromStateId(stateId)
+        # TODO upstream: this is the default predicate, vanilla overwrites it for some blocks.
+        if not suffocating and blocksMovement(state, blockRef.id) and state.isFullCube:
+          for box in checkCollisionShapes(boundingBox, pos, state):
+            if box.intersects(eyeLevelBox):
+              suffocating = true
+        var collisionShape: BoundingBox
+        if blockRef.id == blockIdPowderSnow:
+          let shape = collisionShapeForEntity(caller, pos)
+          collisionShape = if shape.isSome: shape.unsafeGet else: BoundingBox.fullBlock()
+        else:
+          collisionShape = gBlockHooks.getInsideCollisionShape(blockRef, world, state, pos)
+        if boundingBox.intersects(collisionShape.atPos(pos)):
+          if blockRef.id == blockIdPowderSnow:
+            self.isInPowderSnow = true
+          gBlockHooks.onEntityCollision(blockRef, world, caller, pos, state, server)
+  suffocating
+
+proc sendPosRot*(self: Entity) =
+  ## `send_pos_rot`
+  let old = self.lastSentPos
+  let new0 = self.pos
+  let converted = Vector3[int16](
+    x: asI16(mulAdd(new0.x, 4096.0'f64, -(old.x * 4096.0'f64))),
+    y: asI16(mulAdd(new0.y, 4096.0'f64, -(old.y * 4096.0'f64))),
+    z: asI16(mulAdd(new0.z, 4096.0'f64, -(old.z * 4096.0'f64))))
+  let yaw = angleToU8(self.yaw)
+  let pitch = angleToU8(self.pitch)
+  # Only broadcast when position or rotation has actually changed.
+  let posChanged = converted.x != 0'i16 or converted.y != 0'i16 or converted.z != 0'i16
+  let rotChanged = yaw != self.lastSentYaw or pitch != self.lastSentPitch
+  if not posChanged and not rotChanged:
+    return
+  self.lastSentPos = new0
+  self.lastSentYaw = yaw
+  self.lastSentPitch = pitch
+  # Dynamically pick the most efficient packet
+  if posChanged and rotChanged:
+    self.world.broadcastToChunk(self.chunkPos, CUpdateEntityPosRot(entityId: newVarInt(self.entityId), delta: converted,
+      yaw: yaw, pitch: pitch, onGround: self.onGround))
+  elif posChanged:
+    self.world.broadcastToChunk(self.chunkPos, CUpdateEntityPos(entityId: newVarInt(self.entityId), delta: converted,
+      onGround: self.onGround))
+  else:
+    self.world.broadcastToChunk(self.chunkPos, CUpdateEntityRot(entityId: newVarInt(self.entityId), yaw: yaw, pitch: pitch,
+      onGround: self.onGround))
+  self.sendHeadRot(yaw)
+
+proc updateLastPos*(self: Entity): Vector3[float64] {.discardable.} =
+  ## `update_last_pos`
+  let pos = self.pos
+  let old = self.lastPos
+  self.movement = pos - old
+  self.lastPos = pos
+  old
+
+proc sendPos*(self: Entity) =
+  ## `send_pos`
+  let old = self.lastSentPos
+  let new0 = self.pos
+  let converted = Vector3[int16](
+    x: asI16(mulAdd(new0.x, 4096.0'f64, -(old.x * 4096.0'f64))),
+    y: asI16(mulAdd(new0.y, 4096.0'f64, -(old.y * 4096.0'f64))),
+    z: asI16(mulAdd(new0.z, 4096.0'f64, -(old.z * 4096.0'f64))))
+  # Only broadcast when position has actually changed.
+  if converted.x == 0'i16 and converted.y == 0'i16 and converted.z == 0'i16:
+    return
+  self.lastSentPos = new0
+  self.world.broadcastToChunk(self.chunkPos, CUpdateEntityPos(entityId: newVarInt(self.entityId), delta: converted,
+    onGround: self.onGround))
+
+proc pushByFluid(self: Entity; speed: float64; push0: Vector3[float64]; n: int) =
+  ## `push_by_fluid`
+  var push = push0
+  if push.lengthSquared() != 0.0'f64:
+    if n > 0:
+      push = push * (1.0'f64 / float64(n))
+    if not self.isPlayerType():
+      push = push.normalize()
+    push = push * speed
+    let velo = self.velocity
+    if abs(velo.x) < 0.003'f64 and abs(velo.z) < 0.003'f64 and velo.lengthSquared() < 0.000_020_25'f64:
+      push = push.normalize() * 0.0045'f64
+    self.velocity = velo + push
+
+proc updateFluidState*(self: Entity; caller: EntityBase) =
+  ## `update_fluid_state`: updateWaterState() in yarn.
+  let isPushed = caller.isPushedByFluids()
+  # `BTreeMap` by fluid id: water comes before lava, as in vanilla.
+  var fluids: seq[Fluid] = @[]
+  var fluidPush = @[Vector3[float64](x: 0.0, y: 0.0, z: 0.0), Vector3[float64](x: 0.0, y: 0.0, z: 0.0)]
+  var fluidN = @[0, 0]
+  var inFluid = @[false, false]
+  var fluidHeight = @[0.0'f64, 0.0'f64]
+  let boundingBox = self.boundingBox.expand(-0.001'f64, -0.001'f64, -0.001'f64)
+  let lo = boundingBox.minBlockPos()
+  let hi = boundingBox.maxBlockPos()
+  let world = self.world
+  proc remember(fluids: var seq[Fluid]; fluid: Fluid) =
+    var at = 0
+    while at < fluids.len and fluids[at].id < fluid.id:
+      inc at
+    if at == fluids.len or fluids[at].id != fluid.id:
+      fluids.add(fluid)
+      var i = fluids.len - 1
+      while i > at:
+        let moved = fluids[i - 1]
+        fluids[i] = moved
+        dec i
+      fluids[at] = fluid
+  for x in lo.vec.x .. hi.vec.x:
+    for y in lo.vec.y .. hi.vec.y:
+      for z in lo.vec.z .. hi.vec.z:
+        let pos = BlockPos(vec: Vector3[int32](x: x, y: y, z: z))
+        let (fluid, state) = world.getFluidAndFluidState(pos)
+        if fluid.id != Fluid.EMPTY.id:
+          let marginalHeight = float64(state.height) + float64(y) - boundingBox.min.y
+          if marginalHeight >= 0.0'f64:
+            let i = if fluid.id == Fluid.FLOWING_LAVA.id or fluid.id == Fluid.LAVA.id: 1 else: 0
+            fluidHeight[i] = max(fluidHeight[i], marginalHeight)
+            inFluid[i] = true
+            if not isPushed:
+              remember(fluids, fluid)
+              continue
+            var fluidVelo = world.getFluidVelocity(pos, fluid, state)
+            if fluidHeight[i] < 0.4'f64:
+              fluidVelo = fluidVelo * fluidHeight[i]
+            fluidPush[i] += fluidVelo
+            fluidN[i] += 1
+            remember(fluids, fluid)
+  for fluid in fluids:
+    gBlockHooks.onEntityCollisionFluid(fluid, caller)
+  let lavaSpeed = if world.dimension == THE_NETHER: 0.007'f64 else: 0.002_333_333'f64
+  self.pushByFluid(0.014'f64, fluidPush[0], fluidN[0])
+  self.pushByFluid(lavaSpeed, fluidPush[1], fluidN[1])
+  let waterHeight = fluidHeight[0]
+  let inWater = inFluid[0]
+  if inWater:
+    let living = caller.living
+    if living != nil:
+      living.fallDistance = 0.0'f32
+    # TODO upstream: splash particles when first touching water.
+  self.waterHeight = waterHeight
+  self.touchingWater = inWater
+  let lavaHeight = fluidHeight[1]
+  let inLava = inFluid[1]
+  if inLava:
+    let living = caller.living
+    if living != nil:
+      let halvedFall = living.fallDistance / 2.0'f32
+      if halvedFall != 0.0'f32:
+        living.fallDistance = halvedFall
+  self.lavaHeight = lavaHeight
+  self.touchingLava = inLava
+
+proc getPosWithYOffset*(self: Entity; offset: float64): (BlockPos, Option[Block], Option[BlockState]) =
+  ## `get_pos_with_y_offset`
+  if self.supportingBlockPos.isSome:
+    var supportingBlock = self.supportingBlockPos.unsafeGet
+    if offset > 1.0e-5'f64:
+      let stateId = self.world.stateIdAt(supportingBlock)
+      let blockRef = Block.fromStateId(stateId)
+      let state = BlockState.fromId(stateId)
+      supportingBlock.vec.y = asI32(floor(self.pos.y - offset))
+      return (supportingBlock, some(blockRef), some(state))
+    return (supportingBlock, none[Block](), none[BlockState]())
+  var blockPos = self.blockPos
+  blockPos.vec.y = asI32(floor(self.pos.y - offset))
+  (blockPos, none[Block](), none[BlockState]())
+
+proc getBlockWithYOffset*(self: Entity; offset: float64): (BlockPos, Block, BlockState) =
+  ## `get_block_with_y_offset`
+  let (pos, blockRef, state) = self.getPosWithYOffset(offset)
+  if blockRef.isSome and state.isSome:
+    return (pos, blockRef.unsafeGet, state.unsafeGet)
+  let stateId = self.world.stateIdAt(pos)
+  (pos, Block.fromStateId(stateId), BlockState.fromId(stateId))
+
+proc movementInputToVelocity*(self: Entity; movementInput: Vector3[float64]; speed: float64): Vector3[float64] =
+  ## `movement_input_to_velocity`: Entity.movementInputToVelocity in yarn.
+  let yaw = degToRad(float64(self.yaw))
+  let dist = movementInput.lengthSquared()
+  if dist < 1.0e-7'f64:
+    return Vector3[float64](x: 0.0, y: 0.0, z: 0.0)
+  let input = if dist > 1.0'f64: movementInput.normalize() * speed else: movementInput * speed
+  let s = sin(yaw)
+  let c = cos(yaw)
+  Vector3[float64](x: mulAdd(input.x, c, -(input.z * s)), y: input.y, z: mulAdd(input.z, c, input.x * s))
+
+proc updateVelocityFromInput*(self: Entity; movementInput: Vector3[float64]; speed: float64) =
+  ## `update_velocity_from_input`: Entity.updateVelocity in yarn.
+  self.velocity = self.velocity + self.movementInputToVelocity(movementInput, speed)
+
+proc getVelocityMultiplier*(self: Entity): float32 =
+  ## `get_velocity_multiplier`
+  let blockRef = self.world.getBlock(self.blockPos)
+  let multiplier = blockRef.velocityMultiplier
+  if multiplier != 1.0'f32 or blockRef.id == blockIdWater or blockRef.id == blockIdBubbleColumn:
+    multiplier
+  else:
+    self.getBlockWithYOffset(0.500_001'f64)[1].velocityMultiplier
+
+proc getJumpVelocityMultiplier*(self: Entity): float32 =
+  ## `get_jump_velocity_multiplier`
+  let f = self.world.getBlock(self.blockPos).jumpVelocityMultiplier
+  let g = self.getBlockWithYOffset(0.500_001'f64)[1].jumpVelocityMultiplier
+  if f == 1.0'f32: g else: f
+
+proc movePos*(self: Entity; delta: Vector3[float64]) =
+  ## `move_pos`
+  self.setPos(self.pos + delta)
+
+proc fall*(self: LivingEntity; caller: EntityBase; heightDifference: float64; ground, dontDamage: bool)
+
+proc moveEntity*(self: Entity; caller: EntityBase; motion0: Vector3[float64]) =
+  ## `move_entity`: move by a delta and adjust for collisions. Does not send movement. That must be done separately.
+  if caller.player != nil:
+    return
+  if self.noClip:
+    self.movePos(motion0)
+    return
+  var motion = motion0
+  let movementMultiplier = self.movementMultiplier
+  self.movementMultiplier = Vector3[float64](x: 0.0, y: 0.0, z: 0.0)
+  if movementMultiplier.lengthSquared() > 1.0e-7'f64:
+    motion = motion.multiply(movementMultiplier.x, movementMultiplier.y, movementMultiplier.z)
+    self.velocity = Vector3[float64](x: 0.0, y: 0.0, z: 0.0)
+  let finalMove = self.adjustMovementForCollisions(motion, caller)
+  self.movePos(finalMove)
+  let velocityMultiplier = float64(self.getVelocityMultiplier())
+  self.velocity = finalMove * velocityMultiplier
+  let living = caller.living
+  if living != nil:
+    living.fall(caller, finalMove.y, self.onGround, false)
+  if motion.y != finalMove.y:
+    gBlockHooks.updateEntityMovementAfterFallOn(self.getBlockWithYOffset(0.2'f64)[1], caller)
+
+proc pushOutOfBlocks*(self: Entity; centerPos: Vector3[float64]) =
+  ## `push_out_of_blocks`
+  let blockPos = flooredV(centerPos)
+  let delta = centerPos.sub(blockPos.vec.toF64())
+  var minDist = 1.7976931348623157e308'f64
+  var direction = BlockDirection.Up
+  let allDirections = blockDirectionAll()
+  for dir in allDirections:
+    if dir == BlockDirection.Down:
+      continue
+    let offset = dir.toOffset()
+    if BlockState.fromId(self.world.stateIdAt(blockPos.offset(offset))).isFullCube:
+      continue
+    let component = delta.getAxis(toMathAxis(dir.toAxis()))
+    let dist = if dir.positive(): 1.0'f64 - component else: component
+    if dist < minDist:
+      minDist = dist
+      direction = dir
+  let amplitude = mulAdd(randomF64(), 0.2'f64, 0.1'f64)
+  let axis = toMathAxis(direction.toAxis())
+  let sign = if direction.positive(): 1.0'f64 else: -1.0'f64
+  var velo = self.velocity
+  velo = velo * 0.75'f64
+  velo.setAxis(axis, sign * amplitude)
+  self.velocity = velo
+
+proc extinguish*(self: Entity) =
+  ## `extinguish`
+  self.fireTicks = 0'i32
+
+proc isFreezeImmune*(self: Entity): bool =
+  ## `is_freeze_immune`
+  hasTag(self.entityType.id, EntityType_MINECRAFT_FREEZE_IMMUNE_ENTITY_TYPES)
+
+proc canFreeze(self: Entity; caller: EntityBase): bool =
+  ## `can_freeze`: mirrors vanilla `LivingEntity#canFreeze`.
+  if caller.isSpectator() or self.isFreezeImmune():
+    return false
+  let living = caller.living
+  if living == nil:
+    return true
+  for slot in [esHead, esChest, esLegs, esFeet]:
+    if hasTag(living.entityEquipment.get(slot).item.id, Item_MINECRAFT_FREEZE_IMMUNE_WEARABLES):
+      return false
+  true
+
+proc tickFrozen*(self: Entity; caller: EntityBase) =
+  ## `tick_frozen`
+  let canFreeze = self.canFreeze(caller)
+  let inPowderSnow = self.isInPowderSnow
+  let oldFrozenTicks = self.frozenTicks
+  let newFrozenTicks = if inPowderSnow and canFreeze: min(oldFrozenTicks + 1'i32, MaxFrozenTicks)
+    else: max(oldFrozenTicks - 2'i32, 0'i32)
+  # Only update and send metadata if the value changed
+  if newFrozenTicks != oldFrozenTicks:
+    self.frozenTicks = newFrozenTicks
+    self.sendMetaData(TrackedData_TICKS_FROZEN, INTEGER, newVarInt(newFrozenTicks))
+  # Vanilla parity: full-freeze damage is tick-phase based.
+  if canFreeze and newFrozenTicks >= MaxFrozenTicks and self.age mod FreezeDamageInterval == 0'i32:
+    discard caller.damage(caller, 1.0'f32, FREEZE)
+
+proc setPitch*(self: Entity; pitch: float32) =
+  ## `set_pitch`
+  let clamped = clamp(pitch, -90.0'f32, 90.0'f32)
+  self.pitch = fmodF32(clamped, 360.0'f32)
+
+proc setRotation*(self: Entity; yaw, pitch: float32) =
+  ## `set_rotation`
+  self.yaw = yaw
+  self.setPitch(pitch)
+
+proc removeEntity*(world: World; entity: Entity)
+
+proc remove*(self: Entity) =
+  ## `remove`: from the current world.
+  removeEntity(self.world, self)
+
+proc createSpawnPacket*(self: Entity): CSpawnEntity =
+  ## `create_spawn_packet`
+  newCSpawnEntity(newVarInt(self.entityId), self.entityUuid, newVarInt(int32(self.entityType.id)), self.pos, self.pitch,
+    self.yaw, self.headYaw, newVarInt(self.data), self.velocity)
+
+proc width*(self: Entity): float32 = self.entityDimension.width
+proc height*(self: Entity): float32 = self.entityDimension.height
+
+proc setFlag(self: Entity; flag: EntityFlag; value: bool) =
+  ## `set_flag`
+  let mask = cast[int8](1'u8 shl uint8(ord(flag)))
+  if value:
+    self.flags = self.flags or mask
+  else:
+    self.flags = self.flags and (not mask)
+  self.sendMetaData(TrackedData_SHARED_FLAGS_ID, BYTE, self.flags)
+
+proc setSneaking*(self: Entity; sneaking: bool) =
+  self.sneaking = sneaking
+  self.setFlag(flagSneaking, sneaking)
+
+proc isSneaking*(self: Entity): bool = self.sneaking
+
+proc setSwimming*(self: Entity; swimming: bool) =
+  if self.swimming != swimming:
+    self.swimming = swimming
+    self.setFlag(flagSwimming, swimming)
+
+proc setInvisible*(self: Entity; invisible: bool) =
+  if self.invisible != invisible:
+    self.invisible = invisible
+    self.setFlag(flagInvisible, invisible)
+
+proc setGlowing*(self: Entity; glowing: bool) =
+  if self.glowing != glowing:
+    self.glowing = glowing
+    self.setFlag(flagGlowing, glowing)
+
+proc setOnFire*(self: Entity; onFire: bool) =
+  if self.hasVisualFire != onFire:
+    self.hasVisualFire = onFire
+    self.setFlag(flagOnFire, onFire)
+
+proc getHorizontalFacing*(self: Entity): HorizontalFacing =
+  ## `get_horizontal_facing`: vanilla's floor(angle / 90.0 + 0.5) & 3.
+  let quarterTurns = asI32(floor((self.yaw / 90.0'f32) + 0.5'f32)) and 3'i32
+  case quarterTurns
+  of 0'i32: HorizontalFacing.South
+  of 1'i32: HorizontalFacing.West
+  of 2'i32: HorizontalFacing.North
+  else: HorizontalFacing.East
+
+proc getRotation16*(self: Entity): uint8 =
+  ## `get_rotation_16`
+  let adjustedYaw = remEuclidF32(self.yaw, 360.0'f32)
+  asU8(round(adjustedYaw / 22.5'f32)) mod 16'u8
+
+proc getFlippedRotation16*(self: Entity): uint8 =
+  (self.getRotation16() + 8'u8) mod 16'u8
+
+proc getFacing*(self: Entity): Facing =
+  ## `get_facing`
+  let pitch = toRadiansF32(self.pitch)
+  let yaw = -toRadiansF32(self.yaw)
+  let sinP = sinF32(pitch)
+  let cosP = cosF32(pitch)
+  let sinY = sinF32(yaw)
+  let cosY = cosF32(yaw)
+  let x = sinY * cosP
+  let y = -sinP
+  let z = cosY * cosP
+  let ax = abs(x)
+  let ay = abs(y)
+  let az = abs(z)
+  if ax > ay and ax > az:
+    if x > 0.0'f32: Facing.East else: Facing.West
+  elif ay > ax and ay > az:
+    if y > 0.0'f32: Facing.Up else: Facing.Down
+  elif z > 0.0'f32:
+    Facing.South
+  else:
+    Facing.North
+
+proc oppositeFacing(f: Facing): Facing =
+  f.toBlockDirection().opposite().toFacing()
+
+proc getEntityFacingOrder*(self: Entity): array[6, Facing] =
+  ## `get_entity_facing_order`
+  let pitch = toRadiansF32(self.pitch)
+  let yaw = -toRadiansF32(self.yaw)
+  let sinP = sinF32(pitch)
+  let cosP = cosF32(pitch)
+  let sinY = sinF32(yaw)
+  let cosY = cosF32(yaw)
+  let eastWest = if sinY > 0.0'f32: Facing.East else: Facing.West
+  let upDown = if sinP < 0.0'f32: Facing.Up else: Facing.Down
+  let southNorth = if cosY > 0.0'f32: Facing.South else: Facing.North
+  let xAxis = abs(sinY)
+  let yAxis = abs(sinP)
+  let zAxis = abs(cosY)
+  let xWeight = xAxis * cosP
+  let zWeight = zAxis * cosP
+  var first, second, third: Facing
+  if xAxis > zAxis:
+    if yAxis > xWeight:
+      first = upDown; second = eastWest; third = southNorth
+    elif zWeight > yAxis:
+      first = eastWest; second = southNorth; third = upDown
+    else:
+      first = eastWest; second = upDown; third = southNorth
+  elif yAxis > zWeight:
+    first = upDown; second = southNorth; third = eastWest
+  elif xWeight > yAxis:
+    first = southNorth; second = eastWest; third = upDown
+  else:
+    first = southNorth; second = upDown; third = eastWest
+  [first, second, third, oppositeFacing(third), oppositeFacing(second), oppositeFacing(first)]
+
+proc setSprinting*(self: Entity; sprinting: bool) =
+  self.sprinting = sprinting
+  self.setFlag(flagSprinting, sprinting)
+
+proc isSprinting*(self: Entity): bool = self.sprinting
+
+proc checkFallFlying*(self: Entity): bool = not self.onGround
+
+proc setFallFlying*(self: Entity; fallFlying: bool) =
+  assert self.fallFlying != fallFlying
+  self.fallFlying = fallFlying
+  self.setFlag(flagFallFlying, fallFlying)
+
+proc isFallFlying*(self: Entity): bool = self.fallFlying
+
+proc playSound*(self: Entity; soundRef: Sound) =
+  ## `play_sound`: at this entity, in the neutral category.
+  self.world.playSound(soundRef, scNeutral, self.pos)
+
+proc setPose*(self: Entity; pose: EntityPose) =
+  ## `set_pose`
+  let dimension = getEntityDimensions(pose)
+  let position = self.pos
+  let aabb = BoundingBox.newFromPos(position.x, position.y, position.z, dimension)
+  if self.world.isSpaceEmpty(aabb.contractAll(1.0e-7'f64)):
+    self.pose = pose
+    self.boundingBox = aabb
+    self.entityDimension = dimension
+    self.sendMetaData(TrackedData_POSE, ENTITY_POSE, newVarInt(int32(ord(pose))))
+
+proc isInvulnerableTo*(self: Entity; damageType: DamageType): bool =
+  ## `is_invulnerable_to`
+  # Nothing is immune to void or kill
+  if damageType.id == GENERIC_KILL.id or damageType.id == OUT_OF_WORLD.id:
+    return false
+  # General invulnerability
+  if self.invulnerable:
+    return true
+  # Specific type immunities
+  for immune in self.damageImmunities:
+    if immune.id == damageType.id:
+      return true
+  false
+
+proc setDamageImmunity*(self: Entity; damageType: DamageType; immune: bool) =
+  ## `set_damage_immunity`
+  var at = -1
+  for i in 0 ..< self.damageImmunities.len:
+    if self.damageImmunities[i].id == damageType.id:
+      at = i
+  if immune:
+    if at < 0:
+      self.damageImmunities.add(damageType)
+  elif at >= 0:
+    self.damageImmunities.delete(at)
+
+proc setInvulnerable*(self: Entity; invulnerable: bool) =
+  self.invulnerable = invulnerable
+
+proc checkBlockCollision*(entity: EntityBase; server: Server) =
+  ## `check_block_collision`
+  let aabb = entity.entity.boundingBox
+  let world = entity.entity.world
+  let lox = asI32(floor(aabb.min.x + 0.001'f64))
+  let loy = asI32(floor(aabb.min.y + 0.001'f64))
+  let loz = asI32(floor(aabb.min.z + 0.001'f64))
+  let hix = asI32(floor(aabb.max.x - 0.001'f64))
+  let hiy = asI32(floor(aabb.max.y - 0.001'f64))
+  let hiz = asI32(floor(aabb.max.z - 0.001'f64))
+  for x in lox .. hix:
+    for y in loy .. hiy:
+      for z in loz .. hiz:
+        let pos = BlockPos(vec: Vector3[int32](x: x, y: y, z: z))
+        let stateId = world.stateIdAt(pos)
+        let state = BlockState.fromId(stateId)
+        let blockRef = Block.fromStateId(stateId)
+        if state.outlineShapes.len == 0:
+          gBlockHooks.onEntityCollision(blockRef, world, entity, pos, state, server)
+          gBlockHooks.onEntityCollisionFluid(world.getFluid(pos), entity)
+          continue
+        for outline in state.getBlockOutlineShapes():
+          if outline.atPos(pos).intersects(aabb):
+            gBlockHooks.onEntityCollision(blockRef, world, entity, pos, state, server)
+            gBlockHooks.onEntityCollisionFluid(world.getFluid(pos), entity)
+            break
+
+proc teleportEntity*(self: Entity; position: Vector3[float64]; yaw, pitch: Option[float32]; world: World) =
+  ## `Entity::teleport`, the private one. Upstream ignores `world` here too.
+  # Update server-side position and bounding box
+  self.setPos(position)
+  if yaw.isSome:
+    self.yaw = yaw.unsafeGet
+  if pitch.isSome:
+    self.setPitch(pitch.unsafeGet)
+  # Update cache so we don't send rubberbanding deltas
+  self.lastSentPos = position
+  if yaw.isSome:
+    self.lastSentYaw = angleToU8(yaw.unsafeGet)
+    self.lastSentHeadYaw = angleToU8(yaw.unsafeGet)
+  if pitch.isSome:
+    self.lastSentPitch = angleToU8(pitch.unsafeGet)
+  self.world.broadcastToChunk(self.chunkPos, CEntityPositionSync(entityId: newVarInt(self.entityId), position: position,
+    delta: Vector3[float64](x: 0.0, y: 0.0, z: 0.0), yaw: (if yaw.isSome: yaw.unsafeGet else: self.yaw),
+    pitch: (if pitch.isSome: pitch.unsafeGet else: self.pitch), onGround: self.onGround))
+
+proc getEyePos*(self: Entity): Vector3[float64] =
+  ## `get_eye_pos`
+  let pos = self.pos
+  Vector3[float64](x: pos.x, y: pos.y + float64(self.entityDimension.eyeHeight), z: pos.z)
+
+proc getEyeY*(self: Entity): float64 =
+  self.pos.y + float64(self.entityDimension.eyeHeight)
+
+proc isRemoved*(self: Entity): bool = self.removalReason.isSome
+
+proc isAlive*(self: Entity): bool = not self.isRemoved()
+
+proc leashTo*(self: Entity; holder: EntityBase) =
+  ## `leash_to`
+  self.leashedTo = holder
+  self.world.broadcastToChunk(self.chunkPos, CSetEntityLink(attachedEntityId: self.entityId,
+    holdingEntityId: holder.entity.entityId))
+
+proc unleash*(self: Entity) =
+  ## `unleash`
+  if self.leashedTo == nil:
+    return
+  self.leashedTo = nil
+  self.world.broadcastToChunk(self.chunkPos, CSetEntityLink(attachedEntityId: self.entityId, holdingEntityId: -1'i32))
+
+proc tickLeash*(self: Entity) =
+  ## `tick_leash`
+  let holder = self.leashedTo
+  if holder != nil:
+    let holderEntity = holder.entity
+    # Drop leash if entity or holder is removed or dead
+    if not self.isAlive() or not holderEntity.isAlive():
+      self.unleash()
+      return
+    let selfPos = self.pos
+    let holderPos = holderEntity.pos
+    let diff = selfPos - holderPos
+    let distance = diff.length()
+    if distance > LeashSnapDistance:
+      # Too far: snap/break leash and drop lead item
+      self.unleash()
+      gDropStack(self.world, self.blockPos, newItemStack(1'u8, ITEM_LEAD))
+    elif distance > LeashElasticDistance:
+      # Elastic pull force towards leash holder
+      let dir = (holderPos - selfPos).normalize()
+      let pullStrength = (distance - LeashElasticDistance) * 0.11'f64
+      self.velocity = self.velocity + dir * pullStrength
+      self.velocityDirty = true
+
+proc hasPassengers*(self: Entity): bool = self.passengers.len > 0
+
+proc hasVehicle*(self: Entity): bool = self.vehicle != nil
+
+proc passengerIds(self: Entity): seq[VarInt] =
+  result = @[]
+  for p in self.passengers:
+    result.add(newVarInt(p.entity.entityId))
+
+proc addPassenger*(self: Entity; vehicle, passenger: EntityBase) =
+  ## `add_passenger`
+  passenger.entity.vehicle = vehicle
+  self.passengers.add(passenger)
+  self.world.broadcastToChunk(self.chunkPos, CSetPassengers(entityId: newVarInt(self.entityId),
+    passengers: self.passengerIds()))
+
+proc dismountDirection(wrappedYaw: float32): BlockDirection =
+  if not (wrappedYaw >= 45.0'f32 and wrappedYaw < 315.0'f32): BlockDirection.South
+  elif wrappedYaw >= 45.0'f32 and wrappedYaw < 135.0'f32: BlockDirection.West
+  elif wrappedYaw >= 135.0'f32 and wrappedYaw < 225.0'f32: BlockDirection.North
+  else: BlockDirection.East
+
+proc dismountStep(dir: BlockDirection): (int32, int32) =
+  case dir
+  of BlockDirection.North: (0'i32, -1'i32)
+  of BlockDirection.South: (0'i32, 1'i32)
+  of BlockDirection.East: (1'i32, 0'i32)
+  of BlockDirection.West: (-1'i32, 0'i32)
+  else: (0'i32, 0'i32)
+
+proc dismountClockwise(dir: BlockDirection): BlockDirection =
+  case dir
+  of BlockDirection.North: BlockDirection.East
+  of BlockDirection.East: BlockDirection.South
+  of BlockDirection.South: BlockDirection.West
+  of BlockDirection.West: BlockDirection.North
+  else: dir
+
+proc dismountOpposite(dir: BlockDirection): BlockDirection =
+  case dir
+  of BlockDirection.North: BlockDirection.South
+  of BlockDirection.South: BlockDirection.North
+  of BlockDirection.East: BlockDirection.West
+  of BlockDirection.West: BlockDirection.East
+  else: dir
+
+proc removePassenger*(self: Entity; passengerId: int32) =
+  ## `remove_passenger`
+  var removedPassenger: nil EntityBase = nil
+  for idx in 0 ..< self.passengers.len:
+    if self.passengers[idx].entity.entityId == passengerId:
+      removedPassenger = self.passengers[idx]
+      self.passengers.delete(idx)
+      removedPassenger.entity.vehicle = nil
+      break
+  let ids = self.passengerIds()
+  let chunkPos = self.chunkPos
+  let world = self.world
+  if removedPassenger == nil:
+    # No passenger was removed, still need to broadcast the passenger list
+    world.broadcastToChunk(chunkPos, CSetPassengers(entityId: newVarInt(self.entityId), passengers: ids))
+    return
+  let passenger = cast[EntityBase](removedPassenger)
+  let vehicleBox = self.boundingBox
+  let passengerEntity = passenger.entity
+  let passengerPlayer = passenger.player
+  # Pre-allocate teleport ID and block movement packets BEFORE sending CSetPassengers: see upstream's note on the race.
+  var teleportId = 0'i32
+  if passengerPlayer != nil:
+    passengerPlayer.teleportIdCount += 1'i32
+    teleportId = passengerPlayer.teleportIdCount
+    let placeholder = Vector3[float64](x: self.pos.x, y: vehicleBox.max.y, z: self.pos.z)
+    passengerPlayer.awaitingTeleport = some((teleportId, placeholder))
+  # Vanilla: ridingCooldown = 60 (prevents immediate re-mount)
+  passengerEntity.ridingCooldown = 60'i32
+  let passengersPacket = CSetPassengers(entityId: newVarInt(self.entityId), passengers: ids)
+  if passengerPlayer != nil:
+    passengerPlayer.client.writePacketFor(passengersPacket)
+    world.broadcastToChunkExcept(chunkPos, passengerEntity.entityUuid, passengersPacket)
+  else:
+    world.broadcastToChunk(chunkPos, passengersPacket)
+  # Calculate dismount directions and offsets (vanilla DismountHelper)
+  let vehicleYaw = self.yaw
+  let wrappedYaw = fmodF32(fmodF32(vehicleYaw, 360.0'f32) + 360.0'f32, 360.0'f32)
+  let forwardDir = dismountDirection(wrappedYaw)
+  let rightDir = dismountClockwise(forwardDir)
+  let leftDir = dismountOpposite(rightDir)
+  let backDir = dismountOpposite(forwardDir)
+  let (fx, fz) = dismountStep(forwardDir)
+  let (rx, rz) = dismountStep(rightDir)
+  let (lx, lz) = dismountStep(leftDir)
+  let (bx, bz) = dismountStep(backDir)
+  let offsetsX = @[rx, lx, bx + rx, bx + lx, fx + rx, fx + lx, bx, fx]
+  let offsetsZ = @[rz, lz, bz + rz, bz + lz, fz + rz, fz + lz, bz, fz]
+  let targetBlockY0 = asI32(floor(vehicleBox.max.y))
+  let belowPos = BlockPos(vec: Vector3[int32](x: asI32(floor(self.pos.x)), y: targetBlockY0 - 1'i32,
+    z: asI32(floor(self.pos.z))))
+  let belowFluid = Fluid.fromStateId(world.stateIdAt(belowPos))
+  # Vanilla: isWater checks specifically for water fluid, not any fluid
+  let isWater = belowFluid.isSome and (belowFluid.unsafeGet.id == Fluid.WATER.id or
+    belowFluid.unsafeGet.id == Fluid.FLOWING_WATER.id)
+  let fallbackPos = Vector3[float64](x: self.pos.x, y: vehicleBox.max.y, z: self.pos.z)
+  var dismountPos = fallbackPos
+  if not isWater:
+    # Vanilla checks Standing, Crouching, Swimming poses and their respective height checks
+    let posesAndHeights = @[(epStanding, @[0'i32, 1'i32, -1'i32]), (epCrouching, @[0'i32, 1'i32, -1'i32]),
+      (epSwimming, @[0'i32, 1'i32])]
+    let vehicleBlockPos = self.blockPos
+    var found = false
+    var foundPos = fallbackPos
+    var foundPose = epStanding
+    block search:
+      for entry in posesAndHeights:
+        let dims = getEntityDimensions(entry[0])
+        for yOffset in entry[1]:
+          for i in 0 ..< offsetsX.len:
+            let targetBlockX = vehicleBlockPos.vec.x + offsetsX[i]
+            let targetBlockY = vehicleBlockPos.vec.y + yOffset
+            let targetBlockZ = vehicleBlockPos.vec.z + offsetsZ[i]
+            let height = world.getDismountHeight(BlockPos(vec: Vector3[int32](x: targetBlockX, y: targetBlockY, z: targetBlockZ)))
+            if height != Inf and height != -Inf and not isNaN(height) and height < 1.0'f64:
+              let location = Vector3[float64](x: float64(targetBlockX) + 0.5'f64, y: float64(targetBlockY) + height,
+                z: float64(targetBlockZ) + 0.5'f64)
+              if world.isSpaceEmpty(BoundingBox.newFromPos(location.x, location.y, location.z, dims)):
+                found = true
+                foundPos = location
+                foundPose = entry[0]
+                break search
+    if found:
+      if foundPose != epStanding:
+        passengerEntity.setPose(foundPose)
+      dismountPos = foundPos
+    else:
+      # Try dismounting directly on top of the vehicle as fallback
+      let vehicleTop = vehicleBox.max.y
+      for pose in [epStanding, epCrouching, epSwimming]:
+        let dims = getEntityDimensions(pose)
+        if world.isSpaceEmpty(BoundingBox.newFromPos(self.pos.x, vehicleTop, self.pos.z, dims)):
+          if pose != epStanding:
+            passengerEntity.setPose(pose)
+          dismountPos = Vector3[float64](x: self.pos.x, y: vehicleTop, z: self.pos.z)
+          break
+  if passengerPlayer != nil:
+    passengerEntity.setPos(dismountPos)
+    playermod.setPos(passengerPlayer, dismountPos)
+    # Update awaiting_teleport with the real dismount position
+    passengerPlayer.awaitingTeleport = some((teleportId, dismountPos))
+    # Vanilla uses DELTA | ROT flags: position absolute, delta/rotation relative.
+    passengerPlayer.client.writePacketFor(CPlayerPosition(teleportId: newVarInt(teleportId), position: dismountPos,
+      delta: Vector3[float64](x: 0.0, y: 0.0, z: 0.0), yaw: 0.0'f32, pitch: 0.0'f32,
+      relatives: @[pfDeltaX, pfDeltaY, pfDeltaZ, pfYRot, pfXRot]))
+    # Vanilla: setSneaking(false) after dismount via sneak input
+    if passengerEntity.sneaking:
+      passengerEntity.setSneaking(false)
+  else:
+    passengerEntity.setPos(dismountPos)
+
+proc checkOutOfWorld*(self: Entity; dynSelf: EntityBase) =
+  ## `check_out_of_world`
+  if self.pos.y < float64(self.world.dimension.minY) - 64.0'f64:
+    dynSelf.tickInVoid(dynSelf)
+
+proc resetState*(self: Entity) =
+  ## `reset_state`
+  self.pose = epStanding
+  self.fallFlying = false
+  self.extinguish()
+  self.setOnFire(false)
+
+proc slowMovement*(self: Entity; state: BlockState; multiplier: Vector3[float64]) =
+  ## `slow_movement`. Upstream reads `self.get_player()` and `self.get_living_entity()` on an `Entity`, whose
+  ## `EntityBase` impl answers `None` to both, so the player-flying check and the fall distance reset never run.
+  ## That is kept. A spider in cobweb and a wither are what actually return early.
+  let id = self.entityType.id
+  if (id == EntityType.SPIDER.id or id == EntityType.CAVE_SPIDER.id) and Block.fromStateId(state.id).id == blockIdCobweb:
+    return
+  if id == EntityType.WITHER.id:
+    return
+  self.movementMultiplier = multiplier
+
+proc setOnFireForTicks*(self: Entity; ticks: uint32) =
+  ## `EntityBase::set_on_fire_for_ticks`'s default body.
+  if self.fireTicks < int32(ticks):
+    self.fireTicks = int32(ticks)
+
+proc setOnFireFor*(self: Entity; seconds: float32) =
+  ## `EntityBase::set_on_fire_for`'s default body.
+  if not self.fireImmune:
+    self.setOnFireForTicks(uint32(floor(seconds * 20.0'f32)))
+
+# NBT `impl NBTStorage for Entity`
+
+proc listOf3(a, b, c: float64): NbtTag =
+  NbtTag(kind: ntkList, listVal: @[nbtTag(a), nbtTag(b), nbtTag(c)])
+
+proc writeEntityNbt*(self: Entity; nbt: var NbtCompound) =
+  ## `impl NBTStorage for Entity`: `write_nbt`
+  let position = self.pos
+  nbt.putString("id", "minecraft:" & self.entityType.resourceName)
+  let idInts = toIntArray(self.entityUuid)
+  nbt.put("UUID", NbtTag(kind: ntkIntArray, intArrayVal: @[idInts[0], idInts[1], idInts[2], idInts[3]]))
+  nbt.put("Pos", listOf3(position.x, position.y, position.z))
+  let velocity = self.velocity
+  nbt.put("Motion", listOf3(velocity.x, velocity.y, velocity.z))
+  nbt.put("Rotation", NbtTag(kind: ntkList, listVal: @[nbtTag(self.yaw), nbtTag(self.pitch)]))
+  nbt.putShort("Fire", cast[int16](self.fireTicks))
+  nbt.putBool("OnGround", self.onGround)
+  nbt.putBool("Invulnerable", self.invulnerable)
+  nbt.putInt("PortalCooldown", int32(self.portalCooldown))
+  if self.hasVisualFire:
+    nbt.putBool("HasVisualFire", true)
+  nbt.putInt("TicksFrozen", self.frozenTicks)
+  if self.customName.isSome:
+    nbt.putString("CustomName", toJsonString(self.customName.unsafeGet))
+  nbt.putBool("CustomNameVisible", self.customNameVisible)
+  if self.scoreboardTags.len > 0:
+    var tags: seq[NbtTag] = @[]
+    for tag in self.scoreboardTags:
+      tags.add(nbtTag(tag))
+    nbt.put("Tags", NbtTag(kind: ntkList, listVal: tags))
+
+proc listF64(list: seq[NbtTag]; i: int): float64 =
+  ## `position[i].extract_double().unwrap_or(0.0)`
+  let v = list[i].extractDouble()
+  if v.isSome: v.unsafeGet else: 0.0'f64
+
+proc listF32(list: seq[NbtTag]; i: int): float32 =
+  let v = list[i].extractFloat()
+  if v.isSome: v.unsafeGet else: 0.0'f32
+
+proc readEntityNbt*(self: Entity; nbt: NbtCompound) =
+  ## `impl NBTStorage for Entity`: `read_nbt_non_mut`. A missing `Pos`, `Motion` or `Rotation` panics upstream too.
+  let position = nbt.getList("Pos").unsafeGet
+  let pos = Vector3[float64](x: listF64(position, 0), y: listF64(position, 1), z: listF64(position, 2))
+  self.setPos(pos)
+  self.lastSentPos = pos
+  let velocity = nbt.getList("Motion").unsafeGet
+  self.velocity = Vector3[float64](x: listF64(velocity, 0), y: listF64(velocity, 1), z: listF64(velocity, 2))
+  let rotation = nbt.getList("Rotation").unsafeGet
+  let yaw = listF32(rotation, 0)
+  let pitch = listF32(rotation, 1)
+  self.setRotation(yaw, pitch)
+  let yawByte = angleToU8(yaw)
+  let pitchByte = angleToU8(pitch)
+  self.lastSentYaw = yawByte
+  self.lastSentPitch = pitchByte
+  self.headYaw = yaw
+  self.lastSentHeadYaw = yawByte
+  let fire = nbt.getShort("Fire")
+  self.fireTicks = if fire.isSome: int32(fire.unsafeGet) else: 0'i32
+  let ground = nbt.getBool("OnGround")
+  self.onGround = ground.isSome and ground.unsafeGet
+  let inv = nbt.getBool("Invulnerable")
+  self.invulnerable = inv.isSome and inv.unsafeGet
+  let portal = nbt.getInt("PortalCooldown")
+  self.portalCooldown = if portal.isSome: cast[uint32](portal.unsafeGet) else: 0'u32
+  let visual = nbt.getBool("HasVisualFire")
+  self.hasVisualFire = visual.isSome and visual.unsafeGet
+  let frozen = nbt.getInt("TicksFrozen")
+  self.frozenTicks = if frozen.isSome: frozen.unsafeGet else: 0'i32
+  let nameJson = nbt.getString("CustomName")
+  if nameJson.isSome:
+    let parsed = TextComponent.fromJsonString(nameJson.unsafeGet)
+    if parsed.ok:
+      self.customName = some(parsed.value)
+  let nameVisible = nbt.getBool("CustomNameVisible")
+  self.customNameVisible = nameVisible.isSome and nameVisible.unsafeGet
+  let tagList = nbt.getList("Tags")
+  if tagList.isSome:
+    self.scoreboardTags = @[]
+    for tag in tagList.unsafeGet:
+      if self.scoreboardTags.len >= MaxScoreboardTags:
+        break
+      let value = tag.extractString()
+      if value.isSome:
+        var known = false
+        for have in self.scoreboardTags:
+          if have == value.unsafeGet:
+            known = true
+        if not known:
+          self.scoreboardTags.add(value.unsafeGet)
+
+proc effectToNbt*(self: Effect; nbt: var NbtCompound) =
+  ## pumpkin/src/entity/effect/mod.rs: `impl NBTStorage for Effect`. See effect.aowl.
+  nbt.put("id", self.effectType.minecraftName)
+  if self.amplifier > 0'u8:
+    nbt.putInt("amplifier", int32(self.amplifier))
+  nbt.putInt("duration", self.duration)
+  if self.ambient:
+    nbt.putByte("ambient", 1'i8)
+  if not self.showParticles:
+    nbt.putByte("show_particles", 0'i8)
+  nbt.putByte("show_icon", if self.showIcon: 1'i8 else: 0'i8)
+
+proc effectFromNbt*(nbt: NbtCompound): Option[Effect] =
+  ## pumpkin/src/entity/effect/mod.rs: `impl NBTStorageInit for Effect`.
+  let effectId = nbt.getString("id")
+  if effectId.isNone:
+    echo "Unable to read effect. Effect id is not present"
+    return none[Effect]()
+  let effectType = StatusEffect.fromMinecraftName(effectId.unsafeGet)
+  if effectType.isNone:
+    echo "Unable to read effect. Unknown effect type: ", effectId.unsafeGet
+    return none[Effect]()
+  let showIcon = nbt.getByte("show_icon")
+  if showIcon.isNone:
+    echo "Unable to read effect. Show icon is not present"
+    return none[Effect]()
+  let amplifier = nbt.getInt("amplifier")
+  let duration = nbt.getInt("duration")
+  let ambient = nbt.getByte("ambient")
+  let showParticles = nbt.getByte("show_particles")
+  some(Effect(effectType: effectType.unsafeGet, duration: (if duration.isSome: duration.unsafeGet else: 0'i32),
+    amplifier: (if amplifier.isSome: cast[uint8](amplifier.unsafeGet and 0xFF'i32) else: 0'u8),
+    ambient: ambient.isSome and ambient.unsafeGet == 1'i8,
+    showParticles: showParticles.isNone or showParticles.unsafeGet == 1'i8,
+    showIcon: showIcon.unsafeGet == 1'i8, blend: false))
+
+# --- `impl LivingEntity` ------------------------------------------------------------------------------------------------------
+
+proc hurtSoundForEntity*(entityType: EntityType): Sound =
+  ## `hurt_sound_for_entity`
+  if entityType.hurtSound.len > 0:
+    let (known, s) = fromName(entityType.hurtSound)
+    if known:
+      return s
+  sdEntityGenericHurt
+
+proc newLivingEntity*(entity: Entity): LivingEntity =
+  ## `LivingEntity::new`
+  let waterMovementSpeedMultiplier =
+    if entity.entityType.id == EntityType.POLAR_BEAR.id: 0.98'f32
+    elif entity.entityType.id == EntityType.SKELETON_HORSE.id: 0.96'f32
+    else: 0.8'f32
+  var maxHealth = 20.0'f32 # Overridden by attribute base below
+  var attributes = initTable[uint8, AttributeInstance]()
+  for entry in entity.entityType.attributes:
+    if entry.attribute.id == MAX_HEALTH.id:
+      maxHealth = float32(entry.value)
+    attributes[entry.attribute.id] = newAttributeInstance(entry.value)
+  LivingEntity(entity: entity, health: maxHealth, itemInUse: none[ItemStack](), activeHand: none[netbase.Hand](),
+    activeEffects: @[], entityEquipment: newEntityEquipment(), equipmentDropChances: initTable[int, float32](),
+    movementInput: Vector3[float64](x: 0.0, y: 0.0, z: 0.0), equipmentSlots: buildEquipmentSlots(),
+    climbingPos: none[BlockPos](), waterMovementSpeedMultiplier: waterMovementSpeedMultiplier, attributes: attributes)
+
+proc entityId*(self: LivingEntity): int32 {.inline.} = self.entity.entityId
+
+proc sendEquipmentChanges*(self: LivingEntity; equipment: openArray[(EquipmentSlot, ItemStack)]) =
+  ## `send_equipment_changes`
+  if equipment.len == 0:
+    return
+  var wire: seq[(int8, ItemStackSerializer)] = @[]
+  for item in equipment:
+    wire.add((int8(ord(item[0])), toSerializer(item[1])))
+  self.entity.world.broadcastPacketExcept(self.entity.entityUuid, CSetEquipment(entityId: newVarInt(self.entityId()),
+    equipment: wire))
+
+proc pickup*(self: LivingEntity; item: Entity; stackAmount: uint32) =
+  ## `pickup`: an item entity or XP orb.
+  self.entity.world.broadcastToChunk(self.entity.chunkPos, CTakeItemEntity(entityId: newVarInt(item.entityId),
+    collectorEntityId: newVarInt(self.entity.entityId), stackAmount: newVarInt(int32(stackAmount))))
+
+proc setLivingFlag(self: LivingEntity; flag: uint8; value: bool) =
+  ## `set_living_flag`
+  var b = self.livingsFlags
+  if value:
+    b = b or flag
+  else:
+    b = b and (not flag)
+  self.livingsFlags = b
+  self.entity.sendMetaData(TrackedData_LIVING_ENTITY_FLAGS, BYTE, b)
+
+proc setActiveHand*(self: LivingEntity; hand: netbase.Hand; stack: ItemStack; duration: int32) =
+  ## `set_active_hand`
+  self.itemUseTime = duration
+  self.itemInUse = some(stack)
+  self.activeHand = some(hand)
+  self.setLivingFlag(UsingItemFlag, true)
+  self.setLivingFlag(OffHandActiveFlag, hand == hLeft)
+
+proc clearActiveHand*(self: LivingEntity) =
+  ## `clear_active_hand`
+  self.itemInUse = none[ItemStack]()
+  self.activeHand = none[netbase.Hand]()
+  self.itemUseTime = 0'i32
+  self.setLivingFlag(UsingItemFlag, false)
+
+proc isBlocking*(self: LivingEntity): bool =
+  ## `is_blocking`
+  if self.itemInUse.isSome:
+    let item = self.itemInUse.unsafeGet
+    if item.getDataComponent(BlocksAttacksImpl)[0]:
+      return item.getMaxUseTime() - self.itemUseTime >= 5'i32
+  false
+
+proc getAttributeValue*(self: LivingEntity; attribute: Attribute): float64 =
+  ## `get_attribute_value`
+  if self.attributes.hasKey(attribute.id):
+    return self.attributes.getOrDefault(attribute.id).value()
+  attribute.defaultValue
+
+proc getMaxHealth*(self: LivingEntity): float32 =
+  float32(self.getAttributeValue(MAX_HEALTH))
+
+proc setHealth*(self: LivingEntity; health: float32) =
+  ## `set_health`: clamp to [0, max_health].
+  let maxHealth = self.getMaxHealth()
+  let clamped = min(max(health, 0.0'f32), maxHealth)
+  self.health = clamped
+  # tell everyone entities health changed
+  self.entity.sendMetaData(TrackedData_HEALTH_ID, FLOAT, clamped)
+
+proc heal*(self: LivingEntity; additionalHealth: float32) =
+  ## `heal`
+  assert additionalHealth > 0.0'f32
+  self.setHealth(self.health + additionalHealth)
+
+proc baseOfType(self: LivingEntity; attribute: Attribute): (bool, float64) =
+  for entry in self.entity.entityType.attributes:
+    if entry.attribute.id == attribute.id:
+      return (true, entry.value)
+  (false, 0.0'f64)
+
+proc updateAttributeInstance*(self: LivingEntity; attribute: Attribute): AttributeInstance =
+  ## `update_attribute`'s find-or-insert. The caller changes the answer; it is already marked dirty.
+  if not self.attributes.hasKey(attribute.id):
+    let (known, base) = self.baseOfType(attribute)
+    if not known:
+      echo "Entity type ", self.entity.entityType.name, " has no base value for attribute ", attribute.id,
+        "; falling back to default ", attribute.defaultValue
+    self.attributes[attribute.id] = newAttributeInstance(if known: base else: attribute.defaultValue)
+  result = self.attributes.getOrDefault(attribute.id)
+  result.dirty = true
+
+proc getAttributeBase*(self: LivingEntity; attribute: Attribute): float64 =
+  ## `get_attribute_base`
+  if self.attributes.hasKey(attribute.id):
+    return self.attributes.getOrDefault(attribute.id).baseValue
+  let (known, base) = self.baseOfType(attribute)
+  assert known
+  base
+
+proc setAttributeBase*(self: LivingEntity; attribute: Attribute; newBase: float64) =
+  ## `set_attribute_base`
+  if self.attributes.hasKey(attribute.id):
+    let inst = self.attributes.getOrDefault(attribute.id)
+    inst.baseValue = newBase
+    inst.dirty = true
+  else:
+    let ai = newAttributeInstance(newBase)
+    ai.dirty = true
+    self.attributes[attribute.id] = ai
+
+proc sendAttributeUpdatesForLiving*(living: LivingEntity; attributes: openArray[Attribute]) =
+  ## pumpkin/src/entity/attributes.rs: `send_attribute_updates_for_living`
+  var properties: seq[update_attributes.Property] = @[]
+  for attribute in attributes:
+    var modifiers: seq[AttributeModifier] = @[]
+    if living.attributes.hasKey(attribute.id):
+      for modInst in living.attributes.getOrDefault(attribute.id).modifiers:
+        modifiers.add(AttributeModifier(id: modInst.id, amount: modInst.amount, operation: int8(ord(modInst.operation))))
+    properties.add(update_attributes.Property(id: newVarInt(int32(attribute.id)), value: living.getAttributeBase(attribute),
+      modifiers: modifiers))
+  living.entity.world.broadcastPacketAll(CUpdateAttributes(entityId: newVarInt(living.entity.entityId),
+    properties: properties))
+
+proc setMaxHealth*(self: LivingEntity; maxHealth: float32) =
+  ## `set_max_health`
+  self.setAttributeBase(MAX_HEALTH, float64(maxHealth))
+  sendAttributeUpdatesForLiving(self, [MAX_HEALTH])
+  if self.health > maxHealth:
+    self.setHealth(maxHealth)
+
+proc getAbsorption*(self: LivingEntity): float32 = self.absorption
+
+proc setAbsorption*(self: LivingEntity; newAbs0: float32) =
+  ## `set_absorption`
+  let newAbs = max(newAbs0, 0.0'f32)
+  self.absorption = newAbs
+  sendAttributeUpdatesForLiving(self, [MAX_ABSORPTION])
+  # Send absorption metadata for players (visual yellow hearts)
+  if self.entity.isPlayerType():
+    let trackedId = TrackedId(v1_21: 17'u8, v1_21_2: 17'u8, v1_21_4: 17'u8, v1_21_5: 17'u8, v1_21_6: 17'u8, v1_21_7: 17'u8,
+      v1_21_9: 17'u8, v1_21_11: 17'u8, v26_1: 17'u8, v26_2: 17'u8)
+    self.entity.sendMetaData(trackedId, FLOAT, newAbs)
+
+proc effectIndex(self: LivingEntity; effect: StatusEffect): int =
+  for i in 0 ..< self.activeEffects.len:
+    if self.activeEffects[i].effectType.id == effect.id:
+      return i
+  -1
+
+proc hasEffect*(self: LivingEntity; effect: StatusEffect): bool =
+  self.effectIndex(effect) >= 0
+
+proc getEffect*(self: LivingEntity; effect: StatusEffect): Option[Effect] =
+  let i = self.effectIndex(effect)
+  if i >= 0: some(self.activeEffects[i]) else: none[Effect]()
+
+proc touchedAttributes(effectType: StatusEffect): seq[Attribute] =
+  result = @[]
+  for m in effectType.attributeModifiers:
+    var known = false
+    for a in result:
+      if a.id == m.attribute.id:
+        known = true
+    if not known:
+      result.add(m.attribute)
+
+proc addEffect*(self: LivingEntity; effect: Effect) =
+  ## `add_effect`
+  # Apply instant effects immediately before storing
+  if effect.effectType.id == StatusEffect.INSTANT_HEALTH.id:
+    let healAmount = 4.0'f32 * float32(1'i32 shl int32(effect.amplifier))
+    self.heal(healAmount)
+  elif effect.effectType.id == StatusEffect.INSTANT_DAMAGE.id:
+    let damageAmount = 6.0'f32 * float32(1'i32 shl int32(effect.amplifier))
+    let dynSelf = self.entity.base
+    if dynSelf != nil:
+      discard dynSelf.damage(dynSelf, damageAmount, MAGIC)
+  else:
+    # Apply non-instant effects
+    let at = self.effectIndex(effect.effectType)
+    if at >= 0:
+      self.activeEffects[at] = effect
+    else:
+      self.activeEffects.add(effect)
+    # Effects that modify attributes (ex. speed) should also update the entity's attribute instances and notify clients.
+    if effect.effectType.attributeModifiers.len > 0:
+      for m in effect.effectType.attributeModifiers:
+        # `Operation::AddValue`, `AddMultipliedBase`, `AddMultipliedTotal` are in the same order.
+        let op = ModifierOperation(ord(m.operation))
+        let scaledAmount = m.baseValue * (float64(effect.amplifier) + 1.0'f64)
+        self.updateAttributeInstance(m.attribute).addOrReplaceModifier(
+          AttrModifier(id: m.id, amount: scaledAmount, operation: op))
+      sendAttributeUpdatesForLiving(self, touchedAttributes(effect.effectType))
+    # Apply absorption effect (+4 absorption per level)
+    if effect.effectType.id == StatusEffect.ABSORPTION.id:
+      let added = 4.0'f32 * (float32(effect.amplifier) + 1.0'f32)
+      let maxAbs = float32(self.getAttributeValue(MAX_ABSORPTION))
+      self.setAbsorption(min(self.absorption + added, maxAbs))
+    if effect.effectType.id == StatusEffect.INVISIBILITY.id:
+      self.entity.setInvisible(true)
+    if effect.effectType.id == StatusEffect.GLOWING.id:
+      self.entity.setGlowing(true)
+  # Broadcast effect to nearby players
+  var flag = 0'i8
+  if effect.ambient:
+    flag = flag or 1'i8
+  if effect.showParticles:
+    flag = flag or 2'i8
+  if effect.showIcon:
+    flag = flag or 4'i8
+  if effect.blend:
+    flag = flag or 8'i8
+  self.entity.world.broadcastPacketAll(CUpdateMobEffect(entityId: newVarInt(self.entity.entityId),
+    effectId: newVarInt(int32(effect.effectType.id)), amplifier: newVarInt(int32(effect.amplifier)),
+    duration: newVarInt(effect.duration), flags: flag))
+
+proc removeEffect*(self: LivingEntity; effectType: StatusEffect): bool {.discardable.} =
+  ## `remove_effect`
+  let at = self.effectIndex(effectType)
+  let succeeded = at >= 0
+  if succeeded:
+    self.activeEffects.delete(at)
+  # Broadcast effect removal
+  self.entity.world.sendRemoveMobEffect(self.entity, effectType)
+  # Remove attribute modifiers, if any
+  if effectType.attributeModifiers.len > 0:
+    for m in effectType.attributeModifiers:
+      # Clean local server state
+      self.updateAttributeInstance(m.attribute).removeModifier(m.id)
+    # Sync the clean state to the client
+    sendAttributeUpdatesForLiving(self, touchedAttributes(effectType))
+  # If absorption effect removed, clear current absorption amount and notify clients
+  if effectType.id == StatusEffect.ABSORPTION.id:
+    self.setAbsorption(0.0'f32)
+  # If health boost effect removed, clamp current health to new max and notify clients
+  if effectType.id == StatusEffect.HEALTH_BOOST.id:
+    let newMax = self.getMaxHealth()
+    if self.health > newMax:
+      self.setHealth(max(newMax, 0.0'f32))
+  if effectType.id == StatusEffect.INVISIBILITY.id:
+    self.entity.setInvisible(false)
+  if effectType.id == StatusEffect.GLOWING.id:
+    self.entity.setGlowing(false)
+  succeeded
+
+proc resetEffectsAndAttributes*(self: LivingEntity) =
+  ## `reset_effects_and_attributes`
+  var effectsToRemove: seq[StatusEffect] = @[]
+  for e in self.activeEffects:
+    effectsToRemove.add(e.effectType)
+  for effectType in effectsToRemove:
+    discard self.removeEffect(effectType)
+
+proc isInFallDamageResetting*(self: LivingEntity): (bool, Block) =
+  ## `is_in_fall_damage_resetting`
+  let blockRef = self.entity.world.getBlock(self.entity.blockPos)
+  (hasTag(asU16(blockRef.id), Block_MINECRAFT_FALL_DAMAGE_RESETTING), blockRef)
+
+proc isInWater*(self: LivingEntity): bool =
+  self.entity.world.getBlock(self.entity.blockPos).id == blockIdWater
+
+proc isInPowderSnow*(self: LivingEntity): bool =
+  self.entity.world.getBlock(self.entity.blockPos).id == blockIdPowderSnow
+
+proc shouldPreventFallDamage*(self: LivingEntity): bool =
+  ## `should_prevent_fall_damage`
+  let (prevents, blockRef) = self.isInFallDamageResetting()
+  if blockRef.id == blockIdScaffolding and not self.entity.isSneaking():
+    return false
+  if blockRef.id == blockIdWater:
+    return true
+  if self.entity.isPlayerType():
+    if blockRef.id == blockIdEndGateway or blockRef.id == blockIdEndPortal:
+      return true
+    if blockRef.id == blockIdNetherPortal:
+      return self.entity.world.levelInfo.gameRules.playersNetherPortalDefaultDelay == 0'i64
+  prevents
+
+proc shouldPreventFallDamageInArea*(self: LivingEntity): bool =
+  ## `should_prevent_fall_damage_in_area`. Upstream's FIXME stands: the java server raycasts here.
+  let world = self.entity.world
+  let blockPos = self.entity.blockPos.down()
+  let entityPos = self.entity.pos
+  for x in blockPos.vec.x - 1'i32 .. blockPos.vec.x + 1'i32:
+    for z in blockPos.vec.z - 1'i32 .. blockPos.vec.z + 1'i32:
+      let pos = BlockPos(vec: Vector3[int32](x: x, y: blockPos.vec.y, z: z))
+      let id = world.getBlock(pos).id
+      # `PREVENT_AREA_FALL_DAMAGE_BLOCKS`
+      if id == blockIdCobweb or id == blockIdLadder or id == blockIdPowderSnow or id == blockIdSlimeBlock:
+        let blockCenter = Vector3[float64](x: float64(x) + 0.5'f64, y: float64(blockPos.vec.y) + 0.5'f64,
+          z: float64(z) + 0.5'f64)
+        let distance = entityPos.squaredDistanceToVec(blockCenter)
+        # Fetch safe fall distance from attribute
+        let safeDistance = self.getAttributeValue(SAFE_FALL_DISTANCE)
+        return sqrt(distance) <= safeDistance * safeDistance
+  false
+
+proc isImmuneToFallDamage*(self: LivingEntity): bool =
+  hasTag(self.entity.entityType.id, EntityType_MINECRAFT_FALL_DAMAGE_IMMUNE)
+
+proc getEffectiveGravity(self: LivingEntity; caller: EntityBase): float64 =
+  ## `get_effective_gravity`
+  let finalGravity = caller.getGravity()
+  if self.entity.velocity.y <= 0.0'f64 and self.hasEffect(StatusEffect.SLOW_FALLING):
+    min(finalGravity, 0.01'f64)
+  else:
+    finalGravity
+
+proc swingHand*(self: LivingEntity) =
+  ## `swing_hand`
+  self.entity.world.broadcastPacketAll(newCEntityAnimation(newVarInt(self.entityId()), anSwingMainArm))
+
+proc getSwimHeight*(self: LivingEntity): float64 =
+  ## `get_swim_height`
+  let eyeHeight = self.entity.getEyeHeight()
+  if self.entity.entityType.id == EntityType.BREEZE.id: eyeHeight
+  elif eyeHeight < 0.4'f64: 0.0'f64
+  else: 0.4'f64
+
+proc getJumpVelocity(self: LivingEntity; strength0: float64): float64 =
+  ## `get_jump_velocity`
+  var strength = strength0
+  strength *= self.getAttributeValue(JUMP_STRENGTH)
+  strength *= float64(self.entity.getJumpVelocityMultiplier())
+  let effect = self.getEffect(StatusEffect.JUMP_BOOST)
+  if effect.isSome:
+    strength += 0.1'f64 * float64(int32(effect.unsafeGet.amplifier) + 1'i32)
+  strength
+
+proc jump*(self: LivingEntity) =
+  ## `jump`
+  let jump = self.getJumpVelocity(1.0'f64)
+  if jump <= 1.0e-5'f64:
+    return
+  var velo = self.entity.velocity
+  velo.y = max(jump, velo.y)
+  if self.entity.sprinting:
+    let yaw = degToRad(float64(self.entity.yaw))
+    velo.x -= sin(yaw) * 0.2'f64
+    velo.z += cos(yaw) * 0.2'f64
+  self.entity.velocity = velo
+  self.entity.velocityDirty = true
+
+proc checkClimbing(self: LivingEntity) =
+  ## `check_climbing`: upstream's ladder detection is commented out, so nothing climbs yet.
+  self.climbing = false
+  if self.entity.onGround:
+    self.climbingPos = none[BlockPos]()
+
+proc applyClimbingSpeed(self: LivingEntity) =
+  ## `apply_climbing_speed`
+  if self.climbing:
+    self.fallDistance = 0.0'f32
+    var velo = self.entity.velocity
+    let pos = 0.15'f64
+    let neg = -0.15'f64
+    if velo.x < neg:
+      velo.x = neg
+    elif velo.x > pos:
+      velo.x = pos
+    if velo.z < neg:
+      velo.z = neg
+    elif velo.z > pos:
+      velo.z = pos
+    velo.y = max(velo.y, neg)
+    self.entity.velocity = velo
+
+proc makeMove(self: LivingEntity; caller: EntityBase) =
+  ## `make_move`
+  self.entity.moveEntity(caller, self.entity.velocity)
+  self.checkClimbing()
+
+proc applyFluidMovingSpeed(self: LivingEntity; dy: var float64; gravity: float64; falling: bool) =
+  ## `apply_fluid_moving_speed`
+  if gravity != 0.0'f64 and not self.entity.sprinting:
+    if falling and abs(dy - 0.005'f64) >= 0.003'f64 and abs(dy - gravity / 16.0'f64) < 0.003'f64:
+      dy = -0.003'f64
+    else:
+      dy -= gravity / 16.0'f64
+
+proc travelInAir(self: LivingEntity; caller: EntityBase) =
+  ## `travel_in_air`: applyMovementInput
+  let effectiveSpeed = self.getAttributeValue(MOVEMENT_SPEED)
+  var speed: float64
+  var friction: float64
+  if self.entity.onGround:
+    # getVelocityAffectingPos
+    let slipperiness = float64(self.entity.getBlockWithYOffset(0.500_001'f64)[1].slipperiness)
+    speed = effectiveSpeed * 0.216_000_02'f64 / (slipperiness * slipperiness * slipperiness)
+    friction = slipperiness * 0.91'f64
+  else:
+    speed = if caller.player != nil: gPlayerHooks.getOffGroundSpeed(mustPlayer(caller)) else: 0.02'f64
+    friction = 0.91'f64
+  self.entity.updateVelocityFromInput(self.movementInput, speed)
+  self.applyClimbingSpeed()
+  self.makeMove(caller)
+  var velo = self.entity.velocity
+  let canPowderSnowClimb = if self.entity.wasInPowderSnow: canEntityWalkOnPowderSnow(caller) else: false
+  if (self.entity.horizontalCollision or self.jumping) and (self.climbing or canPowderSnowClimb):
+    velo.y = 0.2'f64
+  let levitation = self.getEffect(StatusEffect.LEVITATION)
+  if levitation.isSome:
+    velo.y += mulAdd(0.05'f64, float64(int32(levitation.unsafeGet.amplifier) + 1'i32), -velo.y) * 0.2'f64
+  else:
+    velo.y -= self.getEffectiveGravity(caller)
+  # If entity has no drag: store velo and return
+  velo.x *= friction
+  velo.z *= friction
+  let drag = caller.getYVelocityDrag()
+  velo.y *= (if drag.isSome: drag.unsafeGet elif caller.isFlutterer(): friction else: 0.98'f64)
+  self.entity.velocity = velo
+
+proc travelInFluid(self: LivingEntity; caller: EntityBase; water: bool) =
+  ## `travel_in_fluid`
+  let movementInput = self.movementInput
+  let falling = self.entity.velocity.y <= 0.0'f64
+  let gravity = self.getEffectiveGravity(caller)
+  let effectiveSpeed = self.getAttributeValue(MOVEMENT_SPEED)
+  if water:
+    var friction = if self.entity.sprinting: 0.9'f64 else: float64(self.waterMovementSpeedMultiplier)
+    var speed = 0.02'f64
+    # Apply water movement efficiency attribute
+    var waterMovementEfficiency = self.getAttributeValue(WATER_MOVEMENT_EFFICIENCY)
+    if waterMovementEfficiency > 0.0'f64:
+      if not self.entity.onGround:
+        waterMovementEfficiency *= 0.5'f64
+      friction += (0.546_000_06'f64 - friction) * waterMovementEfficiency
+      speed += (effectiveSpeed - speed) * waterMovementEfficiency
+    if self.hasEffect(StatusEffect.DOLPHINS_GRACE):
+      friction = 0.96'f64
+    self.entity.updateVelocityFromInput(movementInput, speed)
+    self.makeMove(caller)
+    var velo = self.entity.velocity
+    if self.entity.horizontalCollision and self.climbing:
+      velo.y = 0.2'f64
+    velo = velo.multiply(friction, 0.8'f64, friction)
+    self.applyFluidMovingSpeed(velo.y, gravity, falling)
+    self.entity.velocity = velo
+  else:
+    self.entity.updateVelocityFromInput(movementInput, 0.02'f64)
+    self.makeMove(caller)
+    var velo = self.entity.velocity
+    if self.entity.lavaHeight <= self.getSwimHeight():
+      velo.x *= 0.5'f64
+      velo.z *= 0.5'f64
+      velo.y *= 0.8'f64
+      self.applyFluidMovingSpeed(velo.y, gravity, falling)
+    else:
+      velo = velo * 0.5'f64
+    if gravity != 0.0'f64:
+      velo.y -= gravity / 4.0'f64 # Negative gravity = buoyancy
+    self.entity.velocity = velo
+  var velo = self.entity.velocity
+  if self.entity.horizontalCollision and not self.entity.world.checkFluidCollision(self.entity.boundingBox.shift(velo)):
+    velo.y = 0.3'f64
+    self.entity.velocity = velo
+
+proc tickMovement(self: LivingEntity; server: Server; caller: EntityBase) =
+  ## `tick_movement`
+  if self.jumpingCooldown != 0'u8:
+    self.jumpingCooldown -= 1'u8
+  let shouldSwimInFluids = if caller.player != nil: not mustPlayer(caller).abilities.flying else: true
+  self.entity.checkZeroVelo()
+  var movementInput = self.movementInput
+  movementInput.x *= 0.98'f64
+  movementInput.z *= 0.98'f64
+  self.movementInput = movementInput
+  if self.jumping and shouldSwimInFluids:
+    let inLava = self.entity.touchingLava
+    let inWater = self.entity.touchingWater
+    let fluidHeight = if inLava: self.entity.lavaHeight else: self.entity.waterHeight
+    let swimHeight = self.getSwimHeight()
+    let onGround = self.entity.onGround
+    if (inWater or inLava) and (not onGround or fluidHeight > swimHeight):
+      # Swim upward
+      var velo = self.entity.velocity
+      velo.y += 0.04'f64
+      self.entity.velocity = velo
+    elif (onGround or inWater and fluidHeight <= swimHeight) and self.jumpingCooldown == 0'u8:
+      self.jump()
+      self.jumpingCooldown = 10'u8
+  else:
+    self.jumpingCooldown = 0'u8
+  if self.hasEffect(StatusEffect.SLOW_FALLING) or self.hasEffect(StatusEffect.LEVITATION):
+    self.fallDistance = 0.0'f32
+  let touchingWater = self.entity.touchingWater
+  # Strider is the only entity that has canWalkOnFluid = false
+  if (touchingWater or self.entity.touchingLava) and shouldSwimInFluids and self.entity.entityType.id != EntityType.STRIDER.id:
+    self.travelInFluid(caller, touchingWater)
+  else:
+    self.travelInAir(caller)
+  let suffocating = self.entity.tickBlockCollisions(caller, server)
+  if suffocating:
+    # `self.damage(...)` on a `LivingEntity`: the trait default, which goes through `caller`.
+    discard caller.damageWithContext(caller, 1.0'f32, IN_WALL, none[Vector3[float64]](), nil, nil)
+
+proc getFallSound*(distance: int32): Sound =
+  ## `get_fall_sound`
+  if distance > 4'i32: sdEntityGenericBigFall else: sdEntityGenericSmallFall
+
+proc handleFallDamage*(self: LivingEntity; caller: EntityBase; fallDistance, damagePerDistance: float32) =
+  ## `handle_fall_damage`
+  if self.isImmuneToFallDamage():
+    return
+  # Fetches the safe fall distance attribute
+  let safeFallDistance = float32(self.getAttributeValue(SAFE_FALL_DISTANCE))
+  let unsafeFallDistance = fallDistance + 1.0e-6'f32 - safeFallDistance
+  let damage = floor(unsafeFallDistance * damagePerDistance)
+  if damage > 0.0'f32:
+    # `self.damage(caller, ...)` on a `LivingEntity`: the trait default.
+    let checkDamage = caller.damageWithContext(caller, damage, FALL, none[Vector3[float64]](), nil, nil)
+    if checkDamage:
+      self.entity.playSound(getFallSound(asI32(fallDistance)))
+
+proc fall*(self: LivingEntity; caller: EntityBase; heightDifference: float64; ground, dontDamage: bool) =
+  ## `fall`
+  if ground:
+    let fallDistance = self.fallDistance
+    self.fallDistance = 0.0'f32
+    if fallDistance <= 0.0'f32 or dontDamage or self.shouldPreventFallDamage() or self.shouldPreventFallDamageInArea() or
+        self.isImmuneToFallDamage():
+      return
+    let world = self.entity.world
+    let blockRef = world.getBlock(self.entity.getPosWithYOffset(0.2'f64)[0])
+    if not gBlockHooks.onLandedUpon(blockRef, world, fallDistance, caller):
+      self.handleFallDamage(caller, fallDistance, 1.0'f32)
+  elif heightDifference < 0.0'f64:
+    let newFallDistance = if not self.shouldPreventFallDamage() and not self.shouldPreventFallDamageInArea():
+        self.fallDistance - float32(heightDifference)
+      else:
+        0.0'f32
+    self.fallDistance = newFallDistance
+
+proc getDeathMessage*(dynSelf: EntityBase; damageType: DamageType; source, cause: nil EntityBase): TextComponent =
+  ## `get_death_message`
+  case damageType.deathMessageType
+  of dmtDefault:
+    if cause != nil and source != nil:
+      let key = "death.attack." & damageType.messageId & ".player"
+      translateCross(key, key, [dynSelf.getDisplayName(), cause.getDisplayName()])
+    else:
+      let key = "death.attack." & damageType.messageId
+      translateCross(key, key, [dynSelf.getDisplayName()])
+  of dmtFallVariants:
+    translateCross("death.fell.accident.generic", "death.fell.accident.generic", [dynSelf.getDisplayName()])
+  of dmtIntentionalGameDesign:
+    let key = "death.attack." & damageType.messageId & ".message"
+    text("[").addChild(translateCross(key, key, [dynSelf.getDisplayName()])).addChild(text("]"))
+
+proc updateDeathStats(self: LivingEntity; dynSelf: EntityBase; cause: nil EntityBase) =
+  ## `update_death_stats`
+  let hooks = gPlayerHooks
+  let victimPlayer = dynSelf.player
+  if victimPlayer != nil:
+    hooks.incrementStat(victimPlayer, scCustom, int32(ord(csDeaths)), 1'i32)
+    hooks.setStat(victimPlayer, scCustom, int32(ord(csTimeSinceDeath)), 0'i32)
+    if cause != nil:
+      hooks.incrementStat(victimPlayer, scKilledBy, int32(cause.entity.entityType.id), 1'i32)
+  if cause != nil and cause.player != nil:
+    let killerPlayer = mustPlayer(cause)
+    if dynSelf.player != nil:
+      hooks.incrementStat(killerPlayer, scCustom, int32(ord(csPlayerKills)), 1'i32)
+    else:
+      hooks.incrementStat(killerPlayer, scCustom, int32(ord(csMobKills)), 1'i32)
+      let resourceName = self.entity.entityType.resourceName
+      hooks.triggerAdvancement(killerPlayer, "PlayerKilledEntity", "minecraft:" & resourceName)
+      if resourceName == "skeleton":
+        if killerPlayer.pos.squaredDistanceToVec(self.entity.pos) >= 2500.0'f64:
+          hooks.triggerAdvancement(killerPlayer, "SniperDuel", "")
+      if resourceName == "phantom":
+        hooks.triggerAdvancement(killerPlayer, "TwoBirdsOneArrow", "")
+      if killerPlayer.inventory.heldItem().item.registryKey == "crossbow":
+        hooks.triggerAdvancement(killerPlayer, "Arbalistic", "")
+    hooks.incrementStat(killerPlayer, scKilled, int32(self.entity.entityType.id), 1'i32)
+
+proc dropLoot(self: LivingEntity; params: LootContextParams) =
+  ## `drop_loot`
+  if self.entity.entityType.lootTable != nil:
+    for stack in gLootHook(self.entity.entityType, params):
+      gDropStack(self.entity.world, self.entity.blockPos, stack)
+
+proc dropEquipment(self: LivingEntity; lootingLevel: uint32) =
+  ## `drop_equipment`
+  let world = self.entity.world
+  let blockPos = self.entity.blockPos
+  var slotsToDrop: seq[EquipmentSlot] = @[]
+  for entry in self.equipmentSlots:
+    slotsToDrop.add(entry.slot)
+  slotsToDrop.add(esMainHand)
+  for slot in slotsToDrop:
+    var chance = self.equipmentDropChances.getOrDefault(ord(slot), DefaultEquipmentDropChance)
+    # Vanilla approximation: EnchantmentHelper.processEquipmentDropChance adds lootingLevel * 0.01.
+    chance += float32(lootingLevel) * 0.01'f32
+    chance = min(chance, 1.0'f32)
+    if randomF32() >= chance:
+      continue
+    var item = self.entityEquipment.put(slot, emptyItemStack())
+    if item.isEmpty():
+      continue
+    # Vanilla approximation: Mob.dropCustomDeathLoot applies random damage to dropped equipment.
+    let maxDamage = item.getMaxDamage()
+    if maxDamage.isSome:
+      let inner = randomRange(0'i32, max(maxDamage.unsafeGet - 3'i32, 1'i32))
+      let outer = randomRangeInclusive(0'i32, inner)
+      item.setDamage(max(maxDamage.unsafeGet - outer, 0'i32))
+    gDropStack(world, blockPos, item)
+
+proc broadcastDeathMessage(self: LivingEntity; dynSelf: EntityBase; damageType: DamageType; source, cause: nil EntityBase) =
+  ## `broadcast_death_message`
+  let world = self.entity.world
+  if self.entity.isPlayerType() and world.levelInfo.gameRules.showDeathMessages:
+    #TODO upstream: KillCredit
+    let deathMessage = getDeathMessage(dynSelf, damageType, source, cause)
+    for w in world.server.worlds:
+      for player in w.players:
+        player.sendSystemMessage(deathMessage)
+
+proc onDeath*(self: LivingEntity; damageType: DamageType; source, cause: nil EntityBase) =
+  ## `on_death`
+  let world = self.entity.world
+  let dynSelf = self.entity.base
+  assert dynSelf != nil, "Entity not found in world"
+  if not self.dead:
+    self.dead = true
+    self.movementInput = Vector3[float64](x: 0.0, y: 0.0, z: 0.0)
+    self.jumping = false
+    # Statistics updates
+    self.updateDeathStats(dynSelf, cause)
+    # Plays the death sound
+    world.sendEntityStatus(self.entity, esDeath)
+    var lootingLevel = 0'u32
+    var tool = none[ItemStack]()
+    if cause != nil and cause.player != nil:
+      let handStack = mustPlayer(cause).inventory.getStackInHand(false)
+      lootingLevel = uint32(max(handStack.getEnchantmentLevel(EnchantmentRef(id: Enchantment.LOOTING.id, name: "")), 0'i32))
+      if handStack.itemCount > 0'u8:
+        tool = some(handStack)
+    let params = LootContextParams(
+      killedByPlayer: (if cause != nil: some(cause.entity.isPlayerType()) else: none[bool]()),
+      thisEntity: some(self.entity.entityType),
+      killerEntity: (if cause != nil: some(cause.entity.entityType) else: none[EntityType]()),
+      directKillerEntity: (if source != nil: some(source.entity.entityType) else: none[EntityType]()),
+      position: some(self.entity.pos),
+      worldTime: cast[uint64](world.levelInfo.dayTime),
+      damageType: some(damageType),
+      tool: tool,
+      isRaining: some(world.weather.raining),
+      isThundering: some(world.weather.thundering),
+      isOnFire: some(self.entity.fireTicks > 0'i32))
+    # Drop loot
+    self.dropLoot(params)
+    # Award experience
+    if params.killedByPlayer.isSome and params.killedByPlayer.unsafeGet and world.levelInfo.gameRules.mobDrops:
+      let amount = dynSelf.getExperienceReward(cause)
+      if amount > 0'u32:
+        gSpawnExperienceOrb(world, self.entity.pos, amount)
+    self.entity.pose = epDying
+    self.dropEquipment(lootingLevel)
+    # Broadcast death message if it's a player and the gamerule is enabled
+    self.broadcastDeathMessage(dynSelf, damageType, source, cause)
+    self.resetEffectsAndAttributes()
+
+proc shouldApplyEffectTick*(effect: Effect; duration: int32): bool =
+  ## `should_apply_effect_tick`: vanilla's effect tick frequencies.
+  let id = effect.effectType.id
+  let amp = int32(min(effect.amplifier, 4'u8))
+  if id == StatusEffect.REGENERATION.id:
+    if duration <= 0'i32:
+      return false
+    duration mod (50'i32 shr amp) == 0'i32
+  elif id == StatusEffect.POISON.id:
+    if duration <= 0'i32:
+      return false
+    duration mod (25'i32 shr amp) == 0'i32
+  elif id == StatusEffect.WITHER.id:
+    if duration <= 0'i32:
+      return false
+    duration mod (40'i32 shr amp) == 0'i32
+  elif id == StatusEffect.HUNGER.id:
+    # Hunger every 20 ticks
+    duration mod 20'i32 == 0'i32
+  elif id == StatusEffect.SATURATION.id:
+    # Saturation every tick
+    true
+  else:
+    # Other effects that don't tick
+    false
+
+proc applyEffectTick(self: LivingEntity; effectType: StatusEffect; amplifier: uint8) =
+  ## `apply_effect_tick`
+  let id = effectType.id
+  let dynSelf = self.entity.base
+  if id == StatusEffect.REGENERATION.id:
+    let currentHealth = self.health
+    if currentHealth < self.getMaxHealth() and currentHealth > 0.0'f32:
+      self.heal(1.0'f32)
+  elif id == StatusEffect.POISON.id:
+    let currentHealth = self.health
+    if currentHealth > 1.0'f32 and dynSelf != nil:
+      let damageAmount = min(currentHealth - 1.0'f32, 1.0'f32)
+      if damageAmount > 0.0'f32:
+        discard dynSelf.damage(dynSelf, damageAmount, MAGIC)
+  elif id == StatusEffect.WITHER.id:
+    if dynSelf != nil:
+      discard dynSelf.damage(dynSelf, 1.0'f32, damage_type.WITHER)
+  elif id == StatusEffect.HUNGER.id:
+    if dynSelf != nil and dynSelf.player != nil:
+      # Add exhaustion to trigger hunger decrease
+      mustPlayer(dynSelf).addExhaustion(0.1'f32 * (float32(amplifier) + 1.0'f32))
+  elif id == StatusEffect.SATURATION.id:
+    if dynSelf != nil and dynSelf.player != nil:
+      # Add hunger and saturation: `HungerManager::add_hunger`, `add_saturation`.
+      let hunger = amplifier + 1'u8
+      let target = mustPlayer(dynSelf)
+      target.hungerManager.level = min(target.hungerManager.level + hunger, 20'u8)
+      target.hungerManager.saturation = min(target.hungerManager.saturation + float32(hunger) * 2.0'f32,
+        float32(target.hungerManager.level))
+
+proc tickEffects(self: LivingEntity) =
+  ## `tick_effects`
+  var effectsToRemove: seq[StatusEffect] = @[]
+  var effectsToApply: seq[(StatusEffect, uint8)] = @[]
+  let entityAge = self.entity.age
+  for i in 0 ..< self.activeEffects.len:
+    if self.activeEffects[i].duration == 0'i32:
+      effectsToRemove.add(self.activeEffects[i].effectType)
+      continue
+    let tickDuration = if self.activeEffects[i].duration == -1'i32: entityAge else: self.activeEffects[i].duration
+    if shouldApplyEffectTick(self.activeEffects[i], tickDuration):
+      effectsToApply.add((self.activeEffects[i].effectType, self.activeEffects[i].amplifier))
+    if self.activeEffects[i].duration != -1'i32:
+      self.activeEffects[i].duration -= 1'i32
+  # Call the central removal function for each expired effect
+  for effectType in effectsToRemove:
+    discard self.removeEffect(effectType)
+  for entry in effectsToApply:
+    self.applyEffectTick(entry[0], entry[1])
+
+proc heldItem*(self: LivingEntity; caller: EntityBase): ItemStack =
+  ## `held_item`
+  if caller.player != nil:
+    return mustPlayer(caller).inventory.heldItem()
+  self.entityEquipment.get(esMainHand)
+
+proc setHeldItem*(self: LivingEntity; caller: EntityBase; stack: ItemStack) =
+  ## `*held_item(..).lock().await = stack`
+  if caller.player != nil:
+    mustPlayer(caller).inventory.setHeldItem(stack)
+  else:
+    discard self.entityEquipment.put(esMainHand, stack)
+
+proc offHandItem*(self: LivingEntity): ItemStack =
+  ## `off_hand_item`: getOffHandStack in source.
+  self.entityEquipment.get(esOffHand)
+
+proc getStackInHand*(self: LivingEntity; caller: EntityBase; hand: netbase.Hand): ItemStack =
+  ## `get_stack_in_hand`
+  if hand == hLeft: self.offHandItem() else: self.heldItem(caller)
+
+proc setStackInHand*(self: LivingEntity; caller: EntityBase; hand: netbase.Hand; stack: ItemStack) =
+  if hand == hLeft:
+    discard self.entityEquipment.put(esOffHand, stack)
+  else:
+    self.setHeldItem(caller, stack)
+
+proc newEffect(effectType: StatusEffect; duration: int32; amplifier: uint8): Effect =
+  Effect(effectType: effectType, duration: duration, amplifier: amplifier, ambient: false, showParticles: true,
+    showIcon: true, blend: false)
+
+proc tryUseDeathProtector(self: LivingEntity; caller: EntityBase): bool =
+  ## `try_use_death_protector`: a totem of undying.
+  for hand in [hLeft, hRight]:
+    var stack = self.getStackInHand(caller, hand)
+    # Clear the stack and use the totem of undying
+    if stack.getDataComponent(DeathProtectionImpl)[0]:
+      stack.clear()
+      self.setStackInHand(caller, hand, stack)
+      self.setHealth(1.0'f32)
+      self.entity.world.sendEntityStatus(self.entity, esProtectedFromDeath)
+      # Set Absorption, Regeneration, and Fire Resistance effects
+      self.addEffect(newEffect(StatusEffect.ABSORPTION, 100'i32, 1'u8))
+      self.addEffect(newEffect(StatusEffect.REGENERATION, 900'i32, 1'u8))
+      self.addEffect(newEffect(StatusEffect.FIRE_RESISTANCE, 800'i32, 0'u8))
+      return true
+  false
+
+proc isArmorSlot(slot: EquipmentSlot): bool =
+  slot == esHead or slot == esChest or slot == esLegs or slot == esFeet or slot == esBody
+
+proc damageArmorItems(self: LivingEntity; caller: EntityBase; damageAmount: float32) =
+  ## `damage_armor_items`. Formula: armor loses floor(incoming_damage / 4) durability, minimum 1.
+  let armorDamage = int32(max(floor(damageAmount / 4.0'f32), 1.0'f32))
+  var equipmentUpdates: seq[(EquipmentSlot, ItemStack)] = @[]
+  for entry in self.equipmentSlots:
+    if not entry.slot.isArmorSlot():
+      continue
+    var stack = self.entityEquipment.get(entry.slot)
+    if stack.isEmpty():
+      continue
+    # Items without `EquippableImpl` take damage freely; `damage_on_hurt: false` (e.g. elytra) are exempt.
+    let (hasEquippable, equippable) = stack.getDataComponent(EquippableImpl)
+    let takesDamage = not hasEquippable or equippable.damageOnHurt
+    if not takesDamage:
+      continue
+    let slotResult = stack.damageItem(armorDamage)
+    if slotResult != drUntouched:
+      discard self.entityEquipment.put(entry.slot, stack)
+      # Broadcast break status before clearing the slot.
+      if slotResult == drBroken:
+        self.entity.world.sendEntityStatus(self.entity, equipmentBreakStatus(entry.slot))
+      equipmentUpdates.add((entry.slot, stack))
+      let player = caller.player
+      if player != nil:
+        player.client.writePacketFor(CSetPlayerInventory(slot: newVarInt(int32(entry.index)), item: toSerializer(stack)))
+  if equipmentUpdates.len > 0:
+    self.sendEquipmentChanges(equipmentUpdates)
+
+proc canTakeDamage*(self: LivingEntity): bool =
+  ## `can_take_damage`. `is_spectator` on a `LivingEntity` is the trait's default false.
+  not self.entity.invulnerable and self.entity.isAlive()
+
+proc isPartOfGame*(self: LivingEntity): bool =
+  ## `is_part_of_game`
+  self.entity.isAlive()
+
+proc resetState*(self: LivingEntity) =
+  ## `reset_state`
+  self.entity.resetState()
+  # Restore to maximum health for this entity type
+  let maxHealth = self.getMaxHealth()
+  self.setHealth(maxHealth)
+  self.absorption = 0.0'f32
+  self.entity.sendMetaData(TrackedData_HEALTH_ID, FLOAT, maxHealth)
+  self.resetEffectsAndAttributes()
+  # Give a short grace period of invulnerability after respawn
+  self.hurtCooldown = 20'i32
+  self.lastDamageTaken = 0.0'f32
+  self.entity.portalCooldown = 0'u32
+  # Clear fall/fire state
+  self.fallDistance = 0.0'f32
+  self.deathTime = 0'u8
+  self.entity.extinguish()
+  self.entity.fireTicks = 0'i32
+  # Clear velocity and movement input to remove persisted momentum
+  self.entity.velocity = Vector3[float64](x: 0.0, y: 0.0, z: 0.0)
+  self.entity.velocityDirty = true
+  self.movementInput = Vector3[float64](x: 0.0, y: 0.0, z: 0.0)
+  self.jumping = false
+  # If this LivingEntity corresponds to a Player, reset their hunger manager
+  let player = getPlayerById(self.entity.world, self.entity.entityId)
+  if player != nil:
+    player.hungerManager = HungerManager(level: 20'u8, saturation: 5.0'f32, exhaustion: 0.0'f32, tickTimer: 0'u32)
+  self.dead = false
+
+proc spawnEntity*(world: World; entity: EntityBase)
+
+proc trySpawnInfestedSilverfish(self: LivingEntity) =
+  ## `try_spawn_infested_silverfish`
+  if not self.hasEffect(StatusEffect.INFESTED):
+    return
+  # Wither, ender dragon and silverfish are immune
+  let id = self.entity.entityType.id
+  if id == EntityType.WITHER.id or id == EntityType.ENDER_DRAGON.id or id == EntityType.SILVERFISH.id:
+    return
+  let world = self.entity.world
+  # 10% chance
+  if randomF32() <= 0.1'f32:
+    let count = randomRange(1'i32, 3'i32)
+    for i in 0'i32 ..< count:
+      # Spawn at center of entity
+      let bbox = self.entity.boundingBox
+      let center = Vector3[float64](x: (bbox.min.x + bbox.max.x) / 2.0'f64, y: (bbox.min.y + bbox.max.y) / 2.0'f64,
+        z: (bbox.min.z + bbox.max.z) / 2.0'f64)
+      # Random direction
+      let yawRad = float64(toRadiansF32(self.entity.yaw))
+      let randomAngle = randomF64() * PI - PI / 2.0'f64
+      let angle = yawRad + randomAngle
+      let speed = 0.3'f64
+      let dx = -sin(angle) * speed
+      let dz = cos(angle) * speed
+      let dy = 0.1'f64
+      # Spawn
+      let silverOpt = gFromType(EntityType.SILVERFISH, center, world, randomUuid())
+      if silverOpt == nil:
+        continue
+      let silver = cast[EntityBase](silverOpt)
+      silver.entity.setPos(center)
+      silver.entity.velocity = Vector3[float64](x: dx, y: dy, z: dz)
+      spawnEntity(world, silver)
+      # Play sound
+      world.playSound(sdEntitySilverfishHurt, scPlayers, center)
+
+proc isPlayer*(self: LivingEntity): bool =
+  ## `is_player`
+  getPlayerById(self.entity.world, self.entity.entityId) != nil
+
+proc getMovement*(self: LivingEntity): Vector3[float64] = self.entity.movement
+
+proc hurtSound(self: LivingEntity): Sound =
+  ## `hurt_sound`. `SlimeEntity::hurt_sound_for_size`: pumpkin/src/entity/mob/slime.rs.
+  if self.entity.entityType.id == EntityType.SLIME.id:
+    if self.entity.data <= 1'i32: sdEntitySlimeHurtSmall else: sdEntitySlimeHurt
+  else:
+    hurtSoundForEntity(self.entity.entityType)
+
+proc bypassesArmorDurability*(damageType: DamageType): bool =
+  ## `bypasses_armor_durability`: `#minecraft:bypasses_armor` (1.21.11).
+  let id = damageType.id
+  id == FALL.id or id == FLY_INTO_WALL.id or id == ON_FIRE.id or id == IN_WALL.id or id == CRAMMING.id or id == DROWN.id or
+    id == GENERIC.id or id == damage_type.WITHER.id or id == DRAGON_BREATH.id or id == STARVE.id or id == damage_type.ENDER_PEARL.id or
+    id == FREEZE.id or id == STALAGMITE.id or id == MAGIC.id or id == INDIRECT_MAGIC.id or id == OUT_OF_WORLD.id or
+    id == GENERIC_KILL.id or id == SONIC_BOOM.id or id == OUTSIDE_BORDER.id
+
+proc damageAfterArmor*(amount, armor, toughness: float32): float32 =
+  ## The armor step of `damage_with_context`.
+  let value = 2.0'f32 + toughness / 4.0'f32
+  let clampedArmor = min(max(armor - amount / value, armor / 5.0'f32), 20.0'f32)
+  amount * (1.0'f32 - clampedArmor / 25.0'f32)
+
+proc damageWithContextImpl*(self: LivingEntity; caller: EntityBase; amount0: float32; damageType: DamageType;
+    position: Option[Vector3[float64]]; source, cause: nil EntityBase): bool =
+  ## `impl EntityBase for LivingEntity`: `damage_with_context`
+  var amount = amount0
+  # Check invulnerability before applying damage
+  if self.entity.isInvulnerableTo(damageType):
+    return false
+  if self.health <= 0.0'f32 or self.dead:
+    return false # Dying or dead
+  if amount < 0.0'f32:
+    return false
+  let world = self.entity.world
+  let hooks = gPlayerHooks
+  let isFireDamage = damageType.id == IN_FIRE.id or damageType.id == ON_FIRE.id or damageType.id == damage_type.LAVA.id or
+    damageType.id == HOT_FLOOR.id
+  # Fire damage can be prevented by either game rules or fire resistance
+  if isFireDamage:
+    # Check game rule for fire damage (only for players)
+    if self.entity.isPlayerType() and not world.levelInfo.gameRules.fireDamage:
+      return false
+    # Check for fire resistance effect
+    if self.hasEffect(StatusEffect.FIRE_RESISTANCE):
+      return false
+  # Vanilla parity: entities in FREEZE_HURTS_EXTRA_TYPES take 5x freezing damage.
+  if damageType.id == FREEZE.id and hasTag(self.entity.entityType.id, EntityType_MINECRAFT_FREEZE_HURTS_EXTRA_TYPES):
+    amount *= 5.0'f32
+  # These damage types bypass the hurt cooldown and death protection
+  let bypassesCooldownProtection = damageType.id == GENERIC_KILL.id or damageType.id == OUT_OF_WORLD.id
+  var damageAfterArmor = amount
+  if not bypassesArmorDurability(damageType):
+    var armor = 0.0'f32
+    var toughness = 0.0'f32
+    for slot in [esHead, esChest, esLegs, esFeet]:
+      let stack = self.entityEquipment.get(slot)
+      if not stack.isEmpty():
+        let (has, modifiers) = stack.getDataComponent(AttributeModifiersImpl)
+        if has:
+          for modifier in modifiers.attributeModifiers:
+            if modifier.attribute.id == ARMOR.id:
+              armor += float32(modifier.amount)
+            elif modifier.attribute.id == ARMOR_TOUGHNESS.id:
+              toughness += float32(modifier.amount)
+    damageAfterArmor = entitymod.damageAfterArmor(damageAfterArmor, armor, toughness)
+  var damageAfterEnchantments = damageAfterArmor
+  if damageType.id != OUT_OF_WORLD.id:
+    var epf = 0'i32
+    for slot in [esHead, esChest, esLegs, esFeet]:
+      let stack = self.entityEquipment.get(slot)
+      if not stack.isEmpty():
+        let (has, enchantments) = stack.getDataComponent(EnchantmentsImpl)
+        if has:
+          for entry in enchantments.enchantment:
+            var factor = 0'i32
+            let enc = entry.enchantment
+            let level = entry.level
+            if enc.id == Enchantment.PROTECTION.id:
+              if damageType.id != DROWN.id and damageType.id != STARVE.id and damageType.id != GENERIC_KILL.id:
+                factor = level
+            elif enc.id == Enchantment.FIRE_PROTECTION.id:
+              if isFireDamage:
+                factor = level * 2'i32
+            elif enc.id == Enchantment.BLAST_PROTECTION.id:
+              if damageType.id == EXPLOSION.id or damageType.id == PLAYER_EXPLOSION.id:
+                factor = level * 2'i32
+            elif enc.id == Enchantment.PROJECTILE_PROTECTION.id:
+              if damageType.id == damage_type.ARROW.id or damageType.id == MOB_PROJECTILE.id or damageType.id == THROWN.id:
+                factor = level * 2'i32
+            elif enc.id == Enchantment.FEATHER_FALLING.id and damageType.id == FALL.id:
+              factor = level * 4'i32
+            epf += factor
+    epf = min(epf, 20'i32)
+    if epf > 0'i32:
+      damageAfterEnchantments *= 1.0'f32 - (float32(epf) * 0.04'f32)
+  # Apply Resistance effect reduction (20% per level), excluding bypasses_cooldown_protection and starvation damage
+  var resistanceReduction = 0.0'f32
+  if not bypassesCooldownProtection and damageType.id != STARVE.id:
+    let resistance = self.getEffect(StatusEffect.RESISTANCE)
+    if resistance.isSome:
+      resistanceReduction = 0.2'f32 * float32(int32(resistance.unsafeGet.amplifier) + 1'i32)
+  # Total damage after reductions
+  let effectiveAmount = damageAfterEnchantments * (1.0'f32 - resistanceReduction)
+  let causePlayer = if cause != nil: cause.player else: nil
+  let callerPlayer = caller.player
+  if resistanceReduction > 0.0'f32:
+    let resisted = damageAfterEnchantments * resistanceReduction
+    if callerPlayer != nil:
+      hooks.incrementStat(callerPlayer, scCustom, int32(ord(csDamageResisted)), asI32(resisted * 10.0'f32))
+    if causePlayer != nil:
+      hooks.incrementStat(causePlayer, scCustom, int32(ord(csDamageDealtResisted)), asI32(resisted * 10.0'f32))
+  # Check for shield blocking
+  if self.isBlocking() and not hasTag(uint16(damageType.id), DamageType_MINECRAFT_BYPASSES_SHIELD) and position.isSome:
+    let playerPos = self.entity.pos
+    let lookVec = rotationVector(0.0'f64, float64(self.entity.yaw))
+    var sourceToPlayer = (playerPos - position.unsafeGet).normalize()
+    sourceToPlayer.y = 0.0'f64
+    if sourceToPlayer.dot(lookVec) < 0.0'f64:
+      world.playSound(sdItemShieldBlock, scPlayers, playerPos)
+      if callerPlayer != nil:
+        hooks.incrementStat(callerPlayer, scCustom, int32(ord(csDamageBlockedByShield)), asI32(effectiveAmount * 10.0'f32))
+        hooks.triggerAdvancement(callerPlayer, "DeflectedDamage", "")
+      if causePlayer != nil:
+        if causePlayer.inventory.heldItem().isAxe():
+          var disableChance = 0.25'f32
+          if causePlayer.sprinting:
+            disableChance = 1.0'f32
+          if randomF32() < disableChance and callerPlayer != nil:
+            hooks.startCooldown(mustPlayer(caller), "minecraft:shield", 100'i32)
+            self.clearActiveHand()
+            world.broadcastPacketAll(CEntityStatus(entityId: self.entity.entityId, entityStatus: 30'i8))
+      if self.activeHand.isSome:
+        # As upstream, the opposite of what the name suggests: `Hand::Left` picks the main hand slot.
+        let slot = if self.activeHand.unsafeGet == hLeft: esMainHand else: esOffHand
+        var stack = self.entityEquipment.get(slot)
+        let durabilityDamage = int32(max(floor(amount / 1.0'f32), 1.0'f32))
+        let damageResult = stack.damageItem(durabilityDamage)
+        if damageResult == drBroken:
+          if callerPlayer != nil:
+            hooks.incrementStat(callerPlayer, scBroken, int32(stack.item.id), 1'i32)
+          world.sendEntityStatus(self.entity, equipmentBreakStatus(slot))
+          let brokenStack = emptyItemStack()
+          discard self.entityEquipment.put(slot, brokenStack)
+          self.sendEquipmentChanges([(slot, brokenStack)])
+          self.clearActiveHand()
+        else:
+          discard self.entityEquipment.put(slot, stack)
+      return false
+  # Apply hurt cooldown logic
+  let lastDamage = self.lastDamageTaken
+  var damageAmount: float32
+  var playSound: bool
+  if self.hurtCooldown > 10'i32 and not bypassesCooldownProtection:
+    if effectiveAmount <= lastDamage:
+      return false
+    damageAmount = effectiveAmount - lastDamage
+    playSound = false
+  else:
+    self.hurtCooldown = 20'i32
+    damageAmount = effectiveAmount
+    playSound = true
+  # Finalize state
+  self.lastDamageTaken = amount
+  damageAmount = max(damageAmount, 0.0'f32)
+  if world.server.advancedConfig.pvp.hurtAnimation:
+    var hurtYaw = 0.0'f32
+    if source != nil:
+      let src = source.entity.pos
+      let tgt = self.entity.pos
+      hurtYaw = float32(radToDeg(arctan2(src.z - tgt.z, src.x - tgt.x))) - self.entity.yaw
+    world.broadcastPacketAll(CHurtAnimation(entityId: newVarInt(self.entity.entityId), yaw: hurtYaw))
+  world.broadcastPacketAll(newCDamageEvent(newVarInt(self.entity.entityId), newVarInt(int32(damageType.id)),
+    (if source != nil: some(newVarInt(source.entity.entityId)) else: none[VarInt]()),
+    (if cause != nil: some(newVarInt(cause.entity.entityId)) else: none[VarInt]()), position))
+  # Try to spawn infested silverfish
+  self.trySpawnInfestedSilverfish()
+  if playSound:
+    world.playSound(self.hurtSound(), scPlayers, self.entity.pos)
+    if source != nil:
+      let sourcePos = source.entity.pos
+      let targetPos = self.entity.pos
+      let dx = sourcePos.x - targetPos.x
+      let dz = sourcePos.z - targetPos.z
+      let resistance = self.getAttributeValue(KNOCKBACK_RESISTANCE)
+      # `knockback_after_resistance`
+      self.entity.applyKnockback(0.4'f64 * (1.0'f64 - resistance), dx, dz)
+      self.entity.sendVelocity()
+  # Consume absorption first, then apply remaining damage to health
+  var remaining = damageAmount
+  let currentAbs = self.absorption
+  if currentAbs > 0.0'f32:
+    let absorbed = min(currentAbs, remaining)
+    if callerPlayer != nil:
+      hooks.incrementStat(callerPlayer, scCustom, int32(ord(csDamageAbsorbed)), asI32(absorbed * 10.0'f32))
+    if causePlayer != nil:
+      hooks.incrementStat(causePlayer, scCustom, int32(ord(csDamageDealtAbsorbed)), asI32(absorbed * 10.0'f32))
+    if currentAbs >= remaining:
+      self.setAbsorption(currentAbs - remaining)
+      remaining = 0.0'f32
+    else:
+      remaining -= currentAbs
+      self.setAbsorption(0.0'f32)
+    # Track attacker for RevengeGoal (only after confirming damage)
+    let attacker = if cause != nil: cause else: source
+    if attacker != nil:
+      self.lastAttackerId = attacker.entity.entityId
+      self.lastAttackedTime = self.entity.age
+  # Apply remaining damage to health (clamped)
+  let maxH = self.getMaxHealth()
+  let newHealth = self.health - remaining
+  let clampedHealth = min(max(newHealth, 0.0'f32), maxH)
+  if remaining > 0.0'f32:
+    self.setHealth(clampedHealth)
+    # Statistics updates
+    if callerPlayer != nil:
+      hooks.incrementStat(callerPlayer, scCustom, int32(ord(csDamageTaken)), asI32(remaining * 10.0'f32))
+    if causePlayer != nil:
+      hooks.incrementStat(causePlayer, scCustom, int32(ord(csDamageDealt)), asI32(remaining * 10.0'f32))
+    # Track attacker for RevengeGoal (only after confirming damage)
+    let attacker = if cause != nil: cause else: source
+    if attacker != nil:
+      self.lastAttackerId = attacker.entity.entityId
+      self.lastAttackedTime = self.entity.age
+  # Check if the entity died and isn't protected by a death protection mechanic (ex. totem of undying)
+  if clampedHealth <= 0.0'f32 and (bypassesCooldownProtection or not self.tryUseDeathProtector(caller)):
+    self.onDeath(damageType, source, cause)
+  # Armor durability is based on incoming raw damage, not post-absorption remaining.
+  # Not applied when the source is in `#minecraft:bypasses_armor`.
+  if damageAmount > 0.0'f32 and not bypassesArmorDurability(damageType):
+    self.damageArmorItems(caller, damageAmount)
+  true
+
+# NBT `impl NBTStorage for LivingEntity`
+
+proc writeLivingNbt*(self: LivingEntity; nbt: var NbtCompound) =
+  ## `write_nbt`
+  self.entity.writeEntityNbt(nbt)
+  nbt.putFloat("Health", self.health)
+  # Avoid persisting a lethal fall distance when the entity is dead to prevent death loops
+  let fallDistance = if self.dead: 0.0'f32 else: self.fallDistance
+  # Persist current absorption amount
+  nbt.putFloat("AbsorptionAmount", self.absorption)
+  nbt.putFloat("fall_distance", fallDistance)
+  if self.activeEffects.len > 0:
+    var effectsList: seq[NbtTag] = @[]
+    for effect in self.activeEffects:
+      var effectNbt = newCompound()
+      effectToNbt(effect, effectNbt)
+      effectsList.add(nbtTag(effectNbt))
+    nbt.put("active_effects", NbtTag(kind: ntkList, listVal: effectsList))
+
+proc readLivingNbt*(self: LivingEntity; nbt: NbtCompound) =
+  ## `read_nbt_non_mut`
+  self.entity.readEntityNbt(nbt)
+  let health = nbt.getFloat("Health")
+  self.health = if health.isSome: health.unsafeGet else: 0.0'f32
+  # Clamp any persisted absorption to the entity's configured max
+  let rawAbsOpt = nbt.getFloat("AbsorptionAmount")
+  let rawAbs = if rawAbsOpt.isSome: rawAbsOpt.unsafeGet else: 0.0'f32
+  let maxAbs = float32(self.getAttributeValue(MAX_ABSORPTION))
+  self.absorption = min(max(rawAbs, 0.0'f32), maxAbs)
+  # Load fall distance, but if this entity is currently marked dead ensure we don't restore a lethal one.
+  let fd = nbt.getFloat("fall_distance")
+  self.fallDistance = if self.dead or fd.isNone: 0.0'f32 else: fd.unsafeGet
+  let nbtEffects = nbt.getList("active_effects")
+  if nbtEffects.isSome:
+    for tag in nbtEffects.unsafeGet:
+      if tag.kind == ntkCompound:
+        let parsed = effectFromNbt(tag.compoundVal)
+        if parsed.isNone:
+          echo "Unable to read effect from nbt"
+          continue
+        var effect = parsed.unsafeGet
+        effect.blend = true # TODO upstream: change, is taken from effect give command
+        let at = self.effectIndex(effect.effectType)
+        if at >= 0:
+          self.activeEffects[at] = effect
+        else:
+          self.activeEffects.add(effect)
+
+# --- The vtables ----------------------------------------------------------------------------------------------------------------
+
+proc defaultEntityName(self: EntityBase): TextComponent =
+  let entity = self.entity
+  if entity.customName.isSome:
+    return entity.customName.unsafeGet
+  let key = "entity.minecraft." & entity.entityType.resourceName
+  translateCross(key, key)
+
+proc entityTick*(self: Entity; caller: EntityBase; server: Server) =
+  ## `impl EntityBase for Entity`: `tick`
+  # Recomputed during movement/block-collision handling in the same tick.
+  self.wasInPowderSnow = self.isInPowderSnow
+  self.isInPowderSnow = false
+  let blockPos = self.blockPos
+  if not (self.lastBiomeUpdatePos.vec == blockPos.vec):
+    self.currentBiome = getRoughBiome(self.world.level, blockPos)
+    self.lastBiomeUpdatePos = blockPos
+  self.updateLastPos()
+  # `tick_portal`: the cooldown half. See the PARTIAL line.
+  if self.portalCooldown > 0'u32:
+    self.portalCooldown -= 1'u32
+  self.updateFluidState(caller)
+  self.checkOutOfWorld(caller)
+  let fireTicks = self.fireTicks
+  # Check for fire immunity (or if the specific entity is)
+  let isImmune = self.entityType.fireImmune or self.fireImmune
+  if fireTicks > 0'i32:
+    if isImmune:
+      self.fireTicks = fireTicks - 4'i32
+      if self.fireTicks < 0'i32:
+        self.extinguish()
+    else:
+      if fireTicks mod 20'i32 == 0'i32:
+        discard caller.damage(caller, 1.0'f32, ON_FIRE)
+      self.fireTicks = fireTicks - 1'i32
+  # Check if visual fire should be sent
+  self.setOnFire(self.fireTicks > 0'i32 and not isImmune)
+  if self.ridingCooldown > 0'i32:
+    self.ridingCooldown -= 1'i32
+
+proc isMinecartId(id: uint16): bool =
+  id == EntityType.MINECART.id or id == EntityType.CHEST_MINECART.id or id == EntityType.COMMAND_BLOCK_MINECART.id or
+    id == EntityType.FURNACE_MINECART.id or id == EntityType.HOPPER_MINECART.id or id == EntityType.SPAWNER_MINECART.id or
+    id == EntityType.TNT_MINECART.id
+
+proc getEntitiesAtBox*(world: World; aabb: BoundingBox): seq[EntityBase]
+proc getPlayersAtBox*(world: World; aabb: BoundingBox): seq[Player]
+proc playerBase*(player: Player): EntityBase
+
+proc defaultPush(self, entity: EntityBase) =
+  ## `EntityBase::push`
+  let selfEntity = self.entity
+  let otherEntity = entity.entity
+  if selfEntity.noClip or otherEntity.noClip:
+    return
+  for p in selfEntity.passengers:
+    if p.entity.entityId == otherEntity.entityId:
+      return
+  for p in otherEntity.passengers:
+    if p.entity.entityId == selfEntity.entityId:
+      return
+  var dx = otherEntity.pos.x - selfEntity.pos.x
+  var dz = otherEntity.pos.z - selfEntity.pos.z
+  var d = max(abs(dx), abs(dz))
+  if d >= 0.01'f64:
+    d = sqrt(d)
+    dx = dx / d
+    dz = dz / d
+    var d2 = 1.0'f64 / d
+    if d2 > 1.0'f64:
+      d2 = 1.0'f64
+    dx *= d2
+    dz *= d2
+    dx *= 0.05'f64
+    dz *= 0.05'f64
+    if not selfEntity.hasPassengers() and self.isPushable():
+      var vel = selfEntity.velocity
+      vel.x -= dx
+      vel.z -= dz
+      selfEntity.velocity = vel
+      selfEntity.sendVelocity()
+    if not otherEntity.hasPassengers() and entity.isPushable():
+      var vel = otherEntity.velocity
+      vel.x += dx
+      vel.z += dz
+      otherEntity.velocity = vel
+      otherEntity.sendVelocity()
+
+proc defaultPushEntities(self, dynSelf: EntityBase): bool =
+  ## `EntityBase::push_entities`
+  var pickedUp = false
+  var pushed = false
+  let selfEntity = self.entity
+  let entityBb = selfEntity.boundingBox
+  if not self.isPushable():
+    return false
+  let world = selfEntity.world
+  let isRideableMinecart = selfEntity.entityType.id == EntityType.MINECART.id
+  let isAbstractMinecart = isMinecartId(selfEntity.entityType.id)
+  if isAbstractMinecart:
+    let isVehicle = self.isVehicle()
+    if isRideableMinecart and not isVehicle:
+      let pickupBb = entityBb.expand(0.2'f64, 0.0'f64, 0.2'f64)
+      for other in world.getEntitiesAtBox(pickupBb):
+        if other.entity.entityId != selfEntity.entityId:
+          let otherType = other.entity.entityType.id
+          if otherType != EntityType.IRON_GOLEM.id and not isMinecartId(otherType) and not other.isPassenger() and
+              other.isPushable() and other.entity.ridingCooldown == 0'i32:
+            dynSelf.entity.addPassenger(dynSelf, other)
+            pickedUp = true
+            break
+    let pushBb = entityBb.expand(1.0e-7'f64, 1.0e-7'f64, 1.0e-7'f64)
+    for other in world.getEntitiesAtBox(pushBb):
+      if other.entity.entityId != selfEntity.entityId:
+        let otherType = other.entity.entityType.id
+        let isOtherMinecart = isMinecartId(otherType)
+        if isRideableMinecart:
+          if (otherType == EntityType.IRON_GOLEM.id or isOtherMinecart or isVehicle or not other.entity.hasVehicle()) and
+              other.isPushable():
+            dynSelf.push(other)
+            pushed = true
+        elif not self.hasPassenger(other) and other.isPushable() and isOtherMinecart:
+          dynSelf.push(other)
+          pushed = true
+    for player in world.getPlayersAtBox(pushBb):
+      # Non-rideable minecarts (hoppers, chests) do not push players in vanilla.
+      if player.entityId != selfEntity.entityId and isRideableMinecart:
+        dynSelf.push(playerBase(player))
+        pushed = true
+  else:
+    for other in world.getEntitiesAtBox(entityBb):
+      if other.entity.entityId != selfEntity.entityId:
+        dynSelf.push(other)
+        pushed = true
+    for player in world.getPlayersAtBox(entityBb):
+      if player.entityId != selfEntity.entityId:
+        dynSelf.push(playerBase(player))
+        pushed = true
+  pickedUp and not pushed
+
+proc newEntityVt*(): EntityVt =
+  ## The trait's default methods.
+  EntityVt(
+    tick: proc(self, caller: EntityBase; server: Server) {.closure.} =
+      # The trait default dispatches on get_living_entity; `livingVt` and `entityVt` override it.
+      entityTick(self.entity, caller, server),
+    getJobSitePos: proc(self: EntityBase): Option[BlockPos] {.closure.} = none[BlockPos](),
+    getHomePos: proc(self: EntityBase): Option[BlockPos] {.closure.} = none[BlockPos](),
+    getEyePos: proc(self: EntityBase): Vector3[float64] {.closure.} = entitymod.getEyePos(self.entity),
+    initDataTracker: proc(self: EntityBase) {.closure.} =
+      # If the internal age is negative, it's a baby
+      if self.entity.age < 0'i32:
+        self.entity.sendMetaData(TrackedData_BABY_ID, BOOLEAN, true),
+    setVariantName: proc(self: EntityBase; name: string) {.closure.} = discard,
+    teleport: proc(self: EntityBase; position: Vector3[float64]; yaw, pitch: Option[float32]; world: World) {.closure.} =
+      self.entity.teleportEntity(position, yaw, pitch, world),
+    isPushedByFluids: proc(self: EntityBase): bool {.closure.} = true,
+    isImmuneToExplosion: proc(self: EntityBase): bool {.closure.} = false,
+    getGravity: proc(self: EntityBase): float64 {.closure.} = 0.0'f64,
+    tickInVoid: proc(self, dynSelf: EntityBase) {.closure.} = self.entity.remove(),
+    damage: proc(self, caller: EntityBase; amount: float32; damageType: DamageType): bool {.closure.} =
+      caller.damageWithContext(caller, amount, damageType, none[Vector3[float64]](), nil, nil),
+    isSpectator: proc(self: EntityBase): bool {.closure.} = false,
+    isCollidable: proc(self: EntityBase; entity: nil EntityBase): bool {.closure.} = false,
+    canHit: proc(self: EntityBase): bool {.closure.} = false,
+    isFlutterer: proc(self: EntityBase): bool {.closure.} = false,
+    getYVelocityDrag: proc(self: EntityBase): Option[float64] {.closure.} = none[float64](),
+    damageWithContext: proc(self, caller: EntityBase; amount: float32; damageType: DamageType;
+        position: Option[Vector3[float64]]; source, cause: nil EntityBase): bool {.closure.} =
+      if caller.living != nil:
+        return caller.damageWithContext(caller, amount, damageType, position, source, cause)
+      false,
+    interact: proc(self: EntityBase; player: Player; itemStack: var ItemStack): bool {.closure.} = false,
+    setOnFireFor: proc(self: EntityBase; seconds: float32) {.closure.} =
+      # Exclude fire-immune entities (ex. certain items) from burn damage
+      if not self.entity.fireImmune:
+        self.setOnFireForTicks(uint32(floor(seconds * 20.0'f32))),
+    setOnFireForTicks: proc(self: EntityBase; ticks: uint32) {.closure.} = self.entity.setOnFireForTicks(ticks),
+    onPlayerCollision: proc(self: EntityBase; player: Player) {.closure.} = discard,
+    moveEntity: proc(self, caller: EntityBase; motion: Vector3[float64]) {.closure.} =
+      self.entity.moveEntity(caller, motion),
+    isPushable: proc(self: EntityBase): bool {.closure.} = false,
+    push: proc(self, entity: EntityBase) {.closure.} = defaultPush(self, entity),
+    pushEntities: proc(self, dynSelf: EntityBase): bool {.closure.} = defaultPushEntities(self, dynSelf),
+    onHit: proc(self: EntityBase; hit: ProjectileHit) {.closure.} = discard,
+    setPaddleState: proc(self: EntityBase; left, right: bool) {.closure.} = discard,
+    isInLove: proc(self: EntityBase): bool {.closure.} = false,
+    isBreedingReady: proc(self: EntityBase): bool {.closure.} = false,
+    resetLove: proc(self: EntityBase) {.closure.} = discard,
+    setBreedingCooldown: proc(self: EntityBase; ticks: int32) {.closure.} = discard,
+    isPanicking: proc(self: EntityBase): bool {.closure.} = false,
+    getName: proc(self: EntityBase): TextComponent {.closure.} = defaultEntityName(self),
+    getDisplayName: proc(self: EntityBase): TextComponent {.closure.} =
+      # TODO upstream: team color
+      let entity = self.entity
+      let name = defaultEntityName(self)
+      name.hoverEvent(showEntity($entity.entityUuid, entity.entityType.resourceName, some(name))).insertion($entity.entityUuid),
+    kill: proc(self, caller: EntityBase) {.closure.} =
+      if self.living != nil:
+        discard caller.damage(caller, 3.4028234663852886e38'f32, GENERIC_KILL)
+      else:
+        # TODO upstream: this should be removed once all entities are implemented
+        self.entity.remove(),
+    getExperienceReward: proc(self: EntityBase; killer: nil EntityBase): uint32 {.closure.} = 0'u32,
+    getBaseExperienceReward: proc(self: EntityBase): uint32 {.closure.} = 0'u32,
+    writeNbt: proc(self: EntityBase; nbt: var NbtCompound) {.closure.} = discard,
+    readNbt: proc(self: EntityBase; nbt: NbtCompound) {.closure.} = discard)
+
+proc copyVt*(vt: EntityVt): EntityVt =
+  ## A new vtable to override, starting from `vt`.
+  result = EntityVt()
+  result[] = vt[]
+
+proc newEntityBaseVt(): EntityVt =
+  ## `impl EntityBase for Entity`
+  result = newEntityVt()
+  result.writeNbt = proc(self: EntityBase; nbt: var NbtCompound) {.closure.} = writeEntityNbt(self.entity, nbt)
+  result.readNbt = proc(self: EntityBase; nbt: NbtCompound) {.closure.} = readEntityNbt(self.entity, nbt)
+
+proc decrementForUse(stack: var ItemStack; isPotion: bool; player: Player) =
+  ## The three-way repeated body of `tick`'s consume step.
+  if isPotion:
+    if player.gamemode != Creative:
+      stack.decrement(1'u8)
+      if stack.isEmpty():
+        stack = newItemStack(1'u8, ITEM_GLASS_BOTTLE)
+  else:
+    stack.decrementUnlessCreative(player.gamemode, 1'u8)
+
+proc consumeItem(self: LivingEntity; caller: EntityBase; item: ItemStack) =
+  ## `tick`'s "Current active item", once its use time has run out.
+  var isPotion = false
+  let player = caller.player
+  let (hasFood, food) = item.getDataComponent(FoodImpl)
+  if hasFood and player != nil:
+    gEatHook(player, uint8(food.nutrition), food.saturation)
+    # Special food effects
+    if item.item.id == ITEM_GOLDEN_APPLE.id:
+      self.addEffect(newEffect(StatusEffect.REGENERATION, 100'i32, 1'u8))
+      self.addEffect(newEffect(StatusEffect.ABSORPTION, 2400'i32, 0'u8))
+    elif item.item.id == ITEM_ENCHANTED_GOLDEN_APPLE.id:
+      self.addEffect(newEffect(StatusEffect.REGENERATION, 400'i32, 1'u8))
+      self.addEffect(newEffect(StatusEffect.ABSORPTION, 2400'i32, 3'u8))
+      self.addEffect(newEffect(StatusEffect.RESISTANCE, 6000'i32, 0'u8))
+      self.addEffect(newEffect(StatusEffect.FIRE_RESISTANCE, 6000'i32, 0'u8))
+  # Handle potion consumption
+  if item.getDataComponent(PotionContentsImpl)[0]:
+    gDrinkPotionHook(self, item)
+    isPotion = true
+  if player != nil:
+    gPlayerHooks.triggerAdvancement(player, "ConsumeItem", "minecraft:" & item.item.registryKey)
+    # Prefer modifying the exact stack that matches the consumed item:
+    # 1) selected hotbar (held_item) 2) off-hand 3) fallback to active_hand if the above didn't match
+    var handled = false
+    var held = player.inventory.heldItem()
+    if held.areItemsAndComponentsEqual(item):
+      decrementForUse(held, isPotion, player)
+      player.inventory.setHeldItem(held)
+      handled = true
+    if not handled:
+      var off = player.inventory.offHandItem()
+      if off.areItemsAndComponentsEqual(item):
+        decrementForUse(off, isPotion, player)
+        player.inventory.setOffHandItem(off)
+        handled = true
+    if not handled:
+      # Use stored active_hand (as a fallback)
+      let handToModify = if self.activeHand.isSome: self.activeHand.unsafeGet else: hRight
+      var stack = self.getStackInHand(caller, handToModify)
+      decrementForUse(stack, isPotion, player)
+      self.setStackInHand(caller, handToModify, stack)
+    let cooldown = item.getUseCooldown()
+    if cooldown.isSome:
+      let c = cooldown.unsafeGet
+      let group = if c.cooldownGroup.isSome: c.cooldownGroup.unsafeGet else: item.item.registryKey
+      gPlayerHooks.startCooldown(player, group, asI32(c.seconds * 20.0'f32))
+  self.clearActiveHand()
+
+proc livingTick*(self: LivingEntity; caller: EntityBase; server: Server) =
+  ## `impl EntityBase for LivingEntity`: `tick`
+  entityTick(self.entity, caller, server)
+  # Only tick movement if the entity is alive. This prevents a dead "corpse" from continuing to be simulated.
+  # We allow movement during death animation (20 ticks) so knockback is applied.
+  let isAlive = not self.dead and self.health > 0.0'f32
+  let inDeathAnimation = self.health <= 0.0'f32 and self.deathTime < 20'u8
+  if isAlive or (inDeathAnimation and self.entity.entityType.id != EntityType.PLAYER.id):
+    self.tickMovement(server, caller)
+    # Vanilla-like order: freeze logic runs after movement/collisions.
+    self.entity.tickFrozen(caller)
+  let player = caller.player
+  if player == nil:
+    self.entity.sendPosRot()
+  # Fetch supporting blocks for players or other entities
+  let supportingPos = if player != nil: gPlayerHooks.getSupportingBlockPos(player) else: self.entity.getSupportingBlockPos()
+  # Notify the block under the entity each tick if a supporting block position is found
+  if supportingPos.isSome:
+    let supporting = supportingPos.unsafeGet
+    let world = self.entity.world
+    let stateId = world.stateIdAt(supporting)
+    let blockRef = Block.fromStateId(stateId)
+    gBlockHooks.onEntityStep(blockRef, world, caller, supporting, BlockState.fromId(stateId), false)
+    # Check slightly below supporting_pos for additional supporting blocks (blocks under carpets and the like)
+    if not blockRef.isSolid():
+      let belowSupporting = supporting.down()
+      let belowId = world.stateIdAt(belowSupporting)
+      # If block is not air, notify it as well
+      gBlockHooks.onEntityStep(Block.fromStateId(belowId), world, caller, belowSupporting, BlockState.fromId(belowId), true)
+  self.tickEffects()
+  # Current active item
+  if self.itemInUse.isSome:
+    let item = self.itemInUse.unsafeGet
+    let wasUseTime = self.itemUseTime
+    self.itemUseTime = wasUseTime - 1'i32
+    if wasUseTime <= 0'i32:
+      self.consumeItem(caller, item)
+  if self.hurtCooldown > 0'i32:
+    self.hurtCooldown -= 1'i32
+  if self.health <= 0.0'f32:
+    let time = self.deathTime
+    self.deathTime = time + 1'u8
+    # Only send death particles once (on the exact tick death_time reaches 20) and then remove the entity.
+    if time == 20'u8 and not self.entity.removed:
+      self.entity.removed = true
+      self.entity.world.sendEntityStatus(self.entity, esDeath)
+      self.entity.remove()
+
+proc newLivingVt*(): EntityVt =
+  ## `impl EntityBase for LivingEntity`. A mob or a concrete living type starts from this and overrides.
+  result = newEntityBaseVt()
+  result.tick = proc(self, caller: EntityBase; server: Server) {.closure.} =
+    livingTick(mustLiving(self), caller, server)
+  result.damageWithContext = proc(self, caller: EntityBase; amount: float32; damageType: DamageType;
+      position: Option[Vector3[float64]]; source, cause: nil EntityBase): bool {.closure.} =
+    damageWithContextImpl(mustLiving(self), caller, amount, damageType, position, source, cause)
+  result.tickInVoid = proc(self, dynSelf: EntityBase) {.closure.} =
+    discard dynSelf.damage(dynSelf, 4.0'f32, OUT_OF_WORLD)
+  result.getGravity = proc(self: EntityBase): float64 {.closure.} =
+    getAttributeValue(mustLiving(self), GRAVITY)
+  result.isPushable = proc(self: EntityBase): bool {.closure.} =
+    mustLiving(self).health > 0.0'f32 and not mustLiving(self).dead
+  result.writeNbt = proc(self: EntityBase; nbt: var NbtCompound) {.closure.} = writeLivingNbt(mustLiving(self), nbt)
+  result.readNbt = proc(self: EntityBase; nbt: NbtCompound) {.closure.} = readLivingNbt(mustLiving(self), nbt)
+
+let gEntityVt: EntityVt = newEntityBaseVt()
+let gLivingVt: EntityVt = newLivingVt()
+
+proc entityVt*(): EntityVt = gEntityVt
+  ## The shared vtable of a plain `Entity`. Copy it (`copyVt`) to override.
+
+proc livingVt*(): EntityVt = gLivingVt
+  ## The shared vtable of a plain `LivingEntity`. Copy it (`copyVt`) to override.
+
+proc initEntityBase*(self: EntityBase; entity: Entity; vt: EntityVt) =
+  ## Fills a `dyn EntityBase` over `entity`: what a concrete type's constructor calls on its derived object.
+  self.vt = vt
+  self.entity = entity
+  self.living = nil
+  self.player = nil
+  entity.base = self
+
+proc initLivingBase*(self: EntityBase; living: LivingEntity; vt: EntityVt) =
+  ## `initEntityBase` for something with a `LivingEntity`.
+  self.vt = vt
+  self.entity = living.entity
+  self.living = living
+  self.player = nil
+  living.entity.base = self
+
+proc entityBaseOf*(entity: Entity): EntityBase =
+  ## A bare `Entity` as `dyn EntityBase`.
+  result = EntityBase(vt: gEntityVt, entity: entity, living: nil, player: nil)
+  entity.base = result
+
+proc livingBaseOf*(living: LivingEntity): EntityBase =
+  ## A bare `LivingEntity` as `dyn EntityBase`.
+  result = EntityBase(vt: gLivingVt, entity: living.entity, living: living, player: nil)
+  living.entity.base = result
+
+# --- A `Player` as a `dyn EntityBase`: `impl EntityBase for Player` ---------------------------------------------------------------
+
+proc newPlayerVt(): EntityVt =
+  result = newLivingVt()
+  # Players tick through `World::tick_players`, in worldmod.aowl.
+  result.tick = proc(self, caller: EntityBase; server: Server) {.closure.} = discard
+  result.damageWithContext = proc(self, caller: EntityBase; amount: float32; damageType: DamageType;
+      position: Option[Vector3[float64]]; source, cause: nil EntityBase): bool {.closure.} =
+    syncFromPlayer(self)
+    let player = mustPlayer(self)
+    if player.abilities.invulnerable and damageType.id != GENERIC_KILL.id and damageType.id != OUT_OF_WORLD.id:
+      return false
+    let damaged = damageWithContextImpl(mustLiving(self), caller, amount, damageType, position, source, cause)
+    syncToPlayer(self)
+    if damaged:
+      player.sendHealth()
+      if mustLiving(self).health <= 0.0'f32:
+        gPlayerHooks.handleKilled(player, getDeathMessage(caller, damageType, source, cause))
+    damaged
+  result.teleport = proc(self: EntityBase; position: Vector3[float64]; yaw, pitch: Option[float32]; world: World) {.closure.} =
+    let player = mustPlayer(self)
+    player.requestTeleport(position, (if yaw.isSome: yaw.unsafeGet else: player.yaw),
+      (if pitch.isSome: pitch.unsafeGet else: player.pitch))
+  result.isSpectator = proc(self: EntityBase): bool {.closure.} = mustPlayer(self).gamemode == Spectator
+  result.setOnFireForTicks = proc(self: EntityBase; ticks0: uint32) {.closure.} =
+    let entity = self.entity
+    let ticks = if entity.invulnerable: 1'u32 else: ticks0
+    if entity.fireTicks < int32(ticks):
+      entity.fireTicks = int32(ticks)
+  result.isPushable = proc(self: EntityBase): bool {.closure.} =
+    mustPlayer(self).gamemode != Spectator and mustPlayer(self).gamemode != Creative
+  result.getName = proc(self: EntityBase): TextComponent {.closure.} = text(mustPlayer(self).gameprofile.name)
+  result.getDisplayName = proc(self: EntityBase): TextComponent {.closure.} =
+    let name = text(mustPlayer(self).gameprofile.name)
+    name.hoverEvent(showEntity($self.entity.entityUuid, self.entity.entityType.resourceName, some(name))).insertion(mustPlayer(self).gameprofile.name)
+  result.getExperienceReward = proc(self: EntityBase; killer: nil EntityBase): uint32 {.closure.} =
+    # vanilla: min(level * 7, 100)
+    uint32(min(mustPlayer(self).experienceLevel * 7'i32, 100'i32))
+  result.writeNbt = proc(self: EntityBase; nbt: var NbtCompound) {.closure.} = playermod.writeNbt(mustPlayer(self), nbt)
+  result.readNbt = proc(self: EntityBase; nbt: NbtCompound) {.closure.} = playermod.readNbt(mustPlayer(self), nbt)
+
+let gPlayerVt: EntityVt = newPlayerVt()
+
+proc playerBase*(player: Player): EntityBase =
+  ## The `dyn EntityBase` of a player: one adapter per entity id, refreshed from the `Player` on every lookup. Writes
+  ## other than through `syncToPlayer` (a velocity set on `entity`) are lost on the next lookup, so anything that pushes
+  ## a player goes through `sendVelocity`, which is what a client acts on.
+  if gPlayerBases.hasKey(player.entityId):
+    result = gPlayerBases.getOrDefault(player.entityId)
+  else:
+    let entity = fromUuidWithId(player.entityId, player.gameprofile.id, player.world, player.pos, EntityType.PLAYER)
+    let living = newLivingEntity(entity)
+    living.entityEquipment = player.equipment
+    result = EntityBase(vt: gPlayerVt, entity: entity, living: living, player: player)
+    entity.base = result
+    gPlayerBases[player.entityId] = result
+  result.player = player
+  syncFromPlayer(result)
+
+proc playerBaseOrNil*(player: nil Player): nil EntityBase =
+  ## `.map(|p| p as Arc<dyn EntityBase>)`
+  if player == nil:
+    return nil
+  playerBase(cast[Player](player))
+
+# --- `World`: the entity list ------------------------------------------------------------------------------------------------------
+
+proc allEntities*(world: World): seq[EntityBase] =
+  ## `world.entities.load()`
+  entitiesOf(world).entities
+
+proc getEntityById*(world: World; id: int32): nil EntityBase =
+  ## `get_entity_by_id`
+  for entity in entitiesOf(world).entities:
+    if entity.entity.entityId == id:
+      return entity
+  for player in world.players:
+    if player.entityId == id:
+      return playerBase(player)
+  nil
+
+proc getEntityByUuid*(world: World; id: Uuid): nil EntityBase =
+  ## `get_entity_by_uuid`
+  for entity in entitiesOf(world).entities:
+    if entity.entity.entityUuid == id:
+      return entity
+  nil
+
+proc getEntitiesAtBox*(world: World; aabb: BoundingBox): seq[EntityBase] =
+  ## `get_entities_at_box`: all non-player entities at a box.
+  result = @[]
+  for entity in entitiesOf(world).entities:
+    if entity.entity.boundingBox.intersects(aabb):
+      result.add(entity)
+
+proc getPlayersAtBox*(world: World; aabb: BoundingBox): seq[Player] =
+  ## `get_players_at_box`
+  result = @[]
+  for player in world.players:
+    if playermod.boundingBox(player).intersects(aabb):
+      result.add(player)
+
+proc getAllAtBox*(world: World; aabb: BoundingBox): seq[EntityBase] =
+  ## `get_all_at_box`
+  result = world.getEntitiesAtBox(aabb)
+  for player in world.getPlayersAtBox(aabb):
+    result.add(playerBase(player))
+
+proc getNearbyPlayers*(world: World; pos: Vector3[float64]; radius: float64): seq[Player] =
+  ## `get_nearby_players`
+  let radiusSquared = radius * radius
+  result = @[]
+  for player in world.players:
+    if player.pos.squaredDistanceToVec(pos) <= radiusSquared:
+      result.add(player)
+
+proc getNearbyEntities*(world: World; pos: Vector3[float64]; radius: float64): seq[EntityBase] =
+  ## `get_nearby_entities`
+  let radiusSquared = radius * radius
+  result = @[]
+  for entity in entitiesOf(world).entities:
+    if entity.entity.pos.squaredDistanceToVec(pos) <= radiusSquared:
+      result.add(entity)
+
+proc getClosestPlayer*(world: World; pos: Vector3[float64]; radius: float64): nil Player =
+  ## `get_closest_player`: `min_by` keeps the first of equals.
+  result = nil
+  var best = 0.0'f64
+  for player in world.getNearbyPlayers(pos, radius):
+    let d = player.pos.squaredDistanceToVec(pos)
+    if result == nil or d < best:
+      result = player
+      best = d
+
+proc getClosestEntity*(world: World; pos: Vector3[float64]; radius: float64; entityTypes: openArray[EntityType]): nil EntityBase =
+  ## `get_closest_entity`; an empty `entityTypes` is `None`.
+  result = nil
+  var best = 0.0'f64
+  for entity in world.getNearbyEntities(pos, radius):
+    var matches = entityTypes.len == 0
+    for t in entityTypes:
+      if t.id == entity.entity.entityType.id:
+        matches = true
+    if matches:
+      let d = entity.entity.pos.squaredDistanceToVec(pos)
+      if result == nil or d < best:
+        result = entity
+        best = d
+
+proc broadcastEntitySpawn*(world: World; entity: EntityBase) =
+  ## `broadcast_entity_spawn`
+  let base = entity.entity
+  for player in world.players:
+    if isWithinViewDistance(base.chunkPos, player.chunkPos, int32(getViewDistance(player, world.server))):
+      player.client.writePacketFor(base.createSpawnPacket())
+
+proc addEntitySilent*(world: World; entity: EntityBase) =
+  ## `add_entity_silent`: guards against a duplicate uuid. Natural spawning's `spawn_state` is not ported.
+  let store = entitiesOf(world)
+  for e in store.entities:
+    if e.entity.entityUuid == entity.entity.entityUuid:
+      return
+  store.entities.add(entity)
+
+proc spawnEntity*(world: World; entity: EntityBase) =
+  ## `spawn_entity`
+  world.broadcastEntitySpawn(entity)
+  entity.initDataTracker()
+  world.addEntitySilent(entity)
+
+proc spawnEntityNonSave*(world: World; entity: EntityBase) =
+  ## `spawn_entity_non_save`
+  world.broadcastEntitySpawn(entity)
+  entitiesOf(world).entities.add(entity)
+
+proc removeEntity*(world: World; entity: Entity) =
+  ## `remove_entity`
+  let store = entitiesOf(world)
+  var kept: seq[EntityBase] = @[]
+  for e in store.entities:
+    if e.entity.entityUuid != entity.entityUuid:
+      kept.add(e)
+  store.entities = kept
+  world.broadcastToChunk(entity.chunkPos, CRemoveEntities(entityIds: @[newVarInt(entity.entityId)]))
+
+proc sendEntitiesTo*(world: World; player: Player) =
+  ## `try_enqueue_spawn_packet` for each entity already in view, for a player that just came into the world.
+  for e in entitiesOf(world).entities:
+    if isWithinViewDistance(e.entity.chunkPos, player.chunkPos, int32(getViewDistance(player, world.server))):
+      player.client.writePacketFor(e.entity.createSpawnPacket())
+
+proc tickEntities*(world: World; server: Server) =
+  ## The entity half of `World::tick`. The caller is the gameplay core's `World::tick`.
+  let entitiesToTick = entitiesOf(world).entities
+  for entity in entitiesToTick:
+    # Only tick entities that sit in an active (ticking) chunk: the same set block-entity ticking and mob spawning use.
+    # Use the live position: fast movers write `pos` directly and leave the cached chunk_pos stale.
+    let entityPos0 = entity.entity.pos
+    let entityChunk = Vector2[int32](x: getSectionCord(asI32(floor(entityPos0.x))),
+      y: getSectionCord(asI32(floor(entityPos0.z))))
+    var active = false
+    for c in world.activeChunks:
+      if c == entityChunk:
+        active = true
+        break
+    if not active:
+      continue
+    entity.entity.age += 1'i32
+    entity.tick(entity, server)
+    let entityPos = entity.entity.pos
+    let entityBb = entity.entity.boundingBox
+    for player in world.players:
+      let playerPos = player.pos
+      if abs(playerPos.x - entityPos.x) < 5.0'f64 and abs(playerPos.y - entityPos.y) < 5.0'f64 and
+          abs(playerPos.z - entityPos.z) < 5.0'f64 and playermod.boundingBox(player).intersects(entityBb):
+        entity.onPlayerCollision(player)
+        break
+
+proc saveEntity*(world: World; entity: EntityBase) =
+  ## `save_entity`
+  let currentChunk = entity.entity.blockPos.chunkPosition()
+  var nbt = newCompound()
+  entity.writeNbt(nbt)
+  let chunk = getEntityChunk(world.level, currentChunk.x, currentChunk.y)
+  chunk.data.add(nbt)
+  chunk.dirty = true
+
+proc saveAllEntities*(world: World) =
+  ## The entity half of `World::shutdown`.
+  for entity in entitiesOf(world).entities:
+    world.saveEntity(entity)
+
+# --- The defaults for what the rest of the server fills ------------------------------------------------------------------------------
+
+proc defaultBlockHooks(): BlockHooks =
+  BlockHooks(
+    onEntityCollision: proc(blockRef: Block; world: World; entity: EntityBase; position: BlockPos; state: BlockState;
+        server: Server) {.closure.} = discard,
+    onEntityCollisionFluid: proc(fluid: Fluid; entity: EntityBase) {.closure.} = discard,
+    onEntityStep: proc(blockRef: Block; world: World; entity: EntityBase; position: BlockPos; state: BlockState;
+        belowSupportingBlock: bool) {.closure.} = discard,
+    updateEntityMovementAfterFallOn: proc(blockRef: Block; entity: EntityBase) {.closure.} =
+      # `update_entity_movement_after_fall_on`'s default in pumpkin/src/block/mod.rs.
+      var velo = entity.entity.velocity
+      velo.y = 0.0'f64
+      entity.entity.velocity = velo,
+    getInsideCollisionShape: proc(blockRef: Block; world: World; state: BlockState; position: BlockPos): BoundingBox {.closure.} =
+      BoundingBox.fullBlock(),
+    onLandedUpon: proc(blockRef: Block; world: World; fallDistance: float32; entity: EntityBase): bool {.closure.} = false)
+
+proc defaultPlayerHooks(): PlayerHooks =
+  PlayerHooks(
+    incrementStat: proc(player: Player; category: StatisticCategory; id, amount: int32) {.closure.} = discard,
+    setStat: proc(player: Player; category: StatisticCategory; id, value: int32) {.closure.} = discard,
+    triggerAdvancement: proc(player: Player; trigger, argument: string) {.closure.} = discard,
+    startCooldown: proc(player: Player; group: string; ticks: int32) {.closure.} = discard,
+    handleKilled: proc(player: Player; deathMessage: TextComponent) {.closure.} = player.dead = true,
+    getOffGroundSpeed: proc(player: Player): float64 {.closure.} =
+      # `get_off_ground_speed`
+      if player.abilities.flying:
+        float64(player.abilities.flySpeed) * (if player.sprinting: 2.0'f64 else: 1.0'f64)
+      else:
+        if player.sprinting: 0.025'f64 else: 0.02'f64,
+    getSupportingBlockPos: proc(player: Player): Option[BlockPos] {.closure.} = none[BlockPos](),
+    experiencePickUpDelay: proc(player: Player): uint32 {.closure.} = gExperienceDelays.getOrDefault(player.entityId, 0'u32),
+    setExperiencePickUpDelay: proc(player: Player; delay: uint32) {.closure.} = gExperienceDelays[player.entityId] = delay,
+    applyMendingFromXp: proc(player: Player; amount: int32): int32 {.closure.} = amount,
+    addExperiencePoints: proc(player: Player; amount: int32) {.closure.} = player.experiencePoints += amount)
+
+gBlockHooks = defaultBlockHooks()
+gPlayerHooks = defaultPlayerHooks()

@@ -1,15 +1,16 @@
 ## Port of pumpkin/src/net/java/login.rs
-## PARTIAL: pumpkin/src/net/java/login.rs - offline mode only. With `online_mode` or `encryption` set, `handle_login_start` refuses the client: `handle_encryption_response`, `authenticate` and the key store are not ported. No proxy logins, resource-pack branch is ported but its answer is in config.aowl.
+## PARTIAL: pumpkin/src/net/java/login.rs - `encryption` works end to end, with or without `online_mode`. With `online_mode`, `authenticate` is a clean refusal after the cipher is on: it needs an HTTP client with TLS to reach Mojang's session server (GET https://sessionserver.mojang.com/session/minecraft/hasJoined?username=..&serverId=<digest>), which src/auth/client.aowl cannot give yet, since ../requests does not compile (a seq literal inside a const array) and links curl-impersonate only for Linux. No proxy logins. Upstream does not compare the verify token the client echoes, and neither does this.
 
-import std/options
+import std/[options, syncio]
 import ../../../protocol/java/client/config/[add_resource_pack, server_links, known_packs, plugin_message]
-import ../../../protocol/java/client/login/[login_success, set_compression]
-import ../../../protocol/java/server/login/[login_start, cookie_response]
+import ../../../protocol/java/client/login/[encryption_request, login_success, set_compression]
+import ../../../protocol/java/server/login/[encryption_response, login_start, cookie_response]
 import ../../../protocol/uuid
 import ../../../generated/translation as tr
 import ../../../util/text/text
 import ../../../config/networking/compression
 import ../../connection_cache
+import ../../key_store
 import ../../serverbase
 import ../../servermod
 import javamod
@@ -46,17 +47,26 @@ proc handleLoginStart*(self: JavaClient; server: Server; loginStart: SLoginStart
     return
 
   let java = server.advancedConfig.networking.java
-  if java.onlineMode or java.encryption:
-    self.kick(text("This server does not do online mode or encryption yet"))
-    return
-
-  let id = offlineUuid(loginStart.name)
+  let id = if java.onlineMode: loginStart.uuid else: offlineUuid(loginStart.name)
   let profile = GameProfile(id: id, name: loginStart.name, properties: @[], profileActions: @[])
 
   if java.compression.enabled:
     self.enableCompression(server)
 
-  # Don't allow a duplicate UUID or username. Upstream only checks this in `handle_encryption_response`,
+  if java.encryption:
+    let store = server.keyStore
+    if store == nil:
+      self.kick(text("The key store is not ready"))
+      return
+    let (_, randomId) = newV4()
+    let verifyToken: array[4, byte] = [byte(randomId.lo and 0xFF'u64), byte((randomId.lo shr 8) and 0xFF'u64),
+      byte((randomId.lo shr 16) and 0xFF'u64), byte((randomId.lo shr 24) and 0xFF'u64)]
+    # Wait until we have sent the encryption packet to the client
+    self.writePacketFor(store.encryptionRequest("", verifyToken, java.onlineMode))
+    self.gameprofile = some(profile)
+    return
+
+  # Do not allow a duplicate UUID or username. Upstream only checks this in `handle_encryption_response`,
   # which an offline login never reaches; two clients with one name would share every player lookup here.
   if server.getPlayerByUuid(profile.id).isSome or server.getPlayerByName(profile.name).isSome:
     self.kick(translateCross(tr.JAVA_MULTIPLAYER_DISCONNECT_DUPLICATE_LOGIN, tr.JAVA_MULTIPLAYER_DISCONNECT_DUPLICATE_LOGIN))
@@ -64,6 +74,41 @@ proc handleLoginStart*(self: JavaClient; server: Server; loginStart: SLoginStart
 
   self.finishLogin(profile)
   self.gameprofile = some(profile)
+
+proc handleEncryptionResponse*(self: JavaClient; server: Server; encryptionResponse: SEncryptionResponse) =
+  ## `handle_encryption_response`
+  let store = server.keyStore
+  if store == nil:
+    self.kick(text("Failed to decrypt shared secret"))
+    return
+  let sharedSecret = store.decrypt(encryptionResponse.sharedSecret)
+  if sharedSecret.isNone:
+    self.kick(text("Failed to decrypt shared secret"))
+    return
+  let secret = sharedSecret.unsafeGet
+
+  if not self.setEncryption(secret):
+    self.kick(text("Invalid encryption key"))
+    return
+
+  if self.gameprofile.isNone:
+    self.kick(text("No `GameProfile`"))
+    return
+  let profile = self.gameprofile.unsafeGet
+
+  if server.advancedConfig.networking.java.onlineMode:
+    # `authenticate`: see the PARTIAL line. A client that cannot be verified is not let in.
+    echo "Refusing ", profile.name, ": online mode needs Mojang's session server, and there is no HTTP client yet. ",
+      "Their server hash would be ", store.getDigest(secret)
+    self.kick(translateCross(tr.JAVA_MULTIPLAYER_DISCONNECT_AUTHSERVERS_DOWN, tr.JAVA_MULTIPLAYER_DISCONNECT_AUTHSERVERS_DOWN))
+    return
+
+  # Do not allow duplicate UUIDs or a duplicate username.
+  if server.getPlayerByUuid(profile.id).isSome or server.getPlayerByName(profile.name).isSome:
+    self.kick(translateCross(tr.JAVA_MULTIPLAYER_DISCONNECT_DUPLICATE_LOGIN, tr.JAVA_MULTIPLAYER_DISCONNECT_DUPLICATE_LOGIN))
+    return
+
+  self.finishLogin(profile)
 
 proc handleLoginCookieResponse*(self: JavaClient; packet: SLoginCookieResponse) =
   discard

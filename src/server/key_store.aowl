@@ -1,0 +1,428 @@
+## Port of pumpkin/src/server/key_store.rs
+##
+## Upstream takes RSA from the `rsa` crate, SHA-1 from `sha1` and the digest's formatting from `num-bigint`. Here RSA is on
+## ../jwt's bignum, with the key generation and PKCS#1 v1.5 decrypt that bignum's other user, src/util/jwtmod.aowl, does
+## not need. That bignum is not constant time and neither is this: a 1024-bit key exchanged once per login, the same size
+## and use as vanilla's, but a timing side channel upstream's `rsa` crate also documents for its own decrypt.
+##
+## Key generation takes seconds, so the server makes the key only when `online_mode` or `encryption` asks for one. Random
+## bytes are the OS's, through the uuid generator's source.
+
+import std/options
+import bignum
+import ../protocol/java/client/login/encryption_request
+import ../util/uuid
+
+const
+  KeyBits = 1024
+  PublicExponent = 65537'u32
+
+type
+  EncryptionErrorKind* = enum
+    eeFailedDecrypt
+    eeSharedWrongLength
+
+  KeyStore* = ref object
+    n*: BigInt
+    d*: BigInt
+    p*, q*: BigInt
+    dp*, dq*, qInv*: BigInt
+    publicKeyDer*: seq[byte]
+
+# --- SHA-1 -----------------------------------------------------------------------------------------------------------
+
+proc rol(x: uint32; n: int): uint32 {.inline.} =
+  (x shl n) or (x shr (32 - n))
+
+proc sha1Blocks(h: var array[5, uint32]; data: openArray[byte]; at: int) =
+  var w = newSeq[uint32](80)
+  for i in 0 ..< 16:
+    w[i] = (uint32(data[at + i * 4]) shl 24) or (uint32(data[at + i * 4 + 1]) shl 16) or
+      (uint32(data[at + i * 4 + 2]) shl 8) or uint32(data[at + i * 4 + 3])
+  for i in 16 ..< 80:
+    w[i] = rol(w[i - 3] xor w[i - 8] xor w[i - 14] xor w[i - 16], 1)
+  var a = h[0]
+  var b = h[1]
+  var c = h[2]
+  var d = h[3]
+  var e = h[4]
+  for i in 0 ..< 80:
+    var f = 0'u32
+    var k = 0'u32
+    if i < 20:
+      f = (b and c) or ((not b) and d)
+      k = 0x5A827999'u32
+    elif i < 40:
+      f = b xor c xor d
+      k = 0x6ED9EBA1'u32
+    elif i < 60:
+      f = (b and c) or (b and d) or (c and d)
+      k = 0x8F1BBCDC'u32
+    else:
+      f = b xor c xor d
+      k = 0xCA62C1D6'u32
+    let t = rol(a, 5) + f + e + k + w[i]
+    e = d
+    d = c
+    c = rol(b, 30)
+    b = a
+    a = t
+  h[0] += a
+  h[1] += b
+  h[2] += c
+  h[3] += d
+  h[4] += e
+
+proc sha1*(data: openArray[byte]): array[20, byte] =
+  var h: array[5, uint32] = [0x67452301'u32, 0xEFCDAB89'u32, 0x98BADCFE'u32, 0x10325476'u32, 0xC3D2E1F0'u32]
+  var at = 0
+  while at + 64 <= data.len:
+    sha1Blocks(h, data, at)
+    at += 64
+  var last: seq[byte] = @[]
+  for i in at ..< data.len:
+    last.add(data[i])
+  last.add(0x80'u8)
+  while last.len mod 64 != 56:
+    last.add(0'u8)
+  let bits = uint64(data.len) * 8'u64
+  for i in 0 ..< 8:
+    last.add(byte((bits shr (56 - i * 8)) and 0xFF'u64))
+  var o = 0
+  while o < last.len:
+    sha1Blocks(h, last, o)
+    o += 64
+  for i in 0 ..< 5:
+    result[i * 4] = byte((h[i] shr 24) and 0xFF'u32)
+    result[i * 4 + 1] = byte((h[i] shr 16) and 0xFF'u32)
+    result[i * 4 + 2] = byte((h[i] shr 8) and 0xFF'u32)
+    result[i * 4 + 3] = byte(h[i] and 0xFF'u32)
+
+proc authDigest*(bytes: openArray[byte]): string =
+  ## `auth_digest`: `BigInt::from_signed_bytes_be(bytes).to_str_radix(16)`. Negative in two's complement prints as a
+  ## minus sign and the magnitude; leading zeros go.
+  const Hex = "0123456789abcdef"
+  var magnitude = newSeq[byte](bytes.len)
+  for i in 0 ..< bytes.len:
+    magnitude[i] = bytes[i]
+  let negative = bytes.len > 0 and (bytes[0] and 0x80'u8) != 0'u8
+  if negative:
+    var carry = 1
+    var i = magnitude.len - 1
+    while i >= 0:
+      let v = int((not magnitude[i]) and 0xFF'u8) + carry
+      magnitude[i] = byte(v and 0xFF)
+      carry = v shr 8
+      dec i
+  result = ""
+  var started = false
+  for b in magnitude:
+    let hi = int(b shr 4)
+    let lo = int(b and 0x0F'u8)
+    if started or hi != 0:
+      result.add(Hex[hi])
+      started = true
+    if started or lo != 0:
+      result.add(Hex[lo])
+      started = true
+  if result.len == 0:
+    result = "0"
+  elif negative:
+    result = "-" & result
+
+# --- Montgomery exponentiation --------------------------------------------------------------------------------------
+
+proc montInverse32(n0: uint32): uint32 =
+  ## -n0^-1 mod 2^32, for odd n0: Newton's iteration.
+  var x = 1'u32
+  for i in 0 ..< 5:
+    x = x * (2'u32 - n0 * x)
+  0'u32 - x
+
+proc montMul(a, b, n: openArray[uint32]; n0inv: uint32; res: var seq[uint32]) =
+  ## CIOS: `res` = a * b / 2^(32 k) mod n, for k limbs. All of a, b, n have k limbs.
+  let k = n.len
+  var t = newSeq[uint32](k + 2)
+  for i in 0 ..< k:
+    var carry = 0'u64
+    for j in 0 ..< k:
+      let cur = uint64(t[j]) + uint64(a[j]) * uint64(b[i]) + carry
+      t[j] = uint32(cur and 0xFFFFFFFF'u64)
+      carry = cur shr 32
+    let top = uint64(t[k]) + carry
+    t[k] = uint32(top and 0xFFFFFFFF'u64)
+    t[k + 1] = uint32(top shr 32)
+    let m = t[0] * n0inv
+    var cur = uint64(t[0]) + uint64(m) * uint64(n[0])
+    carry = cur shr 32
+    for j in 1 ..< k:
+      cur = uint64(t[j]) + uint64(m) * uint64(n[j]) + carry
+      t[j - 1] = uint32(cur and 0xFFFFFFFF'u64)
+      carry = cur shr 32
+    cur = uint64(t[k]) + carry
+    t[k - 1] = uint32(cur and 0xFFFFFFFF'u64)
+    t[k] = t[k + 1] + uint32(cur shr 32)
+  # Subtract n once if the result is at least n.
+  var geq = t[k] != 0'u32
+  if not geq:
+    geq = true
+    var i = k - 1
+    while i >= 0:
+      if t[i] != n[i]:
+        geq = t[i] > n[i]
+        break
+      dec i
+  if geq:
+    var borrow = 0'u64
+    for i in 0 ..< k:
+      let d = uint64(t[i]) - uint64(n[i]) - borrow
+      t[i] = uint32(d and 0xFFFFFFFF'u64)
+      borrow = (d shr 32) and 1'u64
+  for i in 0 ..< k:
+    res[i] = t[i]
+
+proc paddedLimbs(a: BigInt; k: int): seq[uint32] =
+  result = newSeq[uint32](k)
+  for i in 0 ..< min(a.len, k):
+    result[i] = a[i]
+
+proc fastModPow*(base, exp, modulus: BigInt): BigInt =
+  ## `bnModPow`'s answer for an odd modulus, a few hundred times faster: bignum's reduction allocates for every bit.
+  let k = modulus.len
+  let n = paddedLimbs(modulus, k)
+  let n0inv = montInverse32(n[0])
+  # R^2 mod n, by doubling.
+  var r2Big = bnFromU32(1'u32)
+  for i in 0 ..< 64 * k:
+    r2Big = bnShl1(r2Big)
+    if bnCmp(r2Big, modulus) >= 0:
+      r2Big = bnSub(r2Big, modulus)
+  let r2 = paddedLimbs(r2Big, k)
+  let reduced = paddedLimbs(bnMod(base, modulus), k)
+  var one = newSeq[uint32](k)
+  one[0] = 1'u32
+  var b = newSeq[uint32](k)
+  montMul(reduced, r2, n, n0inv, b)
+  var acc = newSeq[uint32](k)
+  montMul(one, r2, n, n0inv, acc)
+  var tmp = newSeq[uint32](k)
+  let nbits = bnBitLen(exp)
+  var i = nbits - 1
+  while i >= 0:
+    montMul(acc, acc, n, n0inv, tmp)
+    let swapped = acc
+    acc = tmp
+    tmp = swapped
+    if bnTestBit(exp, i):
+      montMul(acc, b, n, n0inv, tmp)
+      let again = acc
+      acc = tmp
+      tmp = again
+    dec i
+  montMul(acc, one, n, n0inv, tmp)
+  result = tmp
+  while result.len > 1 and result[result.len - 1] == 0'u32:
+    result.setLen(result.len - 1)
+
+# --- random bytes and primes ----------------------------------------------------------------------------------------
+
+proc randomBytes(count: int): seq[byte] =
+  ## From the OS, in sixteens: `newV4` hands back 122 random bits, and its version and variant bits are overwritten here.
+  result = @[]
+  while result.len < count:
+    let (ok, id) = newV4()
+    if not ok:
+      continue
+    var hi = id.hi
+    var lo = id.lo
+    # Bits 12-15 of `hi` and the top two of `lo` are fixed by v4: mix them from the next value's bits.
+    let (ok2, other) = newV4()
+    if ok2:
+      hi = hi xor ((other.lo and 0xFFFF'u64) shl 12)
+      lo = lo xor (other.hi and 0xC000000000000000'u64)
+    for i in 0 ..< 8:
+      result.add(byte((hi shr (56 - i * 8)) and 0xFF'u64))
+    for i in 0 ..< 8:
+      result.add(byte((lo shr (56 - i * 8)) and 0xFF'u64))
+  result.setLen(count)
+
+const SmallPrimes: array[54, uint32] = [3'u32, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37, 41, 43, 47, 53, 59, 61, 67, 71, 73, 79,
+  83, 89, 97, 101, 103, 107, 109, 113, 127, 131, 137, 139, 149, 151, 157, 163, 167, 173, 179, 181, 191, 193, 197, 199,
+  211, 223, 227, 229, 233, 239, 241, 251, 257]
+
+proc modSmall(a: BigInt; m: uint32): uint32 =
+  var r = 0'u64
+  var i = a.len - 1
+  while i >= 0:
+    r = ((r shl 32) or uint64(a[i])) mod uint64(m)
+    dec i
+  uint32(r)
+
+proc isProbablePrime(n: BigInt; rounds: int): bool =
+  ## Miller-Rabin, after trial division.
+  for p in SmallPrimes:
+    if modSmall(n, p) == 0'u32:
+      return false
+  let one = bnFromU32(1'u32)
+  let nMinusOne = bnSub(n, one)
+  var d = nMinusOne
+  var s = 0
+  while not bnTestBit(d, 0):
+    d = bnShr1(d)
+    inc s
+  for round in 0 ..< rounds:
+    # A random base in [2, n-2].
+    var a = bnMod(bnFromBytesBE(randomBytes((bnBitLen(n) + 7) div 8)), bnSub(n, bnFromU32(3'u32)))
+    a = bnAdd(a, bnFromU32(2'u32))
+    var x = fastModPow(a, d, n)
+    if bnCmp(x, one) == 0 or bnCmp(x, nMinusOne) == 0:
+      continue
+    var composite = true
+    var r = 1
+    while r < s:
+      x = bnMulMod(x, x, n)
+      if bnCmp(x, nMinusOne) == 0:
+        composite = false
+        break
+      inc r
+    if composite:
+      return false
+  true
+
+proc generatePrime(bits: int): BigInt =
+  while true:
+    var bytes = randomBytes((bits + 7) div 8)
+    # The top two bits set, so a product of two such primes has its full length; odd.
+    bytes[0] = bytes[0] or 0xC0'u8
+    bytes[bytes.len - 1] = bytes[bytes.len - 1] or 1'u8
+    let candidate = bnFromBytesBE(bytes)
+    if modSmall(candidate, PublicExponent) != 1'u32 and isProbablePrime(candidate, 8):
+      return candidate
+
+# --- DER ------------------------------------------------------------------------------------------------------------
+
+proc derLength(n: int): seq[byte] =
+  if n < 0x80:
+    @[byte(n)]
+  elif n < 0x100:
+    @[0x81'u8, byte(n)]
+  else:
+    @[0x82'u8, byte((n shr 8) and 0xFF), byte(n and 0xFF)]
+
+proc derWrap(tag: byte; body: openArray[byte]): seq[byte] =
+  result = @[tag]
+  let length = derLength(body.len)
+  for b in length:
+    result.add(b)
+  for b in body:
+    result.add(b)
+
+proc derInteger(value: BigInt): seq[byte] =
+  let byteLen = (bnBitLen(value) + 7) div 8
+  var body = bnToBytesBE(value, byteLen)
+  if body.len == 0 or (body[0] and 0x80'u8) != 0'u8:
+    var padded: seq[byte] = @[0'u8]
+    for b in body:
+      padded.add(b)
+    body = padded
+  derWrap(0x02'u8, body)
+
+proc publicKeyToDer*(n: BigInt; e: uint32): seq[byte] =
+  ## SubjectPublicKeyInfo with rsaEncryption: `to_public_key_der`.
+  var rsaKey = derInteger(n)
+  let exponent = derInteger(bnFromU32(e))
+  for b in exponent:
+    rsaKey.add(b)
+  let rsaSeq = derWrap(0x30'u8, rsaKey)
+  var bitString: seq[byte] = @[0'u8]
+  for b in rsaSeq:
+    bitString.add(b)
+  # 1.2.840.113549.1.1.1 and a NULL.
+  let algorithm: seq[byte] = @[0x30'u8, 0x0D, 0x06, 0x09, 0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x01, 0x01, 0x05, 0x00]
+  var spki = algorithm
+  let wrapped = derWrap(0x03'u8, bitString)
+  for b in wrapped:
+    spki.add(b)
+  derWrap(0x30'u8, spki)
+
+# --- KeyStore --------------------------------------------------------------------------------------------------------
+
+proc modInverse(a, m: BigInt): BigInt =
+  ## The extended Euclid, for a composite modulus: bignum's `bnModInv` is Fermat's and needs a prime one. Negative
+  ## coefficients are kept reduced mod `m`, so this works in unsigned numbers.
+  var r0 = m
+  var r1 = bnMod(a, m)
+  var t0 = bnZero()
+  var t1 = bnFromU32(1'u32)
+  while not bnIsZero(r1):
+    let (quotient, remainder) = bnDivMod(r0, r1)
+    let t2 = bnSubMod(t0, bnMod(bnMul(quotient, t1), m), m)
+    t0 = t1
+    t1 = t2
+    r0 = r1
+    r1 = remainder
+  t0
+
+proc keyFromPrimes*(p, q: BigInt): KeyStore =
+  ## The private key's numbers from its primes. Separate so a test can use known ones.
+  let one = bnFromU32(1'u32)
+  let n = bnMul(p, q)
+  let pm1 = bnSub(p, one)
+  let qm1 = bnSub(q, one)
+  let phi = bnMul(pm1, qm1)
+  let e = bnFromU32(PublicExponent)
+  let d = modInverse(e, phi)
+  KeyStore(n: n, d: d, p: p, q: q, dp: bnMod(d, pm1), dq: bnMod(d, qm1), qInv: modInverse(q, p),
+    publicKeyDer: publicKeyToDer(n, PublicExponent))
+
+proc newKeyStore*(): KeyStore =
+  ## `KeyStore::new`
+  while true:
+    let p = generatePrime(KeyBits div 2)
+    let q = generatePrime(KeyBits div 2)
+    if bnCmp(p, q) != 0:
+      return keyFromPrimes(p, q)
+
+proc encryptionRequest*(self: KeyStore; serverId: string; verificationToken: array[4, byte];
+    shouldAuthenticate: bool): CEncryptionRequest =
+  ## `encryption_request`
+  CEncryptionRequest(serverId: serverId, publicKey: self.publicKeyDer, verifyToken: @verificationToken,
+    shouldAuthenticate: shouldAuthenticate)
+
+proc rsaPrivate(self: KeyStore; c: BigInt): BigInt =
+  ## Decryption by the Chinese remainder theorem: four times the speed of `c^d mod n` on this bignum.
+  let m1 = fastModPow(c, self.dp, self.p)
+  let m2 = fastModPow(c, self.dq, self.q)
+  let h = bnMulMod(self.qInv, bnSubMod(m1, bnMod(m2, self.p), self.p), self.p)
+  bnAdd(m2, bnMul(h, self.q))
+
+proc decrypt*(self: KeyStore; data: openArray[byte]): Option[seq[byte]] =
+  ## `decrypt`: PKCS#1 v1.5, none on anything malformed. Upstream's `EncryptionError::FailedDecrypt` is the none.
+  let k = (bnBitLen(self.n) + 7) div 8
+  if data.len != k:
+    return none[seq[byte]]()
+  let c = bnFromBytesBE(data)
+  if bnCmp(c, self.n) >= 0:
+    return none[seq[byte]]()
+  let em = bnToBytesBE(rsaPrivate(self, c), k)
+  if k < 11 or em[0] != 0'u8 or em[1] != 2'u8:
+    return none[seq[byte]]()
+  var i = 2
+  while i < k and em[i] != 0'u8:
+    inc i
+  if i >= k or i < 10:
+    return none[seq[byte]]()
+  var message = newSeq[byte](k - i - 1)
+  for j in 0 ..< message.len:
+    message[j] = em[i + 1 + j]
+  some(message)
+
+proc getDigest*(self: KeyStore; secret: openArray[byte]): string =
+  ## `get_digest`: SHA-1 over the shared secret and the public key.
+  var buf: seq[byte] = @[]
+  for b in secret:
+    buf.add(b)
+  for b in self.publicKeyDer:
+    buf.add(b)
+  let hash = sha1(buf)
+  authDigest(hash)

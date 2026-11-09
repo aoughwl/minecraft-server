@@ -1,0 +1,350 @@
+## Port of pumpkin/src/entity/mob/slime.rs
+
+import std/[math, options, tables]
+from ../../../generated/attributes import MAX_HEALTH, MOVEMENT_SPEED, ATTACK_DAMAGE
+import ../../../nbt/tag as nbttag
+import ../../../util/difficulty
+import ../../../util/legacy_rand
+import ../../../util/math/boundingbox
+import ../../../util/random/random as utilrandom
+import ../ai/aibase
+import ../ai/goal/track_target
+import mobvts
+
+type
+  SlimeEntity* = ref object of Mob
+    jumpDelay*: int32
+    targetYaw*: float32
+    isAggressive*: bool
+    wasOnGround*: bool
+    squish*: float32
+    targetSquish*: float32
+    oSquish*: float32
+    speedModifier*: float64
+    hasSplit*: bool
+
+  SlimeMoveControl* = ref object of MoveControlBase
+    slime*: SlimeEntity
+
+  SlimeFloatGoal* = ref object of Goal
+    slime*: SlimeEntity
+
+  SlimeAttackGoal* = ref object of Goal
+    slime*: SlimeEntity
+    growTiredTimer*: int32
+
+  SlimeRandomDirectionGoal* = ref object of Goal
+    slime*: SlimeEntity
+    chosenDegrees*: float32
+    nextRandomizeTime*: int32
+
+  SlimeKeepOnJumpingGoal* = ref object of Goal
+    slime*: SlimeEntity
+
+proc setSize*(self: SlimeEntity; size: int32; updateHealth: bool) =
+  let actualSize = clamp(size, 1'i32, 127'i32)
+  let living = self.mobEntity.livingEntity
+  let entity = living.entity
+  entity.data = actualSize
+
+  # Update attributes
+  living.setAttributeBase(MAX_HEALTH, float64(actualSize * actualSize))
+  living.setAttributeBase(MOVEMENT_SPEED, float64(0.2'f32 + 0.1'f32 * float32(actualSize)))
+  living.setAttributeBase(ATTACK_DAMAGE, float64(actualSize))
+
+  if updateHealth:
+    let maxHealth = float32(living.getAttributeValue(MAX_HEALTH))
+    living.health = maxHealth
+
+  # Refresh dimensions
+  let scaledDimensions = EntityDimensions(
+    width: entity.entityType.dimension[0] * float32(actualSize),
+    height: entity.entityType.dimension[1] * float32(actualSize),
+    eyeHeight: entity.entityType.eyeHeight * float32(actualSize))
+  entity.entityDimension = scaledDimensions
+
+  let pos = entity.pos
+  entity.boundingBox = newFromPos(BoundingBox, pos.x, pos.y, pos.z, scaledDimensions)
+
+proc randomizeSize*(self: SlimeEntity) =
+  var sizeScale = randomRange(0'i32, 3'i32)
+  if sizeScale < 2'i32 and randomF64() < 0.5:
+    sizeScale = sizeScale + 1'i32
+  let size = 1'i32 shl sizeScale
+  self.setSize(size, true)
+
+proc getSize*(self: SlimeEntity): int32 =
+  self.mobEntity.livingEntity.entity.data
+
+proc isTiny*(self: SlimeEntity): bool =
+  self.getSize() <= 1'i32
+
+proc checkSlimeSpawnRules*(world: World; pos: BlockPos): bool =
+  if world.levelInfo.difficulty == Peaceful:
+    return false
+
+  # TODO upstream: check spawn reason. if it's spawner, we should return true if block below is valid
+  # For now, we assume natural spawning as that's what we are implementing.
+
+  # Swamp/Surface Spawning
+  # TODO upstream: fix. The surface-slime branch is commented out there too.
+
+  # Slime Chunk Spawning
+  let chunkPos = pos.chunkPosition()
+  let worldSeed = world.level.seed
+  let slimeSeed = seedSlimeChunk(chunkPos.x, chunkPos.y, worldSeed, 987_234_911'u64)
+  var slimeRand = fromSeed(slimeSeed)
+
+  if randomRange(0'i32, 10'i32) == 0'i32 and nextBoundedI32(slimeRand, 10'i32) == 0'i32 and pos.y < 40'i32:
+    return true
+
+  false
+
+proc hurtSoundForSize*(size: int32): Sound =
+  if size == 1'i32: sdEntitySlimeHurtSmall else: sdEntitySlimeHurt
+
+proc getJumpDelay(): int32 =
+  randomRange(10'i32, 30'i32)
+
+proc rotLerp*(start, stop, maxStep: float32): float32 =
+  var diff = remEuclidF32(stop - start, 360.0'f32)
+  if diff > 180.0'f32:
+    diff = diff - 360.0'f32
+  start + clamp(diff, -maxStep, maxStep)
+
+proc doPlayJumpSound(self: SlimeEntity): bool =
+  self.getSize() > 0'i32
+
+proc getJumpSound(self: SlimeEntity): Sound =
+  if self.isTiny(): sdEntitySlimeJumpSmall else: sdEntitySlimeJump
+
+proc getSquishSound(self: SlimeEntity): Sound =
+  if self.isTiny(): sdEntitySlimeSquishSmall else: sdEntitySlimeSquish
+
+proc getSoundVolume(self: SlimeEntity): float32 =
+  0.4'f32 * float32(self.getSize())
+
+proc getSoundPitch(self: SlimeEntity): float32 =
+  let pitchAdjuster = if self.isTiny(): 1.4'f32 else: 0.8'f32
+  (randomF32() - randomF32()) * 0.2'f32 + 1.0'f32 * pitchAdjuster
+
+proc slimeMoveTick(slime: SlimeEntity; mob: Mob) =
+  let mobEntity = mob.mobEntity
+  let livingEntity = mobEntity.livingEntity
+  let entity = livingEntity.entity
+
+  let currentYaw = entity.yaw
+  let newYaw = rotLerp(currentYaw, slime.targetYaw, 90.0'f32)
+  entity.yaw = newYaw
+  entity.headYaw = newYaw
+  entity.bodyYaw = newYaw
+
+  let speedModifier = slime.speedModifier
+  var movementInput = Vector3[float64](x: 0.0, y: 0.0, z: 0.0)
+
+  if entity.onGround:
+    if speedModifier > 0.0:
+      let currentDelay = slime.jumpDelay
+      if currentDelay <= 0'i32:
+        # Start jump
+        var nextDelay = getJumpDelay()
+        if slime.isAggressive:
+          nextDelay = nextDelay div 3'i32
+        slime.jumpDelay = nextDelay
+        livingEntity.jumping = true
+        if slime.doPlayJumpSound():
+          playSoundFine(entity.world, slime.getJumpSound(), scHostile, entity.pos, slime.getSoundVolume(),
+            slime.getSoundPitch())
+        movementInput.z = speedModifier
+      else:
+        slime.jumpDelay = currentDelay - 1'i32
+        livingEntity.jumping = false
+    else:
+      livingEntity.jumping = false
+  else:
+    # In air: move forward but don't "jump" again
+    if speedModifier > 0.0:
+      movementInput.z = speedModifier
+    livingEntity.jumping = false
+  livingEntity.movementInput = movementInput
+
+proc newSlimeMoveControl*(slime: SlimeEntity): SlimeMoveControl =
+  result = SlimeMoveControl(slime: slime)
+  result.tickImpl = proc(self: MoveControlBase; mob: Mob) {.closure.} =
+    let control = SlimeMoveControl(self)
+    slimeMoveTick(control.slime, mob)
+
+proc makeSlimeFloatVt(): GoalVt =
+  result = newGoalVt()
+  result.canStart = proc(self: Goal; mob: Mob): bool {.closure.} =
+    let g = SlimeFloatGoal(self)
+    let entity = g.slime.mobEntity.livingEntity.entity
+    entity.touchingWater or entity.touchingLava
+  result.tick = proc(self: Goal; mob: Mob) {.closure.} =
+    let g = SlimeFloatGoal(self)
+    if randomF64() < 0.8:
+      g.slime.mobEntity.livingEntity.jumping = true
+    g.slime.speedModifier = 1.2
+  result.shouldRunEveryTick = proc(self: Goal): bool {.closure.} = true
+  result.controls = proc(self: Goal): Controls {.closure.} = ControlsJump or ControlsMove
+
+proc makeSlimeAttackVt(): GoalVt =
+  result = newGoalVt()
+  result.canStart = proc(self: Goal; mob: Mob): bool {.closure.} =
+    let g = SlimeAttackGoal(self)
+    g.slime.mobEntity.target != nil
+  result.start = proc(self: Goal; mob: Mob) {.closure.} =
+    let g = SlimeAttackGoal(self)
+    g.growTiredTimer = 300'i32
+  result.shouldContinue = proc(self: Goal; mob: Mob): bool {.closure.} =
+    let g = SlimeAttackGoal(self)
+    g.slime.mobEntity.target != nil and g.growTiredTimer > 0'i32
+  result.tick = proc(self: Goal; mob: Mob) {.closure.} =
+    let g = SlimeAttackGoal(self)
+    g.growTiredTimer = g.growTiredTimer - 1'i32
+    let target = g.slime.mobEntity.target
+    if target != nil:
+      let pos = target.entity.pos
+      let myPos = g.slime.mobEntity.livingEntity.entity.pos
+      let dx = pos.x - myPos.x
+      let dz = pos.z - myPos.z
+      g.slime.targetYaw = float32(radToDeg(arctan2(dx, dz)))
+    g.slime.isAggressive = true
+  result.shouldRunEveryTick = proc(self: Goal): bool {.closure.} = true
+  result.controls = proc(self: Goal): Controls {.closure.} = ControlsLook
+
+proc makeSlimeRandomDirectionVt(): GoalVt =
+  result = newGoalVt()
+  result.canStart = proc(self: Goal; mob: Mob): bool {.closure.} =
+    let g = SlimeRandomDirectionGoal(self)
+    let entity = g.slime.mobEntity.livingEntity.entity
+    g.slime.mobEntity.target == nil and (entity.onGround or entity.touchingWater or entity.touchingLava)
+  result.tick = proc(self: Goal; mob: Mob) {.closure.} =
+    let g = SlimeRandomDirectionGoal(self)
+    g.nextRandomizeTime = g.nextRandomizeTime - 1'i32
+    if g.nextRandomizeTime <= 0'i32:
+      g.nextRandomizeTime = randomRange(40'i32, 100'i32)
+      g.chosenDegrees = randomF32() * 360.0'f32
+    g.slime.targetYaw = g.chosenDegrees
+    g.slime.isAggressive = false
+  result.controls = proc(self: Goal): Controls {.closure.} = ControlsLook
+
+proc makeSlimeKeepOnJumpingVt(): GoalVt =
+  result = newGoalVt()
+  result.canStart = proc(self: Goal; mob: Mob): bool {.closure.} =
+    let g = SlimeKeepOnJumpingGoal(self)
+    g.slime.mobEntity.livingEntity.entity.vehicle == nil
+  result.tick = proc(self: Goal; mob: Mob) {.closure.} =
+    let g = SlimeKeepOnJumpingGoal(self)
+    g.slime.speedModifier = 1.0
+  result.controls = proc(self: Goal): Controls {.closure.} = ControlsJump or ControlsMove
+
+let slimeFloatVt* = makeSlimeFloatVt()
+let slimeAttackVt* = makeSlimeAttackVt()
+let slimeRandomDirectionVt* = makeSlimeRandomDirectionVt()
+let slimeKeepOnJumpingVt* = makeSlimeKeepOnJumpingVt()
+
+proc newSlimeEntity*(entity: Entity): SlimeEntity
+
+proc slimeMobTick(slime: SlimeEntity) =
+  slime.oSquish = slime.squish
+  slime.squish = slime.squish + (slime.targetSquish - slime.squish) * 0.5'f32
+
+  let entity = slime.mobEntity.livingEntity.entity
+  let onGround = entity.onGround
+  let wasOnGround = slime.wasOnGround
+
+  if onGround and not wasOnGround:
+    # TODO upstream: particles
+    playSoundFine(entity.world, slime.getSquishSound(), scHostile, entity.pos, slime.getSoundVolume(),
+      ((randomF32() - randomF32()) * 0.2'f32 + 1.0'f32) / 0.8'f32)
+    slime.targetSquish = -0.5'f32
+  elif not onGround and wasOnGround:
+    slime.targetSquish = 1.0'f32
+
+  slime.wasOnGround = onGround
+  slime.targetSquish = slime.targetSquish * 0.6'f32
+
+  slime.isAggressive = false
+  slime.speedModifier = 0.0
+
+proc slimePostTick(slime: SlimeEntity) =
+  let living = slime.mobEntity.livingEntity
+  if living.dead and slime.getSize() > 1'i32 and not slime.hasSplit:
+    slime.hasSplit = true
+    let size = slime.getSize()
+    let world = living.entity.world
+    let pos = living.entity.pos
+    let halfSize = size div 2'i32
+    let count = 2'i32 + randomRange(0'i32, 3'i32)
+
+    let width = living.entity.entityDimension.width
+    let xzOffset = width / 4.0'f32
+
+    var i = 0'i32
+    while i < count:
+      let xd = (float32(i mod 2'i32) - 0.5'f32) * xzOffset
+      let zd = (float32(i div 2'i32) - 0.5'f32) * xzOffset
+
+      let newPos = Vector3[float64](x: pos.x + float64(xd), y: pos.y + 0.5, z: pos.z + float64(zd))
+      let newEntity0 = newEntity(world, newPos, EntityType.SLIME)
+      let child = newSlimeEntity(newEntity0)
+      child.setSize(halfSize, true)
+      child.mobEntity.livingEntity.entity.yaw = randomF32() * 360.0'f32
+      let childBase = asBase(child)
+      spawnEntity(world, childBase)
+      i = i + 1'i32
+
+proc makeSlimeMobVt(): MobVt =
+  result = newMobVt()
+  result.mobTick = proc(self: Mob; caller: EntityBase) {.closure.} =
+    let slime = SlimeEntity(self)
+    slimeMobTick(slime)
+  result.mobPlayerCollision = proc(self: Mob; player: Player) {.closure.} =
+    let slime = SlimeEntity(self)
+    if not slime.isTiny():
+      # dealDamage
+      let selfBase = asBase(slime)
+      slime.mobEntity.tryAttack(selfBase, playerBase(player))
+  result.postTick = proc(self: Mob) {.closure.} =
+    let slime = SlimeEntity(self)
+    slimePostTick(slime)
+
+proc makeSlimeVt(): EntityVt =
+  result = copyVt(mobEntityVt())
+  result.writeNbt = proc(self: EntityBase; nbt: var NbtCompound) {.closure.} =
+    let slime = SlimeEntity(self)
+    Mob(self).mobEntity.livingEntity.writeLivingNbt(nbt)
+    nbt.putInt("Size", slime.getSize() - 1'i32)
+    nbt.putBool("wasOnGround", slime.wasOnGround)
+  result.readNbt = proc(self: EntityBase; nbt: NbtCompound) {.closure.} =
+    let slime = SlimeEntity(self)
+    Mob(self).mobEntity.livingEntity.readLivingNbt(nbt)
+    let size = nbt.getInt("Size")
+    slime.setSize((if size.isSome: size.unsafeGet else: 0'i32) + 1'i32, false)
+    let wasOnGround = nbt.getBool("wasOnGround")
+    slime.wasOnGround = wasOnGround.isSome and wasOnGround.unsafeGet
+
+let slimeMobVt = makeSlimeMobVt()
+let slimeVt = makeSlimeVt()
+
+proc newSlimeEntity*(entity: Entity): SlimeEntity =
+  result = SlimeEntity(jumpDelay: 0'i32, targetYaw: 0.0'f32, isAggressive: false, wasOnGround: false, squish: 0.0'f32,
+    targetSquish: 0.0'f32, oSquish: 0.0'f32, speedModifier: 0.0, hasSplit: false)
+  result.initMob(newMobEntity(entity), slimeMobVt, slimeVt)
+
+  result.mobEntity.moveControl = newSlimeMoveControl(result)
+
+  let goalSelector = result.mobEntity.goalsSelector
+  let targetSelector = result.mobEntity.targetSelector
+
+  goalSelector.addGoal(1'u8, SlimeFloatGoal(vt: slimeFloatVt, slime: result))
+  goalSelector.addGoal(2'u8, SlimeAttackGoal(vt: slimeAttackVt, slime: result, growTiredTimer: 0'i32))
+  goalSelector.addGoal(3'u8, SlimeRandomDirectionGoal(vt: slimeRandomDirectionVt, slime: result, chosenDegrees: 0.0'f32,
+    nextRandomizeTime: 0'i32))
+  goalSelector.addGoal(5'u8, SlimeKeepOnJumpingGoal(vt: slimeKeepOnJumpingVt, slime: result))
+
+  targetSelector.addGoal(1'u8, activeTargetGoalWithDefault(result.mobEntity, EntityType.PLAYER, true))
+  targetSelector.addGoal(3'u8, activeTargetGoalWithDefault(result.mobEntity, EntityType.IRON_GOLEM, true))
+
+  result.randomizeSize()

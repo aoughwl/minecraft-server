@@ -1,0 +1,595 @@
+## Port of pumpkin/src/entity/mob/equipment.rs
+##
+## Mob spawn equipment system.
+##
+## This module handles the automatic equipping of mobs when they spawn, matching vanilla Minecraft's
+## `populateDefaultEquipmentSlots` and `populateDefaultEquipmentEnchantments` behaviour. It features:
+##
+## - A data-driven `EQUIPMENT_REGISTRY` mapping mob types to their weapon/armor configurations (upstream's comment says
+##   13; it holds 12).
+## - Exact vanilla `RegionalDifficulty` computation (game time, chunk inhabited time, moon phase).
+## - Weighted enchantment selection with exclusive-set conflict resolution and cost-based level determination.
+## - Per-slot drop chances with looting bonus on death.
+##
+## Mobs not listed in the registry spawn with no equipment, matching vanilla (not all mob types have equipment
+## definitions).
+##
+## Upstream's `exclusive_set.0` is the tag's member keys; here the tag's ids are compared, which is the same set.
+
+import std/[math, options, strutils, tables]
+import "../../../data/item_stack/mod"
+import ../../../data/data_component_impl/impl_base
+from ../../../generated/enchantment as enchdata import Enchantment, calculate, SHARPNESS, SMITE, BANE_OF_ARTHROPODS,
+  KNOCKBACK, FIRE_ASPECT, LOOTING, SWEEPING_EDGE, UNBREAKING, MENDING, IMPALING, CHANNELING, RIPTIDE, LOYALTY, POWER,
+  PUNCH, FLAME, INFINITY, QUICK_CHARGE, MULTISHOT, PIERCING, LUCK_OF_THE_SEA, LURE, PROTECTION, FIRE_PROTECTION,
+  BLAST_PROTECTION, PROJECTILE_PROTECTION, RESPIRATION, AQUA_AFFINITY, THORNS, SWIFT_SNEAK, FEATHER_FALLING,
+  DEPTH_STRIDER, FROST_WALKER, SOUL_SPEED
+from ../../../generated/enchantment as enchdata import `==`
+import ../../../generated/item_refs as itemrefs
+import ../../../generated/tag as tagdata
+import ../../../inventory/entity_equipment
+import ../../../util/difficulty
+import ../ai/aibase
+
+const
+  WearingArmorChance* = 0.15'f32
+    ## Base chance (before `specialMultiplier` scaling) that a mob will wear armor. `Mob.MAX_WEARING_ARMOR_CHANCE`.
+  ArmorUpgradeMaterialChance* = 0.1087'f32
+    ## Chance per attempt to promote the armor tier to the next material. `Mob.WEARING_ARMOR_UPGRADE_MATERIAL_CHANCE`.
+  ArmorUpgradeMaterialAttempts* = 3.0'f32
+    ## Maximum number of upgrade attempts for armor tier selection. `Mob.WEARING_ARMOR_UPGRADE_MATERIAL_ATTEMPTS`.
+  DefaultEquipmentDropChance* = 0.085'f32
+    ## Default per-slot drop chance for equipment on mob death. `Mob.DEFAULT_EQUIPMENT_DROP_CHANCE`.
+  WeaponEnchantChance* = 0.25'f32
+    ## Base chance (before `specialMultiplier`) for weapon enchantments at spawn. `Mob.MAX_ENCHANTED_WEAPON_CHANCE`.
+  ArmorEnchantChance* = 0.5'f32
+    ## Base chance (before `specialMultiplier`) for armor enchantments at spawn. `Mob.MAX_ENCHANTED_ARMOR_CHANCE`.
+  MobSpawnEnchantMinCost* = 5'i32
+    ## Minimum enchantment cost for mob spawn equipment. From vanilla `mob_spawn_equipment.json`.
+  MobSpawnEnchantCostSpan* = 17'i32
+    ## Cost span added to the minimum, scaled by `specialMultiplier`. From vanilla `mob_spawn_equipment.json`.
+  ArmorPopulationOrder* = [esHead, esChest, esLegs, esFeet]
+
+type
+  WeaponEntry* = object
+    ## A weighted entry in a weapon selection table.
+    ## Matches vanilla's weighted random selection in mob `populateDefaultEquipmentSlots`.
+    item*: Item     ## The item to potentially give.
+    weight*: float32  ## Relative weight in the selection pool.
+
+  WeaponConfigKind* = enum
+    wcAlways          ## Always give this exact item (e.g. skeleton -> bow).
+    wcAlwaysWeighted  ## Always give one of the weighted items (e.g. piglin weapons).
+    wcChance          ## Give a weighted weapon with a difficulty-dependent chance.
+    wcNone            ## No weapon.
+
+  WeaponConfig* = object
+    ## How a mob's main-hand weapon is selected on spawn.
+    kind*: WeaponConfigKind
+    item*: nil Item           ## `Always`
+    items*: seq[WeaponEntry]  ## `AlwaysWeighted`, `Chance`: weighted item pool to select from.
+    onHard*: float32          ## `Chance`: chance when the base difficulty is Hard.
+    otherwise*: float32       ## `Chance`: chance on all other difficulties.
+
+  ArmorSlotEntry* = object
+    ## A per-slot armor entry with an independent spawn chance.
+    slot*: EquipmentSlot  ## Which equipment slot this armor occupies.
+    item*: Item           ## The armor item.
+    chance*: float32      ## Independent chance this slot receives armor.
+
+  ArmorConfigKind* = enum
+    acVanilla        ## The vanilla algorithm: see `selectVanillaArmor`.
+    acCustomPerSlot  ## Custom per-slot entries with independent chances (e.g. piglin golden armor).
+    acNone           ## No armor.
+
+  ArmorConfig* = object
+    ## How a mob's armor is selected on spawn.
+    kind*: ArmorConfigKind
+    entries*: seq[ArmorSlotEntry]
+
+  MobEquipmentDef* = object
+    ## Equipment definition for a single mob type. All equipment is randomized at spawn using `RegionalDifficulty` to
+    ## compute per-world/per-chunk scaling factors.
+    entityType*: string   ## The entity resource name (e.g. `"zombie"`, `"skeleton"`).
+    weapon*: WeaponConfig ## Main-hand weapon configuration.
+    armor*: ArmorConfig   ## Armor configuration.
+    enchanted*: bool      ## Whether spawn-time enchantments can be applied.
+    canPickUpLoot*: bool  ## Whether this mob can randomly pick up loot from the ground.
+
+  RegionalDifficulty* = object
+    ## Computed difficulty values for a specific world chunk.
+    ##
+    ## Mirrors Vanilla's `DifficultyInstance`. Used to scale equipment spawn rates, enchantment costs, and loot-pickup
+    ## flags.
+    baseDifficulty*: Difficulty    ## The world's base difficulty level (`Easy`, `Normal`, `Hard`).
+    effectiveDifficulty*: float32
+      ## Effective difficulty computed from game time, inhabited time, and moon phase. Clamped to the range `[2.0, 4.0]`
+      ## (or `0.0` for Peaceful).
+    specialMultiplier*: float32
+      ## Linear multiplier in `[0.0, 1.0]` derived from `effective_difficulty`. When `0.0` (fresh chunk + early game), no
+      ## equipment, enchantments, or loot-pickup flags are applied.
+
+  EquipmentPiece* = object
+    slot*: EquipmentSlot
+    stack*: ItemStack
+    dropChance*: float32
+
+proc armorTiers(): seq[array[4, Item]] =
+  @[[ITEM_LEATHER_HELMET, ITEM_LEATHER_CHESTPLATE, ITEM_LEATHER_LEGGINGS, ITEM_LEATHER_BOOTS],
+    [ITEM_COPPER_HELMET, ITEM_COPPER_CHESTPLATE, ITEM_COPPER_LEGGINGS, ITEM_COPPER_BOOTS],
+    [ITEM_GOLDEN_HELMET, ITEM_GOLDEN_CHESTPLATE, ITEM_GOLDEN_LEGGINGS, ITEM_GOLDEN_BOOTS],
+    [ITEM_CHAINMAIL_HELMET, ITEM_CHAINMAIL_CHESTPLATE, ITEM_CHAINMAIL_LEGGINGS, ITEM_CHAINMAIL_BOOTS],
+    [ITEM_IRON_HELMET, ITEM_IRON_CHESTPLATE, ITEM_IRON_LEGGINGS, ITEM_IRON_BOOTS],
+    [ITEM_DIAMOND_HELMET, ITEM_DIAMOND_CHESTPLATE, ITEM_DIAMOND_LEGGINGS, ITEM_DIAMOND_BOOTS]]
+
+proc enchantsMeleeWeaponEnchants(): seq[Enchantment] =
+  @[Enchantment.SHARPNESS,
+    Enchantment.SMITE,
+    Enchantment.BANE_OF_ARTHROPODS,
+    Enchantment.KNOCKBACK,
+    Enchantment.FIRE_ASPECT,
+    Enchantment.LOOTING,
+    Enchantment.SWEEPING_EDGE,
+    Enchantment.UNBREAKING,
+    Enchantment.MENDING]
+
+proc enchantsTridentEnchants(): seq[Enchantment] =
+  @[Enchantment.IMPALING,
+    Enchantment.CHANNELING,
+    Enchantment.RIPTIDE,
+    Enchantment.LOYALTY,
+    Enchantment.UNBREAKING,
+    Enchantment.MENDING]
+
+proc enchantsBowEnchants(): seq[Enchantment] =
+  @[Enchantment.POWER,
+    Enchantment.PUNCH,
+    Enchantment.FLAME,
+    Enchantment.INFINITY,
+    Enchantment.UNBREAKING,
+    Enchantment.MENDING]
+
+proc enchantsCrossbowEnchants(): seq[Enchantment] =
+  @[Enchantment.QUICK_CHARGE,
+    Enchantment.MULTISHOT,
+    Enchantment.PIERCING,
+    Enchantment.UNBREAKING,
+    Enchantment.MENDING]
+
+proc enchantsFishingRodEnchants(): seq[Enchantment] =
+  @[Enchantment.LUCK_OF_THE_SEA,
+    Enchantment.LURE,
+    Enchantment.UNBREAKING,
+    Enchantment.MENDING]
+
+proc enchantsHeadArmorEnchants(): seq[Enchantment] =
+  @[Enchantment.PROTECTION,
+    Enchantment.FIRE_PROTECTION,
+    Enchantment.BLAST_PROTECTION,
+    Enchantment.PROJECTILE_PROTECTION,
+    Enchantment.RESPIRATION,
+    Enchantment.AQUA_AFFINITY,
+    Enchantment.THORNS,
+    Enchantment.UNBREAKING,
+    Enchantment.MENDING]
+
+proc enchantsChestArmorEnchants(): seq[Enchantment] =
+  @[Enchantment.PROTECTION,
+    Enchantment.FIRE_PROTECTION,
+    Enchantment.BLAST_PROTECTION,
+    Enchantment.PROJECTILE_PROTECTION,
+    Enchantment.THORNS,
+    Enchantment.UNBREAKING,
+    Enchantment.MENDING]
+
+proc enchantsLegsArmorEnchants(): seq[Enchantment] =
+  @[Enchantment.PROTECTION,
+    Enchantment.FIRE_PROTECTION,
+    Enchantment.BLAST_PROTECTION,
+    Enchantment.PROJECTILE_PROTECTION,
+    Enchantment.THORNS,
+    Enchantment.UNBREAKING,
+    Enchantment.MENDING,
+    Enchantment.SWIFT_SNEAK]
+
+proc enchantsFeetArmorEnchants(): seq[Enchantment] =
+  @[Enchantment.PROTECTION,
+    Enchantment.FIRE_PROTECTION,
+    Enchantment.BLAST_PROTECTION,
+    Enchantment.PROJECTILE_PROTECTION,
+    Enchantment.FEATHER_FALLING,
+    Enchantment.DEPTH_STRIDER,
+    Enchantment.FROST_WALKER,
+    Enchantment.SOUL_SPEED,
+    Enchantment.THORNS,
+    Enchantment.UNBREAKING,
+    Enchantment.MENDING]
+
+proc weaponsZombieWeapons(): seq[WeaponEntry] =
+  @[WeaponEntry(item: ITEM_IRON_SWORD, weight: 1.0'f32),
+    WeaponEntry(item: ITEM_IRON_SPEAR, weight: 1.0'f32),
+    WeaponEntry(item: ITEM_IRON_SHOVEL, weight: 4.0'f32)]
+
+proc weaponsDrownedWeapons(): seq[WeaponEntry] =
+  @[WeaponEntry(item: ITEM_TRIDENT, weight: 10.0'f32),
+    WeaponEntry(item: ITEM_FISHING_ROD, weight: 6.0'f32)]
+
+proc weaponsPiglinWeapons(): seq[WeaponEntry] =
+  @[WeaponEntry(item: ITEM_CROSSBOW, weight: 5.0'f32),
+    WeaponEntry(item: ITEM_GOLDEN_SWORD, weight: 4.5'f32),
+    WeaponEntry(item: ITEM_GOLDEN_SPEAR, weight: 0.5'f32)]
+
+proc weaponsZombifiedPiglinWeapons(): seq[WeaponEntry] =
+  @[WeaponEntry(item: ITEM_GOLDEN_SWORD, weight: 19.0'f32),
+    WeaponEntry(item: ITEM_GOLDEN_SPEAR, weight: 1.0'f32)]
+
+proc armorPiglinArmor(): seq[ArmorSlotEntry] =
+  @[ArmorSlotEntry(slot: esHead, item: ITEM_GOLDEN_HELMET, chance: 0.1'f32),
+    ArmorSlotEntry(slot: esChest, item: ITEM_GOLDEN_CHESTPLATE, chance: 0.1'f32),
+    ArmorSlotEntry(slot: esLegs, item: ITEM_GOLDEN_LEGGINGS, chance: 0.1'f32),
+    ArmorSlotEntry(slot: esFeet, item: ITEM_GOLDEN_BOOTS, chance: 0.1'f32)]
+
+proc buildEquipmentRegistry(): Table[string, MobEquipmentDef] =
+  result = initTable[string, MobEquipmentDef]()
+  result["zombie"] = MobEquipmentDef(entityType: "zombie",
+    weapon: WeaponConfig(kind: wcChance, item: nil, items: weaponsZombieWeapons(), onHard: 0.05'f32, otherwise: 0.01'f32),
+    armor: ArmorConfig(kind: acVanilla, entries: @[]),
+    enchanted: true, canPickUpLoot: true)
+  result["husk"] = MobEquipmentDef(entityType: "husk",
+    weapon: WeaponConfig(kind: wcChance, item: nil, items: weaponsZombieWeapons(), onHard: 0.05'f32, otherwise: 0.01'f32),
+    armor: ArmorConfig(kind: acVanilla, entries: @[]),
+    enchanted: true, canPickUpLoot: true)
+  result["zombie_villager"] = MobEquipmentDef(entityType: "zombie_villager",
+    weapon: WeaponConfig(kind: wcChance, item: nil, items: weaponsZombieWeapons(), onHard: 0.05'f32, otherwise: 0.01'f32),
+    armor: ArmorConfig(kind: acVanilla, entries: @[]),
+    enchanted: true, canPickUpLoot: true)
+  result["drowned"] = MobEquipmentDef(entityType: "drowned",
+    weapon: WeaponConfig(kind: wcChance, item: nil, items: weaponsDrownedWeapons(), onHard: 0.10'f32, otherwise: 0.10'f32),
+    armor: ArmorConfig(kind: acNone, entries: @[]),
+    enchanted: true, canPickUpLoot: true)
+  result["zombified_piglin"] = MobEquipmentDef(entityType: "zombified_piglin",
+    weapon: WeaponConfig(kind: wcAlwaysWeighted, item: nil, items: weaponsZombifiedPiglinWeapons(), onHard: 0.0'f32, otherwise: 0.0'f32),
+    armor: ArmorConfig(kind: acNone, entries: @[]),
+    enchanted: true, canPickUpLoot: false)
+  result["skeleton"] = MobEquipmentDef(entityType: "skeleton",
+    weapon: WeaponConfig(kind: wcAlways, item: ITEM_BOW, items: @[], onHard: 0.0'f32, otherwise: 0.0'f32),
+    armor: ArmorConfig(kind: acVanilla, entries: @[]),
+    enchanted: true, canPickUpLoot: true)
+  result["stray"] = MobEquipmentDef(entityType: "stray",
+    weapon: WeaponConfig(kind: wcAlways, item: ITEM_BOW, items: @[], onHard: 0.0'f32, otherwise: 0.0'f32),
+    armor: ArmorConfig(kind: acVanilla, entries: @[]),
+    enchanted: true, canPickUpLoot: true)
+  result["bogged"] = MobEquipmentDef(entityType: "bogged",
+    weapon: WeaponConfig(kind: wcAlways, item: ITEM_BOW, items: @[], onHard: 0.0'f32, otherwise: 0.0'f32),
+    armor: ArmorConfig(kind: acVanilla, entries: @[]),
+    enchanted: true, canPickUpLoot: true)
+  result["wither_skeleton"] = MobEquipmentDef(entityType: "wither_skeleton",
+    weapon: WeaponConfig(kind: wcAlways, item: ITEM_STONE_SWORD, items: @[], onHard: 0.0'f32, otherwise: 0.0'f32),
+    armor: ArmorConfig(kind: acNone, entries: @[]),
+    enchanted: false, canPickUpLoot: false)
+  result["piglin"] = MobEquipmentDef(entityType: "piglin",
+    weapon: WeaponConfig(kind: wcAlwaysWeighted, item: nil, items: weaponsPiglinWeapons(), onHard: 0.0'f32, otherwise: 0.0'f32),
+    armor: ArmorConfig(kind: acCustomPerSlot, entries: armorPiglinArmor()),
+    enchanted: true, canPickUpLoot: false)
+  result["pillager"] = MobEquipmentDef(entityType: "pillager",
+    weapon: WeaponConfig(kind: wcAlways, item: ITEM_CROSSBOW, items: @[], onHard: 0.0'f32, otherwise: 0.0'f32),
+    armor: ArmorConfig(kind: acNone, entries: @[]),
+    enchanted: false, canPickUpLoot: false)
+  result["vindicator"] = MobEquipmentDef(entityType: "vindicator",
+    weapon: WeaponConfig(kind: wcAlways, item: ITEM_IRON_AXE, items: @[], onHard: 0.0'f32, otherwise: 0.0'f32),
+    armor: ArmorConfig(kind: acNone, entries: @[]),
+    enchanted: true, canPickUpLoot: false)
+
+
+let EquipmentRegistry*: Table[string, MobEquipmentDef] = buildEquipmentRegistry()
+  ## `EQUIPMENT_REGISTRY`: registry of all mobs that receive equipment at spawn.
+  ##
+  ## Maps entity resource names to their equipment definitions. Only mobs listed here will receive weapons, armor,
+  ## enchantments, and drop-chance settings. Unlisted mobs spawn with no equipment (matching vanilla).
+
+let gArmorTiers = armorTiers()
+
+proc moonBrightness*(timeOfDay: int64): float32 =
+  ## Moon brightness factor for the given time of day (0.0 to 1.0).
+  ## Full moon at phase 0, new moon at phase 4.
+  let phase = int32(timeOfDay div 24000'i64 mod 8'i64)
+  if phase == 0'i32:
+    1.0'f32
+  else:
+    1.0'f32 - float32(abs(phase - 4'i32)) / 4.0'f32
+
+proc calculateRegionalDifficulty*(difficulty: Difficulty; totalGameTime: int64; chunkInhabitedTime: uint64;
+    moonBrightness: float32): RegionalDifficulty =
+  ## `RegionalDifficulty::calculate`. Direct calculation from raw inputs. Used by `regionalDifficultyAt` and for testing.
+  if difficulty == Peaceful:
+    return RegionalDifficulty(baseDifficulty: difficulty, effectiveDifficulty: 0.0'f32, specialMultiplier: 0.0'f32)
+
+  let isHard = difficulty == Hard
+
+  var scale = 0.75'f32
+  let globalScale = clamp((float32(totalGameTime) - 72000.0'f32) / 1440000.0'f32, 0.0'f32, 1.0'f32) * 0.25'f32
+  scale = scale + globalScale
+
+  var localScale = 0.0'f32
+  localScale = localScale + clamp(float32(chunkInhabitedTime) / 3600000.0'f32, 0.0'f32, 1.0'f32) *
+    (if isHard: 1.0'f32 else: 0.75'f32)
+  localScale = localScale + clamp(moonBrightness * 0.25'f32, 0.0'f32, globalScale)
+
+  if difficulty == Easy:
+    localScale = localScale * 0.5'f32
+
+  let difficultyId = case difficulty
+    of Peaceful: 0'i32
+    of Easy: 1'i32
+    of Normal: 2'i32
+    of Hard: 3'i32
+
+  let effective = float32(difficultyId) * (scale + localScale)
+
+  let specialMultiplier =
+    if effective < 2.0'f32: 0.0'f32
+    elif effective > 4.0'f32: 1.0'f32
+    else: (effective - 2.0'f32) / 2.0'f32
+
+  RegionalDifficulty(baseDifficulty: difficulty, effectiveDifficulty: effective, specialMultiplier: specialMultiplier)
+
+proc regionalDifficultyAt*(world: World; pos: Vector3[float64]): RegionalDifficulty =
+  ## `RegionalDifficulty::at`. Computes difficulty at the given world position.
+  ##
+  ## Looks up the chunk's inhabited time and combines it with the world's difficulty, game time, and moon phase.
+  let difficulty = world.levelInfo.difficulty
+  let timeOfDay = world.levelTime.timeOfDay
+  let chunkX = int32(floor(pos.x / 16.0))
+  let chunkZ = int32(floor(pos.z / 16.0))
+  var inhabitedTime = 0'u64
+  let key = chunkKey(chunkX, chunkZ)
+  if world.level.loadedChunks.hasKey(key):
+    inhabitedTime = world.level.loadedChunks.getOrDefault(key, nil).inhabitedTime
+  calculateRegionalDifficulty(difficulty, timeOfDay, inhabitedTime, moonBrightness(timeOfDay))
+
+proc shouldHappen*(self: RegionalDifficulty; baseChance: float32): bool =
+  ## Random check scaled by `special_multiplier`.
+  ##
+  ## Returns `true` with probability `base_chance * special_multiplier`. When `special_multiplier` is `0.0` this always
+  ## returns `false` (matching vanilla behaviour on fresh Normal/Easy worlds).
+  randomF32() < baseChance * self.specialMultiplier
+
+proc spawnEnchantCost*(specialMultiplier: float32): int32 =
+  ## Random enchantment cost in `[min, min + specialMultiplier * span]`.
+  let min0 = MobSpawnEnchantMinCost
+  let max0 = min0 + int32(round(specialMultiplier * float32(MobSpawnEnchantCostSpan)))
+  randomRangeInclusive(min0, max0)
+
+proc enchantmentLevelFromCost*(enchant: Enchantment; cost: int32): int32 =
+  ## Returns the highest enchantment level whose cost is affordable.
+  var lvl = enchant.maxLevel
+  while lvl >= 1'i32:
+    if cost >= enchant.minCost.calculate(lvl):
+      return lvl
+    lvl = lvl - 1'i32
+  1'i32
+
+proc enchantPoolFor*(item: Item; slot: EquipmentSlot): seq[Enchantment] =
+  ## Selects the enchantment pool for an item/slot combination.
+  ##
+  ## Uses a curated flat pool per equipment category (melee, trident, bow, crossbow, fishing rod, and per-armor-slot).
+  ## This is an approximation of vanilla's data-driven `mob_spawn_equipment` enchantment provider which filters by
+  ## `supported_items` tags. The tests are upstream's in order, so a crossbow matches "bow" first.
+  let key = item.registryKey
+  if key.contains("sword") or key.contains("spear") or key.contains("axe") or key.contains("shovel"):
+    enchantsMeleeWeaponEnchants()
+  elif key.contains("trident"):
+    enchantsTridentEnchants()
+  elif key.contains("bow"):
+    enchantsBowEnchants()
+  elif key.contains("crossbow"):
+    enchantsCrossbowEnchants()
+  elif key.contains("fishing_rod"):
+    enchantsFishingRodEnchants()
+  elif slot == esHead:
+    enchantsHeadArmorEnchants()
+  elif slot == esChest:
+    enchantsChestArmorEnchants()
+  elif slot == esLegs:
+    enchantsLegsArmorEnchants()
+  elif slot == esFeet:
+    enchantsFeetArmorEnchants()
+  else:
+    @[]
+
+proc conflictsWith*(candidate: Enchantment; applied: seq[Enchantment]): bool =
+  ## Checks whether `candidate` conflicts with any already-applied enchantment via vanilla exclusive sets (e.g.
+  ## `exclusive_set_damage`).
+  if candidate.exclusiveSet.isSome:
+    let (found, ids) = getTagIds(rkEnchantment, candidate.exclusiveSet.unsafeGet)
+    if found:
+      for existing in applied:
+        if uint16(existing.id) in ids:
+          return true
+  false
+
+proc containsEnchant(list: seq[Enchantment]; e: Enchantment): bool =
+  for other in list:
+    if enchdata.`==`(other, e):
+      return true
+  false
+
+proc applyVanillaEnchantments*(stack: var ItemStack; slot: EquipmentSlot; specialMultiplier: float32) =
+  ## Applies multiple enchantments to a stack using weighted pool selection.
+  ##
+  ## Starts with a random cost (scaled by `special_multiplier`), picks enchantments by weight, resolves exclusive-set
+  ## conflicts, and determines the level from the remaining cost. Cost is halved each iteration so later enchantments
+  ## receive lower levels.
+  let pool = enchantPoolFor(stack.item, slot)
+  if pool.len == 0:
+    return
+
+  var cost = spawnEnchantCost(specialMultiplier)
+  var applied: seq[Enchantment] = @[]
+
+  while true:
+    var candidates: seq[Enchantment] = @[]
+    for e in pool:
+      if not containsEnchant(applied, e) and not conflictsWith(e, applied):
+        candidates.add(e)
+
+    if candidates.len == 0:
+      break
+
+    var totalWeight = 0.0'f32
+    for e in candidates:
+      totalWeight = totalWeight + float32(e.weight)
+    if totalWeight <= 0.0'f32:
+      break
+
+    var roll = randomF32() * totalWeight
+    var selected = candidates[candidates.len - 1]
+    for e in candidates:
+      roll = roll - float32(e.weight)
+      if roll <= 0.0'f32:
+        selected = e
+        break
+
+    let level = enchantmentLevelFromCost(selected, cost)
+    stack.addEnchantment(itemrefs.gEnchantments[int(selected.id)], uint16(clamp(level, 1'i32, selected.maxLevel)))
+    applied.add(selected)
+
+    cost = cost div 2'i32
+    if cost < 1'i32:
+      break
+
+proc weightedSelectItem*(items: seq[WeaponEntry]): Item =
+  ## Weighted random selection from a table of weapon entries.
+  var total = 0.0'f32
+  for entry in items:
+    total = total + entry.weight
+  var roll = randomF32() * total
+  for entry in items:
+    roll = roll - entry.weight
+    if roll <= 0.0'f32:
+      return entry.item
+  items[items.len - 1].item
+
+proc createEquipmentItem(item: Item; difficulty: RegionalDifficulty): ItemStack =
+  ## Creates a fresh, full-durability `ItemStack` for mob equipment.
+  ## Vanilla mobs always spawn with equipment at full durability.
+  newItemStack(1'u8, item)
+
+proc selectVanillaArmor*(difficulty: RegionalDifficulty): seq[EquipmentPiece] =
+  ## Selects armor using the vanilla algorithm.
+  ##
+  ## 1. Random base tier (0-2) with up to 3 upgrade attempts at 10.87% each.
+  ## 2. Iterates HEAD->CHEST->LEGS->FEET, with a chance to stop early (10% Hard, 25% otherwise): higher difficulty
+  ##    produces fewer pieces.
+  ## 3. Each piece gets the default equipment drop chance.
+  var armorType = randomRange(0'i32, 3'i32)
+  var i = 1'i32
+  while float32(i) <= ArmorUpgradeMaterialAttempts:
+    if randomF32() < ArmorUpgradeMaterialChance:
+      armorType = armorType + 1'i32
+    i = i + 1'i32
+  armorType = min(armorType, 5'i32)
+
+  let tier = gArmorTiers[int(armorType)]
+
+  let partialChance = if difficulty.baseDifficulty == Hard: 0.1'f32 else: 0.25'f32
+
+  result = @[]
+  var first = true
+  for at in 0 ..< ArmorPopulationOrder.len:
+    if not first and randomF32() < partialChance:
+      break
+    first = false
+    result.add(EquipmentPiece(slot: ArmorPopulationOrder[at], stack: createEquipmentItem(tier[at], difficulty),
+      dropChance: DefaultEquipmentDropChance))
+
+proc weaponPiece(item: Item; def: MobEquipmentDef; difficulty: RegionalDifficulty): EquipmentPiece =
+  var stack = createEquipmentItem(item, difficulty)
+  if def.enchanted and difficulty.shouldHappen(WeaponEnchantChance):
+    applyVanillaEnchantments(stack, esMainHand, difficulty.specialMultiplier)
+  EquipmentPiece(slot: esMainHand, stack: stack, dropChance: DefaultEquipmentDropChance)
+
+proc equipMobFromDef*(def: MobEquipmentDef; difficulty: RegionalDifficulty): seq[EquipmentPiece] =
+  ## Generates the equipment items, slots, and drop chances for a mob definition.
+  ##
+  ## Handles the full weapon + armor selection logic, including enchantment application when both `def.enchanted` is
+  ## true and the difficulty-dependent random check passes.
+  result = @[]
+
+  # -- Weapon --
+  case def.weapon.kind
+  of wcAlways:
+    let item = def.weapon.item
+    if item != nil:
+      result.add(weaponPiece(item, def, difficulty))
+  of wcAlwaysWeighted:
+    result.add(weaponPiece(weightedSelectItem(def.weapon.items), def, difficulty))
+  of wcChance:
+    let chance = if difficulty.baseDifficulty == Hard: def.weapon.onHard else: def.weapon.otherwise
+    if randomF32() < chance:
+      result.add(weaponPiece(weightedSelectItem(def.weapon.items), def, difficulty))
+  of wcNone:
+    discard
+
+  # -- Armor --
+  case def.armor.kind
+  of acVanilla:
+    if difficulty.shouldHappen(WearingArmorChance):
+      var armorPieces = selectVanillaArmor(difficulty)
+      for at in 0 ..< armorPieces.len:
+        if def.enchanted and difficulty.shouldHappen(ArmorEnchantChance):
+          applyVanillaEnchantments(armorPieces[at].stack, armorPieces[at].slot, difficulty.specialMultiplier)
+        result.add(armorPieces[at])
+  of acCustomPerSlot:
+    for entry in def.armor.entries:
+      if randomF32() < entry.chance:
+        var stack = createEquipmentItem(entry.item, difficulty)
+        if def.enchanted and difficulty.shouldHappen(ArmorEnchantChance):
+          applyVanillaEnchantments(stack, entry.slot, difficulty.specialMultiplier)
+        result.add(EquipmentPiece(slot: entry.slot, stack: stack, dropChance: DefaultEquipmentDropChance))
+  of acNone:
+    discard
+
+proc equipMobOnSpawn*(mob: EntityBase; world: World) =
+  ## Equips a mob with weapons/armor/enchantments when it spawns.
+  ##
+  ## Called from the blanket `EntityBase::init_data_tracker` implementation for all mob types. Looks up the mob's
+  ## equipment definition in `EQUIPMENT_REGISTRY`, computes `RegionalDifficulty` at the mob's position, generates
+  ## equipment, stores it in the entity's equipment slots, and broadcasts the changes to nearby players.
+  ##
+  ## Mobs not listed in the registry silently receive no equipment.
+  let entityType = mob.entity.entityType
+  let pos = mob.entity.pos
+  let difficulty = regionalDifficultyAt(world, pos)
+
+  let living = mob.getLivingEntity()
+  if living == nil:
+    return
+
+  let entityName = entityType.resourceName
+  if not EquipmentRegistry.hasKey(entityName):
+    return
+  let def = EquipmentRegistry.getOrDefault(entityName)
+
+  let changesWithDrops = equipMobFromDef(def, difficulty)
+
+  var equipmentChanges: seq[(EquipmentSlot, ItemStack)] = @[]
+
+  for piece in changesWithDrops:
+    discard living.entityEquipment.put(piece.slot, piece.stack)
+    living.equipmentDropChances[ord(piece.slot)] = piece.dropChance
+    equipmentChanges.add((piece.slot, piece.stack))
+
+  living.sendEquipmentChanges(equipmentChanges)
+
+proc equipAndLootHook(mob: Mob; world: World) =
+  ## The tail of the blanket `init_data_tracker`: `equip_mob_on_spawn`, then the loot-pickup roll.
+  equipMobOnSpawn(mob, world)
+  let entityName = mob.entity.entityType.resourceName
+  if EquipmentRegistry.hasKey(entityName) and EquipmentRegistry.getOrDefault(entityName).canPickUpLoot:
+    let difficulty = regionalDifficultyAt(world, mob.entity.pos)
+    let pickupChance = 0.55'f32 * difficulty.specialMultiplier
+    mob.mobEntity.setCanPickUpLoot(randomF32() < pickupChance)
+
+gEquipMobOnSpawn = proc(mob: Mob; world: World) {.closure.} =
+  equipAndLootHook(mob, world)
