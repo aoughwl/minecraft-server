@@ -1,0 +1,199 @@
+## Port of pumpkin-world/src/generation/feature/placed_features.rs
+##
+## `generate` follows the newer checkout (../ref/pumpkin): vanilla chains modifiers as lazy Java streams, so each candidate
+## walks every modifier and then the feature before the next candidate draws anything. The pinned tree finishes each
+## modifier for every candidate first, which draws the same numbers in another order. `FOLIAGE_NOISE` is
+## util/biome.aowl's. The feature's own `generate` is reached through `configuredGenerateHook`, which
+## configured_features.aowl sets, since it in turn calls back up through `placedGenerateHook`.
+
+{.feature: "lenientnils".}
+
+import std/math
+import ../../../generated/biome as biomedata
+import ../../../generated/placed_feature as placedenum
+type PlacedFeatureEnum = placedenum.PlacedFeature
+from ../../../util/biome import FoliageNoise
+import ../../../util/noise/simplex
+import ../height_provider
+import decode
+import types
+import common
+
+var configuredGenerateHook*: proc(f: ConfiguredFeatureDef, ctx: FeatureContext, random: var RandomGenerator,
+                                  pos: BlockPos): bool {.nimcall.}
+
+proc satAdd(a, b: int32): int32 {.inline.} =
+  ## `i32::saturating_add`
+  let s = int64(a) + int64(b)
+  if s > int64(int32.high): int32.high
+  elif s < int64(int32.low): int32.low
+  else: int32(s)
+
+proc blocksSpawn(state: BlockStateId): bool =
+  let blk = blockIdOf(state)
+  isAir(state) or blk == BWater or blk == BLava
+
+let BBedrock = blockIdOfName("bedrock")
+
+proc findPos(c: FeatureContext, x, y, z, targetY: int32): int32 =
+  ## `CountOnEveryLayerPlacementModifier::find_pos`
+  var foundCount = 0'i32
+  var current = getStateV(c, vec3[int32](x, y, z))
+  var j = y
+  while j >= bottomY(c) + 1:
+    let next = getStateV(c, vec3[int32](x, j - 1, z))
+    if not blocksSpawn(next) and blocksSpawn(current) and blockIdOf(next) != BBedrock:
+      if foundCount == targetY:
+        return j
+      inc foundCount
+    current = next
+    dec j
+  int32.high
+
+proc biomeHasFeature(b: biomedata.Biome, feature: PlacedFeatureEnum): bool =
+  for step in 0 ..< b.features.len:
+    for i in 0 ..< b.features[step].len:
+      if b.features[step][i] == feature:
+        return true
+  false
+
+proc testOr(p: BlockPredicate, c: FeatureContext, at: BlockPos): bool {.inline.} =
+  p == nil or test(p, c.blockRegistry, c.chunk, at)
+
+proc environmentScan(m: PlacementModifier, c: FeatureContext, start: BlockPos, found: var BlockPos): bool =
+  ## `EnvironmentScanPlacementModifier::get_positions`
+  if not testOr(m.allowedSearchCondition, c, start):
+    return false
+  var at = start
+  for i in 0'i32 ..< m.maxSteps:
+    if test(m.targetCondition, c.blockRegistry, c.chunk, at):
+      found = at
+      return true
+    at = offset(at, m.directionOfSearch)
+    if outOfHeight(c, at.y):
+      return false
+    if not testOr(m.allowedSearchCondition, c, at):
+      break
+  if test(m.targetCondition, c.blockRegistry, c.chunk, at):
+    found = at
+    return true
+  false
+
+proc generateFrom(p: PlacedFeatureDef, ctx: FeatureContext, modifierIndex: int, random: var RandomGenerator,
+                  at: BlockPos): bool
+
+proc repeated(p: PlacedFeatureDef, ctx: FeatureContext, modifierIndex: int, count: int32, random: var RandomGenerator,
+              at: BlockPos): bool =
+  ## `CountPlacementModifierBase::get_positions`. Vanilla treats a negative count as 0.
+  result = false
+  var i = 0'i32
+  while i < count:
+    if generateFrom(p, ctx, modifierIndex + 1, random, at):
+      result = true
+    inc i
+
+proc generateFrom(p: PlacedFeatureDef, ctx: FeatureContext, modifierIndex: int, random: var RandomGenerator,
+                  at: BlockPos): bool =
+  ## `generate_with_modifiers`, with `PlacementModifier::get_positions` inline.
+  result = false
+  if modifierIndex == p.placement.len:
+    let feature = if p.featureKind == FeatureRefKind.Named: configuredFeatureDef(p.feature) else: p.inlined
+    return configuredGenerateHook(feature, ctx, random, at)
+  let m = p.placement[modifierIndex]
+  let nextIndex = modifierIndex + 1
+  case m.kind
+  of PlacementModifierKind.BlockPredicateFilter:
+    if test(m.predicate, ctx.blockRegistry, ctx.chunk, at):
+      return generateFrom(p, ctx, nextIndex, random, at)
+    return false
+  of PlacementModifierKind.RarityFilter:
+    if nextF32(random) < 1.0'f32 / float32(m.chance):
+      return generateFrom(p, ctx, nextIndex, random, at)
+    return false
+  of PlacementModifierKind.SurfaceRelativeThresholdFilter:
+    let y = topY(ctx, m.heightmap, at.x, at.z)
+    let lo = satAdd(y, if m.hasMin: m.minInclusive else: int32.low)
+    let hi = satAdd(y, if m.hasMax: m.maxInclusive else: int32.high)
+    if lo <= at.y and at.y <= hi:
+      return generateFrom(p, ctx, nextIndex, random, at)
+    return false
+  of PlacementModifierKind.SurfaceWaterDepthFilter:
+    if topBlock(ctx, at.x, at.z) - oceanFloor(ctx, at.x, at.z) <= m.maxWaterDepth:
+      return generateFrom(p, ctx, nextIndex, random, at)
+    return false
+  of PlacementModifierKind.Biome:
+    if biomeHasFeature(biomeForTerrainGenOf(ctx.chunk, at.x, at.y, at.z), ctx.feature):
+      return generateFrom(p, ctx, nextIndex, random, at)
+    return false
+  of PlacementModifierKind.Count:
+    let n = get(m.count, random)
+    return repeated(p, ctx, modifierIndex, n, random, at)
+  of PlacementModifierKind.NoiseBasedCount:
+    let noise = FoliageNoise.sample(float64(at.x) / m.factor, float64(at.z) / m.factor, false)
+    return repeated(p, ctx, modifierIndex, int32(ceil((noise + m.offset) * float64(m.toCountRatio))), random, at)
+  of PlacementModifierKind.NoiseThresholdCount:
+    let noise = FoliageNoise.sample(float64(at.x) / 200.0, float64(at.z) / 200.0, false)
+    return repeated(p, ctx, modifierIndex, if noise < m.noiseLevel: m.belowNoise else: m.aboveNoise, random, at)
+  of PlacementModifierKind.CountOnEveryLayer:
+    # Vanilla draws the whole layer list before any of it is placed.
+    var positions = newSeq[BlockPos](0)
+    var i = 0'i32
+    while true:
+      var bl = false
+      let n = get(m.count, random)
+      var j = 0'i32
+      while j < n:
+        let x = nextBoundedI32(random, 16) + at.x
+        let z = nextBoundedI32(random, 16) + at.z
+        let y = topMotionBlocking(ctx, x, z)
+        let found = findPos(ctx, x, y, z, i)
+        if found != int32.high:
+          positions.add(pos(x, found, z))
+          bl = true
+        inc j
+      inc i
+      if not bl:
+        break
+    result = false
+    for k in 0 ..< positions.len:
+      if generateFrom(p, ctx, nextIndex, random, positions[k]):
+        result = true
+  of PlacementModifierKind.EnvironmentScan:
+    var found = at
+    if environmentScan(m, ctx, at, found):
+      return generateFrom(p, ctx, nextIndex, random, found)
+    return false
+  of PlacementModifierKind.Heightmap:
+    let top = topY(ctx, m.heightmap, at.x, at.z)
+    if top > int32(ctx.minY):
+      return generateFrom(p, ctx, nextIndex, random, pos(at.x, top, at.z))
+    return false
+  of PlacementModifierKind.HeightRange:
+    let y = height_provider.get(m.height, random, ctx.minY, ctx.height)
+    return generateFrom(p, ctx, nextIndex, random, pos(at.x, y, at.z))
+  of PlacementModifierKind.InSquare:
+    let x = nextBoundedI32(random, 16) + at.x
+    let z = nextBoundedI32(random, 16) + at.z
+    return generateFrom(p, ctx, nextIndex, random, pos(x, at.y, z))
+  of PlacementModifierKind.RandomOffset:
+    let x = at.x + get(m.xzSpread, random)
+    let y = at.y + get(m.ySpread, random)
+    let z = at.z + get(m.xzSpread, random)
+    return generateFrom(p, ctx, nextIndex, random, pos(x, y, z))
+  of PlacementModifierKind.FixedPlacement:
+    result = false
+    for k in 0 ..< m.positions.len:
+      if generateFrom(p, ctx, nextIndex, random, m.positions[k]):
+        result = true
+
+proc generatePlaced*(p: PlacedFeatureDef, ctx: FeatureContext, random: var RandomGenerator, at: BlockPos): bool =
+  ## `PlacedFeature::generate`
+  generateFrom(p, ctx, 0, random, at)
+
+proc wrapperGet*(w: PlacedFeatureWrapper): PlacedFeatureDef =
+  ## `PlacedFeatureWrapper::get`
+  if w.direct != nil: w.direct else: placedFeatureDef(w.named)
+
+proc installPlacedHooks*() =
+  placedGenerateHook = generatePlaced
+  placedGetHook = wrapperGet
