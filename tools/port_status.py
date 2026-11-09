@@ -3,11 +3,16 @@
 
     python tools/port_status.py [upstream-checkout] [--missing crate]
 
-A port names what it translates in its header comment, so an upstream file counts as
-touched when a source here names its path or its crate-relative tail. Touched is not
-finished: a header can say "core only". Lines marked `## PARTIAL: <path>` count as
-touched-partial, and the table keeps them apart. Generated code under pumpkin-data is
-left out: that is regenerated from assets/, not hand-ported.
+Each upstream file is in one of four states:
+
+  whole    a source here names it, and no PARTIAL line does. Not proof it is right: that takes
+           its tests, and for the server tools/mcbot.py.
+  partial  a `## PARTIAL: <path>` line names it, saying what is missing.
+  draft    machine-translated and never compiled, so it is not counted as ported at all.
+  missing  no source names it.
+
+Generated code under pumpkin-data is left out: that is regenerated from assets/, not hand-ported.
+`--missing crate` lists what is not whole for that crate, largest first, with its state.
 """
 import os
 import re
@@ -28,47 +33,71 @@ rs = [p for p in rs if '/generated/' not in p and '/src/' in p]
 
 # Only comments name upstream files. Generated tables hold huge single tokens, and a regex over
 # those takes minutes, so generated output is skipped and only lines mentioning `.rs` are read.
-named = set()
 ref = re.compile(r'[\w\-./]+\.rs\b')
+draftWords = ('machine translation', 'not yet compiled')
+named = set()
+partial = set()
+drafts = set()
 for root, dirs, names in os.walk(os.path.join(here, 'src')):
     dirs[:] = [d for d in dirs if d != 'generated']
     for n in names:
-        if n.endswith('.aowl'):
-            for line in open(os.path.join(root, n), encoding='utf-8', errors='replace'):
-                if '.rs' in line and len(line) < 2000:
-                    named.update(m.replace(chr(92), '/') for m in ref.findall(line))
-tails = set()
-for n in named:
-    parts = n.split('/')
-    for i in range(len(parts)):
-        tails.add('/'.join(parts[i:]))
+        if not n.endswith('.aowl'):
+            continue
+        for line in open(os.path.join(root, n), encoding='utf-8', errors='replace'):
+            if '.rs' not in line or len(line) >= 2000:
+                continue
+            found = [m.replace(chr(92), '/') for m in ref.findall(line)]
+            named.update(found)
+            if 'PARTIAL' in line:
+                # The upstream file is the first path; later ones are only mentioned.
+                head = found[:1]
+                partial.update(head)
+                if any(w in line for w in draftWords):
+                    drafts.update(head)
+
+
+def names(group, path, crate, tail):
+    """Whether a group of named paths names this upstream file."""
+    if path in group or (crate + '/src/' + tail) in group:
+        return True
+    if tail.split('/')[-1] in ('mod.rs', 'lib.rs', 'main.rs'):
+        return False
+    return any(n == tail or n.endswith('/' + tail) for n in group)
+
 
 rows = {}
-missing = []
+listed = []
 for p in rs:
     crate = p[len('crates/'):].split('/')[0] if p.startswith('crates/') else p.split('/')[0]
     tail = p.split('/src/', 1)[-1]
     lines = sum(1 for _ in open(os.path.join(upstream, p), 'rb'))
-    r = rows.setdefault(crate, [0, 0, 0, 0])
-    r[0] += 1
-    r[1] += lines
-    # The full path always counts. A shorter tail counts unless it could be any crate's file.
-    hit = p in tails or (crate + '/src/' + tail) in tails or (
-        tail in tails and tail.split('/')[-1] not in ('mod.rs', 'lib.rs', 'main.rs') if '/' in tail
-        else tail in named and tail not in ('mod.rs', 'lib.rs', 'main.rs'))
-    if hit:
-        r[2] += 1
-        r[3] += lines
-    elif crate == only:
-        missing.append((lines, tail))
+    row = rows.setdefault(crate, {'files': 0, 'lines': 0, 'whole': 0, 'partial': 0, 'draft': 0, 'missing': 0})
+    row['files'] += 1
+    row['lines'] += lines
+    if not names(named, p, crate, tail):
+        state = 'missing'
+    elif names(drafts, p, crate, tail):
+        state = 'draft'
+    elif names(partial, p, crate, tail):
+        state = 'partial'
+    else:
+        state = 'whole'
+    row[state] += lines
+    if crate == only and state != 'whole':
+        listed.append((lines, state, tail))
 
 if only:
-    for lines, tail in sorted(missing, reverse=True):
-        print('%7d %s' % (lines, tail))
+    for lines, state, tail in sorted(listed, reverse=True):
+        print('%7d %-8s %s' % (lines, state, tail))
     sys.exit(0)
-print('%-28s %6s %8s %6s %8s %5s' % ('crate', 'files', 'lines', 'named', 'lines', '%'))
-tot = [0, 0, 0, 0]
-for c, r in sorted(rows.items(), key=lambda kv: -kv[1][1]):
-    print('%-28s %6d %8d %6d %8d %4d%%' % (c, r[0], r[1], r[2], r[3], 100 * r[3] / max(1, r[1])))
-    tot = [a + b for a, b in zip(tot, r)]
-print('%-28s %6d %8d %6d %8d %4d%%' % ('TOTAL', tot[0], tot[1], tot[2], tot[3], 100 * tot[3] / max(1, tot[1])))
+
+print('Upstream lines by state. Whole means named with no PARTIAL line, not proven correct.')
+print('%-26s %6s %8s %8s %8s %8s %8s %6s' % ('crate', 'files', 'lines', 'whole', 'partial', 'draft', 'missing', 'whole%'))
+total = dict.fromkeys(('files', 'lines', 'whole', 'partial', 'draft', 'missing'), 0)
+for crate, row in sorted(rows.items(), key=lambda kv: -kv[1]['lines']):
+    print('%-26s %6d %8d %8d %8d %8d %8d %5d%%' % (crate, row['files'], row['lines'], row['whole'], row['partial'],
+                                                 row['draft'], row['missing'], 100 * row['whole'] / max(1, row['lines'])))
+    for k in total:
+        total[k] += row[k]
+print('%-26s %6d %8d %8d %8d %8d %8d %5d%%' % ('TOTAL', total['files'], total['lines'], total['whole'], total['partial'],
+                                             total['draft'], total['missing'], 100 * total['whole'] / max(1, total['lines'])))
