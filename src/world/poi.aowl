@@ -1,23 +1,23 @@
-## Points-of-interest tracking (villager job sites, nether portals, etc.).
-## Port of upstream/world/src/poi/mod.rs's in-memory model and NBT
-## (de)serialization. The on-disk MCA read/write (`save`/`load`, ~250 lines)
-## is NOT ported here: it needs zlib, which - same gap as `nbt_compress.aowl` -
-## aowlmony's stdlib has no module for. `buildChunkNbt`/`parseChunkNbt` below
-## produce/consume the *uncompressed* NBT bytes that upstream's
-## `compress_chunk_data`/`decompress_chunk_data` wrap with zlib; once
-## `nbt_compress.aowl`'s gzip TODO is resolved for real (it's wired to the
-## sibling `compress` repo but unverified on Windows - see its own header),
-## the same wiring covers POI's zlib need and `save`/`load` become a
-## mechanical follow-up on top of `anvilformat.aowl`'s header math.
+## Points of interest (villager job sites, nether portals, etc.): the model, its NBT, region files.
+## Port of pumpkin-world/src/poi/mod.rs
+##
+## DIVERGENCE: upstream's `PoiEntry` serializes `x`, `y`, `z`, where vanilla's POI files store
+## `pos: [I; x, y, z]`, so upstream skips every record of a real save. Reading accepts both; writing
+## emits vanilla's `pos`.
 
 import tick  # BlockPos
 import ../nbt/tag
-import ../nbt/nbtbase
+import ../nbt/[nbtbase, serializer, deserializer, nbtdoc]
+import std/times
+import nbtget, chunkcompress, worldfs
 
 const
   PoiTypeNetherPortal* = "minecraft:nether_portal"
+  SectorSize = 4096
   RegionSize = 32
   ChunkCount = RegionSize * RegionSize
+  HeaderSize = SectorSize * 2
+  CompressionZlib = 2'u8
   DataVersion = 3955'i32  ## upstream's hardcoded "for 1.21" constant.
 
 type
@@ -147,9 +147,7 @@ proc buildChunkNbt*(data: PoiChunkData): NbtCompound =
     var recList: seq[NbtTag] = @[]
     for rec in sec.records:
       var recComp = newCompound()
-      put(recComp, "x", NbtTag(kind: ntkInt, intVal: rec.x))
-      put(recComp, "y", NbtTag(kind: ntkInt, intVal: rec.y))
-      put(recComp, "z", NbtTag(kind: ntkInt, intVal: rec.z))
+      put(recComp, "pos", intArrayTag(@[rec.x, rec.y, rec.z]))
       put(recComp, "type", NbtTag(kind: ntkString, stringVal: rec.poiType))
       put(recComp, "free_tickets", NbtTag(kind: ntkInt, intVal: rec.freeTickets))
       recList.add(NbtTag(kind: ntkCompound, compoundVal: recComp))
@@ -197,6 +195,11 @@ proc parseChunkNbt*(root: NbtCompound): PoiChunkData =
         if fy and yt.kind == ntkInt: e.y = yt.intVal
         let (fz, zt) = get(rc, "z")
         if fz and zt.kind == ntkInt: e.z = zt.intVal
+        let (hasPos, posArr) = nbtIntArray(rc, "pos")
+        if hasPos and posArr.len == 3:
+          e.x = posArr[0]
+          e.y = posArr[1]
+          e.z = posArr[2]
         let (ft, tt) = get(rc, "type")
         if ft and tt.kind == ntkString: e.poiType = tt.stringVal
         let (ff, ftt) = get(rc, "free_tickets")
@@ -205,3 +208,195 @@ proc parseChunkNbt*(root: NbtCompound): PoiChunkData =
     data.sectionKeys.add(secKey)
     data.sections.add(PoiSectionData(valid: valid, records: records))
   data
+
+proc compressChunkData*(chunkData: PoiChunkData): (bool, seq[byte]) =
+  ## `PoiRegion::compress_chunk_data`
+  let r = zlibCompress(write(newNbt("", buildChunkNbt(chunkData)), nwmJava))
+  (r.ok, r.data)
+
+proc decompressChunkData*(compressed: openArray[byte]): (bool, PoiChunkData) =
+  ## `PoiRegion::decompress_chunk_data`
+  let empty = PoiChunkData(dataVersion: DataVersion, sectionKeys: @[], sections: @[])
+  let raw = zlibDecompress(compressed)
+  if not raw.ok:
+    return (false, empty)
+  let isNamed = raw.data.len >= 3 and raw.data[0] == 0x0a'u8 and raw.data[1] == 0x00'u8 and raw.data[2] == 0x00'u8
+  var reader = newNbtReader(nrmJava, raw.data)
+  let doc = if isNamed: read(reader) else: readUnnamed(reader)
+  if not doc.isOk:
+    return (false, empty)
+  (true, parseChunkNbt(doc.value.rootTag))
+
+proc be32(data: openArray[byte], p: int): uint32 =
+  (uint32(data[p]) shl 24) or (uint32(data[p + 1]) shl 16) or (uint32(data[p + 2]) shl 8) or uint32(data[p + 3])
+
+proc putBe32(o: var seq[byte], p: int, v: uint32) =
+  o[p] = uint8(v shr 24)
+  o[p + 1] = uint8((v shr 16) and 0xFF'u32)
+  o[p + 2] = uint8((v shr 8) and 0xFF'u32)
+  o[p + 3] = uint8(v and 0xFF'u32)
+
+proc save*(r: var PoiRegion, path: string): (bool, string) =
+  ## `PoiRegion::save`
+  if not r.dirty:
+    return (true, "")
+  if r.entries.len == 0:
+    # Don't save empty regions, delete the file if it exists.
+    if fileExistsW(path):
+      if not removeFileW(path):
+        return (false, "could not remove " & path)
+    r.dirty = false
+    r.dirtyChunks = @[]
+    return (true, "")
+
+  var chunkData = newSeq[seq[byte]](ChunkCount)
+  var present = newSeq[bool](ChunkCount)
+  for i in 0 ..< r.entries.len:
+    let chunkX = r.entries[i][1].x shr 4
+    let chunkZ = r.entries[i][1].z shr 4
+    let index = chunkIndex(chunkX, chunkZ)
+    if present[index]:
+      continue
+    let (found, data) = getChunkData(r, chunkX, chunkZ)
+    if found:
+      let (ok, compressed) = compressChunkData(data)
+      if not ok:
+        return (false, "could not compress POI chunk")
+      chunkData[index] = compressed
+      present[index] = true
+
+  let timestamp = uint32(getTime().toUnix())
+  var output = newSeq[byte](HeaderSize)
+  var currentSector = 2'u32
+  for index in 0 ..< ChunkCount:
+    if present[index]:
+      let compressed = chunkData[index]
+      let dataLen = compressed.len + 5  # 4 bytes length + 1 byte compression + data
+      let sectorCount = uint32((dataLen + SectorSize - 1) div SectorSize)
+      let start = output.len
+      output.setLen(start + int(sectorCount) * SectorSize)
+      putBe32(output, start, uint32(compressed.len + 1))
+      output[start + 4] = CompressionZlib
+      for i in 0 ..< compressed.len:
+        output[start + 5 + i] = compressed[i]
+      putBe32(output, index * 4, (currentSector shl 8) or sectorCount)
+      putBe32(output, SectorSize + index * 4, timestamp)
+      currentSector += sectorCount
+
+  let parent = parentDirW(path)
+  if parent.len > 0:
+    discard createDirAllW(parent)
+  if not writeFileBytes(path, output):
+    return (false, "could not write " & path)
+  r.dirty = false
+  r.dirtyChunks = @[]
+  (true, "")
+
+proc load*(path: string): (bool, PoiRegion) =
+  ## `PoiRegion::load`. An absent or short file is an empty region; a bad chunk is skipped.
+  var region = newPoiRegion()
+  let (status, fileData) = readFileBytes(path)
+  if status != rsOk or fileData.len < HeaderSize:
+    return (true, region)
+  for index in 0 ..< ChunkCount:
+    let location = be32(fileData, index * 4)
+    let sectorOffset = int(location shr 8)
+    let sectorCount = int(location and 0xFF'u32)
+    if sectorOffset == 0 or sectorCount == 0:
+      continue
+    let byteOffset = sectorOffset * SectorSize
+    let byteEnd = byteOffset + sectorCount * SectorSize
+    if byteEnd > fileData.len:
+      continue
+    let length = int(be32(fileData, byteOffset))
+    let compression = fileData[byteOffset + 4]
+    if compression != CompressionZlib or length < 1 or length > sectorCount * SectorSize - 4:
+      continue
+    let (ok, data) = decompressChunkData(toOpenArray(fileData, byteOffset + 5, byteOffset + 4 + length - 1))
+    if ok:
+      for section in data.sections:
+        for entry in section.records:
+          region.add(entry)
+  region.dirty = false
+  region.dirtyChunks = @[]
+  (true, region)
+
+type
+  LoadedPoiRegion = object
+    rx, rz: int32
+    region: PoiRegion
+
+  PoiStorage* = ref object
+    folder: string
+    regions: seq[LoadedPoiRegion]
+
+proc newPoiStorage*(poiFolder: string): PoiStorage =
+  ## `PoiStorage::new`
+  PoiStorage(folder: poiFolder, regions: @[])
+
+proc regionPath(s: PoiStorage, rx, rz: int32): string =
+  joinPathW(s.folder, "r." & $rx & "." & $rz & ".mca")
+
+proc getOrLoadRegion(s: PoiStorage, rx, rz: int32): int =
+  ## `PoiStorage::get_or_load_region`, as an index into `regions`.
+  for i in 0 ..< s.regions.len:
+    if s.regions[i].rx == rx and s.regions[i].rz == rz:
+      return i
+  let (_, region) = load(regionPath(s, rx, rz))
+  s.regions.add(LoadedPoiRegion(rx: rx, rz: rz, region: region))
+  s.regions.len - 1
+
+proc add*(s: PoiStorage, p: BlockPos, poiType: string) =
+  ## `PoiStorage::add`
+  let i = getOrLoadRegion(s, (p.x shr 4) shr 5, (p.z shr 4) shr 5)
+  s.regions[i].region.add(PoiEntry(x: p.x, y: p.y, z: p.z, poiType: poiType, freeTickets: 0'i32))
+
+proc addPortal*(s: PoiStorage, p: BlockPos) =
+  ## `PoiStorage::add_portal`
+  add(s, p, PoiTypeNetherPortal)
+
+proc remove*(s: PoiStorage, p: BlockPos): bool =
+  ## `PoiStorage::remove`
+  let i = getOrLoadRegion(s, (p.x shr 4) shr 5, (p.z shr 4) shr 5)
+  s.regions[i].region.remove(p)
+
+proc getInSquare*(s: PoiStorage, center: BlockPos, radius: int32, poiType = ""): seq[BlockPos] =
+  ## `PoiStorage::get_in_square`. An empty `poiType` is upstream's `None`.
+  result = newSeq[BlockPos](0)
+  let minRx = ((center.x - radius) shr 4) shr 5
+  let maxRx = ((center.x + radius) shr 4) shr 5
+  let minRz = ((center.z - radius) shr 4) shr 5
+  let maxRz = ((center.z + radius) shr 4) shr 5
+  var rx = minRx
+  while rx <= maxRx:
+    var rz = minRz
+    while rz <= maxRz:
+      let i = getOrLoadRegion(s, rx, rz)
+      let entries = s.regions[i].region.getAll()
+      for entry in entries:
+        if poiType.len > 0 and entry.poiType != poiType:
+          continue
+        if abs(entry.x - center.x) <= radius and abs(entry.z - center.z) <= radius:
+          result.add(entry.pos())
+      inc rz
+    inc rx
+
+proc saveAll*(s: PoiStorage): (bool, string) =
+  ## `PoiStorage::save_all`
+  discard createDirAllW(s.folder)
+  for i in 0 ..< s.regions.len:
+    if s.regions[i].region.dirty:
+      let (ok, msg) = save(s.regions[i].region, regionPath(s, s.regions[i].rx, s.regions[i].rz))
+      if not ok:
+        return (false, msg)
+  (true, "")
+
+proc loadedRegionCount*(s: PoiStorage): int {.inline.} =
+  ## `PoiStorage::loaded_region_count`
+  s.regions.len
+
+proc totalPoiCount*(s: PoiStorage): int =
+  ## `PoiStorage::total_poi_count`
+  result = 0
+  for r in s.regions:
+    result += r.region.getAll().len

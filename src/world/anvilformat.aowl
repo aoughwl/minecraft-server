@@ -1,27 +1,16 @@
-## The Java Edition on-disk region file (.mca "Anvil") format: the 8 KiB
-## location/timestamp header, per-chunk sector accounting, and the
-## length-prefixed/compression-tagged chunk payload framing.
-## Port of the pure on-disk-layout portion of upstream/world/src/chunk/format/anvil.rs.
+## The Java Edition on-disk region file (.mca "Anvil") format: the 8 KiB location and timestamp
+## header, per-chunk sector accounting, chunk payload framing and compression, and the file object
+## that reads, updates and writes a region.
+## Port of pumpkin-world/src/chunk/format/anvil.rs
 ##
-## Scope: this file ports the FORMAT MATH ONLY - the byte-level header
-## layout, sector bookkeeping, and payload framing that decide where a
-## chunk's bytes live in a region file and how its length/compression tag
-## is encoded. It deliberately does NOT port:
-##   - actual gzip/zlib/LZ4 (de)compression bodies: same gap as
-##     src/nbt/nbt_compress.aowl (no zlib/gzip module in aowlmony's stdlib);
-##     `CompressionKind` here still tags a chunk's declared method, this
-##     file just doesn't decode/encode the compressed bytes themselves.
-##   - the async file I/O / mutex-guarded in-place sector allocator
-##     (`AnvilChunkFile::write`/`write_indices`, tokio `AsyncWrite`) - no
-##     concurrency/async design has been chosen yet for this port (the
-##     same gap flagged for the scheduler and plugin runtime).
-## Those are real follow-ups, not silently skipped: this layer (framing +
-## header math) is exactly what upstream's own `palette.rs` fork called
-## out as "a separate mechanical follow-up now the in-memory shape is
-## settled", and it's self-contained enough to verify with a real
-## round-trip test (see anvilformattest.aowl) without either gap.
+## Upstream's `AnvilChunkFile<S>` is generic over the chunk type; `toSerializer` here gives the
+## bytes-level `ChunkSerializer`, and filemanager.aowl parses the bytes into a chunk. No async: the
+## `write_action` mutex is a plain field.
 
+import std/[algorithm, times]
 import ../nbt/nbtbase
+import ../config/chunk as chunkconfig
+import chunkdata, chunkio, chunkcompress, worldfs
 
 const
   RegionSize* = 32                      ## one region is 32x32 chunks
@@ -30,7 +19,7 @@ const
   ChunkCount* = RegionSize * RegionSize
   SectorBytes* = 4096
   NoCompressionId = 3'u8
-  WorldDataVersion* = 4903
+  WorldDataVersion* = 4790  ## WORLD_DATA_VERSION, "26.1.2"
 
 type
   CompressionKind* = enum
@@ -134,9 +123,7 @@ proc parseRegionHeader*(headerBytes: openArray[byte]): NbtResult[seq[RegionChunk
   ## `headerBytes` must be exactly `2 * SectorBytes` (8192) bytes: the
   ## location table (1024 big-endian u32s) followed by the timestamp
   ## table (1024 big-endian u32s), per upstream's `AnvilChunkFile::read`.
-  ## Sector 0 and sector 1 are reserved for these two tables, so a chunk
-  ## can never legitimately claim `sectorOffset < 2`; upstream treats
-  ## that (and a zero location word) as "absent", which this mirrors.
+  ## A zero sector offset or a zero count means absent.
   if headerBytes.len != 2 * SectorBytes:
     return errRes[seq[RegionChunkEntry]](
       nbtError(nekIncomplete, "region header must be exactly " & $(2 * SectorBytes) & " bytes"))
@@ -146,7 +133,7 @@ proc parseRegionHeader*(headerBytes: openArray[byte]): NbtResult[seq[RegionChunk
     let timestamp = readBE32(headerBytes, SectorBytes + i * 4)
     let sectorCount = decodeLocationCount(location)
     let sectorOffset = decodeLocationOffset(location)
-    if location == 0 or sectorOffset < 2:
+    if sectorOffset == 0'u32 or sectorCount == 0'u8:
       entries[i] = RegionChunkEntry(present: false)
     else:
       entries[i] = RegionChunkEntry(
@@ -203,3 +190,356 @@ proc unframePayload*(bytes: openArray[byte]): NbtResult[AnvilChunkPayload] =
   for i in 0 ..< length:
     data[i] = bytes[5 + i]
   ok[AnvilChunkPayload](AnvilChunkPayload(compression: comp, data: data))
+
+# --- Compression::{compress_data,decompress_data} ------------------------------
+
+const Lz4CompressionLevelBase = 10
+
+proc decompressData*(comp: CompressionKind, compressedData: openArray[byte]): (bool, seq[byte], CompressionError) =
+  ## `Compression::decompress_data`
+  let none = CompressionError(kind: ceUnknownCompression, msg: "")
+  case comp
+  of ckGZip:
+    let r = gzipDecompressBytes(compressedData)
+    if r.ok: (true, r.data, none) else: (false, newSeq[byte](0), CompressionError(kind: ceGZipError, msg: r.msg))
+  of ckZLib:
+    let r = zlibDecompress(compressedData)
+    if r.ok: (true, r.data, none) else: (false, newSeq[byte](0), CompressionError(kind: ceZlibError, msg: r.msg))
+  of ckLZ4:
+    let r = lz4Decompress(compressedData)
+    if r.ok: (true, r.data, none) else: (false, newSeq[byte](0), CompressionError(kind: ceLZ4Error, msg: r.msg))
+  of ckCustom:
+    (false, newSeq[byte](0), none)
+
+proc compressData*(comp: CompressionKind, uncompressedData: openArray[byte],
+                   compressionLevel: uint32): (bool, seq[byte], CompressionError) =
+  ## `Compression::compress_data`
+  let none = CompressionError(kind: ceUnknownCompression, msg: "")
+  case comp
+  of ckGZip:
+    let r = gzipCompressBytes(uncompressedData, int(compressionLevel))
+    if r.ok: (true, r.data, none) else: (false, newSeq[byte](0), CompressionError(kind: ceGZipError, msg: r.msg))
+  of ckZLib:
+    let r = zlibCompress(uncompressedData, int(compressionLevel))
+    if r.ok: (true, r.data, none) else: (false, newSeq[byte](0), CompressionError(kind: ceZlibError, msg: r.msg))
+  of ckLZ4:
+    let blockSize = 1 shl (Lz4CompressionLevelBase + int(compressionLevel))
+    let r = lz4Compress(uncompressedData, blockSize)
+    if r.ok: (true, r.data, none) else: (false, newSeq[byte](0), CompressionError(kind: ceLZ4Error, msg: r.msg))
+  of ckCustom:
+    (false, newSeq[byte](0), none)
+
+proc compressionFromConfig*(c: chunkconfig.Compression): CompressionKind =
+  ## `impl From<pumpkin_config::chunk::Compression> for Compression`
+  case c
+  of compGZip: ckGZip
+  of compZLib: ckZLib
+  of compLZ4: ckLZ4
+  of compCustom: ckCustom
+
+# --- AnvilChunkData ------------------------------------------------------------
+
+type
+  AnvilChunkData* = AnvilChunkPayload
+
+proc sectorCount*(d: AnvilChunkData): uint32 {.inline.} =
+  ## `AnvilChunkData::sector_count`
+  sectorCountFor(d.data.len)
+
+proc writePadded(d: AnvilChunkData, o: var seq[byte]) =
+  ## `AnvilChunkData::write`: frame plus zero padding to the sector boundary.
+  let start = o.len
+  let frame = framePayload(d)
+  o.setLen(start + paddedSizeFor(d.data.len))
+  for i in 0 ..< frame.len:
+    o[start + i] = frame[i]
+
+proc toChunkBytes*(d: AnvilChunkData): (bool, seq[byte], ChunkReadingError) =
+  ## `AnvilChunkData::to_chunk`, up to the point `S::from_bytes` takes over.
+  if d.compression.kind == cbSome:
+    let (ok, raw, e) = decompressData(d.compression.comp, d.data)
+    if not ok:
+      return (false, newSeq[byte](0), readErr(creCompression, $e.kind & " " & e.msg))
+    (true, raw, readErr(creIoError))
+  else:
+    (true, d.data, readErr(creIoError))
+
+proc fromChunkBytes*(raw: openArray[byte], compression: CompressionByteResult,
+                     cfg: AnvilChunkConfig): (bool, AnvilChunkData, ChunkWritingError) =
+  ## `AnvilChunkData::from_chunk`
+  let kind = if compression.kind == cbSome: compression.comp
+             else: compressionFromConfig(cfg.compression.algorithm)
+  let (ok, compressed, e) = compressData(kind, raw, cfg.compression.level)
+  let empty = AnvilChunkPayload(compression: CompressionByteResult(kind: cbNone), data: @[])
+  if not ok:
+    return (false, empty, writeErr(cweCompression, $e.kind & " " & e.msg))
+  (true, AnvilChunkPayload(compression: CompressionByteResult(kind: cbSome, comp: kind), data: compressed),
+    writeErr(cweIoError))
+
+# --- AnvilChunkFile ------------------------------------------------------------
+
+type
+  WriteActionKind = enum
+    waPass   ## Don't write anything
+    waAll    ## Write the entire file
+    waParts  ## Only write certain indices
+
+  AnvilChunkMetadata* = object
+    present*: bool
+    serializedData*: AnvilChunkData
+    timestamp*: uint32
+    fileSectorOffset*: uint32
+
+  AnvilChunkFile* = ref object
+    chunksData*: seq[AnvilChunkMetadata]
+    endSector*: uint32
+    writeAction: WriteActionKind
+    writeParts: seq[int]
+
+proc newAnvilChunkFile*(): AnvilChunkFile =
+  ## `impl Default for AnvilChunkFile`
+  AnvilChunkFile(chunksData: newSeq[AnvilChunkMetadata](ChunkCount), endSector: 2'u32,
+    writeAction: waPass, writeParts: @[])
+
+proc cmpInt64(a, b: int64): int =
+  if a < b: -1
+  elif a > b: 1
+  else: 0
+
+proc maybeUpdateChunkIndex(f: AnvilChunkFile, index: int) =
+  ## `WriteAction::maybe_update_chunk_index`
+  case f.writeAction
+  of waPass:
+    f.writeAction = waParts
+    f.writeParts = @[index]
+  of waParts:
+    var found = false
+    for p in f.writeParts:
+      if p == index:
+        found = true
+    if not found:
+      f.writeParts.add(index)
+  of waAll:
+    discard
+
+proc putU32(o: var seq[byte], v: uint32) =
+  o.add(uint8(v shr 24))
+  o.add(uint8((v shr 16) and 0xFF'u32))
+  o.add(uint8((v shr 8) and 0xFF'u32))
+  o.add(uint8(v and 0xFF'u32))
+
+proc buildHeader(f: AnvilChunkFile, assignSectors: bool): seq[byte] =
+  result = newSeq[byte](0)
+  var currentSector = 2'u32
+  for m in f.chunksData:
+    if m.present:
+      let count = sectorCount(m.serializedData)
+      if assignSectors:
+        putU32(result, (currentSector shl 8) or count)
+        currentSector += count
+      else:
+        putU32(result, (m.fileSectorOffset shl 8) or count)
+    else:
+      putU32(result, 0'u32)
+  for m in f.chunksData:
+    putU32(result, if m.present: m.timestamp else: 0'u32)
+
+proc writeIndices(f: AnvilChunkFile, path: string, indices: openArray[int]): IoStatus =
+  ## `AnvilChunkFile::write_indices`
+  var keys = newSeq[int64](0)
+  for index in indices:
+    keys.add(int64(f.chunksData[index].fileSectorOffset) * 2048'i64 + int64(index))
+  sort(keys, cmpInt64)  # stable by offset, then index
+  var patches = @[FilePatch(offset: 0'i64, data: buildHeader(f, false))]
+  for k in keys:
+    let index = int(k mod 2048'i64)
+    let m = f.chunksData[index]
+    var body = newSeq[byte](0)
+    writePadded(m.serializedData, body)
+    patches.add(FilePatch(offset: int64(m.fileSectorOffset) * int64(SectorBytes), data: body))
+  if not writePatches(path, patches):
+    return ioErr("could not write " & path)
+  ioOk()
+
+proc withExtensionTmp*(path: string): string =
+  ## `path.with_extension("tmp")`
+  var i = path.len - 1
+  while i >= 0:
+    if path[i] == '.':
+      return path[0 ..< i] & ".tmp"
+    if path[i] == '/' or path[i] == '\\':
+      break
+    dec i
+  path & ".tmp"
+
+proc writeAll(f: AnvilChunkFile, path: string): IoStatus =
+  ## `AnvilChunkFile::write_all`
+  let tempPath = withExtensionTmp(path)
+  var o = buildHeader(f, true)
+  for m in f.chunksData:
+    if m.present:
+      writePadded(m.serializedData, o)
+  if not writeFileBytes(tempPath, o):
+    return ioErr("could not write " & tempPath)
+  if not renameReplace(tempPath, path):
+    return ioErr("could not rename " & tempPath)
+  ioOk()
+
+proc writeRegion*(f: AnvilChunkFile, path: string): IoStatus =
+  ## `<AnvilChunkFile as ChunkSerializer>::write`
+  var res = ioOk()
+  case f.writeAction
+  of waPass:
+    discard
+  of waAll:
+    res = writeAll(f, path)
+  of waParts:
+    res = writeIndices(f, path, f.writeParts)
+  if res.ok:
+    f.writeAction = waPass
+    f.writeParts = @[]
+  res
+
+proc readRegion*(r: seq[byte]): (bool, AnvilChunkFile, ChunkReadingError) =
+  ## `<AnvilChunkFile as ChunkSerializer>::read`
+  let chunkFile = newAnvilChunkFile()
+  if r.len < SectorBytes * 2:
+    return (false, chunkFile, readErr(creInvalidHeader))
+  var lastOffset = 2
+  for i in 0 ..< ChunkCount:
+    let timestamp = readBE32(r, SectorBytes + i * 4)
+    let location = readBE32(r, i * 4)
+    let sectorCnt = int(location and 0xFF'u32)
+    let sectorOffset = int(location shr 8)
+    let endOffset = sectorOffset + sectorCnt
+    if sectorOffset == 0 or sectorCnt == 0:
+      continue
+    if endOffset > lastOffset:
+      lastOffset = endOffset
+    let bytesOffset = sectorOffset * SectorBytes
+    let bytesCount = sectorCnt * SectorBytes
+    if sectorOffset < 2 or bytesOffset + bytesCount > r.len:
+      return (false, chunkFile, readErr(creParsingError,
+        "Not enough bytes available for the chunk " & $i))
+    let payload = unframePayload(toOpenArray(r, bytesOffset, bytesOffset + bytesCount - 1))
+    if not payload.isOk:
+      let kind = if payload.error.kind == nekUnknownTagId: creCompression else: creParsingError
+      return (false, chunkFile, readErr(kind, payload.error.msg))
+    chunkFile.chunksData[i] = AnvilChunkMetadata(present: true, serializedData: payload.value,
+      timestamp: timestamp, fileSectorOffset: uint32(sectorOffset))
+  chunkFile.endSector = uint32(lastOffset)
+  (true, chunkFile, readErr(creIoError))
+
+proc nowEpoch(): uint32 =
+  uint32(getTime().toUnix())
+
+proc updateChunkBytes*(f: AnvilChunkFile, x, z: int32, raw: openArray[byte],
+                       cfg: AnvilChunkConfig): ChunkWriteStatus =
+  ## `<AnvilChunkFile as ChunkSerializer>::update_chunk`
+  let epoch = nowEpoch()
+  let index = getChunkIndex(x, z)
+  # Default to the compression type read from the file.
+  let compressionType =
+    if f.chunksData[index].present: f.chunksData[index].serializedData.compression
+    else: CompressionByteResult(kind: cbNone)
+  let (ok, newChunkData, err) = fromChunkBytes(raw, compressionType, cfg)
+  if not ok:
+    return ChunkWriteStatus(ok: false, error: err)
+
+  if not cfg.writeInPlace:
+    f.writeAction = waAll
+
+  if f.writeAction == waAll:
+    f.chunksData[index] = AnvilChunkMetadata(present: true, serializedData: newChunkData,
+      timestamp: epoch, fileSectorOffset: 0'u32)
+    return writeOk()
+
+  if not f.chunksData[index].present:
+    # This chunk didn't exist before; append to EOF.
+    let newEof = f.endSector + sectorCount(newChunkData)
+    f.chunksData[index] = AnvilChunkMetadata(present: true, serializedData: newChunkData,
+      timestamp: epoch, fileSectorOffset: f.endSector)
+    f.endSector = newEof
+    maybeUpdateChunkIndex(f, index)
+    return writeOk()
+
+  let oldChunk = f.chunksData[index]
+  let oldSectors = sectorCount(oldChunk.serializedData)
+  if oldSectors == sectorCount(newChunkData):
+    f.chunksData[index] = AnvilChunkMetadata(present: true, serializedData: newChunkData,
+      timestamp: epoch, fileSectorOffset: oldChunk.fileSectorOffset)
+    maybeUpdateChunkIndex(f, index)
+    return writeOk()
+
+  # Walk back the end of the list, seeing if something can fit in our spot. If nothing does after
+  # 64 chunks, re-write the whole file instead.
+  var keys = newSeq[int64](0)
+  for i in 0 ..< ChunkCount:
+    if f.chunksData[i].present:
+      keys.add(int64(f.chunksData[i].fileSectorOffset) * 2048'i64 + int64(i))
+  sort(keys, cmpInt64)
+  var chunksToShift = newSeq[int](0)
+  var k = keys.len - 1
+  while k >= 0 and chunksToShift.len < 64:
+    let i = int(keys[k] mod 2048'i64)
+    chunksToShift.add(i)
+    if sectorCount(f.chunksData[i].serializedData) == oldSectors:
+      break  # take_while_inclusive
+    dec k
+
+  if chunksToShift.len == 0 or chunksToShift[chunksToShift.len - 1] == index:
+    # Unable to find a chunk to swap with; give up and serialize everything.
+    f.writeAction = waAll
+    f.chunksData[index] = AnvilChunkMetadata(present: true, serializedData: newChunkData,
+      timestamp: epoch, fileSectorOffset: 0'u32)
+    return writeOk()
+
+  let swappedIndex = chunksToShift[chunksToShift.len - 1]
+  chunksToShift.setLen(chunksToShift.len - 1)
+  let swapOffset = f.chunksData[swappedIndex].fileSectorOffset
+  let swappedSectors = sectorCount(f.chunksData[swappedIndex].serializedData)
+  let newSectors = sectorCount(newChunkData)
+  let oldOffset = oldChunk.fileSectorOffset
+  f.chunksData[index] = AnvilChunkMetadata(present: true, serializedData: newChunkData,
+    timestamp: epoch, fileSectorOffset: swapOffset)
+  maybeUpdateChunkIndex(f, index)
+  f.chunksData[swappedIndex].fileSectorOffset = oldOffset
+  maybeUpdateChunkIndex(f, swappedIndex)
+
+  # If positive, now larger: shift right; else shift left.
+  let offset = int64(newSectors) - int64(swappedSectors)
+  for shiftIndex in chunksToShift:
+    f.chunksData[shiftIndex].fileSectorOffset =
+      uint32(int64(f.chunksData[shiftIndex].fileSectorOffset) + offset)
+    maybeUpdateChunkIndex(f, shiftIndex)
+  f.endSector = uint32(int64(f.endSector) + offset)
+  writeOk()
+
+proc getChunkBytes*(f: AnvilChunkFile, x, z: int32): LoadedBytes =
+  ## One step of `<AnvilChunkFile as ChunkSerializer>::get_chunks`.
+  let index = getChunkIndex(x, z)
+  if not f.chunksData[index].present:
+    return loadedMissing(x, z)
+  let (ok, raw, e) = toChunkBytes(f.chunksData[index].serializedData)
+  if ok: loadedOk(x, z, raw) else: loadedError(x, z, e)
+
+proc getChunkKeyAnvil*(x, z: int32): string =
+  ## `<AnvilChunkFile as ChunkSerializer>::get_chunk_key`
+  let (rx, rz) = getRegionCoords(x, z)
+  "./r." & $rx & "." & $rz & ".mca"
+
+proc toSerializer*(f: AnvilChunkFile, cfg: AnvilChunkConfig): ChunkSerializer =
+  ChunkSerializer(
+    shouldWrite: proc(isWatched: bool): bool {.closure.} = not isWatched,
+    write: proc(path: string): IoStatus {.closure.} = writeRegion(f, path),
+    updateChunk: proc(x, z: int32, raw: seq[byte]): ChunkWriteStatus {.closure.} =
+      updateChunkBytes(f, x, z, raw, cfg),
+    getChunk: proc(x, z: int32): LoadedBytes {.closure.} = getChunkBytes(f, x, z))
+
+proc anvilSerializerType*(cfg: AnvilChunkConfig): ChunkSerializerType =
+  ChunkSerializerType(
+    getChunkKey: proc(x, z: int32): string {.closure.} = getChunkKeyAnvil(x, z),
+    makeDefault: proc(): ChunkSerializer {.closure.} = toSerializer(newAnvilChunkFile(), cfg),
+    read: proc(r: seq[byte]): SerializerReadResult {.closure.} =
+      let (ok, f, e) = readRegion(r)
+      if ok: serializerOk(toSerializer(f, cfg)) else: serializerErr(e))

@@ -1,0 +1,129 @@
+## Small file helpers for the world crate: no `raise` at I/O boundaries, so every
+## call returns a status the caller checks (PORTING.md). Upstream uses `std::fs` and
+## `tokio::fs` directly; aowlmony's `readFile`/`writeFile` raise and it has no replace-
+## on-rename, so these wrap `File`, `tryCreateFinalDir` and the platform's rename.
+
+import std/[syncio, dirs, paths]
+import std/errorcodes/errorcodes
+
+{.feature: "lenientnils".}
+
+when defined(windows):
+  proc moveFileExA(src, dst: cstring, flags: uint32): int32
+    {.stdcall, importc: "MoveFileExA", header: "<windows.h>".}
+else:
+  proc cRename(src, dst: cstring): cint {.importc: "rename", header: "<stdio.h>".}
+
+type
+  ReadStatus* = enum
+    rsOk
+    rsNotFound  ## std::io::ErrorKind::NotFound; `open` cannot tell it from denied.
+
+proc fileExistsW*(path: string): bool =
+  var f: File
+  if open(f, path, fmRead):
+    close(f)
+    return true
+  false
+
+proc readFileBytes*(path: string): (ReadStatus, seq[byte]) =
+  var f: File
+  if not open(f, path, fmRead):
+    return (rsNotFound, newSeq[byte](0))
+  var data = newSeq[byte](0)
+  var buf = newSeq[byte](65536)
+  while true:
+    let n = readBuffer(f, addr buf[0], buf.len)
+    if n <= 0:
+      break
+    let at = data.len
+    data.setLen(at + n)
+    copyMem(addr data[at], addr buf[0], n)
+  close(f)
+  (rsOk, data)
+
+proc writeFileBytes*(path: string, data: openArray[byte]): bool =
+  var f: File
+  if not open(f, path, fmWrite):
+    return false
+  var ok = true
+  if data.len > 0:
+    ok = writeBuffer(f, unsafeAddr data[0], data.len) == data.len
+  close(f)
+  ok
+
+proc renameReplace*(src, dst: string): bool =
+  var srcC = src
+  var dstC = dst
+  ## `tokio::fs::rename`: the target is replaced if it exists.
+  when defined(windows):
+    moveFileExA(toCString(srcC), toCString(dstC), 1'u32) != 0  # MOVEFILE_REPLACE_EXISTING
+  else:
+    cRename(toCString(srcC), toCString(dstC)) == 0
+
+proc removeFileW*(path: string): bool =
+  tryRemoveFile(path(path)) == Success
+
+proc joinPathW*(a, b: string): string =
+  if a.len == 0: return b
+  if a[a.len - 1] == '/' or a[a.len - 1] == '\\': return a & b
+  a & "/" & b
+
+proc parentDirW*(p: string): string =
+  var i = p.len - 1
+  while i >= 0:
+    if p[i] == '/' or p[i] == '\\':
+      return p[0 ..< i]
+    dec i
+  ""
+
+proc createDirAllW*(dir: string): bool =
+  ## `create_dir_all`. Walks the prefixes; a prefix that exists already fails the
+  ## single-level create harmlessly, so only the last create decides the answer.
+  var i = 0
+  var last = true
+  while i <= dir.len:
+    if i == dir.len or dir[i] == '/' or dir[i] == '\\':
+      if i > 0 and not (i == 2 and dir[1] == ':'):
+        let code = tryCreateFinalDir(path(dir[0 ..< i]))
+        last = code == Success or code == NameExists
+    inc i
+  last
+
+# In-place region writes need a seek, which std/syncio's `File` does not offer. C stdio does.
+type CFileHandle {.importc: "FILE", header: "<stdio.h>", incompleteStruct.} = object
+
+proc cfopen(path, mode: cstring): ptr CFileHandle {.importc: "fopen", header: "<stdio.h>".}
+proc cfclose(f: ptr CFileHandle): cint {.importc: "fclose", header: "<stdio.h>".}
+proc cfwrite(p: pointer, size, n: csize_t, f: ptr CFileHandle): csize_t {.importc: "fwrite", header: "<stdio.h>".}
+when defined(windows):
+  proc cfseek(f: ptr CFileHandle, off: int64, whence: cint): cint {.importc: "_fseeki64", header: "<stdio.h>".}
+else:
+  proc cfseek(f: ptr CFileHandle, off: int64, whence: cint): cint {.importc: "fseeko", header: "<stdio.h>".}
+
+type
+  FilePatch* = object
+    offset*: int64
+    data*: seq[byte]
+
+proc writePatches*(path: string, patches: openArray[FilePatch]): bool =
+  var pathC = path
+  ## Opens without truncating, creating the file if needed, as upstream's `write_indices` does,
+  ## and writes each patch at its offset.
+  var f = cfopen(toCString(pathC), "r+b")
+  if f == nil:
+    f = cfopen(toCString(pathC), "w+b")
+  if f == nil:
+    return false
+  var ok = true
+  for p in patches:
+    if cfseek(f, p.offset, 0.cint) != 0.cint:
+      ok = false
+      break
+    if p.data.len > 0:
+      if int(cfwrite(unsafeAddr p.data[0], 1.csize_t, csize_t(p.data.len), f)) != p.data.len:
+        ok = false
+        break
+  if cfclose(f) != 0.cint:
+    ok = false
+  ok

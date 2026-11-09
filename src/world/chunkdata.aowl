@@ -1,22 +1,79 @@
-## In-memory chunk data model: heightmaps and per-section block/biome storage.
-## Port of upstream/pumpkin-world/src/chunk/mod.rs's `ChunkHeightmaps` and
-## `ChunkSections` (the "which chunks are loaded, how do I look one up"
-## shape asked for - NOT the full `ChunkData`, which also needs a light
-## engine, blending data, and NBT (de)serialization that are separately
-## scoped). Skips `RwLock`/`Mutex`/`AtomicBool` wrappers entirely: this
-## port has no concurrency model decided yet (same punt as scheduler/net),
-## so fields that were synchronization wrappers upstream are just plain
-## fields here.
+## In-memory chunk data: sections, heightmaps, light containers, `ChunkData`, `ChunkEntityData`.
+## Port of pumpkin-world/src/chunk/mod.rs, plus `LightContainer` from chunk/format/mod.rs, which
+## `ChunkLight` needs here.
+##
+## `RwLock`, `Mutex` and atomics are plain fields: this port drives chunks from the tick loop.
+## `ChunkData` and `ChunkEntityData` are `ref object`s, standing in for `Arc<ChunkData>`.
+##
+## PARTIAL: pumpkin-world/src/chunk/mod.rs - `blending_data` is absent until generation/ lands;
+## `is_opaque` takes a state id because `&BlockState` is not a type here.
 
-import palette
+{.feature: "lenientnils".}
+
+import palette, tick, tickscheduler, blockstates
+import ../nbt/tag
+import ../generated/chunk_status
+
+export chunk_status
 
 const
-  SectionBlocks* = 4096 ## 16*16*16
-  SectionBiomes* = 64   ## 4*4*4 (biomes are quantized to 4-block cells)
-  HeightmapColumns* = 256 ## 16*16, one value per (x, z) column
-  HeightmapWords* = 37 ## ceil(256 / 7), 9 bits per value packed into i64 words
+  ChunkWidth* = 16          ## CHUNK_WIDTH
+  ChunkArea* = 256          ## CHUNK_AREA
+  BiomeVolume* = 64         ## BIOME_VOLUME
+  SubchunkVolume* = 4096    ## SUBCHUNK_VOLUME
+  SectionBlocks* = 4096     ## 16*16*16
+  SectionBiomes* = 64       ## 4*4*4 (biomes are quantized to 4-block cells)
+  HeightmapColumns* = 256   ## 16*16, one value per (x, z) column
+  HeightmapWords* = 37      ## ceil(256 / 7), 9 bits per value packed into i64 words
+  LightDim* = 16            ## LightContainer::DIM
+  LightArraySize* = 2048    ## LightContainer::ARRAY_SIZE
 
 type
+  ChunkReadingErrorKind* = enum
+    creIoError
+    creInvalidHeader
+    creRegionIsInvalid
+    creCompression
+    creChunkNotExist
+    creParsingError
+
+  ChunkReadingError* = object
+    kind*: ChunkReadingErrorKind
+    msg*: string
+
+  ChunkWritingErrorKind* = enum
+    cweIoError
+    cweCompression
+    cweChunkSerializingError
+
+  ChunkWritingError* = object
+    kind*: ChunkWritingErrorKind
+    msg*: string
+
+  CompressionErrorKind* = enum
+    ceUnknownCompression
+    ceZlibError
+    ceGZipError
+    ceLZ4Error
+    ceZstdError
+
+  CompressionError* = object
+    kind*: CompressionErrorKind
+    msg*: string
+
+  LightContainer* = object
+    ## `LightContainer::Empty(u8)` when `data` is empty, otherwise `LightContainer::Full`.
+    default*: uint8
+    data*: seq[uint8]
+
+  ChunkLight* = ref object
+    skyLight*: seq[LightContainer]
+    blockLight*: seq[LightContainer]
+
+  RandomTickSectionCache* = object
+    randomTickingBlockCount*: uint16
+    randomTickingFluidCount*: uint16
+
   ChunkHeightmapType* = enum
     chmWorldSurface = 0
     chmMotionBlocking = 1
@@ -30,8 +87,115 @@ type
   ChunkSections* = object
     count*: int
     blockSections*: seq[PalettedContainer]
+    randomTickSections*: seq[RandomTickSectionCache]  ## empty == upstream's None
+    randomlyTickingMask*: uint32
     biomeSections*: seq[PalettedContainer]
     minY*: int32
+
+  BlockEntityEntry* = object
+    pos*: BlockPos
+    nbt*: NbtCompound
+
+  ChunkData* = ref object
+    section*: ChunkSections
+    heightmap*: ChunkHeightmaps
+    x*: int32
+    z*: int32
+    blockTicks*: ChunkTickScheduler
+    fluidTicks*: ChunkTickScheduler
+    pendingBlockEntities*: seq[BlockEntityEntry]
+    lightEngine*: ChunkLight
+    lightPopulated*: bool
+    status*: ChunkStatus
+    dirty*: bool
+    inhabitedTime*: uint64
+    # Not upstream: what a vanilla save carries that upstream's writer drops. See chunkformat.aowl.
+    dataVersion*: int32
+    extraNbt*: NbtCompound
+    extraHeightmaps*: NbtCompound
+
+  ChunkEntityData* = ref object
+    x*: int32
+    z*: int32
+    data*: seq[NbtCompound]
+    dirty*: bool
+    dataVersion*: int32  ## Not upstream: kept so a vanilla save is not re-stamped on write.
+
+proc readErr*(kind: ChunkReadingErrorKind, msg = ""): ChunkReadingError =
+  ChunkReadingError(kind: kind, msg: msg)
+
+proc writeErr*(kind: ChunkWritingErrorKind, msg = ""): ChunkWritingError =
+  ChunkWritingError(kind: kind, msg: msg)
+
+proc `$`*(e: ChunkReadingError): string = $e.kind & ": " & e.msg
+proc `$`*(e: ChunkWritingError): string = $e.kind & ": " & e.msg
+
+# --- LightContainer -----------------------------------------------------------
+
+proc newLightEmpty*(default: uint8): LightContainer =
+  ## `LightContainer::new_empty`; no assert, `default` is always a nibble at the call sites.
+  LightContainer(default: default, data: @[])
+
+proc newLightFull*(data: sink seq[uint8]): LightContainer =
+  ## `LightContainer::new`. The caller guarantees `LightArraySize` bytes.
+  LightContainer(default: 0'u8, data: data)
+
+proc newLightFilled*(default: uint8): LightContainer =
+  ## `LightContainer::new_filled`
+  let value = (default shl 4) or default
+  var d = newSeq[uint8](LightArraySize)
+  for i in 0 ..< d.len:
+    d[i] = value
+  LightContainer(default: 0'u8, data: d)
+
+proc defaultLightContainer*(): LightContainer =
+  ## `LightContainer::default()`
+  newLightEmpty(15'u8)
+
+proc isEmpty*(l: LightContainer): bool {.inline.} =
+  l.data.len == 0
+
+proc lightIndex(x, y, z: int): int {.inline.} = y * 16 * 16 + z * 16 + x
+
+proc get*(l: LightContainer, x, y, z: int): uint8 =
+  if l.data.len == 0:
+    return l.default
+  let index = lightIndex(x, y, z)
+  (l.data[index shr 1] shr (4 * (index and 1))) and 0x0F'u8
+
+proc set*(l: var LightContainer, x, y, z: int, value: uint8) =
+  if l.data.len == 0:
+    if value != l.default:
+      l = newLightFilled(l.default)
+      l.set(x, y, z, value)
+    return
+  let index = lightIndex(x, y, z)
+  let mask = 0x0F'u8 shl (4 * (index and 1))
+  l.data[index shr 1] = l.data[index shr 1] and (not mask)
+  l.data[index shr 1] = l.data[index shr 1] or (value shl (4 * (index and 1)))
+
+proc fill*(l: var LightContainer, value: uint8) =
+  l = newLightFilled(value)
+
+proc newChunkLight*(): ChunkLight =
+  ChunkLight(skyLight: @[], blockLight: @[])
+
+# --- heightmaps ---------------------------------------------------------------
+
+proc isOpaque*(kind: ChunkHeightmapType, state: BlockStateId): bool =
+  ## `ChunkHeightmapType::is_opaque`
+  case kind
+  of chmWorldSurface: not isAir(state)
+  of chmMotionBlocking: blocksMovement(state) or isLiquid(state)
+  of chmMotionBlockingNoLeaves: (blocksMovement(state) or isLiquid(state)) and not isLeaves(state)
+
+proc heightmapTypeFromInt*(value: int): (bool, ChunkHeightmapType) =
+  ## `TryFrom<usize> for ChunkHeightmapType`
+  case value
+  of 0: (true, chmWorldSurface)
+  of 1: (true, chmMotionBlocking)
+  of 2: (true, chmMotionBlockingNoLeaves)
+  else: (false, chmWorldSurface)
 
 proc newChunkHeightmaps*(): ChunkHeightmaps =
   ChunkHeightmaps(worldSurface: @[], motionBlocking: @[], motionBlockingNoLeaves: @[])
@@ -80,24 +244,187 @@ proc getHeightmap*(h: ChunkHeightmaps, kind: ChunkHeightmapType, x, z, minY: int
   let val = (current shr shift) and 0x1FF'u64
   int32(val) + minY - 1
 
+proc updateHeightmap*(h: var ChunkHeightmaps, kind: ChunkHeightmapType, localX, localY, localZ: int32,
+                      blockState: BlockStateId, minY: int32,
+                      getBlock: proc(y: int32): BlockStateId {.closure.}): bool =
+  ## Port of `ChunkHeightmaps::update`.
+  let firstAvailable = getHeightmap(h, kind, localX, localZ, minY) + 1
+  if localY <= firstAvailable - 2:
+    return false
+  if isOpaque(kind, blockState):
+    if localY >= firstAvailable:
+      setHeightmap(h, kind, localX, localZ, localY, minY)
+      return true
+  elif firstAvailable - 1 == localY:
+    var y = localY - 1
+    while y >= minY:
+      if isOpaque(kind, getBlock(y)):
+        setHeightmap(h, kind, localX, localZ, y, minY)
+        return true
+      dec y
+    setHeightmap(h, kind, localX, localZ, minY - 1, minY)
+    return true
+  false
+
+# --- ChunkSections ------------------------------------------------------------
+
+proc isRandomlyTicking*(c: RandomTickSectionCache): bool {.inline.} =
+  c.randomTickingBlockCount > 0'u16 or c.randomTickingFluidCount > 0'u16
+
+proc buildRandomTickSectionsCache*(blockSections: openArray[PalettedContainer]): (seq[RandomTickSectionCache], uint32) =
+  ## `ChunkSections::build_random_tick_sections_cache`
+  var mask = 0'u32
+  var hasTicks = false
+  var cache = newSeq[RandomTickSectionCache](blockSections.len)
+  for i in 0 ..< blockSections.len:
+    let (blockCount, fluidCount) = randomTickingCounts(blockSections[i])
+    if blockCount > 0'u16 or fluidCount > 0'u16:
+      mask = mask or (1'u32 shl i)
+      hasTicks = true
+    cache[i] = RandomTickSectionCache(randomTickingBlockCount: blockCount, randomTickingFluidCount: fluidCount)
+  if hasTicks: (cache, mask) else: (newSeq[RandomTickSectionCache](0), 0'u32)
+
 proc newChunkSections*(count: int, minY: int32, defaultBlock, defaultBiome: PaletteValue): ChunkSections =
-  ## `count` is the number of 16-block-tall subchunk sections (vanilla
-  ## Overworld: 24, for a -64..320 height range). Each section is a
-  ## fixed-shape PalettedContainer: 16x16x16 (4096 cells) for blocks,
-  ## 4x4x4 (64 cells) for biomes, matching upstream's `BlockPalette`/
-  ## `BiomePalette` type aliases.
-  result = ChunkSections(count: count, minY: minY)
+  ## `count` is the number of 16-block-tall subchunk sections (vanilla Overworld: 24, for a
+  ## -64..320 height range). `ChunkSections::new` with explicit fill values.
+  result = ChunkSections(count: count, minY: minY, randomTickSections: @[], randomlyTickingMask: 0'u32)
   result.blockSections = newSeq[PalettedContainer](count)
   result.biomeSections = newSeq[PalettedContainer](count)
   for i in 0 ..< count:
     result.blockSections[i] = newPalettedContainer(16, defaultBlock)
     result.biomeSections[i] = newPalettedContainer(4, defaultBiome)
+  let (cache, mask) = buildRandomTickSectionsCache(result.blockSections)
+  result.randomTickSections = cache
+  result.randomlyTickingMask = mask
+
+proc newChunkSections*(numSections: int, minY: int32): ChunkSections =
+  ## `ChunkSections::new`
+  newChunkSections(numSections, minY, 0'u32, 0'u32)
+
+proc fromPalettes*(blockSections: sink seq[PalettedContainer], biomeSections: sink seq[PalettedContainer],
+                   minY: int32): ChunkSections =
+  ## `ChunkSections::from_palettes`
+  let (cache, mask) = buildRandomTickSectionsCache(blockSections)
+  ChunkSections(count: blockSections.len, blockSections: blockSections, randomTickSections: cache,
+    randomlyTickingMask: mask, biomeSections: biomeSections, minY: minY)
+
+proc getRelativeBlock*(s: ChunkSections, relativeX, relativeY, relativeZ: int): (bool, BlockStateId) =
+  ## `ChunkSections::get_relative_block`
+  let sectionIndex = relativeY div 16
+  if sectionIndex < 0 or sectionIndex >= s.blockSections.len:
+    return (false, 0'u32)
+  (true, get(s.blockSections[sectionIndex], relativeX, relativeY mod 16, relativeZ))
+
+proc getBlockAbsoluteY*(s: ChunkSections, relativeX: int, y: int32, relativeZ: int): (bool, BlockStateId) =
+  ## `ChunkSections::get_block_absolute_y`
+  let rel = y - s.minY
+  if rel < 0'i32:
+    return (false, 0'u32)
+  getRelativeBlock(s, relativeX, int(rel), relativeZ)
+
+proc saturatingSub1(v: uint16): uint16 {.inline.} =
+  if v == 0'u16: 0'u16 else: v - 1'u16
+
+proc saturatingAdd1(v: uint16): uint16 {.inline.} =
+  if v == 65535'u16: v else: v + 1'u16
+
+proc setBlockNoHeightmapUpdate*(s: var ChunkSections, relativeX, relativeY, relativeZ: int,
+                                blockStateId: BlockStateId): BlockStateId =
+  ## `ChunkSections::set_block_no_heightmap_update`
+  let sectionIndex = relativeY div 16
+  let localY = relativeY mod 16
+  if sectionIndex < 0 or sectionIndex >= s.blockSections.len:
+    return 0'u32
+  let replaced = set(s.blockSections[sectionIndex], relativeX, localY, relativeZ, blockStateId)
+  if replaced == blockStateId:
+    return replaced
+
+  if (hasRandomTicks(blockStateId) or hasRandomTickingFluid(blockStateId)) and s.randomTickSections.len == 0:
+    s.randomTickSections = newSeq[RandomTickSectionCache](s.count)
+
+  if s.randomTickSections.len > 0:
+    if hasRandomTicks(replaced):
+      s.randomTickSections[sectionIndex].randomTickingBlockCount =
+        saturatingSub1(s.randomTickSections[sectionIndex].randomTickingBlockCount)
+    if hasRandomTickingFluid(replaced):
+      s.randomTickSections[sectionIndex].randomTickingFluidCount =
+        saturatingSub1(s.randomTickSections[sectionIndex].randomTickingFluidCount)
+    if hasRandomTicks(blockStateId):
+      s.randomTickSections[sectionIndex].randomTickingBlockCount =
+        saturatingAdd1(s.randomTickSections[sectionIndex].randomTickingBlockCount)
+    if hasRandomTickingFluid(blockStateId):
+      s.randomTickSections[sectionIndex].randomTickingFluidCount =
+        saturatingAdd1(s.randomTickSections[sectionIndex].randomTickingFluidCount)
+    if isRandomlyTicking(s.randomTickSections[sectionIndex]):
+      s.randomlyTickingMask = s.randomlyTickingMask or (1'u32 shl sectionIndex)
+    else:
+      s.randomlyTickingMask = s.randomlyTickingMask and (not (1'u32 shl sectionIndex))
+  replaced
+
+proc setRelativeBlock*(s: var ChunkSections, relativeX, relativeY, relativeZ: int,
+                       blockStateId: BlockStateId): BlockStateId {.discardable.} =
+  ## `ChunkSections::set_relative_block`
+  setBlockNoHeightmapUpdate(s, relativeX, relativeY, relativeZ, blockStateId)
+
+proc setBlockAbsoluteY*(s: var ChunkSections, relativeX: int, y: int32, relativeZ: int,
+                        blockStateId: BlockStateId): BlockStateId {.discardable.} =
+  ## `ChunkSections::set_block_absolute_y`
+  let rel = y - s.minY
+  if rel < 0'i32:
+    return 0'u32
+  setBlockNoHeightmapUpdate(s, relativeX, int(rel), relativeZ, blockStateId)
+
+proc getNoiseBiome*(s: ChunkSections, index, scaleX, scaleY, scaleZ: int): (bool, uint8) =
+  ## `ChunkSections::get_noise_biome`
+  if index < 0 or index >= s.biomeSections.len:
+    return (false, 0'u8)
+  (true, uint8(get(s.biomeSections[index], scaleX, scaleY, scaleZ)))
+
+proc getRoughBiomeAbsoluteY*(s: ChunkSections, relativeX: int, y: int32, relativeZ: int): (bool, uint8) =
+  ## `ChunkSections::get_rough_biome_absolute_y`
+  let rel = y - s.minY
+  if rel < 0'i32:
+    return (false, 0'u8)
+  let relativeY = int(rel)
+  getNoiseBiome(s, relativeY div 16, (relativeX shr 2) and 3, (relativeY shr 2) and 3, (relativeZ shr 2) and 3)
+
+proc setRelativeBiome*(s: var ChunkSections, relativeX, relativeY, relativeZ: int, biomeId: uint8) =
+  ## `ChunkSections::set_relative_biome`. Upstream's y is in biome cells, four to a section.
+  let sectionIndex = relativeY div 4
+  let localY = relativeY mod 4
+  if sectionIndex >= 0 and sectionIndex < s.biomeSections.len:
+    discard set(s.biomeSections[sectionIndex], relativeX, localY, relativeZ, uint32(biomeId))
+
+proc getTopY*(s: ChunkSections, relativeX, relativeZ: int, firstY: int32): (bool, int32) =
+  ## `ChunkSections::get_top_y`
+  var y = firstY
+  while y >= s.minY:
+    let (ok, id) = getBlockAbsoluteY(s, relativeX, y, relativeZ)
+    if ok and not isAir(id):
+      return (true, y)
+    dec y
+  (false, 0'i32)
+
+proc dumpBlocks*(s: ChunkSections): seq[BlockStateId] =
+  ## `ChunkSections::dump_blocks`
+  result = newSeq[BlockStateId](0)
+  for section in s.blockSections:
+    let c = cells(section)
+    for v in c:
+      result.add(v)
+
+proc dumpBiomes*(s: ChunkSections): seq[uint8] =
+  ## `ChunkSections::dump_biomes`
+  result = newSeq[uint8](0)
+  for section in s.biomeSections:
+    let c = cells(section)
+    for v in c:
+      result.add(uint8(v))
+
+# Earlier call sites (worldchunks.aowl, chunkdatatest.aowl).
 
 proc sectionIndex*(s: ChunkSections, blockY: int32): int =
-  ## Which section a world-space block Y coordinate falls in, relative to
-  ## `minY`. Negative/out-of-range inputs are the caller's responsibility
-  ## (upstream indexes an array too and would panic; this port doesn't add
-  ## a bounds check upstream doesn't have).
+  ## Which section a world-space block Y falls in, relative to `minY`.
   int((blockY - s.minY) div 16)
 
 proc getBlock*(s: ChunkSections, x, y, z: int32): PaletteValue =
@@ -106,6 +433,98 @@ proc getBlock*(s: ChunkSections, x, y, z: int32): PaletteValue =
   get(s.blockSections[idx], int(x and 15), localY, int(z and 15))
 
 proc setBlock*(s: var ChunkSections, x, y, z: int32, value: PaletteValue): PaletteValue =
-  let idx = sectionIndex(s, y)
-  let localY = int(y - s.minY) mod 16
-  set(s.blockSections[idx], int(x and 15), localY, int(z and 15), value)
+  setBlockNoHeightmapUpdate(s, int(x and 15), int(y - s.minY), int(z and 15), value)
+
+# --- ChunkData ----------------------------------------------------------------
+
+proc newChunkData*(x, z: int32, section: sink ChunkSections): ChunkData =
+  ChunkData(section: section, heightmap: newChunkHeightmaps(), x: x, z: z,
+    blockTicks: newChunkTickScheduler(), fluidTicks: newChunkTickScheduler(),
+    pendingBlockEntities: @[], lightEngine: newChunkLight(), lightPopulated: false,
+    status: csEmpty, dirty: false, inhabitedTime: 0'u64, dataVersion: 0'i32,
+    extraNbt: newCompound(), extraHeightmaps: newCompound())
+
+proc putBlockEntity*(c: ChunkData, pos: BlockPos, nbt: NbtCompound) =
+  ## `pending_block_entities.insert`
+  for i in 0 ..< c.pendingBlockEntities.len:
+    if c.pendingBlockEntities[i].pos == pos:
+      c.pendingBlockEntities[i].nbt = nbt
+      return
+  c.pendingBlockEntities.add(BlockEntityEntry(pos: pos, nbt: nbt))
+
+proc updateHeightmapAt(c: ChunkData, relativeX, relativeY, relativeZ: int, state: BlockStateId) =
+  ## `ChunkData::update_heightmap`
+  let minY = c.section.minY
+  let x = int32(relativeX)
+  let y = int32(relativeY) + minY
+  let z = int32(relativeZ)
+  for hmType in [chmWorldSurface, chmMotionBlocking, chmMotionBlockingNoLeaves]:
+    discard updateHeightmap(c.heightmap, hmType, x, y, z, state, minY,
+      proc(yAt: int32): BlockStateId {.closure.} =
+        let (ok, id) = getBlockAbsoluteY(c.section, relativeX, yAt, relativeZ)
+        if ok: id else: 0'u32)
+
+proc setBlockAbsoluteY*(c: ChunkData, relativeX: int, y: int32, relativeZ: int,
+                        blockStateId: BlockStateId): BlockStateId {.discardable.} =
+  ## `ChunkData::set_block_absolute_y`
+  let yRel = y - c.section.minY
+  if yRel < 0'i32:
+    return 0'u32
+  let relativeY = int(yRel)
+  let old = setBlockNoHeightmapUpdate(c.section, relativeX, relativeY, relativeZ, blockStateId)
+  if old != blockStateId:
+    updateHeightmapAt(c, relativeX, relativeY, relativeZ, blockStateId)
+  old
+
+proc getRelativeBlock*(c: ChunkData, relativeX, relativeY, relativeZ: int): (bool, BlockStateId) =
+  getRelativeBlock(c.section, relativeX, relativeY, relativeZ)
+
+proc setRelativeBlock*(c: ChunkData, relativeX, relativeY, relativeZ: int, blockStateId: BlockStateId) =
+  ## `ChunkData::set_relative_block`
+  updateHeightmapAt(c, relativeX, relativeY, relativeZ, blockStateId)
+  discard setRelativeBlock(c.section, relativeX, relativeY, relativeZ, blockStateId)
+
+proc setBlockNoHeightmapUpdate*(c: ChunkData, relativeX, relativeY, relativeZ: int, blockStateId: BlockStateId) =
+  ## `ChunkData::set_block_no_heightmap_update`
+  discard setRelativeBlock(c.section, relativeX, relativeY, relativeZ, blockStateId)
+
+proc getHighestNonEmptySubchunk*(c: ChunkData): int =
+  ## `ChunkData::get_highest_non_empty_subchunk`
+  var i = c.section.blockSections.len - 1
+  while i >= 0:
+    if not hasOnlyAir(c.section.blockSections[i]):
+      return i
+    dec i
+  0
+
+proc populateHeightmaps(c: ChunkData, heightmaps: var ChunkHeightmaps, startSubChunk, x, z: int) =
+  ## `ChunkData::populate_heightmaps`
+  let minY = c.section.minY
+  let startHeight = int32(startSubChunk) * 16'i32 - abs(minY) + 15'i32
+  var hasFound = [false, false, false]
+  var y = startHeight
+  while y >= minY:
+    let (_, stateId) = getBlockAbsoluteY(c.section, x, y, z)
+    for hmType in [chmWorldSurface, chmMotionBlocking, chmMotionBlockingNoLeaves]:
+      let i = ord(hmType)
+      if not hasFound[i] and isOpaque(hmType, stateId):
+        setHeightmap(heightmaps, hmType, int32(x), int32(z), y, minY)
+        hasFound[i] = true
+    if hasFound[0] and hasFound[1] and hasFound[2]:
+      return
+    dec y
+  for i in 0 .. 2:
+    if not hasFound[i]:
+      let (_, hmType) = heightmapTypeFromInt(i)
+      setHeightmap(heightmaps, hmType, int32(x), int32(z), minY - 1'i32, minY)
+
+proc calculateHeightmap*(c: ChunkData): ChunkHeightmaps =
+  ## `ChunkData::calculate_heightmap`
+  let highest = getHighestNonEmptySubchunk(c)
+  result = newChunkHeightmaps()
+  for x in 0 ..< 16:
+    for z in 0 ..< 16:
+      populateHeightmaps(c, result, highest, x, z)
+
+proc newChunkEntityData*(x, z: int32): ChunkEntityData =
+  ChunkEntityData(x: x, z: z, data: @[], dirty: false, dataVersion: 0'i32)

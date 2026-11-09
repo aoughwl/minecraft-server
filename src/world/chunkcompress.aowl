@@ -1,0 +1,431 @@
+## Byte codecs the world crate's region formats need: zlib, gzip, zstd, the LZ4Java
+## block stream (`lz4_java_wrc`) and xxHash. Upstream gets these from `flate2`,
+## `ruzstd`, `lz4_java_wrc` and `xxhash_rust`.
+##
+## Local helper, not a port: src/nbt/nbt_compress.aowl imports the sibling `compress`
+## library, whose zlib binding hardcodes `libz.so.1` and declares the z_stream `uLong`
+## fields with the wrong width for LLP64 Windows, so deflateInit fails there. This
+## module binds <zlib.h>/<zstd.h> directly, letting the C compiler lay out z_stream,
+## and links `-lz -lzstd`. It should collapse into src/nbt once that is fixed.
+
+{.passL: "-lz -lzstd".}
+{.feature: "lenientnils".}
+
+type
+  ByteResult* = object
+    ok*: bool
+    data*: seq[byte]
+    msg*: string
+
+proc okBytes(d: sink seq[byte]): ByteResult = ByteResult(ok: true, data: d, msg: "")
+proc errBytes(m: string): ByteResult = ByteResult(ok: false, data: @[], msg: m)
+
+# --- zlib ---------------------------------------------------------------------
+
+type
+  ZStream {.importc: "z_stream", header: "<zlib.h>", bycopy.} = object
+    next_in: ptr byte
+    avail_in: cuint
+    next_out: ptr byte
+    avail_out: cuint
+
+const
+  zFinish = 4.cint
+  zOk = 0.cint
+  zStreamEnd = 1.cint
+  zBufError = -5.cint
+  zDeflated = 8.cint
+  zDefaultStrategy = 0.cint
+  wbitsZlib = 15.cint
+  wbitsGzip = 31.cint   ## 15 + 16: write or expect a gzip wrapper
+  DefaultMaxOut* = 512 * 1024 * 1024
+
+proc deflateInit2Raw(s: ptr ZStream, level, meth, wbits, memLevel, strategy: cint,
+                     version: cstring, size: cint): cint {.importc: "deflateInit2_", header: "<zlib.h>".}
+proc zDeflate(s: ptr ZStream, flush: cint): cint {.importc: "deflate", header: "<zlib.h>".}
+proc zDeflateEnd(s: ptr ZStream): cint {.importc: "deflateEnd", header: "<zlib.h>".}
+proc inflateInit2Raw(s: ptr ZStream, wbits: cint, version: cstring, size: cint): cint
+  {.importc: "inflateInit2_", header: "<zlib.h>".}
+proc zInflate(s: ptr ZStream, flush: cint): cint {.importc: "inflate", header: "<zlib.h>".}
+proc zInflateEnd(s: ptr ZStream): cint {.importc: "inflateEnd", header: "<zlib.h>".}
+proc zVersion(): cstring {.importc: "zlibVersion", header: "<zlib.h>".}
+proc zDeflateBound(s: ptr ZStream, n: culong): culong {.importc: "deflateBound", header: "<zlib.h>".}
+
+proc deflateWith(input: openArray[byte], level, wbits: cint): ByteResult =
+  var s {.noinit.}: ZStream
+  zeroMem(addr s, sizeof(ZStream))
+  if deflateInit2Raw(addr s, level, zDeflated, wbits, 8.cint, zDefaultStrategy, zVersion(),
+                     cint(sizeof(ZStream))) != zOk:
+    return errBytes("deflateInit failed")
+  var output = newSeq[byte](int(zDeflateBound(addr s, culong(input.len))) + 64)
+  s.next_in = if input.len > 0: unsafeAddr input[0] else: nil
+  s.avail_in = cuint(input.len)
+  s.next_out = addr output[0]
+  s.avail_out = cuint(output.len)
+  let rc = zDeflate(addr s, zFinish)
+  let left = int(s.avail_out)
+  discard zDeflateEnd(addr s)
+  if rc != zStreamEnd:
+    return errBytes("deflate failed: " & $int(rc))
+  output.setLen(output.len - left)
+  okBytes(output)
+
+proc inflateWith(input: openArray[byte], wbits: cint, maxOut: int): ByteResult =
+  var s {.noinit.}: ZStream
+  zeroMem(addr s, sizeof(ZStream))
+  if inflateInit2Raw(addr s, wbits, zVersion(), cint(sizeof(ZStream))) != zOk:
+    return errBytes("inflateInit failed")
+  var output = newSeq[byte](max(input.len * 4, 4096))
+  s.next_in = if input.len > 0: unsafeAddr input[0] else: nil
+  s.avail_in = cuint(input.len)
+  s.next_out = addr output[0]
+  s.avail_out = cuint(output.len)
+  var used = 0
+  while true:
+    let rc = zInflate(addr s, 0.cint)
+    used = output.len - int(s.avail_out)
+    if rc == zStreamEnd:
+      break
+    if rc != zOk and rc != zBufError:
+      discard zInflateEnd(addr s)
+      return errBytes("inflate failed: " & $int(rc))
+    if s.avail_out != 0:
+      discard zInflateEnd(addr s)
+      return errBytes("inflate failed: truncated stream")
+    if output.len >= maxOut:
+      discard zInflateEnd(addr s)
+      return errBytes("inflate failed: output exceeds limit")
+    output.setLen(min(output.len * 2, maxOut))
+    s.next_out = addr output[used]
+    s.avail_out = cuint(output.len - used)
+  discard zInflateEnd(addr s)
+  output.setLen(used)
+  okBytes(output)
+
+proc zlibCompress*(input: openArray[byte], level = 6): ByteResult =
+  deflateWith(input, cint(level), wbitsZlib)
+
+proc zlibDecompress*(input: openArray[byte], maxOut = DefaultMaxOut): ByteResult =
+  inflateWith(input, wbitsZlib, maxOut)
+
+proc gzipCompressBytes*(input: openArray[byte], level = 6): ByteResult =
+  deflateWith(input, cint(level), wbitsGzip)
+
+proc gzipDecompressBytes*(input: openArray[byte], maxOut = DefaultMaxOut): ByteResult =
+  inflateWith(input, wbitsGzip, maxOut)
+
+# --- zstd ---------------------------------------------------------------------
+
+proc zstdCompressRaw(dst: pointer, cap: csize_t, src: pointer, n: csize_t, level: cint): csize_t
+  {.importc: "ZSTD_compress", header: "<zstd.h>".}
+proc zstdDecompressRaw(dst: pointer, cap: csize_t, src: pointer, n: csize_t): csize_t
+  {.importc: "ZSTD_decompress", header: "<zstd.h>".}
+proc zstdBound(n: csize_t): csize_t {.importc: "ZSTD_compressBound", header: "<zstd.h>".}
+proc zstdIsError(code: csize_t): cuint {.importc: "ZSTD_isError", header: "<zstd.h>".}
+proc zstdContentSize(src: pointer, n: csize_t): culonglong
+  {.importc: "ZSTD_getFrameContentSize", header: "<zstd.h>".}
+
+proc zstdCompressBytes*(input: openArray[byte], level = 1): ByteResult =
+  ## Upstream calls `compress_to_vec(.., CompressionLevel::Fastest)`; level 1 is libzstd's
+  ## counterpart. Any conforming decoder reads the frame.
+  var output = newSeq[byte](int(zstdBound(csize_t(input.len))))
+  let src: pointer = if input.len > 0: unsafeAddr input[0] else: nil
+  let n = zstdCompressRaw(addr output[0], csize_t(output.len), src, csize_t(input.len), cint(level))
+  if zstdIsError(n) != 0:
+    return errBytes("zstd compress failed")
+  output.setLen(int(n))
+  okBytes(output)
+
+proc zstdDecompressBytes*(input: openArray[byte], maxOut = DefaultMaxOut): ByteResult =
+  if input.len == 0:
+    return errBytes("zstd: empty frame")
+  let declared = uint64(zstdContentSize(unsafeAddr input[0], csize_t(input.len)))
+  # ZSTD_CONTENTSIZE_UNKNOWN / ERROR are the top two u64 values.
+  let unknown = declared >= 0xFFFFFFFFFFFFFFFE'u64
+  var cap = if unknown: max(input.len * 8, 65536) else: int(declared)
+  while true:
+    if cap > maxOut:
+      return errBytes("zstd: output exceeds limit")
+    var output = newSeq[byte](max(cap, 1))
+    let n = zstdDecompressRaw(addr output[0], csize_t(output.len), unsafeAddr input[0], csize_t(input.len))
+    if zstdIsError(n) == 0:
+      output.setLen(int(n))
+      return okBytes(output)
+    if not unknown:
+      return errBytes("zstd decompress failed")
+    cap = cap * 2
+
+# --- xxHash -------------------------------------------------------------------
+
+proc rotl64(x: uint64, r: int): uint64 {.inline.} = (x shl r) or (x shr (64 - r))
+proc rotl32(x: uint32, r: int): uint32 {.inline.} = (x shl r) or (x shr (32 - r))
+
+proc le64(d: openArray[byte], p: int): uint64 {.inline.} =
+  result = 0'u64
+  for i in 0 ..< 8:
+    result = result or (uint64(d[p + i]) shl (8 * i))
+
+proc le32(d: openArray[byte], p: int): uint32 {.inline.} =
+  result = 0'u32
+  for i in 0 ..< 4:
+    result = result or (uint32(d[p + i]) shl (8 * i))
+
+const
+  P1 = 0x9E3779B185EBCA87'u64
+  P2 = 0xC2B2AE3D27D4EB4F'u64
+  P3 = 0x165667B19E3779F9'u64
+  P4 = 0x85EBCA77C2B2AE63'u64
+  P5 = 0x27D4EB2F165667C5'u64
+  Q1 = 0x9E3779B1'u32
+  Q2 = 0x85EBCA77'u32
+  Q3 = 0xC2B2AE3D'u32
+  Q4 = 0x27D4EB2F'u32
+  Q5 = 0x165667B1'u32
+
+proc xxRound(acc, v: uint64): uint64 {.inline.} = rotl64(acc + (v * P2), 31) * P1
+proc xxMerge(acc, v: uint64): uint64 {.inline.} = ((acc xor xxRound(0'u64, v)) * P1) + P4
+
+proc xxh64*(d: openArray[byte], seed = 0'u64): uint64 =
+  ## `xxhash_rust::xxh64::xxh64`.
+  var p = 0
+  let n = d.len
+  var h: uint64 = 0
+  if n >= 32:
+    var v1 = seed + P1 + P2
+    var v2 = seed + P2
+    var v3 = seed
+    var v4 = seed - P1
+    while p + 32 <= n:
+      v1 = xxRound(v1, le64(d, p))
+      v2 = xxRound(v2, le64(d, p + 8))
+      v3 = xxRound(v3, le64(d, p + 16))
+      v4 = xxRound(v4, le64(d, p + 24))
+      p += 32
+    h = rotl64(v1, 1) + rotl64(v2, 7) + rotl64(v3, 12) + rotl64(v4, 18)
+    h = xxMerge(h, v1)
+    h = xxMerge(h, v2)
+    h = xxMerge(h, v3)
+    h = xxMerge(h, v4)
+  else:
+    h = seed + P5
+  h = h + uint64(n)
+  while p + 8 <= n:
+    h = rotl64(h xor xxRound(0'u64, le64(d, p)), 27) * P1 + P4
+    p += 8
+  if p + 4 <= n:
+    h = rotl64(h xor (uint64(le32(d, p)) * P1), 23) * P2 + P3
+    p += 4
+  while p < n:
+    h = rotl64(h xor (uint64(d[p]) * P5), 11) * P1
+    inc p
+  h = (h xor (h shr 33)) * P2
+  h = (h xor (h shr 29)) * P3
+  h xor (h shr 32)
+
+proc xxh32*(d: openArray[byte], seed = 0'u32): uint32 =
+  var p = 0
+  let n = d.len
+  var h: uint32 = 0
+  if n >= 16:
+    var v1 = seed + Q1 + Q2
+    var v2 = seed + Q2
+    var v3 = seed
+    var v4 = seed - Q1
+    while p + 16 <= n:
+      v1 = rotl32(v1 + (le32(d, p) * Q2), 13) * Q1
+      v2 = rotl32(v2 + (le32(d, p + 4) * Q2), 13) * Q1
+      v3 = rotl32(v3 + (le32(d, p + 8) * Q2), 13) * Q1
+      v4 = rotl32(v4 + (le32(d, p + 12) * Q2), 13) * Q1
+      p += 16
+    h = rotl32(v1, 1) + rotl32(v2, 7) + rotl32(v3, 12) + rotl32(v4, 18)
+  else:
+    h = seed + Q5
+  h = h + uint32(n)
+  while p + 4 <= n:
+    h = rotl32(h + (le32(d, p) * Q3), 17) * Q4
+    p += 4
+  while p < n:
+    h = rotl32(h + (uint32(d[p]) * Q5), 11) * Q1
+    inc p
+  h = (h xor (h shr 15)) * Q2
+  h = (h xor (h shr 13)) * Q3
+  h xor (h shr 16)
+
+# --- LZ4Java block stream -----------------------------------------------------
+#
+# The format `lz4_java_wrc::Lz4BlockInput`/`Lz4BlockOutput` and Minecraft's own
+# LZ4BlockOutputStream use. Each block is:
+#   "LZ4Block" | token u8 | compressedLen i32le | decompressedLen i32le | checksum i32le | bytes
+# token: high nibble 0x10 raw, 0x20 LZ4; low nibble is log2(blockSize) - 10. A block with
+# decompressedLen 0 ends the stream. checksum: XXH32(bytes, 0x9747B28C) & 0x0FFFFFFF.
+
+const
+  Lz4Magic = "LZ4Block"
+  Lz4Seed = 0x9747B28C'u32
+  Lz4MethodRaw = 0x10'u8
+  Lz4MethodLz4 = 0x20'u8
+
+proc lz4BlockDecode(src: openArray[byte], start, stop: int, dst: var seq[byte], expected: int): bool =
+  var p = start
+  let base = dst.len
+  let limit = base + expected
+  dst.setLen(limit)
+  var o = base
+  while p < stop:
+    let token = int(src[p])
+    inc p
+    var litLen = token shr 4
+    if litLen == 15:
+      while true:
+        if p >= stop: return false
+        let b = int(src[p])
+        inc p
+        litLen += b
+        if b != 255: break
+    if p + litLen > stop or o + litLen > limit: return false
+    for i in 0 ..< litLen:
+      dst[o + i] = src[p + i]
+    p += litLen
+    o += litLen
+    if p >= stop:
+      break
+    if p + 2 > stop: return false
+    let offset = int(src[p]) or (int(src[p + 1]) shl 8)
+    p += 2
+    if offset == 0 or o - offset < base: return false
+    var matchLen = (token and 15) + 4
+    if (token and 15) == 15:
+      while true:
+        if p >= stop: return false
+        let b = int(src[p])
+        inc p
+        matchLen += b
+        if b != 255: break
+    if o + matchLen > limit: return false
+    for i in 0 ..< matchLen:  # overlapping copy, byte by byte on purpose
+      dst[o + i] = dst[o + i - offset]
+    o += matchLen
+  o == limit
+
+proc lz4Decompress*(input: openArray[byte], maxOut = DefaultMaxOut): ByteResult =
+  ## `Lz4BlockInput::read_to_end`.
+  var output = newSeq[byte](0)
+  var p = 0
+  while p < input.len:
+    if p + 21 > input.len:
+      return errBytes("lz4: truncated block header")
+    for i in 0 ..< 8:
+      if char(input[p + i]) != Lz4Magic[i]:
+        return errBytes("lz4: bad block magic")
+    let token = input[p + 8]
+    let meth = token and 0xF0'u8
+    let compLen = int(le32(input, p + 9))
+    let rawLen = int(le32(input, p + 13))
+    let checksum = le32(input, p + 17)
+    p += 21
+    if rawLen == 0:
+      break  # the end-of-stream block
+    if p + compLen > input.len:
+      return errBytes("lz4: truncated block")
+    if output.len + rawLen > maxOut:
+      return errBytes("lz4: output exceeds limit")
+    let at = output.len
+    if meth == Lz4MethodRaw:
+      output.setLen(at + rawLen)
+      for i in 0 ..< rawLen:
+        output[at + i] = input[p + i]
+    elif meth == Lz4MethodLz4:
+      if not lz4BlockDecode(input, p, p + compLen, output, rawLen):
+        return errBytes("lz4: corrupt block")
+    else:
+      return errBytes("lz4: unknown block method")
+    let actual = xxh32(toOpenArray(output, at, output.len - 1), Lz4Seed) and 0x0FFFFFFF'u32
+    if actual != checksum:
+      return errBytes("lz4: checksum mismatch")
+    p += compLen
+  okBytes(output)
+
+proc putLe32(o: var seq[byte], v: uint32) =
+  for i in 0 ..< 4:
+    o.add(byte((v shr (8 * i)) and 0xFF'u32))
+
+proc emitLen(o: var seq[byte], n0: int) =
+  var n = n0
+  while n >= 255:
+    o.add(255'u8)
+    n -= 255
+  o.add(byte(n))
+
+proc lz4BlockEncode(src: openArray[byte], start, stop: int, o: var seq[byte]) =
+  ## Greedy LZ4 block encoder with a 4-byte hash table.
+  const HashBits = 16
+  var table = newSeq[int32](1 shl HashBits)
+  for i in 0 ..< table.len:
+    table[i] = -1'i32
+  var anchor = start
+  var p = start
+  let matchLimit = stop - 12  # the format ends with literals; last match starts >=12 from the end
+  while p < matchLimit:
+    let v = le32(src, p)
+    let h = int((v * 2654435761'u32) shr (32 - HashBits))
+    let cand = int(table[h])
+    table[h] = int32(p)
+    if cand >= start and p - cand <= 65535 and le32(src, cand) == v:
+      var mlen = 4
+      let lastEnd = stop - 5
+      while p + mlen < lastEnd and src[cand + mlen] == src[p + mlen]:
+        inc mlen
+      let lit = p - anchor
+      let tokLit = if lit >= 15: 15 else: lit
+      let tokMat = if mlen - 4 >= 15: 15 else: mlen - 4
+      o.add(byte((tokLit shl 4) or tokMat))
+      if lit >= 15: emitLen(o, lit - 15)
+      for i in anchor ..< p:
+        o.add(src[i])
+      let off = p - cand
+      o.add(byte(off and 255))
+      o.add(byte(off shr 8))
+      if mlen - 4 >= 15: emitLen(o, mlen - 4 - 15)
+      p += mlen
+      anchor = p
+    else:
+      inc p
+  let lit = stop - anchor
+  let tokLit = if lit >= 15: 15 else: lit
+  o.add(byte(tokLit shl 4))
+  if lit >= 15: emitLen(o, lit - 15)
+  for i in anchor ..< stop:
+    o.add(src[i])
+
+proc lz4Compress*(input: openArray[byte], blockSize = 65536): ByteResult =
+  ## `Lz4BlockOutput` with upstream's `1 << (10 + level)` block size.
+  var bits = 0
+  while (1 shl (bits + 10)) < blockSize:
+    inc bits
+  var output = newSeq[byte](0)
+  var p = 0
+  while p < input.len:
+    let n = min(blockSize, input.len - p)
+    var body = newSeq[byte](0)
+    lz4BlockEncode(input, p, p + n, body)
+    let raw = body.len >= n
+    for ch in Lz4Magic:
+      output.add(byte(ch))
+    output.add((if raw: Lz4MethodRaw else: Lz4MethodLz4) or byte(bits))
+    putLe32(output, uint32(if raw: n else: body.len))
+    putLe32(output, uint32(n))
+    putLe32(output, xxh32(toOpenArray(input, p, p + n - 1), Lz4Seed) and 0x0FFFFFFF'u32)
+    if raw:
+      for i in 0 ..< n:
+        output.add(input[p + i])
+    else:
+      for b in body:
+        output.add(b)
+    p += n
+  for ch in Lz4Magic:
+    output.add(byte(ch))
+  output.add(Lz4MethodRaw or byte(bits))
+  putLe32(output, 0'u32)
+  putLe32(output, 0'u32)
+  putLe32(output, 0'u32)
+  okBytes(output)

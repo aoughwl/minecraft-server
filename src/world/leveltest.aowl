@@ -1,0 +1,147 @@
+## `Level`: block access, saving and fetching, entity chunks, watchers, ticks.
+import std/[syncio, assertions, cmdline, envvars]
+import ../config/[chunk, lighting, world]
+import ../generated/dimension as dimensiondata
+import blockstates, palette, chunkdata, chunkio, tick, level, worldfs
+
+proc sid(name: string): uint32 =
+  let (ok, id) = defaultStateByName(name)
+  assert ok, name
+  id
+
+proc scratch(name: string): string =
+  var base = getEnv("WORLDTEST_DIR")
+  if base.len == 0:
+    base = parentDirW(paramStr(0)) & "/level_scratch"
+  result = base & "/" & name
+  discard createDirAllW(result)
+
+proc emptyChunk(x, z: int32, sections = 4): ChunkData =
+  let c = newChunkData(x, z, newChunkSections(sections, 0'i32))
+  c.lightEngine.skyLight = newSeq[LightContainer](sections)
+  c.lightEngine.blockLight = newSeq[LightContainer](sections)
+  for i in 0 ..< sections:
+    c.lightEngine.skyLight[i] = newLightEmpty(0'u8)
+    c.lightEngine.blockLight[i] = newLightEmpty(0'u8)
+  c.heightmap = calculateHeightmap(c)
+  c
+
+
+proc testBlockAccess() =
+  let l = fromRootFolder(defaultLevelConfig(), scratch("access"), 1'i64, OVERWORLD)
+  let voidAir = sid("void_air")
+  assert getBlockState(l, blockPos(0, 0, 0)) == voidAir
+  assert setBlockState(l, blockPos(0, 0, 0), sid("stone")) == voidAir  # unloaded: nothing happens
+  let c = emptyChunk(-1'i32, 2'i32)
+  addLoadedChunk(l, c)
+  assert isChunkLoaded(l, -1'i32, 2'i32) and loadedChunkCount(l) == 1
+  assert not isChunkLoaded(l, 2'i32, -1'i32)
+  # Block (-1, 5, 40) is chunk (-1, 2), local (15, 5, 8).
+  assert setBlockState(l, blockPos(-1, 5, 40), sid("stone")) == 0'u32
+  assert c.dirty
+  assert getBlockState(l, blockPos(-1, 5, 40)) == sid("stone")
+  assert get(c.section.blockSections[0], 15, 5, 8) == sid("stone")
+  assert getHeightmap(c.heightmap, chmWorldSurface, 15, 8, 0'i32) == 5'i32
+  # Out of height: void air, as upstream's `unwrap_or(VOID_AIR)`.
+  assert getBlockState(l, blockPos(-1, 500, 40)) == voidAir
+  # Rough biome: section 0's default.
+  assert getRoughBiome(l, blockPos(-1, 5, 40)) == 0
+
+proc testSaveAndFetch() =
+  let dir = scratch("save")
+  discard removeFileW(dir & "/region/r.0.0.mca")
+  let l = fromRootFolder(defaultLevelConfig(), dir, 1'i64, OVERWORLD)
+  let c = emptyChunk(3'i32, 4'i32)
+  c.status = csFull
+  c.setBlockAbsoluteY(1, 2'i32, 3, sid("stone"))
+  c.dirty = true
+  addLoadedChunk(l, c)
+  assert writeChunks(l, [c]).ok
+  assert not c.dirty
+
+  let l2 = fromRootFolder(defaultLevelConfig(), dir, 1'i64, OVERWORLD)
+  let f = fetchChunk(l2, 3'i32, 4'i32)
+  assert f.kind == lkLoaded and isChunkLoaded(l2, 3'i32, 4'i32)
+  assert get(f.chunk.section.blockSections[0], 1, 2, 3) == sid("stone")
+  assert fetchChunk(l2, 9'i32, 9'i32).kind == lkNotOnDisk
+
+proc testEntityChunks() =
+  let dir = scratch("entities")
+  discard removeFileW(dir & "/entities/r.0.0.mca")
+  let l = fromRootFolder(defaultLevelConfig(), dir, 1'i64, OVERWORLD)
+  assert readEntityChunkSync(l, 1'i32, 1'i32) == nil
+  let e = getEntityChunk(l, 1'i32, 1'i32)
+  assert e.x == 1'i32 and e.data.len == 0
+  assert readEntityChunkSync(l, 1'i32, 1'i32) == e
+  let received = receiveEntityChunks(l, [(1'i32, 1'i32), (2'i32, 2'i32)])
+  assert received.len == 2 and received[0][1] == false and received[1][1] == true
+
+  markChunksAsNewlyWatched(l, [(1'i32, 1'i32)])
+  markChunksAsNewlyWatched(l, [(1'i32, 1'i32)])
+  assert isChunkWatched(l, 1'i32, 1'i32)
+  assert not markChunkAsNotWatched(l, 1'i32, 1'i32)
+  assert isChunkWatched(l, 1'i32, 1'i32)
+  # (2, 2) has no watcher, so memory cleaning names it.
+  let idle = cleanMemory(l)
+  assert idle.len == 1 and idle[0] == (2'i32, 2'i32)
+  assert markChunkAsNotWatched(l, 1'i32, 1'i32)
+  assert not isChunkWatched(l, 1'i32, 1'i32)
+
+  e.dirty = true
+  assert cleanEntityChunks(l, [(1'i32, 1'i32)]).ok
+  assert readEntityChunkSync(l, 1'i32, 1'i32) == nil
+  assert fileExistsW(dir & "/entities/r.0.0.mca")
+  assert shutdown(l).ok
+  assert readEntityChunkSync(l, 2'i32, 2'i32) == nil
+
+proc testTicks() =
+  let l = fromRootFolder(defaultLevelConfig(), scratch("ticks"), 1'i64, OVERWORLD)
+  let c = emptyChunk(0'i32, 0'i32)
+  addLoadedChunk(l, c)
+  let pos = blockPos(1, 2, 3)
+  scheduleBlockTick(l, "minecraft:stone", blockPos(9, 9, 9), 1'u8, tpNormal)  # order 0
+  scheduleBlockTick(l, "minecraft:stone", pos, 1'u8, tpHigh)                  # order 1
+  scheduleBlockTick(l, "minecraft:stone", pos, 1'u8, tpHigh)                  # duplicate, dropped
+  scheduleFluidTick(l, "minecraft:water", pos, 0'u8, tpNormal)
+  assert isBlockTickScheduled(l, pos, "minecraft:stone")
+  assert isFluidTickScheduled(l, pos, "minecraft:water")
+  assert not isFluidTickScheduled(l, pos, "minecraft:lava")
+  assert not isBlockTickScheduled(l, blockPos(100, 2, 3), "minecraft:stone")
+
+  let first = getTickData(l, [(0'i32, 0'i32)])
+  assert first.fluidTicks.len == 1 and first.blockTicks.len == 0
+  let second = getTickData(l, [(0'i32, 0'i32)])
+  # Sorted: the higher priority first even though it was scheduled second.
+  assert second.blockTicks.len == 2
+  assert second.blockTicks[0].priority == tpHigh and second.blockTicks[1].priority == tpNormal
+  assert not isBlockTickScheduled(l, pos, "minecraft:stone")
+  # Drained, so the chunk leaves the scheduled set; an unloaded chunk does too.
+  assert l.chunksWithScheduledTicks.len == 0
+  scheduleBlockTick(l, "minecraft:stone", pos, 5'u8, tpNormal)
+  removeLoadedChunk(l, 0'i32, 0'i32)
+  discard getTickData(l, newSeq[(int32, int32)](0))
+  assert l.chunksWithScheduledTicks.len == 0
+
+  # Random ticks only ever land on randomly ticking states.
+  let w = emptyChunk(1'i32, 0'i32)
+  for x in 0 ..< 16:
+    for z in 0 ..< 16:
+      for y in 0 ..< 16:
+        discard setRelativeBlock(w.section, x, y, z, sid("wheat"))
+  addLoadedChunk(l, w)
+  let data = getTickData(l, [(1'i32, 0'i32), (5'i32, 5'i32)])
+  assert data.randomTicks.len == 3  # three draws per ticking section
+  for r in data.randomTicks:
+    assert r.tickBlock and not r.tickFluid
+    assert r.position.x >= 16'i32 and r.position.x < 32'i32 and r.position.y < 16'i32
+
+
+
+
+
+
+testBlockAccess()
+testSaveAndFetch()
+testEntityChunks()
+testTicks()
+echo "level: all checks passed"

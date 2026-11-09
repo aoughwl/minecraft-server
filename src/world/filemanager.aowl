@@ -1,0 +1,272 @@
+## Loads and saves chunk data through region files, with a cache keyed by file path.
+## Port of pumpkin-world/src/chunk/io/file_manager.rs
+##
+## No async and no locks: the serializer cache, watchers and eviction keep upstream's order, and the
+## `Arc::strong_count` test in `can_remove` is always true because nothing here outlives the call.
+## `PathFromLevelFolder` is the `FolderKind` the manager is built with. `ChunkFileManager` is the
+## `FileIO` implementation, typed by which `fetch`/`save` pair the caller uses.
+
+{.feature: "lenientnils".}
+
+import std/algorithm
+import chunkdata, chunkio, chunkformat, worldfs
+
+type
+  FolderKind* = enum
+    fkRegion    ## `impl PathFromLevelFolder for ChunkData`
+    fkEntities  ## `impl PathFromLevelFolder for ChunkEntityData`
+
+  CachedSerializer = object
+    path: string
+    serializer: ChunkSerializer
+
+  WatchEntry = object
+    path: string
+    count: int
+
+  ChunkFileManager* = ref object
+    fileLocks: seq[CachedSerializer]
+    watchers: seq[WatchEntry]
+    serializerType: ChunkSerializerType
+    folderKind: FolderKind
+
+  LoadedChunk* = object
+    kind*: LoadedKind
+    x*, z*: int32
+    chunk*: ChunkData
+    error*: ChunkReadingError
+
+  LoadedEntityChunk* = object
+    kind*: LoadedKind
+    x*, z*: int32
+    chunk*: ChunkEntityData
+    error*: ChunkReadingError
+
+  SaveChunk* = object
+    x*, z*: int32
+    raw*: proc(): BytesResult {.closure.}
+    isDirty*: proc(): bool {.closure.}
+    markDirty*: proc(flag: bool) {.closure.}
+
+  GroupedCoords = object
+    fileName: string
+    coords: seq[(int32, int32)]
+
+  GetSerializerResult = object
+    ok: bool
+    serializer: ChunkSerializer
+    error: ChunkReadingError
+
+proc newChunkFileManager*(t: ChunkSerializerType, folderKind: FolderKind): ChunkFileManager =
+  ChunkFileManager(fileLocks: @[], watchers: @[], serializerType: t, folderKind: folderKind)
+
+proc filePath*(m: ChunkFileManager, folder: LevelFolder, fileName: string): string =
+  case m.folderKind
+  of fkRegion: joinPathW(folder.regionFolder, fileName)
+  of fkEntities: joinPathW(folder.entitiesFolder, fileName)
+
+proc readFromDisk(m: ChunkFileManager, path: string): GetSerializerResult =
+  ## `ChunkSerializerLazyLoader::read_from_disk`
+  let (status, bytes) = readFileBytes(path)
+  if status == rsNotFound:
+    return GetSerializerResult(ok: true, serializer: makeDefaultOf(m.serializerType), error: readErr(creIoError))
+  let r = readOf(m.serializerType, bytes)
+  GetSerializerResult(ok: r.ok, serializer: r.serializer, error: r.error)
+
+proc getSerializer(m: ChunkFileManager, path: string): GetSerializerResult =
+  ## `ChunkFileManager::get_serializer`
+  for c in m.fileLocks:
+    if c.path == path:
+      return GetSerializerResult(ok: true, serializer: c.serializer, error: readErr(creIoError))
+  let r = readFromDisk(m, path)
+  if r.ok:
+    m.fileLocks.add(CachedSerializer(path: path, serializer: r.serializer))
+  r
+
+proc isWatchedPath(m: ChunkFileManager, path: string): bool =
+  for w in m.watchers:
+    if w.path == path:
+      return w.count > 0
+  false
+
+proc maybeEvict(m: ChunkFileManager, path: string) =
+  ## `ChunkFileManager::maybe_evict`
+  if isWatchedPath(m, path):
+    return
+  for i in 0 ..< m.fileLocks.len:
+    if m.fileLocks[i].path == path:
+      m.fileLocks.delete(i)
+      return
+
+proc cachedSerializerCount*(m: ChunkFileManager): int {.inline.} = m.fileLocks.len
+
+proc watchChunks*(m: ChunkFileManager, folder: LevelFolder, chunks: openArray[(int32, int32)]) =
+  ## `FileIO::watch_chunks`
+  for c in chunks:
+    let path = filePath(m, folder, chunkKeyOf(m.serializerType, c[0], c[1]))
+    var found = false
+    for i in 0 ..< m.watchers.len:
+      if m.watchers[i].path == path:
+        inc m.watchers[i].count
+        found = true
+        break
+    if not found:
+      m.watchers.add(WatchEntry(path: path, count: 1))
+
+proc unwatchChunks*(m: ChunkFileManager, folder: LevelFolder, chunks: openArray[(int32, int32)]) =
+  ## `FileIO::unwatch_chunks`
+  for c in chunks:
+    let path = filePath(m, folder, chunkKeyOf(m.serializerType, c[0], c[1]))
+    for i in 0 ..< m.watchers.len:
+      if m.watchers[i].path == path:
+        if m.watchers[i].count > 0:
+          dec m.watchers[i].count
+        if m.watchers[i].count == 0:
+          m.watchers.delete(i)
+        break
+
+proc clearWatchedChunks*(m: ChunkFileManager) =
+  ## `FileIO::clear_watched_chunks`
+  m.watchers = @[]
+
+proc blockAndAwaitOngoingTasks*(m: ChunkFileManager) =
+  ## `FileIO::block_and_await_ongoing_tasks`: every call here has finished by the time it returns.
+  discard
+
+proc byFileName(a, b: GroupedCoords): int = cmp(a.fileName, b.fileName)
+
+proc groupByFile(m: ChunkFileManager, coords: openArray[(int32, int32)]): seq[GroupedCoords] =
+  ## The `BTreeMap<String, Vec<_>>` grouping: ordered by file name, coordinates in input order.
+  result = newSeq[GroupedCoords](0)
+  for c in coords:
+    let key = chunkKeyOf(m.serializerType, c[0], c[1])
+    var found = false
+    for i in 0 ..< result.len:
+      if result[i].fileName == key:
+        result[i].coords.add(c)
+        found = true
+        break
+    if not found:
+      result.add(GroupedCoords(fileName: key, coords: @[c]))
+  sort(result, byFileName)
+
+proc fetchRaw*(m: ChunkFileManager, folder: LevelFolder, coords: openArray[(int32, int32)]): seq[LoadedBytes] =
+  ## `FileIO::fetch_chunks`, before the bytes are parsed.
+  result = newSeq[LoadedBytes](0)
+  let groups = groupByFile(m, coords)
+  for group in groups:
+    let path = filePath(m, folder, group.fileName)
+    let r = getSerializer(m, path)
+    if not r.ok:
+      if r.error.kind != creChunkNotExist:
+        # Best-effort: report the error for the first coord in the batch.
+        result.add(loadedError(group.coords[0][0], group.coords[0][1], r.error))
+      continue
+    for c in group.coords:
+      result.add(getChunkOf(r.serializer, c[0], c[1]))
+
+proc fetchChunks*(m: ChunkFileManager, folder: LevelFolder, coords: openArray[(int32, int32)]): seq[LoadedChunk] =
+  ## `FileIO::fetch_chunks` with `Data = Arc<ChunkData>`.
+  result = newSeq[LoadedChunk](0)
+  let raws = fetchRaw(m, folder, coords)
+  for raw in raws:
+    case raw.kind
+    of ldLoaded:
+      let p = internalFromBytes(raw.bytes, raw.x, raw.z)
+      if p.ok:
+        result.add(LoadedChunk(kind: ldLoaded, x: raw.x, z: raw.z, chunk: p.chunk, error: readErr(creIoError)))
+      else:
+        result.add(LoadedChunk(kind: ldError, x: raw.x, z: raw.z, chunk: nil, error: readErr(creParsingError, p.error)))
+    of ldMissing:
+      result.add(LoadedChunk(kind: ldMissing, x: raw.x, z: raw.z, chunk: nil, error: readErr(creIoError)))
+    of ldError:
+      result.add(LoadedChunk(kind: ldError, x: raw.x, z: raw.z, chunk: nil, error: raw.error))
+
+proc fetchEntityChunks*(m: ChunkFileManager, folder: LevelFolder, coords: openArray[(int32, int32)]): seq[LoadedEntityChunk] =
+  ## `FileIO::fetch_chunks` with `Data = Arc<ChunkEntityData>`.
+  result = newSeq[LoadedEntityChunk](0)
+  let raws = fetchRaw(m, folder, coords)
+  for raw in raws:
+    case raw.kind
+    of ldLoaded:
+      let p = internalFromBytesEntity(raw.bytes, raw.x, raw.z)
+      if p.ok:
+        result.add(LoadedEntityChunk(kind: ldLoaded, x: raw.x, z: raw.z, chunk: p.chunk, error: readErr(creIoError)))
+      else:
+        result.add(LoadedEntityChunk(kind: ldError, x: raw.x, z: raw.z, chunk: nil, error: readErr(creParsingError, p.error)))
+    of ldMissing:
+      result.add(LoadedEntityChunk(kind: ldMissing, x: raw.x, z: raw.z, chunk: nil, error: readErr(creIoError)))
+    of ldError:
+      result.add(LoadedEntityChunk(kind: ldError, x: raw.x, z: raw.z, chunk: nil, error: raw.error))
+
+proc saveGeneric*(m: ChunkFileManager, folder: LevelFolder, chunks: seq[SaveChunk]): ChunkWriteStatus =
+  ## `FileIO::save_chunks`
+  var coords = newSeq[(int32, int32)](0)
+  for c in chunks:
+    coords.add((c.x, c.z))
+  var firstError = writeOk()
+  let groups = groupByFile(m, coords)
+  for group in groups:
+    let path = filePath(m, folder, group.fileName)
+    let r = getSerializer(m, path)
+    if not r.ok:
+      if firstError.ok:
+        let msg = if r.error.kind == creChunkNotExist: "get_serializer returned ChunkNotExist" else: $r.error
+        firstError = writeFail(cweIoError, msg)
+      continue
+    var failed = false
+    for c in chunks:
+      if chunkKeyOf(m.serializerType, c.x, c.z) != group.fileName:
+        continue
+      # Snapshot and clear the dirty flag before serialising, as upstream does.
+      let isDirtyFn = c.isDirty
+      let markDirtyFn = c.markDirty
+      let rawFn = c.raw
+      let wasDirty = isDirtyFn()
+      markDirtyFn(false)
+      if wasDirty:
+        let bytes = rawFn()
+        if not bytes.ok:
+          firstError = if firstError.ok: writeFail(cweChunkSerializingError, bytes.error) else: firstError
+          failed = true
+          break
+        let u = updateChunkOf(r.serializer, c.x, c.z, bytes.bytes)
+        if not u.ok:
+          firstError = if firstError.ok: u else: firstError
+          failed = true
+          break
+    if failed:
+      continue
+    if not isWatchedPath(m, path):
+      let w = writeOf(r.serializer, path)
+      if not w.ok:
+        firstError = if firstError.ok: writeFail(cweIoError, w.msg) else: firstError
+        continue
+      maybeEvict(m, path)
+  firstError
+
+proc saveItem(c: ChunkData): SaveChunk =
+  SaveChunk(x: c.x, z: c.z,
+    raw: proc(): BytesResult {.closure.} = internalToBytes(c),
+    isDirty: proc(): bool {.closure.} = c.dirty,
+    markDirty: proc(flag: bool) {.closure.} = c.dirty = flag)
+
+proc saveItem(c: ChunkEntityData): SaveChunk =
+  SaveChunk(x: c.x, z: c.z,
+    raw: proc(): BytesResult {.closure.} = internalToBytesEntity(c),
+    isDirty: proc(): bool {.closure.} = c.dirty,
+    markDirty: proc(flag: bool) {.closure.} = c.dirty = flag)
+
+proc saveChunks*(m: ChunkFileManager, folder: LevelFolder, chunks: openArray[ChunkData]): ChunkWriteStatus =
+  ## `FileIO::save_chunks` with `Data = Arc<ChunkData>`.
+  var items = newSeq[SaveChunk](0)
+  for c in chunks:
+    items.add(saveItem(c))
+  saveGeneric(m, folder, items)
+
+proc saveEntityChunks*(m: ChunkFileManager, folder: LevelFolder, chunks: openArray[ChunkEntityData]): ChunkWriteStatus =
+  ## `FileIO::save_chunks` with `Data = Arc<ChunkEntityData>`.
+  var items = newSeq[SaveChunk](0)
+  for c in chunks:
+    items.add(saveItem(c))
+  saveGeneric(m, folder, items)

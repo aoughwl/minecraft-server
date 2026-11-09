@@ -1,0 +1,210 @@
+## Port of pumpkin-protocol/src/java/client/play/chunk_data.rs
+## Provides the client with the full data for a chunk: heightmaps, block and biome sections, block entities and
+## light.
+import std/options
+import ../../../protobase, ../../../netcodec, ../../../varint
+import ../../../../generated/packet, ../../../../util/javaversion
+import ../../../bitset
+import ../../../../generated/block_state_remap, ../../../../generated/block_properties
+import ../../../../nbt/tag
+import ../../../../util/math/position
+import ../../../../world/[chunkdata, palette]
+
+type
+  CChunkData* = object
+    data*: ChunkData  ## Upstream's tuple field `.0`.
+
+proc heightmapsToNbt(h: ChunkHeightmaps): NbtTag =
+  ## Upstream's serde form: `rename_all = "UPPERCASE"`, long arrays, and `None` skipped.
+  var c = newCompound()
+  if h.worldSurface.len > 0:
+    c.put("WORLD_SURFACE", NbtTag(kind: ntkLongArray, longArrayVal: h.worldSurface))
+  if h.motionBlocking.len > 0:
+    c.put("MOTION_BLOCKING", NbtTag(kind: ntkLongArray, longArrayVal: h.motionBlocking))
+  if h.motionBlockingNoLeaves.len > 0:
+    c.put("MOTION_BLOCKING_NO_LEAVES", NbtTag(kind: ntkLongArray, longArrayVal: h.motionBlockingNoLeaves))
+  NbtTag(kind: ntkCompound, compoundVal: c)
+
+proc writeHeightmap(w: var NetWriter; index: int32; data: seq[int64]) =
+  writeVarInt(w, newVarInt(index))
+  # `unwrap_or(&[0; 37])`
+  if data.len == 0:
+    writeVarInt(w, newVarInt(int32(HeightmapWords)))
+    for i in 0 ..< HeightmapWords:
+      writeI64Be(w, 0'i64)
+  else:
+    writeVarInt(w, newVarInt(int32(data.len)))
+    for val in data:
+      writeI64Be(w, val)
+
+proc remapState(id: uint32; version: JavaMinecraftVersion): uint32 =
+  uint32(remapBlockStateForVersion(uint16(id and 0xFFFF'u32), version))
+
+proc remapForVersion(network: var NetworkSerialization; version: JavaMinecraftVersion) =
+  case network.paletteKind
+  of npSingle:
+    network.value = remapState(network.value, version)
+  of npIndirect:
+    for i in 0 ..< network.values.len:
+      network.values[i] = remapState(network.values[i], version)
+  of npDirect:
+    let bitsPerEntry = int(network.bitsPerEntry)
+    let valuesPerI64 = 64 div bitsPerEntry
+    let idMask = (1'u64 shl bitsPerEntry) - 1'u64
+
+    for wordIndex in 0 ..< network.packedData.len:
+      var remappedWord = 0'u64
+      let packedWordU64 = cast[uint64](network.packedData[wordIndex])
+      for index in 0 ..< valuesPerI64:
+        let shift = index * bitsPerEntry
+        let stateId = uint16((packedWordU64 shr shift) and idMask)
+        let remappedId = remapBlockStateForVersion(stateId, version)
+        remappedWord = remappedWord or (uint64(remappedId) shl shift)
+      network.packedData[wordIndex] = cast[int64](remappedWord)
+
+proc writeNetworkSerialization(buf: var NetWriter; network: NetworkSerialization; version: JavaMinecraftVersion) =
+  writeU8(buf, network.bitsPerEntry)
+
+  case network.paletteKind
+  of npSingle:
+    writeVarInt(buf, newVarInt(int32(network.value)))
+  of npIndirect:
+    writeVarInt(buf, newVarInt(int32(network.values.len)))
+    for registryId in network.values:
+      writeVarInt(buf, newVarInt(int32(registryId)))
+  of npDirect:
+    discard
+
+  if version <= jmvV1_21_4:
+    writeVarInt(buf, newVarInt(int32(network.packedData.len)))
+  for packed in network.packedData:
+    writeI64Be(buf, packed)
+
+proc blockEntityTypeId(name: Option[string]): int32 =
+  ## `nbt.get_string("id")`, past the last `:`, as a position in `BLOCK_ENTITY_TYPES`; 0 if anything is absent.
+  if name.isNone:
+    return 0'i32
+  let idStr = name.unsafeGet
+  var start = 0
+  for i in 0 ..< idStr.len:
+    if idStr[i] == ':':
+      start = i + 1
+  let short = idStr[start ..< idStr.len]
+  for i in 0 ..< BLOCK_ENTITY_TYPES.len:
+    if BLOCK_ENTITY_TYPES[i] == short:
+      return int32(i)
+  0'i32
+
+proc toId*(_: typedesc[CChunkData]; v: JavaMinecraftVersion): int32 =
+  CB_PLAY_LEVEL_CHUNK_WITH_LIGHT.toId(v)
+
+proc writePacket*(p: CChunkData; w: var NetWriter; v: JavaMinecraftVersion): ProtoWriteVoidResult =
+  # Chunk X
+  writeI32Be(w, p.data.x)
+  # Chunk Z
+  writeI32Be(w, p.data.z)
+
+  if v <= jmvV1_21_4:
+    tryWrite writeNbt(w, heightmapsToNbt(p.data.heightmap))
+  else:
+    writeVarInt(w, newVarInt(3))  # Map size
+    writeHeightmap(w, 1, p.data.heightmap.worldSurface)
+    writeHeightmap(w, 4, p.data.heightmap.motionBlocking)
+    writeHeightmap(w, 5, p.data.heightmap.motionBlockingNoLeaves)
+
+  block:
+    var blocksAndBiomesBuf = newNetWriter()
+    let sections = min(p.data.section.blockSections.len, p.data.section.biomeSections.len)
+    for i in 0 ..< sections:
+      let blockPalette = p.data.section.blockSections[i]
+      let biomePalette = p.data.section.biomeSections[i]
+      writeI16Be(blocksAndBiomesBuf, cast[int16](nonAirBlockCount(blockPalette)))
+      if v >= jmvV26_1:
+        # New in 26.1, fluid count
+        writeI16Be(blocksAndBiomesBuf, cast[int16](liquidBlockCount(blockPalette)))
+
+      var blockNetwork = blockConvertNetwork(blockPalette)
+      if v < CURRENT_MC_VERSION:
+        remapForVersion(blockNetwork, v)
+      writeNetworkSerialization(blocksAndBiomesBuf, blockNetwork, v)
+
+      writeNetworkSerialization(blocksAndBiomesBuf, biomeConvertNetwork(biomePalette), v)
+
+    writeVarInt(w, newVarInt(int32(blocksAndBiomesBuf.buf.len)))
+    writeSlice(w, blocksAndBiomesBuf.buf)
+
+  let blockEntities = p.data.pendingBlockEntities
+  writeVarInt(w, newVarInt(int32(blockEntities.len)))
+  for entry in blockEntities:
+    let localXz = ((getLocalCord(entry.pos.x) and 0xF'i32) shl 4) or (getLocalCord(entry.pos.z) and 0xF'i32)
+
+    writeU8(w, uint8(localXz))
+    writeI16Be(w, cast[int16](entry.pos.y))
+
+    writeVarInt(w, newVarInt(blockEntityTypeId(entry.nbt.getString("id"))))
+
+    var clientNbt = entry.nbt
+    discard clientNbt.remove("id")
+    discard clientNbt.remove("x")
+    discard clientNbt.remove("y")
+    discard clientNbt.remove("z")
+    tryWrite writeNbt(w, NbtTag(kind: ntkCompound, compoundVal: clientNbt))
+
+  block:
+    # Light masks include sections from -1 (below world) to num_sections (above world)
+    # This means we need to account for 2 extra sections in the bitset
+    let lightEngine = p.data.lightEngine
+    let numSections = lightEngine.skyLight.len
+
+    var skyLightEmptyMask = 0'u64
+    var blockLightEmptyMask = 0'u64
+    var skyLightMask = 0'u64
+    var blockLightMask = 0'u64
+
+    # Bit 0 represents the section below the world (always empty)
+    skyLightEmptyMask = skyLightEmptyMask or (1'u64 shl 0)
+    blockLightEmptyMask = blockLightEmptyMask or (1'u64 shl 0)
+
+    # Bits 1..=num_sections represent the actual world sections
+    for sectionIndex in 0 ..< numSections:
+      let bitIndex = sectionIndex + 1  # Offset by 1 for the below-world section
+
+      if not lightEngine.skyLight[sectionIndex].isEmpty:
+        skyLightMask = skyLightMask or (1'u64 shl bitIndex)
+      else:
+        skyLightEmptyMask = skyLightEmptyMask or (1'u64 shl bitIndex)
+
+      if not lightEngine.blockLight[sectionIndex].isEmpty:
+        blockLightMask = blockLightMask or (1'u64 shl bitIndex)
+      else:
+        blockLightEmptyMask = blockLightEmptyMask or (1'u64 shl bitIndex)
+
+    # Bit num_sections+1 represents the section above the world (always empty)
+    skyLightEmptyMask = skyLightEmptyMask or (1'u64 shl (numSections + 1))
+    blockLightEmptyMask = blockLightEmptyMask or (1'u64 shl (numSections + 1))
+
+    # Write Sky Light Mask
+    tryWrite writeBitset(w, fromU64(skyLightMask))
+    # Write Block Light Mask
+    tryWrite writeBitset(w, fromU64(blockLightMask))
+    # Write Empty Sky Light Mask
+    tryWrite writeBitset(w, fromU64(skyLightEmptyMask))
+    # Write Empty Block Light Mask
+    tryWrite writeBitset(w, fromU64(blockLightEmptyMask))
+
+    let lightDataSize = newVarInt(int32(LightArraySize))
+
+    # Write Sky Light arrays
+    writeVarInt(w, newVarInt(int32(countOnes(fromU64(skyLightMask)))))
+    for sectionIndex in 0 ..< numSections:
+      if not lightEngine.skyLight[sectionIndex].isEmpty:
+        writeVarInt(w, lightDataSize)
+        writeSlice(w, lightEngine.skyLight[sectionIndex].data)
+
+    # Write Block Light arrays
+    writeVarInt(w, newVarInt(int32(countOnes(fromU64(blockLightMask)))))
+    for sectionIndex in 0 ..< numSections:
+      if not lightEngine.blockLight[sectionIndex].isEmpty:
+        writeVarInt(w, lightDataSize)
+        writeSlice(w, lightEngine.blockLight[sectionIndex].data)
+  writeOkVoid()

@@ -1,0 +1,302 @@
+## Chunk-generation lighting: BFS propagation of block and sky light across a chunk cache.
+## Port of pumpkin-world/src/lighting/engine.rs
+##
+## `LightProvider`'s two zero-sized impls become `LightKind`. `FastHashSet<BlockPos>` becomes a
+## `HashSet[int64]` of packed positions. Runs over `LightCache`; see lightingstorage.aowl.
+
+import std/[deques, sets, tables]
+import ../config/lighting
+import blockstates, chunkdata, lightingstorage, tick
+
+type
+  LightKind* = enum
+    lkBlock  ## `BlockLightProvider`
+    lkSky    ## `SkyLightProvider`
+
+  BlockDirection* = enum
+    ## pumpkin-data/src/block_direction.rs, in `BlockDirection::all()` order.
+    bdDown
+    bdUp
+    bdNorth
+    bdSouth
+    bdWest
+    bdEast
+
+  PropagationEntry* = object
+    pos*: BlockPos
+    hasSkip*: bool
+    skipDirection*: BlockDirection  ## Direction the light came from, to prevent back-propagation.
+
+  DecreaseEntry* = object
+    pos*: BlockPos
+    level*: uint8
+
+  LightPropagator* = object
+    kind*: LightKind
+    queue*: Deque[PropagationEntry]
+    visited*: HashSet[int64]
+    decreaseQueue*: Deque[DecreaseEntry]
+
+  LightEngine* = object
+    blockLight*: LightPropagator
+    skyLight*: LightPropagator
+
+const AllDirections* = [bdDown, bdUp, bdNorth, bdSouth, bdWest, bdEast]
+
+proc offsetPos*(pos: BlockPos, dir: BlockDirection): BlockPos =
+  ## `pos.offset(dir.to_offset())`
+  case dir
+  of bdDown: blockPos(pos.x, pos.y - 1'i32, pos.z)
+  of bdUp: blockPos(pos.x, pos.y + 1'i32, pos.z)
+  of bdNorth: blockPos(pos.x, pos.y, pos.z - 1'i32)
+  of bdSouth: blockPos(pos.x, pos.y, pos.z + 1'i32)
+  of bdWest: blockPos(pos.x - 1'i32, pos.y, pos.z)
+  of bdEast: blockPos(pos.x + 1'i32, pos.y, pos.z)
+
+proc opposite*(dir: BlockDirection): BlockDirection =
+  case dir
+  of bdDown: bdUp
+  of bdUp: bdDown
+  of bdNorth: bdSouth
+  of bdSouth: bdNorth
+  of bdWest: bdEast
+  of bdEast: bdWest
+
+proc posKey(p: BlockPos): int64 {.inline.} =
+  ## 26 + 26 + 12 bits, the layout of `BlockPos::as_long`, used only as a set key here.
+  (int64(p.x and 0x3FFFFFF'i32) shl 38) or (int64(p.z and 0x3FFFFFF'i32) shl 12) or int64(p.y and 0xFFF'i32)
+
+proc satSub(a, b: uint8): uint8 {.inline.} =
+  if a > b: a - b else: 0'u8
+
+proc getLight(k: LightKind, cache: LightCache, pos: BlockPos): uint8 {.inline.} =
+  case k
+  of lkBlock: getBlockLight(cache, pos)
+  of lkSky: getSkyLight(cache, pos)
+
+proc setLight(k: LightKind, cache: LightCache, pos: BlockPos, level: uint8) {.inline.} =
+  case k
+  of lkBlock: setBlockLight(cache, pos, level)
+  of lkSky: setSkyLight(cache, pos, level)
+
+proc propagateLevel*(k: LightKind, currentLevel, opacity: uint8, dir: BlockDirection): uint8 =
+  ## `LightProvider::propagate_level`
+  if k == lkSky and currentLevel == 15'u8 and dir == bdDown and opacity == 0'u8:
+    return 15'u8
+  satSub(currentLevel, max(opacity, 1'u8))
+
+proc newLightPropagator*(kind: LightKind): LightPropagator =
+  LightPropagator(kind: kind, queue: initDeque[PropagationEntry](), visited: initHashSet[int64](),
+    decreaseQueue: initDeque[DecreaseEntry]())
+
+proc clear*(p: var LightPropagator) =
+  p.queue = initDeque[PropagationEntry]()
+  p.visited = initHashSet[int64]()
+  p.decreaseQueue = initDeque[DecreaseEntry]()
+
+proc propagate*(p: var LightPropagator, cache: LightCache) =
+  ## `LightPropagator::propagate`
+  let minY = cache.bottomY
+  let maxY = minY + cache.height
+  while p.queue.len > 0:
+    let entry = p.queue.popFirst()
+    let pos = entry.pos
+    let currentLight = getLight(p.kind, cache, pos)
+    if currentLight <= 1'u8:
+      continue
+    for dir in AllDirections:
+      if entry.hasSkip and dir == entry.skipDirection:
+        continue
+      let neighbor = offsetPos(pos, dir)
+      let key = posKey(neighbor)
+      if key in p.visited:
+        continue
+      if neighbor.y < minY or neighbor.y >= maxY:
+        continue
+      let relX = (neighbor.x shr 4) - cache.x
+      let relZ = (neighbor.z shr 4) - cache.z
+      if relX < 0'i32 or relX >= cache.size or relZ < 0'i32 or relZ >= cache.size:
+        continue
+      let opac = opacity(blockStateAt(cache, neighbor.x, neighbor.y, neighbor.z))
+      let newLevel = propagateLevel(p.kind, currentLight, opac, dir)
+      let neighborLight = getLight(p.kind, cache, neighbor)
+      if newLevel > neighborLight:
+        setLight(p.kind, cache, neighbor, newLevel)
+        if newLevel > 1'u8 and not containsOrIncl(p.visited, key):
+          p.queue.addLast(PropagationEntry(pos: neighbor, hasSkip: true, skipDirection: opposite(dir)))
+
+proc processDecreaseQueue*(p: var LightPropagator, cache: LightCache) =
+  ## `LightPropagator::process_decrease_queue`
+  while p.decreaseQueue.len > 0:
+    let e = p.decreaseQueue.popFirst()
+    for dir in AllDirections:
+      let neighbor = offsetPos(e.pos, dir)
+      let relX = (neighbor.x shr 4) - cache.x
+      let relZ = (neighbor.z shr 4) - cache.z
+      if relX < 0'i32 or relX >= cache.size or relZ < 0'i32 or relZ >= cache.size:
+        continue
+      let neighborLight = getLight(p.kind, cache, neighbor)
+      if neighborLight == 0'u8:
+        continue
+      let opac = opacity(blockStateAt(cache, neighbor.x, neighbor.y, neighbor.z))
+      let predicted = propagateLevel(p.kind, e.level, opac, dir)
+      if neighborLight == predicted or neighborLight < e.level:
+        setLight(p.kind, cache, neighbor, 0'u8)
+        p.decreaseQueue.addLast(DecreaseEntry(pos: neighbor, level: neighborLight))
+      elif neighborLight >= e.level:
+        p.queue.addLast(PropagationEntry(pos: neighbor, hasSkip: false, skipDirection: bdDown))
+        incl(p.visited, posKey(neighbor))
+  propagate(p, cache)
+
+proc propagateBlockLight*(p: var LightPropagator, cache: LightCache) =
+  ## `BlockLightPropagator::propagate_light`
+  clear(p)
+  let minY = cache.bottomY
+  let maxY = minY + cache.height
+  let centerX = cache.x + (cache.size div 2'i32)
+  let centerZ = cache.z + (cache.size div 2'i32)
+  let startX = centerX * 16'i32 - 1'i32
+  let startZ = centerZ * 16'i32 - 1'i32
+  let endX = startX + 18'i32
+  let endZ = startZ + 18'i32
+  var y = minY
+  while y < maxY:
+    var z = startZ
+    while z < endZ:
+      var x = startX
+      while x < endX:
+        let emission = luminance(blockStateAt(cache, x, y, z))
+        if emission > 0'u8:
+          let pos = blockPos(x, y, z)
+          setBlockLight(cache, pos, emission)
+          if not containsOrIncl(p.visited, posKey(pos)):
+            p.queue.addLast(PropagationEntry(pos: pos, hasSkip: false, skipDirection: bdDown))
+        inc x
+      inc z
+    inc y
+  propagate(p, cache)
+
+proc columnKey(x, z: int32): int64 {.inline.} =
+  (int64(x) shl 32) xor (int64(z) and 0xFFFFFFFF'i64)
+
+proc convertLight*(p: var LightPropagator, cache: LightCache) =
+  ## `SkyLightPropagator::convert_light`
+  clear(p)
+  let centerX = cache.x + (cache.size div 2'i32)
+  let centerZ = cache.z + (cache.size div 2'i32)
+  let startX = centerX * 16'i32 - 1'i32
+  let startZ = centerZ * 16'i32 - 1'i32
+  let endX = startX + 18'i32
+  let endZ = startZ + 18'i32
+  let bottomY = cache.bottomY
+  let maxY = bottomY + cache.height
+  var surfaceHeights = initTable[int64, int32]()
+
+  var z = startZ
+  while z < endZ:
+    let chunkZ = z shr 4
+    let localZ = int(z and 15'i32)
+    var x = startX
+    while x < endX:
+      let chunkX = x shr 4
+      let localX = int(x and 15'i32)
+      let topY = topYAt(cache, x, z)
+      surfaceHeights[columnKey(x, z)] = topY
+      let relX = chunkX - cache.x
+      let relZ = chunkZ - cache.z
+      if relX < 0'i32 or relX >= cache.size or relZ < 0'i32 or relZ >= cache.size:
+        inc x
+        continue
+      let chunkIdx = int(relX * cache.size + relZ)
+      let light = cache.chunks[chunkIdx].light
+
+      # Fill everything above the heightmap with 15.
+      var y = topY + 1'i32
+      while y < maxY:
+        let sectionIdx = int((y - bottomY) shr 4)
+        if sectionIdx < light.skyLight.len:
+          light.skyLight[sectionIdx].set(localX, int(y and 15'i32), localZ, 15'u8)
+        inc y
+
+      # Only iterate from top_y down.
+      var level = 15'i32
+      y = topY
+      while y >= bottomY:
+        let sectionIdx = int((y - bottomY) shr 4)
+        level -= int32(opacity(blockStateAt(cache, x, y, z)))
+        let lightVal = if level <= 0'i32: 0'u8 else: uint8(level)
+        if sectionIdx < light.skyLight.len:
+          light.skyLight[sectionIdx].set(localX, int(y and 15'i32), localZ, lightVal)
+        if level <= 0'i32:
+          break
+        dec y
+      inc x
+    inc z
+
+  # Enqueue horizontal propagation.
+  z = startZ
+  while z < endZ:
+    var x = startX
+    while x < endX:
+      let topY = surfaceHeights.getOrDefault(columnKey(x, z), 0'i32)
+      let northTop = surfaceHeights.getOrDefault(columnKey(x, z - 1'i32), topY)
+      let southTop = surfaceHeights.getOrDefault(columnKey(x, z + 1'i32), topY)
+      let westTop = surfaceHeights.getOrDefault(columnKey(x - 1'i32, z), topY)
+      let eastTop = surfaceHeights.getOrDefault(columnKey(x + 1'i32, z), topY)
+      let maxCheckY = max(max(max(max(topY, northTop), southTop), westTop), eastTop)
+      var y = maxCheckY
+      while y >= bottomY:
+        let pos = blockPos(x, y, z)
+        let lightLevel = getSkyLight(cache, pos)
+        if lightLevel == 0'u8:
+          if y <= topY:
+            break
+          dec y
+          continue
+        let isAtSurface = y == topY
+        let belowNeighbor = y < northTop or y < southTop or y < westTop or y < eastTop
+        if (isAtSurface or belowNeighbor) and not containsOrIncl(p.visited, posKey(pos)):
+          p.queue.addLast(PropagationEntry(pos: pos, hasSkip: y >= topY, skipDirection: bdUp))
+        dec y
+      inc x
+    inc z
+  propagate(p, cache)
+
+proc newLightEngine*(): LightEngine =
+  LightEngine(blockLight: newLightPropagator(lkBlock), skyLight: newLightPropagator(lkSky))
+
+proc initializeLight*(e: var LightEngine, cache: LightCache, config: LightingEngineConfig) =
+  ## `LightEngine::initialize_light`
+  if config != lecDefault:
+    return
+  if cache.centerAtLightingStage:
+    return
+  convertLight(e.skyLight, cache)
+  propagateBlockLight(e.blockLight, cache)
+  clear(e.blockLight)
+  clear(e.skyLight)
+
+proc updateBlockLight*(e: var LightEngine, cache: LightCache, pos: BlockPos, oldLuminance, newLuminance: uint8) =
+  ## `LightEngine::update_block_light`
+  if oldLuminance > newLuminance:
+    let currentLight = getBlockLight(cache, pos)
+    if currentLight > 0'u8:
+      e.blockLight.decreaseQueue.addLast(DecreaseEntry(pos: pos, level: currentLight))
+      setBlockLight(cache, pos, 0'u8)
+  if newLuminance > 0'u8:
+    setBlockLight(cache, pos, newLuminance)
+    if not containsOrIncl(e.blockLight.visited, posKey(pos)):
+      e.blockLight.queue.addLast(PropagationEntry(pos: pos, hasSkip: false, skipDirection: bdDown))
+
+proc runLightUpdates*(e: var LightEngine, cache: LightCache) =
+  ## `LightEngine::run_light_updates`
+  if e.blockLight.decreaseQueue.len > 0:
+    processDecreaseQueue(e.blockLight, cache)
+  if e.blockLight.queue.len > 0:
+    propagate(e.blockLight, cache)
+    e.blockLight.visited = initHashSet[int64]()
+  if e.skyLight.decreaseQueue.len > 0:
+    processDecreaseQueue(e.skyLight, cache)
+  if e.skyLight.queue.len > 0:
+    propagate(e.skyLight, cache)
+    e.skyLight.visited = initHashSet[int64]()

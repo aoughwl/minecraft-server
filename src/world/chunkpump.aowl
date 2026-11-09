@@ -1,0 +1,133 @@
+## Upstream's own region format: an unnamed NBT compound of zstd-compressed chunks.
+## Port of pumpkin-world/src/chunk/format/pump.rs
+##
+## `PumpData` is {x: int, z: int, chunks: {"<index>": [bytes]}}. Upstream's serde writes a `Vec<u8>`
+## as a list of bytes, and this keeps that shape on write; reading also takes a byte array.
+##
+## PARTIAL: pumpkin-world/src/chunk/format/pump.rs - a list of bytes is capped at `MaxArrayLength`
+## (512000) by src/nbt's reader, which upstream's serde reader is not. A chunk compressing to more
+## than that cannot be read back.
+
+import ../nbt/[tag, nbtbase, serializer, deserializer, nbtdoc]
+import chunkdata, chunkio, chunkcompress, nbtget, worldfs
+
+type
+  PumpEntry* = object
+    key*: string
+    data*: seq[byte]
+
+  PumpFile* = ref object
+    x*: int32
+    z*: int32
+    chunks*: seq[PumpEntry]  ## `BTreeMap<String, Vec<u8>>`, sorted by key.
+
+proc newPumpFile*(): PumpFile =
+  PumpFile(x: 0'i32, z: 0'i32, chunks: @[])
+
+proc putChunk(f: PumpFile, key: string, data: sink seq[byte]) =
+  var at = 0
+  while at < f.chunks.len:
+    if f.chunks[at].key == key:
+      f.chunks[at].data = data
+      return
+    if cmp(f.chunks[at].key, key) > 0:
+      break
+    inc at
+  f.chunks.add(PumpEntry(key: "", data: @[]))
+  var i = f.chunks.len - 1
+  while i > at:
+    let moved = f.chunks[i - 1]
+    f.chunks[i] = moved
+    dec i
+  f.chunks[at] = PumpEntry(key: key, data: data)
+
+proc euclid32(v: int32): int32 {.inline.} = v and 31'i32  # rem_euclid(32)
+
+proc pumpIndexKey(x, z: int32): string = $(int(euclid32(x)) + int(euclid32(z)) * 32)
+
+proc getChunkKeyPump*(x, z: int32): string =
+  ## `<PumpFile as ChunkSerializer>::get_chunk_key`
+  "r." & $(x shr 5) & "." & $(z shr 5) & ".pump"
+
+proc pumpToBytes*(f: PumpFile): seq[byte] =
+  var chunks = newCompound()
+  for e in f.chunks:
+    var list = newSeq[NbtTag](e.data.len)
+    for i in 0 ..< e.data.len:
+      list[i] = byteTag(cast[int8](e.data[i]))
+    put(chunks, e.key, listTag(list))
+  var root = newCompound()
+  put(root, "x", intTag(f.x))
+  put(root, "z", intTag(f.z))
+  put(root, "chunks", compoundTag(chunks))
+  writeUnnamed(newNbt("", root), nwmJava)
+
+proc writePump*(f: PumpFile, path: string): IoStatus =
+  ## `<PumpFile as ChunkSerializer>::write`
+  if writeFileBytes(path, pumpToBytes(f)): ioOk() else: ioErr("could not write " & path)
+
+proc readPump*(r: seq[byte]): (bool, PumpFile, ChunkReadingError) =
+  ## `<PumpFile as ChunkSerializer>::read`
+  let f = newPumpFile()
+  var reader = newNbtReader(nrmJava, r)
+  let doc = readUnnamed(reader)
+  if not doc.isOk:
+    return (false, f, readErr(creParsingError, doc.error.msg))
+  let (hasX, x) = nbtInt(doc.value.rootTag, "x")
+  let (hasZ, z) = nbtInt(doc.value.rootTag, "z")
+  let (hasChunks, chunks) = nbtCompound(doc.value.rootTag, "chunks")
+  if not (hasX and hasZ and hasChunks):
+    return (false, f, readErr(creParsingError, "missing x, z or chunks"))
+  f.x = x
+  f.z = z
+  for i in 0 ..< chunks.names.len:
+    let t = chunks.values[i]
+    var data = newSeq[byte](0)
+    if t.kind == ntkList:
+      for b in t.listVal:
+        if b.kind != ntkByte:
+          return (false, f, readErr(creParsingError, "chunk list element is not a byte"))
+        data.add(cast[byte](b.byteVal))
+    elif t.kind == ntkByteArray:
+      for b in t.byteArrayVal:
+        data.add(cast[byte](b))
+    else:
+      return (false, f, readErr(creParsingError, "chunk is not a byte sequence"))
+    putChunk(f, chunks.names[i], data)
+  (true, f, readErr(creIoError))
+
+proc updateChunkPump*(f: PumpFile, x, z: int32, raw: seq[byte]): ChunkWriteStatus =
+  ## `<PumpFile as ChunkSerializer>::update_chunk`
+  f.x = x shr 5
+  f.z = z shr 5
+  let compressed = zstdCompressBytes(raw)
+  if not compressed.ok:
+    return writeFail(cweCompression, compressed.msg)
+  putChunk(f, pumpIndexKey(x, z), compressed.data)
+  writeOk()
+
+proc getChunkPump*(f: PumpFile, x, z: int32): LoadedBytes =
+  ## One step of `<PumpFile as ChunkSerializer>::get_chunks`.
+  let key = pumpIndexKey(x, z)
+  for e in f.chunks:
+    if e.key == key:
+      let d = zstdDecompressBytes(e.data)
+      if d.ok:
+        return loadedOk(x, z, d.data)
+      return loadedError(x, z, readErr(creIoError, d.msg))
+  loadedMissing(x, z)
+
+proc toSerializer*(f: PumpFile): ChunkSerializer =
+  ChunkSerializer(
+    shouldWrite: proc(isWatched: bool): bool {.closure.} = true,
+    write: proc(path: string): IoStatus {.closure.} = writePump(f, path),
+    updateChunk: proc(x, z: int32, raw: seq[byte]): ChunkWriteStatus {.closure.} = updateChunkPump(f, x, z, raw),
+    getChunk: proc(x, z: int32): LoadedBytes {.closure.} = getChunkPump(f, x, z))
+
+proc pumpSerializerType*(): ChunkSerializerType =
+  ChunkSerializerType(
+    getChunkKey: proc(x, z: int32): string {.closure.} = getChunkKeyPump(x, z),
+    makeDefault: proc(): ChunkSerializer {.closure.} = toSerializer(newPumpFile()),
+    read: proc(r: seq[byte]): SerializerReadResult {.closure.} =
+      let (ok, f, e) = readPump(r)
+      if ok: serializerOk(toSerializer(f)) else: serializerErr(e))

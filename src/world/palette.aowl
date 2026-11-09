@@ -1,145 +1,446 @@
 ## Chunk-section paletted storage: the compact block/biome array format
 ## Minecraft uses per 16x16x16 section (blocks) or 4x4x4 (biomes).
-## Port of upstream/pumpkin-world/src/chunk/palette.rs's `HeterogeneousPaletteData`.
+## Port of pumpkin-world/src/chunk/palette.rs
 ##
-## Design decisions made porting this (flagged by an earlier pass as
-## deserving one, rather than a rushed line-by-line translation):
-## - Upstream is generic over `const DIM: usize` (16 for block sections, 4
-##   for biome sections) via `[[[V; DIM]; DIM]; DIM]`. aowlmony has no
-##   const-generic array types, and forcing generality here buys nothing -
-##   Minecraft only ever uses two concrete section shapes. So `dim` is a
-##   plain `int` field set at construction, and storage is a flat seq of
-##   length `dim*dim*dim` indexed by `(y*dim + z)*dim + x`, rather than
-##   upstream's nested fixed arrays - same access pattern, no fixed-size-
-##   array machinery needed.
-## - Upstream is also generic over `V: Hash + Eq + Copy` (a block-state id
-##   or biome id). Making the stored value type generic here hit real
-##   aowlmony friction (constrained generics need an explicit concept, and
-##   plain `[V]` on an object type didn't resolve `==`/`HasDefault` against
-##   an unconstrained `V`). Since both real uses (block-state id, biome id)
-##   are plain integers, this follows the same "fixed concrete size over
-##   forced generality" call already made for `dim`: the stored value type
-##   is a concrete `uint32`, wide enough for either id space.
-## - Left OUT for now: the Bedrock-specific `bedrock_palette_bits`/
-##   `bedrock_water_state`/`has_random_ticking_fluid` helpers (need
-##   `pumpkin_data::{BlockState, Fluid}`, not ported) and the on-disk
-##   bit-packed (de)serialization (`ChunkSectionBlockStates`/
-##   `ChunkSectionBiomes` codec, `format/anvil.rs`/`format/linear.rs`,
-##   ~3.5k lines combined) - this file is the in-memory data structure
-##   only, which is the part worth a deliberate design pass; the wire
-##   format is a separate, mechanical follow-up once this shape is settled.
+## Upstream is generic over `V` and `const DIM`. Here `dim` is a plain field and values are
+## a concrete `uint32`, wide enough for a block-state or biome id. Storage is a flat seq
+## indexed by `(y*dim + z)*dim + x`, the same order as upstream's nested cube, and
+## `PalettedContainer` covers both of upstream's `Homogeneous` and `Heterogeneous` forms.
+## `BlockPalette` and `BiomePalette` are the two dims of the one type, with the type-specific
+## procs prefixed `block`/`biome`.
+##
+## PARTIAL: pumpkin-world/src/chunk/palette.rs - `convertBeNetwork` takes the id mapper as a
+## parameter, because `BlockState::to_be_network_id` and `Biome::be_network_id` tables are not
+## generated yet.
+
+import blockstates
+
+const
+  BlockDiskMinBits* = 4'u8
+  BlockNetworkMinMapBits* = 4'u8
+  BlockNetworkMaxMapBits* = 8'u8
+  BlockNetworkMaxBitsU8* = 15'u8
+  BiomeDiskMinBits* = 0'u8
+  BiomeNetworkMinMapBits* = 1'u8
+  BiomeNetworkMaxMapBits* = 3'u8
+  BiomeNetworkMaxBitsU8* = 7'u8
+  BlockPaletteSize* = 16
+  BlockPaletteVolume* = 4096
+  BiomePaletteSize* = 4
+  BiomePaletteVolume* = 64
 
 type
   PaletteValue* = uint32
     ## Wide enough for either a block-state id or a biome id.
 
   PaletteStorageKind = enum
-    pskDense   ## One value per cell - used once the palette gets large.
-    pskIndexed ## One palette-index byte per cell - the common case.
+    pskHomogeneous  ## `PalettedContainer::Homogeneous`
+    pskDense        ## `PaletteStorage::Dense`
+    pskIndexed      ## `PaletteStorage::Indexed`
 
   PalettedContainer* = object
     dim: int                     ## Section edge length (16 for blocks, 4 for biomes).
     kind: PaletteStorageKind
     dense: seq[PaletteValue]     ## len == dim^3, valid when kind == pskDense.
     indices: seq[uint8]          ## len == dim^3, valid when kind == pskIndexed.
-    palette: seq[PaletteValue]
+    palette: seq[PaletteValue]   ## One entry when homogeneous.
     counts: seq[uint16]
+
+  BlockPalette* = PalettedContainer
+  BiomePalette* = PalettedContainer
+
+  ChunkSectionPaletteNbt* = object
+    ## `ChunkSectionBlockStates`/`ChunkSectionBiomes` from chunk/format/mod.rs. An empty
+    ## `data` is upstream's `None`.
+    data*: seq[int64]
+    palette*: seq[PaletteValue]
+
+  NetworkPaletteKind* = enum
+    npSingle    ## Bits per entry 0. `value` is the one id.
+    npIndirect  ## `values` lists the ids the data indexes into.
+    npDirect    ## The data holds global ids.
+
+  NetworkSerialization* = object
+    bitsPerEntry*: uint8
+    paletteKind*: NetworkPaletteKind
+    value*: uint32
+    values*: seq[uint32]
+    packedData*: seq[int64]
+
+  BeNetworkSerialization* = object
+    bitsPerEntry*: uint8
+    paletteKind*: NetworkPaletteKind
+    value*: uint32
+    values*: seq[uint32]
+    packedData*: seq[uint32]
 
 proc idx(dim, x, y, z: int): int {.inline.} =
   (y * dim + z) * dim + x
 
-proc newPalettedContainer*(dim: int, default: PaletteValue): PalettedContainer =
-  let n = dim * dim * dim
-  result = PalettedContainer(
-    dim: dim,
-    kind: pskIndexed,
-    dense: @[],
-    indices: newSeq[uint8](n),
-    palette: @[default],
-    counts: newSeq[uint16](1),
-  )
-  result.counts[0] = uint16(n)
+proc volumeOf(dim: int): int {.inline.} = dim * dim * dim
 
-proc paletteIndexOf(p: PalettedContainer, value: PaletteValue): int =
-  for i, v in p.palette:
-    if v == value:
+proc encompassingBits*(count: int): uint8 =
+  ## `pumpkin_util::encompassing_bits`.
+  if count == 1:
+    return 1'u8
+  var log = 0
+  while (1 shl (log + 1)) <= count:
+    inc log
+  let isPow = (1 shl log) == count
+  uint8(log + (if isPow: 0 else: 1))
+
+proc newHomogeneous(dim: int, value: PaletteValue): PalettedContainer =
+  result = PalettedContainer(dim: dim, kind: pskHomogeneous, dense: @[], indices: @[],
+    palette: @[value], counts: newSeq[uint16](1))
+  result.counts[0] = uint16(volumeOf(dim))
+
+proc newPalettedContainer*(dim: int, default: PaletteValue): PalettedContainer =
+  newHomogeneous(dim, default)
+
+proc newBlockPalette*(): BlockPalette =
+  ## `BlockPalette::default()`
+  newHomogeneous(16, 0'u32)
+
+proc newBiomePalette*(): BiomePalette =
+  ## `BiomePalette::default()`
+  newHomogeneous(4, 0'u32)
+
+proc useIndexed(dim, paletteLen: int): bool {.inline.} =
+  ## Upstream's `palette.len() <= 256 && size_of::<V>() > 1`: `BiomePalette`'s u8 is the case
+  ## where that size test fails.
+  paletteLen <= 256 and dim != 4
+
+proc paletteIndexOf(palette: seq[PaletteValue], value: PaletteValue): int =
+  for i in 0 ..< palette.len:
+    if palette[i] == value:
       return i
-  result = -1
+  -1
+
+proc fromCube(dim: int, cube: sink seq[PaletteValue]): PalettedContainer =
+  ## `PalettedContainer::from_cube`
+  var palette = newSeq[PaletteValue](0)
+  var counts = newSeq[uint16](0)
+  for val in cube:
+    let i = paletteIndexOf(palette, val)
+    if i >= 0:
+      inc counts[i]
+    else:
+      palette.add(val)
+      counts.add(1'u16)
+  if palette.len == 1:
+    return newHomogeneous(dim, palette[0])
+  if useIndexed(dim, palette.len):
+    var indices = newSeq[uint8](cube.len)
+    for i in 0 ..< cube.len:
+      indices[i] = uint8(paletteIndexOf(palette, cube[i]))
+    PalettedContainer(dim: dim, kind: pskIndexed, dense: @[], indices: indices, palette: palette, counts: counts)
+  else:
+    PalettedContainer(dim: dim, kind: pskDense, dense: cube, indices: @[], palette: palette, counts: counts)
+
+proc fromFn*(dim: int, valueAt: proc(x, y, z: int): PaletteValue {.closure.}): PalettedContainer =
+  ## `PalettedContainer::from_fn`
+  var cube = newSeq[PaletteValue](volumeOf(dim))
+  var i = 0
+  for y in 0 ..< dim:
+    for z in 0 ..< dim:
+      for x in 0 ..< dim:
+        cube[i] = valueAt(x, y, z)
+        inc i
+  fromCube(dim, cube)
+
+proc dimOf*(p: PalettedContainer): int {.inline.} = p.dim
 
 proc get*(p: PalettedContainer, x, y, z: int): PaletteValue =
-  let i = idx(p.dim, x, y, z)
   case p.kind
-  of pskDense: p.dense[i]
-  of pskIndexed: p.palette[p.indices[i]]
+  of pskHomogeneous: p.palette[0]
+  of pskDense: p.dense[idx(p.dim, x, y, z)]
+  of pskIndexed: p.palette[int(p.indices[idx(p.dim, x, y, z)])]
 
-proc upgradeToDense(p: var PalettedContainer) =
-  var dense = newSeq[PaletteValue](p.dim * p.dim * p.dim)
-  for i in 0 ..< dense.len:
-    dense[i] = p.palette[p.indices[i]]
-  p.dense = dense
-  p.indices = @[]
-  p.kind = pskDense
+proc swapRemove[T: HasDefault](s: var seq[T], i: int) =
+  let last = s.len - 1
+  if i != last:
+    s[i] = s[last]
+  s.setLen(last)
 
-proc set*(p: var PalettedContainer, x, y, z: int, value: PaletteValue): PaletteValue =
-  ## Sets the cell and returns the previous value, mirroring upstream's
-  ## `set`'s return of the original.
-  let i = idx(p.dim, x, y, z)
+proc setHeterogeneous(p: var PalettedContainer, x, y, z: int, value: PaletteValue): PaletteValue =
+  ## `HeterogeneousPaletteData::set`
   let original = p.get(x, y, z)
   if original == value:
     return original
+  let at = idx(p.dim, x, y, z)
+  let originalIndex = paletteIndexOf(p.palette, original)
 
-  # Upstream tracks palette/counts bookkeeping regardless of storage kind -
-  # Dense only skips the per-cell index array, not the palette occupancy
-  # counting (a first pass here wrongly special-cased Dense to skip this,
-  # which silently stopped the palette from ever shrinking back down once
-  # upgraded - caught by palettetest.aowl, not by "it compiles").
-  let originalIndex = paletteIndexOf(p, original)
-
-  var newIndex = paletteIndexOf(p, value)
-  if newIndex < 0:
+  var newIndex = paletteIndexOf(p.palette, value)
+  if newIndex >= 0:
+    inc p.counts[newIndex]
+  else:
     p.palette.add(value)
-    p.counts.add(0'u16)
+    p.counts.add(1'u16)
     newIndex = p.palette.len - 1
-  inc p.counts[newIndex]
 
+  var upgraded = false
   case p.kind
   of pskDense:
-    p.dense[i] = value
+    p.dense[at] = value
   of pskIndexed:
     if newIndex <= 255:
-      p.indices[i] = uint8(newIndex)
+      p.indices[at] = uint8(newIndex)
     else:
-      upgradeToDense(p)
-      p.dense[i] = value
+      var cube = newSeq[PaletteValue](p.indices.len)
+      for i in 0 ..< cube.len:
+        cube[i] = p.palette[int(p.indices[i])]
+      cube[at] = value
+      p.dense = cube
+      p.indices = @[]
+      p.kind = pskDense
+      upgraded = true
+  of pskHomogeneous:
+    discard
 
-  if originalIndex >= 0:
-    dec p.counts[originalIndex]
-    if p.counts[originalIndex] == 0:
-      let lastIndex = p.palette.len - 1
-      let lastValue = p.palette[lastIndex]
-      let lastCount = p.counts[lastIndex]
-      p.palette[originalIndex] = lastValue
-      p.counts[originalIndex] = lastCount
-      var newPalette = newSeq[PaletteValue](lastIndex)
-      var newCounts = newSeq[uint16](lastIndex)
-      for k in 0 ..< lastIndex:
-        newPalette[k] = p.palette[k]
-        newCounts[k] = p.counts[k]
-      p.palette = newPalette
-      p.counts = newCounts
-      if p.kind == pskIndexed:
-        for k in 0 ..< p.indices.len:
-          if int(p.indices[k]) == lastIndex:
-            p.indices[k] = uint8(originalIndex)
+  dec p.counts[originalIndex]
+  if p.counts[originalIndex] == 0:
+    let lastIndex = p.palette.len - 1
+    swapRemove(p.palette, originalIndex)
+    swapRemove(p.counts, originalIndex)
+    if not upgraded and p.kind == pskIndexed:
+      for i in 0 ..< p.indices.len:
+        if int(p.indices[i]) == lastIndex:
+          p.indices[i] = uint8(originalIndex)
+  original
 
-  result = original
+proc set*(p: var PalettedContainer, x, y, z: int, value: PaletteValue): PaletteValue =
+  ## Sets the cell and returns the previous value.
+  case p.kind
+  of pskHomogeneous:
+    let original = p.palette[0]
+    if value != original:
+      var cube = newSeq[PaletteValue](volumeOf(p.dim))
+      for i in 0 ..< cube.len:
+        cube[i] = original
+      cube[idx(p.dim, x, y, z)] = value
+      p = fromCube(p.dim, cube)
+    original
+  of pskDense, pskIndexed:
+    let original = setHeterogeneous(p, x, y, z, value)
+    if p.counts.len == 1:
+      p = newHomogeneous(p.dim, p.palette[0])
+    original
 
 proc paletteSize*(p: PalettedContainer): int {.inline.} =
   p.palette.len
 
 proc isSingleValued*(p: PalettedContainer): bool {.inline.} =
-  ## True when every cell holds the same value - the common case for a
-  ## freshly generated all-air/all-stone section, worth a fast path when
-  ## serializing (upstream's own palette format has a dedicated single-value
-  ## encoding for exactly this).
-  p.palette.len == 1
+  p.kind == pskHomogeneous
+
+proc isEmpty*(p: PalettedContainer): bool {.inline.} =
+  ## `PalettedContainer::is_empty`: homogeneous and equal to `V::default()`.
+  p.kind == pskHomogeneous and p.palette[0] == 0'u32
+
+proc cells*(p: PalettedContainer): seq[PaletteValue] =
+  ## `PalettedContainer::iter` collected, in y, z, x order.
+  let n = volumeOf(p.dim)
+  result = newSeq[PaletteValue](n)
+  case p.kind
+  of pskHomogeneous:
+    for i in 0 ..< n: result[i] = p.palette[0]
+  of pskDense:
+    for i in 0 ..< n: result[i] = p.dense[i]
+  of pskIndexed:
+    for i in 0 ..< n: result[i] = p.palette[int(p.indices[i])]
+
+proc bitsPerEntry*(p: PalettedContainer): uint8 =
+  ## `PalettedContainer::bits_per_entry`
+  if p.kind == pskHomogeneous: 0'u8 else: encompassingBits(p.counts.len)
+
+proc toPaletteAndPackedData*(p: PalettedContainer, bitsPerEntry: uint8): (seq[PaletteValue], seq[int64]) =
+  ## `PalettedContainer::to_palette_and_packed_data`
+  if p.kind == pskHomogeneous:
+    return (@[p.palette[0]], newSeq[int64](0))
+  let blocksPerI64 = 64 div int(bitsPerEntry)
+  let n = volumeOf(p.dim)
+  var packed = newSeq[int64]((n + blocksPerI64 - 1) div blocksPerI64)
+  for w in 0 ..< packed.len:
+    var acc = 0'u64
+    for i in 0 ..< blocksPerI64:
+      let at = w * blocksPerI64 + i
+      if at >= n:
+        break
+      let keyIndex =
+        if p.kind == pskIndexed: uint64(p.indices[at])
+        else: uint64(paletteIndexOf(p.palette, p.dense[at]))
+      acc = acc or (keyIndex shl (uint64(bitsPerEntry) * uint64(i)))
+    packed[w] = cast[int64](acc)
+  (p.palette, packed)
+
+proc fromPaletteAndPackedData*(dim: int, palette: openArray[PaletteValue], packedData: openArray[int64],
+                               minimumBitsPerEntry: uint8): PalettedContainer =
+  ## `PalettedContainer::from_palette_and_packed_data`. Upstream logs a warning and defaults on
+  ## an empty palette or an out-of-range index; this port has no logger here, so it only defaults.
+  if palette.len == 0:
+    return newHomogeneous(dim, 0'u32)
+  if palette.len == 1:
+    return newHomogeneous(dim, palette[0])
+
+  let bitsPerKey = max(encompassingBits(palette.len), minimumBitsPerEntry)
+  let indexMask = (1'u64 shl uint64(bitsPerKey)) - 1'u64
+  let keysPerI64 = 64 div int(bitsPerKey)
+  let n = volumeOf(dim)
+  var counts = newSeq[uint16](palette.len)
+  var ownPalette = newSeq[PaletteValue](palette.len)
+  for i in 0 ..< palette.len:
+    ownPalette[i] = palette[i]
+
+  var wordIndex = 0
+  var currentWord = if packedData.len > 0: cast[uint64](packedData[0]) else: 0'u64
+
+  if useIndexed(dim, palette.len):
+    var indices = newSeq[uint8](n)
+    for i in 0 ..< n:
+      let bitIndex = i mod keysPerI64
+      if bitIndex == 0 and i > 0:
+        inc wordIndex
+        currentWord = if wordIndex < packedData.len: cast[uint64](packedData[wordIndex]) else: 0'u64
+      let lookup = int((currentWord shr (uint64(bitIndex) * uint64(bitsPerKey))) and indexMask)
+      if lookup < palette.len:
+        indices[i] = uint8(lookup)
+        inc counts[lookup]
+    return PalettedContainer(dim: dim, kind: pskIndexed, dense: @[], indices: indices,
+      palette: ownPalette, counts: counts)
+
+  var cube = newSeq[PaletteValue](n)
+  for i in 0 ..< n:
+    let bitIndex = i mod keysPerI64
+    if bitIndex == 0 and i > 0:
+      inc wordIndex
+      currentWord = if wordIndex < packedData.len: cast[uint64](packedData[wordIndex]) else: 0'u64
+    let lookup = int((currentWord shr (uint64(bitIndex) * uint64(bitsPerKey))) and indexMask)
+    let value = if lookup < palette.len: palette[lookup] else: 0'u32
+    cube[i] = value
+    let pi = paletteIndexOf(ownPalette, value)
+    if pi >= 0:
+      inc counts[pi]
+  PalettedContainer(dim: dim, kind: pskDense, dense: cube, indices: @[], palette: ownPalette, counts: counts)
+
+proc convertNetworkWith(p: PalettedContainer, maxMapBits, minMapBits, maxBits: uint8): NetworkSerialization =
+  if p.kind == pskHomogeneous:
+    return NetworkSerialization(bitsPerEntry: 0'u8, paletteKind: npSingle, value: p.palette[0],
+      values: @[], packedData: @[])
+  let rawBits = encompassingBits(p.counts.len)
+  if rawBits > maxMapBits:
+    let valuesPerI64 = 64 div int(maxBits)
+    let n = volumeOf(p.dim)
+    var packed = newSeq[int64](0)
+    var current = 0
+    let c = cells(p)
+    while current < n:
+      var acc = 0'u64
+      for i in 0 ..< valuesPerI64:
+        if current + i < n:
+          acc = acc or (uint64(c[current + i]) shl (uint64(maxBits) * uint64(i)))
+      packed.add(cast[int64](acc))
+      current += valuesPerI64
+    NetworkSerialization(bitsPerEntry: maxBits, paletteKind: npDirect, value: 0'u32, values: @[], packedData: packed)
+  else:
+    let bits = max(rawBits, minMapBits)
+    let (palette, packed) = toPaletteAndPackedData(p, bits)
+    NetworkSerialization(bitsPerEntry: bits, paletteKind: npIndirect, value: 0'u32, values: palette, packedData: packed)
+
+proc biomeConvertNetwork*(p: BiomePalette): NetworkSerialization =
+  ## `BiomePalette::convert_network`
+  convertNetworkWith(p, BiomeNetworkMaxMapBits, BiomeNetworkMinMapBits, BiomeNetworkMaxBitsU8)
+
+proc blockConvertNetwork*(p: BlockPalette): NetworkSerialization =
+  ## `BlockPalette::convert_network`
+  convertNetworkWith(p, BlockNetworkMaxMapBits, BlockNetworkMinMapBits, BlockNetworkMaxBitsU8)
+
+proc convertBeNetworkCommon(p: PalettedContainer, mapId: proc(v: uint32): uint32 {.closure.},
+                            cellAt: proc(x, y, z: int): PaletteValue {.closure.}): BeNetworkSerialization =
+  if p.kind == pskHomogeneous:
+    return BeNetworkSerialization(bitsPerEntry: 0'u8, paletteKind: npSingle, value: mapId(p.palette[0]),
+      values: @[], packedData: @[])
+  let bits = encompassingBits(p.palette.len)
+  let perWord = 32 div int(bits)
+  var packed = newSeq[uint32](0)
+  var word = 0'u32
+  var inWord = 0
+  for x in 0 ..< 16:
+    for y in 0 ..< 16:
+      for z in 0 ..< 16:
+        let key = cellAt(x, y, z)
+        let keyIndex = paletteIndexOf(p.palette, key)
+        word = word or (uint32(keyIndex) shl (uint32(bits) * uint32(inWord)))
+        inc inWord
+        if inWord == perWord:
+          packed.add(word)
+          word = 0'u32
+          inWord = 0
+  if inWord > 0:
+    packed.add(word)
+  var mapped = newSeq[uint32](p.palette.len)
+  for i in 0 ..< p.palette.len:
+    mapped[i] = mapId(p.palette[i])
+  BeNetworkSerialization(bitsPerEntry: bits, paletteKind: npIndirect, value: 0'u32, values: mapped, packedData: packed)
+
+proc biomeConvertBeNetwork*(p: BiomePalette, mapId: proc(v: uint32): uint32 {.closure.}): BeNetworkSerialization =
+  ## `BiomePalette::convert_be_network`; `self.get(x / 4, z / 4, y / 4)`
+  convertBeNetworkCommon(p, mapId, proc(x, y, z: int): PaletteValue {.closure.} = p.get(x div 4, z div 4, y div 4))
+
+proc blockConvertBeNetwork*(p: BlockPalette, mapId: proc(v: uint32): uint32 {.closure.}): BeNetworkSerialization =
+  ## `BlockPalette::convert_be_network`; `data.get(x, z, y)`
+  convertBeNetworkCommon(p, mapId, proc(x, y, z: int): PaletteValue {.closure.} = p.get(x, z, y))
+
+proc hasOnlyAir*(p: BlockPalette): bool =
+  ## `BlockPalette::has_only_air`
+  for id in p.palette:
+    if not isAir(id):
+      return false
+  true
+
+proc saturatingAdd(a, b: uint16): uint16 {.inline.} =
+  let s = int(a) + int(b)
+  if s > 65535: 65535'u16 else: uint16(s)
+
+proc randomTickingCounts*(p: BlockPalette): (uint16, uint16) =
+  ## `BlockPalette::random_ticking_counts`
+  var blockCount = 0'u16
+  var fluidCount = 0'u16
+  for i in 0 ..< p.palette.len:
+    if hasRandomTicks(p.palette[i]):
+      blockCount = saturatingAdd(blockCount, p.counts[i])
+    if hasRandomTickingFluid(p.palette[i]):
+      fluidCount = saturatingAdd(fluidCount, p.counts[i])
+  (blockCount, fluidCount)
+
+proc nonAirBlockCount*(p: BlockPalette): uint16 =
+  ## `BlockPalette::non_air_block_count`
+  result = 0'u16
+  for i in 0 ..< p.palette.len:
+    if not isAir(p.palette[i]):
+      result += p.counts[i]
+
+proc liquidBlockCount*(p: BlockPalette): uint16 =
+  ## `BlockPalette::liquid_block_count`
+  result = 0'u16
+  for i in 0 ..< p.palette.len:
+    if isLiquid(p.palette[i]):
+      result += p.counts[i]
+
+proc blockFromDiskNbt*(nbt: ChunkSectionPaletteNbt): BlockPalette =
+  ## `BlockPalette::from_disk_nbt`
+  fromPaletteAndPackedData(16, nbt.palette, nbt.data, BlockDiskMinBits)
+
+proc biomeFromDiskNbt*(nbt: ChunkSectionPaletteNbt): BiomePalette =
+  ## `BiomePalette::from_disk_nbt`
+  fromPaletteAndPackedData(4, nbt.palette, nbt.data, BiomeDiskMinBits)
+
+proc blockToDiskNbt*(p: BlockPalette): ChunkSectionPaletteNbt =
+  ## `BlockPalette::to_disk_nbt`
+  let bits = max(bitsPerEntry(p), BlockDiskMinBits)
+  let (palette, packed) = toPaletteAndPackedData(p, bits)
+  ChunkSectionPaletteNbt(data: packed, palette: palette)
+
+proc biomeToDiskNbt*(p: BiomePalette): ChunkSectionPaletteNbt =
+  ## `BiomePalette::to_disk_nbt`
+  let bits = max(bitsPerEntry(p), BiomeDiskMinBits)
+  let (palette, packed) = toPaletteAndPackedData(p, bits)
+  ChunkSectionPaletteNbt(data: packed, palette: palette)

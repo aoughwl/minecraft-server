@@ -1,0 +1,598 @@
+## Port of pumpkin-protocol/src/java/client/play/recipe_book_add.rs
+##
+## `write_entry` takes either a crafting or a cooking recipe upstream, one of them always `None`, and returns
+## whether it wrote. Here those are `writeCraftingEntry` and `writeCookingEntry`, the former with a `written`
+## out parameter, because `tryWrite` needs a proc that returns ProtoWriteVoidResult. Upstream's
+## `CookingRecipeType` variants are `CookingRecipe.kind` in src/generated/recipes.aowl, and `Tagged`'s display
+## is empty, as it is upstream. A shaped recipe's pattern is walked by byte, whereas upstream's `chars()` walks
+## code points: its key symbols are ASCII, and `width` is the byte length on both sides.
+
+import std/[options, tables]
+import ../../../protobase, ../../../netcodec, ../../../varint
+import ../../../datacomponent
+import ../../../itemstackserializer
+import ../../../recipe
+import ../../../../generated/packet, ../../../../util/javaversion
+import ../../../../generated/item as itemdata
+import ../../../../generated/item_id_remap
+import ../../../../generated/recipes
+
+export recipe
+
+# Recipe Display type IDs
+const
+  RecipeDisplayShapeless = 0'i32
+  RecipeDisplayShaped = 1'i32
+  RecipeDisplayFurnace = 2'i32
+
+  # Slot Display type IDs
+  SlotDisplayEmpty = 0'i32
+  SlotDisplayAnyFuel = 1'i32
+  # 1.21.2 - 1.21.11
+  SlotDisplayItemLegacy = 2'i32
+  SlotDisplayItemStackLegacy = 3'i32
+  SlotDisplayCompositeLegacy = 7'i32
+  # 26.1+
+  SlotDisplayItem26_1 = 4'i32
+  SlotDisplayItemStack26_1 = 5'i32
+  SlotDisplayComposite26_1 = 10'i32
+
+  EntryFlagNotification = 0x01'u8
+  EntryFlagHighlight = 0x02'u8
+
+  # RecipeBookCategory IDs
+  CategoryCraftingBuilding = 0'i32
+  CategoryCraftingRedstone = 1'i32
+  CategoryCraftingEquipment = 2'i32
+  CategoryCraftingMisc = 3'i32
+  CategoryFurnaceFood = 4'i32
+  CategoryFurnaceBlocks = 5'i32
+  CategoryFurnaceMisc = 6'i32
+  CategoryBlastFurnaceBlocks = 7'i32
+  CategoryBlastFurnaceMisc = 8'i32
+  CategorySmokerFood = 9'i32
+  CategoryCampfire = 12'i32
+
+type
+  CRecipeBookAdd* = object
+    ## Adds recipes to the client's recipe book.
+    ## `replace = true` means the client replaces its current recipe list.
+    replace*: bool
+    dynamicRecipes*: seq[DynamicRecipe]
+
+  Stations = object
+    craftingTable, furnace, blastFurnace, smoker, campfire: Item
+
+proc buildItemIndex(): Table[string, int] =
+  result = initTable[string, int]()
+  for i in 0 ..< AllItems.len:
+    result[AllItems[i].name] = i
+
+let ItemIndex = buildItemIndex()
+
+proc fromRegistryKey(key: string; item: var Item): bool =
+  ## `Item::from_registry_key`, which is a generated `match` upstream. There are thousands of lookups per
+  ## packet, so this is an index rather than generated/item.aowl's `itemByName` scan.
+  let i = ItemIndex.getOrDefault(key, -1)
+  if i < 0:
+    return false
+  item = AllItems[i]
+  true
+
+proc stripMinecraft(id: string): string =
+  ## `id.strip_prefix("minecraft:").unwrap_or(id)`.
+  const Prefix = "minecraft:"
+  if id.len >= Prefix.len and id[0 ..< Prefix.len] == Prefix:
+    id[Prefix.len .. ^1]
+  else:
+    id
+
+proc itemIdVersioned(item: Item; v: JavaMinecraftVersion): int32 =
+  int32(remapItemIdForVersion(uint16(item.id), v))
+
+proc slotDisplayItemType(v: JavaMinecraftVersion): int32 =
+  if v >= jmvV26_1: SlotDisplayItem26_1 else: SlotDisplayItemLegacy
+
+proc slotDisplayCompositeType(v: JavaMinecraftVersion): int32 =
+  if v >= jmvV26_1: SlotDisplayComposite26_1 else: SlotDisplayCompositeLegacy
+
+proc slotDisplayItemStackType(v: JavaMinecraftVersion): int32 =
+  if v >= jmvV26_1: SlotDisplayItemStack26_1 else: SlotDisplayItemStackLegacy
+
+proc writeItemSlotDisplay(w: var NetWriter; item: Item; v: JavaMinecraftVersion) =
+  writeVarInt(w, newVarInt(slotDisplayItemType(v)))
+  writeVarInt(w, newVarInt(itemIdVersioned(item, v)))
+
+proc writeItemStackSlotDisplay(w: var NetWriter; item: Item; count: uint8; v: JavaMinecraftVersion): ProtoWriteVoidResult =
+  writeVarInt(w, newVarInt(slotDisplayItemStackType(v)))
+  let stack = ItemStackTemplateSerializer(stack: newItemStack(count, uint16(item.id), newSeq[PatchEntry]()))
+  stack.writeWithVersion(w, v)
+
+proc writeEmptySlotDisplay(w: var NetWriter) =
+  writeVarInt(w, newVarInt(SlotDisplayEmpty))
+
+proc writeAnyFuelSlotDisplay(w: var NetWriter) =
+  writeVarInt(w, newVarInt(SlotDisplayAnyFuel))
+
+proc writeSimpleSlotDisplay(w: var NetWriter; id: string; v: JavaMinecraftVersion) =
+  var item = Item()
+  if fromRegistryKey(stripMinecraft(id), item):
+    writeItemSlotDisplay(w, item, v)
+  else:
+    writeEmptySlotDisplay(w)
+
+proc writeOneOfSlotDisplay(w: var NetWriter; ids: seq[string]; v: JavaMinecraftVersion) =
+  var items: seq[Item] = @[]
+  for id in ids:
+    var item = Item()
+    if fromRegistryKey(stripMinecraft(id), item):
+      items.add(item)
+  if items.len == 0:
+    writeEmptySlotDisplay(w)
+  elif items.len == 1:
+    writeItemSlotDisplay(w, items[0], v)
+  else:
+    writeVarInt(w, newVarInt(slotDisplayCompositeType(v)))
+    writeVarInt(w, newVarInt(int32(items.len)))
+    for item in items:
+      writeItemSlotDisplay(w, item, v)
+
+proc writeSimpleHolderset(w: var NetWriter; id: string; v: JavaMinecraftVersion) =
+  var item = Item()
+  if fromRegistryKey(stripMinecraft(id), item):
+    # 1 item -> VarInt(1 + 1) = VarInt(2)
+    writeVarInt(w, newVarInt(2))
+    writeVarInt(w, newVarInt(itemIdVersioned(item, v)))
+  else:
+    # Item not found -> empty direct list
+    writeVarInt(w, newVarInt(1))
+
+proc writeOneOfHolderset(w: var NetWriter; ids: seq[string]; v: JavaMinecraftVersion) =
+  var items: seq[int32] = @[]
+  for id in ids:
+    var item = Item()
+    if fromRegistryKey(stripMinecraft(id), item):
+      items.add(itemIdVersioned(item, v))
+  # n items -> VarInt(n + 1)
+  writeVarInt(w, newVarInt(int32(items.len) + 1))
+  for id in items:
+    writeVarInt(w, newVarInt(id))
+
+proc writeIngredientSlotDisplay(w: var NetWriter; ingredient: RecipeIngredient; v: JavaMinecraftVersion) =
+  case ingredient.kind
+  of rikSimple:
+    writeSimpleSlotDisplay(w, ingredient.name, v)
+  of rikTagged:
+    # TODO: We lack registry access here to resolve tags to a TagSlotDisplay.
+    # Sending an empty slot prevents a client DecoderException, but will
+    # result in invisible ingredients in the recipe book.
+    writeEmptySlotDisplay(w)
+  of rikOneOf:
+    writeOneOfSlotDisplay(w, ingredient.options, v)
+
+proc writeIngredientHolderset(w: var NetWriter; ingredient: RecipeIngredient; v: JavaMinecraftVersion) =
+  ## Write a single Ingredient as a `HolderSet`<Item> for craftingRequirements.
+  ##
+  ## Vanilla wire format for `ByteBufCodecs.holderSet(Registries.ITEM)`:
+  ##   VarInt(0)     -> named tag reference (followed by `ResourceLocation`)
+  ##   VarInt(n + 1) -> direct list of n item IDs
+  case ingredient.kind
+  of rikSimple:
+    writeSimpleHolderset(w, ingredient.name, v)
+  of rikTagged:
+    # No current recipes use Tagged; write empty direct list.
+    writeVarInt(w, newVarInt(1))
+  of rikOneOf:
+    writeOneOfHolderset(w, ingredient.options, v)
+
+proc writeCraftingRequirements(w: var NetWriter; slots: seq[RecipeIngredient]; v: JavaMinecraftVersion) =
+  ## Write the `craftingRequirements: Option<List<Ingredient>>` field (present). Every caller upstream
+  ## passes `Some` only, so there is no `None` slot here.
+  writeBool(w, true)  # present
+  writeVarInt(w, newVarInt(int32(slots.len)))
+  for slot in slots:
+    writeIngredientHolderset(w, slot, v)
+
+proc writeResultSlotDisplay(w: var NetWriter; res: RecipeResult; v: JavaMinecraftVersion): ProtoWriteVoidResult =
+  var item = Item()
+  if fromRegistryKey(stripMinecraft(res.id), item):
+    tryWrite writeItemStackSlotDisplay(w, item, res.count, v)
+  else:
+    writeEmptySlotDisplay(w)
+  writeOkVoid()
+
+proc writeOptionalVarInt(w: var NetWriter; value: Option[int32]): ProtoWriteVoidResult =
+  var encoded = 0'i32
+  if value.isSome:
+    let n = value.unsafeGet
+    if n == int32.high:
+      return writeErrVoid(messageWrite("group id " & $n & " overflow"))
+    encoded = n + 1
+  writeVarInt(w, newVarInt(encoded))
+  writeOkVoid()
+
+proc entryFlags(replace, notification, highlight: bool): uint8 =
+  if replace:
+    return 0'u8
+  result = 0'u8
+  if notification:
+    result = result or EntryFlagNotification
+  if highlight:
+    result = result or EntryFlagHighlight
+
+proc craftingCategory(cat: RecipeCategory): int32 =
+  case cat
+  of rcEquipment: CategoryCraftingEquipment
+  of rcBuilding, rcBlocks: CategoryCraftingBuilding
+  of rcRedstone: CategoryCraftingRedstone
+  of rcFood, rcMisc: CategoryCraftingMisc
+
+proc shapedIngredient(recipe: ShapedRecipe; ch: char; ingredient: var RecipeIngredient): bool =
+  ## `key.iter().find(|(k, _)| *k == ch)`.
+  for i in 0 ..< recipe.keyChars.len:
+    if recipe.keyChars[i] == ch:
+      ingredient = recipe.keyIngredients[i]
+      return true
+  false
+
+proc writeCraftingEntry(w: var NetWriter; displayId: int32; v: JavaMinecraftVersion; groupId: Option[int32];
+    flags: uint8; craftingTable: Item; recipe: CraftingRecipeTypes; written: var bool): ProtoWriteVoidResult =
+  ## Write a single `RecipeDisplayEntry` + flags byte. `written` is false if skipped (special recipe).
+  written = true
+  case recipe.kind
+  of crkCraftingShaped:
+    let shaped = recipe.shaped
+    # Compute width and height from pattern
+    let height = int32(shaped.pattern.len)
+    let width = if shaped.pattern.len > 0: int32(shaped.pattern[0].len) else: 0'i32
+
+    # RecipeDisplayId
+    writeVarInt(w, newVarInt(displayId))
+    # RecipeDisplay type = shaped (1)
+    writeVarInt(w, newVarInt(RecipeDisplayShaped))
+    # width, height
+    writeVarInt(w, newVarInt(width))
+    writeVarInt(w, newVarInt(height))
+    # ingredients: flat list, row by row
+    writeVarInt(w, newVarInt(width * height))
+    for row in shaped.pattern:
+      for ch in row:
+        var ingredient = RecipeIngredient(kind: rikSimple, name: "")
+        if ch == ' ':
+          writeEmptySlotDisplay(w)
+        elif shapedIngredient(shaped, ch, ingredient):
+          writeIngredientSlotDisplay(w, ingredient, v)
+        else:
+          writeEmptySlotDisplay(w)
+    # result
+    tryWrite writeResultSlotDisplay(w, shaped.result, v)
+    # craftingStation
+    writeItemSlotDisplay(w, craftingTable, v)
+    # group: OptionalVarInt
+    tryWrite writeOptionalVarInt(w, groupId)
+    # category
+    writeVarInt(w, newVarInt(craftingCategory(shaped.category)))
+    # craftingRequirements: one HolderSet per non-empty grid slot
+    # (Ingredient cannot be empty, so empty slots must be excluded)
+    var slots: seq[RecipeIngredient] = @[]
+    for row in shaped.pattern:
+      for ch in row:
+        var ingredient = RecipeIngredient(kind: rikSimple, name: "")
+        if ch != ' ' and shapedIngredient(shaped, ch, ingredient):
+          slots.add(ingredient)
+    writeCraftingRequirements(w, slots, v)
+    writeU8(w, flags)
+  of crkCraftingShapeless:
+    let shapeless = recipe.shapeless
+    # RecipeDisplayId
+    writeVarInt(w, newVarInt(displayId))
+    # RecipeDisplay type = shapeless (0)
+    writeVarInt(w, newVarInt(RecipeDisplayShapeless))
+    # ingredients list
+    writeVarInt(w, newVarInt(int32(shapeless.ingredients.len)))
+    for ing in shapeless.ingredients:
+      writeIngredientSlotDisplay(w, ing, v)
+    # result
+    tryWrite writeResultSlotDisplay(w, shapeless.result, v)
+    # craftingStation
+    writeItemSlotDisplay(w, craftingTable, v)
+    # group: OptionalVarInt
+    tryWrite writeOptionalVarInt(w, groupId)
+    # category
+    writeVarInt(w, newVarInt(craftingCategory(shapeless.category)))
+    # craftingRequirements: one HolderSet per ingredient
+    writeCraftingRequirements(w, shapeless.ingredients, v)
+    writeU8(w, flags)
+  of crkCraftingTransmute:
+    let transmute = recipe.transmute
+    # Transmute shown as shapeless with 2 ingredients
+    writeVarInt(w, newVarInt(displayId))
+    writeVarInt(w, newVarInt(RecipeDisplayShapeless))
+    # 2 ingredients
+    writeVarInt(w, newVarInt(2))
+    writeIngredientSlotDisplay(w, transmute.input, v)
+    writeIngredientSlotDisplay(w, transmute.material, v)
+    tryWrite writeResultSlotDisplay(w, transmute.result, v)
+    writeItemSlotDisplay(w, craftingTable, v)
+    tryWrite writeOptionalVarInt(w, groupId)
+    writeVarInt(w, newVarInt(craftingCategory(transmute.category)))
+    # craftingRequirements: input + material
+    writeCraftingRequirements(w, @[transmute.input, transmute.material], v)
+    writeU8(w, flags)
+  of crkCraftingDecoratedPot:
+    # Skip special/decorated_pot recipes as they have no useful display
+    written = false
+  writeOkVoid()
+
+proc writeCookingEntry(w: var NetWriter; displayId: int32; v: JavaMinecraftVersion; groupId: Option[int32];
+    flags: uint8; stations: Stations; cooking: CookingRecipe; bookCategory: int32): ProtoWriteVoidResult =
+  let station = case cooking.kind
+    of crkSmelting: stations.furnace
+    of crkBlasting: stations.blastFurnace
+    of crkSmoking: stations.smoker
+    of crkCampfireCooking: stations.campfire
+
+  writeVarInt(w, newVarInt(displayId))
+  # RecipeDisplay type = furnace (2)
+  writeVarInt(w, newVarInt(RecipeDisplayFurnace))
+  # ingredient
+  writeIngredientSlotDisplay(w, cooking.ingredient, v)
+  # fuel: AnyFuel
+  writeAnyFuelSlotDisplay(w)
+  # result
+  tryWrite writeResultSlotDisplay(w, cooking.result, v)
+  # craftingStation
+  writeItemSlotDisplay(w, station, v)
+  # duration
+  writeVarInt(w, newVarInt(cooking.cookingTime))
+  # experience
+  writeF32Be(w, cooking.experience)
+  # group: OptionalVarInt
+  tryWrite writeOptionalVarInt(w, groupId)
+  # category
+  writeVarInt(w, newVarInt(bookCategory))
+  # craftingRequirements: the single ingredient
+  writeCraftingRequirements(w, @[cooking.ingredient], v)
+  writeU8(w, flags)
+  writeOkVoid()
+
+proc resolveGroupIdOwned(groupIds: var Table[string, int32]; nextGroupId: var int32;
+    group: Option[string]): Option[int32] =
+  if group.isNone:
+    return none[int32]()
+  let key = group.unsafeGet
+  let existing = groupIds.getOrDefault(key, -1'i32)
+  if existing >= 0'i32:
+    return some(existing)
+  let id = nextGroupId
+  nextGroupId += 1
+  groupIds[key] = id
+  some(id)
+
+proc groupOf(hasGroup: bool; group: string): Option[string] =
+  if hasGroup: some(group) else: none[string]()
+
+proc smeltingBookCategory(category: RecipeCategory): int32 =
+  case category
+  of rcFood: CategoryFurnaceFood
+  of rcBlocks: CategoryFurnaceBlocks
+  else: CategoryFurnaceMisc
+
+proc blastingBookCategory(category: RecipeCategory): int32 =
+  case category
+  of rcBlocks: CategoryBlastFurnaceBlocks
+  else: CategoryBlastFurnaceMisc
+
+# --- dynamic recipes ---------------------------------------------------------
+
+proc writeDynamicIngredientSlotDisplay(w: var NetWriter; ingredient: OwnedRecipeIngredient; v: JavaMinecraftVersion) =
+  case ingredient.kind
+  of oriSimple:
+    writeSimpleSlotDisplay(w, ingredient.id, v)
+  of oriTagged:
+    writeEmptySlotDisplay(w)
+  of oriOneOf:
+    writeOneOfSlotDisplay(w, ingredient.ids, v)
+
+proc writeDynamicIngredientHolderset(w: var NetWriter; ingredient: OwnedRecipeIngredient; v: JavaMinecraftVersion) =
+  case ingredient.kind
+  of oriSimple:
+    writeSimpleHolderset(w, ingredient.id, v)
+  of oriTagged:
+    writeVarInt(w, newVarInt(1))
+  of oriOneOf:
+    writeOneOfHolderset(w, ingredient.ids, v)
+
+proc writeDynamicResultSlotDisplay(w: var NetWriter; res: OwnedRecipeResult; v: JavaMinecraftVersion): ProtoWriteVoidResult =
+  var item = Item()
+  if fromRegistryKey(stripMinecraft(res.itemId), item):
+    tryWrite writeItemStackSlotDisplay(w, item, res.count, v)
+  else:
+    writeEmptySlotDisplay(w)
+  writeOkVoid()
+
+proc dynamicIngredient(recipe: OwnedCraftingRecipe; ch: char; ingredient: var OwnedRecipeIngredient): bool =
+  for entry in recipe.key:
+    if entry.symbol == ch:
+      ingredient = entry.ingredient
+      return true
+  false
+
+proc writeDynamicCraftingEntry(w: var NetWriter; displayId: int32; v: JavaMinecraftVersion; groupId: Option[int32];
+    flags: uint8; craftingTable: Item; recipe: OwnedCraftingRecipe): ProtoWriteVoidResult =
+  case recipe.kind
+  of ocrShaped:
+    let height = int32(recipe.pattern.len)
+    let width = if recipe.pattern.len > 0: int32(recipe.pattern[0].len) else: 0'i32
+
+    writeVarInt(w, newVarInt(displayId))
+    writeVarInt(w, newVarInt(RecipeDisplayShaped))
+    writeVarInt(w, newVarInt(width))
+    writeVarInt(w, newVarInt(height))
+    writeVarInt(w, newVarInt(width * height))
+    for row in recipe.pattern:
+      for ch in row:
+        var ingredient = OwnedRecipeIngredient(kind: oriSimple, id: "")
+        if ch == ' ':
+          writeEmptySlotDisplay(w)
+        elif dynamicIngredient(recipe, ch, ingredient):
+          writeDynamicIngredientSlotDisplay(w, ingredient, v)
+        else:
+          writeEmptySlotDisplay(w)
+    tryWrite writeDynamicResultSlotDisplay(w, recipe.result, v)
+    writeItemSlotDisplay(w, craftingTable, v)
+    tryWrite writeOptionalVarInt(w, groupId)
+    writeVarInt(w, newVarInt(craftingCategory(recipe.category)))
+
+    writeBool(w, true)  # present
+    var nonEmptySlots = 0'i32
+    for row in recipe.pattern:
+      for ch in row:
+        if ch != ' ':
+          nonEmptySlots += 1
+    writeVarInt(w, newVarInt(nonEmptySlots))
+    for row in recipe.pattern:
+      for ch in row:
+        if ch != ' ':
+          # Unlike the static recipes, a symbol missing from the key still counts: an empty direct list.
+          var ingredient = OwnedRecipeIngredient(kind: oriSimple, id: "")
+          if dynamicIngredient(recipe, ch, ingredient):
+            writeDynamicIngredientHolderset(w, ingredient, v)
+          else:
+            writeVarInt(w, newVarInt(1))
+    writeU8(w, flags)
+  of ocrShapeless:
+    writeVarInt(w, newVarInt(displayId))
+    writeVarInt(w, newVarInt(RecipeDisplayShapeless))
+    writeVarInt(w, newVarInt(int32(recipe.ingredients.len)))
+    for ing in recipe.ingredients:
+      writeDynamicIngredientSlotDisplay(w, ing, v)
+    tryWrite writeDynamicResultSlotDisplay(w, recipe.result, v)
+    writeItemSlotDisplay(w, craftingTable, v)
+    tryWrite writeOptionalVarInt(w, groupId)
+    writeVarInt(w, newVarInt(craftingCategory(recipe.category)))
+
+    writeBool(w, true)
+    writeVarInt(w, newVarInt(int32(recipe.ingredients.len)))
+    for ing in recipe.ingredients:
+      writeDynamicIngredientHolderset(w, ing, v)
+    writeU8(w, flags)
+  writeOkVoid()
+
+# Upstream writes this entry's craftingRequirements as a bare holder set, with no present flag or count, unlike
+# the static writeCookingEntry. Ported as written; see recipebooktest.
+proc writeDynamicCookingEntry(w: var NetWriter; displayId: int32; v: JavaMinecraftVersion; groupId: Option[int32];
+    flags: uint8; station: Item; cooking: OwnedCookingRecipe; bookCategory: int32): ProtoWriteVoidResult =
+  writeVarInt(w, newVarInt(displayId))
+  writeVarInt(w, newVarInt(RecipeDisplayFurnace))
+  writeDynamicIngredientSlotDisplay(w, cooking.ingredient, v)
+  writeAnyFuelSlotDisplay(w)
+  tryWrite writeDynamicResultSlotDisplay(w, cooking.result, v)
+  writeItemSlotDisplay(w, station, v)
+  writeVarInt(w, newVarInt(cooking.cookingTime))
+  writeF32Be(w, cooking.experience)
+  tryWrite writeOptionalVarInt(w, groupId)
+  writeVarInt(w, newVarInt(bookCategory))
+  writeDynamicIngredientHolderset(w, cooking.ingredient, v)
+  writeU8(w, flags)
+  writeOkVoid()
+
+# --- the packet --------------------------------------------------------------
+
+proc toId*(_: typedesc[CRecipeBookAdd]; v: JavaMinecraftVersion): int32 =
+  CB_PLAY_RECIPE_BOOK_ADD.toId(v)
+
+proc writePacket*(p: CRecipeBookAdd; w: var NetWriter; v: JavaMinecraftVersion): ProtoWriteVoidResult =
+  # Station items (these IDs are stable across all versions we support)
+  var stations = Stations()
+  if not fromRegistryKey("crafting_table", stations.craftingTable):
+    return writeErrVoid(messageWrite("crafting_table item must exist"))
+  if not fromRegistryKey("furnace", stations.furnace):
+    return writeErrVoid(messageWrite("furnace item must exist"))
+  if not fromRegistryKey("blast_furnace", stations.blastFurnace):
+    return writeErrVoid(messageWrite("blast_furnace item must exist"))
+  if not fromRegistryKey("smoker", stations.smoker):
+    return writeErrVoid(messageWrite("smoker item must exist"))
+  if not fromRegistryKey("campfire", stations.campfire):
+    return writeErrVoid(messageWrite("campfire item must exist"))
+
+  # First pass - count and skip CraftingSpecial and CraftingDecoratedPot entries.
+  var craftingCount = 0
+  for r in RECIPES_CRAFTING:
+    if r.kind != crkCraftingDecoratedPot:
+      inc craftingCount
+  let dynamicCount = p.dynamicRecipes.len
+  let total = craftingCount + RECIPES_COOKING.len + dynamicCount
+
+  # Entry count (VarInt)
+  writeVarInt(w, newVarInt(int32(total)))
+
+  var displayId = 0'i32
+  var groupIds = initTable[string, int32]()
+  var nextGroupId = 0'i32
+  let highlight = not p.replace
+
+  # Write crafting recipes
+  for recipe in RECIPES_CRAFTING:
+    var group = none[string]()
+    var notification = true
+    case recipe.kind
+    of crkCraftingShaped:
+      group = groupOf(recipe.shaped.hasGroup, recipe.shaped.group)
+      notification = recipe.shaped.showNotification
+    of crkCraftingShapeless:
+      group = groupOf(recipe.shapeless.hasGroup, recipe.shapeless.group)
+    of crkCraftingTransmute:
+      group = groupOf(recipe.transmute.hasGroup, recipe.transmute.group)
+    of crkCraftingDecoratedPot:
+      discard
+    let groupId = resolveGroupIdOwned(groupIds, nextGroupId, group)
+    let flags = entryFlags(p.replace, notification, highlight)
+    var written = false
+    tryWrite writeCraftingEntry(w, displayId, v, groupId, flags, stations.craftingTable, recipe, written)
+    if written:
+      displayId += 1
+
+  # Write cooking recipes
+  for recipe in RECIPES_COOKING:
+    let bookCategory = case recipe.kind
+      of crkSmelting: smeltingBookCategory(recipe.category)
+      of crkBlasting: blastingBookCategory(recipe.category)
+      of crkSmoking: CategorySmokerFood
+      of crkCampfireCooking: CategoryCampfire
+    let groupId = resolveGroupIdOwned(groupIds, nextGroupId, groupOf(recipe.hasGroup, recipe.group))
+    let flags = entryFlags(p.replace, true, highlight)
+    tryWrite writeCookingEntry(w, displayId, v, groupId, flags, stations, recipe, bookCategory)
+    displayId += 1
+
+  # Write dynamic recipes
+  for recipe in p.dynamicRecipes:
+    case recipe.kind
+    of drCrafting:
+      let crafting = recipe.crafting
+      let notification = case crafting.kind
+        of ocrShaped: crafting.showNotification
+        of ocrShapeless: true
+      let flags = entryFlags(p.replace, notification, highlight)
+      let groupId = resolveGroupIdOwned(groupIds, nextGroupId, crafting.group)
+      tryWrite writeDynamicCraftingEntry(w, displayId, v, groupId, flags, stations.craftingTable, crafting)
+    of drCooking:
+      let cooking = recipe.cooking
+      let bookCategory = case cooking.kind
+        of ockSmelting: smeltingBookCategory(cooking.recipe.category)
+        of ockBlasting: blastingBookCategory(cooking.recipe.category)
+        of ockSmoking: CategorySmokerFood
+        of ockCampfireCooking: CategoryCampfire
+      let station = case cooking.kind
+        of ockSmelting: stations.furnace
+        of ockBlasting: stations.blastFurnace
+        of ockSmoking: stations.smoker
+        of ockCampfireCooking: stations.campfire
+      let groupId = resolveGroupIdOwned(groupIds, nextGroupId, cooking.recipe.group)
+      let flags = entryFlags(p.replace, true, highlight)
+      tryWrite writeDynamicCookingEntry(w, displayId, v, groupId, flags, station, cooking.recipe, bookCategory)
+    displayId += 1
+
+  # replace flag
+  writeBool(w, p.replace)
+  writeOkVoid()

@@ -99,15 +99,13 @@ block:
   # An untouched slot must round-trip as absent, not garbage.
   assert not parsed[getChunkIndex(1, 1)].present
 
-  # sectorOffset < 2 is reserved for the header itself - must decode as
-  # absent even if a location word happens to be nonzero there (the same
-  # guard upstream's real reader applies).
+  # Upstream's `read`: only a zero offset or a zero count is absent.
   var badLoc = newSeq[byte](2 * SectorBytes)
-  # location word for slot 0: offset=1 (invalid), count=1
-  badLoc[0] = 0; badLoc[1] = 0; badLoc[2] = 1; badLoc[3] = 1
+  badLoc[0] = 0; badLoc[1] = 0; badLoc[2] = 0; badLoc[3] = 1  # offset 0, count 1
+  badLoc[4] = 0; badLoc[5] = 0; badLoc[6] = 2; badLoc[7] = 0  # offset 2, count 0
   let badParsed = parseRegionHeader(badLoc)
   assert badParsed.isOk
-  assert not badParsed.value[0].present
+  assert not badParsed.value[0].present and not badParsed.value[1].present
 
   let wrongSizeRes = parseRegionHeader(header[0 ..< 100])
   assert not wrongSizeRes.isOk
@@ -129,3 +127,93 @@ block:
 echo "sector math: OK"
 
 echo "all anvil-format round-trip checks passed"
+
+# --- Upstream's `custom_*_compression_*` vectors, the sector leapfrog, and exact file bytes -----
+
+import std/[envvars, cmdline]
+import ../config/chunk as chunkconfig
+import chunkdata, chunkio, chunkcompress, worldfs
+
+proc inPlaceConfig(): AnvilChunkConfig =
+  AnvilChunkConfig(compression: ChunkCompression(algorithm: compZLib, level: 6'u32), writeInPlace: true)
+
+proc scratchDir(): string =
+  result = getEnv("WORLDTEST_DIR")
+  if result.len == 0:
+    result = parentDirW(paramStr(0)) & "/chunkformats_scratch"
+  discard createDirAllW(result)
+
+proc testCustomCompression() =
+  # custom_compression_returns_unknown_compression_error and its decompress twin.
+  let (ok1, _, e1) = compressData(ckCustom, [1'u8, 2'u8], 6'u32)
+  assert not ok1 and e1.kind == ceUnknownCompression
+  let (ok2, _, e2) = decompressData(ckCustom, [1'u8, 2'u8])
+  assert not ok2 and e2.kind == ceUnknownCompression
+
+proc testSwapBranch() =
+  # Drive the leapfrog in `update_chunk` directly and check the sector arithmetic.
+  let cfg = inPlaceConfig()
+  let f = newAnvilChunkFile()
+  proc payload(n: int): seq[byte] =
+    result = newSeq[byte](n)
+    var v = 88172645463325252'u64
+    for i in 0 ..< n:
+      v = v xor (v shl 13)
+      v = v xor (v shr 7)
+      v = v xor (v shl 17)
+      result[i] = byte(v and 0xFF'u64)
+  assert updateChunkBytes(f, 0'i32, 0'i32, payload(5000), cfg).ok    # ~2 sectors at offset 2
+  assert updateChunkBytes(f, 1'i32, 0'i32, payload(5000), cfg).ok    # ~2 sectors at offset 4
+  assert updateChunkBytes(f, 2'i32, 0'i32, payload(5000), cfg).ok    # ~2 sectors at offset 6
+  assert f.chunksData[0].fileSectorOffset == 2'u32
+  assert f.chunksData[1].fileSectorOffset == 4'u32
+  assert f.chunksData[2].fileSectorOffset == 6'u32
+  assert f.endSector == 8'u32
+  # Same size again stays in place.
+  assert updateChunkBytes(f, 1'i32, 0'i32, payload(5100), cfg).ok
+  assert f.chunksData[1].fileSectorOffset == 4'u32
+  # Chunk 0 grows to four sectors. Walking back from the end, the last chunk has the old size, so
+  # chunk 2 swaps into chunk 0's old spot and chunk 0 takes offset 6, growing the file.
+  assert updateChunkBytes(f, 0'i32, 0'i32, payload(14000), cfg).ok
+  assert f.chunksData[2].fileSectorOffset == 2'u32
+  assert f.chunksData[0].fileSectorOffset == 6'u32
+  assert sectorCount(f.chunksData[0].serializedData) == 4'u32
+  assert f.endSector == 10'u32
+
+proc testRegionHeaderBytes(base: string) =
+  # Known bytes for a one-chunk region: location (2 shl 8) or 1, then the frame.
+  let cfg = AnvilChunkConfig(compression: ChunkCompression(algorithm: compZLib, level: 6'u32), writeInPlace: false)
+  let f = newAnvilChunkFile()
+  let raw = [0x0a'u8, 0, 0, 0]
+  assert updateChunkBytes(f, 1'i32, 0'i32, raw, cfg).ok
+  let path = base & "/one.mca"
+  assert writeRegion(f, path).ok
+  let (st, bytes) = readFileBytes(path)
+  assert st == rsOk
+  assert bytes.len == 3 * 4096
+  assert bytes[4] == 0'u8 and bytes[5] == 0'u8 and bytes[6] == 2'u8 and bytes[7] == 1'u8
+  assert bytes[0] == 0'u8 and bytes[3] == 0'u8
+  let frameLen = (int(bytes[8192]) shl 24) or (int(bytes[8193]) shl 16) or (int(bytes[8194]) shl 8) or int(bytes[8195])
+  assert bytes[8196] == 2'u8
+  let body = zlibDecompress(toOpenArray(bytes, 8197, 8197 + frameLen - 2))
+  assert body.ok and body.data == @[0x0a'u8, 0, 0, 0]
+  # The padding is zero.
+  assert bytes[bytes.len - 1] == 0'u8
+  let (ok, back, err) = readRegion(bytes)
+  assert ok, $err
+  assert back.endSector == 3'u32
+  assert back.chunksData[1].present and not back.chunksData[0].present
+  assert back.chunksData[1].fileSectorOffset == 2'u32
+  # Too short is an invalid header.
+  let (shortOk, _, shortErr) = readRegion(newSeq[byte](100))
+  assert not shortOk and shortErr.kind == creInvalidHeader
+  # A location past the end of the file is a parse error.
+  var trunc = bytes
+  trunc.setLen(8192)
+  let (truncOk, _, truncErr) = readRegion(trunc)
+  assert not truncOk and truncErr.kind == creParsingError
+
+testCustomCompression()
+testSwapBranch()
+testRegionHeaderBytes(scratchDir())
+echo "anvilformat: region file checks passed"

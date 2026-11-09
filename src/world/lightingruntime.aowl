@@ -1,0 +1,318 @@
+## Runtime lighting updates when a block changes. Port of pumpkin-world/src/lighting/runtime.rs
+##
+## Upstream's functions take `&Arc<Level>`. level.aowl imports this module, so the Level calls go
+## through `LightLevelAccess`, a vtable it fills in. The `SegQueue`s are FIFO `Deque`s.
+
+{.feature: "lenientnils".}
+
+import std/deques
+import ../config/lighting
+import blockstates, chunkdata, lightingengine, tick
+
+type
+  LightLevelAccess* = ref object
+    lightingConfig*: LightingEngineConfig
+    getBlockState*: proc(pos: BlockPos): BlockStateId {.closure.}
+    isChunkLoaded*: proc(chunkX, chunkZ: int32): bool {.closure.}
+    chunkAt*: proc(chunkX, chunkZ: int32): ChunkData {.closure.}  ## nil when unloaded
+
+  QueuedLight = object
+    pos: BlockPos
+    level: uint8
+
+  DynamicLightEngine* = object
+    blockDecrease: Deque[QueuedLight]
+    blockIncrease: Deque[QueuedLight]
+    skyDecrease: Deque[QueuedLight]
+    skyIncrease: Deque[QueuedLight]
+
+# See the same anchor in chunkio.aowl: this module only declares closure fields otherwise.
+proc closureLiftAnchor*(): proc(): bool {.closure.} =
+  proc(): bool {.closure.} = true
+
+proc newDynamicLightEngine*(): DynamicLightEngine =
+  DynamicLightEngine(blockDecrease: initDeque[QueuedLight](), blockIncrease: initDeque[QueuedLight](),
+    skyDecrease: initDeque[QueuedLight](), skyIncrease: initDeque[QueuedLight]())
+
+proc stateAt(level: LightLevelAccess, pos: BlockPos): BlockStateId {.inline.} =
+  ## Through a local; see the note in chunkio.aowl.
+  let f = level.getBlockState
+  f(pos)
+
+proc loadedAt(level: LightLevelAccess, chunkX, chunkZ: int32): bool {.inline.} =
+  let f = level.isChunkLoaded
+  f(chunkX, chunkZ)
+
+proc chunkOf(level: LightLevelAccess, chunkX, chunkZ: int32): ChunkData {.inline.} =
+  let f = level.chunkAt
+  f(chunkX, chunkZ)
+
+proc satSub(a, b: uint8): uint8 {.inline.} =
+  if a > b: a - b else: 0'u8
+
+proc divEuclid16(v: int32): int32 {.inline.} = v shr 4
+
+proc hasOpenSkyAbove(level: LightLevelAccess, pos: BlockPos): bool =
+  ## `DynamicLightEngine::has_open_sky_above`
+  const maxY = 319'i32  # Maximum build height, as upstream hardcodes it.
+  var y = pos.y
+  while y < maxY:
+    inc y
+    if opacity(stateAt(level, blockPos(pos.x, y, pos.z))) > 0'u8:
+      return false
+  true
+
+proc queueBlockLightDecrease*(e: var DynamicLightEngine, pos: BlockPos, level: uint8) =
+  e.blockDecrease.addLast(QueuedLight(pos: pos, level: level))
+
+proc queueBlockLightIncrease*(e: var DynamicLightEngine, pos: BlockPos, level: uint8) =
+  e.blockIncrease.addLast(QueuedLight(pos: pos, level: level))
+
+proc queueSkyLightDecrease*(e: var DynamicLightEngine, pos: BlockPos, level: uint8) =
+  e.skyDecrease.addLast(QueuedLight(pos: pos, level: level))
+
+proc queueSkyLightIncrease*(e: var DynamicLightEngine, pos: BlockPos, level: uint8) =
+  e.skyIncrease.addLast(QueuedLight(pos: pos, level: level))
+
+proc getBlockLightLevel*(level: LightLevelAccess, position: BlockPos): (bool, uint8) =
+  ## `DynamicLightEngine::get_block_light_level` and its `_sync` twin.
+  let chunk = chunkOf(level, divEuclid16(position.x), divEuclid16(position.z))
+  if chunk == nil:
+    return (false, 0'u8)
+  let rel = position.y - chunk.section.minY
+  if rel < 0'i32:
+    return (false, 0'u8)
+  let sectionIdx = int(rel) div 16
+  if sectionIdx >= chunk.lightEngine.blockLight.len:
+    return (false, 0'u8)
+  (true, chunk.lightEngine.blockLight[sectionIdx].get(int(position.x and 15'i32), int(rel) mod 16, int(position.z and 15'i32)))
+
+proc setBlockLightLevel*(level: LightLevelAccess, position: BlockPos, lightLevel: uint8) =
+  ## `DynamicLightEngine::set_block_light_level`
+  let chunk = chunkOf(level, divEuclid16(position.x), divEuclid16(position.z))
+  if chunk == nil:
+    return
+  let rel = position.y - chunk.section.minY
+  if rel < 0'i32:
+    return
+  let sectionIndex = int(rel) div 16
+  if sectionIndex >= chunk.lightEngine.blockLight.len:
+    return
+  chunk.lightEngine.blockLight[sectionIndex].set(int(position.x and 15'i32), int(rel) mod 16,
+    int(position.z and 15'i32), lightLevel)
+  # Mark chunk as dirty so lighting changes are saved to disk.
+  chunk.dirty = true
+
+proc getSkyLightLevel*(level: LightLevelAccess, position: BlockPos): uint8 =
+  ## `DynamicLightEngine::get_sky_light_level` and its `_sync` twin.
+  let chunk = chunkOf(level, divEuclid16(position.x), divEuclid16(position.z))
+  if chunk == nil:
+    return 0'u8
+  let rel = position.y - chunk.section.minY
+  if rel < 0'i32:
+    return 15'u8
+  let sectionIndex = int(rel) div 16
+  if sectionIndex >= chunk.lightEngine.skyLight.len:
+    return 15'u8
+  chunk.lightEngine.skyLight[sectionIndex].get(int(position.x and 15'i32), int(rel) mod 16, int(position.z and 15'i32))
+
+proc setSkyLightLevel*(level: LightLevelAccess, position: BlockPos, lightLevel: uint8) =
+  ## `DynamicLightEngine::set_sky_light_level`
+  let chunk = chunkOf(level, divEuclid16(position.x), divEuclid16(position.z))
+  if chunk == nil:
+    return
+  let rel = position.y - chunk.section.minY
+  if rel < 0'i32:
+    return
+  let sectionIndex = int(rel) div 16
+  if sectionIndex >= chunk.lightEngine.skyLight.len:
+    return
+  chunk.lightEngine.skyLight[sectionIndex].set(int(position.x and 15'i32), int(rel) mod 16,
+    int(position.z and 15'i32), lightLevel)
+  chunk.dirty = true
+
+proc propagateBlockLightIncrease(e: var DynamicLightEngine, level: LightLevelAccess, pos: BlockPos, lightLevel: uint8) =
+  for dir in AllDirections:
+    let neighbor = offsetPos(pos, dir)
+    let (has, neighborLight) = getBlockLightLevel(level, neighbor)
+    if has:
+      let opac = max(opacity(stateAt(level, neighbor)), 1'u8)
+      let newLight = satSub(lightLevel, opac)
+      if newLight > neighborLight:
+        setBlockLightLevel(level, neighbor, newLight)
+        if newLight > 1'u8:
+          queueBlockLightIncrease(e, neighbor, newLight)
+
+proc propagateBlockLightDecrease(e: var DynamicLightEngine, level: LightLevelAccess, pos: BlockPos, removedLightLevel: uint8) =
+  # Only propagate if this position has already been reset to 0.
+  let (has, current) = getBlockLightLevel(level, pos)
+  let currentLevel = if has: current else: 0'u8
+  if currentLevel == 0'u8 and removedLightLevel > 0'u8:
+    for dir in AllDirections:
+      let neighbor = offsetPos(pos, dir)
+      let (hasN, neighborLight) = getBlockLightLevel(level, neighbor)
+      if hasN:
+        if neighborLight == 0'u8:
+          continue
+        let state = stateAt(level, neighbor)
+        let expectedFromRemovedSource = satSub(removedLightLevel, max(opacity(state), 1'u8))
+        if neighborLight <= expectedFromRemovedSource:
+          let neighborLuminance = luminance(state)
+          if neighborLuminance == 0'u8:
+            setBlockLightLevel(level, neighbor, 0'u8)
+            queueBlockLightDecrease(e, neighbor, neighborLight)
+          else:
+            setBlockLightLevel(level, neighbor, neighborLuminance)
+            queueBlockLightIncrease(e, neighbor, neighborLuminance)
+        else:
+          queueBlockLightIncrease(e, neighbor, neighborLight)
+
+proc performBlockLightUpdates*(e: var DynamicLightEngine, level: LightLevelAccess): int32 =
+  ## `DynamicLightEngine::perform_block_light_updates`
+  var updates = 0'i32
+  while true:
+    var dec0 = 0'i32
+    while e.blockDecrease.len > 0:
+      let q = e.blockDecrease.popFirst()
+      propagateBlockLightDecrease(e, level, q.pos, q.level)
+      inc dec0
+    var inc0 = 0'i32
+    while e.blockIncrease.len > 0:
+      let q = e.blockIncrease.popFirst()
+      propagateBlockLightIncrease(e, level, q.pos, q.level)
+      inc inc0
+    updates += dec0 + inc0
+    if dec0 == 0'i32 and inc0 == 0'i32:
+      break
+  updates
+
+proc checkNeighborsLightUpdates*(e: var DynamicLightEngine, level: LightLevelAccess, pos: BlockPos, currentLight: uint8) =
+  ## `DynamicLightEngine::check_neighbors_light_updates`
+  for dir in AllDirections:
+    let neighbor = offsetPos(pos, dir)
+    let (has, neighborLight) = getBlockLightLevel(level, neighbor)
+    if has and neighborLight > currentLight + 1'u8:
+      queueBlockLightIncrease(e, neighbor, neighborLight)
+
+proc checkBlockLightUpdates*(e: var DynamicLightEngine, level: LightLevelAccess, pos: BlockPos) =
+  ## `DynamicLightEngine::check_block_light_updates`
+  case level.lightingConfig
+  of lecFull:
+    setBlockLightLevel(level, pos, 15'u8)
+    return
+  of lecDark:
+    setBlockLightLevel(level, pos, 0'u8)
+    return
+  of lecDefault:
+    discard
+  let (has, current) = getBlockLightLevel(level, pos)
+  let currentLight = if has: current else: 0'u8
+  let expectedLight = luminance(stateAt(level, pos))
+  if expectedLight < currentLight:
+    setBlockLightLevel(level, pos, expectedLight)
+    queueBlockLightDecrease(e, pos, currentLight)
+  elif expectedLight > currentLight:
+    setBlockLightLevel(level, pos, expectedLight)
+    queueBlockLightIncrease(e, pos, expectedLight)
+  # Decrease propagation handles re-validating neighbors.
+  if expectedLight >= currentLight:
+    checkNeighborsLightUpdates(e, level, pos, expectedLight)
+
+proc propagateSkyLightIncrease(e: var DynamicLightEngine, level: LightLevelAccess, pos: BlockPos, lightLevel: uint8) =
+  for dir in AllDirections:
+    let neighbor = offsetPos(pos, dir)
+    # Never propagate into an unloaded chunk: the write is dropped, the "brighter" check stays true,
+    # and this would spin forever at the border.
+    if not loadedAt(level, divEuclid16(neighbor.x), divEuclid16(neighbor.z)):
+      continue
+    let neighborLight = getSkyLightLevel(level, neighbor)
+    let opac = opacity(stateAt(level, neighbor))
+    let newLight =
+      if lightLevel == 15'u8 and dir == bdDown and opac == 0'u8: 15'u8
+      else: satSub(satSub(lightLevel, 1'u8), opac)
+    if newLight > neighborLight:
+      setSkyLightLevel(level, neighbor, newLight)
+      if newLight > 0'u8:
+        queueSkyLightIncrease(e, neighbor, newLight)
+
+proc propagateSkyLightDecrease(e: var DynamicLightEngine, level: LightLevelAccess, pos: BlockPos, removedLight: uint8) =
+  for dir in AllDirections:
+    let neighbor = offsetPos(pos, dir)
+    if not loadedAt(level, divEuclid16(neighbor.x), divEuclid16(neighbor.z)):
+      continue
+    let neighborLight = getSkyLightLevel(level, neighbor)
+    if neighborLight == 0'u8:
+      continue
+    let opac = opacity(stateAt(level, neighbor))
+    let expected =
+      if removedLight == 15'u8 and dir == bdDown and opac == 0'u8: 15'u8
+      else: satSub(satSub(removedLight, 1'u8), opac)
+    if neighborLight == expected or neighborLight < removedLight:
+      setSkyLightLevel(level, neighbor, 0'u8)
+      queueSkyLightDecrease(e, neighbor, neighborLight)
+    elif neighborLight > removedLight:
+      queueSkyLightIncrease(e, neighbor, neighborLight)
+
+proc performSkyLightUpdates*(e: var DynamicLightEngine, level: LightLevelAccess): int32 =
+  ## `DynamicLightEngine::perform_sky_light_updates`
+  var updates = 0'i32
+  while true:
+    var dec0 = 0'i32
+    while e.skyDecrease.len > 0:
+      let q = e.skyDecrease.popFirst()
+      propagateSkyLightDecrease(e, level, q.pos, q.level)
+      inc dec0
+    var inc0 = 0'i32
+    while e.skyIncrease.len > 0:
+      let q = e.skyIncrease.popFirst()
+      propagateSkyLightIncrease(e, level, q.pos, q.level)
+      inc inc0
+    updates += dec0 + inc0
+    if dec0 == 0'i32 and inc0 == 0'i32:
+      break
+  updates
+
+proc checkNeighborsSkyLightUpdates*(e: var DynamicLightEngine, pos: BlockPos, currentLight: uint8) =
+  ## `DynamicLightEngine::check_neighbors_sky_light_updates`
+  if currentLight > 0'u8:
+    queueSkyLightIncrease(e, pos, currentLight)
+
+proc checkSkyLightUpdates*(e: var DynamicLightEngine, level: LightLevelAccess, pos: BlockPos) =
+  ## `DynamicLightEngine::check_sky_light_updates`
+  case level.lightingConfig
+  of lecFull:
+    setSkyLightLevel(level, pos, 15'u8)
+    return
+  of lecDark:
+    setSkyLightLevel(level, pos, 0'u8)
+    return
+  of lecDefault:
+    discard
+  let currentLight = getSkyLightLevel(level, pos)
+  let opac = opacity(stateAt(level, pos))
+  var expectedLight = 0'u8
+  if opac != 15'u8:
+    if hasOpenSkyAbove(level, pos):
+      expectedLight = satSub(15'u8, opac)
+    else:
+      var bestLight = 0'u8
+      for dir in AllDirections:
+        let neighborLight = getSkyLightLevel(level, offsetPos(pos, dir))
+        let potential = if neighborLight == 15'u8 and dir == bdUp: 15'u8 else: satSub(neighborLight, 1'u8)
+        bestLight = max(bestLight, potential)
+      expectedLight = satSub(bestLight, opac)
+  if expectedLight < currentLight:
+    setSkyLightLevel(level, pos, expectedLight)
+    queueSkyLightDecrease(e, pos, currentLight)
+  elif expectedLight > currentLight:
+    setSkyLightLevel(level, pos, expectedLight)
+    queueSkyLightIncrease(e, pos, expectedLight)
+  if expectedLight >= currentLight:
+    checkNeighborsSkyLightUpdates(e, pos, expectedLight)
+
+proc updateLightingAt*(e: var DynamicLightEngine, level: LightLevelAccess, pos: BlockPos) =
+  ## `DynamicLightEngine::update_lighting_at`
+  checkBlockLightUpdates(e, level, pos)
+  discard performBlockLightUpdates(e, level)
+  checkSkyLightUpdates(e, level, pos)
+  discard performSkyLightUpdates(e, level)

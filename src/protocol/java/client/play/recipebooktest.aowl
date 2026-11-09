@@ -1,0 +1,273 @@
+{.feature: "untyped".}
+## Test for recipe_book_add and recipe_book_settings. The whole recipe book cannot be written out by hand, so:
+## its first entry is asserted to the byte, every entry is walked by a small parser of the wire form the client
+## also reads, and each dynamic recipe's bytes are asserted exactly, after the static part stays unchanged.
+import std/[options, strutils]
+import std/assertions
+import playtestutil
+import ../../../protobase, ../../../varint
+import ../../../../generated/item as itemdata
+import ../../../../generated/item_id_remap
+import ../../../../generated/recipes
+import ../../../../util/javaversion
+import recipe_book_add, recipe_book_settings
+
+const V = jmvV1_21_11
+
+template full(Pk, p, v: untyped): seq[byte] =
+  block:
+    var fullWriter = newNetWriter()
+    writeJavaPacketId(fullWriter, Pk.toId(v))
+    let fullResult = writePacket(p, fullWriter, v)
+    if not fullResult.isOk:
+      echo "FAIL write: ", fullResult.error.msg
+      quit(1)
+    fullWriter.buf
+
+proc varHex(n: int): string =
+  var w = newNetWriter()
+  writeVarInt(w, newVarInt(int32(n)))
+  hexOf(w.buf)
+
+proc itemHex(name: string; v: JavaMinecraftVersion): string =
+  let (found, item) = itemByName(name)
+  assert found, name
+  varHex(int(remapItemIdForVersion(uint16(item.id), v)))
+
+proc bodyOf(p: CRecipeBookAdd; v: JavaMinecraftVersion): seq[byte] =
+  var w = newNetWriter()
+  assert writePacket(p, w, v).isOk
+  w.buf
+
+block settings:
+  eqHex(full(CRecipeBookSettings, CRecipeBookSettings.defaultClosed(), V), "4a 00 00 00 00 00 00 00 00", "settings closed")
+  let p = CRecipeBookSettings(craftingOpen: true, furnaceFiltering: true, blastFurnaceOpen: true, smokerFiltering: true)
+  eqHex(full(CRecipeBookSettings, p, V), "4a 01 00 00 01 01 00 00 01", "settings order")
+
+proc expectedCount(): int =
+  result = RECIPES_COOKING.len
+  for r in RECIPES_CRAFTING:
+    if r.kind != crkCraftingDecoratedPot:
+      inc result
+
+let staticReplace = bodyOf(CRecipeBookAdd(replace: true, dynamicRecipes: @[]), V)
+let staticAdd = bodyOf(CRecipeBookAdd(replace: false, dynamicRecipes: @[]), V)
+
+block firstEntry:
+  # The first recipe in the table is minecraft:acacia_boat: shaped, "# #" / "###", group "boat", misc.
+  assert RECIPES_CRAFTING[0].kind == crkCraftingShaped and RECIPES_CRAFTING[0].shaped.id == "minecraft:acacia_boat"
+  let planks = "02" & itemHex("acacia_planks", V)
+  let holder = "02" & itemHex("acacia_planks", V)
+  let want = varHex(expectedCount()) &
+    "00 01 03 02 06" &                              # display id, shaped, width, height, slot count
+    planks & "00" & planks & planks & planks & planks &
+    "03 01" & itemHex("acacia_boat", V) & "00 00" & # result stack: count first on 774
+    "02" & itemHex("crafting_table", V) &           # station
+    "01" &                                          # group 0, as OptionalVarInt
+    "03" &                                          # category: misc
+    "01 05" & holder & holder & holder & holder & holder &  # requirements: non-empty slots only
+    "00"                                            # flags: all clear on replace
+  let got = hexOf(staticReplace)
+  var wanted = ""
+  for c in want:
+    if c != ' ':
+      wanted.add(c)
+  assert got.len > wanted.len
+  assert got[0 ..< wanted.len] == wanted, "first entry\n  got  " & got[0 ..< wanted.len] & "\n  want " & wanted
+
+# --- a parser of the wire form, for all the rest ----------------------------------
+
+proc skipSlotDisplay(r: var NetReader; v: JavaMinecraftVersion) =
+  let kind = getVarInt(r).value.value
+  let itemKind = if v >= jmvV26_1: 4'i32 else: 2'i32
+  let stackKind = if v >= jmvV26_1: 5'i32 else: 3'i32
+  let compositeKind = if v >= jmvV26_1: 10'i32 else: 7'i32
+  if kind == 0'i32 or kind == 1'i32:
+    discard
+  elif kind == itemKind:
+    assert getVarInt(r).value.value >= 0'i32
+  elif kind == stackKind:
+    assert getVarInt(r).value.value > 0'i32  # id and count, both positive, in either order
+    assert getVarInt(r).value.value > 0'i32
+    assert getVarInt(r).value.value == 0'i32
+    assert getVarInt(r).value.value == 0'i32
+  elif kind == compositeKind:
+    let n = getVarInt(r).value.value
+    assert n >= 2'i32
+    for i in 0 ..< n:
+      skipSlotDisplay(r, v)
+  else:
+    assert false, "slot display " & $kind
+
+proc skipRequirements(r: var NetReader) =
+  assert getBool(r).value
+  let slots = getVarInt(r).value.value
+  for i in 0 ..< slots:
+    let holder = getVarInt(r).value.value
+    assert holder >= 1'i32  # never a named tag
+    for k in 0 ..< holder - 1:
+      assert getVarInt(r).value.value >= 0'i32
+
+proc walkStatic(bytes: seq[byte]; v: JavaMinecraftVersion; replace: bool) =
+  var r = newNetReader(bytes)
+  let total = getVarInt(r).value.value
+  assert int(total) == expectedCount()
+  for i in 0 ..< total:
+    assert getVarInt(r).value.value == i, "display id"
+    let display = getVarInt(r).value.value
+    case display
+    of 0'i32:  # shapeless
+      let n = getVarInt(r).value.value
+      for k in 0 ..< n:
+        skipSlotDisplay(r, v)
+      skipSlotDisplay(r, v)
+      skipSlotDisplay(r, v)
+    of 1'i32:  # shaped
+      let width = getVarInt(r).value.value
+      let height = getVarInt(r).value.value
+      let n = getVarInt(r).value.value
+      assert n == width * height
+      for k in 0 ..< n:
+        skipSlotDisplay(r, v)
+      skipSlotDisplay(r, v)
+      skipSlotDisplay(r, v)
+    of 2'i32:  # furnace
+      skipSlotDisplay(r, v)
+      skipSlotDisplay(r, v)
+      skipSlotDisplay(r, v)
+      skipSlotDisplay(r, v)
+      assert getVarInt(r).value.value > 0'i32  # duration
+      assert getF32Be(r).value >= 0.0'f32      # experience
+    else:
+      assert false, "recipe display " & $display
+    assert getVarInt(r).value.value >= 0'i32   # group
+    let category = getVarInt(r).value.value
+    assert category >= 0'i32 and category <= 12'i32
+    skipRequirements(r)
+    let flags = getU8(r).value
+    if replace:
+      assert flags == 0'u8
+    else:
+      assert (flags and 2'u8) != 0'u8 and flags <= 3'u8
+  assert getBool(r).value == replace
+  assert remaining(r) == 0
+
+block wholeBook:
+  walkStatic(staticReplace, V, true)
+  walkStatic(staticAdd, V, false)
+  walkStatic(bodyOf(CRecipeBookAdd(replace: true, dynamicRecipes: @[]), jmvV1_21_2), jmvV1_21_2, true)
+  walkStatic(bodyOf(CRecipeBookAdd(replace: false, dynamicRecipes: @[]), jmvV26_1), jmvV26_1, false)
+
+# --- dynamic recipes --------------------------------------------------------------
+
+let stoneSlot = "02 01"       # item display, stone
+let stoneResult = "03 04 01 00 00"
+let table = "02" & itemHex("crafting_table", V)
+
+proc simple(id: string): OwnedRecipeIngredient =
+  OwnedRecipeIngredient(kind: oriSimple, id: id)
+
+proc cookingRecipe(kind: OwnedCookingRecipeKind; category: RecipeCategory): DynamicRecipe =
+  DynamicRecipe(kind: drCooking, cooking: OwnedCookingRecipeType(kind: kind, recipe: OwnedCookingRecipe(
+    recipeId: "x:y", category: category, group: none[string](), ingredient: simple("minecraft:stone"),
+    cookingTime: 200'i32, experience: 0.5'f32, result: OwnedRecipeResult(itemId: "stone", count: 4'u8))))
+
+proc checkDynamic(recipes: seq[DynamicRecipe]; want: string; what: string) =
+  ## Same static bytes, the count grown, these entries, then the replace flag.
+  let got = bodyOf(CRecipeBookAdd(replace: false, dynamicRecipes: recipes), V)
+  let countLen = varHex(expectedCount()).len div 2
+  let countNewHex = varHex(expectedCount() + recipes.len)
+  let middle = staticAdd[countLen ..< staticAdd.len - 1]
+  let expected = countNewHex & hexOf(middle) & want & "00"
+  var wanted = ""
+  for c in expected:
+    if c != ' ':
+      wanted.add(c)
+  if hexOf(got) != wanted:
+    let tail = wanted.len - want.len - 200
+    echo "FAIL ", what
+    echo "  got  ", hexOf(got)[max(tail, 0) .. ^1]
+    echo "  want ", wanted[max(tail, 0) .. ^1]
+    quit(1)
+
+let first = expectedCount()
+
+block dynamicShaped:
+  let shaped = DynamicRecipe(kind: drCrafting, crafting: OwnedCraftingRecipe(
+    kind: ocrShaped, category: rcRedstone, group: some("boat"), showNotification: true,
+    key: @[RecipeKeyEntry(symbol: 'A', ingredient: simple("minecraft:stone"))],
+    pattern: @["AB", " A"],
+    result: OwnedRecipeResult(itemId: "minecraft:stone", count: 4'u8)))
+  checkDynamic(@[shaped],
+    varHex(first) & "01 02 02 04" &             # display id, shaped, width, height, slots
+    stoneSlot & "00" & "00" & stoneSlot &       # A, B (not in the key), space, A
+    stoneResult & table &
+    "01" &                                      # the static group "boat" is 0, as OptionalVarInt
+    "01" &                                      # category: redstone
+    "01 03 02 01 01 02 01" &                    # requirements: A, B as an empty list, A
+    "03", "dynamic shaped")
+
+block dynamicShapedQuiet:
+  let shaped = DynamicRecipe(kind: drCrafting, crafting: OwnedCraftingRecipe(
+    kind: ocrShaped, category: rcEquipment, group: none[string](), showNotification: false,
+    key: @[], pattern: @[" "], result: OwnedRecipeResult(itemId: "nothing", count: 1'u8)))
+  checkDynamic(@[shaped],
+    varHex(first) & "01 01 01 01 00" & "00" & table & "00 02 01 00" & "02", "dynamic shaped, no notification")
+
+block dynamicShapeless:
+  let shapeless = DynamicRecipe(kind: drCrafting, crafting: OwnedCraftingRecipe(
+    kind: ocrShapeless, category: rcBuilding, group: none[string](),
+    ingredients: @[
+      OwnedRecipeIngredient(kind: oriOneOf, ids: @["minecraft:stone", "granite", "minecraft:no_such_item"]),
+      OwnedRecipeIngredient(kind: oriTagged, tag: "#minecraft:logs"),
+      simple("minecraft:no_such_item")],
+    result: OwnedRecipeResult(itemId: "minecraft:no_such_item", count: 1'u8)))
+  checkDynamic(@[shapeless],
+    varHex(first) & "00 03" &
+    "07 02 02 01 02 02" &                       # one of: composite of stone, granite
+    "00" & "00" &                               # tag and unknown item: empty displays
+    "00" &                                      # unknown result: empty
+    table & "00" & "00" &
+    "01 03 03 01 02 01 01" &                    # n + 1 ids; the tag and the unknown item: empty lists
+    "03", "dynamic shapeless")
+
+block dynamicOneOfOne:
+  let shapeless = DynamicRecipe(kind: drCrafting, crafting: OwnedCraftingRecipe(
+    kind: ocrShapeless, category: rcFood, group: none[string](),
+    ingredients: @[OwnedRecipeIngredient(kind: oriOneOf, ids: @["minecraft:stone"]),
+      OwnedRecipeIngredient(kind: oriOneOf, ids: @["minecraft:no_such_item"])],
+    result: OwnedRecipeResult(itemId: "stone", count: 4'u8)))
+  checkDynamic(@[shapeless],
+    varHex(first) & "00 02" & stoneSlot & "00" & stoneResult & table & "00" & "03" & "01 02 02 01 01" & "03",
+    "dynamic one of, one and none")
+
+proc cookingHex(displayId: int; station: string; category: int): string =
+  # Upstream's dynamic cooking entry writes the holder set bare, with no present flag or count, unlike its
+  # static one. Ported as written.
+  varHex(displayId) & "02" & stoneSlot & "01" & stoneResult & "02" & itemHex(station, V) &
+    "c801 3f000000" & "00" & varHex(category) & "02 01" & "03"
+
+block dynamicCooking:
+  checkDynamic(@[cookingRecipe(ockSmelting, rcFood)], cookingHex(first, "furnace", 4), "smelting, food")
+  checkDynamic(@[cookingRecipe(ockSmelting, rcBlocks)], cookingHex(first, "furnace", 5), "smelting, blocks")
+  checkDynamic(@[cookingRecipe(ockSmelting, rcMisc)], cookingHex(first, "furnace", 6), "smelting, misc")
+  checkDynamic(@[cookingRecipe(ockBlasting, rcBlocks)], cookingHex(first, "blast_furnace", 7), "blasting, blocks")
+  checkDynamic(@[cookingRecipe(ockBlasting, rcFood)], cookingHex(first, "blast_furnace", 8), "blasting, other")
+  checkDynamic(@[cookingRecipe(ockSmoking, rcFood)], cookingHex(first, "smoker", 9), "smoking")
+  checkDynamic(@[cookingRecipe(ockCampfireCooking, rcFood)], cookingHex(first, "campfire", 12), "campfire")
+  checkDynamic(@[cookingRecipe(ockSmoking, rcFood), cookingRecipe(ockSmoking, rcFood)],
+    cookingHex(first, "smoker", 9) & cookingHex(first + 1, "smoker", 9), "two, with rising display ids")
+
+block replaceClearsFlags:
+  let got = bodyOf(CRecipeBookAdd(replace: true, dynamicRecipes: @[cookingRecipe(ockSmoking, rcFood)]), V)
+  # flags, then the replace flag.
+  assert got[got.len - 2] == 0'u8
+  assert got[got.len - 1] == 1'u8
+
+block slotDisplayGate:
+  # 26.1 renumbers the slot displays and writes a template stack id first.
+  let got = bodyOf(CRecipeBookAdd(replace: false, dynamicRecipes: @[cookingRecipe(ockSmoking, rcFood)]), jmvV26_1)
+  let want = "02" & "0401" & "01" & "05" & "01" & "04" & "0000" & "04"
+  assert hexOf(got).find(want) >= 0
+
+echo "ok"

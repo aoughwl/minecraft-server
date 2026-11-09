@@ -1,0 +1,132 @@
+## level.dat reading and writing, plus the data files that go with it.
+## Port of pumpkin-world/src/world_info/anvil.rs
+
+import std/times
+import ../nbt/[tag, nbtbase, serializer, deserializer, nbtdoc]
+import worldinfo, worldinfodatafiles, nbtget, worldfs, chunkcompress
+
+const
+  LevelDatFileName* = "level.dat"
+  LevelDatBackupFileName* = "level.dat_old"
+
+proc parseLevelDat*(rawNbt: seq[byte]): (bool, NbtCompound, WorldInfoError) =
+  ## The `Data` compound, or a `DeserializationError`.
+  var reader = newNbtReader(nrmJava, rawNbt)
+  let doc = read(reader)
+  if not doc.isOk:
+    return (false, newCompound(), infoErr(wieDeserializationError, doc.error.msg))
+  let (hasData, data) = nbtCompound(doc.value.rootTag, "Data")
+  if not hasData:
+    return (false, newCompound(), infoErr(wieDeserializationError, "missing field Data"))
+  (true, data, infoErr(wieIoError))
+
+proc checkFileDataVersion*(data: NbtCompound): (bool, WorldInfoError) =
+  ## `check_file_data_version`
+  let (has, v) = nbtInt(data, "DataVersion")
+  if not has:
+    return (false, infoErr(wieDeserializationError, "The level.dat file does not have a data version"))
+  if v >= MinimumSupportedWorldDataVersion and v <= MaximumSupportedWorldDataVersion:
+    return (true, infoErr(wieIoError))
+  (false, infoErr(wieUnsupportedDataVersion, "", v))
+
+proc checkFileLevelVersion*(data: NbtCompound): (bool, WorldInfoError) =
+  ## `check_file_level_version`
+  let (has, v) = nbtInt(data, "version")
+  if not has:
+    return (false, infoErr(wieDeserializationError, "The level.dat file does not have a level version"))
+  if v >= MinimumSupportedLevelVersion and v <= MaximumSupportedLevelVersion:
+    return (true, infoErr(wieIoError))
+  (false, infoErr(wieUnsupportedLevelVersion, "", v))
+
+proc readWorldInfo*(levelFolder: string): (bool, LevelData, WorldInfoError) =
+  ## `<AnvilLevelInfo as WorldInfoReader>::read_world_info`
+  let empty = defaultLevelData(0'u64)
+  let (status, compressed) = readFileBytes(joinPathW(levelFolder, LevelDatFileName))
+  if status != rsOk:
+    return (false, empty, infoErr(wieInfoNotFound, "Info not found!"))
+  let raw = gzipDecompressBytes(compressed)
+  if not raw.ok:
+    return (false, empty, infoErr(wieIoError, raw.msg))
+  let (parsed, data, parseError) = parseLevelDat(raw.data)
+  if not parsed:
+    return (false, empty, parseError)
+  let (dvOk, dvErr) = checkFileDataVersion(data)
+  if not dvOk:
+    return (false, empty, dvErr)
+  let (lvOk, lvErr) = checkFileLevelVersion(data)
+  if not lvOk:
+    return (false, empty, lvErr)
+  let (ok, info0, msg) = levelDataFromNbt(data)
+  if not ok:
+    return (false, empty, infoErr(wieDeserializationError, msg))
+  var info = info0
+
+  let dataDir = minecraftDataDir(levelFolder)
+  # game_rules.dat: prefer the new file, fall back to level.dat values.
+  if fileExistsW(joinPathW(dataDir, "game_rules.dat")):
+    info.gameRules = readGameRules(levelFolder)
+  # world_gen_settings.dat
+  let (hasWgs, wgs) = readWorldGenSettings(levelFolder)
+  if hasWgs:
+    info.worldGenSettings = wgs
+  # world_clocks.dat: read the overworld day_time.
+  if fileExistsW(joinPathW(dataDir, "world_clocks.dat")):
+    let clocks = readWorldClocks(levelFolder)
+    for e in clocks.clocks:
+      if e.name == "minecraft:overworld":
+        info.dayTime = e.clock.totalTicks
+  # weather.dat
+  if fileExistsW(joinPathW(dataDir, "weather.dat")):
+    info.clearWeatherTime = readWeather(levelFolder).clearWeatherTime
+  (true, info, infoErr(wieIoError))
+
+proc writeWorldInfo*(info: LevelData, levelFolder: string): (bool, WorldInfoError) =
+  ## `<AnvilLevelInfo as WorldInfoWriter>::write_world_info`. As upstream, a failed `data/` file does
+  ## not fail the call; upstream logs it, and this port has no logger in the world crate yet.
+  var levelData = info
+  let t = getTime()
+  levelData.lastPlayed = t.toUnix() * 1000'i64 + int64(t.nanosecond() div 1_000_000)
+  var root = newCompound()
+  put(root, "Data", compoundTag(levelDataToNbt(levelData)))
+  let (gzOk, gzMsg) = writeGzipCompoundFile(joinPathW(levelFolder, LevelDatFileName), root, 9)
+  if not gzOk:
+    return (false, infoErr(wieIoError, gzMsg))
+
+  let dataVersion = info.dataVersion
+  discard writeGameRules(levelFolder, info.gameRules, dataVersion)
+  discard writeWorldGenSettings(levelFolder, info.worldGenSettings, dataVersion)
+
+  # world_clocks.dat: persist the overworld day_time, preserve others.
+  var clocks = readWorldClocks(levelFolder)
+  clocks.dataVersion = dataVersion
+  var found = false
+  for i in 0 ..< clocks.clocks.len:
+    if clocks.clocks[i].name == "minecraft:overworld":
+      clocks.clocks[i].clock.totalTicks = info.dayTime
+      found = true
+  if not found:
+    clocks.clocks.add(ClockEntry(name: "minecraft:overworld", clock: DimensionClock(totalTicks: info.dayTime)))
+  discard writeWorldClocks(levelFolder, clocks)
+
+  var weather = readWeather(levelFolder)
+  weather.clearWeatherTime = info.clearWeatherTime
+  weather.dataVersion = dataVersion
+  discard writeWeather(levelFolder, weather)
+
+  var wanderingTrader = readWanderingTrader(levelFolder)
+  wanderingTrader.dataVersion = dataVersion
+  discard writeWanderingTrader(levelFolder, wanderingTrader)
+
+  discard writeCustomBossEventsStub(levelFolder, dataVersion)
+  discard writeScheduledEventsStub(levelFolder, dataVersion)
+  (true, infoErr(wieIoError))
+
+proc anvilLevelInfoReader*(): WorldInfoReader =
+  ## `AnvilLevelInfo` as a `WorldInfoReader`.
+  WorldInfoReader(readWorldInfo: proc(levelFolder: string): (bool, LevelData, WorldInfoError) {.closure.} =
+    readWorldInfo(levelFolder))
+
+proc anvilLevelInfoWriter*(): WorldInfoWriter =
+  ## `AnvilLevelInfo` as a `WorldInfoWriter`.
+  WorldInfoWriter(writeWorldInfo: proc(info: LevelData, levelFolder: string): (bool, WorldInfoError) {.closure.} =
+    writeWorldInfo(info, levelFolder))

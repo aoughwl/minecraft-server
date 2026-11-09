@@ -1,0 +1,173 @@
+{.feature: "untyped".}
+## Test for chunk_data, light_update and login. Exact bytes for protocol 774.
+import std/[options, strutils]
+import playtestutil
+import ../../../varint, ../../../protobase
+import ../../../../generated/block_state_remap
+import ../../../../generated/dimension
+import ../../../../nbt/tag
+import ../../../../util/javaversion
+import ../../../../util/math/position
+import ../../../../world/[chunkdata, palette]
+from ../../../../world/tick import blockPos
+import chunk_data, light_update, login, player_spawn_data
+
+const V = jmvV1_21_11
+
+template full(Pk, p, v: untyped): seq[byte] =
+  block:
+    var fullWriter = newNetWriter()
+    writeJavaPacketId(fullWriter, Pk.toId(v))
+    let fullResult = writePacket(p, fullWriter, v)
+    if not fullResult.isOk:
+      echo "FAIL write: ", fullResult.error.msg
+      quit(1)
+    fullWriter.buf
+
+proc rep(s: string; n: int): string =
+  result = ""
+  for i in 0 ..< n:
+    result.add(s)
+
+proc nibbles(b: uint8): seq[uint8] =
+  result = newSeq[uint8](2048)
+  for i in 0 ..< 2048:
+    result[i] = b
+
+proc chunk(): ChunkData =
+  ## One air section. Sky light empty, block light full.
+  result = newChunkData(1'i32, 2'i32, newChunkSections(1, -64'i32))
+  result.lightEngine = ChunkLight(skyLight: @[newLightEmpty(0'u8)], blockLight: @[newLightFull(nibbles(0x12'u8))])
+
+const
+  EmptyHeightmaps = "03"
+  OneSection = "06 0000 00 00 00 00"
+  # Sky: mask 0. Block: section 0 is bit 1. Empty sky: below, section, above. Empty block: below, above.
+  ChunkMasks = "01 0000000000000000 01 0000000000000002 01 0000000000000007 01 0000000000000005"
+
+let hm0 = "01 25" & rep("0000000000000000", 37)
+let hm1 = "04 25" & rep("0000000000000000", 37)
+let hm2 = "05 25" & rep("0000000000000000", 37)
+
+# All absent heightmaps are 37 zero longs; the light arrays go out as they are.
+eqHex(full(CChunkData, CChunkData(data: chunk()), V),
+  "2c 00000001 00000002" & EmptyHeightmaps & hm0 & hm1 & hm2 & OneSection & "00" & ChunkMasks &
+  "00 01 8010" & rep("12", 2048), "chunk data")
+
+# A block entity: its position is local, its id is the table's, id and x, y, z leave the NBT.
+block:
+  let c = chunk()
+  var nbt = newCompound()
+  nbt.putString("id", "minecraft:chest")
+  nbt.putInt("x", 17'i32)
+  nbt.putInt("y", -5'i32)
+  nbt.putInt("z", 34'i32)
+  nbt.putByte("a", 1'i8)
+  c.pendingBlockEntities.add(BlockEntityEntry(pos: blockPos(17'i32, -5'i32, 34'i32), nbt: nbt))
+  var unknown = newCompound()
+  unknown.putString("id", "nope")
+  c.pendingBlockEntities.add(BlockEntityEntry(pos: blockPos(0'i32, 0'i32, 15'i32), nbt: unknown))
+  c.pendingBlockEntities.add(BlockEntityEntry(pos: blockPos(0'i32, 0'i32, 0'i32), nbt: newCompound()))
+  eqHex(full(CChunkData, CChunkData(data: c), V),
+    "2c 00000001 00000002" & EmptyHeightmaps & hm0 & hm1 & hm2 & OneSection &
+    "03 12 fffb 01 0a 01 0001 61 01 00 0f 0000 00 0a 00 00 0000 00 0a 00" & ChunkMasks &
+    "00 01 8010" & rep("12", 2048), "chunk data, block entities")
+
+# A set heightmap goes out at its own length.
+block:
+  let c = chunk()
+  c.heightmap.worldSurface = @[7'i64]
+  let got = full(CChunkData, CChunkData(data: c), V)
+  eqHex(got[0 ..< 20], "2c 00000001 00000002 03 01 01 0000000000000007", "chunk data, heightmap length")
+
+# Through 1.21.4 the heightmaps are NBT and the data arrays carry a length.
+block:
+  let c = chunk()
+  c.heightmap.worldSurface = @[7'i64]
+  var w = newNetWriter()
+  if not writePacket(CChunkData(data: c), w, jmvV1_21_4).isOk:
+    echo "FAIL old chunk"
+    quit(1)
+  eqHex(w.buf, "00000001 00000002" &
+    "0a 0c 000d 574f524c445f53555246414345 00000001 0000000000000007 00" &
+    "08 0000 00 00 00 00 00 00" & "00" & ChunkMasks & "00 01 8010" & rep("12", 2048), "chunk data, 1.21.4")
+
+# An indirect palette goes through the state table. State 1381 is 1181 on 774, and the first cell is index 1.
+block:
+  var sections = newChunkSections(1, -64'i32)
+  discard sections.blockSections[0].set(0, 0, 0, 1381'u32)
+  let c = newChunkData(0'i32, 0'i32, sections)
+  c.lightEngine = ChunkLight(skyLight: @[], blockLight: @[])
+  let network = blockConvertNetwork(sections.blockSections[0])
+  if network.paletteKind != npIndirect or network.bitsPerEntry != 4'u8 or network.packedData.len != 256:
+    echo "FAIL expected an indirect palette of 4 bits"
+    quit(1)
+  let wantPalette =
+    if network.values[0] == 0'u32: "02 00 9d09"
+    else: "02 9d09 00"
+  var packed = ""
+  for word in network.packedData:
+    var wordW = newNetWriter()
+    writeI64Be(wordW, word)
+    packed.add(hexOf(wordW.buf))
+  var wantSection = "0001 04" & wantPalette & packed & "00 00"
+  let got = full(CChunkData, CChunkData(data: c), V)
+  # The size prefix of the section buffer is two bytes here: 2 + 1 + 4 + 2048 + 2 = 2057.
+  eqHex(got, "2c 00000000 00000000" & EmptyHeightmaps & hm0 & hm1 & hm2 & "8910" & wantSection & "00" &
+    "01 0000000000000000 01 0000000000000000 01 0000000000000003 01 0000000000000003 00 00", "chunk data, indirect")
+
+# A direct palette (over 256 different states) has each state remapped inside the packed longs, four to a long.
+block:
+  var sections = newChunkSections(1, -64'i32)
+  var n = 0
+  for y in 0 ..< 16:
+    for z in 0 ..< 16:
+      for x in 0 ..< 16:
+        discard sections.blockSections[0].set(x, y, z, 1000'u32 + uint32(n mod 600))
+        inc n
+  let network = blockConvertNetwork(sections.blockSections[0])
+  if network.paletteKind != npDirect or network.bitsPerEntry != 15'u8:
+    echo "FAIL expected a direct palette of 15 bits"
+    quit(1)
+  let cellsOf = cells(sections.blockSections[0])
+  var want = ""
+  var i = 0
+  while i < cellsOf.len:
+    var word = 0'u64
+    for j in 0 ..< 4:
+      if i + j < cellsOf.len:
+        word = word or (uint64(remapBlockStateForVersion(uint16(cellsOf[i + j]), V)) shl (15 * j))
+    var wordW = newNetWriter()
+    writeU64Be(wordW, word)
+    want.add(hexOf(wordW.buf))
+    i += 4
+  let c = newChunkData(0'i32, 0'i32, sections)
+  c.lightEngine = ChunkLight(skyLight: @[], blockLight: @[])
+  let got = hexOf(full(CChunkData, CChunkData(data: c), V))
+  # Section buffer: count, bits; the packed longs follow directly.
+  if got.len < want.len or got.find(want) < 0:
+    echo "FAIL direct palette remap"
+    quit(1)
+
+# Light update: masks from bit 0, nibbles swapped.
+eqHex(full(CLightUpdate, CLightUpdate(data: chunk()), V),
+  "2f 01 02 01 0000000000000000 01 0000000000000001 01 0000000000000001 01 0000000000000000 00 01 8010" & rep("21", 2048),
+  "light update")
+
+# Login: every field on 774, where online mode is not sent, and with it on 26.2.
+let spawn = PlayerSpawnData(dimension: OVERWORLD, hashedSeed: 1'i64, gameMode: 2'u8, previousGamemode: -1'i8,
+  debug: false, isFlat: true, deathDimensionName: none[(string, BlockPos)](), portalCooldown: newVarInt(3),
+  sealevel: newVarInt(63))
+let loginPacket = CLogin(entityId: 7'i32, isHardcore: true, dimensionNames: @["a:b", "c"], maxPlayers: newVarInt(20),
+  viewDistance: newVarInt(10), simulatedDistance: newVarInt(8), reducedDebugInfo: false, enabledRespawnScreen: true,
+  limitedCrafting: false, spawnData: spawn, onlineMode: true, enforceSecureChat: true)
+const
+  SpawnBytes = "00 13 6d696e6563726166743a6f766572776f726c64 0000000000000001 02 ff 00 01 00 03 3f"
+  LoginHead = "00000007 01 02 03 613a62 01 63 14 0a 08 00 01 00"
+eqHex(full(CLogin, loginPacket, V), "30" & LoginHead & SpawnBytes & "01", "login")
+block:
+  var w = newNetWriter()
+  discard writePacket(loginPacket, w, jmvV26_2)
+  eqHex(w.buf, LoginHead & SpawnBytes & "01 01", "login, online mode on 26.2")
+
+echo "ok"

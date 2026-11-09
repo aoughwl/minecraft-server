@@ -1,0 +1,380 @@
+## The Linear v2 region format.
+## Port of pumpkin-world/src/chunk/format/linear.rs
+##
+## Like anvilformat.aowl this works in serialized chunk bytes; `toSerializer` gives the
+## `ChunkSerializer`. `ruzstd` becomes libzstd through chunkcompress.aowl, with level 1 for upstream's
+## `CompressionLevel::Fastest`, and `xxhash_rust::xxh64` becomes `xxh64` there. The signature comes
+## from `gist.github.com/Aaron2550/5701519671253d4c6190bde6706f9f98`.
+
+import std/times
+import chunkdata, chunkio, chunkcompress, worldfs, anvilformat
+
+const
+  SignatureValue = 0xc3ff13183cca9d9a'u64
+  SignatureLen = 8
+  DefaultGridSize* = 2'u8
+  LinearSuperblockSize* = 26
+  ChunkBitmapSize* = 128
+  BucketSizeEntrySize* = 13
+  BucketChunkFixedSize* = 12
+
+type
+  LinearV2Superblock* = object
+    newestTimestamp*: uint64
+    gridSize*: uint8  ## One of {1, 2, 4, 8, 16, 32}.
+    regionX*: int32
+    regionZ*: int32
+
+  ChunkBitmap* = object
+    bits*: array[128, uint8]
+
+  NbtFeatures* = object
+    ## `HashMap<String, u32>`; parallel seqs, as `NbtCompound` does.
+    keys*: seq[string]
+    values*: seq[uint32]
+
+  BucketSizeEntry* = object
+    size*: uint32
+    compressionLevel*: int8
+    xxhash*: uint64
+
+  BucketChunkEntry* = object
+    timestamp*: uint64
+    hasData*: bool
+    data*: seq[byte]
+
+  ByteCursor* = object
+    ## `impl Buf`: a read position over a borrowed-by-copy buffer.
+    data*: seq[byte]
+    pos*: int
+
+  LinearV2File* = ref object
+    regionX*: int32
+    regionZ*: int32
+    gridSize*: uint8
+    timestamps*: seq[uint64]
+    chunksData*: seq[seq[byte]]
+    chunkPresent*: seq[bool]
+
+proc remaining(c: ByteCursor): int {.inline.} = c.data.len - c.pos
+
+proc getU8(c: var ByteCursor): uint8 =
+  result = c.data[c.pos]
+  inc c.pos
+
+proc getBE(c: var ByteCursor, n: int): uint64 =
+  result = 0'u64
+  for i in 0 ..< n:
+    result = (result shl 8) or uint64(c.data[c.pos + i])
+  c.pos += n
+
+proc putBE(o: var seq[byte], v: uint64, n: int) =
+  var i = n - 1
+  while i >= 0:
+    o.add(uint8((v shr (uint64(i) * 8'u64)) and 0xFF'u64))
+    dec i
+
+proc isValidGridSize(g: uint8): bool =
+  g == 1'u8 or g == 2'u8 or g == 4'u8 or g == 8'u8 or g == 16'u8 or g == 32'u8
+
+proc superblockToBytes*(s: LinearV2Superblock): seq[byte] =
+  ## `LinearV2Superblock::to_bytes`
+  result = newSeq[byte](0)
+  putBE(result, SignatureValue, 8)
+  result.add(0x02'u8)
+  putBE(result, s.newestTimestamp, 8)
+  result.add(s.gridSize)
+  putBE(result, uint64(cast[uint32](s.regionX)), 4)
+  putBE(result, uint64(cast[uint32](s.regionZ)), 4)
+
+proc superblockFromBytes*(buf: openArray[byte]): (bool, LinearV2Superblock, ChunkReadingError) =
+  ## `LinearV2Superblock::from_bytes`
+  var s = LinearV2Superblock(newestTimestamp: 0'u64, gridSize: 0'u8, regionX: 0'i32, regionZ: 0'i32)
+  if buf.len < LinearSuperblockSize:
+    return (false, s, readErr(creIoError, "UnexpectedEof"))
+  var c = ByteCursor(data: newSeq[byte](LinearSuperblockSize), pos: 0)
+  for i in 0 ..< LinearSuperblockSize:
+    c.data[i] = buf[i]
+  if getBE(c, 8) != SignatureValue:
+    return (false, s, readErr(creInvalidHeader, "Linear v2: invalid superblock signature"))
+  let version = getU8(c)
+  if version != 0x02'u8:
+    return (false, s, readErr(creInvalidHeader, "Linear v2: unexpected version byte in superblock"))
+  s.newestTimestamp = getBE(c, 8)
+  s.gridSize = getU8(c)
+  s.regionX = cast[int32](uint32(getBE(c, 4)))
+  s.regionZ = cast[int32](uint32(getBE(c, 4)))
+  if not isValidGridSize(s.gridSize):
+    return (false, s, readErr(creInvalidHeader, "Linear v2: invalid grid size " & $s.gridSize))
+  (true, s, readErr(creIoError))
+
+proc newChunkBitmap*(): ChunkBitmap =
+  result = ChunkBitmap()
+
+proc set*(b: var ChunkBitmap, index: int, exists: bool) =
+  let byteAt = index div 8
+  let bit = index mod 8
+  if exists:
+    b.bits[byteAt] = b.bits[byteAt] or (1'u8 shl bit)
+  else:
+    b.bits[byteAt] = b.bits[byteAt] and (not (1'u8 shl bit))
+
+proc get*(b: ChunkBitmap, index: int): bool =
+  ((b.bits[index div 8] shr (index mod 8)) and 1'u8) == 1'u8
+
+proc emptyFeatures*(): NbtFeatures =
+  NbtFeatures(keys: @[], values: @[])
+
+proc featuresToBytes*(f: NbtFeatures): seq[byte] =
+  ## `NbtFeatures::to_bytes`
+  result = newSeq[byte](0)
+  for i in 0 ..< f.keys.len:
+    result.add(uint8(f.keys[i].len))
+    for ch in f.keys[i]:
+      result.add(byte(ch))
+    putBE(result, uint64(f.values[i]), 4)
+  result.add(0'u8)
+
+proc featuresFromBytes*(c: var ByteCursor): (bool, NbtFeatures, ChunkReadingError) =
+  ## `NbtFeatures::from_bytes`
+  var f = emptyFeatures()
+  while true:
+    if remaining(c) <= 0:
+      return (false, f, readErr(creIoError, "UnexpectedEof"))
+    let keyLen = int(getU8(c))
+    if keyLen == 0:
+      break
+    if remaining(c) < keyLen + 4:
+      return (false, f, readErr(creIoError, "UnexpectedEof"))
+    var key = newString(keyLen)
+    for i in 0 ..< keyLen:
+      key[i] = char(getU8(c))
+    f.keys.add(key)
+    f.values.add(uint32(getBE(c, 4)))
+  (true, f, readErr(creIoError))
+
+proc bucketEntryToBytes*(e: BucketSizeEntry): seq[byte] =
+  ## `BucketSizeEntry::to_bytes`
+  result = newSeq[byte](0)
+  putBE(result, uint64(e.size), 4)
+  result.add(cast[uint8](e.compressionLevel))
+  putBE(result, e.xxhash, 8)
+
+proc bucketEntryFromBytes*(c: var ByteCursor): (bool, BucketSizeEntry) =
+  ## `BucketSizeEntry::from_bytes`
+  if remaining(c) < BucketSizeEntrySize:
+    return (false, BucketSizeEntry(size: 0'u32, compressionLevel: 0'i8, xxhash: 0'u64))
+  let size = uint32(getBE(c, 4))
+  let level = cast[int8](getU8(c))
+  let hash = getBE(c, 8)
+  (true, BucketSizeEntry(size: size, compressionLevel: level, xxhash: hash))
+
+proc writeInto*(e: BucketChunkEntry, o: var seq[byte]) =
+  ## `BucketChunkEntry::write_into`
+  if e.hasData:
+    putBE(o, uint64(e.data.len), 4)
+    putBE(o, e.timestamp, 8)
+    for b in e.data:
+      o.add(b)
+  else:
+    putBE(o, 0'u64, 4)
+    putBE(o, e.timestamp, 8)
+
+proc readFrom*(c: var ByteCursor): (bool, BucketChunkEntry) =
+  ## `BucketChunkEntry::read_from`
+  var e = BucketChunkEntry(timestamp: 0'u64, hasData: false, data: @[])
+  if remaining(c) < BucketChunkFixedSize:
+    return (false, e)
+  let size = int(getBE(c, 4))
+  e.timestamp = getBE(c, 8)
+  if size == 0:
+    return (true, e)
+  if remaining(c) < size:
+    return (false, e)
+  e.hasData = true
+  e.data = newSeq[byte](size)
+  for i in 0 ..< size:
+    e.data[i] = c.data[c.pos + i]
+  c.pos += size
+  (true, e)
+
+proc bucketCount*(gridSize: uint8): int {.inline.} = int(gridSize) * int(gridSize)
+proc chunksPerBucket*(gridSize: uint8): int {.inline.} = ChunkCount div bucketCount(gridSize)
+
+proc globalChunkIndex*(bucketIdx, local: int, gridSize: uint8): int =
+  ## `LinearV2File::global_chunk_index`: the inverse of bucket + local indexing.
+  let stride = 32 div int(gridSize)
+  let bucketRow = bucketIdx div int(gridSize)
+  let bucketCol = bucketIdx mod int(gridSize)
+  let localRow = local div stride
+  let localCol = local mod stride
+  let cz = bucketRow * stride + localRow
+  let cx = bucketCol * stride + localCol
+  cz * 32 + cx
+
+proc newLinearV2File*(): LinearV2File =
+  ## `impl Default for LinearV2File`
+  LinearV2File(regionX: 0'i32, regionZ: 0'i32, gridSize: DefaultGridSize,
+    timestamps: newSeq[uint64](ChunkCount), chunksData: newSeq[seq[byte]](ChunkCount),
+    chunkPresent: newSeq[bool](ChunkCount))
+
+proc serialiseBucket(f: LinearV2File, bucketIdx: int): seq[byte] =
+  ## `LinearV2File::serialise_bucket`
+  result = newSeq[byte](0)
+  for local in 0 ..< chunksPerBucket(f.gridSize):
+    let chunkIndex = globalChunkIndex(bucketIdx, local, f.gridSize)
+    let entry = BucketChunkEntry(timestamp: f.timestamps[chunkIndex], hasData: f.chunkPresent[chunkIndex],
+      data: f.chunksData[chunkIndex])
+    writeInto(entry, result)
+
+proc buildBitmap(f: LinearV2File): ChunkBitmap =
+  ## `LinearV2File::build_bitmap`
+  result = newChunkBitmap()
+  for i in 0 ..< ChunkCount:
+    result.set(i, f.chunkPresent[i])
+
+proc writeLinear*(f: LinearV2File, path: string): IoStatus =
+  ## `<LinearV2File as ChunkSerializer>::write`
+  let tempPath = withExtensionTmp(path)
+  let count = bucketCount(f.gridSize)
+  var compressedBuckets = newSeq[seq[byte]](0)
+  var bucketEntries = newSeq[BucketSizeEntry](0)
+  for bucketIdx in 0 ..< count:
+    let raw = serialiseBucket(f, bucketIdx)
+    let compressed = zstdCompressBytes(raw)
+    if not compressed.ok:
+      return ioErr(compressed.msg)
+    bucketEntries.add(BucketSizeEntry(size: uint32(compressed.data.len), compressionLevel: 1'i8,
+      xxhash: xxh64(compressed.data, 0'u64)))
+    compressedBuckets.add(compressed.data)
+
+  var newest = 0'u64
+  for t in f.timestamps:
+    if t > newest:
+      newest = t
+  let superblock = LinearV2Superblock(newestTimestamp: newest, gridSize: f.gridSize,
+    regionX: f.regionX, regionZ: f.regionZ)
+  let bitmap = buildBitmap(f)
+
+  var o = superblockToBytes(superblock)
+  for b in bitmap.bits:
+    o.add(b)
+  let features = featuresToBytes(emptyFeatures())
+  for b in features:
+    o.add(b)
+  for e in bucketEntries:
+    let entryBytes = bucketEntryToBytes(e)
+    for b in entryBytes:
+      o.add(b)
+  for bucket in compressedBuckets:
+    for b in bucket:
+      o.add(b)
+  putBE(o, SignatureValue, 8)
+
+  # Atomic rename so a crash during write cannot produce a torn file.
+  if not writeFileBytes(tempPath, o):
+    return ioErr("could not write " & tempPath)
+  if not renameReplace(tempPath, path):
+    return ioErr("could not rename " & tempPath)
+  ioOk()
+
+proc readLinear*(rawFile: seq[byte]): (bool, LinearV2File, ChunkReadingError) =
+  ## `<LinearV2File as ChunkSerializer>::read`
+  let f = newLinearV2File()
+  if rawFile.len < LinearSuperblockSize:
+    return (false, f, readErr(creIoError, "UnexpectedEof"))
+  let (sbOk, superblock, sbErr) = superblockFromBytes(rawFile)
+  if not sbOk:
+    return (false, f, sbErr)
+  var c = ByteCursor(data: rawFile, pos: LinearSuperblockSize)
+  let gridSize = superblock.gridSize
+  let count = bucketCount(gridSize)
+
+  # The bitmap is read but, per the spec, not yet reliable: actual presence is determined by the
+  # per-chunk size field inside each bucket.
+  if remaining(c) < ChunkBitmapSize:
+    return (false, f, readErr(creIoError, "UnexpectedEof"))
+  c.pos += ChunkBitmapSize
+
+  let (fOk, _, fErr) = featuresFromBytes(c)
+  if not fOk:
+    return (false, f, fErr)
+
+  if remaining(c) < count * BucketSizeEntrySize:
+    return (false, f, readErr(creIoError, "UnexpectedEof"))
+  var bucketEntries = newSeq[BucketSizeEntry](0)
+  for _ in 0 ..< count:
+    let (ok, e) = bucketEntryFromBytes(c)
+    if not ok:
+      return (false, f, readErr(creIoError, "UnexpectedEof"))
+    bucketEntries.add(e)
+
+  var totalCompressed = 0
+  for e in bucketEntries:
+    totalCompressed += int(e.size)
+  if remaining(c) < totalCompressed + SignatureLen:
+    return (false, f, readErr(creIoError, "UnexpectedEof"))
+  var footer = ByteCursor(data: c.data, pos: c.pos + totalCompressed)
+  if getBE(footer, 8) != SignatureValue:
+    return (false, f, readErr(creInvalidHeader, "Linear v2: invalid footer signature"))
+
+  for bucketIdx in 0 ..< bucketEntries.len:
+    let entry = bucketEntries[bucketIdx]
+    let compressedSize = int(entry.size)
+    let last = c.pos + compressedSize - 1
+    let actualHash = if compressedSize > 0: xxh64(toOpenArray(c.data, c.pos, last), 0'u64) else: xxh64(newSeq[byte](0), 0'u64)
+    if actualHash != entry.xxhash:
+      # Skip the corrupted bucket rather than aborting the whole file: the rest may be intact.
+      c.pos += compressedSize
+      continue
+    let decompressed = zstdDecompressBytes(toOpenArray(c.data, c.pos, last))
+    if not decompressed.ok:
+      return (false, f, readErr(creRegionIsInvalid, decompressed.msg))
+    c.pos += compressedSize
+    var bucketBuf = ByteCursor(data: decompressed.data, pos: 0)
+    for local in 0 ..< chunksPerBucket(gridSize):
+      let chunkIndex = globalChunkIndex(bucketIdx, local, gridSize)
+      let (ok, record) = readFrom(bucketBuf)
+      if not ok:
+        return (false, f, readErr(creIoError, "UnexpectedEof"))
+      f.timestamps[chunkIndex] = record.timestamp
+      f.chunkPresent[chunkIndex] = record.hasData
+      f.chunksData[chunkIndex] = record.data
+
+  f.regionX = superblock.regionX
+  f.regionZ = superblock.regionZ
+  f.gridSize = gridSize
+  (true, f, readErr(creIoError))
+
+proc updateChunkLinear*(f: LinearV2File, x, z: int32, raw: seq[byte]): ChunkWriteStatus =
+  ## `<LinearV2File as ChunkSerializer>::update_chunk`
+  let index = getChunkIndex(x, z)
+  f.timestamps[index] = uint64(getTime().toUnix())
+  f.chunksData[index] = raw
+  f.chunkPresent[index] = true
+  writeOk()
+
+proc getChunkLinear*(f: LinearV2File, x, z: int32): LoadedBytes =
+  ## One step of `<LinearV2File as ChunkSerializer>::get_chunks`.
+  let index = getChunkIndex(x, z)
+  if f.chunkPresent[index]: loadedOk(x, z, f.chunksData[index]) else: loadedMissing(x, z)
+
+proc getChunkKeyLinear*(x, z: int32): string =
+  ## `<LinearV2File as ChunkSerializer>::get_chunk_key`
+  let (rx, rz) = getRegionCoords(x, z)
+  "./r." & $rx & "." & $rz & ".linear"
+
+proc toSerializer*(f: LinearV2File): ChunkSerializer =
+  ChunkSerializer(
+    shouldWrite: proc(isWatched: bool): bool {.closure.} = not isWatched,
+    write: proc(path: string): IoStatus {.closure.} = writeLinear(f, path),
+    updateChunk: proc(x, z: int32, raw: seq[byte]): ChunkWriteStatus {.closure.} = updateChunkLinear(f, x, z, raw),
+    getChunk: proc(x, z: int32): LoadedBytes {.closure.} = getChunkLinear(f, x, z))
+
+proc linearSerializerType*(): ChunkSerializerType =
+  ChunkSerializerType(
+    getChunkKey: proc(x, z: int32): string {.closure.} = getChunkKeyLinear(x, z),
+    makeDefault: proc(): ChunkSerializer {.closure.} = toSerializer(newLinearV2File()),
+    read: proc(r: seq[byte]): SerializerReadResult {.closure.} =
+      let (ok, f, e) = readLinear(r)
+      if ok: serializerOk(toSerializer(f)) else: serializerErr(e))

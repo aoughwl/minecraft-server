@@ -1,0 +1,470 @@
+## The chunk NBT form: `ChunkData` and `ChunkEntityData` to and from bytes.
+## Port of pumpkin-world/src/chunk/format/mod.rs
+##
+## DIVERGENCE from upstream, so a real save reads and writes correctly. Upstream at the pinned
+## commit keeps an internal form: block palettes as a list of state ids, biome palettes as a list of
+## bytes. Reading a vanilla chunk there maps every palette entry to id 0 (`_ => 0` in
+## `extract_u16_array`), an all-air chunk, and the file it writes back is one vanilla cannot read.
+##   * Reading accepts both forms, and on the vanilla form resolves {Name, Properties} and biome names.
+##   * Writing emits the vanilla form.
+##   * Keys upstream's writer drops (`structures`, `PostProcessing`, `LastUpdate`, `OCEAN_FLOOR`, ...)
+##     survive through `extraNbt`/`extraHeightmaps`, and a loaded chunk keeps its `DataVersion`
+##     instead of being re-stamped with one vanilla 1.21.11 would refuse as newer.
+##   * `InhabitedTime` is written back.
+##   * Only sections holding `block_states` extend the section range: vanilla's light-only sections
+##     above the world would otherwise make 25 sections.
+##   * An absent `SkyLight` follows vanilla's meaning (same as the section above, 15 at the top)
+##     rather than upstream's dark `Empty(0)`, when the chunk carries sky light at all.
+##
+## PARTIAL: pumpkin-world/src/chunk/format/mod.rs - ticks hold ids as strings, not `&'static Block`;
+## nothing here checks the id is registered, which upstream's `from_resource_location` does.
+
+{.feature: "lenientnils".}
+
+import ../nbt/[tag, nbtbase, serializer, deserializer, nbtdoc]
+import blockstates, chunkdata, palette, tick, tickscheduler, nbtget, anvilformat
+
+var unknownPaletteEntries* = 0
+  ## Palette entries that named a block or biome this table lacks and fell back to id 0.
+
+type
+  ChunkParseResult* = object
+    ok*: bool
+    chunk*: ChunkData
+    error*: string
+
+  EntityParseResult* = object
+    ok*: bool
+    chunk*: ChunkEntityData
+    error*: string
+
+  BytesResult* = object
+    ok*: bool
+    bytes*: seq[byte]
+    error*: string
+
+proc readRoot(chunkData: openArray[byte]): (bool, NbtCompound, string) =
+  let isNamed = chunkData.len >= 3 and chunkData[0] == 0x0a'u8 and chunkData[1] == 0x00'u8 and
+    chunkData[2] == 0x00'u8
+  var bytes = newSeq[byte](chunkData.len)
+  for i in 0 ..< chunkData.len:
+    bytes[i] = chunkData[i]
+  var reader = newNbtReader(nrmJava, bytes)
+  let res = if isNamed: read(reader) else: readUnnamed(reader)
+  if not res.isOk:
+    return (false, newCompound(), res.error.msg)
+  (true, res.value.rootTag, "")
+
+proc tagAsU16(t: NbtTag): uint32 =
+  ## `extract_u16_array`'s element conversion.
+  case t.kind
+  of ntkInt: uint32(cast[uint16](int16(t.intVal and 0xFFFF'i32)))
+  of ntkShort: uint32(cast[uint16](t.shortVal))
+  of ntkByte: uint32(cast[uint16](int16(t.byteVal)))
+  of ntkLong: uint32(cast[uint16](int16(t.longVal and 0xFFFF'i64)))
+  else: 0'u32
+
+proc blockStateFromCompound(c: NbtCompound): BlockStateId =
+  ## `BlockStateCodec::get_state_id` applied to a vanilla palette entry.
+  let (hasName, name) = nbtString(c, "Name")
+  if not hasName:
+    inc unknownPaletteEntries
+    return 0'u32
+  let (known, blockId) = blockIdByName(name)
+  if not known:
+    inc unknownPaletteEntries
+    return 0'u32
+  let (hasProps, props) = nbtCompound(c, "Properties")
+  if not hasProps:
+    return defaultStateOf(blockId)
+  var kv = newSeq[StateProp](0)
+  for i in 0 ..< props.names.len:
+    if props.values[i].kind == ntkString:
+      kv.add((name: props.names[i], value: props.values[i].stringVal))
+  stateIdFromProps(blockId, kv)
+
+proc extractBlockPalette(t: NbtTag): (bool, seq[BlockStateId]) =
+  ## `extract_u16_array`, plus the vanilla compound form.
+  var o = newSeq[BlockStateId](0)
+  case t.kind
+  of ntkIntArray:
+    for v in t.intArrayVal: o.add(stateIdOrAir(uint32(cast[uint16](int16(v and 0xFFFF'i32)))))
+  of ntkByteArray:
+    for v in t.byteArrayVal: o.add(stateIdOrAir(uint32(cast[uint16](int16(v)))))
+  of ntkLongArray:
+    for v in t.longArrayVal: o.add(stateIdOrAir(uint32(cast[uint16](int16(v and 0xFFFF'i64)))))
+  of ntkList:
+    for e in t.listVal:
+      if e.kind == ntkCompound:
+        o.add(blockStateFromCompound(e.compoundVal))
+      else:
+        o.add(stateIdOrAir(tagAsU16(e)))
+  else:
+    return (false, o)
+  (true, o)
+
+proc extractBiomePalette(t: NbtTag): (bool, seq[PaletteValue]) =
+  ## `extract_u8_array`, plus the vanilla string form.
+  var o = newSeq[PaletteValue](0)
+  case t.kind
+  of ntkByteArray:
+    for v in t.byteArrayVal: o.add(uint32(cast[uint8](v)))
+  of ntkIntArray:
+    for v in t.intArrayVal: o.add(uint32(cast[uint8](int8(v and 0x7F'i32))) or uint32(v and 0x80'i32))
+  of ntkList:
+    for e in t.listVal:
+      case e.kind
+      of ntkString:
+        let (known, id) = biomeIdByName(e.stringVal)
+        if not known:
+          inc unknownPaletteEntries
+        o.add(if known: uint32(id) else: 0'u32)
+      of ntkByte: o.add(uint32(cast[uint8](e.byteVal)))
+      of ntkInt: o.add(uint32(e.intVal and 0xFF'i32))
+      of ntkShort: o.add(uint32(e.shortVal and 0xFF'i16))
+      else: o.add(0'u32)
+  else:
+    return (false, o)
+  (true, o)
+
+proc lightFromSection(c: NbtCompound, name: string): LightContainer =
+  let (ok, arr) = nbtByteArray(c, name)
+  if not ok or arr.len != LightArraySize:
+    return newLightEmpty(0'u8)
+  var data = newSeq[uint8](arr.len)
+  for i in 0 ..< arr.len:
+    data[i] = cast[uint8](arr[i])
+  newLightFull(data)
+
+proc settleAbsentSkyLight(sky: var seq[LightContainer]) =
+  ## See the file comment. Walking down, an absent section copies the bottom layer of the one above;
+  ## above the highest stored section the light is 15.
+  var anyFull = false
+  for l in sky:
+    if not l.isEmpty:
+      anyFull = true
+      break
+  if not anyFull:
+    return
+  var i = sky.len - 1
+  var above = newLightEmpty(15'u8)
+  while i >= 0:
+    if sky[i].isEmpty:
+      if above.isEmpty:
+        sky[i] = newLightEmpty(above.default)
+      else:
+        var filled = newLightEmpty(0'u8)
+        for z in 0 ..< 16:
+          for x in 0 ..< 16:
+            let v = above.get(x, 0, z)
+            for y in 0 ..< 16:
+              filled.set(x, y, z, v)
+        sky[i] = filled
+    above = sky[i]
+    dec i
+
+proc statusFromString(s: string): ChunkStatus =
+  case s
+  of "minecraft:structure_starts": csStructureStarts
+  of "minecraft:structure_references": csStructureReferences
+  of "minecraft:biomes": csBiomes
+  of "minecraft:noise": csNoise
+  of "minecraft:surface": csSurface
+  of "minecraft:carvers": csCarvers
+  of "minecraft:features": csFeatures
+  of "minecraft:initialize_light": csInitializeLight
+  of "minecraft:light": csLight
+  of "minecraft:spawn": csSpawn
+  of "minecraft:full": csFull
+  else: csEmpty
+
+proc statusToString*(s: ChunkStatus): string =
+  case s
+  of csEmpty: "minecraft:empty"
+  of csStructureStarts: "minecraft:structure_starts"
+  of csStructureReferences: "minecraft:structure_references"
+  of csBiomes: "minecraft:biomes"
+  of csNoise: "minecraft:noise"
+  of csSurface: "minecraft:surface"
+  of csCarvers: "minecraft:carvers"
+  of csFeatures: "minecraft:features"
+  of csInitializeLight: "minecraft:initialize_light"
+  of csLight: "minecraft:light"
+  of csSpawn: "minecraft:spawn"
+  of csFull: "minecraft:full"
+
+proc isKnownRootKey(k: string): bool =
+  case k
+  of "DataVersion", "xPos", "zPos", "yPos", "Status", "Heightmaps", "sections", "block_ticks",
+     "fluid_ticks", "block_entities", "isLightOn", "InhabitedTime": true
+  else: false
+
+proc parseErr(msg: string): ChunkParseResult =
+  ChunkParseResult(ok: false, chunk: nil, error: msg)
+
+proc parseTicks(root: NbtCompound, name: string): ChunkTickScheduler =
+  var ticks = newSeq[ScheduledTick[string]](0)
+  let (ok, list) = nbtList(root, name)
+  if ok:
+    for t in list:
+      if t.kind == ntkCompound:
+        let (parsed, tick) = fromNbtCompound(t.compoundVal)
+        if parsed:
+          ticks.add(tick)
+  fromTicks(ticks)
+
+proc internalFromBytes*(chunkData: openArray[byte], x, z: int32): ChunkParseResult =
+  ## `ChunkData::internal_from_bytes`
+  let (readOk, root, readMsg) = readRoot(chunkData)
+  if not readOk:
+    return parseErr(readMsg)
+
+  let (hasX, xPos) = nbtInt(root, "xPos")
+  if not hasX: return parseErr("Missing xPos")
+  let (hasZ, zPos) = nbtInt(root, "zPos")
+  if not hasZ: return parseErr("Missing zPos")
+  if xPos != x or zPos != z:
+    return parseErr("Expected data for chunk " & $x & "," & $z & " but got it for " & $xPos & "," & $zPos & "!")
+  let (hasY, minYSection) = nbtInt(root, "yPos")
+  if not hasY: return parseErr("Missing yPos")
+
+  let (hasSections, sectionsList) = nbtList(root, "sections")
+  var maxYSection = minYSection
+  if hasSections:
+    for tag in sectionsList:
+      if tag.kind == ntkCompound and tag.compoundVal.containsKey("block_states"):
+        let (_, y) = nbtByte(tag.compoundVal, "Y")
+        if int32(y) > maxYSection:
+          maxYSection = int32(y)
+
+  let sectionCount = int(max(maxYSection - minYSection + 1'i32, 0'i32))
+  var blockLights = newSeq[LightContainer](sectionCount)
+  var skyLights = newSeq[LightContainer](sectionCount)
+  var blockPalettes = newSeq[PalettedContainer](sectionCount)
+  var biomePalettes = newSeq[PalettedContainer](sectionCount)
+  for i in 0 ..< sectionCount:
+    blockLights[i] = newLightEmpty(0'u8)
+    skyLights[i] = newLightEmpty(0'u8)
+    blockPalettes[i] = newBlockPalette()
+    biomePalettes[i] = newBiomePalette()
+
+  if hasSections:
+    for tag in sectionsList:
+      if tag.kind != ntkCompound:
+        continue
+      let section = tag.compoundVal
+      let (_, y) = nbtByte(section, "Y")
+      let index = int(y) - int(minYSection)
+      if index < 0 or index >= sectionCount:
+        continue
+      blockLights[index] = lightFromSection(section, "BlockLight")
+      skyLights[index] = lightFromSection(section, "SkyLight")
+
+      let (hasBs, bs) = nbtCompound(section, "block_states")
+      if hasBs:
+        let (_, data) = nbtLongArray(bs, "data")
+        let (hasPalette, paletteTag) = get(bs, "palette")
+        var palette = @[0'u32]
+        if hasPalette:
+          let (extracted, ids) = extractBlockPalette(paletteTag)
+          if extracted:
+            palette = ids
+        blockPalettes[index] = blockFromDiskNbt(ChunkSectionPaletteNbt(data: data, palette: palette))
+
+      let (hasBiomes, biomes) = nbtCompound(section, "biomes")
+      if hasBiomes:
+        let (_, data) = nbtLongArray(biomes, "data")
+        let (hasPalette, paletteTag) = get(biomes, "palette")
+        var palette = @[0'u32]
+        if hasPalette:
+          let (extracted, ids) = extractBiomePalette(paletteTag)
+          if extracted:
+            palette = ids
+        biomePalettes[index] = biomeFromDiskNbt(ChunkSectionPaletteNbt(data: data, palette: palette))
+
+  settleAbsentSkyLight(skyLights)
+
+  # section_coords::section_to_block
+  let minY = minYSection * 16'i32
+  let chunk = newChunkData(x, z, fromPalettes(blockPalettes, biomePalettes, minY))
+  chunk.lightEngine.blockLight = blockLights
+  chunk.lightEngine.skyLight = skyLights
+
+  let (hasHm, hm) = nbtCompound(root, "Heightmaps")
+  if hasHm:
+    for i in 0 ..< hm.names.len:
+      case hm.names[i]
+      of "WORLD_SURFACE":
+        if hm.values[i].kind == ntkLongArray: chunk.heightmap.worldSurface = hm.values[i].longArrayVal
+      of "MOTION_BLOCKING":
+        if hm.values[i].kind == ntkLongArray: chunk.heightmap.motionBlocking = hm.values[i].longArrayVal
+      of "MOTION_BLOCKING_NO_LEAVES":
+        if hm.values[i].kind == ntkLongArray: chunk.heightmap.motionBlockingNoLeaves = hm.values[i].longArrayVal
+      else:
+        put(chunk.extraHeightmaps, hm.names[i], hm.values[i])
+
+  chunk.blockTicks = parseTicks(root, "block_ticks")
+  chunk.fluidTicks = parseTicks(root, "fluid_ticks")
+
+  let (hasBe, beList) = nbtList(root, "block_entities")
+  if hasBe:
+    for tag in beList:
+      if tag.kind == ntkCompound:
+        let (hx, bx) = nbtInt(tag.compoundVal, "x")
+        let (hy, by) = nbtInt(tag.compoundVal, "y")
+        let (hz, bz) = nbtInt(tag.compoundVal, "z")
+        if hx and hy and hz:
+          putBlockEntity(chunk, blockPos(bx, by, bz), tag.compoundVal)
+
+  let (hasLight, lightCorrect) = nbtBool(root, "isLightOn")
+  chunk.lightPopulated = hasLight and lightCorrect
+  let (hasStatus, statusStr) = nbtString(root, "Status")
+  chunk.status = if hasStatus: statusFromString(statusStr) else: csEmpty
+  chunk.dirty = false  # This chunk is read from disk, so it has not been modified
+  let (hasIt, it) = nbtLong(root, "InhabitedTime")
+  chunk.inhabitedTime = if hasIt: cast[uint64](it) else: 0'u64
+
+  let (hasDv, dv) = nbtInt(root, "DataVersion")
+  chunk.dataVersion = if hasDv: dv else: 0'i32
+  for i in 0 ..< root.names.len:
+    if not isKnownRootKey(root.names[i]):
+      put(chunk.extraNbt, root.names[i], root.values[i])
+
+  ChunkParseResult(ok: true, chunk: chunk, error: "")
+
+proc blockPaletteTags(palette: openArray[PaletteValue]): seq[NbtTag] =
+  result = newSeq[NbtTag](0)
+  for id in palette:
+    var entry = newCompound()
+    put(entry, "Name", stringTag("minecraft:" & blockNameOfState(id)))
+    let props = stateProperties(id)
+    if props.len > 0:
+      var propsNbt = newCompound()
+      for p in props:
+        put(propsNbt, p.name, stringTag(p.value))
+      put(entry, "Properties", compoundTag(propsNbt))
+    result.add(compoundTag(entry))
+
+proc biomePaletteTags(palette: openArray[PaletteValue]): seq[NbtTag] =
+  result = newSeq[NbtTag](0)
+  for id in palette:
+    let (known, name) = biomeNameById(int(id))
+    result.add(stringTag("minecraft:" & (if known: name else: "plains")))
+
+proc lightTag(l: LightContainer): NbtTag =
+  var bytes = newSeq[int8](l.data.len)
+  for i in 0 ..< l.data.len:
+    bytes[i] = cast[int8](l.data[i])
+  byteArrayTag(bytes)
+
+proc ticksTag(s: ChunkTickScheduler): NbtTag =
+  var list = newSeq[NbtTag](0)
+  let ticks = toSeq(s)
+  for tick in ticks:
+    list.add(compoundTag(toNbtCompound(tick)))
+  listTag(list)
+
+proc toRootCompound*(c: ChunkData): NbtCompound =
+  ## The compound `ChunkData::internal_to_bytes` builds.
+  result = newCompound()
+  put(result, "DataVersion", intTag(if c.dataVersion != 0'i32: c.dataVersion else: int32(WorldDataVersion)))
+  put(result, "xPos", intTag(c.x))
+  put(result, "zPos", intTag(c.z))
+  # section_coords::block_to_section
+  put(result, "yPos", intTag(c.section.minY shr 4))
+  put(result, "Status", stringTag(statusToString(c.status)))
+
+  var heightmaps = newCompound()
+  if c.heightmap.worldSurface.len > 0:
+    put(heightmaps, "WORLD_SURFACE", longArrayTag(c.heightmap.worldSurface))
+  if c.heightmap.motionBlocking.len > 0:
+    put(heightmaps, "MOTION_BLOCKING", longArrayTag(c.heightmap.motionBlocking))
+  if c.heightmap.motionBlockingNoLeaves.len > 0:
+    put(heightmaps, "MOTION_BLOCKING_NO_LEAVES", longArrayTag(c.heightmap.motionBlockingNoLeaves))
+  for i in 0 ..< c.extraHeightmaps.names.len:
+    put(heightmaps, c.extraHeightmaps.names[i], c.extraHeightmaps.values[i])
+  put(result, "Heightmaps", compoundTag(heightmaps))
+
+  let minSectionY = int(c.section.minY shr 4)
+  var sectionsList = newSeq[NbtTag](0)
+  for i in 0 ..< c.section.count:
+    var sectionComp = newCompound()
+    put(sectionComp, "Y", byteTag(int8(i + minSectionY)))
+
+    let blockStates = blockToDiskNbt(c.section.blockSections[i])
+    var bsComp = newCompound()
+    if blockStates.data.len > 0:
+      put(bsComp, "data", longArrayTag(blockStates.data))
+    put(bsComp, "palette", listTag(blockPaletteTags(blockStates.palette)))
+    put(sectionComp, "block_states", compoundTag(bsComp))
+
+    let biomes = biomeToDiskNbt(c.section.biomeSections[i])
+    var bComp = newCompound()
+    if biomes.data.len > 0:
+      put(bComp, "data", longArrayTag(biomes.data))
+    put(bComp, "palette", listTag(biomePaletteTags(biomes.palette)))
+    put(sectionComp, "biomes", compoundTag(bComp))
+
+    if i < c.lightEngine.blockLight.len and not c.lightEngine.blockLight[i].isEmpty:
+      put(sectionComp, "BlockLight", lightTag(c.lightEngine.blockLight[i]))
+    if i < c.lightEngine.skyLight.len and not c.lightEngine.skyLight[i].isEmpty:
+      put(sectionComp, "SkyLight", lightTag(c.lightEngine.skyLight[i]))
+    sectionsList.add(compoundTag(sectionComp))
+  put(result, "sections", listTag(sectionsList))
+
+  put(result, "block_ticks", ticksTag(c.blockTicks))
+  put(result, "fluid_ticks", ticksTag(c.fluidTicks))
+
+  var blockEntities = newSeq[NbtTag](0)
+  for be in c.pendingBlockEntities:
+    blockEntities.add(compoundTag(be.nbt))
+  put(result, "block_entities", listTag(blockEntities))
+
+  put(result, "isLightOn", boolTag(c.lightPopulated))
+  put(result, "InhabitedTime", longTag(cast[int64](c.inhabitedTime)))
+  for i in 0 ..< c.extraNbt.names.len:
+    put(result, c.extraNbt.names[i], c.extraNbt.values[i])
+
+proc internalToBytes*(c: ChunkData): BytesResult =
+  ## `ChunkData::internal_to_bytes`
+  BytesResult(ok: true, bytes: write(newNbt("", toRootCompound(c)), nwmJava), error: "")
+
+proc internalFromBytesEntity*(chunkData: openArray[byte], x, z: int32): EntityParseResult =
+  ## `ChunkEntityData::internal_from_bytes`
+  let (readOk, root, readMsg) = readRoot(chunkData)
+  if not readOk:
+    return EntityParseResult(ok: false, chunk: nil, error: readMsg)
+  var px = 0'i32
+  var pz = 0'i32
+  let (hasArr, arr) = nbtIntArray(root, "Position")
+  let (hasList, list) = nbtList(root, "Position")
+  if hasArr and arr.len == 2:
+    px = arr[0]
+    pz = arr[1]
+  elif hasList and list.len == 2 and list[0].kind == ntkInt and list[1].kind == ntkInt:
+    px = list[0].intVal
+    pz = list[1].intVal
+  else:
+    return EntityParseResult(ok: false, chunk: nil, error: "Missing Position")
+  if px != x or pz != z:
+    return EntityParseResult(ok: false, chunk: nil, error: "Expected data for entity chunk " & $x & "," & $z &
+      " but got it for " & $px & "," & $pz & "!")
+  let chunk = newChunkEntityData(x, z)
+  let (_, entities) = nbtList(root, "Entities")
+  for e in entities:
+    if e.kind == ntkCompound:
+      chunk.data.add(e.compoundVal)
+  let (hasDv, dv) = nbtInt(root, "DataVersion")
+  chunk.dataVersion = if hasDv: dv else: 0'i32
+  EntityParseResult(ok: true, chunk: chunk, error: "")
+
+proc internalToBytesEntity*(c: ChunkEntityData): BytesResult =
+  ## `ChunkEntityData::internal_to_bytes`. `Position` is an int array, as vanilla stores it.
+  var root = newCompound()
+  put(root, "DataVersion", intTag(if c.dataVersion != 0'i32: c.dataVersion else: int32(WorldDataVersion)))
+  put(root, "Position", intArrayTag(@[c.x, c.z]))
+  var list = newSeq[NbtTag](0)
+  for e in c.data:
+    list.add(compoundTag(e))
+  put(root, "Entities", listTag(list))
+  BytesResult(ok: true, bytes: write(newNbt("", root), nwmJava), error: "")

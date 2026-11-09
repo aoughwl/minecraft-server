@@ -1,0 +1,246 @@
+## The file manager over all three region formats. The scenarios of upstream's commented-out
+## `write_in_place` and `write_bulk` tests in chunk/format/anvil.rs, with hand-built chunks in place of
+## generated ones. The block data is upstream's own fixture, assets/no_blend_no_beard_0_0.chunk: a JSON
+## array of 24*4096 state ids, kept checked out with the pinned tree.
+##
+## Scratch files go under the path in WORLDTEST_DIR when set, otherwise a folder beside the exe.
+
+import std/[syncio, assertions, envvars, cmdline]
+import ../nbt/[tag, nbtbase, serializer, deserializer, nbtdoc]
+import ../config/chunk as chunkconfig
+import blockstates, palette, chunkdata, chunkio, chunkformat, anvilformat, chunklinear,
+       chunkpump, filemanager, worldfs, tick, nbtget
+
+proc scratchDir(): string =
+  result = getEnv("WORLDTEST_DIR")
+  if result.len == 0:
+    result = parentDirW(paramStr(0)) & "/chunkformats_scratch"
+  discard createDirAllW(result)
+
+proc folderAt(base: string): LevelFolder =
+  discard createDirAllW(base & "/region")
+  discard createDirAllW(base & "/entities")
+  LevelFolder(rootFolder: base, dimFolder: base, regionFolder: base & "/region",
+    entitiesFolder: base & "/entities", poiFolder: base & "/poi")
+
+proc wipeRegion(folder: LevelFolder, name: string) =
+  discard removeFileW(folder.regionFolder & "/" & name)
+
+proc readFixtureIds(path: string): seq[uint32] =
+  let (status, bytes) = readFileBytes(path)
+  assert status == rsOk, "missing fixture " & path
+  result = newSeq[uint32](0)
+  var cur = 0'u32
+  var inNum = false
+  for b in bytes:
+    if b >= byte('0') and b <= byte('9'):
+      cur = cur * 10'u32 + uint32(b - byte('0'))
+      inNum = true
+    elif inNum:
+      result.add(cur)
+      cur = 0'u32
+      inNum = false
+
+proc cellsAt(ids: seq[uint32], start: int): proc(cx, cy, cz: int): uint32 {.closure.} =
+  proc(cx, cy, cz: int): uint32 {.closure.} =
+    stateIdOrAir(ids[start + (cy * 16 + cz) * 16 + cx])
+
+proc biomesAt(s: int): proc(cx, cy, cz: int): uint32 {.closure.} =
+  proc(cx, cy, cz: int): uint32 {.closure.} = uint32((cx + cz + s) mod 5)
+
+proc chunkFromFixture(ids: seq[uint32], x, z: int32): ChunkData =
+  ## 24 sections from y -64, filled in y, z, x order from the fixture.
+  var sections = newSeq[PalettedContainer](24)
+  var biomes = newSeq[PalettedContainer](24)
+  for s in 0 ..< 24:
+    sections[s] = fromFn(16, cellsAt(ids, s * 4096))
+    biomes[s] = fromFn(4, biomesAt(s))
+  let c = newChunkData(x, z, fromPalettes(sections, biomes, -64'i32))
+  c.status = csFull
+  c.dirty = true
+  c.lightPopulated = true
+  c.heightmap = calculateHeightmap(c)
+  c
+
+proc smallChunk(x, z: int32, fill: uint32): ChunkData =
+  var s = newChunkSections(4, -64'i32)
+  discard s.setBlockAbsoluteY(1, -60'i32, 2, fill)
+  let c = newChunkData(x, z, s)
+  c.status = csFull
+  c.dirty = true
+  c
+
+proc sid(name: string): uint32 =
+  let (ok, id) = defaultStateByName(name)
+  assert ok, name
+  id
+
+proc assertSameChunk(a, b: ChunkData) =
+  assert a.x == b.x and a.z == b.z
+  assert a.section.count == b.section.count
+  assert a.section.minY == b.section.minY
+  assert dumpBlocks(a.section) == dumpBlocks(b.section), "blocks differ"
+  assert dumpBiomes(a.section) == dumpBiomes(b.section), "biomes differ"
+  assert a.heightmap.worldSurface == b.heightmap.worldSurface
+  assert a.heightmap.motionBlocking == b.heightmap.motionBlocking
+  assert a.heightmap.motionBlockingNoLeaves == b.heightmap.motionBlockingNoLeaves
+  assert a.status == b.status
+
+proc inPlaceConfig(): AnvilChunkConfig =
+  AnvilChunkConfig(compression: ChunkCompression(algorithm: compZLib, level: 6'u32), writeInPlace: true)
+
+proc reloadAndCompare(cfg: AnvilChunkConfig, folder: LevelFolder, chunks: seq[ChunkData]) =
+  let reader = newChunkFileManager(anvilSerializerType(cfg), fkRegion)
+  var coords = newSeq[(int32, int32)](0)
+  for c in chunks:
+    coords.add((c.x, c.z))
+  let loaded = fetchChunks(reader, folder, coords)
+  for i in 0 ..< loaded.len:
+    assert loaded[i].kind == ldLoaded, $loaded[i].error
+    assertSameChunk(chunks[i], loaded[i].chunk)
+
+proc noisyFill(c: ChunkData, section: int) =
+  ## A section with many states, big enough to change the chunk's sector count.
+  for x in 0 ..< 16:
+    for z in 0 ..< 16:
+      for y in 0 ..< 16:
+        let id = uint32(((16 * 16 * y + 16 * z + x) * 2654435761) mod BsStateCount)
+        discard setRelativeBlock(c.section, x, section * 16 + y, z, id)
+  c.dirty = true
+
+proc testRegionFormat(t: ChunkSerializerType, name, fileName: string, chunks: seq[ChunkData], base: string) =
+  let folder = folderAt(base & "/" & name)
+  wipeRegion(folder, fileName)
+  let saver = newChunkFileManager(t, fkRegion)
+  let status = saveChunks(saver, folder, chunks)
+  assert status.ok, $status.error
+  assert fileExistsW(folder.regionFolder & "/" & fileName), fileName
+  assert cachedSerializerCount(saver) == 0  # evicted after the unwatched write
+  for c in chunks:
+    assert not c.dirty
+
+  let reader = newChunkFileManager(t, fkRegion)
+  var coords = newSeq[(int32, int32)](0)
+  for c in chunks:
+    coords.add((c.x, c.z))
+  let loaded = fetchChunks(reader, folder, coords)
+  assert loaded.len == chunks.len
+  for i in 0 ..< loaded.len:
+    assert loaded[i].kind == ldLoaded, $loaded[i].error
+    assertSameChunk(chunks[i], loaded[i].chunk)
+
+  # A chunk never written is Missing, not an error.
+  let missing = fetchChunks(reader, folder, [(7'i32, 7'i32)])
+  assert missing.len == 1 and missing[0].kind == ldMissing
+
+  # A clean chunk is not rewritten: nothing dirty means the serializer sees no update.
+  let saved = chunks[0]
+  saved.dirty = false
+  let again = saveChunks(newChunkFileManager(t, fkRegion), folder, [saved])
+  assert again.ok
+
+proc testNotExisting(base: string) =
+  # `not_existing`: a missing region file gives Missing.
+  let saver = newChunkFileManager(anvilSerializerType(defaultAnvilChunkConfig()), fkRegion)
+  let folder = LevelFolder(rootFolder: "", dimFolder: "", regionFolder: base & "/not_existing",
+    entitiesFolder: "", poiFolder: "")
+  let chunks = fetchChunks(saver, folder, [(0'i32, 0'i32)])
+  assert chunks.len == 1 and chunks[0].kind == ldMissing
+
+proc testWriteInPlace(base: string) =
+  # The scenarios of upstream's commented-out `write_in_place`.
+  let cfg = inPlaceConfig()
+  let t = anvilSerializerType(cfg)
+  let folder = folderAt(base & "/inplace")
+  wipeRegion(folder, "r.0.0.mca")
+  var chunks = newSeq[ChunkData](0)
+  for x in 0'i32 ..< 6'i32:
+    for z in 0'i32 ..< 6'i32:
+      chunks.add(smallChunk(x, z, sid("stone")))
+
+  # TEST APPEND TO END
+  let saver = newChunkFileManager(t, fkRegion)
+  let keep = [(0'i32, 0'i32)]
+  watchChunks(saver, folder, keep)      # stay cached so the write stays in place
+  assert saveChunks(saver, folder, chunks).ok
+  assert cachedSerializerCount(saver) == 1
+  assert not fileExistsW(folder.regionFolder & "/r.0.0.mca"), "a watched region is not flushed"
+  unwatchChunks(saver, folder, keep)
+  chunks[0].dirty = true
+  assert saveChunks(saver, folder, [chunks[0]]).ok
+  assert fileExistsW(folder.regionFolder & "/r.0.0.mca")
+  reloadAndCompare(cfg, folder, chunks)
+
+  # TEST WRITE IN PLACE: same sector count.
+  discard setRelativeBlock(chunks[0].section, 0, 0, 0, sid("dirt"))
+  chunks[0].dirty = true
+  discard setRelativeBlock(chunks[35].section, 0, 0, 0, sid("dirt"))
+  chunks[35].dirty = true
+  let s2 = newChunkFileManager(t, fkRegion)
+  assert saveChunks(s2, folder, chunks).ok
+  reloadAndCompare(cfg, folder, chunks)
+
+  # TEST SWAP SHIFT: a chunk grows, so it swaps or falls back; either way the data must survive.
+  noisyFill(chunks[0], 0)
+  noisyFill(chunks[2], 0)
+  let s3 = newChunkFileManager(t, fkRegion)
+  assert saveChunks(s3, folder, chunks).ok
+  reloadAndCompare(cfg, folder, chunks)
+
+  # TEST DEFAULT TO WRITE ALL: bigger still.
+  noisyFill(chunks[35], 0)
+  noisyFill(chunks[35], 1)
+  noisyFill(chunks[35], 2)
+  let s4 = newChunkFileManager(t, fkRegion)
+  assert saveChunks(s4, folder, chunks).ok
+  reloadAndCompare(cfg, folder, chunks)
+
+proc testAnvilCompressions(base: string, chunk: ChunkData) =
+  for algo in [compGZip, compZLib, compLZ4]:
+    let cfg = AnvilChunkConfig(compression: ChunkCompression(algorithm: algo, level: 6'u32), writeInPlace: false)
+    chunk.dirty = true
+    testRegionFormat(anvilSerializerType(cfg), "algo" & $ord(algo), "r.0.0.mca", @[chunk], base)
+  # A custom-compression config surfaces as a compression error, not a crash.
+  let bad = AnvilChunkConfig(compression: ChunkCompression(algorithm: compCustom, level: 6'u32), writeInPlace: false)
+  let folder = folderAt(base & "/custom")
+  chunk.dirty = true
+  let res = saveChunks(newChunkFileManager(anvilSerializerType(bad), fkRegion), folder, [chunk])
+  assert not res.ok and res.error.kind == cweCompression
+
+proc testEntitySave(base: string) =
+  let folder = folderAt(base & "/entities")
+  discard removeFileW(folder.entitiesFolder & "/r.0.0.mca")
+  let t = anvilSerializerType(defaultAnvilChunkConfig())
+  let saver = newChunkFileManager(t, fkEntities)
+  let e = newChunkEntityData(1'i32, 2'i32)
+  e.dirty = true
+  var pig = newCompound()
+  put(pig, "id", stringTag("minecraft:pig"))
+  e.data.add(pig)
+  assert saveEntityChunks(saver, folder, [e]).ok
+  assert fileExistsW(folder.entitiesFolder & "/r.0.0.mca")
+  let got = fetchEntityChunks(newChunkFileManager(t, fkEntities), folder, [(1'i32, 2'i32), (3'i32, 3'i32)])
+  assert got.len == 2 and got[0].kind == ldLoaded and got[0].chunk.data.len == 1
+  assert got[1].kind == ldMissing
+
+proc main() =
+  let base = scratchDir()
+  testNotExisting(base)
+  testEntitySave(base)
+  testWriteInPlace(base)
+
+  let ids = readFixtureIds("../ref/pumpkin-1.21.11/assets/no_blend_no_beard_0_0.chunk")
+  assert ids.len == 24 * 4096, "fixture has " & $ids.len & " ids"
+  let c0 = chunkFromFixture(ids, 0'i32, 0'i32)
+  let c1 = chunkFromFixture(ids, 1'i32, 0'i32)
+  let cfg = defaultAnvilChunkConfig()
+  testRegionFormat(anvilSerializerType(cfg), "anvil", "r.0.0.mca", @[c0, c1], base)
+  c0.dirty = true
+  c1.dirty = true
+  testRegionFormat(linearSerializerType(), "linear", "r.0.0.linear", @[c0, c1], base)
+  c0.dirty = true
+  testRegionFormat(pumpSerializerType(), "pump", "r.0.0.pump", @[c0], base)
+  testAnvilCompressions(base, c0)
+  echo "filemanager: all checks passed"
+
+main()

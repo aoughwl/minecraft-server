@@ -1,0 +1,427 @@
+## The world's chunk store: loaded chunks, watchers, savers, ticks, block get and set.
+## Port of pumpkin-world/src/level.rs (level.rs)
+##
+## PARTIAL: pumpkin-world/src/level.rs - no `world_gen`, `chunk_loading`, `GenerationSchedule`,
+## `chunk_system_tasks` or thread tracking: those are the chunk-system and generation batches. So
+## `getOrFetchChunk` loads from disk only and answers `lkNotOnDisk` where upstream would generate. No
+## async: `spawn_task`, the cancel token and the channels are plain calls. Random ticks draw from a
+## small xorshift here where upstream uses `rand::random`, since nothing depends on the sequence.
+
+{.feature: "lenientnils".}
+
+import std/[tables, sets, algorithm]
+import ../config/[chunk, lighting, world]
+import ../generated/dimension as dimensiondata
+import ../nbt/tag
+import blockstates, palette, chunkdata, chunkio, filemanager, anvilformat, chunklinear, chunkpump,
+       tick, tickscheduler, worldfs, worldinfo, worldinfodatafiles, lightingruntime, nbtget
+
+type
+  FlatLayer* = object
+    ## `generation::generator::FlatLayer`
+    block_name*: string
+    height*: int32
+
+  RandomTickSample* = object
+    position*: BlockPos
+    tickBlock*: bool
+    tickFluid*: bool
+
+  TickData* = object
+    blockTicks*: seq[OrderedTick[string]]
+    fluidTicks*: seq[OrderedTick[string]]
+    randomTicks*: seq[RandomTickSample]
+
+  FetchKind* = enum
+    lkLoaded     ## In memory or read from disk.
+    lkNotOnDisk  ## Upstream's generation path; see the file comment.
+    lkFailed
+
+  FetchResult* = object
+    kind*: FetchKind
+    chunk*: ChunkData
+    error*: ChunkReadingError
+
+  Level* = ref object
+    seed*: uint64
+    levelFolder*: LevelFolder
+    lightingConfig*: LightingEngineConfig
+    scheduleTickCounts: uint64
+    loadedChunks*: Table[int64, ChunkData]
+    loadedEntityChunks: Table[int64, ChunkEntityData]
+    chunksWithScheduledTicks*: HashSet[int64]
+    chunkWatchers: Table[int64, int]
+    chunkSaver*: ChunkFileManager
+    entitySaver: ChunkFileManager
+    lightEngine*: DynamicLightEngine
+    lightAccess*: LightLevelAccess
+    shutDownChunkSystem*: bool
+    shouldSave*: bool
+    shouldUnload*: bool
+    saveEnabled*: bool
+    autosaveTicks*: uint64
+    isFlat*: bool
+    flatLayers*: seq[FlatLayer]
+    flatBiome*: string
+    randState: uint32
+
+  DimensionType* = dimensiondata.Dimension  ## `pumpkin_data::dimension::Dimension`
+
+const VoidAirName = "void_air"
+
+let voidAirState = defaultStateByName(VoidAirName)[1]
+
+proc chunkKey*(x, z: int32): int64 {.inline.} =
+  (int64(x) shl 32) or (int64(z) and 0xFFFFFFFF'i64)
+
+proc keyX(k: int64): int32 {.inline.} = int32(k shr 32)
+proc keyZ(k: int64): int32 {.inline.} = cast[int32](uint32(cast[uint64](k) and 0xFFFFFFFF'u64))
+
+proc serializerTypeFor(cfg: ChunkConfig): ChunkSerializerType =
+  case cfg.kind
+  of cckLinear: linearSerializerType()
+  of cckAnvil: anvilSerializerType(cfg.anvil)
+  of cckPump: pumpSerializerType()
+
+proc dimFolderFor(rootFolder: string, dimension: DimensionType): string =
+  if dimension.minecraftName == OVERWORLD.minecraftName or dimension.minecraftName == THE_NETHER.minecraftName or dimension.minecraftName == THE_END.minecraftName:
+    return rootFolder
+  var namespace = "minecraft"
+  var name = dimension.minecraftName
+  for i in 0 ..< dimension.minecraftName.len:
+    if dimension.minecraftName[i] == ':':
+      namespace = dimension.minecraftName[0 ..< i]
+      name = dimension.minecraftName[i + 1 .. ^1]
+      break
+  joinPathW(joinPathW(joinPathW(rootFolder, "dimensions"), namespace), name)
+
+proc readFlatSettings(l: Level, mainFolder: string, dimension: DimensionType) =
+  let (hasWgs, wgs) = readWorldGenSettings(mainFolder)
+  if not hasWgs:
+    return
+  let (hasDim, dim) = findDimension(wgs, dimension.minecraftName)
+  if not hasDim or dim.generator.generatorType != "minecraft:flat":
+    return
+  l.isFlat = true
+  if dim.generator.settings.kind == gskCompound:
+    let nbt = dim.generator.settings.compound
+    let (hasBiome, biome) = nbtString(nbt, "biome")
+    if hasBiome:
+      l.flatBiome = biome
+    let (hasLayers, layers) = nbtList(nbt, "layers")
+    if hasLayers:
+      for t in layers:
+        if t.kind == ntkCompound:
+          let (hasBlock, layerBlock) = nbtString(t.compoundVal, "block")
+          let (hasHeight, layerHeight) = nbtInt(t.compoundVal, "height")
+          l.flatLayers.add(FlatLayer(block_name: if hasBlock: layerBlock else: "minecraft:air",
+            height: if hasHeight: layerHeight else: 1'i32))
+
+proc buildLightAccess(l: Level): LightLevelAccess =
+  LightLevelAccess(lightingConfig: l.lightingConfig,
+    getBlockState: proc(pos: BlockPos): BlockStateId {.closure.} =
+      let key = chunkKey(pos.x shr 4, pos.z shr 4)
+      let c = l.loadedChunks.getOrDefault(key, nil)
+      if c == nil:
+        return voidAirState
+      let (ok, id) = getBlockAbsoluteY(c.section, int(pos.x and 15'i32), pos.y, int(pos.z and 15'i32))
+      if ok: id else: voidAirState,
+    isChunkLoaded: proc(cx, cz: int32): bool {.closure.} = l.loadedChunks.hasKey(chunkKey(cx, cz)),
+    chunkAt: proc(cx, cz: int32): ChunkData {.closure.} = l.loadedChunks.getOrDefault(chunkKey(cx, cz), nil))
+
+proc fromRootFolder*(levelConfig: LevelConfig, rootFolder: string, seed: int64, dimension: DimensionType): Level =
+  ## `Level::from_root_folder`
+  let dimFolder = dimFolderFor(rootFolder, dimension)
+  let regionFolder = joinPathW(dimFolder, "region")
+  let entitiesFolder = joinPathW(dimFolder, "entities")
+  let poiFolder = joinPathW(dimFolder, "poi")
+  discard createDirAllW(regionFolder)
+  discard createDirAllW(entitiesFolder)
+  discard createDirAllW(poiFolder)
+  let t = serializerTypeFor(levelConfig.chunk)
+  result = Level(seed: cast[uint64](seed),
+    levelFolder: LevelFolder(rootFolder: rootFolder, dimFolder: dimFolder, regionFolder: regionFolder,
+      entitiesFolder: entitiesFolder, poiFolder: poiFolder),
+    lightingConfig: levelConfig.lighting, scheduleTickCounts: 0'u64,
+    loadedChunks: initTable[int64, ChunkData](), loadedEntityChunks: initTable[int64, ChunkEntityData](),
+    chunksWithScheduledTicks: initHashSet[int64](), chunkWatchers: initTable[int64, int](),
+    chunkSaver: newChunkFileManager(t, fkRegion), entitySaver: newChunkFileManager(t, fkEntities),
+    lightEngine: newDynamicLightEngine(), lightAccess: nil, shutDownChunkSystem: false, shouldSave: false,
+    shouldUnload: false, saveEnabled: true, autosaveTicks: levelConfig.autosaveTicks,
+    isFlat: false, flatLayers: @[], flatBiome: "minecraft:plains",
+    randState: 0x9E3779B9'u32 xor uint32(cast[uint64](seed) and 0xFFFFFFFF'u64) or 1'u32)
+  let mainFolder =
+    if dimension.minecraftName == OVERWORLD.minecraftName: rootFolder
+    else:
+      let parent = parentDirW(rootFolder)
+      if parent.len > 0: parent else: rootFolder
+  readFlatSettings(result, mainFolder, dimension)
+  result.lightAccess = buildLightAccess(result)
+
+proc loadedChunkCount*(l: Level): int {.inline.} = l.loadedChunks.len
+
+proc isChunkLoaded*(l: Level, x, z: int32): bool =
+  ## `Level::is_chunk_loaded`
+  l.loadedChunks.hasKey(chunkKey(x, z))
+
+proc readChunkSync*(l: Level, x, z: int32): ChunkData =
+  ## `Level::read_chunk_sync`, handing back the chunk. nil when not loaded.
+  l.loadedChunks.getOrDefault(chunkKey(x, z), nil)
+
+proc addLoadedChunk*(l: Level, c: ChunkData) =
+  ## The chunk system's insert into `loaded_chunks`.
+  l.loadedChunks[chunkKey(c.x, c.z)] = c
+
+proc removeLoadedChunk*(l: Level, x, z: int32) =
+  l.loadedChunks.del(chunkKey(x, z))
+
+proc readEntityChunkSync*(l: Level, x, z: int32): ChunkEntityData =
+  ## `Level::read_entity_chunk_sync` and `get_entity_chunk_sync`.
+  l.loadedEntityChunks.getOrDefault(chunkKey(x, z), nil)
+
+proc spawnEntityGeneration*(l: Level, x, z: int32): ChunkEntityData =
+  ## `Level::spawn_entity_generation`, run in place.
+  result = newChunkEntityData(x, z)
+  l.loadedEntityChunks[chunkKey(x, z)] = result
+
+proc writeChunks*(l: Level, chunks: openArray[ChunkData]): ChunkWriteStatus =
+  ## `Level::write_chunks`. Upstream logs the error; this hands it back.
+  if chunks.len == 0:
+    return writeOk()
+  saveChunks(l.chunkSaver, l.levelFolder, chunks)
+
+proc writeEntityChunks*(l: Level, chunks: openArray[ChunkEntityData]): ChunkWriteStatus =
+  ## `Level::write_entity_chunks`
+  if chunks.len == 0:
+    return writeOk()
+  saveEntityChunks(l.entitySaver, l.levelFolder, chunks)
+
+proc shutdown*(l: Level): ChunkWriteStatus =
+  ## `Level::shutdown`, after the chunk system is gone: flush the entity chunks.
+  l.shutDownChunkSystem = true
+  blockAndAwaitOngoingTasks(l.chunkSaver)
+  blockAndAwaitOngoingTasks(l.entitySaver)
+  var chunksToWrite = newSeq[ChunkEntityData](0)
+  for _, c in pairs(l.loadedEntityChunks):
+    chunksToWrite.add(c)
+  l.loadedEntityChunks = initTable[int64, ChunkEntityData]()
+  clearWatchedChunks(l.entitySaver)
+  writeEntityChunks(l, chunksToWrite)
+
+proc markChunksAsNewlyWatched*(l: Level, chunks: openArray[(int32, int32)]) =
+  ## `Level::mark_chunks_as_newly_watched`
+  for c in chunks:
+    let k = chunkKey(c[0], c[1])
+    l.chunkWatchers[k] = l.chunkWatchers.getOrDefault(k, 0) + 1
+  watchChunks(l.entitySaver, l.levelFolder, chunks)
+
+proc markChunksAsNotWatched*(l: Level, chunks: openArray[(int32, int32)]): seq[(int32, int32)] =
+  ## `Level::mark_chunks_as_not_watched`
+  result = newSeq[(int32, int32)](0)
+  for c in chunks:
+    let k = chunkKey(c[0], c[1])
+    if l.chunkWatchers.hasKey(k):
+      let n = max(l.chunkWatchers.getOrDefault(k, 0) - 1, 0)
+      if n == 0:
+        l.chunkWatchers.del(k)
+        result.add(c)
+      else:
+        l.chunkWatchers[k] = n
+  unwatchChunks(l.entitySaver, l.levelFolder, chunks)
+
+proc markChunkAsNotWatched*(l: Level, x, z: int32): bool =
+  ## `Level::mark_chunk_as_not_watched`
+  markChunksAsNotWatched(l, [(x, z)]).len > 0
+
+proc isChunkWatched*(l: Level, x, z: int32): bool =
+  ## `Level::is_chunk_watched`
+  l.chunkWatchers.hasKey(chunkKey(x, z))
+
+proc cleanEntityChunks*(l: Level, chunks: openArray[(int32, int32)]): ChunkWriteStatus =
+  ## `Level::clean_entity_chunks`
+  var toProcess = newSeq[ChunkEntityData](0)
+  for c in chunks:
+    let k = chunkKey(c[0], c[1])
+    if l.chunkWatchers.getOrDefault(k, 0) != 0:
+      continue
+    let e = l.loadedEntityChunks.getOrDefault(k, nil)
+    if e != nil:
+      l.loadedEntityChunks.del(k)
+      toProcess.add(e)
+  writeEntityChunks(l, toProcess)
+
+proc cleanMemory*(l: Level): seq[(int32, int32)] =
+  ## `Level::clean_memory`: the entity chunks nothing watches, for the caller to save and clean.
+  result = newSeq[(int32, int32)](0)
+  for k, _ in pairs(l.loadedEntityChunks):
+    if not l.chunkWatchers.hasKey(k):
+      result.add((keyX(k), keyZ(k)))
+
+proc nextRandom(l: Level): uint32 =
+  var x = l.randState
+  x = x xor (x shl 13)
+  x = x xor (x shr 17)
+  x = x xor (x shl 5)
+  l.randState = x
+  x
+
+proc tickLess(a, b: OrderedTick[string]): int = cmp(a, b)
+
+proc getTickData*(l: Level, activeChunks: openArray[(int32, int32)]): TickData =
+  ## `Level::get_tick_data`
+  result = TickData(blockTicks: @[], fluidTicks: @[], randomTicks: @[])
+  # 1. Active chunks: random ticks.
+  for pos in activeChunks:
+    let chunk = l.loadedChunks.getOrDefault(chunkKey(pos[0], pos[1]), nil)
+    if chunk == nil:
+      continue
+    let chunkXBase = chunk.x * 16'i32
+    let chunkZBase = chunk.z * 16'i32
+    let mask = chunk.section.randomlyTickingMask
+    if mask == 0'u32:
+      continue
+    for i in 0 ..< chunk.section.count:
+      if (mask and (1'u32 shl i)) == 0'u32:
+        continue
+      let yBase = chunk.section.minY + int32(i) * 16'i32
+      for _ in 0 ..< 3:
+        let r = nextRandom(l)
+        let xOffset = int(r and 0xF'u32)
+        let zOffset = int((r shr 8) and 0xF'u32)
+        let yInSection = int((r shr 4) and 0xF'u32)
+        let id = get(chunk.section.blockSections[i], xOffset, yInSection, zOffset)
+        let tickBlock = hasRandomTicks(id)
+        let tickFluid = hasRandomTickingFluid(id)
+        if tickBlock or tickFluid:
+          result.randomTicks.add(RandomTickSample(
+            position: blockPos(chunkXBase + int32(xOffset), yBase + int32(yInSection), chunkZBase + int32(zOffset)),
+            tickBlock: tickBlock, tickFluid: tickFluid))
+
+  # 2. Chunks with scheduled ticks; keys first, the set changes below.
+  var scheduled = newSeq[int64](0)
+  for k in items(l.chunksWithScheduledTicks):
+    scheduled.add(k)
+  for k in scheduled:
+    let chunk = l.loadedChunks.getOrDefault(k, nil)
+    if chunk != nil:
+      let bt = stepTick(chunk.blockTicks)
+      for t in bt:
+        result.blockTicks.add(t)
+      let ft = stepTick(chunk.fluidTicks)
+      for t in ft:
+        result.fluidTicks.add(t)
+      if not hasTicks(chunk.blockTicks) and not hasTicks(chunk.fluidTicks):
+        excl(l.chunksWithScheduledTicks, k)
+    else:
+      excl(l.chunksWithScheduledTicks, k)  # Chunk unloaded
+
+  sort(result.blockTicks, tickLess)
+  sort(result.fluidTicks, tickLess)
+
+proc fetchChunk*(l: Level, x, z: int32): FetchResult =
+  ## `Level::get_or_fetch_chunk` and `fetch_chunk`, from disk only; see the file comment.
+  let inMemory = l.loadedChunks.getOrDefault(chunkKey(x, z), nil)
+  if inMemory != nil:
+    return FetchResult(kind: lkLoaded, chunk: inMemory, error: readErr(creIoError))
+  let loaded = fetchChunks(l.chunkSaver, l.levelFolder, [(x, z)])
+  if loaded.len == 0:
+    return FetchResult(kind: lkNotOnDisk, chunk: nil, error: readErr(creChunkNotExist))
+  case loaded[0].kind
+  of ldLoaded:
+    addLoadedChunk(l, loaded[0].chunk)
+    FetchResult(kind: lkLoaded, chunk: loaded[0].chunk, error: readErr(creIoError))
+  of ldMissing:
+    FetchResult(kind: lkNotOnDisk, chunk: nil, error: readErr(creChunkNotExist))
+  of ldError:
+    FetchResult(kind: lkFailed, chunk: nil, error: loaded[0].error)
+
+proc loadSingleEntityChunk(l: Level, x, z: int32): ChunkEntityData =
+  ## `Level::load_single_entity_chunk`; nil where upstream errs with ChunkNotExist.
+  let loaded = fetchEntityChunks(l.entitySaver, l.levelFolder, [(x, z)])
+  if loaded.len > 0 and loaded[0].kind == ldLoaded: loaded[0].chunk else: nil
+
+proc getEntityChunk*(l: Level, x, z: int32): ChunkEntityData =
+  ## `Level::get_entity_chunk`
+  let k = chunkKey(x, z)
+  let inMemory = l.loadedEntityChunks.getOrDefault(k, nil)
+  if inMemory != nil:
+    return inMemory
+  let loaded = loadSingleEntityChunk(l, x, z)
+  if loaded != nil:
+    l.loadedEntityChunks[k] = loaded
+    return loaded
+  spawnEntityGeneration(l, x, z)
+
+proc receiveEntityChunks*(l: Level, chunks: openArray[(int32, int32)]): seq[(ChunkEntityData, bool)] =
+  ## `Level::receive_entity_chunks`: (chunk, newly loaded) for each coordinate, without the channel.
+  result = newSeq[(ChunkEntityData, bool)](0)
+  for c in chunks:
+    let k = chunkKey(c[0], c[1])
+    let inMemory = l.loadedEntityChunks.getOrDefault(k, nil)
+    if inMemory != nil:
+      result.add((inMemory, false))
+    else:
+      result.add((getEntityChunk(l, c[0], c[1]), true))
+
+proc getBlockState*(l: Level, position: BlockPos): BlockStateId =
+  ## `Level::get_block_state`
+  let chunk = l.loadedChunks.getOrDefault(chunkKey(position.x shr 4, position.z shr 4), nil)
+  if chunk == nil:
+    return voidAirState
+  let (ok, id) = getBlockAbsoluteY(chunk.section, int(position.x and 15'i32), position.y, int(position.z and 15'i32))
+  if ok: id else: voidAirState
+
+proc setBlockState*(l: Level, position: BlockPos, blockStateId: BlockStateId): BlockStateId =
+  ## `Level::set_block_state`
+  let chunk = l.loadedChunks.getOrDefault(chunkKey(position.x shr 4, position.z shr 4), nil)
+  if chunk == nil:
+    return voidAirState
+  let replaced = setBlockAbsoluteY(chunk, int(position.x and 15'i32), position.y, int(position.z and 15'i32), blockStateId)
+  if replaced != blockStateId:
+    chunk.dirty = true
+  replaced
+
+proc getRoughBiome*(l: Level, position: BlockPos): int =
+  ## `Level::get_rough_biome`, as the biome id. The default id 0 stands in as upstream's lookup does;
+  ## a section with no biome reads the same.
+  let chunk = l.loadedChunks.getOrDefault(chunkKey(position.x shr 4, position.z shr 4), nil)
+  if chunk == nil:
+    return 0
+  let (ok, id) = getRoughBiomeAbsoluteY(chunk.section, int(position.x and 15'i32), position.y, int(position.z and 15'i32))
+  if ok: int(id) else: 0
+
+proc scheduleBlockTick*(l: Level, blockName: string, blockPosition: BlockPos, delay: uint8, priority: TickPriority) =
+  ## `Level::schedule_block_tick`
+  let tickOrder = l.scheduleTickCounts
+  inc l.scheduleTickCounts
+  let scheduled = ScheduledTick[string](delay: delay, position: blockPosition, priority: priority, value: blockName)
+  let k = chunkKey(blockPosition.x shr 4, blockPosition.z shr 4)
+  let chunk = l.loadedChunks.getOrDefault(k, nil)
+  if chunk != nil:
+    scheduleTick(chunk.blockTicks, scheduled, tickOrder)
+    incl(l.chunksWithScheduledTicks, k)
+
+proc scheduleFluidTick*(l: Level, fluidName: string, blockPosition: BlockPos, delay: uint8, priority: TickPriority) =
+  ## `Level::schedule_fluid_tick`
+  let tickOrder = l.scheduleTickCounts
+  inc l.scheduleTickCounts
+  let scheduled = ScheduledTick[string](delay: delay, position: blockPosition, priority: priority, value: fluidName)
+  let k = chunkKey(blockPosition.x shr 4, blockPosition.z shr 4)
+  let chunk = l.loadedChunks.getOrDefault(k, nil)
+  if chunk != nil:
+    scheduleTick(chunk.fluidTicks, scheduled, tickOrder)
+    incl(l.chunksWithScheduledTicks, k)
+
+proc isBlockTickScheduled*(l: Level, pos: BlockPos, blockName: string): bool =
+  ## `Level::is_block_tick_scheduled`
+  let chunk = l.loadedChunks.getOrDefault(chunkKey(pos.x shr 4, pos.z shr 4), nil)
+  chunk != nil and isScheduled(chunk.blockTicks, pos, blockName)
+
+proc isFluidTickScheduled*(l: Level, pos: BlockPos, fluidName: string): bool =
+  ## `Level::is_fluid_tick_scheduled`
+  let chunk = l.loadedChunks.getOrDefault(chunkKey(pos.x shr 4, pos.z shr 4), nil)
+  chunk != nil and isScheduled(chunk.fluidTicks, pos, fluidName)
+
+proc updateLightingAt*(l: Level, pos: BlockPos) =
+  ## `level.light_engine.update_lighting_at(&level, pos)`
+  updateLightingAt(l.lightEngine, l.lightAccess, pos)
