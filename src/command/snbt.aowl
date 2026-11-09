@@ -1,0 +1,1033 @@
+## The SNBT parser: stringified NBT in commands, with the suggestions a failed parse leaves behind.
+## Port of pumpkin/src/command/snbt/mod.rs
+## Port of pumpkin/src/command/snbt/markers.rs
+## Port of pumpkin/src/command/snbt/operations.rs
+## Port of pumpkin/src/command/snbt/rules.rs
+##
+## Each rule returns false for upstream's `None`, with its value in a `var`. Every `parse_or_revert` keeps its place:
+## a rule that wraps one saves the cursor and restores it on failure.
+
+import std/[math, options, parseutils, strutils]
+import ../util/uuid
+import ../nbt/[tag, nbt_ops]
+import ../codecs/[data_result, dynamic_ops]
+import ../generated/translation
+import cmderrors, string_reader, suggestion, parser
+
+type
+  Sign = enum
+    signPlus
+    signMinus
+
+  SignedPrefix = enum
+    spNone
+    spUnsigned
+    spSigned
+
+  TypeSuffix = enum
+    tsNone
+    tsByte
+    tsShort
+    tsInt
+    tsLong
+    tsFloat
+    tsDouble
+
+  Base = enum
+    baseBinary
+    baseDecimal
+    baseHexadecimal
+
+  ArrayPrefix = enum
+    apByte
+    apLong
+    apInt
+
+  IntegerLiteral = object
+    sign: Sign
+    base: Base
+    digits: string
+    suffixSign: SignedPrefix
+    suffixType: TypeSuffix
+
+  SnbtNumberKind = enum
+    snByte
+    snShort
+    snInt
+    snLong
+
+  SnbtNumber = object
+    kind: SnbtNumberKind
+    value: int64
+
+  SignedString = object
+    present: bool
+    sign: Sign
+    value: string
+
+  SnbtParser = object
+    reader: StringReader
+    errors: ParserErrors
+
+proc et0(k: string): CommandErrorType = errorType0(k, k)
+proc et1(k: string): CommandErrorType = errorType1(k, k)
+
+proc numberParseFailure(): CommandErrorType = et1(JAVA_SNBT_PARSER_NUMBER_PARSE_FAILURE)
+proc underscoreNotAllowed(): CommandErrorType = et0(JAVA_SNBT_PARSER_UNDESCORE_NOT_ALLOWED)
+proc expectedHexEscape(): CommandErrorType = et1(JAVA_SNBT_PARSER_EXPECTED_HEX_ESCAPE)
+proc expectedNonNegativeNumber(): CommandErrorType = et0(JAVA_SNBT_PARSER_EXPECTED_NON_NEGATIVE_NUMBER)
+proc invalidArrayElementType(): CommandErrorType = et0(JAVA_SNBT_PARSER_INVALID_ARRAY_ELEMENT_TYPE)
+proc expectedIntegerType(): CommandErrorType = et0(JAVA_SNBT_PARSER_EXPECTED_INTEGER_TYPE)
+proc expectedNumberOrBoolean(): CommandErrorType = et0(JAVA_SNBT_PARSER_EXPECTED_NUMBER_OR_BOOLEAN)
+proc expectedStringUuid(): CommandErrorType = et0(JAVA_SNBT_PARSER_EXPECTED_STRING_UUID)
+proc invalidCodepoint(): CommandErrorType = et1(JAVA_SNBT_PARSER_INVALID_CODEPOINT)
+proc noSuchOperation(): CommandErrorType = et1(JAVA_SNBT_PARSER_NO_SUCH_OPERATION)
+proc expectedFloatType(): CommandErrorType = et0(JAVA_SNBT_PARSER_EXPECTED_FLOAT_TYPE)
+proc invalidCharacterName(): CommandErrorType = et0(JAVA_SNBT_PARSER_INVALID_CHARACTER_NAME)
+proc invalidUnquotedStart(): CommandErrorType = et0(JAVA_SNBT_PARSER_INVALID_UNQUOTED_START)
+proc expectedUnquotedString(): CommandErrorType = et0(JAVA_SNBT_PARSER_EXPECTED_UNQUOTED_STRING)
+proc invalidStringContents(): CommandErrorType = et0(JAVA_SNBT_PARSER_INVALID_STRING_CONTENTS)
+proc expectedBinaryNumeral(): CommandErrorType = et0(JAVA_SNBT_PARSER_EXPECTED_BINARY_NUMERAL)
+proc expectedDecimalNumeral(): CommandErrorType = et0(JAVA_SNBT_PARSER_EXPECTED_DECIMAL_NUMERAL)
+proc expectedHexNumeral(): CommandErrorType = et0(JAVA_SNBT_PARSER_EXPECTED_HEX_NUMERAL)
+proc emptyKey(): CommandErrorType = et0(JAVA_SNBT_PARSER_EMPTY_KEY)
+proc leadingZeroNotAllowed(): CommandErrorType = et0(JAVA_SNBT_PARSER_LEADING_ZERO_NOT_ALLOWED)
+proc infinityNotAllowed(): CommandErrorType = et0(JAVA_SNBT_PARSER_INFINITY_NOT_ALLOWED)
+proc parsingFailedWithoutErrors(): CommandErrorType = et0(JAVA_COMMAND_FAILED)
+
+proc simple(p: var SnbtParser; t: CommandErrorType) = storeSimpleError(p.errors, p.reader, t)
+proc dynamic(p: var SnbtParser; t: CommandErrorType; a: string) = storeDynamicError(p.errors, p.reader, t, a)
+proc literalError(p: var SnbtParser; a: string; suggestions: seq[string]) =
+  storeDynamicErrorAndSuggest(p.errors, p.reader, literalIncorrect(), a, suggestions)
+
+proc peekAny(p: SnbtParser; a, b: char): bool =
+  let c = peek(p.reader)
+  c == int32(ord(a)) or c == int32(ord(b))
+
+# ---- Numbers ------------------------------------------------------------------------------------------------------
+
+proc shouldAllow(b: Base; c: char): bool =
+  if c == '_':
+    return true
+  case b
+  of baseBinary: c == '0' or c == '1'
+  of baseDecimal: c >= '0' and c <= '9'
+  of baseHexadecimal: (c >= '0' and c <= '9') or (c >= 'A' and c <= 'F') or (c >= 'a' and c <= 'f')
+
+proc noValueErrorType(b: Base): CommandErrorType =
+  case b
+  of baseBinary: expectedBinaryNumeral()
+  of baseDecimal: expectedDecimalNumeral()
+  of baseHexadecimal: expectedHexNumeral()
+
+proc radix(b: Base): uint64 =
+  case b
+  of baseBinary: 2'u64
+  of baseDecimal: 10'u64
+  of baseHexadecimal: 16'u64
+
+proc digitValue(c: char): uint64 =
+  if c >= '0' and c <= '9': uint64(ord(c) - ord('0'))
+  elif c >= 'a' and c <= 'f': uint64(ord(c) - ord('a') + 10)
+  else: uint64(ord(c) - ord('A') + 10)
+
+proc parseMagnitude(s: string; radix: uint64; res: var uint64): bool =
+  ## `u64::from_str_radix`; digits only.
+  if s.len == 0:
+    return false
+  var acc = 0'u64
+  for c in s:
+    let d = digitValue(c)
+    if acc > (high(uint64) - d) div radix:
+      return false
+    acc = acc * radix + d
+  res = acc
+  true
+
+proc parseSigned(number: string; radix: uint64; low, high0: int64; res: var int64): bool =
+  ## `i32::from_str_radix` and `i64::from_str_radix`; the string may lead with `-`.
+  let neg = number.len > 0 and number[0] == '-'
+  var m = 0'u64
+  if not parseMagnitude(if neg: number[1 ..< number.len] else: number, radix, m):
+    return false
+  if neg:
+    if m > uint64(high0) + 1'u64:
+      return false
+    if m == uint64(high0) + 1'u64:
+      res = low
+    else:
+      res = -int64(m)
+  else:
+    if m > uint64(high0):
+      return false
+    res = int64(m)
+  true
+
+proc parseFloatText(s: string; value: var float64): bool =
+  ## `str::parse::<f64>` on a buffer the rules built: `[-][whole][.fraction][e[-]digits]`.
+  var i = 0
+  var neg = false
+  if i < s.len and s[i] == '-':
+    neg = true
+    inc i
+  var mantissa = ""
+  var fractionDigits = 0
+  var seenDot = false
+  var anyDigit = false
+  while i < s.len and s[i] != 'e':
+    if s[i] == '.':
+      if seenDot:
+        return false
+      seenDot = true
+    else:
+      anyDigit = true
+      mantissa.add(s[i])
+      if seenDot:
+        inc fractionDigits
+    inc i
+  if not anyDigit:
+    return false
+  var allZero = true
+  for c in mantissa:
+    if c != '0':
+      allZero = false
+  if allZero:
+    value = if neg: -0.0 else: 0.0
+    return true
+  # An exponent past any double's range decides the answer before the digits do, and would overflow the reader's.
+  var exponent = 0'i64
+  if i < s.len:
+    inc i
+    var expNeg = false
+    if i < s.len and s[i] == '-':
+      expNeg = true
+      inc i
+    var e = 0'i64
+    while i < s.len:
+      if e < 100000000000'i64:
+        e = e * 10'i64 + int64(ord(s[i]) - ord('0'))
+      inc i
+    exponent = if expNeg: -e else: e
+  let effective = exponent + int64(mantissa.len) - int64(fractionDigits)
+  if effective > 400'i64:
+    value = if neg: -Inf else: Inf
+    return true
+  if effective < -400'i64:
+    value = if neg: -0.0 else: 0.0
+    return true
+  var text0 = (if neg: "-" else: "") & mantissa & "e" & $(exponent - int64(fractionDigits))
+  var v = 0.0
+  if parseBiggestFloat(text0, v) != text0.len:
+    return false
+  value = v
+  true
+
+proc parseNumeral(p: var SnbtParser; base: Base; res: var string): bool =
+  let origin = cursor(p.reader)
+  skipWhitespace(p.reader)
+  let start = cursor(p.reader)
+  var stop = start
+  while stop < p.reader.str.len and shouldAllow(base, p.reader.str[stop]):
+    inc stop
+  if start == stop:
+    simple(p, noValueErrorType(base))
+    setCursor(p.reader, origin)
+    return false
+  if p.reader.str[start] == '_' or p.reader.str[stop - 1] == '_':
+    simple(p, underscoreNotAllowed())
+    setCursor(p.reader, origin)
+    return false
+  setCursor(p.reader, stop)
+  res = p.reader.str[start ..< stop]
+  true
+
+proc cleanAndAppend(buffer: var string; reference: string) =
+  for c in reference:
+    if c != '_':
+      buffer.add(c)
+
+proc integerTypeSuffix(p: var SnbtParser; res: var TypeSuffix): bool =
+  skipWhitespace(p.reader)
+  if peekAny(p, 'b', 'B'):
+    skip(p.reader)
+    res = tsByte
+  elif peekAny(p, 's', 'S'):
+    skip(p.reader)
+    res = tsShort
+  elif peekAny(p, 'i', 'I'):
+    skip(p.reader)
+    res = tsInt
+  elif peekAny(p, 'l', 'L'):
+    skip(p.reader)
+    res = tsLong
+  else:
+    literalError(p, "b|B", @["b", "B", "s", "S", "i", "I", "l", "L"])
+    return false
+  true
+
+proc signRule(p: var SnbtParser; res: var Sign): bool =
+  let origin = cursor(p.reader)
+  skipWhitespace(p.reader)
+  if peekIs(p.reader, '+'):
+    skip(p.reader)
+    res = signPlus
+    return true
+  if peekIs(p.reader, '-'):
+    skip(p.reader)
+    res = signMinus
+    return true
+  literalError(p, "+", @["+", "-"])
+  setCursor(p.reader, origin)
+  false
+
+proc integerSuffix(p: var SnbtParser; sign: var SignedPrefix; suffix: var TypeSuffix): bool =
+  let origin = cursor(p.reader)
+  skipWhitespace(p.reader)
+  if peekAny(p, 'u', 'U'):
+    skip(p.reader)
+    sign = spUnsigned
+    if integerTypeSuffix(p, suffix):
+      return true
+  elif peekAny(p, 's', 'S'):
+    let inner = cursor(p.reader)
+    skip(p.reader)
+    if integerTypeSuffix(p, suffix):
+      sign = spSigned
+      return true
+    setCursor(p.reader, inner)
+    sign = spNone
+    if integerTypeSuffix(p, suffix):
+      return true
+  elif peekAny(p, 'b', 'B') or peekAny(p, 'i', 'I') or peekAny(p, 'l', 'L'):
+    sign = spNone
+    if integerTypeSuffix(p, suffix):
+      return true
+  else:
+    literalError(p, "u|U", @["u", "U", "s", "S", "b", "B", "s", "S", "i", "I", "l", "L"])
+  setCursor(p.reader, origin)
+  false
+
+proc integerLiteralBody(p: var SnbtParser; res: var IntegerLiteral): bool =
+  var sign = signPlus
+  discard signRule(p, sign)
+  res.sign = sign
+  res.suffixSign = spNone
+  res.suffixType = tsNone
+  skipWhitespace(p.reader)
+  let afterSign = cursor(p.reader)
+  if peekIs(p.reader, '0'):
+    skip(p.reader)
+    skipWhitespace(p.reader)
+    if peekAny(p, 'x', 'X'):
+      skip(p.reader)
+      res.base = baseHexadecimal
+      return parseNumeral(p, baseHexadecimal, res.digits)
+    elif peekAny(p, 'b', 'B'):
+      skip(p.reader)
+      var number = ""
+      if parseNumeral(p, baseBinary, number):
+        res.base = baseBinary
+        res.digits = number
+        return true
+      setCursor(p.reader, afterSign)
+    else:
+      var number = ""
+      if not parseNumeral(p, baseDecimal, number):
+        res.base = baseDecimal
+        res.digits = "0"
+        return true
+      simple(p, leadingZeroNotAllowed())
+      return false
+  var number = ""
+  if parseNumeral(p, baseDecimal, number):
+    res.base = baseDecimal
+    res.digits = number
+    return true
+  literalError(p, "0", @["0"])
+  false
+
+proc integerLiteral(p: var SnbtParser; res: var IntegerLiteral): bool =
+  let origin = cursor(p.reader)
+  if not integerLiteralBody(p, res):
+    setCursor(p.reader, origin)
+    return false
+  var s = spNone
+  var t = tsNone
+  if integerSuffix(p, s, t):
+    res.suffixSign = s
+    res.suffixType = t
+  else:
+    res.suffixSign = spNone
+    res.suffixType = tsNone
+  true
+
+proc signedPrefixOrDefault(l: IntegerLiteral): SignedPrefix =
+  if l.suffixSign == spNone:
+    if l.base == baseDecimal: spSigned else: spUnsigned
+  else:
+    l.suffixSign
+
+proc parseIntOrError(p: var SnbtParser; number: string; radix: uint64; res: var int64): bool =
+  if parseSigned(number, radix, int64(int32.low), int64(int32.high), res):
+    return true
+  dynamic(p, numberParseFailure(), "For input string: \"" & number & "\"")
+  false
+
+proc parseIntegerLiteral(p: var SnbtParser; l: IntegerLiteral; suffix: TypeSuffix; res: var SnbtNumber): bool =
+  let signed = signedPrefixOrDefault(l) == spSigned
+  if not signed and l.sign == signMinus:
+    simple(p, expectedNonNegativeNumber())
+    return false
+  var number = ""
+  if l.sign == signMinus:
+    number.add('-')
+  cleanAndAppend(number, l.digits)
+  let r = radix(l.base)
+  var v = 0'i64
+  if signed:
+    case suffix
+    of tsByte, tsShort:
+      if not parseIntOrError(p, number, r, v):
+        return false
+      let lo = if suffix == tsByte: -128'i64 else: -32768'i64
+      let hi = if suffix == tsByte: 127'i64 else: 32767'i64
+      if v < lo or v > hi:
+        dynamic(p, numberParseFailure(), "Value out of range. Value:\"" & number & "\" Radix:" & $r)
+        return false
+      res = SnbtNumber(kind: (if suffix == tsByte: snByte else: snShort), value: v)
+    of tsInt:
+      if not parseIntOrError(p, number, r, v):
+        return false
+      res = SnbtNumber(kind: snInt, value: v)
+    of tsLong:
+      if not parseSigned(number, r, int64.low, int64.high, v):
+        dynamic(p, numberParseFailure(), "For input string: \"" & number & "\"")
+        return false
+      res = SnbtNumber(kind: snLong, value: v)
+    else:
+      simple(p, expectedIntegerType())
+      return false
+  else:
+    case suffix
+    of tsByte, tsShort:
+      if not parseIntOrError(p, number, r, v):
+        return false
+      let hi = if suffix == tsByte: 255'i64 else: 65535'i64
+      if v < 0'i64 or v > hi:
+        dynamic(p, numberParseFailure(), "out of range: " & number)
+        return false
+      if suffix == tsByte:
+        res = SnbtNumber(kind: snByte, value: int64(cast[int8](uint8(v))))
+      else:
+        res = SnbtNumber(kind: snShort, value: int64(cast[int16](uint16(v))))
+    of tsInt:
+      var m = 0'u64
+      if not parseMagnitude(number, r, m) or m > uint64(high(uint32)):
+        dynamic(p, numberParseFailure(), "String value " & number & " exceeds range of unsigned int.")
+        return false
+      res = SnbtNumber(kind: snInt, value: int64(cast[int32](uint32(m))))
+    of tsLong:
+      var m = 0'u64
+      if not parseMagnitude(number, r, m):
+        dynamic(p, numberParseFailure(), "String value " & number & " exceeds range of unsigned long.")
+        return false
+      res = SnbtNumber(kind: snLong, value: cast[int64](m))
+    else:
+      simple(p, expectedIntegerType())
+      return false
+  true
+
+proc orSuffix(a, b: TypeSuffix): TypeSuffix =
+  if a == tsNone: b else: a
+
+proc createPrefixedArray(p: var SnbtParser; values: seq[IntegerLiteral]; prefix: ArrayPrefix; res: var NbtTag): bool =
+  case prefix
+  of apByte:
+    var bytes: seq[int8] = @[]
+    for value in values:
+      if value.suffixType != tsNone and value.suffixType != tsByte:
+        simple(p, invalidArrayElementType())
+        return false
+      var n = SnbtNumber()
+      if not parseIntegerLiteral(p, value, tsByte, n):
+        return false
+      bytes.add(int8(n.value))
+    res = NbtTag(kind: ntkByteArray, byteArrayVal: bytes)
+  of apInt:
+    var ints: seq[int32] = @[]
+    for value in values:
+      let suffix = orSuffix(value.suffixType, tsInt)
+      if suffix != tsByte and suffix != tsShort and suffix != tsInt:
+        simple(p, invalidArrayElementType())
+        return false
+      var n = SnbtNumber()
+      if not parseIntegerLiteral(p, value, suffix, n):
+        return false
+      ints.add(int32(n.value))
+    res = NbtTag(kind: ntkIntArray, intArrayVal: ints)
+  of apLong:
+    var longs: seq[int64] = @[]
+    for value in values:
+      let suffix = orSuffix(value.suffixType, tsLong)
+      if suffix != tsByte and suffix != tsShort and suffix != tsInt and suffix != tsLong:
+        simple(p, invalidArrayElementType())
+        return false
+      var n = SnbtNumber()
+      if not parseIntegerLiteral(p, value, suffix, n):
+        return false
+      longs.add(n.value)
+    res = NbtTag(kind: ntkLongArray, longArrayVal: longs)
+  true
+
+proc floatTypeSuffix(p: var SnbtParser; res: var TypeSuffix): bool =
+  let origin = cursor(p.reader)
+  skipWhitespace(p.reader)
+  if peekAny(p, 'f', 'F'):
+    skip(p.reader)
+    res = tsFloat
+    return true
+  if peekAny(p, 'd', 'D'):
+    skip(p.reader)
+    res = tsDouble
+    return true
+  literalError(p, "f|F", @["f", "F", "d", "D"])
+  setCursor(p.reader, origin)
+  false
+
+proc floatExponentPart(p: var SnbtParser; res: var SignedString): bool =
+  let origin = cursor(p.reader)
+  skipWhitespace(p.reader)
+  if peekAny(p, 'e', 'E'):
+    skip(p.reader)
+    var sign = signPlus
+    discard signRule(p, sign)
+    var value = ""
+    if parseNumeral(p, baseDecimal, value):
+      res = SignedString(present: true, sign: sign, value: value)
+      return true
+  else:
+    literalError(p, "e|E", @["e", "E"])
+  setCursor(p.reader, origin)
+  false
+
+proc floatLiteral(p: var SnbtParser; res: var NbtTag): bool =
+  var sign = signPlus
+  discard signRule(p, sign)
+  let origin = cursor(p.reader)
+  var wholePart = ""
+  var fractionPart = ""
+  var hasFraction = false
+  var exponent = SignedString()
+  var typeSuffix = tsNone
+  var hasSuffix = false
+  skipWhitespace(p.reader)
+  var whole = ""
+  if parseNumeral(p, baseDecimal, whole):
+    wholePart = whole
+    skipWhitespace(p.reader)
+    if peekIs(p.reader, '.'):
+      skip(p.reader)
+      var f = ""
+      if parseNumeral(p, baseDecimal, f):
+        hasFraction = true
+        fractionPart = f
+      discard floatExponentPart(p, exponent)
+      hasSuffix = floatTypeSuffix(p, typeSuffix)
+    else:
+      literalError(p, ".", @["."])
+      discard floatExponentPart(p, exponent)
+      hasSuffix = floatTypeSuffix(p, typeSuffix)
+      if not exponent.present and not hasSuffix:
+        setCursor(p.reader, origin)
+        return false
+  else:
+    skipWhitespace(p.reader)
+    if peekIs(p.reader, '.'):
+      skip(p.reader)
+      var f = ""
+      if not parseNumeral(p, baseDecimal, f):
+        setCursor(p.reader, origin)
+        return false
+      hasFraction = true
+      fractionPart = f
+      discard floatExponentPart(p, exponent)
+      hasSuffix = floatTypeSuffix(p, typeSuffix)
+    else:
+      literalError(p, ".", @["."])
+      setCursor(p.reader, origin)
+      return false
+  var buffer = ""
+  if sign == signMinus:
+    buffer.add('-')
+  cleanAndAppend(buffer, wholePart)
+  if hasFraction:
+    buffer.add('.')
+    cleanAndAppend(buffer, fractionPart)
+  if exponent.present:
+    buffer.add('e')
+    if exponent.sign == signMinus:
+      buffer.add('-')
+    cleanAndAppend(buffer, exponent.value)
+  if not hasSuffix or typeSuffix == tsDouble:
+    var v = 0.0
+    if not parseFloatText(buffer, v):
+      dynamic(p, numberParseFailure(), "Invalid float literal")
+    elif classify(v) != fcInf and classify(v) != fcNegInf and classify(v) != fcNan:
+      res = NbtTag(kind: ntkDouble, doubleVal: v)
+      return true
+    else:
+      simple(p, infinityNotAllowed())
+  elif typeSuffix == tsFloat:
+    var v = 0.0
+    if not parseFloatText(buffer, v):
+      dynamic(p, numberParseFailure(), "Invalid float literal")
+    else:
+      let f = float32(v)
+      if classify(f) != fcInf and classify(f) != fcNegInf and classify(f) != fcNan:
+        res = NbtTag(kind: ntkFloat, floatVal: f)
+        return true
+      simple(p, infinityNotAllowed())
+  else:
+    simple(p, expectedFloatType())
+  false
+
+# ---- Strings ------------------------------------------------------------------------------------------------------
+
+proc hexLiteral(p: var SnbtParser; digits: int; res: var uint64): bool =
+  let origin = cursor(p.reader)
+  skipWhitespace(p.reader)
+  let start = cursor(p.reader)
+  var stop = start
+  var count = 0
+  while stop < p.reader.str.len and count < digits:
+    let c = p.reader.str[stop]
+    if not ((c >= '0' and c <= '9') or (c >= 'a' and c <= 'f') or (c >= 'A' and c <= 'F')):
+      break
+    inc stop
+    inc count
+  if stop - start < digits:
+    dynamic(p, expectedHexEscape(), $digits)
+    setCursor(p.reader, origin)
+    return false
+  setCursor(p.reader, stop)
+  parseMagnitude(p.reader.str[start ..< stop], 16'u64, res)
+
+proc escapeSequence(p: var SnbtParser; res: var uint32): bool =
+  let cursorAtEscapingChar = cursor(p.reader)
+  let c = read(p.reader)
+  var value = 0'u64
+  if c == int32(ord('b')):
+    res = 8'u32
+    return true
+  if c == int32(ord('s')):
+    res = 32'u32
+    return true
+  if c == int32(ord('t')):
+    res = 9'u32
+    return true
+  if c == int32(ord('n')):
+    res = 10'u32
+    return true
+  if c == int32(ord('f')):
+    res = 12'u32
+    return true
+  if c == int32(ord('r')):
+    res = 13'u32
+    return true
+  if c == int32(ord('\\')) or c == int32(ord('\'')) or c == int32(ord('"')):
+    res = uint32(c)
+    return true
+  if c == int32(ord('x')):
+    if not hexLiteral(p, 2, value):
+      return false
+  elif c == int32(ord('u')):
+    if not hexLiteral(p, 4, value):
+      return false
+  elif c == int32(ord('U')):
+    if not hexLiteral(p, 8, value):
+      return false
+  elif c == int32(ord('N')):
+    if not peekIs(p.reader, '{'):
+      literalError(p, "{", @["}"])
+      return false
+    skip(p.reader)
+    let start = cursor(p.reader)
+    var stop = start
+    while stop < p.reader.str.len:
+      let b = p.reader.str[stop]
+      if (b >= 'a' and b <= 'z') or (b >= 'A' and b <= 'Z') or (b >= '0' and b <= '9') or b == ' ' or b == '-':
+        inc stop
+      else:
+        break
+    if start == stop:
+      simple(p, invalidCharacterName())
+      return false
+    setCursor(p.reader, stop)
+    if not peekIs(p.reader, '}'):
+      literalError(p, "}", @["}"])
+      return false
+    skip(p.reader)
+    # Upstream resolves no character names: `UnicodeName(_name) => None`.
+    return false
+  else:
+    setCursor(p.reader, cursorAtEscapingChar)
+    literalError(p, "b", @["b", "s", "t", "n", "f", "r", "\\", "'", "\"", "x", "u", "U", "N"])
+    return false
+  if value <= 0x10FFFF'u64:
+    res = uint32(value)
+    true
+  else:
+    const digitsHex = "0123456789ABCDEF"
+    var hex = ""
+    var shift = 28
+    while shift >= 0:
+      hex.add(digitsHex[int((value shr shift) and 15'u64)])
+      shift -= 4
+    dynamic(p, invalidCodepoint(), "U+" & hex)
+    false
+
+proc parseStringLiteral(p: var SnbtParser; quote: int32; res: var string): bool =
+  ## `parse_string_literal!`.
+  const Replacement = 0xFFFD'i32
+  var buffer = ""
+  var highSurrogateQueue = 0'u32
+  while true:
+    let c = read(p.reader)
+    if c == NoChar:
+      storeSimpleErrorAndSuggest(p.errors, p.reader, invalidStringContents(), @["'", "\"", "\\"])
+      return false
+    if c == quote:
+      res = buffer
+      return true
+    if c == int32(ord('\\')):
+      var i = 0'u32
+      if not escapeSequence(p, i):
+        return false
+      let isSurrogate = i >= 0xD800'u32 and i <= 0xDFFF'u32
+      if not isSurrogate:
+        buffer.add(encodeCp(int32(i)))
+      elif highSurrogateQueue == 0'u32 and i <= 0xDBFF'u32:
+        highSurrogateQueue = i
+      elif highSurrogateQueue != 0'u32 and i >= 0xDC00'u32:
+        let bits = ((highSurrogateQueue - 0xD800'u32) shl 10) or (i - 0xDC00'u32)
+        buffer.add(encodeCp(int32(bits + 0x10000'u32)))
+        highSurrogateQueue = 0'u32
+      else:
+        buffer.add(encodeCp(Replacement))
+        if highSurrogateQueue != 0'u32:
+          buffer.add(encodeCp(Replacement))
+        highSurrogateQueue = 0'u32
+    else:
+      if highSurrogateQueue != 0'u32:
+        buffer.add(encodeCp(Replacement))
+        highSurrogateQueue = 0'u32
+      buffer.add(encodeCp(c))
+
+proc quotedStringLiteral(p: var SnbtParser; res: var string): bool =
+  let origin = cursor(p.reader)
+  skipWhitespace(p.reader)
+  var ok = false
+  if peekIs(p.reader, '\''):
+    skip(p.reader)
+    ok = parseStringLiteral(p, int32(ord('\'')), res)
+  elif peekIs(p.reader, '"'):
+    skip(p.reader)
+    ok = parseStringLiteral(p, int32(ord('"')), res)
+  else:
+    literalError(p, "\"", @["'", "\""])
+  if not ok:
+    setCursor(p.reader, origin)
+  ok
+
+proc unquotedStringLiteral(p: var SnbtParser; res: var string): bool =
+  let origin = cursor(p.reader)
+  skipWhitespace(p.reader)
+  let value = readUnquotedString(p.reader)
+  if value.len == 0:
+    simple(p, expectedUnquotedString())
+    setCursor(p.reader, origin)
+    return false
+  res = value
+  true
+
+# ---- Literals -----------------------------------------------------------------------------------------------------
+
+proc literal(p: var SnbtParser; res: var NbtTag): bool
+
+proc parseComma(p: var SnbtParser): bool =
+  let origin = cursor(p.reader)
+  skipWhitespace(p.reader)
+  if peekIs(p.reader, ','):
+    skip(p.reader)
+    return true
+  literalError(p, ",", @[","])
+  setCursor(p.reader, origin)
+  false
+
+proc literalList(p: var SnbtParser): seq[NbtTag] =
+  ## `arguments` and `list_entries`.
+  var elements: seq[NbtTag] = @[]
+  var first = true
+  while true:
+    if not first and not parseComma(p):
+      break
+    let origin = cursor(p.reader)
+    var tag = NbtTag(kind: ntkEnd)
+    if not literal(p, tag):
+      setCursor(p.reader, origin)
+      break
+    elements.add(tag)
+    first = false
+  elements
+
+proc runOperation(p: var SnbtParser; id: string; args: seq[NbtTag]; res: var NbtTag): bool =
+  ## `SnbtOperations::search` and the operation it finds.
+  if id == "bool" and args.len == 1:
+    let r = nbtOps().getBool(args[0])
+    if r.isSuccess:
+      res = NbtTag(kind: ntkByte, byteVal: (if r.successResult: 1'i8 else: 0'i8))
+      return true
+    simple(p, expectedNumberOrBoolean())
+    return false
+  if id == "uuid" and args.len == 1:
+    if args[0].kind == ntkString:
+      let (ok, ints) = parseUuidVec(args[0].stringVal)
+      if ok:
+        res = NbtTag(kind: ntkIntArray, intArrayVal: ints)
+        return true
+    simple(p, expectedStringUuid())
+    return false
+  dynamic(p, noSuchOperation(), id & "/" & $args.len)
+  false
+
+proc unquotedStringOrBuiltIn(p: var SnbtParser; res: var NbtTag): bool =
+  var lit = ""
+  if not unquotedStringLiteral(p, lit):
+    return false
+  var hasArguments = false
+  var arguments: seq[NbtTag] = @[]
+  let origin = cursor(p.reader)
+  skipWhitespace(p.reader)
+  if not peekIs(p.reader, '('):
+    literalError(p, "(", @["("])
+    setCursor(p.reader, origin)
+  else:
+    skip(p.reader)
+    arguments = literalList(p)
+    hasArguments = true
+    skipWhitespace(p.reader)
+    if peekIs(p.reader, ')'):
+      skip(p.reader)
+    else:
+      literalError(p, ")", @[")"])
+      setCursor(p.reader, origin)
+  let c0 = lit[0]
+  if (c0 >= '0' and c0 <= '9') or c0 == '+' or c0 == '-' or c0 == '.':
+    storeSimpleErrorAndSuggest(p.errors, p.reader, invalidUnquotedStart(), @["true", "false", "bool", "uuid"])
+    return false
+  if hasArguments:
+    return runOperation(p, lit, arguments, res)
+  let lower = toLowerAscii(lit)
+  if lower == "true":
+    res = NbtTag(kind: ntkByte, byteVal: 1'i8)
+  elif lower == "false":
+    res = NbtTag(kind: ntkByte, byteVal: 0'i8)
+  else:
+    res = NbtTag(kind: ntkString, stringVal: lit)
+  true
+
+proc mapKey(p: var SnbtParser; res: var string): bool =
+  if quotedStringLiteral(p, res):
+    return true
+  unquotedStringLiteral(p, res)
+
+proc mapEntry(p: var SnbtParser; key: var string; value: var NbtTag): bool =
+  let origin = cursor(p.reader)
+  if not mapKey(p, key):
+    setCursor(p.reader, origin)
+    return false
+  skipWhitespace(p.reader)
+  if not peekIs(p.reader, ':'):
+    literalError(p, ":", @[":"])
+    setCursor(p.reader, origin)
+    return false
+  skip(p.reader)
+  if not literal(p, value):
+    setCursor(p.reader, origin)
+    return false
+  if key.len == 0:
+    simple(p, emptyKey())
+    return false
+  true
+
+proc mapLiteral(p: var SnbtParser; res: var NbtTag): bool =
+  let origin = cursor(p.reader)
+  skipWhitespace(p.reader)
+  if not peekIs(p.reader, '{'):
+    literalError(p, "{", @["}"])
+    setCursor(p.reader, origin)
+    return false
+  skip(p.reader)
+  var entries = newCompound()
+  var first = true
+  while true:
+    if not first and not parseComma(p):
+      break
+    let before = cursor(p.reader)
+    var key = ""
+    var value = NbtTag(kind: ntkEnd)
+    if not mapEntry(p, key, value):
+      setCursor(p.reader, before)
+      break
+    insert(entries, key, value)
+    first = false
+  skipWhitespace(p.reader)
+  if not peekIs(p.reader, '}'):
+    literalError(p, "}", @["}"])
+    setCursor(p.reader, origin)
+    return false
+  skip(p.reader)
+  res = NbtTag(kind: ntkCompound, compoundVal: entries)
+  true
+
+proc arrayPrefix(p: var SnbtParser; res: var ArrayPrefix): bool =
+  let origin = cursor(p.reader)
+  skipWhitespace(p.reader)
+  if peekIs(p.reader, 'B'):
+    skip(p.reader)
+    res = apByte
+    return true
+  if peekIs(p.reader, 'I'):
+    skip(p.reader)
+    res = apInt
+    return true
+  if peekIs(p.reader, 'L'):
+    skip(p.reader)
+    res = apLong
+    return true
+  literalError(p, "B", @["B", "I", "L"])
+  setCursor(p.reader, origin)
+  false
+
+proc intArrayEntries(p: var SnbtParser): seq[IntegerLiteral] =
+  var elements: seq[IntegerLiteral] = @[]
+  var first = true
+  while true:
+    if not first and not parseComma(p):
+      break
+    var l = IntegerLiteral()
+    if not integerLiteral(p, l):
+      break
+    elements.add(l)
+    first = false
+  elements
+
+proc arrayBody(p: var SnbtParser; prefix: var ArrayPrefix; entries: var seq[IntegerLiteral]): bool =
+  let origin = cursor(p.reader)
+  if not arrayPrefix(p, prefix):
+    setCursor(p.reader, origin)
+    return false
+  skipWhitespace(p.reader)
+  if not peekIs(p.reader, ';'):
+    literalError(p, ";", @[";"])
+    setCursor(p.reader, origin)
+    return false
+  skip(p.reader)
+  entries = intArrayEntries(p)
+  skipWhitespace(p.reader)
+  if not peekIs(p.reader, ']'):
+    literalError(p, "]", @["]"])
+    setCursor(p.reader, origin)
+    return false
+  skip(p.reader)
+  true
+
+proc listLiteral(p: var SnbtParser; res: var NbtTag): bool =
+  let origin = cursor(p.reader)
+  skipWhitespace(p.reader)
+  if not peekIs(p.reader, '['):
+    literalError(p, "[", @["["])
+    setCursor(p.reader, origin)
+    return false
+  skip(p.reader)
+  var prefix = apByte
+  var literals: seq[IntegerLiteral] = @[]
+  if arrayBody(p, prefix, literals):
+    if createPrefixedArray(p, literals, prefix, res):
+      return true
+    setCursor(p.reader, origin)
+    return false
+  let entries = literalList(p)
+  skipWhitespace(p.reader)
+  if not peekIs(p.reader, ']'):
+    literalError(p, "]", @["]"])
+    setCursor(p.reader, origin)
+    return false
+  skip(p.reader)
+  res = nbtOps().createList(entries)
+  true
+
+proc literal(p: var SnbtParser; res: var NbtTag): bool =
+  skipWhitespace(p.reader)
+  var isTag = false
+  var isInteger = false
+  var intLit = IntegerLiteral()
+  let c = peek(p.reader)
+  if (c >= int32(ord('0')) and c <= int32(ord('9'))) or c == int32(ord('+')) or c == int32(ord('-')) or c == int32(ord('.')):
+    let origin = cursor(p.reader)
+    if floatLiteral(p, res):
+      isTag = true
+    else:
+      setCursor(p.reader, origin)
+      if integerLiteral(p, intLit):
+        isInteger = true
+  if isTag:
+    return true
+  if isInteger:
+    var n = SnbtNumber()
+    if not parseIntegerLiteral(p, intLit, orSuffix(intLit.suffixType, tsInt), n):
+      return false
+    case n.kind
+    of snByte: res = NbtTag(kind: ntkByte, byteVal: int8(n.value))
+    of snShort: res = NbtTag(kind: ntkShort, shortVal: int16(n.value))
+    of snInt: res = NbtTag(kind: ntkInt, intVal: int32(n.value))
+    of snLong: res = NbtTag(kind: ntkLong, longVal: n.value)
+    return true
+  if peekIs(p.reader, '"') or peekIs(p.reader, '\''):
+    var s = ""
+    if not quotedStringLiteral(p, s):
+      return false
+    res = NbtTag(kind: ntkString, stringVal: s)
+    return true
+  if peekIs(p.reader, '{'):
+    return mapLiteral(p, res)
+  if peekIs(p.reader, '['):
+    return listLiteral(p, res)
+  unquotedStringOrBuiltIn(p, res)
+
+proc parseForCommands*(reader: var StringReader): CmdResult[NbtTag] =
+  ## `SnbtParser::parse_for_commands`.
+  var p = SnbtParser(reader: reader, errors: ParserErrors())
+  var tag = NbtTag(kind: ntkEnd)
+  let ok = literal(p, tag)
+  setCursor(reader, cursor(p.reader))
+  if ok:
+    return cmdOk[NbtTag](tag)
+  if p.errors.hasCommandError:
+    let d = p.errors.commandError
+    return cmdFail[NbtTag](syntaxErrorWith(d.errorType, messageOfDelayed(d),
+      CommandSyntaxErrorContext(input: reader.str, cursor: p.errors.cursor)))
+  cmdFail[NbtTag](create(parsingFailedWithoutErrors(), reader))
+
+proc parseForSuggestions*(builder0: SuggestionsBuilder): Suggestions =
+  var r = newStringReader(builder0.input)
+  setCursor(r, builder0.start)
+  var p = SnbtParser(reader: r, errors: ParserErrors())
+  var tag = NbtTag(kind: ntkEnd)
+  discard literal(p, tag)
+  var builder = builder0
+  if p.errors.suggestions.len > 0:
+    builder = createOffset(builder, p.errors.cursor)
+    for s in p.errors.suggestions:
+      builder = filterAndSuggestOne(builder, s)
+  build(builder)
