@@ -1,0 +1,133 @@
+## Port of pumpkin-protocol/src/java/packet_encoder.rs
+##
+## raw -> compress -> encrypt
+##
+## Upstream's encoder wraps an `AsyncWrite`. There is no async stream here, so it owns an output buffer:
+## `writePacket` appends finished bytes to it and `flush` hands them to the caller for the socket. That is
+## also why `EncryptionWriter` and its `poll_*` methods are gone: `EncryptionWriter::None`/`Encrypt` is the
+## `encrypted` flag, and `upgrade` is `setEncryption`. Upstream's reused compressor and scratch buffer are
+## an allocation saving only; each compressed packet gets its own here.
+
+import ../protobase, ../proto, ../varint, ../netcodec
+import ../aescfb8
+import zlibframe
+
+type
+  TCPNetworkEncoder* = object
+    ## Encoder: Server -> Client
+    ## Supports `ZLib` endecoding/compression
+    ## Supports Aes128 Encryption
+    encrypted: bool
+    encryptor: StreamEncryptor
+    hasCompression: bool
+    compressionThreshold: CompressionThreshold
+    compressionLevel: CompressionLevel
+    output: seq[byte]
+
+  PacketEncodeResult* = object
+    isOk*: bool
+    error*: PacketEncodeError
+
+  CompressionLevelError* = object
+    ## "Invalid compression Level"
+
+proc encodeOk(): PacketEncodeResult =
+  PacketEncodeResult(isOk: true)
+
+proc encodeErr(e: PacketEncodeError): PacketEncodeResult =
+  PacketEncodeResult(isOk: false, error: e)
+
+proc newTCPNetworkEncoder*(): TCPNetworkEncoder =
+  TCPNetworkEncoder(output: @[])
+
+proc setCompression*(self: var TCPNetworkEncoder; threshold: CompressionThreshold; level: CompressionLevel) =
+  self.hasCompression = true
+  self.compressionThreshold = threshold
+  self.compressionLevel = level
+
+proc setEncryption*(self: var TCPNetworkEncoder; key: openArray[uint8]): PacketEncodeResult =
+  ## NOTE: Encryption can only be set; a minecraft stream cannot go back to being unencrypted.
+  if self.encrypted:
+    return encodeErr(packetEncodeMessage("Encryption already enabled"))
+  if key.len != 16:
+    return encodeErr(packetEncodeMessage("Invalid key"))
+  self.encryptor = newStreamEncryptor(newAes128Cfb8(key, key))
+  self.encrypted = true
+  encodeOk()
+
+proc sendBytes(self: var TCPNetworkEncoder; bytes: var seq[byte]) =
+  if self.encrypted:
+    self.encryptor.encrypt(bytes)
+  for b in bytes:
+    self.output.add(b)
+
+proc writePacket*(self: var TCPNetworkEncoder; packetData: openArray[byte]): PacketEncodeResult =
+  ## Appends a Clientbound packet (its id VarInt, then its body) to the output and applies compression
+  ## when needed.
+  ##
+  ## If compression is enabled and the packet size reaches the threshold, the packet is compressed. The
+  ## packet is prefixed with its length and, with compression enabled, the uncompressed data length.
+  ##
+  ## Uncompressed: | Packet Length (VarInt) | Packet ID (VarInt) | Data |
+  ##
+  ## Compressed:   | Packet Length (VarInt) | Data Length (VarInt) | Packet ID (VarInt) | Data |
+  ##
+  ## - Packet Length: the total length of the packet excluding the Packet Length field itself.
+  ## - Data Length: the length of the uncompressed Packet ID and Data; 0 if they are not compressed.
+  ##
+  ## NOTE: This does not flush. Call `flush` to take the buffered data.
+  let dataLen = packetData.len
+  if dataLen > MaxPacketDataSize:
+    return encodeErr(packetTooLong(dataLen))
+  let dataLenVarInt = newVarInt(int32(dataLen))
+
+  var header: seq[byte] = @[]
+  var payload: seq[byte] = @[]
+
+  if self.hasCompression:
+    if dataLen >= self.compressionThreshold:
+      let compressed = zlibCompressBytes(packetData, self.compressionLevel)
+      if not compressed.ok:
+        return encodeErr(packetCompressionFailed(compressed.msg))
+
+      let fullPacketLen = int64(writtenSizeVarInt(dataLenVarInt)) + int64(compressed.data.len)
+      if fullPacketLen > int64(int32.high):
+        return encodeErr(packetEncodeMessage("Full packet length is too large to fit in VarInt! (" & $dataLen & ")"))
+      let fullPacketLenVarInt = newVarInt(int32(fullPacketLen))
+
+      let completeSerializationLength = writtenSizeVarInt(fullPacketLenVarInt) + int(fullPacketLenVarInt.value)
+      if uint64(completeSerializationLength) > MaxPacketSize:
+        return encodeErr(packetTooLong(completeSerializationLength))
+
+      encodeJava(fullPacketLenVarInt, header)
+      encodeJava(dataLenVarInt, header)
+      payload = compressed.data
+    else:
+      let zero = newVarInt(0)
+      let fullPacketLenVarInt = newVarInt(int32(writtenSizeVarInt(zero) + dataLen))
+
+      let completeSerializationLength = writtenSizeVarInt(fullPacketLenVarInt) + int(fullPacketLenVarInt.value)
+      if uint64(completeSerializationLength) > MaxPacketSize:
+        return encodeErr(packetTooLong(completeSerializationLength))
+
+      encodeJava(fullPacketLenVarInt, header)
+      encodeJava(zero, header)
+      payload = @packetData
+  else:
+    let fullPacketLenVarInt = dataLenVarInt
+
+    let completeSerializationLength = writtenSizeVarInt(fullPacketLenVarInt) + int(fullPacketLenVarInt.value)
+    if uint64(completeSerializationLength) > MaxPacketSize:
+      return encodeErr(packetTooLong(completeSerializationLength))
+
+    encodeJava(fullPacketLenVarInt, header)
+    payload = @packetData
+
+  self.sendBytes(header)
+  self.sendBytes(payload)
+  encodeOk()
+
+proc flush*(self: var TCPNetworkEncoder): seq[byte] =
+  ## Everything written since the last flush, compressed and encrypted, for the socket.
+  result = move self.output
+  self.output = @[]

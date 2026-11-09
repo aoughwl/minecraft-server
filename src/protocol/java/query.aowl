@@ -1,0 +1,219 @@
+## Port of pumpkin-protocol/src/query.rs
+##
+## The UDP query protocol. Upstream's async `Cursor` reads become reads on an owned buffer. A `CString`
+## field is a plain string here, and `encode` returns none where upstream's `CString::new` fails, on an
+## interior NUL. So a string field with a NUL fails at `encode`, not when the packet is built.
+
+import std/options
+
+const
+  PaddingStart: array[11, uint8] = [0x73'u8, 0x70, 0x6C, 0x69, 0x74, 0x6E, 0x75, 0x6D, 0x00, 0x80, 0x00]
+    ## Padding bytes are fixed by the vanilla server implementation.
+    ## Some query checkers (incorrectly) depend on these exact bytes.
+  PaddingEnd: array[11, uint8] = [0x00'u8, 0x01, 0x70, 0x6C, 0x61, 0x79, 0x65, 0x72, 0x5F, 0x00, 0x00]
+    ## 11 bytes: 10 padding bytes + 1 null terminator for the key-value section.
+  Magic = 0xFEFD'u16
+    ## The magic number that all Query protocol packets start with.
+
+type
+  DecodeErrorKind* = enum
+    qdeUnexpectedEof      ## The byte stream ended before a complete packet could be read.
+    qdeBadMagic           ## The first two bytes were not the expected magic value (0xFEFD).
+    qdeUnknownPacketType  ## The packet type byte does not correspond to a known type.
+    qdeMalformedPayload   ## The packet was structurally valid but contained an unexpected payload length.
+
+  DecodeError* = object
+    kind*: DecodeErrorKind
+    packetType*: uint8  ## The offending byte, for `qdeUnknownPacketType`.
+
+  DecodeResult*[T] = object
+    case isOk*: bool
+    of true: value*: T
+    of false: error*: DecodeError
+
+  PacketType* = enum
+    ptStatus = 0
+    ptHandshake = 9
+
+  RawQueryPacket* = object
+    ## A partially-decoded packet: magic verified, type extracted, payload buffered.
+    packetType*: PacketType
+    data: seq[byte]
+    pos: int
+
+  SHandshake* = object
+    sessionId*: int32
+
+  SStatusRequest* = object
+    sessionId*: int32
+    challengeToken*: int32
+    isFullRequest*: bool
+      ## `true` for a full-status request (payload padded to 8 extra bytes),
+      ## `false` for a basic-status request (no padding).
+
+  CHandshake* = object
+    sessionId*: int32
+    challengeToken*: int32  ## Encoded as a decimal string in the wire format.
+
+  CBasicStatus* = object
+    sessionId*: int32
+    motd*: string
+    map*: string
+    numPlayers*: int
+    maxPlayers*: int
+    hostPort*: uint16  ## Little-endian on the wire (Notchian quirk).
+    hostIp*: string
+
+  CFullStatus* = object
+    sessionId*: int32
+    hostname*: string
+    version*: string
+    plugins*: string
+    map*: string
+    numPlayers*: int
+    maxPlayers*: int
+    hostPort*: uint16  ## Little-endian on the wire (Notchian quirk).
+    hostIp*: string
+    players*: seq[string]
+
+proc `$`*(e: DecodeError): string =
+  const Hex = "0123456789abcdef"
+  case e.kind
+  of qdeUnexpectedEof: "unexpected end of packet"
+  of qdeBadMagic: "bad magic bytes (expected 0xFEFD)"
+  of qdeUnknownPacketType:
+    "unknown packet type: 0x" & Hex[int(e.packetType shr 4)] & Hex[int(e.packetType and 15'u8)]
+  of qdeMalformedPayload: "malformed packet payload"
+
+proc packetTypeFromU8*(value: uint8): DecodeResult[PacketType] =
+  ## Port of `TryFrom<u8> for PacketType`.
+  case value
+  of 9'u8: DecodeResult[PacketType](isOk: true, value: ptHandshake)
+  of 0'u8: DecodeResult[PacketType](isOk: true, value: ptStatus)
+  else:
+    DecodeResult[PacketType](isOk: false, error: DecodeError(kind: qdeUnknownPacketType, packetType: value))
+
+proc decodeErr[T](kind: DecodeErrorKind): DecodeResult[T] =
+  DecodeResult[T](isOk: false, error: DecodeError(kind: kind))
+
+proc decode*(_: typedesc[RawQueryPacket]; bytes: sink seq[byte]): DecodeResult[RawQueryPacket] =
+  if bytes.len < 2:
+    return decodeErr[RawQueryPacket](qdeUnexpectedEof)
+  let magic = (uint16(bytes[0]) shl 8) or uint16(bytes[1])
+  if magic != Magic:
+    return decodeErr[RawQueryPacket](qdeBadMagic)
+  if bytes.len < 3:
+    return decodeErr[RawQueryPacket](qdeUnexpectedEof)
+  let packetType = packetTypeFromU8(bytes[2])
+  if not packetType.isOk:
+    return DecodeResult[RawQueryPacket](isOk: false, error: packetType.error)
+  DecodeResult[RawQueryPacket](isOk: true,
+    value: RawQueryPacket(packetType: packetType.value, data: bytes, pos: 3))
+
+proc readI32(packet: var RawQueryPacket; value: var int32): bool =
+  if packet.data.len - packet.pos < 4:
+    return false
+  let u = (uint32(packet.data[packet.pos]) shl 24) or (uint32(packet.data[packet.pos + 1]) shl 16) or
+    (uint32(packet.data[packet.pos + 2]) shl 8) or uint32(packet.data[packet.pos + 3])
+  value = cast[int32](u)
+  packet.pos += 4
+  true
+
+proc decode*(_: typedesc[SHandshake]; packet: var RawQueryPacket): DecodeResult[SHandshake] =
+  var sessionId = 0'i32
+  if not readI32(packet, sessionId):
+    return decodeErr[SHandshake](qdeUnexpectedEof)
+  DecodeResult[SHandshake](isOk: true, value: SHandshake(sessionId: sessionId))
+
+proc decode*(_: typedesc[SStatusRequest]; packet: var RawQueryPacket): DecodeResult[SStatusRequest] =
+  var sessionId = 0'i32
+  if not readI32(packet, sessionId):
+    return decodeErr[SStatusRequest](qdeUnexpectedEof)
+  var challengeToken = 0'i32
+  if not readI32(packet, challengeToken):
+    return decodeErr[SStatusRequest](qdeUnexpectedEof)
+
+  var isFullRequest = false
+  case packet.data.len - packet.pos
+  of 0:
+    isFullRequest = false
+  of 4:
+    packet.pos += 4
+    isFullRequest = true
+  else:
+    return decodeErr[SStatusRequest](qdeMalformedPayload)
+
+  DecodeResult[SStatusRequest](isOk: true, value: SStatusRequest(sessionId: sessionId,
+    challengeToken: challengeToken, isFullRequest: isFullRequest))
+
+proc addI32(buf: var seq[byte]; value: int32) =
+  let u = cast[uint32](value)
+  buf.add(uint8(u shr 24))
+  buf.add(uint8((u shr 16) and 0xFF'u32))
+  buf.add(uint8((u shr 8) and 0xFF'u32))
+  buf.add(uint8(u and 0xFF'u32))
+
+proc addCString(buf: var seq[byte]; s: string): bool =
+  ## `as_bytes_with_nul`. False where `CString::new` would have failed.
+  for ch in s:
+    if ch == '\0':
+      return false
+    buf.add(uint8(ord(ch)))
+  buf.add(0'u8)
+  true
+
+proc encode*(self: CHandshake): Option[seq[byte]] =
+  var buf: seq[byte] = @[]
+  buf.add(uint8(ord(ptHandshake)))
+  addI32(buf, self.sessionId)
+  discard addCString(buf, $self.challengeToken)
+  some(buf)
+
+proc encode*(self: CBasicStatus): Option[seq[byte]] =
+  var buf: seq[byte] = @[]
+  buf.add(uint8(ord(ptStatus)))
+  addI32(buf, self.sessionId)
+  if not addCString(buf, self.motd): return none[seq[byte]]()
+  discard addCString(buf, "SMP")
+  if not addCString(buf, self.map): return none[seq[byte]]()
+  discard addCString(buf, $self.numPlayers)
+  discard addCString(buf, $self.maxPlayers)
+  # The port is written little-endian - this is a known Notchian quirk.
+  buf.add(uint8(self.hostPort and 0xFF'u16))
+  buf.add(uint8(self.hostPort shr 8))
+  if not addCString(buf, self.hostIp): return none[seq[byte]]()
+  some(buf)
+
+proc encode*(self: CFullStatus): Option[seq[byte]] =
+  var buf: seq[byte] = @[]
+  buf.add(uint8(ord(ptStatus)))
+  addI32(buf, self.sessionId)
+  for b in PaddingStart:
+    buf.add(b)
+
+  let kvPairs = [
+    ("hostname", self.hostname),
+    ("gametype", "SMP"),
+    ("game_id", "MINECRAFT"),
+    ("version", self.version),
+    ("plugins", self.plugins),
+    ("map", self.map),
+    ("numplayers", $self.numPlayers),
+    ("maxplayers", $self.maxPlayers),
+    ("hostport", $self.hostPort),
+    ("hostip", self.hostIp)]
+
+  for pair in kvPairs:
+    discard addCString(buf, pair[0])
+    if not addCString(buf, pair[1]): return none[seq[byte]]()
+
+  # End padding + null terminator for the key-value section.
+  for b in PaddingEnd:
+    buf.add(b)
+
+  # Player list, each null-terminated, followed by a final null.
+  for player in self.players:
+    if not addCString(buf, player): return none[seq[byte]]()
+  buf.add(0'u8)
+
+  some(buf)

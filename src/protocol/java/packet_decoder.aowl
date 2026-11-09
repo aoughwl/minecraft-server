@@ -1,0 +1,174 @@
+## Port of pumpkin-protocol/src/java/packet_decoder.rs
+##
+## decrypt -> decompress -> raw
+##
+## Upstream's decoder awaits an `AsyncRead`. There is no async stream here, so the caller owns the socket:
+## `feed` hands over what arrived, `packetReady` says whether a whole frame is in, and `getRawPacket` takes
+## one. `getRawPacket` treats the end of the buffer as upstream treats the end of its stream, so a caller
+## that has seen the socket close gets upstream's behaviour at EOF: `pdeConnectionClosed` on a frame
+## boundary, and a short frame otherwise. `DecompressionReader` and `DecryptionReader` are gone with the
+## stream they wrapped; decryption happens in `feed`, decompression in `getRawPacket`.
+##
+## One difference at the edge: a frame is consumed whole. Upstream leaves bytes behind if a compressed
+## frame has trailing bytes after its zlib stream, which desynchronises its next read.
+
+import ../protobase, ../proto, ../varint, ../netcodec
+import ../aescfb8
+import zlibframe
+
+type
+  TCPNetworkDecoder* = object
+    ## Decoder: Client -> Server
+    ## Supports `ZLib` decoding/decompression
+    ## Supports Aes128 Encryption
+    encrypted: bool
+    decryptor: StreamDecryptor
+    hasCompression: bool
+    compression: CompressionThreshold
+    buffer: seq[byte]
+    head: int ## Bytes before this in `buffer` are consumed.
+
+  RawPacketResult* = object
+    case isOk*: bool
+    of true: value*: RawPacket
+    of false: error*: PacketDecodeError
+
+proc rawOk(packet: sink RawPacket): RawPacketResult =
+  RawPacketResult(isOk: true, value: packet)
+
+proc rawErr(e: PacketDecodeError): RawPacketResult =
+  RawPacketResult(isOk: false, error: e)
+
+proc newTCPNetworkDecoder*(): TCPNetworkDecoder =
+  TCPNetworkDecoder(buffer: @[], head: 0)
+
+proc setCompression*(self: var TCPNetworkDecoder; threshold: CompressionThreshold) =
+  self.hasCompression = true
+  self.compression = threshold
+
+proc setEncryption*(self: var TCPNetworkDecoder; key: openArray[uint8]): tuple[isOk: bool, error: PacketDecodeError] =
+  ## NOTE: Encryption can only be set; a minecraft stream cannot go back to being unencrypted.
+  ##
+  ## Upstream reads no further than the packet it is decoding, so nothing is ahead of the cipher when it
+  ## is switched on. `feed` can already hold bytes past the encryption response if the client sent them
+  ## straight after it, and those are ciphertext, so they are decrypted here.
+  if self.encrypted:
+    return (false, packetDecodeError(pdeMessage, "Encryption already enabled"))
+  if key.len != 16:
+    return (false, packetDecodeError(pdeMessage, "Invalid key"))
+  self.decryptor = newStreamDecryptor(newAes128Cfb8(key, key))
+  self.encrypted = true
+  if self.head < self.buffer.len:
+    self.decryptor.decrypt(self.buffer.toOpenArray(self.head, self.buffer.len - 1))
+  (true, PacketDecodeError())
+
+proc feed*(self: var TCPNetworkDecoder; data: openArray[byte]) =
+  ## Bytes as received from the socket, in order.
+  let start = self.buffer.len
+  self.buffer.setLen(start + data.len)
+  for i in 0 ..< data.len:
+    self.buffer[start + i] = data[i]
+  if self.encrypted and data.len > 0:
+    self.decryptor.decrypt(self.buffer.toOpenArray(start, self.buffer.len - 1))
+
+proc buffered*(self: TCPNetworkDecoder): int =
+  ## Decrypted bytes not yet taken as packets.
+  self.buffer.len - self.head
+
+proc packetReady*(self: TCPNetworkDecoder): bool =
+  ## Whether `getRawPacket` has a whole frame to work on, or a length so bad that more bytes cannot help.
+  var val = 0'u32
+  var i = 0
+  while true:
+    if self.head + i >= self.buffer.len:
+      return false
+    let b = self.buffer[self.head + i]
+    val = val or (uint32(b and 0x7F'u8) shl (i * 7))
+    inc i
+    if (b and 0x80'u8) == 0:
+      break
+    if i >= MaxVarIntSize:
+      return true
+  let packetLen = cast[int32](val)
+  if packetLen < 0 or uint64(packetLen) > MaxPacketSize:
+    return true
+  self.buffer.len - (self.head + i) >= int(packetLen)
+
+proc compact(self: var TCPNetworkDecoder) =
+  if self.head == self.buffer.len:
+    self.buffer.setLen(0)
+    self.head = 0
+  elif self.head >= 65536:
+    let left = self.buffer.len - self.head
+    let from0 = self.head
+    for i in 0 ..< left:
+      let moved = self.buffer[from0 + i]
+      self.buffer[i] = moved
+    self.buffer.setLen(left)
+    self.head = 0
+
+proc getRawPacket*(self: var TCPNetworkDecoder): RawPacketResult =
+  if self.head >= self.buffer.len:
+    self.compact()
+    return rawErr(packetDecodeError(pdeConnectionClosed))
+
+  var pos = self.head
+  let lengthRes = decodeJava(self.buffer, pos)
+  self.head = pos
+  if not lengthRes.isOk:
+    self.compact()
+    if lengthRes.error.kind == reCleanEof:
+      return rawErr(packetDecodeError(pdeConnectionClosed))
+    return rawErr(packetDecodeError(pdeMalformedLength, lengthRes.error.msg))
+
+  let packetLen = lengthRes.value.value
+  if packetLen < 0 or uint64(packetLen) > MaxPacketSize:
+    self.compact()
+    return rawErr(packetDecodeError(pdeOutOfBounds))
+
+  # Upstream's `reader.take(packet_len)`.
+  let frameLen = min(int(packetLen), self.buffer.len - self.head)
+  var frame = newSeq[byte](frameLen)
+  for i in 0 ..< frameLen:
+    frame[i] = self.buffer[self.head + i]
+  self.head += frameLen
+  self.compact()
+  var reader = newNetReader(frame)
+
+  var compressed = false
+  var expectedUncompressed = 0
+  if self.hasCompression:
+    let decompressedRes = getVarInt(reader)
+    if not decompressedRes.isOk:
+      return rawErr(toPacketDecodeError(decompressedRes.error))
+    let rawPacketLength = int64(packetLen) - int64(writtenSizeVarInt(decompressedRes.value))
+    let decompressedLength = decompressedRes.value.value
+
+    if decompressedLength < 0 or int(decompressedLength) > MaxPacketDataSize:
+      return rawErr(packetDecodeError(pdeTooLong))
+
+    if decompressedLength > 0:
+      compressed = true
+      expectedUncompressed = int(decompressedLength)
+    else:
+      # Validate that we are not less than the compression threshold
+      if rawPacketLength > int64(self.compression):
+        return rawErr(packetDecodeError(pdeNotCompressed))
+
+  if compressed:
+    let inflated = zlibDecompressBytes(reader.data.toOpenArray(reader.pos, reader.data.len - 1), expectedUncompressed + 1)
+    var idPos = 0
+    let idRes = decodeJava(inflated.data, idPos)
+    if not idRes.isOk:
+      return rawErr(packetDecodeError(pdeDecodeId))
+    if not inflated.ok:
+      return rawErr(packetDecodeError(pdeFailedDecompression, inflated.msg))
+    if inflated.data.len != expectedUncompressed:
+      return rawErr(packetDecodeError(pdeFailedDecompression,
+        "Declared decompressed length " & $expectedUncompressed & " but decoded " & $inflated.data.len & " bytes"))
+    return rawOk(RawPacket(id: idRes.value.value, payload: inflated.data[idPos .. ^1]))
+
+  let idRes = getVarInt(reader)
+  if not idRes.isOk:
+    return rawErr(packetDecodeError(pdeDecodeId))
+  rawOk(RawPacket(id: idRes.value.value, payload: reader.data[reader.pos .. ^1]))

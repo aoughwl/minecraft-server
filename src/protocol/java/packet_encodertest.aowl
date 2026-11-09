@@ -1,0 +1,226 @@
+## Tests for packet_encoder.aowl: upstream's `#[test]`s, then known-answer frames. The compressed and
+## encrypted expected bytes came from independent tools, Python's zlib and `openssl enc -aes-128-cfb8`.
+
+import std/syncio
+import ../aescfb8, ../netcodec, ../proto, ../protobase, ../varint
+import ../../util/javaversion
+import client/status/status_response
+import packet_encoder, pkttestutil, zlibframe
+
+const V = jmvV1_21_11
+
+proc payloadOf(json: string): seq[byte] =
+  ## Upstream's `packet.write_packet_data(&mut expected_payload, ...)`.
+  encoded(CStatusResponse(jsonResponse: json), V)
+
+proc packetBuf(json: string): seq[byte] =
+  ## `build_packet_with_encoder`'s `packet_buf`: the id VarInt then the body.
+  var w = newNetWriter()
+  writeVarInt(w, newVarInt(CStatusResponse.toId(V)))
+  writeSlice(w, payloadOf(json))
+  w.buf
+
+proc build(json: string; threshold: int; level: uint32; key: seq[uint8]): seq[byte] =
+  ## `build_packet_with_encoder`. A negative threshold is its `None` compression and an empty key its
+  ## `None` key.
+  var encoder = newTCPNetworkEncoder()
+  if threshold >= 0:
+    encoder.setCompression(threshold, level)
+  if key.len > 0:
+    assert encoder.setEncryption(key).isOk
+  assert encoder.writePacket(packetBuf(json)).isOk
+  encoder.flush()
+
+proc decrypted(data: seq[byte]; key: seq[uint8]): seq[byte] =
+  var c = newAes128Cfb8(key, key)
+  result = newSeq[byte](data.len)
+  for i in 0 ..< data.len:
+    result[i] = c.decryptByte(data[i])
+
+const Json = "{\"description\": \"A Minecraft Server\"}"
+
+proc checkPlainFrame(bytes: seq[byte]; json: string) =
+  var r = newNetReader(bytes)
+  let packetLength = getVarInt(r)
+  assert packetLength.isOk
+  assert int(packetLength.value.value) == remaining(r), "Packet length mismatch"
+  let id = getVarInt(r)
+  assert id.isOk
+  assert id.value.value == CStatusResponse.toId(V)
+  let rest = readRemainingSlice(r, remaining(r))
+  assert rest.isOk
+  assert rest.value == payloadOf(json)
+
+proc checkCompressedFrame(bytes: seq[byte]; json: string) =
+  var r = newNetReader(bytes)
+  let packetLength = getVarInt(r)
+  assert packetLength.isOk
+  assert int(packetLength.value.value) == remaining(r), "Packet length mismatch"
+  let dataLength = getVarInt(r)
+  assert dataLength.isOk
+  let expectedPayload = payloadOf(json)
+  assert int(dataLength.value.value) == writtenSizeVarInt(newVarInt(CStatusResponse.toId(V))) + expectedPayload.len
+  let body = readRemainingSlice(r, remaining(r))
+  assert body.isOk
+  let decompressed = zlibDecompressBytes(body.value, int(dataLength.value.value))
+  assert decompressed.ok
+  var dr = newNetReader(decompressed.data)
+  let id = getVarInt(dr)
+  assert id.isOk
+  assert id.value.value == CStatusResponse.toId(V)
+  let rest = readRemainingSlice(dr, remaining(dr))
+  assert rest.isOk
+  assert rest.value == expectedPayload
+
+block encodeWithoutCompressionAndEncryption:
+  checkPlainFrame(build(Json, -1, 0'u32, @[]), Json)
+
+block encodeWithCompression:
+  checkCompressedFrame(build(Json, 0, 6'u32, @[]), Json)
+
+block encodeWithEncryption:
+  let key = newSeq[uint8](16)
+  checkPlainFrame(decrypted(build(Json, -1, 0'u32, key), key), Json)
+
+block encodeWithCompressionAndEncryption:
+  var key = newSeq[uint8](16)
+  for i in 0 ..< 16:
+    key[i] = 1'u8
+  checkCompressedFrame(decrypted(build(Json, 0, 6'u32, key), key), Json)
+
+block encodeWithZeroLengthPayload:
+  checkPlainFrame(build("", -1, 0'u32, @[]), "")
+
+block encodeWithMaximumStringLength:
+  var payloadStr = newString(32767)
+  for i in 0 ..< payloadStr.len:
+    payloadStr[i] = 'A'
+  let packetBytes = build(payloadStr, -1, 0'u32, @[])
+  assert uint64(packetBytes.len) <= MaxPacketSize, "Packet size exceeds maximum allowed size"
+  checkPlainFrame(packetBytes, payloadStr)
+
+block encodePacketExceedingMaximumSize:
+  # Upstream's MaxSizePacket: the id of CStatusResponse, then MAX_PACKET_SIZE + 1 bytes of 0xAB.
+  var encoder = newTCPNetworkEncoder()
+  var data = newSeq[byte](int(MaxPacketSize) + 2)
+  data[0] = 0'u8
+  for i in 1 ..< data.len:
+    data[i] = 0xAB'u8
+  let res = encoder.writePacket(data)
+  assert not res.isOk
+  assert res.error.kind == peeTooLong
+  assert encoder.flush().len == 0
+
+block encodeSmallPayloadNoCompression:
+  let packetBytes = build("Hi", 10, 6'u32, @[])
+  var r = newNetReader(packetBytes)
+  assert getVarInt(r).value.value == int32(remaining(newNetReader(packetBytes))) - 1
+  assert getVarInt(r).value.value == 0, "Data length should be 0 indicating no compression"
+  assert getVarInt(r).value.value == CStatusResponse.toId(V)
+  assert readRemainingSlice(r, remaining(r)).value == payloadOf("Hi")
+
+# --- Known answers ------------------------------------------------------------
+
+let plainData = hx("00 07 7b2261223a317d") # id 0, then the string {"a":1}
+
+block exactPlainFrame:
+  var encoder = newTCPNetworkEncoder()
+  assert encoder.writePacket(plainData).isOk
+  assert encoder.flush() == hx("09 00 07 7b2261223a317d")
+
+block exactBelowThresholdFrame:
+  var encoder = newTCPNetworkEncoder()
+  encoder.setCompression(256, 6'u32)
+  assert encoder.writePacket(plainData).isOk
+  assert encoder.flush() == hx("0a 00 00 07 7b2261223a317d")
+
+block exactAtThresholdCompresses:
+  # `data_len >= threshold`: 9 bytes against a threshold of 9. Python: zlib.compress(data, 6).
+  var encoder = newTCPNetworkEncoder()
+  encoder.setCompression(9, 6'u32)
+  assert encoder.writePacket(plainData).isOk
+  assert encoder.flush() == hx("12 09 789c6360af564a54b232ac050008640210")
+
+block exactOneOverThresholdDoesNotCompress:
+  var encoder = newTCPNetworkEncoder()
+  encoder.setCompression(10, 6'u32)
+  assert encoder.writePacket(plainData).isOk
+  assert encoder.flush() == hx("0a 00 00 07 7b2261223a317d")
+
+block exactEncryptedFrames:
+  # openssl enc -aes-128-cfb8, key and iv all zero, then all one.
+  var encoder = newTCPNetworkEncoder()
+  assert encoder.setEncryption(newSeq[uint8](16)).isOk
+  assert encoder.writePacket(plainData).isOk
+  assert encoder.flush() == hx("6fa69e23ecb351ea8d3a")
+
+  var ones = newSeq[uint8](16)
+  for i in 0 ..< 16:
+    ones[i] = 1'u8
+  var encoder2 = newTCPNetworkEncoder()
+  assert encoder2.setEncryption(ones).isOk
+  assert encoder2.writePacket(plainData).isOk
+  assert encoder2.flush() == hx("5766dc6cec216d32e50a")
+
+block exactCompressedEncryptedFrame:
+  var ones = newSeq[uint8](16)
+  for i in 0 ..< 16:
+    ones[i] = 1'u8
+  var encoder = newTCPNetworkEncoder()
+  encoder.setCompression(0, 6'u32)
+  assert encoder.setEncryption(ones).isOk
+  assert encoder.writePacket(plainData).isOk
+  assert encoder.flush() == hx("4c25a505187f2f335a6bf2066f8fe16776065a")
+
+block cipherStateCarriesAcrossPacketsAndFlushes:
+  var joined = newTCPNetworkEncoder()
+  assert joined.setEncryption(newSeq[uint8](16)).isOk
+  assert joined.writePacket(plainData).isOk
+  let first = joined.flush()
+  assert joined.writePacket(plainData).isOk
+  let second = joined.flush()
+
+  var c = newAes128Cfb8(newSeq[uint8](16), newSeq[uint8](16))
+  let frame = hx("09 00 07 7b2261223a317d")
+  for b in first:
+    discard c.decryptByte(b)
+  var plain: seq[byte] = @[]
+  for b in second:
+    plain.add(c.decryptByte(b))
+  assert plain == frame
+
+block encryptionCanOnlyBeSetOnce:
+  var encoder = newTCPNetworkEncoder()
+  assert encoder.setEncryption(newSeq[uint8](16)).isOk
+  let again = encoder.setEncryption(newSeq[uint8](16))
+  assert not again.isOk
+  assert again.error.msg == "Writing packet failed: Encryption already enabled"
+
+block invalidKey:
+  var encoder = newTCPNetworkEncoder()
+  let res = encoder.setEncryption(newSeq[uint8](15))
+  assert not res.isOk
+  assert res.error.msg == "Writing packet failed: Invalid key"
+
+block dataOverMaximumIsRejectedBeforeCompression:
+  var encoder = newTCPNetworkEncoder()
+  encoder.setCompression(0, 6'u32)
+  let res = encoder.writePacket(newSeq[byte](MaxPacketDataSize + 1))
+  assert not res.isOk
+  assert res.error.kind == peeTooLong
+
+block compressibleOverPacketSizeIsAccepted:
+  # Over MAX_PACKET_SIZE before compression, far under it after, and under MAX_PACKET_DATA_SIZE.
+  var encoder = newTCPNetworkEncoder()
+  encoder.setCompression(256, 6'u32)
+  assert encoder.writePacket(newSeq[byte](int(MaxPacketSize) + 1)).isOk
+  assert encoder.flush().len < 65536
+
+block badCompressionLevel:
+  var encoder = newTCPNetworkEncoder()
+  encoder.setCompression(0, 10'u32)
+  let res = encoder.writePacket(plainData)
+  assert not res.isOk
+  assert res.error.kind == peeCompressionFailed
+
+echo "all packet_encoder checks passed"

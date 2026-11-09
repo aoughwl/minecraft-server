@@ -1,0 +1,417 @@
+## Tests for packet_decoder.aowl: upstream's `#[test]`s, then known-answer frames. The compressed and
+## encrypted input bytes came from independent tools, Python's zlib and `openssl enc -aes-128-cfb8`.
+
+import std/syncio
+import ../aescfb8, ../proto, ../varint
+import packet_decoder, packet_encoder, pkttestutil, zlibframe
+
+proc strBytes(s: string): seq[byte] =
+  result = newSeq[byte](s.len)
+  for i in 0 ..< s.len:
+    result[i] = uint8(ord(s[i]))
+
+proc buildPacket(packetId: int32; payload: seq[byte]; compress: bool; key: seq[uint8]): seq[byte] =
+  ## Upstream's `build_packet`; an empty key is its `None`.
+  var buffer: seq[byte] = @[]
+  if compress:
+    var dataToCompress: seq[byte] = @[]
+    encodeJava(newVarInt(packetId), dataToCompress)
+    for b in payload:
+      dataToCompress.add(b)
+    let compressedPayload = zlibCompressBytes(dataToCompress, 6'u32)
+    assert compressedPayload.ok
+    encodeJava(newVarInt(int32(dataToCompress.len)), buffer)
+    for b in compressedPayload.data:
+      buffer.add(b)
+  else:
+    encodeJava(newVarInt(packetId), buffer)
+    for b in payload:
+      buffer.add(b)
+
+  var packet: seq[byte] = @[]
+  encodeJava(newVarInt(int32(buffer.len)), packet)
+  for b in buffer:
+    packet.add(b)
+
+  if key.len > 0:
+    var c = newAes128Cfb8(key, key)
+    for i in 0 ..< packet.len:
+      packet[i] = c.encryptByte(packet[i])
+  packet
+
+proc ones(): seq[uint8] =
+  result = newSeq[uint8](16)
+  for i in 0 ..< 16:
+    result[i] = 1'u8
+
+block decodeWithoutCompressionAndEncryption:
+  var decoder = newTCPNetworkDecoder()
+  decoder.feed(buildPacket(1, strBytes("Hello"), false, @[]))
+  let raw = decoder.getRawPacket()
+  assert raw.isOk
+  assert raw.value.id == 1
+  assert raw.value.payload == strBytes("Hello")
+
+block decodeWithCompression:
+  var decoder = newTCPNetworkDecoder()
+  decoder.feed(buildPacket(2, strBytes("Hello, compressed world!"), true, @[]))
+  # Larger than payload
+  decoder.setCompression(1000)
+  let raw = decoder.getRawPacket()
+  assert raw.isOk
+  assert raw.value.id == 2
+  assert raw.value.payload == strBytes("Hello, compressed world!")
+
+block decodeWithEncryption:
+  let key = newSeq[uint8](16)
+  var decoder = newTCPNetworkDecoder()
+  assert decoder.setEncryption(key).isOk
+  decoder.feed(buildPacket(3, strBytes("Hello, encrypted world!"), false, key))
+  let raw = decoder.getRawPacket()
+  assert raw.isOk
+  assert raw.value.id == 3
+  assert raw.value.payload == strBytes("Hello, encrypted world!")
+
+block decodeWithCompressionAndEncryption:
+  var decoder = newTCPNetworkDecoder()
+  decoder.setCompression(1000)
+  assert decoder.setEncryption(ones()).isOk
+  decoder.feed(buildPacket(4, strBytes("Hello, compressed and encrypted world!"), true, ones()))
+  let raw = decoder.getRawPacket()
+  assert raw.isOk
+  assert raw.value.id == 4
+  assert raw.value.payload == strBytes("Hello, compressed and encrypted world!")
+
+block decodeWithInvalidCompressedData:
+  # data_len 10, then invalid zlib data.
+  var decoder = newTCPNetworkDecoder()
+  decoder.setCompression(1000)
+  decoder.feed(hx("04 0a ffffff"))
+  let res = decoder.getRawPacket()
+  assert not res.isOk, "This should have errored!"
+
+block decodeWithZeroLengthPacket:
+  var decoder = newTCPNetworkDecoder()
+  decoder.feed(buildPacket(7, @[], false, @[]))
+  let raw = decoder.getRawPacket()
+  assert raw.isOk
+  assert raw.value.id == 7
+  assert raw.value.payload.len == 0
+
+block decodeWithMaximumLengthPacket:
+  var payload = newSeq[byte](int(MaxPacketSize) - 1)
+  for i in 0 ..< payload.len:
+    payload[i] = 0x41'u8
+  var decoder = newTCPNetworkDecoder()
+  decoder.feed(buildPacket(8, payload, true, @[]))
+  decoder.setCompression(int(MaxPacketSize) + 1)
+  let raw = decoder.getRawPacket()
+  assert raw.isOk
+  assert raw.value.id == 8
+  assert raw.value.payload == payload
+
+block decodeMultiplePackets:
+  # Upstream's zero-allocation test also checks its scratch buffer's capacity. A RawPacket owns its
+  # payload here, so there is no scratch buffer to check.
+  var decoder = newTCPNetworkDecoder()
+  decoder.feed(buildPacket(1, strBytes("Hello"), false, @[]))
+  decoder.feed(buildPacket(2, strBytes("World"), false, @[]))
+  let p1 = decoder.getRawPacket()
+  assert p1.isOk
+  assert p1.value.id == 1
+  assert p1.value.payload == strBytes("Hello")
+  let p2 = decoder.getRawPacket()
+  assert p2.isOk
+  assert p2.value.id == 2
+  assert p2.value.payload == strBytes("World")
+
+# --- Known answers ------------------------------------------------------------
+
+let plainPayload = hx("07 7b2261223a317d") # the string {"a":1}
+
+block exactPlainFrame:
+  var decoder = newTCPNetworkDecoder()
+  decoder.feed(hx("09 00 07 7b2261223a317d"))
+  let raw = decoder.getRawPacket()
+  assert raw.isOk
+  assert raw.value.id == 0
+  assert raw.value.payload == plainPayload
+
+block exactBelowThresholdFrame:
+  var decoder = newTCPNetworkDecoder()
+  decoder.setCompression(256)
+  decoder.feed(hx("0a 00 00 07 7b2261223a317d"))
+  let raw = decoder.getRawPacket()
+  assert raw.isOk
+  assert raw.value.id == 0
+  assert raw.value.payload == plainPayload
+
+block exactCompressedFrame:
+  # Python: zlib.compress(data, 6).
+  var decoder = newTCPNetworkDecoder()
+  decoder.setCompression(256)
+  decoder.feed(hx("12 09 789c6360af564a54b232ac050008640210"))
+  let raw = decoder.getRawPacket()
+  assert raw.isOk
+  assert raw.value.id == 0
+  assert raw.value.payload == plainPayload
+
+block exactEncryptedFrames:
+  # openssl enc -aes-128-cfb8, key and iv all zero, then all one.
+  var decoder = newTCPNetworkDecoder()
+  assert decoder.setEncryption(newSeq[uint8](16)).isOk
+  decoder.feed(hx("6fa69e23ecb351ea8d3a"))
+  let raw = decoder.getRawPacket()
+  assert raw.isOk
+  assert raw.value.payload == plainPayload
+
+  var decoder2 = newTCPNetworkDecoder()
+  assert decoder2.setEncryption(ones()).isOk
+  decoder2.feed(hx("5766dc6cec216d32e50a"))
+  let raw2 = decoder2.getRawPacket()
+  assert raw2.isOk
+  assert raw2.value.payload == plainPayload
+
+block exactCompressedEncryptedFrame:
+  var decoder = newTCPNetworkDecoder()
+  decoder.setCompression(0)
+  assert decoder.setEncryption(ones()).isOk
+  decoder.feed(hx("4c25a505187f2f335a6bf2066f8fe16776065a"))
+  let raw = decoder.getRawPacket()
+  assert raw.isOk
+  assert raw.value.id == 0
+  assert raw.value.payload == plainPayload
+
+block encoderToDecoder:
+  var encoder = newTCPNetworkEncoder()
+  encoder.setCompression(4, 6'u32)
+  assert encoder.setEncryption(ones()).isOk
+  assert encoder.writePacket(hx("0102")).isOk
+  assert encoder.writePacket(hx("05 0a0b0c0d0e0f")).isOk
+  var decoder = newTCPNetworkDecoder()
+  decoder.setCompression(4)
+  assert decoder.setEncryption(ones()).isOk
+  decoder.feed(encoder.flush())
+  let a = decoder.getRawPacket()
+  assert a.isOk and a.value.id == 1 and a.value.payload == hx("02")
+  let b = decoder.getRawPacket()
+  assert b.isOk and b.value.id == 5 and b.value.payload == hx("0a0b0c0d0e0f")
+
+# --- The error of each path ---------------------------------------------------
+
+block connectionClosedAtBoundary:
+  var decoder = newTCPNetworkDecoder()
+  let res = decoder.getRawPacket()
+  assert not res.isOk
+  assert res.error.kind == pdeConnectionClosed
+
+block malformedLengthEof:
+  var decoder = newTCPNetworkDecoder()
+  decoder.feed(hx("80"))
+  let res = decoder.getRawPacket()
+  assert not res.isOk
+  assert res.error.kind == pdeMalformedLength
+
+block malformedLengthTooLong:
+  var decoder = newTCPNetworkDecoder()
+  decoder.feed(hx("ffffffffff"))
+  let res = decoder.getRawPacket()
+  assert not res.isOk
+  assert res.error.kind == pdeMalformedLength
+
+block negativeLengthOutOfBounds:
+  var decoder = newTCPNetworkDecoder()
+  decoder.feed(hx("ffffffff0f"))
+  let res = decoder.getRawPacket()
+  assert not res.isOk
+  assert res.error.kind == pdeOutOfBounds
+
+block overlongOutOfBounds:
+  # MAX_PACKET_SIZE + 1 = 0x200001.
+  var decoder = newTCPNetworkDecoder()
+  decoder.feed(hx("81808001"))
+  let res = decoder.getRawPacket()
+  assert not res.isOk
+  assert res.error.kind == pdeOutOfBounds
+
+block maximumLengthIsInBounds:
+  var decoder = newTCPNetworkDecoder()
+  decoder.feed(hx("80808001"))
+  assert not decoder.packetReady()
+
+block negativeDecompressedLengthTooLong:
+  var decoder = newTCPNetworkDecoder()
+  decoder.setCompression(0)
+  decoder.feed(hx("05 ffffffff0f"))
+  let res = decoder.getRawPacket()
+  assert not res.isOk
+  assert res.error.kind == pdeTooLong
+
+block overlongDecompressedLengthTooLong:
+  # MAX_PACKET_DATA_SIZE + 1 = 0x800001.
+  var decoder = newTCPNetworkDecoder()
+  decoder.setCompression(0)
+  decoder.feed(hx("04 81808004"))
+  let res = decoder.getRawPacket()
+  assert not res.isOk
+  assert res.error.kind == pdeTooLong
+
+block notCompressedOverThreshold:
+  # Data length 0 and 3 bytes of raw data against a threshold of 2.
+  var decoder = newTCPNetworkDecoder()
+  decoder.setCompression(2)
+  decoder.feed(hx("04 00 010203"))
+  let res = decoder.getRawPacket()
+  assert not res.isOk
+  assert res.error.kind == pdeNotCompressed
+
+block notCompressedAtThreshold:
+  var decoder = newTCPNetworkDecoder()
+  decoder.setCompression(3)
+  decoder.feed(hx("04 00 010203"))
+  let res = decoder.getRawPacket()
+  assert res.isOk
+  assert res.value.id == 1
+  assert res.value.payload == hx("0203")
+
+block emptyFrameHasNoId:
+  var decoder = newTCPNetworkDecoder()
+  decoder.feed(hx("00"))
+  let res = decoder.getRawPacket()
+  assert not res.isOk
+  assert res.error.kind == pdeDecodeId
+
+block invalidZlibIsADecodeIdError:
+  var decoder = newTCPNetworkDecoder()
+  decoder.setCompression(1000)
+  decoder.feed(hx("04 0a ffffff"))
+  let res = decoder.getRawPacket()
+  assert not res.isOk
+  assert res.error.kind == pdeDecodeId
+
+block declaredLengthTooLarge:
+  # The stream inflates to 9 bytes but declares 10.
+  var decoder = newTCPNetworkDecoder()
+  decoder.setCompression(256)
+  decoder.feed(hx("12 0a 789c6360af564a54b232ac050008640210"))
+  let res = decoder.getRawPacket()
+  assert not res.isOk
+  assert res.error.kind == pdeFailedDecompression
+  assert res.error.msg == "failed to decompress packet: Declared decompressed length 10 but decoded 9 bytes"
+
+block declaredLengthTooSmall:
+  # The stream inflates to 9 bytes but declares 8. Inflating stops one byte past what was declared.
+  var decoder = newTCPNetworkDecoder()
+  decoder.setCompression(256)
+  decoder.feed(hx("12 08 789c6360af564a54b232ac050008640210"))
+  let res = decoder.getRawPacket()
+  assert not res.isOk
+  assert res.error.kind == pdeFailedDecompression
+  assert res.error.msg == "failed to decompress packet: Declared decompressed length 8 but decoded 9 bytes"
+
+block truncatedZlibAfterTheId:
+  # Cut off inside the stream, past where the id has come out. A long run of one byte inflates early.
+  let z = zlibCompressBytes(newSeq[byte](300), 6'u32)
+  assert z.ok
+  let cut = z.data[0 ..< z.data.len - 4]
+  var inner: seq[byte] = @[]
+  encodeJava(newVarInt(300), inner)
+  for b in cut:
+    inner.add(b)
+  var frame: seq[byte] = @[]
+  encodeJava(newVarInt(int32(inner.len)), frame)
+  for b in inner:
+    frame.add(b)
+  var decoder = newTCPNetworkDecoder()
+  decoder.setCompression(256)
+  decoder.feed(frame)
+  let res = decoder.getRawPacket()
+  assert not res.isOk
+  assert res.error.kind == pdeFailedDecompression
+
+block shortFrameAtEofComesBackShort:
+  # Upstream's read loop stops at EOF and returns what it has when uncompressed.
+  var decoder = newTCPNetworkDecoder()
+  decoder.feed(hx("05 01 aabb"))
+  assert not decoder.packetReady()
+  let res = decoder.getRawPacket()
+  assert res.isOk
+  assert res.value.id == 1
+  assert res.value.payload == hx("aabb")
+
+block encryptionCanOnlyBeSetOnce:
+  var decoder = newTCPNetworkDecoder()
+  assert decoder.setEncryption(newSeq[uint8](16)).isOk
+  let again = decoder.setEncryption(newSeq[uint8](16))
+  assert not again.isOk
+  assert again.error.kind == pdeMessage
+  assert again.error.msg == "Encryption already enabled"
+
+block invalidKey:
+  var decoder = newTCPNetworkDecoder()
+  let res = decoder.setEncryption(newSeq[uint8](17))
+  assert not res.isOk
+  assert res.error.msg == "Invalid key"
+
+# --- The non-blocking side, which has no upstream counterpart ------------------
+
+block packetReadyByteByByte:
+  # A frame fed one byte at a time, then one more frame behind it.
+  let frame = hx("03 01 aabb 01 02")
+  var decoder = newTCPNetworkDecoder()
+  assert not decoder.packetReady()
+  for i in 0 ..< 3:
+    decoder.feed(frame[i .. i])
+    assert not decoder.packetReady()
+  decoder.feed(frame[3 ..< frame.len])
+  assert decoder.packetReady()
+  let a = decoder.getRawPacket()
+  assert a.isOk and a.value.id == 1 and a.value.payload == hx("aabb")
+  assert decoder.packetReady()
+  let b = decoder.getRawPacket()
+  assert b.isOk and b.value.id == 2 and b.value.payload.len == 0
+  assert not decoder.packetReady()
+  assert decoder.buffered() == 0
+
+block packetReadyOnABadLength:
+  var decoder = newTCPNetworkDecoder()
+  decoder.feed(hx("ffffffffff"))
+  assert decoder.packetReady()
+  var decoder2 = newTCPNetworkDecoder()
+  decoder2.feed(hx("ffffffff0f"))
+  assert decoder2.packetReady()
+
+block cipherSwitchWithCiphertextAlreadyBuffered:
+  # A plaintext frame, then a frame the client encrypted right behind it, in one read. The second must
+  # not be taken for plaintext.
+  let key = newSeq[uint8](16)
+  var both = hx("02 01 aa")
+  for b in hx("6fa69e23ecb351ea8d3a"):
+    both.add(b)
+  var decoder = newTCPNetworkDecoder()
+  decoder.feed(both)
+  let first = decoder.getRawPacket()
+  assert first.isOk and first.value.id == 1 and first.value.payload == hx("aa")
+  assert decoder.setEncryption(key).isOk
+  assert decoder.packetReady()
+  let second = decoder.getRawPacket()
+  assert second.isOk
+  assert second.value.id == 0
+  assert second.value.payload == plainPayload
+
+block manyPacketsCompactTheBuffer:
+  # More than the compaction threshold in total, read as it arrives.
+  var decoder = newTCPNetworkDecoder()
+  var count = 0
+  for i in 0 ..< 2000:
+    decoder.feed(buildPacket(int32(i), newSeq[byte](100), false, @[]))
+    if i mod 2 == 1:
+      while decoder.packetReady():
+        let res = decoder.getRawPacket()
+        assert res.isOk
+        assert res.value.id == int32(count)
+        assert res.value.payload.len == 100
+        inc count
+  assert count == 2000
+
+echo "all packet_decoder checks passed"
