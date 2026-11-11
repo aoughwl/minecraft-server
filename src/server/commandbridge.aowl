@@ -1,0 +1,783 @@
+## Backs the command hooks of src/command/cmdsource.aowl with the real server, world and player objects.
+##
+## Upstream's commands reach straight into `Server`, `World` and `Player`; here each of those has a `CommandServer`,
+## `CommandWorld` or `CommandPlayer` of closures, built once. A `CommandPlayer` is kept on its `Player` and dropped by
+## `forgetCommandPlayer` on removal, since the two refer to each other.
+##
+## What has no backing yet stays nil, and the command gets the neutral answer cmdsource.aowl names on that field:
+##   Player: effects (get/add/remove, in src/server/entity's LivingEntity, not linked to a live player yet),
+##           `isAdvancementDone` (no advancement manager), `getIp` (the connection keeps no peer address),
+##           `heldItemAccepts`/`heldItemCanHold`/`enchantHeld` (no enchantment glue on the live inventory).
+##   Entity: only players exist in a live world: `remove`, `getCustomName`.
+##   World:  `teamHasPlayer`, `getScore`, `getTeamNames`, `getTeamOf`, `getObjectiveNames` (no scoreboard on `World`),
+##           `spawnParticle`, `spawnEntity` (no entity list on `World`), `updateNeighbors`.
+##   Server: `getTps`/`getMspt` (no sample history), `lookupProfileByName` (Mojang), `reloadDatapacks`, `fireSpawnChange`.
+
+import std/[options, syncio, strutils, math]
+import ../command/[client_suggestions, cmdsource, cmddispatch]
+import ../config/[op, whitelist]
+import ../config/lib as configlib
+import "../data/item_stack/mod" as itemstackmod
+import ../data/block_ext
+import ../data/block_state
+import ../generated/[game_rules, item_full, message_type]
+import ../generated/sound as soundtable
+import ../generated/sound_category
+import ../generated/translation as tr
+import ../generated/dimension
+import ../inventory/[inventory, player_inventory, screenhandler]
+import ../protocol/proto
+import ../protocol/varint
+import ../protocol/java/client/config/config_disconnect
+import ../protocol/java/client/login/login_disconnect
+import ../protocol/java/client/play/disconnect
+import ../util/resource_location
+import ../protocol/java/client/play/[actionbar, clear_title, combat_death, disguised_chat_message, set_experience,
+  set_title, set_title_animation, sound_effect, stop_sound, subtitle, transfer]
+import ../util/[difficulty, gamemode, permission, uuid, vector2, vector3]
+import ../util/math/[boundingbox, position]
+import ../util/text/[textbase, text, locale]
+import ../nbt/tag
+import ../world/level
+import ../world/world as worldtraits
+import ../world/worldinfo except Dimension
+import command/[cmdcommon, default_dispatcher]
+import data/[banned_ip, banned_player, banlist_serializer, datamod, usercache]
+import entity/player as playermod
+import net/java/javamod
+import net/winsock
+import serverbase
+import world/[time, weather, worldmod]
+
+const DataFolder = "data"
+
+proc flagsOf(bits: uint32): uint32 =
+  ## cmdsource.aowl's bits as the world's `BlockFlags`.
+  result = 0'u32
+  if (bits and cbfForceState) != 0'u32:
+    result = result or BfForceState
+  if (bits and cbfNotifyNeighbors) != 0'u32:
+    result = result or BfNotifyNeighbors
+  if (bits and cbfSkipBlockAddedCallback) != 0'u32:
+    result = result or BfSkipBlockAddedCallback
+  if (bits and cbfSkipDrops) != 0'u32:
+    result = result or BfSkipDrops
+
+proc playerOf(server: Server; player: Player): CommandPlayer = server.commandPlayerOf(player)
+
+# ---- CommandWorld -------------------------------------------------------------------------------------------------
+
+proc buildCommandWorld(server: Server; world: World): CommandWorld =
+  let rules = proc(): GameRuleRegistry {.closure.} = world.levelInfo.gameRules
+  result = CommandWorld(dimensionName: world.dimension.minecraftName)
+  result.getSeed = proc(): int64 {.closure.} = world.levelInfo.worldGenSettings.seed
+  result.setSaveEnabled = proc(enabled: bool): bool {.closure.} =
+    let previous = world.level.saveEnabled
+    world.level.saveEnabled = enabled
+    previous != enabled
+  result.sendCommandFeedback = proc(): bool {.closure.} = rules().sendCommandFeedback
+  result.commandBlockOutput = proc(): bool {.closure.} = rules().commandBlockOutput
+  result.getSpawnPoint = proc(): Vector3[int32] {.closure.} =
+    Vector3[int32](x: world.levelInfo.spawnX, y: world.levelInfo.spawnY, z: world.levelInfo.spawnZ)
+  result.getPlayers = proc(): seq[CommandPlayer] {.closure.} =
+    var list: seq[CommandPlayer] = @[]
+    for p in world.players:
+      list.add(playerOf(server, p))
+    list
+  result.getEntities = proc(): seq[CommandEntity] {.closure.} =
+    var list: seq[CommandEntity] = @[]
+    for p in world.players:
+      list.add(playerOf(server, p).entity)
+    list
+  result.getEntityByUuid = proc(id: Uuid): nil CommandEntity {.closure.} =
+    for p in world.players:
+      if p.gameprofile.id == id:
+        return playerOf(server, p).entity
+    nil
+  result.getPlayerByUuid = proc(id: Uuid): nil CommandPlayer {.closure.} =
+    for p in world.players:
+      if p.gameprofile.id == id:
+        return playerOf(server, p)
+    nil
+  result.getEntitiesInBox = proc(box: BoundingBox): seq[CommandEntity] {.closure.} =
+    var list: seq[CommandEntity] = @[]
+    for p in world.players:
+      if intersects(box, playermod.boundingBox(p)):
+        list.add(playerOf(server, p).entity)
+    list
+  result.isChunkLoaded = proc(x, z: int32): bool {.closure.} =
+    isLoaded(world, newBlockPos(x * 16'i32, 0'i32, z * 16'i32))
+  result.isInBuildLimit = proc(x, y, z: int32): bool {.closure.} =
+    worldmod.isInBuildLimit(world, newBlockPos(x, y, z))
+  result.requestSave = proc() {.closure.} =
+    world.level.shouldSave = true
+  result.setWeatherParameters = proc(clearTime, rainTime: int32; raining, thundering: bool) {.closure.} =
+    var w = world.weather
+    weather.setWeatherParameters(w, world, clearTime, rainTime, raining, thundering)
+    world.weather = w
+  result.queryDaytime = proc(): int64 {.closure.} = time.queryDaytime(world.levelTime)
+  result.queryGametime = proc(): int64 {.closure.} = time.queryGametime(world.levelTime)
+  result.queryDay = proc(): int64 {.closure.} = time.queryDay(world.levelTime)
+  result.addTime = proc(ticks: int64) {.closure.} =
+    time.addTime(world.levelTime, ticks)
+    time.sendTime(world.levelTime, world)
+  result.setTime = proc(ticks: int64) {.closure.} =
+    time.setTime(world.levelTime, ticks)
+    time.sendTime(world.levelTime, world)
+  result.setBlockState = proc(x, y, z: int32; stateId: uint16; flags: uint32) {.closure.} =
+    discard worldmod.setBlockState(world, newBlockPos(x, y, z), uint32(stateId), flagsOf(flags))
+  result.breakBlock = proc(x, y, z: int32; flags: uint32) {.closure.} =
+    discard worldmod.breakBlock(world, newBlockPos(x, y, z), nil, flagsOf(flags))
+  result.getBlockStateId = proc(x, y, z: int32): uint16 {.closure.} =
+    uint16(worldmod.getBlockStateId(world, newBlockPos(x, y, z)))
+  result.isAirState = proc(stateId: uint16): bool {.closure.} = isAir(BlockState.fromId(newBlockStateIdUnchecked(stateId)))
+  result.getBlockId = proc(x, y, z: int32): int {.closure.} = int(worldmod.getBlock(world, newBlockPos(x, y, z)).id)
+
+proc commandWorldOf(server: Server; world: World): CommandWorld =
+  let existing = world.commandWorld
+  if existing != nil:
+    return existing
+  result = buildCommandWorld(server, world)
+  world.commandWorld = result
+
+proc overworldOf(server: Server): nil World =
+  if server.worlds.len > 0:
+    return server.worlds[0]
+  nil
+
+proc soundId(id: uint16): proto.IdOr[proto.SoundEvent] =
+  proto.IdOr[proto.SoundEvent](kind: iokId, id: id)
+
+# ---- CommandPlayer and its CommandEntity ---------------------------------------------------------------------------
+
+proc toItemStack(stack: CmdItemStack; res: var ItemStack): bool =
+  ## The item by name. A patch is not applied yet: see the note on `insertOrDropStack`.
+  let key = if stack.itemKey.startsWith("minecraft:"): stack.itemKey[10 ..< stack.itemKey.len] else: stack.itemKey
+  let it = Item.fromRegistryKey(key)
+  if it == nil:
+    return false
+  res = newItemStack(uint8(stack.count), it)
+  true
+
+proc fromItemStack(stack: ItemStack): CmdItemStack =
+  if stack.isEmpty():
+    return CmdItemStack(itemKey: "", count: 0'i32, patchNames: @[], patchValues: @[])
+  CmdItemStack(itemKey: stack.item.registryKey, count: int32(stack.itemCount), patchNames: @[], patchValues: @[])
+
+proc killPlayer(player: Player) =
+  ## `Entity::kill` on a player: health to nothing and the death screen, which `handleClientStatus` answers with a
+  ## respawn. Death drops and statistics are in LivingEntity::on_death, src/server/entity, not linked to a live player.
+  if player.dead:
+    return
+  player.health = 0.0'f32
+  player.dead = true
+  playermod.sendHealth(player)
+  let message = tc(tr.JAVA_DEATH_ATTACK_GENERIC, [text(player.gameprofile.name)])
+  player.client.writePacketFor(CCombatDeath(playerId: newVarInt(player.entityId), message: message))
+  player.world.broadcastSystemMessage(message, false)
+
+proc buildCommandEntity(server: Server; player: Player; owner: CommandPlayer): CommandEntity =
+  result = CommandEntity(uuid: player.gameprofile.id, entityId: player.entityId, entityTypeId: "minecraft:player",
+    player: owner, entityTypeName: "player")
+  let name = player.gameprofile.name
+  result.getName = proc(): TextComponent {.closure.} = text(name)
+  result.getDisplayName = proc(): TextComponent {.closure.} = text(name)
+  result.getPos = proc(): Vector3[float64] {.closure.} = player.pos
+  result.getRotation = proc(): Vector2[float32] {.closure.} = Vector2[float32](x: player.pitch, y: player.yaw)
+  result.getEyeHeight = proc(): float64 {.closure.} = eyePosition(player).y - player.pos.y
+  result.getWorld = proc(): nil CommandWorld {.closure.} = commandWorldOf(server, player.world)
+  result.isAlive = proc(): bool {.closure.} = not player.dead and player.health > 0.0'f32
+  result.kill = proc() {.closure.} = killPlayer(player)
+  result.teleport = proc(pos: Vector3[float64]; yaw, pitch: Option[float32]; world: CommandWorld) {.closure.} =
+    # Changing dimension is `Player::teleport_world`, which needs the respawn flow; within a world it is this.
+    let y = if yaw.isSome: yaw.unsafeGet else: player.yaw
+    let p = if pitch.isSome: pitch.unsafeGet else: player.pitch
+    requestTeleport(player, pos, y, p)
+  result.getScoreboardTags = proc(): seq[string] {.closure.} = player.scoreboardTags
+  result.addScoreboardTag = proc(tag: string): bool {.closure.} =
+    if tag in player.scoreboardTags:
+      return false
+    player.scoreboardTags.add(tag)
+    true
+  result.removeScoreboardTag = proc(tag: string): bool {.closure.} =
+    let at = find(player.scoreboardTags, tag)
+    if at < 0:
+      return false
+    player.scoreboardTags.delete(at)
+    true
+  result.getBoundingBox = proc(): BoundingBox {.closure.} = playermod.boundingBox(player)
+  result.damageWithContext = proc(amount: float32; damageType: string; location: Option[Vector3[float64]];
+                                  source, cause: nil CommandEntity): bool {.closure.} =
+    # The sum `LivingEntity::damage` ends in, without armour and the rest of src/server/entity.
+    if player.dead or player.abilities.invulnerable:
+      return false
+    player.health = max(0.0'f32, player.health - amount)
+    playermod.sendHealth(player)
+    if player.health <= 0.0'f32:
+      killPlayer(player)
+    true
+  result.writeNbt = proc(): NbtCompound {.closure.} =
+    var nbt = newCompound()
+    playermod.writeNbt(player, nbt)
+    nbt
+  result.readNbt = proc(nbt: NbtCompound) {.closure.} = playermod.readNbt(player, nbt)
+
+proc sendExperience(player: Player) =
+  player.client.writePacketFor(CSetExperience(progress: player.experienceProgress,
+    level: newVarInt(player.experienceLevel), totalExperience: newVarInt(player.experiencePoints)))
+
+proc pointsForLevel(level: int32): int32 =
+  ## `experience::points_in_level`.
+  if level >= 30'i32: 112'i32 + (level - 30'i32) * 9'i32
+  elif level >= 15'i32: 37'i32 + (level - 15'i32) * 5'i32
+  else: 7'i32 + level * 2'i32
+
+proc inventorySlot(player: Player; index: int): CmdItemSlot =
+  result = CmdItemSlot()
+  let inv = Inventory(player.inventory)
+  result.getStack = proc(): CmdItemStack {.closure.} = fromItemStack(inventory.getStack(inv, index))
+  result.setStack = proc(stack: CmdItemStack) {.closure.} =
+    var s = ItemStack()
+    if stack.itemKey.len == 0 or not toItemStack(stack, s):
+      inventory.setStack(inv, index, emptyItemStack())
+    else:
+      inventory.setStack(inv, index, s)
+    player.currentScreenHandler.sendContentUpdates()
+  result.isEmpty = proc(): bool {.closure.} = inventory.getStack(inv, index).isEmpty()
+
+proc buildCommandPlayer(server: Server; player: Player): CommandPlayer =
+  result = CommandPlayer(gameProfile: CmdGameProfile(id: player.gameprofile.id, name: player.gameprofile.name))
+  let owner = result
+  result.entity = buildCommandEntity(server, player, owner)
+  let client = player.client
+  result.getPermissionLvl = proc(): PermissionLvl {.closure.} = player.permissionLvl
+  result.setPermissionLvl = proc(lvl: PermissionLvl) {.closure.} =
+    player.permissionLvl = lvl
+    sendPermissionLvlUpdate(player)
+    let dispatcher = server.commandDispatcher
+    if dispatcher != nil:
+      client.writePacketFor(buildCCommands(senderPlayer(owner), server.commandServer, dispatcher))
+  result.hasPermission = proc(node: string): bool {.closure.} =
+    # `PermissionManager::has_permission` without attachments, which nothing here sets yet.
+    let commandServer = server.commandServer
+    if commandServer == nil:
+      return false
+    let registry = commandServer.permissionRegistry
+    if registry == nil:
+      return false
+    let (found, p) = getPermission(registry, node)
+    if not found:
+      return false
+    case p.default.kind
+    of pdkAllow: true
+    of pdkDeny: false
+    of pdkOp: ord(p.default.level) <= ord(player.permissionLvl)
+  result.sendSystemMessage = proc(message: TextComponent) {.closure.} = playermod.sendSystemMessage(player, message)
+  result.getLocale = proc(): Locale {.closure.} = localeFromStr(player.config.locale)
+  result.getGameMode = proc(): GameMode {.closure.} = player.gamemode
+  result.setGameMode = proc(mode: GameMode): bool {.closure.} = playermod.setGamemode(player, mode)
+  result.getExperienceLevel = proc(): int32 {.closure.} = player.experienceLevel
+  result.kick = proc(reason: TextComponent) {.closure.} = javamod.kick(client, reason)
+  result.sendMsgOutgoing = proc(message, sender, target: TextComponent) {.closure.} =
+    client.writePacketFor(CDisguisedChatMessage(message: message, chatType: newVarInt(int32(MSG_COMMAND_OUTGOING) + 1'i32),
+      senderName: sender, targetName: some(target)))
+  result.sendMsgIncoming = proc(message, sender, target: TextComponent) {.closure.} =
+    client.writePacketFor(CDisguisedChatMessage(message: message, chatType: newVarInt(int32(MSG_COMMAND_INCOMING) + 1'i32),
+      senderName: sender, targetName: some(target)))
+  result.transfer = proc(host: string; port: int32) {.closure.} =
+    client.writePacketFor(CTransfer(host: host, port: newVarInt(port)))
+  result.clearTitle = proc(reset: bool) {.closure.} = client.writePacketFor(CClearTitle(reset: reset))
+  result.showTitle = proc(text: TextComponent; mode: CmdTitleMode) {.closure.} =
+    case mode
+    of ctmTitle: client.writePacketFor(CTitleText(title: text))
+    of ctmSubTitle: client.writePacketFor(CSubtitle(subtitle: text))
+    of ctmActionBar: client.writePacketFor(CActionBar(actionBar: text))
+  result.sendTitleAnimation = proc(fadeIn, stay, fadeOut: int32) {.closure.} =
+    client.writePacketFor(CTitleAnimation(fadeInTicks: fadeIn, stayTicks: stay, fadeOutTicks: fadeOut))
+  result.stopSound = proc(sound, category: Option[string]) {.closure.} =
+    var cat = none[SoundCategory]()
+    if category.isSome:
+      let (ok, c) = soundCategoryFromName(category.unsafeGet)
+      if ok:
+        cat = some(c)
+    var id = none[ResourceLocation]()
+    if sound.isSome:
+      id = some(sound.unsafeGet)
+    client.writePacketFor(CStopSound(soundId: id, category: cat))
+  result.playSound = proc(soundName, category: string; pos: Vector3[float64]; volume, pitch: float32; seed: float64) {.closure.} =
+    let key = if soundName.startsWith("minecraft:"): soundName[10 ..< soundName.len] else: soundName
+    let (ok, s) = soundtable.fromName(key)
+    if not ok:
+      return
+    let (catOk, cat) = soundCategoryFromName(category)
+    client.writePacketFor(newCSoundEffect(soundId(uint16(ord(s))),
+      if catOk: cat else: scMaster, pos, volume, pitch, seed))
+  result.setRespawnPoint = proc(dimension: string; x, y, z: int32; yaw, pitch: float32; force: bool) {.closure.} =
+    var dim = player.world.dimension
+    for w in server.worlds:
+      if w.dimension.minecraftName == dimension:
+        dim = w.dimension
+    player.respawnPoint = some(RespawnPoint(dimension: dim, position: newBlockPos(x, y, z), yaw: yaw, force: force))
+  result.getExperiencePoints = proc(): int32 {.closure.} = player.experiencePoints
+  result.addExperienceLevels = proc(amount: int32) {.closure.} =
+    player.experienceLevel = max(0'i32, player.experienceLevel + amount)
+    sendExperience(player)
+  result.setExperienceLevel = proc(amount: int32) {.closure.} =
+    player.experienceLevel = amount
+    sendExperience(player)
+  result.addExperiencePoints = proc(amount: int32) {.closure.} =
+    player.experiencePoints = max(0'i32, player.experiencePoints + amount)
+    var progress = player.experienceProgress * float32(pointsForLevel(player.experienceLevel)) + float32(amount)
+    while progress >= float32(pointsForLevel(player.experienceLevel)):
+      progress -= float32(pointsForLevel(player.experienceLevel))
+      inc player.experienceLevel
+    player.experienceProgress = max(0.0'f32, progress / float32(pointsForLevel(player.experienceLevel)))
+    sendExperience(player)
+  result.setExperiencePoints = proc(amount: int32) {.closure.} =
+    player.experienceProgress = clamp(float32(amount) / float32(pointsForLevel(player.experienceLevel)), 0.0'f32, 1.0'f32)
+    player.experiencePoints = amount
+    sendExperience(player)
+  result.insertOrDropStack = proc(stack: CmdItemStack) {.closure.} =
+    var s = ItemStack()
+    if toItemStack(stack, s):
+      discard insertStackAnywhere(player.inventory, s)
+      if not s.isEmpty():
+        player.asInventoryPlayer().dropItem(s, false)
+      player.currentScreenHandler.sendContentUpdates()
+  result.getHeldStack = proc(): CmdItemStack {.closure.} = fromItemStack(player.inventory.heldItem())
+  result.getInventorySlots = proc(): seq[CmdItemSlot] {.closure.} =
+    var list: seq[CmdItemSlot] = @[]
+    var i = 0
+    let total = inventory.size(Inventory(player.inventory))
+    while i < total:
+      list.add(inventorySlot(player, i))
+      inc i
+    list
+
+proc forgetCommandPlayer*(player: Player) =
+  ## `Player::remove`'s half here: break the cycle between a player and its hooks.
+  let existing = player.commandPlayer
+  if existing != nil:
+    existing.entity.player = nil
+    player.commandPlayer = nil
+
+# ---- CommandServer ------------------------------------------------------------------------------------------------
+
+proc allPlayers(server: Server): seq[Player] =
+  result = @[]
+  for w in server.worlds:
+    for p in w.players:
+      result.add(p)
+
+proc byName(server: Server; name: string): nil Player =
+  for p in allPlayers(server):
+    if cmpIgnoreCase(p.gameprofile.name, name) == 0:
+      return p
+  nil
+
+proc byUuid(server: Server; id: Uuid): nil Player =
+  for p in allPlayers(server):
+    if p.gameprofile.id == id:
+      return p
+  nil
+
+proc limitOf(selector: TargetSelector): uint64 =
+  ## `TargetSelector::get_limit`: 1 for the singular selectors, unlimited otherwise, unless a filter says.
+  for f in selector.conditions:
+    if f.kind == efkLimit:
+      return f.limit
+  case selector.selectorType
+  of estNearestPlayer, estNearestEntity, estRandomPlayer: 1'u64
+  of estSource, estNamedPlayer, estUuid: 1'u64
+  of estAllPlayers, estAllEntities: high(uint64)
+
+proc sortOf(selector: TargetSelector): EntityFilterSort =
+  for f in selector.conditions:
+    if f.kind == efkSort:
+      return f.sort
+  case selector.selectorType
+  of estNearestPlayer, estNearestEntity: efsNearest
+  of estRandomPlayer: efsRandom
+  else: efsArbitrary
+
+proc distanceSq(a, b: Vector3[float64]): float64 =
+  let dx = a.x - b.x
+  let dy = a.y - b.y
+  let dz = a.z - b.z
+  dx * dx + dy * dy + dz * dz
+
+proc selectPlayerList(server: Server; selector: TargetSelector; sender: CommandSender): seq[Player] =
+  ## `Server::select_players`.
+  var players: seq[Player] = @[]
+  case selector.selectorType
+  of estSource:
+    if sender.kind == cskPlayer:
+      let p = byUuid(server, sender.player.gameProfile.id)
+      if p != nil:
+        players.add(p)
+  of estNearestPlayer, estNearestEntity, estRandomPlayer, estAllPlayers, estAllEntities:
+    players = allPlayers(server)
+  of estNamedPlayer:
+    let p = byName(server, selector.name)
+    if p != nil:
+      players.add(p)
+  of estUuid:
+    let p = byUuid(server, selector.uuid)
+    if p != nil:
+      players.add(p)
+  # The `type=` filters: a player passes unless excluded, or unless another type is asked for.
+  var included = false
+  var anyIncluded = false
+  var excluded = false
+  for f in selector.conditions:
+    if f.kind == efkType:
+      let isPlayerType = f.value == "player" or f.value == "minecraft:player"
+      if f.negate:
+        excluded = excluded or isPlayerType
+      else:
+        anyIncluded = true
+        included = included or isPlayerType
+  if excluded or (anyIncluded and not included):
+    players = @[]
+  let limit = limitOf(selector)
+  if limit == 0'u64:
+    return @[]
+  let sort = sortOf(selector)
+  if sort == efsNearest or sort == efsFurthest:
+    var center = Vector3[float64](x: 0.0, y: 0.0, z: 0.0)
+    discard position(sender, center)
+    # Insertion sort: stable, as `sort_by` is, and the list is short.
+    var i = 1
+    while i < players.len:
+      let moving = players[i]
+      let d = distanceSq(moving.pos, center)
+      var j = i
+      while j > 0:
+        let other = distanceSq(players[j - 1].pos, center)
+        if (if sort == efsNearest: other <= d else: other >= d):
+          break
+        let previous = players[j - 1]
+        players[j] = previous
+        dec j
+      players[j] = moving
+      inc i
+  elif sort == efsRandom and players.len > 1:
+    # `players.shuffle`.
+    var i = players.len - 1
+    while i > 0:
+      let j = int(nowMs() mod int64(i + 1))
+      let a = players[i]
+      let b = players[j]
+      players[i] = b
+      players[j] = a
+      dec i
+  result = @[]
+  for p in players:
+    if uint64(result.len) >= limit:
+      break
+    result.add(p)
+
+proc playerEntry(id: Uuid; name, source, reason: string): BannedPlayerEntry =
+  BannedPlayerEntry(uuid: id, name: name, created: nowUtcSeconds(), source: source, expires: 0'i64, reason: reason)
+
+proc buildCommandServer(server: Server; registry: PermissionRegistry): CommandServer =
+  result = CommandServer(permissionRegistry: registry, opPermissionLevel: server.basicConfig.opPermissionLevel)
+  result.getAllPlayers = proc(): seq[CommandPlayer] {.closure.} =
+    var list: seq[CommandPlayer] = @[]
+    for p in allPlayers(server):
+      list.add(playerOf(server, p))
+    list
+  result.getPlayerByName = proc(name: string): nil CommandPlayer {.closure.} =
+    let p = byName(server, name)
+    if p != nil:
+      return playerOf(server, p)
+    nil
+  result.getPlayerByUuid = proc(id: Uuid): nil CommandPlayer {.closure.} =
+    let p = byUuid(server, id)
+    if p != nil:
+      return playerOf(server, p)
+    nil
+  result.getWorlds = proc(): seq[CommandWorld] {.closure.} =
+    var list: seq[CommandWorld] = @[]
+    for w in server.worlds:
+      list.add(commandWorldOf(server, w))
+    list
+  result.getOverworld = proc(): nil CommandWorld {.closure.} =
+    let w = overworldOf(server)
+    if w != nil:
+      return commandWorldOf(server, w)
+    nil
+  result.broadcastSystemMessage = proc(message: TextComponent) {.closure.} =
+    for w in server.worlds:
+      w.broadcastSystemMessage(message, false)
+  result.sendCommandFeedback = proc(): bool {.closure.} = server.worlds[0].levelInfo.gameRules.sendCommandFeedback
+  result.getRandomPlayer = proc(): nil CommandPlayer {.closure.} =
+    let list = allPlayers(server)
+    if list.len > 0:
+      return playerOf(server, list[int(nowMs() mod int64(list.len))])
+    nil
+  result.selectPlayers = proc(selector: TargetSelector; sender: CommandSender): seq[CommandPlayer] {.closure.} =
+    var list: seq[CommandPlayer] = @[]
+    for p in selectPlayerList(server, selector, sender):
+      list.add(playerOf(server, p))
+    list
+  result.selectEntities = proc(selector: TargetSelector; sender: CommandSender): seq[CommandEntity] {.closure.} =
+    # `Server::select_entities`: only players live in a world yet, so the same answer, as entities.
+    var list: seq[CommandEntity] = @[]
+    for p in selectPlayerList(server, selector, sender):
+      list.add(playerOf(server, p).entity)
+    list
+  result.stopServer = proc() {.closure.} = server.stopRequested = true
+  result.configuredTps = proc(): float64 {.closure.} = float64(server.basicConfig.tps)
+  result.javaMaxPlayers = proc(): int32 {.closure.} = int32(server.advancedConfig.networking.java.maxPlayers)
+  result.bedrockMaxPlayers = proc(): int32 {.closure.} = int32(server.advancedConfig.networking.java.maxPlayers)
+  result.getDifficulty = proc(): Difficulty {.closure.} = server.worlds[0].levelInfo.difficulty
+  result.setDifficulty = proc(d: Difficulty) {.closure.} =
+    for w in server.worlds:
+      w.levelInfo.difficulty = d
+      for p in w.players:
+        sendDifficultyUpdate(p)
+  result.setPlayerIdleTimeout = proc(minutes: int32) {.closure.} = server.playerIdleTimeout = minutes
+  result.activePlugins = proc(): seq[PluginMetadata] {.closure.} = @[]
+  result.forceGamemode = proc(): bool {.closure.} = server.basicConfig.forceGamemode
+  result.setDefaultGamemode = proc(mode: GameMode) {.closure.} = server.basicConfig.defaultGamemode = mode
+  result.broadcastSay = proc(message, sender: TextComponent) {.closure.} =
+    for p in allPlayers(server):
+      p.client.writePacketFor(CDisguisedChatMessage(message: message, chatType: newVarInt(int32(SAY_COMMAND) + 1'i32),
+        senderName: sender, targetName: none[TextComponent]()))
+  result.broadcastEmote = proc(message, sender: TextComponent) {.closure.} =
+    for p in allPlayers(server):
+      p.client.writePacketFor(CDisguisedChatMessage(message: message, chatType: newVarInt(int32(EMOTE_COMMAND) + 1'i32),
+        senderName: sender, targetName: none[TextComponent]()))
+  # Ban lists, operators, the whitelist and the user cache: server.data.
+  result.getBannedPlayers = proc(): seq[CmdListEntry] {.closure.} =
+    var list: seq[CmdListEntry] = @[]
+    for e in server.data.bannedPlayerList.bannedPlayers:
+      list.add(CmdListEntry(id: e.uuid, name: e.name, source: e.source, reason: e.reason))
+    list
+  result.addBannedPlayer = proc(entry: CmdListEntry) {.closure.} =
+    server.data.bannedPlayerList.bannedPlayers.add(playerEntry(entry.id, entry.name, entry.source, entry.reason))
+    banned_player.save(server.data.bannedPlayerList)
+  result.renameBannedPlayer = proc(id: Uuid; name: string) {.closure.} =
+    var i = 0
+    while i < server.data.bannedPlayerList.bannedPlayers.len:
+      if server.data.bannedPlayerList.bannedPlayers[i].uuid == id:
+        server.data.bannedPlayerList.bannedPlayers[i].name = name
+      inc i
+    banned_player.save(server.data.bannedPlayerList)
+  result.removeBannedPlayer = proc(id: Uuid): bool {.closure.} =
+    var i = 0
+    while i < server.data.bannedPlayerList.bannedPlayers.len:
+      if server.data.bannedPlayerList.bannedPlayers[i].uuid == id:
+        server.data.bannedPlayerList.bannedPlayers.delete(i)
+        return true
+      inc i
+    false
+  result.saveBannedPlayers = proc() {.closure.} = banned_player.save(server.data.bannedPlayerList)
+  result.getBannedIps = proc(): seq[CmdListEntry] {.closure.} =
+    var list: seq[CmdListEntry] = @[]
+    for e in server.data.bannedIpList.bannedIps:
+      list.add(CmdListEntry(ip: e.ip, source: e.source, reason: e.reason))
+    list
+  result.addBannedIp = proc(entry: CmdListEntry) {.closure.} =
+    server.data.bannedIpList.bannedIps.add(BannedIpEntry(ip: entry.ip, created: nowUtcSeconds(), source: entry.source,
+      expires: 0'i64, reason: entry.reason))
+    banned_ip.save(server.data.bannedIpList)
+  result.removeBannedIp = proc(ip: string): bool {.closure.} =
+    var i = 0
+    while i < server.data.bannedIpList.bannedIps.len:
+      if server.data.bannedIpList.bannedIps[i].ip == ip:
+        server.data.bannedIpList.bannedIps.delete(i)
+        banned_ip.save(server.data.bannedIpList)
+        return true
+      inc i
+    false
+  result.getOps = proc(): seq[CmdListEntry] {.closure.} =
+    var list: seq[CmdListEntry] = @[]
+    for e in server.data.operatorConfig.ops:
+      list.add(CmdListEntry(id: e.uuid, name: e.name, level: e.level))
+    list
+  result.putOp = proc(entry: CmdListEntry) {.closure.} =
+    var i = 0
+    while i < server.data.operatorConfig.ops.len:
+      if server.data.operatorConfig.ops[i].uuid == entry.id:
+        server.data.operatorConfig.ops[i].name = entry.name
+        server.data.operatorConfig.ops[i].level = entry.level
+        return
+      inc i
+    server.data.operatorConfig.ops.add(newOp(entry.id, entry.name, entry.level, false))
+  result.removeOp = proc(id: Uuid): bool {.closure.} =
+    var i = 0
+    while i < server.data.operatorConfig.ops.len:
+      if server.data.operatorConfig.ops[i].uuid == id:
+        server.data.operatorConfig.ops.delete(i)
+        return true
+      inc i
+    false
+  result.saveOps = proc() {.closure.} = discard saveOperatorConfig(server.data.operatorConfig, DataFolder)
+  result.getWhitelist = proc(): seq[CmdListEntry] {.closure.} =
+    var list: seq[CmdListEntry] = @[]
+    for e in server.data.whitelistConfig.whitelist:
+      list.add(CmdListEntry(id: e.uuid, name: e.name))
+    list
+  result.addWhitelist = proc(entry: CmdListEntry) {.closure.} =
+    server.data.whitelistConfig.whitelist.add(newWhitelistEntry(entry.id, entry.name))
+  result.renameWhitelist = proc(id: Uuid; name: string) {.closure.} =
+    var i = 0
+    while i < server.data.whitelistConfig.whitelist.len:
+      if server.data.whitelistConfig.whitelist[i].uuid == id:
+        server.data.whitelistConfig.whitelist[i].name = name
+      inc i
+  result.removeWhitelist = proc(id: Uuid): bool {.closure.} =
+    var i = 0
+    while i < server.data.whitelistConfig.whitelist.len:
+      if server.data.whitelistConfig.whitelist[i].uuid == id:
+        server.data.whitelistConfig.whitelist.delete(i)
+        return true
+      inc i
+    false
+  result.saveWhitelist = proc() {.closure.} = discard saveWhitelistConfig(server.data.whitelistConfig, DataFolder)
+  result.reloadWhitelist = proc() {.closure.} =
+    let loaded = loadWhitelistConfig(DataFolder)
+    if loaded.ok:
+      server.data.whitelistConfig = loaded.value
+  result.isWhitelisted = proc(profile: CmdGameProfile): bool {.closure.} =
+    whitelist.isWhitelisted(server.data.whitelistConfig, profile.id)
+  result.enforceWhitelist = proc(): bool {.closure.} = server.basicConfig.enforceWhitelist
+  result.swapWhiteList = proc(value: bool): bool {.closure.} =
+    let previous = server.basicConfig.whiteList
+    server.basicConfig.whiteList = value
+    previous
+  result.whiteListEnabled = proc(): bool {.closure.} = server.basicConfig.whiteList
+  result.userCacheGetByName = proc(name: string; res: var CmdGameProfile): bool {.closure.} =
+    let e = usercache.getByName(server.data.userCache, name)
+    if e.isNone:
+      return false
+    res = CmdGameProfile(id: e.unsafeGet.uuid, name: e.unsafeGet.name)
+    true
+  result.userCacheGetByUuid = proc(id: Uuid; res: var CmdGameProfile): bool {.closure.} =
+    let e = usercache.getByUuid(server.data.userCache, id)
+    if e.isNone:
+      return false
+    res = CmdGameProfile(id: e.unsafeGet.uuid, name: e.unsafeGet.name)
+    true
+  result.userCacheUpsert = proc(id: Uuid; name: string) {.closure.} = usercache.upsert(server.data.userCache, id, name)
+  result.onlineMode = proc(): bool {.closure.} = server.advancedConfig.networking.java.onlineMode
+  result.offlineUuid = proc(name: string; res: var Uuid): bool {.closure.} =
+    res = offlineUuid(name)
+    true
+  result.getGameRule = proc(rule: string): CmdGameRuleValue {.closure.} =
+    let (ok, r) = gameRuleFromName(rule)
+    if not ok:
+      return CmdGameRuleValue()
+    let v = game_rules.get(server.worlds[0].levelInfo.gameRules, r)
+    case gameRuleKind(r)
+    of grkInt: CmdGameRuleValue(isInt: true, intValue: v.intValue)
+    of grkBool: CmdGameRuleValue(isInt: false, boolValue: v.boolValue)
+  result.setGameRule = proc(rule: string; value: CmdGameRuleValue) {.closure.} =
+    let (ok, r) = gameRuleFromName(rule)
+    if ok:
+      for w in server.worlds:
+        if value.isInt:
+          game_rules.set(w.levelInfo.gameRules, r, GameRuleValue(kind: grkInt, intValue: value.intValue))
+        else:
+          game_rules.set(w.levelInfo.gameRules, r, GameRuleValue(kind: grkBool, boolValue: value.boolValue))
+  result.getSpawn = proc(): CmdSpawn {.closure.} =
+    let info = server.worlds[0].levelInfo
+    CmdSpawn(x: info.spawnX, y: info.spawnY, z: info.spawnZ, yaw: info.spawnYaw, pitch: info.spawnPitch)
+  result.setSpawn = proc(spawn: CmdSpawn) {.closure.} =
+    for w in server.worlds:
+      w.levelInfo.spawnX = spawn.x
+      w.levelInfo.spawnY = spawn.y
+      w.levelInfo.spawnZ = spawn.z
+      w.levelInfo.spawnYaw = spawn.yaw
+      w.levelInfo.spawnPitch = spawn.pitch
+
+proc consoleLine(line: string) =
+  echo line
+  stdout.flushFile()
+
+proc installCommands*(server: Server) =
+  ## `default_dispatcher` and `setup_console`'s half that needs no thread: the server's one dispatcher and its hooks.
+  let registry = newPermissionRegistry()
+  server.commandDispatcher = defaultDispatcher(registry)
+  server.commandServer = buildCommandServer(server, registry)
+  server.commandPlayerOf = proc(player: Player): CommandPlayer {.closure.} =
+    let existing = player.commandPlayer
+    if existing != nil:
+      return existing
+    let built = buildCommandPlayer(server, player)
+    player.commandPlayer = built
+    built
+  setConsoleWriter(consoleLine)
+
+proc cGetStdHandle(which: int32): pointer {.stdcall, importc: "GetStdHandle", dynlib: "kernel32".}
+proc cGetFileType(handle: pointer): uint32 {.stdcall, importc: "GetFileType", dynlib: "kernel32".}
+proc cPeekNamedPipe(handle: pointer; buffer: nil pointer; size: uint32; read: nil ptr uint32; avail: ptr uint32; left: nil ptr uint32): int32
+  {.stdcall, importc: "PeekNamedPipe", dynlib: "kernel32".}
+proc cReadFile(handle, buffer: pointer; size: uint32; read: ptr uint32; overlapped: nil pointer): int32
+  {.stdcall, importc: "ReadFile", dynlib: "kernel32".}
+proc cKbhit(): int32 {.cdecl, importc: "_kbhit", dynlib: "ucrtbase".}
+proc cGetche(): int32 {.cdecl, importc: "_getche", dynlib: "ucrtbase".}
+
+var consoleBuffer = ""
+
+proc runConsoleCommand*(server: Server; line: string) =
+  ## A line typed at the console.
+  let command = if line.startsWith("/"): line[1 ..< line.len] else: line
+  if command.len == 0:
+    return
+  let dispatcher = server.commandDispatcher
+  let commandServer = server.commandServer
+  if dispatcher == nil:
+    return
+  if commandServer == nil:
+    return
+  cmddispatch.handleCommand(dispatcher, intoSource(senderConsole(), commandServer), command)
+
+proc takeConsoleLines(server: Server) =
+  var at = find(consoleBuffer, '\n')
+  while at >= 0:
+    var line = consoleBuffer[0 ..< at]
+    consoleBuffer = consoleBuffer[at + 1 ..< consoleBuffer.len]
+    if line.len > 0 and line[line.len - 1] == '\r':
+      line = line[0 ..< line.len - 1]
+    runConsoleCommand(server, line)
+    at = find(consoleBuffer, '\n')
+
+proc pumpConsole*(server: Server) =
+  ## `setup_console`'s reader, called from the server loop: upstream gives it a thread, and this never blocks. Stdin may
+  ## be a console, or a pipe when a parent process runs the server. A file or nothing at all is not read.
+  const StdInputHandle = -10'i32
+  const FileTypeChar = 2'u32
+  const FileTypePipe = 3'u32
+  let handle = cGetStdHandle(StdInputHandle)
+  if handle == nil:
+    return
+  let kind = cGetFileType(handle)
+  if kind == FileTypePipe:
+    var avail = 0'u32
+    if cPeekNamedPipe(handle, nil, 0'u32, nil, addr avail, nil) == 0'i32 or avail == 0'u32:
+      return
+    var chunk = newSeq[char](512)
+    var got = 0'u32
+    if cReadFile(handle, addr chunk[0], min(avail, 512'u32), addr got, nil) == 0'i32:
+      return
+    var i = 0
+    while i < int(got):
+      consoleBuffer.add(chunk[i])
+      inc i
+  elif kind == FileTypeChar:
+    while cKbhit() != 0'i32:
+      let c = cGetche()
+      if c == 13'i32:
+        echo ""
+        consoleBuffer.add('\n')
+      elif c == 8'i32:
+        if consoleBuffer.len > 0:
+          consoleBuffer.setLen(consoleBuffer.len - 1)
+      elif c > 0'i32 and c < 256'i32:
+        consoleBuffer.add(char(c))
+  else:
+    return
+  takeConsoleLines(server)

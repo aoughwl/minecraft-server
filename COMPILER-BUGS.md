@@ -564,3 +564,32 @@ tuple, and a field key spelled like a captured local was rewritten as a capture.
 
 Still open: a closure inside a returned named tuple (`proc f(): tuple[a: int, b: proc(): int {.closure.}]`) stops
 the hexer with `expected ')'`. Return an object instead.
+
+Also open, found 2026-11-09: **#16, reading a closure field from a local object variable frees the closure.** Given
+`let n = s[0]` or `var n = s[0]` where the element is a value object with a closure field, both `n.f()` and `let g = n.f`
+drop one reference on the environment without having taken one. A few calls later the environment is freed, the next call
+runs on freed memory, and mimalloc aborts with 0xC0000409. This was the `/setblock` crash. Reads through `s[0].f`, through a
+`ref` (`n.r.f`) or a by-value parameter are fine, and so is copying the object without reading the closure. Workaround:
+do not bind the element to a local; write `s[i].f()`. Repro; prints a value from 0xdfdf... rather than 2:
+
+```nim
+type
+  Fn = proc(): int {.closure.}
+  B = object
+    s: string
+    f: Fn
+proc mk(x: int): Fn =
+  result = proc(): int {.closure.} = x + 1
+proc use(s: seq[B]) =
+  let n = s[0]
+  discard n.f()
+proc main =
+  let s = @[B(s: "x", f: mk(1))]
+  for k in 0..<10:
+    use(s)
+    var junk: seq[string] = @[]
+    for q in 0..<50:
+      junk.add("xxxxxxxxxxxxxxxxxxxxxxxxx" & $q)
+  echo s[0].f()
+main()
+```

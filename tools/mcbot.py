@@ -593,13 +593,51 @@ def offline_uuid(name):
     return hashlib.sha256(name.encode('utf-8')).digest()[:16]
 
 
+COMMAND_TREE = {}     # What the last commands packet said: 'nodes' and 'root'.
+
+
+def read_argument_properties(r, parser):
+    """The properties of a parser, by its id in 1.21.11's minecraft:command_argument_type."""
+    if parser in (1, 2, 3, 4):     # float, double, integer, long: min and max as the flags say
+        flags = r.u8()
+        size = 4 if parser in (1, 3) else 8
+        if flags & 1:
+            r.take(size)
+        if flags & 2:
+            r.take(size)
+    elif parser == 5:              # string
+        r.varint()
+    elif parser in (6, 31):        # entity, score_holder
+        r.u8()
+    elif parser == 43:             # time
+        r.take(4)
+    elif parser in (44, 45, 46, 47):  # resource_or_tag, resource_or_tag_key, resource, resource_key
+        r.string()
+
+
 def read_commands(r):
+    nodes = []
     for _ in range(r.varint()):
         flags = r.u8()
-        check(flags & 3 == 0, 'only a root node is expected yet')
-        for _ in range(r.varint()):
-            r.varint()
-    r.varint()
+        kind = flags & 3
+        check(kind != 3, 'node type 3 does not exist')
+        children = [r.varint() for _ in range(r.varint())]
+        redirect = r.varint() if flags & 8 else None
+        name = r.string() if kind != 0 else None
+        parser = None
+        if kind == 2:
+            parser = r.varint()
+            read_argument_properties(r, parser)
+        suggests = r.string() if flags & 16 else None
+        nodes.append(dict(kind=kind, flags=flags, children=children, redirect=redirect, name=name, parser=parser,
+                          suggests=suggests))
+    root = r.varint()
+    check(0 <= root < len(nodes) and nodes[root]['kind'] == 0, 'root index %d is not a root node' % root)
+    for at, node in enumerate(nodes):
+        for child in node['children'] + ([node['redirect']] if node['redirect'] is not None else []):
+            check(0 <= child < len(nodes), 'node %d points at %d of %d' % (at, child, len(nodes)))
+    COMMAND_TREE['nodes'] = nodes
+    COMMAND_TREE['root'] = root
 
 
 def read_metadata(r):
@@ -666,6 +704,7 @@ class World:
         self.suggestions = []
         self.mode = None
         self.flying_allowed = None
+        self.time = None
 
     def block(self, x, y, z):
         at = (x, y, z)
@@ -780,10 +819,13 @@ def handle_play_extra(w, pid, r):
                 break
     elif pid == PLAY_SUGGESTIONS:
         ident = r.varint()
-        r.varint(), r.varint()
-        n = r.varint()
-        w.suggestions.append((ident, n))
-        check(n == 0, 'suggestions without a dispatcher: %d' % n)
+        start, length = r.varint(), r.varint()
+        matches = []
+        for _ in range(r.varint()):
+            matches.append(r.string())
+            if r.boolean():
+                skip_network_nbt(r)
+        w.suggestions.append((ident, len(matches), start, length, matches))
     else:
         return False
     return True
@@ -798,6 +840,10 @@ class Stages:
                   'unknown_command']
     VERIFY_NAMES = ['placed_block_persisted', 'position_persisted', 'inventory_persisted', 'gamemode_persisted']
     FAR_NAMES = ['far_chunk_generated', 'keep_alive_during_generation']
+    COMMAND_NAMES = ['tree_parsed', 'tree_children', 'unknown_error', 'bad_block_error', 'bad_mode_error', 'kill_dead',
+                      'kill_respawned', 'setblock_update', 'fill_update', 'give_slot', 'gamemode_creative',
+                      'gamemode_survival', 'time_set', 'time_query', 'tp_moved', 'execute_run', 'suggest_root', 'suggest_arg']
+    COMMAND_VERIFY_NAMES = ['setblock_persisted', 'fill_persisted', 'give_persisted', 'tp_persisted', 'alive_on_return']
     WATCH_NAMES = ['other_appeared', 'other_moved', 'other_swung', 'other_block_change', 'other_chat', 'other_left']
 
     def __init__(self, extra=()):
@@ -835,6 +881,8 @@ def one_packet(c, st, w, biomes, ctx, pid, r):
     if counts[pid] <= 3 or pid in (PLAY_KEEP_ALIVE, PLAY_DISCONNECT):
         print('play   packet 0x%02x (%d bytes)' % (pid, r.left()), flush=True)
     if pid in EXACT_PLAY:
+        if pid == PLAY_TIME:
+            w.time = struct.unpack('>qq', r.data[r.at:r.at + 16])
         if pid == PLAY_SYSTEM_CHAT:
             start = r.at
             said, used = text_of(r.data[start:])
@@ -1077,6 +1125,167 @@ def far_session(c, st, w, biomes, ctx, args):
     st.hit('keep_alive_during_generation')
 
 
+def commands_session(c, st, w, biomes, ctx, args):
+    """--commands: the real dispatcher, over the wire. The bot must be an operator of level 4."""
+    def wait(cond, what, seconds=10.0):
+        pump(c, st, w, biomes, ctx, cond, what, seconds)
+
+    def run_command(line):
+        print('  /%s' % line, flush=True)
+        c.send(SB_CHAT_COMMAND, string(line))
+
+    def heard(fragment, since):
+        return any(fragment in said for said in w.chat[since:])
+
+    wait(lambda: w.pos is not None and ctx['chunk_parsed'], 'a position and a chunk', 40.0)
+    wait(lambda: w.window0 is not None and w.health is not None, 'the inventory and health')
+    wait(lambda: 'nodes' in COMMAND_TREE, 'the command tree')
+    nodes = COMMAND_TREE['nodes']
+    root = nodes[COMMAND_TREE['root']]
+    names = sorted(nodes[i]['name'] for i in root['children'])
+    print('  tree: %d nodes, %d root children: %s' % (len(nodes), len(names), ' '.join(names)))
+    st.hit('tree_parsed')
+    for wanted in ('setblock', 'fill', 'give', 'gamemode', 'time', 'kill', 'say', 'msg', 'gamerule', 'tp', 'teleport', 'execute'):
+        check(wanted in names, 'the root has no %s' % wanted)
+    st.hit('tree_children')
+
+    # What the bad commands answer.
+    at = len(w.chat)
+    run_command('nosuchcommand')
+    wait(lambda: heard('nosuchcommand', at), 'the unknown command error')
+    print('  said: %r' % w.chat[at:])
+    st.hit('unknown_error')
+    at = len(w.chat)
+    run_command('setblock 0 64 0 not_a_block')
+    wait(lambda: len(w.chat) > at, 'the bad block error')
+    print('  said: %r' % w.chat[at:])
+    check(any('not_a_block' in said for said in w.chat[at:]), 'no mention of the bad block')
+    st.hit('bad_block_error')
+    at = len(w.chat)
+    run_command('gamemode nosuchmode')
+    wait(lambda: len(w.chat) > at, 'the bad game mode error')
+    print('  said: %r' % w.chat[at:])
+    check(any('command.unknown.argument' in said for said in w.chat[at:]), 'no error for the bad game mode')
+    st.hit('bad_mode_error')
+
+    # Dying first: a respawn empties a survival inventory.
+    run_command('kill @s')
+    wait(lambda: w.health[0] <= 0.0, 'health to fall to nothing')
+    print('  dead, health %.1f' % w.health[0])
+    st.hit('kill_dead')
+    c.send(SB_CLIENT_COMMAND, varint(0))
+    wait(lambda: w.health[0] > 0.0, 'the respawn')
+    print('  respawned, health %.1f' % w.health[0])
+    st.hit('kill_respawned')
+
+    x, y, z = int(w.pos[0] // 1), int(w.pos[1] // 1), int(w.pos[2] // 1)
+    wait(lambda: w.block(x, y, z) is not None, 'the chunk under the player', 30.0)
+    sx, sy, sz = x + 2, y + 6, z + 2
+    run_command('setblock %d %d %d minecraft:stone' % (sx, sy, sz))
+    wait(lambda: w.overrides.get((sx, sy, sz)) == 1, 'the stone from /setblock')
+    print('  block at %d %d %d is state %d' % (sx, sy, sz, w.overrides[(sx, sy, sz)]))
+    st.hit('setblock_update')
+    run_command('fill %d %d %d %d %d %d granite' % (sx, sy + 2, sz, sx + 1, sy + 3, sz + 1))
+    cube = [(sx + i, sy + 2 + j, sz + k) for i in (0, 1) for j in (0, 1) for k in (0, 1)]
+    wait(lambda: all(w.overrides.get(p) == 2 for p in cube), 'the granite from /fill')
+    print('  %d blocks of state 2 from /fill' % len(cube))
+    st.hit('fill_update')
+
+    run_command('give @s stone 5')
+    wait(lambda: any(s == (5, STONE_ITEM) for s in w.window0), 'five stone in the window')
+    print('  window 0 slot %d holds 5 stone' % w.window0.index((5, STONE_ITEM)))
+    st.hit('give_slot')
+
+    run_command('gamemode creative')
+    wait(lambda: w.mode == 1, 'creative')
+    st.hit('gamemode_creative')
+    run_command('gamemode survival')
+    wait(lambda: w.mode == 0, 'survival')
+    st.hit('gamemode_survival')
+
+    run_command('time set 1000')
+    wait(lambda: w.time is not None and w.time[1] % 24000 in range(1000, 1200), 'the time packet')
+    print('  world age %d, time of day %d' % w.time)
+    st.hit('time_set')
+    at = len(w.chat)
+    run_command('time query daytime')
+    wait(lambda: heard('commands.time.query', at), 'the time query')
+    print('  said: %r' % w.chat[at:])
+    st.hit('time_query')
+
+    tx, ty, tz = x + 3.5, y + 10.0, z - 2.5
+    run_command('tp @s %.1f %.1f %.1f' % (tx, ty, tz))
+    wait(lambda: abs(w.pos[0] - tx) < 0.01 and abs(w.pos[1] - ty) < 0.01 and abs(w.pos[2] - tz) < 0.01, 'the teleport')
+    print('  teleported to %.2f %.2f %.2f' % w.pos)
+    st.hit('tp_moved')
+
+    # /execute. As upstream, `run` reaches only the new dispatcher, so /tag is the command: its answer shows it ran, and
+    # the tags are on the player the selector found through the modified source.
+    ex, ey, ez = x + 5, y + 8, z + 5
+    run_command('setblock %d %d %d stone' % (ex, ey, ez))
+    wait(lambda: w.overrides.get((ex, ey, ez)) == 1, 'the stone for /execute')
+    at = len(w.chat)
+    run_command('execute as @s at @s positioned ~ ~1 ~ run tag @s add through_execute')
+    wait(lambda: heard('through_execute', at), 'the tag through /execute as')
+    print('  said: %r' % w.chat[at:])
+    at = len(w.chat)
+    run_command('execute unless block %d %d %d stone run tag @s add must_not_be' % (ex, ey, ez))
+    run_command('execute if block %d %d %d stone run tag @s add must_be' % (ex, ey, ez))
+    wait(lambda: heard('must_be', at), 'the tag through /execute if block')
+    print('  said: %r' % w.chat[at:])
+    check(not heard('must_not_be', at), 'execute unless block ran its command')
+    at = len(w.chat)
+    run_command('tag @s list')
+    wait(lambda: heard('through_execute', at), 'the tags listed')
+    print('  said: %r' % w.chat[at:])
+    st.hit('execute_run')
+
+    c.send(SB_COMMAND_SUGGESTION, varint(21) + string('/difficulty e'))
+    wait(lambda: any(s[0] == 21 for s in w.suggestions), 'suggestions for /difficulty e')
+    found = [s for s in w.suggestions if s[0] == 21][0]
+    print('  /difficulty e suggests start %d length %d: %s' % (found[2], found[3], found[4]))
+    check('easy' in found[4], 'easy is not among them')
+    st.hit('suggest_root')
+    # The brigadier side: /kill is on the new dispatcher, and the selector type lists what can follow the @.
+    c.send(SB_COMMAND_SUGGESTION, varint(22) + string('/kill @'))
+    wait(lambda: any(s[0] == 22 for s in w.suggestions), 'suggestions for /kill @')
+    found = [s for s in w.suggestions if s[0] == 22][0]
+    print('  /kill @ suggests start %d length %d: %s' % (found[2], found[3], found[4]))
+    check('@s' in found[4], 'no @s among them')
+    st.hit('suggest_arg')
+
+    if args.save:
+        with open(args.save, 'w') as f:
+            json.dump(dict(setblock=[sx, sy, sz], fill=cube, tp=[tx, ty, tz]), f)
+
+
+def commands_verify_session(c, st, w, biomes, ctx, args):
+    """--commands-verify: on return, what the commands did is still there."""
+    with open(args.commands_verify) as f:
+        saved = json.load(f)
+    pump(c, st, w, biomes, ctx, lambda: w.pos is not None and ctx['chunk_parsed'], 'a position and a chunk', 40.0)
+    pump(c, st, w, biomes, ctx, lambda: w.window0 is not None and w.health is not None, 'the inventory and health', 10.0)
+    sx, sy, sz = saved['setblock']
+    pump(c, st, w, biomes, ctx, lambda: w.block(sx, sy, sz) is not None, 'the chunk of the stone', 30.0)
+    print('  /setblock block: state %d' % w.block(sx, sy, sz))
+    check(w.block(sx, sy, sz) == 1, 'the stone is gone')
+    st.hit('setblock_persisted')
+    for p in saved['fill']:
+        check(w.block(*p) == 2, 'granite at %r is state %r' % (p, w.block(*p)))
+    print('  /fill blocks: %d of state 2' % len(saved['fill']))
+    st.hit('fill_persisted')
+    print('  stone stacks: %s' % [s for s in w.window0 if s[1] == STONE_ITEM])
+    check((5, STONE_ITEM) in w.window0, 'the stone from /give is gone')
+    st.hit('give_persisted')
+    print('  back at %.2f %.2f %.2f' % w.pos)
+    tx, ty, tz = saved['tp']
+    check(abs(w.pos[0] - tx) < 0.01 and abs(w.pos[2] - tz) < 0.01, 'not where /tp left it')
+    st.hit('tp_persisted')
+    print('  health %.1f' % w.health[0])
+    check(w.health[0] > 0.0, 'dead on return')
+    st.hit('alive_on_return')
+
+
 def watch_session(c, st, w, biomes, ctx, args):
     """--watch: another client's play as this one is told about it."""
     counts = ctx['counts']
@@ -1107,6 +1316,10 @@ def run(args):
         extra = list(extra) + Stages.FAR_NAMES
     if args.watch:
         extra = list(extra) + Stages.WATCH_NAMES
+    if args.commands:
+        extra = list(extra) + Stages.COMMAND_NAMES
+    if args.commands_verify:
+        extra = list(extra) + Stages.COMMAND_VERIFY_NAMES
     st = Stages(extra)
     status = status_ping(args.host, args.port)
     print('status: %s' % json.dumps(status))
@@ -1245,6 +1458,10 @@ def run(args):
             play_session(c, st, w, biomes, ctx, args)
         elif args.verify:
             verify_session(c, st, w, biomes, ctx, args)
+        if args.commands:
+            commands_session(c, st, w, biomes, ctx, args)
+        elif args.commands_verify:
+            commands_verify_session(c, st, w, biomes, ctx, args)
         if args.far_chunk:
             far_session(c, st, w, biomes, ctx, args)
         if args.watch:
@@ -1285,6 +1502,8 @@ def main():
     ap.add_argument('--op', action='store_true', help="the server's data/ops.json lists this bot")
     ap.add_argument('--save', help='where --play writes what --verify checks')
     ap.add_argument('--verify', help='a file from --save: check it is all still there')
+    ap.add_argument('--commands', action='store_true', help='run real commands as an operator; see commands_session')
+    ap.add_argument('--commands-verify', help='a file from --commands --save: check what the commands did is still there')
     ap.add_argument('--watch', action='store_true', help='watch another player play')
     ap.add_argument('--encrypt', action='store_true', help='answer the encryption request; stops once in play')
     ap.add_argument('--expect-refusal', help='wants a login disconnect containing this')
