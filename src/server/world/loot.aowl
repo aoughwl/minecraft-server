@@ -1,0 +1,628 @@
+## Port of pumpkin/src/world/loot.rs
+##
+## Upstream's `rand::rng()` calls all draw from one module-level `Xoroshiro` (`gLootRand`), seeded from the clock; a test
+## reseeds it with `seedLootRandom` to get a known sequence. The per-table `random` that `get_loot` builds from
+## `get_seed()` is a parameter of `getLootWith`, so a test can pass a seeded one; `getLoot` is upstream's signature.
+## `rand::random::<f32>()` is `nextF32` of that generator and `random_range(0..=n)` is `nextBoundedI32(n + 1)`.
+##
+## What the port does differently from upstream, where upstream panics or overflows: an item entry whose name is not an
+## item gives no stack (upstream `unwrap`s), and a stack count that would pass 255 saturates (upstream wraps in a release
+## build). `CopyComponents` is upstream's `warn!` no-op, and `EntityScores` and `Reference` are upstream's `false`.
+## `ChestLootTable` pools are drawn by `generateChestLoot`; `fillChestInventory` returns the 27 slots' stacks, since the
+## inventory trait is the caller's.
+
+{.feature: "untyped".}
+{.feature: "lenientnils".}
+
+import std/[math, options]
+import "../../data/item_stack/mod"
+import ../../data/block_ext
+from ../../data/block_state import asU16, BlockStateId
+import ../../generated/[block_properties, damage_type, enchantment, entity_type, item_refs, loot_types, potion, recipes]
+import ../../generated/chest_loot
+import ../../generated/tag as tagdata
+import "../../data/data_component_impl/mod"
+import ../../util/chest_loot_table
+import ../../util/loot_table
+import ../../util/vector3
+import ../../util/xoroshiro128
+from ../../util/random/random import getSeed
+
+type
+  LootContextParameters* = object
+    explosionRadius*: Option[float32]
+    blockState*: Option[BlockStateId]
+    killedByPlayer*: Option[bool]
+    luck*: float32
+    thisEntity*: Option[EntityType]
+    killerEntity*: Option[EntityType]
+    directKillerEntity*: Option[EntityType]
+    position*: Option[Vector3[float64]]
+    worldTime*: uint64
+    damageType*: Option[DamageType]
+    tool*: Option[ItemStack]
+    isRaining*: Option[bool]
+    isThundering*: Option[bool]
+    isOnFire*: Option[bool]
+      ## Whether the killed entity was on fire at death time: `Entity.fire_ticks > 0`.
+
+var gLootRand = fromSeed(getSeed())
+
+proc seedLootRandom*(seed: uint64) =
+  ## Makes every `rand::` draw of this module a known sequence. Tests only.
+  gLootRand = fromSeed(seed)
+
+proc randF32(): float32 = gLootRand.nextF32()
+
+proc randBelow(n: int32): int32 =
+  ## `random_range(0..n)`
+  gLootRand.nextBoundedI32(n)
+
+proc f32ToU8(v: float32): uint8 =
+  ## Rust's saturating `as u8`; NaN is 0.
+  if v != v or v <= 0.0'f32: 0'u8
+  elif v >= 255.0'f32: 255'u8
+  else: uint8(v)
+
+proc f32ToU32(v: float32): uint32 =
+  if v != v or v <= 0.0'f32: 0'u32
+  elif v >= 4294967295.0'f32: 4294967295'u32
+  else: uint32(v)
+
+proc satAdd(a: uint8; b: uint32): uint8 =
+  let s = uint32(a) + min(b, 255'u32)
+  if s > 255'u32: 255'u8 else: uint8(s)
+
+proc stripMinecraft(s: string): string =
+  if s.len >= 10 and substr(s, 0, 9) == "minecraft:": substr(s, 10) else: s
+
+proc enchantmentLevel(tool: Option[ItemStack]; name: string): int32 =
+  ## `tool.map_or(0, |tool| Enchantment::from_name(name).map_or(0, |e| tool.get_enchantment_level(e)))`
+  if tool.isNone:
+    return 0'i32
+  let e = Enchantment.fromName(name)
+  if e.isNone:
+    return 0'i32
+  tool.unsafeGet.getEnchantmentLevel(EnchantmentRef(id: e.unsafeGet.id, name: ""))
+
+# ---------------------------------------------------------------------------
+# Number providers
+# ---------------------------------------------------------------------------
+
+proc generate*(p: LootFunctionNumberProvider): float32 =
+  ## `LootFunctionNumberProviderExt::generate`
+  case p.kind
+  of lfnConstant: p.value
+  of lfnUniform: randF32() * (p.max - p.min) + p.min
+  of lfnBinomial:
+    var c = 0.0'f32
+    for _ in 0 ..< int(f32ToU32(floor(p.n))):
+      if gLootRand.nextF64() < float64(p.p):
+        c = c + 1.0'f32
+    c
+
+# ---------------------------------------------------------------------------
+# Conditions
+# ---------------------------------------------------------------------------
+
+proc compareEntityType(expectedType: string; actual: EntityType): bool =
+  stripMinecraft(expectedType) == stripMinecraft(actual.resourceName)
+
+proc checkBlockStateProperty(stateId: BlockStateId; properties: seq[(string, string)]): bool =
+  let (hasProps, props) = Block.fromStateId(stateId).properties(stateId)
+  if not hasProps:
+    return properties.len == 0
+  let actual = props.toProps()
+  for (expectedKey, expectedValue) in properties:
+    var ok = false
+    for (k, v) in actual:
+      if k == expectedKey:
+        ok = v == expectedValue
+        break
+    if not ok:
+      return false
+  true
+
+proc checkDamageSourceProperties(params: LootContextParameters; expectedSourceType, expectedDirectType: Option[string]): bool =
+  if params.damageType.isNone:
+    return false
+  if expectedSourceType.isSome:
+    if params.killerEntity.isSome:
+      if not compareEntityType(expectedSourceType.unsafeGet, params.killerEntity.unsafeGet):
+        return false
+    else:
+      return false
+  if expectedDirectType.isSome:
+    if params.directKillerEntity.isSome:
+      if not compareEntityType(expectedDirectType.unsafeGet, params.directKillerEntity.unsafeGet):
+        return false
+    else:
+      return false
+  true
+
+proc inRange(val: float32; r: FloatRange): bool =
+  (r[0].isNone or val >= r[0].unsafeGet) and (r[1].isNone or val <= r[1].unsafeGet)
+
+proc tableBonusChance(chances: seq[float32]; level: int32): float32 =
+  ## `chances.get(level).unwrap_or(chances.last().unwrap_or(&0.0))`
+  if level >= 0'i32 and int(level) < chances.len: chances[int(level)]
+  elif chances.len > 0: chances[chances.len - 1]
+  else: 0.0'f32
+
+proc isFulfilled*(cond: LootCondition; params: LootContextParameters): bool =
+  ## `LootConditionExt::is_fulfilled`
+  case cond.kind
+  of lcSurvivesExplosion:
+    if params.explosionRadius.isSome:
+      return randF32() <= 1.0'f32 / params.explosionRadius.unsafeGet
+    true
+  of lcRandomChance:
+    randF32() < cond.chance
+  of lcEntityProperties:
+    # Mirrors vanilla `EntityTarget` resolution from `LootContext.java:148-186`.
+    var target = none[EntityType]()
+    case cond.entity
+    of "this": target = params.thisEntity
+    of "attacker", "killer", "attacking_player": target = params.killerEntity
+    of "direct_attacker", "direct_killer": target = params.directKillerEntity
+    else: discard
+    if target.isNone:
+      return false
+    if cond.expectedType.isSome and not compareEntityType(cond.expectedType.unsafeGet, target.unsafeGet):
+      return false
+    if cond.isOnFire.isSome:
+      let actualFire = if params.isOnFire.isSome: params.isOnFire.unsafeGet else: false
+      if actualFire != cond.isOnFire.unsafeGet:
+        return false
+    if cond.mainhandEnchantmentTag.isSome:
+      var tagName = cond.mainhandEnchantmentTag.unsafeGet
+      if tagName.len > 0 and tagName[0] == '#':
+        tagName = substr(tagName, 1)
+      var hasEnchant = false
+      if params.tool.isSome:
+        let (found, ids) = tagdata.getTagIds(tagdata.rkEnchantment, tagName)
+        if found:
+          for id in ids:
+            let e = Enchantment.fromId(uint8(id))
+            if e.isSome and
+                params.tool.unsafeGet.getEnchantmentLevel(EnchantmentRef(id: e.unsafeGet.id, name: "")) > 0'i32:
+              hasEnchant = true
+              break
+      if not hasEnchant:
+        return false
+    true
+  of lcKilledByPlayer:
+    if params.killedByPlayer.isSome: params.killedByPlayer.unsafeGet else: false
+  of lcBlockStateProperty:
+    if params.blockState.isSome:
+      return checkBlockStateProperty(params.blockState.unsafeGet, cond.properties)
+    false
+  of lcInverted:
+    not cond.inverted[0].isFulfilled(params)
+  of lcAnyOf:
+    for i in 0 ..< cond.anyOf.len:
+      if cond.anyOf[i].isFulfilled(params):
+        return true
+    false
+  of lcAllOf:
+    for i in 0 ..< cond.allOf.len:
+      if not cond.allOf[i].isFulfilled(params):
+        return false
+    true
+  of lcRandomChanceWithEnchantedBonus:
+    if cond.bonusChances.isNone:
+      return false
+    let chances = cond.bonusChances.unsafeGet
+    let level = enchantmentLevel(params.tool, cond.bonusEnchantment)
+    randF32() < tableBonusChance(chances, level)
+  of lcTableBonus:
+    let level = enchantmentLevel(params.tool, cond.enchantment)
+    randF32() < tableBonusChance(cond.chances, level)
+  of lcTimeCheck:
+    var time = params.worldTime
+    if cond.period.isSome:
+      time = time mod cond.period.unsafeGet
+    inRange(float32(time), cond.timeRange)
+  of lcValueCheck:
+    var rng = fromSeed(getSeed())
+    var provider = cond.checkValue
+    let val = provider.get(rng)
+    inRange(val, cond.valueRange)
+  of lcDamageSourceProperties:
+    checkDamageSourceProperties(params, cond.expectedSourceType, cond.expectedDirectType)
+  of lcWeatherCheck:
+    let rMatch = cond.raining.isNone or (if params.isRaining.isSome: params.isRaining.unsafeGet else: false) == cond.raining.unsafeGet
+    let tMatch = cond.thundering.isNone or
+      (if params.isThundering.isSome: params.isThundering.unsafeGet else: false) == cond.thundering.unsafeGet
+    rMatch and tMatch
+  of lcMatchTool:
+    if params.tool.isNone:
+      return false
+    let tool = params.tool.unsafeGet
+    if cond.items.isNone:
+      let silk = Enchantment.fromName("minecraft:silk_touch")
+      return silk.isSome and tool.getEnchantmentLevel(EnchantmentRef(id: silk.unsafeGet.id, name: "")) > 0'i32
+    for itemName in cond.items.unsafeGet:
+      if stripMinecraft(itemName) == stripMinecraft(tool.item.registryKey):
+        return true
+    false
+  of lcLocationCheck:
+    cond.expectedBiome.isNone
+  of lcEntityScores:
+    false
+  of lcReference:
+    false
+  of lcEnchantmentActiveCheck:
+    if params.tool.isNone:
+      return not cond.active
+    let (found, e) = params.tool.unsafeGet.getDataComponent(EnchantmentsImpl)
+    (found and e.enchantment.len > 0) == cond.active
+
+proc allFulfilled(conds: Option[seq[LootCondition]]; params: LootContextParameters): bool =
+  if conds.isNone:
+    return true
+  for i in 0 ..< conds.unsafeGet.len:
+    if not conds.unsafeGet[i].isFulfilled(params):
+      return false
+  true
+
+# ---------------------------------------------------------------------------
+# Functions
+# ---------------------------------------------------------------------------
+
+proc applyBonus(stacks: var seq[ItemStack]; enchantmentName, formula: string;
+    parameters: Option[LootFunctionBonusParameter]; params: LootContextParameters) =
+  let enchantmentLevel = enchantmentLevel(params.tool, enchantmentName)
+  if enchantmentLevel <= 0'i32:
+    return
+  for i in 0 ..< stacks.len:
+    case formula
+    of "minecraft:binomial_with_bonus_count":
+      if parameters.isSome and parameters.unsafeGet.kind == lfbProbability:
+        let n = enchantmentLevel + parameters.unsafeGet.extra
+        var extraItems = 0'u32
+        for _ in 0 ..< int(max(n, 0'i32)):
+          if randF32() < parameters.unsafeGet.probability:
+            extraItems += 1'u32
+        stacks[i].itemCount = satAdd(stacks[i].itemCount, extraItems)
+    of "minecraft:uniform_bonus_count":
+      if parameters.isSome and parameters.unsafeGet.kind == lfbMultiplier:
+        # random_range(0..=(level * multiplier))
+        let extra = randBelow(enchantmentLevel * parameters.unsafeGet.bonusMultiplier + 1'i32)
+        stacks[i].itemCount = satAdd(stacks[i].itemCount, uint32(extra))
+    of "minecraft:ore_drops":
+      let multiplier = randBelow(enchantmentLevel + 2'i32)
+      if multiplier > 0'i32:
+        let m = uint32(stacks[i].itemCount) * uint32(multiplier)
+        stacks[i].itemCount = if m > 255'u32: 255'u8 else: uint8(m)
+    else: discard
+
+proc applyFunction(fn: LootFunction; stacks: var seq[ItemStack]; params: LootContextParameters) =
+  ## `LootFunctionExt::apply`
+  if not allFulfilled(fn.conditions, params):
+    return
+  case fn.content.kind
+  of lftSetCount:
+    for i in 0 ..< stacks.len:
+      let n = f32ToU8(round(fn.content.setCount.generate()))
+      if fn.content.add:
+        stacks[i].itemCount = satAdd(stacks[i].itemCount, uint32(n))
+      else:
+        stacks[i].itemCount = n
+  of lftLimitCount:
+    if fn.content.limitMin.isSome:
+      let mn = f32ToU8(round(fn.content.limitMin.unsafeGet))
+      for i in 0 ..< stacks.len:
+        if stacks[i].itemCount < mn:
+          stacks[i].itemCount = mn
+    if fn.content.limitMax.isSome:
+      let mx = f32ToU8(round(fn.content.limitMax.unsafeGet))
+      for i in 0 ..< stacks.len:
+        if stacks[i].itemCount > mx:
+          stacks[i].itemCount = mx
+  of lftExplosionDecay:
+    if params.explosionRadius.isSome:
+      let survivalChance = 1.0'f32 / params.explosionRadius.unsafeGet
+      var kept: seq[ItemStack] = @[]
+      for i in 0 ..< stacks.len:
+        var survived = 0'u8
+        for _ in 0 ..< int(stacks[i].itemCount):
+          if randF32() <= survivalChance:
+            survived += 1'u8
+        stacks[i].itemCount = survived
+        if survived > 0'u8:
+          kept.add(stacks[i])
+      stacks = kept
+  of lftApplyBonus:
+    applyBonus(stacks, fn.content.bonusEnchantmentName, fn.content.formula, fn.content.parameters, params)
+  of lftEnchantedCountIncrease:
+    let level = float32(enchantmentLevel(params.tool, fn.content.increaseEnchantment))
+    var additional = f32ToU32(round(fn.content.increaseCount.generate() * level))
+    if fn.content.limit.isSome:
+      let lim = f32ToU32(round(fn.content.limit.unsafeGet))
+      if additional > lim:
+        additional = lim
+    for i in 0 ..< stacks.len:
+      stacks[i].itemCount = satAdd(stacks[i].itemCount, additional)
+  of lftCopyComponents:
+    discard  # upstream warns "CopyComponents not supported"
+  of lftCopyState:
+    if params.blockState.isSome:
+      let stateId = params.blockState.unsafeGet
+      let (hasProps, propsData) = Block.fromStateId(stateId).properties(stateId)
+      if hasProps:
+        let actualProps = propsData.toProps()
+        var toCopy: seq[(string, string)] = @[]
+        for propName in fn.content.stateProperties:
+          for (k, v) in actualProps:
+            if k == propName:
+              toCopy.add((propName, v))
+              break
+        if toCopy.len > 0:
+          for i in 0 ..< stacks.len:
+            let idx = stacks[i].getDataComponentMut(BlockStateImpl)
+            if idx >= 0:
+              for (k, v) in toCopy:
+                var found = false
+                for j in 0 ..< stacks[i].patch[idx].data.blockState.properties.len:
+                  if stacks[i].patch[idx].data.blockState.properties[j][0] == k:
+                    stacks[i].patch[idx].data.blockState.properties[j] = (k, v)
+                    found = true
+                    break
+                if not found:
+                  stacks[i].patch[idx].data.blockState.properties.add((k, v))
+            else:
+              stacks[i].patch.add(patchSet(toDyn(BlockStateImpl(properties: toCopy))))
+  of lftSetOminousBottleAmplifier:
+    let amplifier = randBelow(5'i32)  # 0 to 4
+    for i in 0 ..< stacks.len:
+      let idx = stacks[i].getDataComponentMut(OminousBottleAmplifierImpl)
+      if idx >= 0:
+        stacks[i].patch[idx].data.ominousBottleAmplifier.amplifier = amplifier
+      else:
+        stacks[i].patch.add(patchSet(toDyn(OminousBottleAmplifierImpl(amplifier: amplifier))))
+  of lftSetPotion:
+    let potion = Potion.fromName(stripMinecraft(fn.content.id))
+    if potion.isSome:
+      let potionId = some(int32(potion.unsafeGet.id))
+      for i in 0 ..< stacks.len:
+        let idx = stacks[i].getDataComponentMut(PotionContentsImpl)
+        if idx >= 0:
+          stacks[i].patch[idx].data.potionContents.potionId = potionId
+        else:
+          stacks[i].patch.add(patchSet(toDyn(PotionContentsImpl(potionId: potionId, customColor: none[int32](),
+            customEffects: @[], customName: none[string]()))))
+  of lftFurnaceSmelt:
+    for i in 0 ..< stacks.len:
+      let item = stacks[i].item
+      let isTagged = proc(tag: string): bool {.closure.} =
+        let (found, tagged) = tagdata.isTaggedWith(toTaggable(item), tag)
+        found and tagged
+      for recipe in RECIPES_COOKING:
+        if recipe.kind == crkSmelting and matchItem(recipe.ingredient, item.registryKey, isTagged):
+          let smelted = Item.fromRegistryKey(stripMinecraft(recipe.result.id))
+          if smelted != nil:
+            stacks[i].item = smelted
+          break
+
+# ---------------------------------------------------------------------------
+# Chest loot
+# ---------------------------------------------------------------------------
+
+proc generateChestLoot*(table: ChestLootTable; seed: int64): seq[ItemStack] =
+  ## `generate_chest_loot`: a table drawn with a deterministic seed.
+  var rng = fromSeed(cast[uint64](seed))
+  result = @[]
+  for pool in table.pools:
+    let range = pool.maxRolls - pool.minRolls
+    let rolls = pool.minRolls + (if range > 0'i32: rng.nextBoundedI32(range + 1'i32) else: 0'i32)
+    for _ in 0 ..< int(max(rolls, 0'i32)):
+      var entryWeight = 0'i32
+      for e in pool.entries:
+        entryWeight += e.weight
+      let totalWeight = entryWeight + pool.emptyWeight
+      if totalWeight == 0'i32:
+        continue
+      var pick = rng.nextBoundedI32(totalWeight)
+      # The empty weight first: a pick that lands there yields nothing.
+      pick -= pool.emptyWeight
+      if pick < 0'i32:
+        continue
+      for entry in pool.entries:
+        pick -= entry.weight
+        if pick < 0'i32:
+          let countRange = entry.maxCount - entry.minCount
+          let count = entry.minCount + (if countRange > 0'i32: rng.nextBoundedI32(countRange + 1'i32) else: 0'i32)
+          let item = Item.fromRegistryKey(stripMinecraft(entry.item))
+          if item != nil:
+            result.add(newItemStack(uint8(count), item))
+          break
+
+proc shuffleAndSplitItems(res: var seq[ItemStack]; availableSlots: int; rng: var Xoroshiro) =
+  ## `shuffle_and_split_items`. `swap_remove` is a swap with the last element and a pop.
+  var splittable: seq[ItemStack] = @[]
+  var i = 0
+  while i < res.len:
+    if res[i].itemCount > 1'u8:
+      let last = res.len - 1
+      swap(res[i], res[last])
+      splittable.add(res[last])
+      res.setLen(last)
+    else:
+      i += 1
+  while availableSlots > res.len + splittable.len and splittable.len > 0:
+    let idx = int(rng.nextBoundedI32(int32(splittable.len)))
+    let last = splittable.len - 1
+    swap(splittable[idx], splittable[last])
+    var stack = splittable[last]
+    splittable.setLen(last)
+    let count = int32(stack.itemCount)
+    # Split off [1, count/2] items.
+    let splitOff = 1'i32 + rng.nextBoundedI32(count div 2'i32)
+    stack.itemCount = uint8(count - splitOff)
+    var copy = stack
+    copy.itemCount = uint8(splitOff)
+    if stack.itemCount > 1'u8: splittable.add(stack) else: res.add(stack)
+    if copy.itemCount > 1'u8: splittable.add(copy) else: res.add(copy)
+  for s in splittable:
+    res.add(s)
+  # Fisher-Yates shuffle with our RNG.
+  var j = res.len - 1
+  while j >= 1:
+    let k = int(rng.nextBoundedI32(int32(j + 1)))
+    swap(res[j], res[k])
+    j -= 1
+
+proc fillChestInventory*(table: ChestLootTable; seed: int64; invSize: int): seq[(int, ItemStack)] =
+  ## `fill_chest_inventory`, answering the (slot, stack) pairs for the caller to `set_stack`.
+  var itemsToPlace = generateChestLoot(table, seed)
+  result = @[]
+  if itemsToPlace.len == 0:
+    return
+  var rng = fromSeed(cast[uint64](seed))
+  shuffleAndSplitItems(itemsToPlace, invSize, rng)
+  var availableSlots: seq[int] = @[]
+  for s in 0 ..< invSize:
+    availableSlots.add(s)
+  var i = availableSlots.len - 1
+  while i >= 1:
+    let j = int(rng.nextBoundedI32(int32(i + 1)))
+    swap(availableSlots[i], availableSlots[j])
+    i -= 1
+  for item in itemsToPlace:
+    if availableSlots.len == 0:
+      break
+    let slot = availableSlots[availableSlots.len - 1]
+    availableSlots.setLen(availableSlots.len - 1)
+    result.add((slot, item))
+
+# ---------------------------------------------------------------------------
+# Pool entries and tables
+# ---------------------------------------------------------------------------
+
+proc getEntryLoot(entry: LootPoolEntry; params: LootContextParameters): (bool, seq[ItemStack])
+
+proc getStacks(content: LootPoolEntryTypes; params: LootContextParameters): seq[ItemStack] =
+  ## `LootPoolEntryTypesExt::get_stacks`
+  case content.kind
+  of lpeEmpty, lpeDynamic:
+    result = @[]
+  of lpeLootTable:
+    let key = stripMinecraft(content.lootTable.value)
+    # First try chest loot tables. No seed here: a random one.
+    let chest = getChestLootTable("minecraft:" & key)
+    if chest.isSome:
+      result = generateChestLoot(chest.unsafeGet, gLootRand.nextI64())
+    else:
+      result = @[]
+  of lpeItem:
+    let item = Item.fromRegistryKey(stripMinecraft(content.item.name))
+    result = @[]
+    if item != nil:
+      result.add(newItemStack(1'u8, item))
+  of lpeTag:
+    let key = stripMinecraft(content.tag.name)
+    let (found, values) = tagdata.getTagValues(tagdata.rkItem, key)
+    var items: seq[Item] = @[]
+    if found:
+      for registryKey in values:
+        let item = Item.fromRegistryKey(stripMinecraft(registryKey))
+        if item != nil:
+          items.add(item)
+    result = @[]
+    if items.len == 0:
+      return
+    if content.tag.expand:
+      # Pick one random item from the tag.
+      result.add(newItemStack(1'u8, items[int(randBelow(int32(items.len)))]))
+    else:
+      # Yield one stack of every item in the tag.
+      for item in items:
+        result.add(newItemStack(1'u8, item))
+  of lpeAlternatives:
+    result = @[]
+    for i in 0 ..< content.children.len:
+      let (ok, loot) = getEntryLoot(content.children[i], params)
+      if ok:
+        return loot
+  of lpeSequence:
+    result = @[]
+    for i in 0 ..< content.children.len:
+      let conds = content.children[i].conditions
+      if conds.isSome and not allFulfilled(conds, params):
+        break
+      let (ok, loot) = getEntryLoot(content.children[i], params)
+      if not ok:
+        break
+      for s in loot:
+        result.add(s)
+  of lpeGroup:
+    result = @[]
+    for i in 0 ..< content.children.len:
+      let (ok, loot) = getEntryLoot(content.children[i], params)
+      if ok:
+        for s in loot:
+          result.add(s)
+
+proc getEntryLoot(entry: LootPoolEntry; params: LootContextParameters): (bool, seq[ItemStack]) =
+  ## `LootPoolEntryExt::get_loot`: false for upstream's `None`.
+  if not allFulfilled(entry.conditions, params):
+    return (false, @[])
+  var stacks = getStacks(entry.content, params)
+  if entry.functions.isSome:
+    for i in 0 ..< entry.functions.unsafeGet.len:
+      applyFunction(entry.functions.unsafeGet[i], stacks, params)
+  (true, stacks)
+
+proc getLootWith*(table: LootTable; params: LootContextParameters; random: var Xoroshiro): seq[ItemStack] =
+  ## `LootTableExt::get_loot` with the table's `random` given.
+  result = @[]
+  if table.pools.isNone:
+    return
+  let pools = table.pools.unsafeGet
+  for pi in 0 ..< pools.len:
+    if not allFulfilled(pools[pi].conditions, params):
+      continue
+    var rollsProvider = pools[pi].rolls
+    var bonusProvider = pools[pi].bonusRolls
+    let rolls = int32(rollsProvider.get(random)) + int32(floor(bonusProvider.get(random) * params.luck))
+    for _ in 0 ..< int(max(rolls, 0'i32)):
+      var totalWeight = 0'i32
+      var validIdx: seq[int] = @[]
+      var validWeight: seq[int32] = @[]
+      for ei in 0 ..< pools[pi].entries.len:
+        let entry = pools[pi].entries[ei]
+        if allFulfilled(entry.conditions, params):
+          var weight = int32(floor(float32(entry.weight) + float32(entry.quality) * params.luck))
+          weight = max(weight, 0'i32)
+          totalWeight += weight
+          validIdx.add(ei)
+          validWeight.add(weight)
+      if totalWeight == 0'i32 or validIdx.len == 0:
+        continue
+      var r = random.nextBoundedI32(totalWeight)
+      for k in 0 ..< validIdx.len:
+        r -= validWeight[k]
+        if r < 0'i32:
+          let (ok, loot) = getEntryLoot(pools[pi].entries[validIdx[k]], params)
+          if ok:
+            for s in loot:
+              if s.itemCount > 0'u8:
+                result.add(s)
+          break
+
+proc getLoot*(table: LootTable; params: LootContextParameters): seq[ItemStack] =
+  ## `LootTableExt::get_loot`
+  var random = fromSeed(getSeed())
+  getLootWith(table, params, random)
+
+proc getLoot*(table: nil LootTableRef; params: LootContextParameters): seq[ItemStack] =
+  ## `get_loot` of what `Block::loot_table` and `EntityType::loot_table` hand out: nothing for upstream's `None`.
+  if table == nil:
+    return @[]
+  getLoot(table[], params)
+
+proc getLootWith*(table: nil LootTableRef; params: LootContextParameters; random: var Xoroshiro): seq[ItemStack] =
+  if table == nil:
+    return @[]
+  getLootWith(table[], params, random)

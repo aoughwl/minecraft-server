@@ -1,0 +1,134 @@
+## The one zlib binding of this port. Support module with no upstream file of its own: it is what `flate2` (and
+## `async_compression`) are to pumpkin-nbt's gzip, the packet codec's zlib frame and the world crate's region formats.
+## src/nbt/zlibgz.aowl, src/protocol/java/zlibframe.aowl and src/world/chunkcompress.aowl are thin wrappers over it,
+## each keeping its own result type and error wording.
+##
+## z_stream is declared through <zlib.h>, so the C compiler lays it out and uLong is 4 bytes on LLP64 Windows and 8 on
+## LP64. zlib is linked statically on Windows so an exe needs no DLL beside it.
+
+when defined(windows):
+  {.passL: "-l:libz.a".}
+else:
+  {.passL: "-lz".}
+{.feature: "lenientnils".}
+
+type
+  ZStream {.importc: "z_stream", header: "<zlib.h>", bycopy.} = object
+    next_in: ptr byte
+    avail_in: cuint
+    next_out: ptr byte
+    avail_out: cuint
+    msg: cstring
+
+  ZFailure* = enum
+    zfNone
+    zfInit        ## deflateInit / inflateInit failed
+    zfDeflate     ## deflate did not reach the stream end
+    zfCorrupt     ## inflate returned an error; `zmsg` is zlib's own text
+    zfTruncated   ## the input ended before the stream did
+    zfLimit       ## the output reached the limit with the stream still going (only under `lmError`)
+
+  LimitMode* = enum
+    lmTruncate    ## output past the limit is cut off, not an error (flate2's `take(limit)`)
+    lmError       ## output past the limit is a failure
+
+  ZResult* = object
+    ok*: bool
+    data*: seq[byte]   ## On a failed inflate: whatever came out before the failure.
+    failure*: ZFailure
+    zmsg*: string      ## zlib's own message for `zfCorrupt`, when it gave one.
+    rc*: int           ## zlib's return code for `zfDeflate` and `zfCorrupt`.
+
+const
+  WbitsZlib* = 15.cint   ## the zlib wrapper
+  WbitsGzip* = 31.cint   ## 15 + 16: write or expect a gzip wrapper
+  DefaultLevel* = -1.cint ## zlib's own default, level 6
+  zNoFlush = 0.cint
+  zFinish = 4.cint
+  zOk = 0.cint
+  zStreamEnd = 1.cint
+  zBufError = -5.cint
+  zDeflated = 8.cint
+  zDefaultStrategy = 0.cint
+
+proc deflateInit2Raw(s: ptr ZStream, level, meth, wbits, memLevel, strategy: cint,
+                     version: cstring, size: cint): cint {.importc: "deflateInit2_", header: "<zlib.h>".}
+proc zDeflate(s: ptr ZStream, flush: cint): cint {.importc: "deflate", header: "<zlib.h>".}
+proc zDeflateEnd(s: ptr ZStream): cint {.importc: "deflateEnd", header: "<zlib.h>".}
+proc zDeflateBound(s: ptr ZStream, n: culong): culong {.importc: "deflateBound", header: "<zlib.h>".}
+proc inflateInit2Raw(s: ptr ZStream, wbits: cint, version: cstring, size: cint): cint
+  {.importc: "inflateInit2_", header: "<zlib.h>".}
+proc zInflate(s: ptr ZStream, flush: cint): cint {.importc: "inflate", header: "<zlib.h>".}
+proc zInflateEnd(s: ptr ZStream): cint {.importc: "inflateEnd", header: "<zlib.h>".}
+proc zVersion(): cstring {.importc: "zlibVersion", header: "<zlib.h>".}
+
+proc msgText(c: cstring): string =
+  result = ""
+  if c != nil:
+    var i = 0
+    while uint8(c[i]) != 0:
+      result.add c[i]
+      inc i
+
+proc zlibDeflate*(input: openArray[byte]; level: cint; wbits: cint): ZResult =
+  ## One stream, run to `Z_FINISH`, with the given level and wrapper (`WbitsZlib` or `WbitsGzip`).
+  var s {.noinit.}: ZStream
+  zeroMem(addr s, sizeof(ZStream))
+  if deflateInit2Raw(addr s, level, zDeflated, wbits, 8.cint, zDefaultStrategy, zVersion(),
+                     cint(sizeof(ZStream))) != zOk:
+    return ZResult(ok: false, data: @[], failure: zfInit, zmsg: "", rc: 0)
+  var output = newSeq[byte](int(zDeflateBound(addr s, culong(input.len))) + 64)
+  s.next_in = if input.len > 0: unsafeAddr input[0] else: nil
+  s.avail_in = cuint(input.len)
+  s.next_out = addr output[0]
+  s.avail_out = cuint(output.len)
+  let rc = zDeflate(addr s, zFinish)
+  let left = int(s.avail_out)
+  discard zDeflateEnd(addr s)
+  if rc != zStreamEnd:
+    return ZResult(ok: false, data: @[], failure: zfDeflate, zmsg: "", rc: int(rc))
+  output.setLen(output.len - left)
+  ZResult(ok: true, data: output, failure: zfNone, zmsg: "", rc: 0)
+
+proc zlibInflate*(input: openArray[byte]; wbits: cint; limit: int; mode: LimitMode): ZResult =
+  ## Inflates one stream with the given wrapper. Bytes after the stream's end are ignored. Output is capped at `limit`:
+  ## `lmTruncate` stops there with `ok`, `lmError` fails with `zfLimit`. A corrupt or cut-off stream is `ok: false` with
+  ## the bytes it did yield in `data`.
+  var s {.noinit.}: ZStream
+  zeroMem(addr s, sizeof(ZStream))
+  if inflateInit2Raw(addr s, wbits, zVersion(), cint(sizeof(ZStream))) != zOk:
+    return ZResult(ok: false, data: @[], failure: zfInit, zmsg: "", rc: 0)
+  var output = newSeq[byte](min(max(input.len * 4, 4096), limit))
+  s.next_in = if input.len > 0: unsafeAddr input[0] else: nil
+  s.avail_in = cuint(input.len)
+  s.next_out = addr output[0]
+  s.avail_out = cuint(output.len)
+  var used = 0
+  while true:
+    let rc = zInflate(addr s, zNoFlush)
+    used = output.len - int(s.avail_out)
+    if rc == zStreamEnd:
+      break
+    if rc != zOk and rc != zBufError:
+      let m = msgText(s.msg)
+      discard zInflateEnd(addr s)
+      output.setLen(used)
+      return ZResult(ok: false, data: output, failure: zfCorrupt, zmsg: m, rc: int(rc))
+    if s.avail_out != 0:
+      if s.avail_in == 0:
+        discard zInflateEnd(addr s)
+        output.setLen(used)
+        return ZResult(ok: false, data: output, failure: zfTruncated, zmsg: "", rc: 0)
+      continue
+    if output.len >= limit:
+      if mode == lmError:
+        discard zInflateEnd(addr s)
+        output.setLen(used)
+        return ZResult(ok: false, data: output, failure: zfLimit, zmsg: "", rc: 0)
+      break
+    output.setLen(min(output.len * 2, limit))
+    s.next_out = addr output[used]
+    s.avail_out = cuint(output.len - used)
+  discard zInflateEnd(addr s)
+  output.setLen(used)
+  ZResult(ok: true, data: output, failure: zfNone, zmsg: "", rc: 0)

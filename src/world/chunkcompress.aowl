@@ -6,10 +6,15 @@
 ## library, whose zlib binding hardcodes `libz.so.1` and declares the z_stream `uLong`
 ## fields with the wrong width for LLP64 Windows, so deflateInit fails there. This
 ## module binds <zlib.h>/<zstd.h> directly, letting the C compiler lay out z_stream,
-## and links `-lz -lzstd`. It should collapse into src/nbt once that is fixed.
+## and links `-lzstd`; zlib is src/util/zlibcore.aowl's, shared with src/nbt and the packet codec.
 
-{.passL: "-lz -lzstd".}
+{.passL: "-lzstd".}
 {.feature: "lenientnils".}
+
+import ../util/zlibcore
+
+const
+  DefaultMaxOut* = 512 * 1024 * 1024  ## Upper bound on one decompressed block.
 
 type
   ByteResult* = object
@@ -21,98 +26,28 @@ proc okBytes(d: sink seq[byte]): ByteResult = ByteResult(ok: true, data: d, msg:
 proc errBytes(m: string): ByteResult = ByteResult(ok: false, data: @[], msg: m)
 
 # --- zlib ---------------------------------------------------------------------
+# One binding, src/util/zlibcore.aowl; these keep this module's result type and wording.
 
-type
-  ZStream {.importc: "z_stream", header: "<zlib.h>", bycopy.} = object
-    next_in: ptr byte
-    avail_in: cuint
-    next_out: ptr byte
-    avail_out: cuint
-
-const
-  zFinish = 4.cint
-  zOk = 0.cint
-  zStreamEnd = 1.cint
-  zBufError = -5.cint
-  zDeflated = 8.cint
-  zDefaultStrategy = 0.cint
-  wbitsZlib = 15.cint
-  wbitsGzip = 31.cint   ## 15 + 16: write or expect a gzip wrapper
-  DefaultMaxOut* = 512 * 1024 * 1024
-
-proc deflateInit2Raw(s: ptr ZStream, level, meth, wbits, memLevel, strategy: cint,
-                     version: cstring, size: cint): cint {.importc: "deflateInit2_", header: "<zlib.h>".}
-proc zDeflate(s: ptr ZStream, flush: cint): cint {.importc: "deflate", header: "<zlib.h>".}
-proc zDeflateEnd(s: ptr ZStream): cint {.importc: "deflateEnd", header: "<zlib.h>".}
-proc inflateInit2Raw(s: ptr ZStream, wbits: cint, version: cstring, size: cint): cint
-  {.importc: "inflateInit2_", header: "<zlib.h>".}
-proc zInflate(s: ptr ZStream, flush: cint): cint {.importc: "inflate", header: "<zlib.h>".}
-proc zInflateEnd(s: ptr ZStream): cint {.importc: "inflateEnd", header: "<zlib.h>".}
-proc zVersion(): cstring {.importc: "zlibVersion", header: "<zlib.h>".}
-proc zDeflateBound(s: ptr ZStream, n: culong): culong {.importc: "deflateBound", header: "<zlib.h>".}
-
-proc deflateWith(input: openArray[byte], level, wbits: cint): ByteResult =
-  var s {.noinit.}: ZStream
-  zeroMem(addr s, sizeof(ZStream))
-  if deflateInit2Raw(addr s, level, zDeflated, wbits, 8.cint, zDefaultStrategy, zVersion(),
-                     cint(sizeof(ZStream))) != zOk:
-    return errBytes("deflateInit failed")
-  var output = newSeq[byte](int(zDeflateBound(addr s, culong(input.len))) + 64)
-  s.next_in = if input.len > 0: unsafeAddr input[0] else: nil
-  s.avail_in = cuint(input.len)
-  s.next_out = addr output[0]
-  s.avail_out = cuint(output.len)
-  let rc = zDeflate(addr s, zFinish)
-  let left = int(s.avail_out)
-  discard zDeflateEnd(addr s)
-  if rc != zStreamEnd:
-    return errBytes("deflate failed: " & $int(rc))
-  output.setLen(output.len - left)
-  okBytes(output)
-
-proc inflateWith(input: openArray[byte], wbits: cint, maxOut: int): ByteResult =
-  var s {.noinit.}: ZStream
-  zeroMem(addr s, sizeof(ZStream))
-  if inflateInit2Raw(addr s, wbits, zVersion(), cint(sizeof(ZStream))) != zOk:
-    return errBytes("inflateInit failed")
-  var output = newSeq[byte](max(input.len * 4, 4096))
-  s.next_in = if input.len > 0: unsafeAddr input[0] else: nil
-  s.avail_in = cuint(input.len)
-  s.next_out = addr output[0]
-  s.avail_out = cuint(output.len)
-  var used = 0
-  while true:
-    let rc = zInflate(addr s, 0.cint)
-    used = output.len - int(s.avail_out)
-    if rc == zStreamEnd:
-      break
-    if rc != zOk and rc != zBufError:
-      discard zInflateEnd(addr s)
-      return errBytes("inflate failed: " & $int(rc))
-    if s.avail_out != 0:
-      discard zInflateEnd(addr s)
-      return errBytes("inflate failed: truncated stream")
-    if output.len >= maxOut:
-      discard zInflateEnd(addr s)
-      return errBytes("inflate failed: output exceeds limit")
-    output.setLen(min(output.len * 2, maxOut))
-    s.next_out = addr output[used]
-    s.avail_out = cuint(output.len - used)
-  discard zInflateEnd(addr s)
-  output.setLen(used)
-  okBytes(output)
+proc fromCore(r: ZResult): ByteResult =
+  case r.failure
+  of zfNone: okBytes(r.data)
+  of zfInit: errBytes("zlib init failed")
+  of zfDeflate: errBytes("deflate failed: " & $r.rc)
+  of zfTruncated: errBytes("inflate failed: truncated stream")
+  of zfLimit: errBytes("inflate failed: output exceeds limit")
+  of zfCorrupt: errBytes("inflate failed: " & $r.rc)
 
 proc zlibCompress*(input: openArray[byte], level = 6): ByteResult =
-  deflateWith(input, cint(level), wbitsZlib)
+  fromCore(zlibDeflate(input, cint(level), WbitsZlib))
 
 proc zlibDecompress*(input: openArray[byte], maxOut = DefaultMaxOut): ByteResult =
-  inflateWith(input, wbitsZlib, maxOut)
+  fromCore(zlibInflate(input, WbitsZlib, maxOut, lmError))
 
 proc gzipCompressBytes*(input: openArray[byte], level = 6): ByteResult =
-  deflateWith(input, cint(level), wbitsGzip)
+  fromCore(zlibDeflate(input, cint(level), WbitsGzip))
 
 proc gzipDecompressBytes*(input: openArray[byte], maxOut = DefaultMaxOut): ByteResult =
-  inflateWith(input, wbitsGzip, maxOut)
+  fromCore(zlibInflate(input, WbitsGzip, maxOut, lmError))
 
 # --- zstd ---------------------------------------------------------------------
 

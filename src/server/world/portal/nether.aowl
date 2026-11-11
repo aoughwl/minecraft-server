@@ -1,0 +1,417 @@
+## Port of pumpkin/src/world/portal/nether.rs
+##
+## Upstream's `&World` and `&Arc<World>` are the `BlockWorld` every block already gets; what `NetherPortal` needs beyond
+## block reads and writes comes through the closure fields `portalPoi*0`, `borderContainsBlock0`, `borderClampBlock0` and
+## `motionBlockingHeight0` that block/blockbehaviour.aowl declares and block/worldhooks.aowl fills (`world.portal_poi`,
+## `world.worldborder`, `get_heightmap_height_async`). A world with the hook left nil sees no portal blocks recorded
+## and no border. Upstream's `async` is plain calls.
+##
+## `lower_conor` (sic) is `lowerConor`, as upstream spells it. `squared_distance_to` is computed in int64 here; upstream's
+## i32 would only differ past 46340 blocks of distance.
+
+{.feature: "untyped".}
+{.feature: "lenientnils".}
+
+import std/math
+import "../../block/blockprelude"
+import ../../../util/math/boundingbox
+import ../../../util/math/rustnum
+
+const
+  SearchRadiusNether* = 128'i32
+  SearchRadiusOverworld* = 128'i32
+  PortalMinWidth* = 2'u32
+  PortalMaxWidth* = 21'u32
+  PortalMaxHeight* = 21'u32
+  PortalMinHeight* = 3'u32
+
+type
+  PortalSearchResult* = object
+    lowerCorner*: BlockPos
+    axis*: HorizontalAxis
+    width*: uint32
+    height*: uint32
+
+  NetherPortal* = object
+    axis*: HorizontalAxis
+    foundPortalBlocks*: uint32
+    negativeDirection*: BlockDirection
+    lowerConor*: BlockPos
+    width*: uint32
+    height*: uint32
+
+proc squaredDistanceTo*(a: BlockPos; x, y, z: int32): int64 =
+  let dx = int64(a.vec.x) - int64(x)
+  let dy = int64(a.vec.y) - int64(y)
+  let dz = int64(a.vec.z) - int64(z)
+  dx * dx + dy * dy + dz * dz
+
+# ---------------------------------------------------------------------------
+# PortalSearchResult
+# ---------------------------------------------------------------------------
+
+proc getTeleportPosition*(self: PortalSearchResult): Vector3[float64] =
+  let x = float64(self.lowerCorner.vec.x)
+  let y = float64(self.lowerCorner.vec.y)
+  let z = float64(self.lowerCorner.vec.z)
+  case self.axis
+  of HorizontalAxis.X: Vector3[float64](x: x + float64(self.width) / 2.0, y: y, z: z + 0.5)
+  of HorizontalAxis.Z: Vector3[float64](x: x + 0.5, y: y, z: z + float64(self.width) / 2.0)
+
+proc calculateTeleportYaw*(self: PortalSearchResult; currentYaw: float32; sourceAxis: Option[HorizontalAxis]): float32 =
+  ## The yaw adjustment when teleporting between portals with different axes.
+  if sourceAxis.isNone:
+    return currentYaw
+  let srcAxis = sourceAxis.unsafeGet
+  if srcAxis == self.axis:
+    return currentYaw
+  # Axis changed, rotate yaw by 90 degrees.
+  if srcAxis == HorizontalAxis.X and self.axis == HorizontalAxis.Z: currentYaw + 90.0'f32
+  elif srcAxis == HorizontalAxis.Z and self.axis == HorizontalAxis.X: currentYaw - 90.0'f32
+  else: currentYaw
+
+proc entityPosInPortal*(self: PortalSearchResult; entityPos: Vector3[float64]; dimensions: EntityDimensions): Vector3[float64] =
+  let portalWidth = float64(self.width) - float64(dimensions.width)
+  let portalHeight = float64(self.height) - float64(dimensions.height)
+  let lower = self.lowerCorner.vec
+  var axisProgress = 0.5'f64
+  if portalWidth > 0.0:
+    let axisCoord = if self.axis == HorizontalAxis.X: entityPos.x else: entityPos.z
+    let lowerAxis = if self.axis == HorizontalAxis.X: float64(lower.x) else: float64(lower.z)
+    let offset = axisCoord - (lowerAxis + float64(dimensions.width) / 2.0)
+    axisProgress = clamp(offset / portalWidth, 0.0, 1.0)
+  var yProgress = 0.0'f64
+  if portalHeight > 0.0:
+    let offset = entityPos.y - float64(lower.y)
+    yProgress = clamp(offset / portalHeight, 0.0, 1.0)
+  var perpOffset =
+    if self.axis == HorizontalAxis.X: entityPos.z - (float64(lower.z) + 0.5)
+    else: entityPos.x - (float64(lower.x) + 0.5)
+  # Clamp perpendicular offset to keep exit position within portal bounds.
+  perpOffset = clamp(perpOffset, -0.5, 0.5)
+  Vector3[float64](x: axisProgress, y: yProgress, z: perpOffset)
+
+proc calculateExitPosition*(self: PortalSearchResult; relativePos: Vector3[float64]; dimensions: EntityDimensions): Vector3[float64] =
+  let portalWidth = float64(self.width) - float64(dimensions.width)
+  let portalHeight = float64(self.height) - float64(dimensions.height)
+  let lower = self.lowerCorner.vec
+  let axisOffset =
+    if portalWidth > 0.0: mulAdd(relativePos.x, portalWidth, float64(dimensions.width) / 2.0)
+    else: float64(self.width) / 2.0
+  let yOffset = if portalHeight > 0.0: relativePos.y * portalHeight else: 0.0
+  case self.axis
+  of HorizontalAxis.X:
+    Vector3[float64](x: float64(lower.x) + axisOffset, y: float64(lower.y) + yOffset, z: float64(lower.z) + 0.5 + relativePos.z)
+  of HorizontalAxis.Z:
+    Vector3[float64](x: float64(lower.x) + 0.5 + relativePos.z, y: float64(lower.y) + yOffset, z: float64(lower.z) + axisOffset)
+
+proc isPositionClear(world: BlockWorld; center: Vector3[float64]; dimensions: EntityDimensions): bool =
+  let halfWidth = float64(dimensions.width) / 2.0
+  let height = float64(dimensions.height)
+  # The bounding box in block coordinates.
+  let minX = int32(floor(center.x - halfWidth))
+  let maxX = int32(floor(center.x + halfWidth))
+  let minY = int32(floor(center.y - height / 2.0))
+  let maxY = int32(floor(center.y + height / 2.0))
+  let minZ = int32(floor(center.z - halfWidth))
+  let maxZ = int32(floor(center.z + halfWidth))
+  # Check ALL blocks that overlap with the entity bounding box.
+  for x in minX .. maxX:
+    for y in minY .. maxY:
+      for z in minZ .. maxZ:
+        let state = BlockState.fromId(world.getBlockStateId(blockPos(x, y, z)))
+        if state.isSolidBlock():
+          return false
+  true
+
+proc findOpenPosition*(self: PortalSearchResult; world: BlockWorld; fallback: Vector3[float64]; dimensions: EntityDimensions): Vector3[float64] =
+  if dimensions.width > 4.0'f32 or dimensions.height > 4.0'f32:
+    return fallback
+  let halfHeight = float64(dimensions.height) / 2.0
+  let checkPos = Vector3[float64](x: fallback.x, y: fallback.y + halfHeight, z: fallback.z)
+  let searchRadius = 1.0'f64
+  let step = 0.5'f64
+  var bestPos = fallback
+  var bestDist = 1.7976931348623157e308
+  var dx = -searchRadius
+  while dx <= searchRadius:
+    var dz = -searchRadius
+    while dz <= searchRadius:
+      let testPos = Vector3[float64](x: checkPos.x + dx, y: checkPos.y, z: checkPos.z + dz)
+      if isPositionClear(world, testPos, dimensions):
+        let dist = dx * dx + dz * dz
+        if dist < bestDist:
+          bestDist = dist
+          bestPos = Vector3[float64](x: testPos.x, y: fallback.y, z: testPos.z)
+      dz += step
+    dx += step
+  bestPos
+
+# ---------------------------------------------------------------------------
+# NetherPortal
+# ---------------------------------------------------------------------------
+
+proc isValid*(self: NetherPortal): bool =
+  self.width >= PortalMinWidth and self.width <= PortalMaxWidth and self.height >= PortalMinHeight and
+    self.height <= PortalMaxHeight
+
+proc wasAlreadyValid*(self: NetherPortal): bool =
+  self.isValid() and self.foundPortalBlocks == self.width * self.height
+
+proc lowerCorner*(self: NetherPortal): BlockPos = self.lowerConor
+
+proc validStateInsidePortal(blockRef: Block; state: BlockState): bool =
+  state.isAir() or blockRef.hasTag(Block_MINECRAFT_FIRE) or blockRef == blockNetherPortal()
+
+proc stateAt(world: BlockWorld; pos: BlockPos): BlockState =
+  BlockState.fromId(world.getBlockStateId(pos))
+
+proc isFrame(world: BlockWorld; pos: BlockPos): bool =
+  world.getBlock(pos) == blockObsidian()
+
+proc getWidth(world: BlockWorld; originalLowerCorner: BlockPos; negativeDir: BlockDirection): uint32 =
+  for i in 0'u32 .. PortalMaxWidth:
+    let lowerCorner = originalLowerCorner.offsetDir(negativeDir.toOffset(), int32(i))
+    let (blockRef, blockStateId) = world.getBlockAndStateId(lowerCorner)
+    if not validStateInsidePortal(blockRef, BlockState.fromId(blockStateId)):
+      if not (blockRef == blockObsidian()):
+        break
+      return i
+    if not isFrame(world, lowerCorner.down()):
+      break
+  0'u32
+
+proc getLowerCornor(world: BlockWorld; direction: BlockDirection; pos0: BlockPos): Option[BlockPos] =
+  let limitY = pos0.vec.y - int32(PortalMaxHeight)
+  var pos = pos0
+  while pos.vec.y > limitY:
+    let (blockRef, stateId) = world.getBlockAndStateId(pos.down())
+    if not validStateInsidePortal(blockRef, BlockState.fromId(stateId)):
+      break
+    pos = pos.down()
+  let negDir = direction.opposite()
+  let width = int32(getWidth(world, pos, negDir)) - 1'i32
+  if width < 0'i32:
+    return none[BlockPos]()
+  some(pos.offsetDir(negDir.toOffset(), width))
+
+proc getPotentialHeight(world: BlockWorld; lowerCorner: BlockPos; negativeDir: BlockDirection; width: uint32;
+    foundPortalBlocks: var uint32): uint32 =
+  for i in 0'i32 ..< int32(PortalMaxHeight):
+    var pos = lowerCorner.offsetDir(BlockDirection.Up.toOffset(), i).offsetDir(negativeDir.toOffset(), -1'i32)
+    if not isFrame(world, pos):
+      return uint32(i)
+    pos = lowerCorner.offsetDir(BlockDirection.Up.toOffset(), i).offsetDir(negativeDir.toOffset(), int32(width))
+    if not isFrame(world, pos):
+      return uint32(i)
+    for j in 0'u32 ..< width:
+      pos = lowerCorner.offsetDir(BlockDirection.Up.toOffset(), i).offsetDir(negativeDir.toOffset(), int32(j))
+      let (blockRef, stateId) = world.getBlockAndStateId(pos)
+      if not validStateInsidePortal(blockRef, BlockState.fromId(stateId)):
+        return uint32(i)
+      if blockRef == blockNetherPortal():
+        foundPortalBlocks += 1'u32
+  21'u32
+
+proc isHorizontalFrameValid(world: BlockWorld; lowerCorner: BlockPos; dir: BlockDirection; width, height: uint32): bool =
+  for i in 0'u32 ..< width:
+    let pos = lowerCorner.offsetDir(BlockDirection.Up.toOffset(), int32(height)).offsetDir(dir.toOffset(), int32(i))
+    if not isFrame(world, pos):
+      return false
+  true
+
+proc getHeight(world: BlockWorld; lowerCorner: BlockPos; negativeDir: BlockDirection; width: uint32;
+    foundPortalBlocks: var uint32): Option[uint32] =
+  let height = getPotentialHeight(world, lowerCorner, negativeDir, width, foundPortalBlocks)
+  if height < PortalMinHeight or height > PortalMaxHeight or
+      not isHorizontalFrameValid(world, lowerCorner, negativeDir, width, height):
+    return none[uint32]()
+  some(height)
+
+proc getOnAxis*(world: BlockWorld; pos: BlockPos; axis: HorizontalAxis): Option[NetherPortal] =
+  let direction = if axis == HorizontalAxis.X: BlockDirection.West else: BlockDirection.South
+  let cornor = getLowerCornor(world, direction, pos)
+  if cornor.isNone:
+    return none[NetherPortal]()
+  let width = getWidth(world, cornor.unsafeGet, direction)
+  if width < PortalMinWidth or width > PortalMaxWidth:
+    return none[NetherPortal]()
+  var foundPortalBlocks = 0'u32
+  let height = getHeight(world, cornor.unsafeGet, direction, width, foundPortalBlocks)
+  if height.isNone:
+    return none[NetherPortal]()
+  some(NetherPortal(axis: axis, foundPortalBlocks: foundPortalBlocks, negativeDirection: direction,
+    lowerConor: cornor.unsafeGet, width: width, height: height.unsafeGet))
+
+proc getNewPortal*(world: BlockWorld; pos: BlockPos; firstAxis: HorizontalAxis): Option[NetherPortal] =
+  let first = getOnAxis(world, pos, firstAxis)
+  if first.isSome and first.unsafeGet.isValid() and first.unsafeGet.foundPortalBlocks == 0'u32:
+    return first
+  let nextAxis = if firstAxis == HorizontalAxis.X: HorizontalAxis.Z else: HorizontalAxis.X
+  let next = getOnAxis(world, pos, nextAxis)
+  if next.isSome and next.unsafeGet.isValid() and next.unsafeGet.foundPortalBlocks == 0'u32:
+    return next
+  none[NetherPortal]()
+
+proc portalState(axis: HorizontalAxis): BlockStateId =
+  NetherPortalLikeProperties(axis: axis).toStateId(blockNetherPortal())
+
+proc create*(self: NetherPortal; world: BlockWorld) =
+  ## Fills the frame's inside with portal blocks and records each in the POI storage.
+  let state = portalState(self.axis)
+  let last = self.lowerConor.offsetDir(BlockDirection.Up.toOffset(), int32(self.height) - 1'i32)
+    .offsetDir(self.negativeDirection.toOffset(), int32(self.width) - 1'i32)
+  for pos in iterate(self.lowerConor, last):
+    discard world.setBlockState(pos, state, BfNotifyListeners or BfForceState)
+    if world.portalPoiAdd0 != nil:
+      world.portalPoiAdd0(pos)
+
+proc searchForPortal*(world: BlockWorld; targetPos: BlockPos): Option[PortalSearchResult] =
+  let minY = world.minY
+  let maxY = minY + world.dimension.height - 1'i32
+  let searchRadius = if world.dimension.hasCeiling: SearchRadiusNether else: SearchRadiusOverworld
+  let searchMaxY = if world.dimension.hasCeiling: min(minY + world.dimension.logicalHeight - 1'i32, maxY) else: maxY
+  var portalPositions: seq[BlockPos] = @[]
+  if world.portalPoiInSquare0 != nil:
+    portalPositions = world.portalPoiInSquare0(targetPos, searchRadius)
+  var best = none[PortalSearchResult]()
+  var bestDist = 0.0'f64
+  var bestY = 0'i32
+  for pos in portalPositions:
+    if pos.vec.y < minY or pos.vec.y > searchMaxY:
+      continue
+    if world.borderContainsBlock0 != nil and not world.borderContainsBlock0(pos.vec.x, pos.vec.z):
+      continue
+    if not (world.getBlock(pos) == blockNetherPortal()):
+      continue
+    for axis in [HorizontalAxis.X, HorizontalAxis.Z]:
+      let portal = getOnAxis(world, pos, axis)
+      if portal.isSome and portal.unsafeGet.wasAlreadyValid():
+        # The POI position gives the distance (matches vanilla behaviour).
+        let dist = float64(targetPos.squaredDistanceTo(pos.vec.x, pos.vec.y, pos.vec.z))
+        let y = portal.unsafeGet.lowerConor.vec.y
+        let isBetter = best.isNone or dist < bestDist or (abs(dist - bestDist) < 2.220446049250313e-16 and y < bestY)
+        if isBetter:
+          best = some(PortalSearchResult(lowerCorner: portal.unsafeGet.lowerConor, axis: portal.unsafeGet.axis,
+            width: portal.unsafeGet.width, height: portal.unsafeGet.height))
+          bestDist = dist
+          bestY = y
+  best
+
+proc isValidPortalAir(state: BlockState): bool =
+  state.replaceable() and not state.isLiquid()
+
+proc isValidPortalPos(world: BlockWorld; floorPos: BlockPos; axis: HorizontalAxis; perpendicularOffset: int32): bool =
+  let direction = if axis == HorizontalAxis.X: BlockDirection.East else: BlockDirection.South
+  let perpendicular = if axis == HorizontalAxis.X: BlockDirection.South else: BlockDirection.West
+  for portalDir in -1'i32 ..< 3'i32:
+    for height in -1'i32 ..< 4'i32:
+      let pos = floorPos.offsetDir(direction.toOffset(), portalDir).offsetDir(perpendicular.toOffset(), perpendicularOffset)
+        .offsetDir(BlockDirection.Up.toOffset(), height)
+      let state = stateAt(world, pos)
+      if height < 0'i32:
+        if not state.isSolidBlock():
+          return false
+      elif not isValidPortalAir(state):
+        return false
+  true
+
+proc findSafeLocation*(world: BlockWorld; targetPos: BlockPos; axis: HorizontalAxis): Option[(BlockPos, HorizontalAxis, bool)] =
+  ## Answers upstream's `Some((lower corner, axis, is_fallback))`; it is always Some.
+  let minY = world.minY
+  let maxY = minY + world.dimension.height - 1'i32
+  let topYLimit = if world.dimension.hasCeiling: min(minY + world.dimension.logicalHeight - 1'i32, maxY) else: maxY
+  let direction = if axis == HorizontalAxis.X: BlockDirection.East else: BlockDirection.South
+  var hasIdeal = false
+  var idealPos = blockPos(0, 0, 0)
+  var idealAxis = HorizontalAxis.X
+  var idealDist = 0.0'f64
+  var hasAcceptable = false
+  var acceptablePos = blockPos(0, 0, 0)
+  var acceptableAxis = HorizontalAxis.X
+  var acceptableDist = 0.0'f64
+  for offsetX in -32'i32 .. 32'i32:
+    for offsetZ in -32'i32 .. 32'i32:
+      let checkX = targetPos.vec.x + offsetX
+      let checkZ = targetPos.vec.z + offsetZ
+      if world.borderContainsBlock0 != nil and not world.borderContainsBlock0(checkX, checkZ):
+        continue
+      let offsetPos = blockPos(checkX, 0'i32, checkZ).offsetDir(direction.toOffset(), 1'i32)
+      if world.borderContainsBlock0 != nil and not world.borderContainsBlock0(offsetPos.vec.x, offsetPos.vec.z):
+        continue
+      let heightmapY = if world.motionBlockingHeight0 != nil: world.motionBlockingHeight0(checkX, checkZ) else: topYLimit
+      let startY = min(heightmapY, topYLimit)
+      var y = startY
+      while y >= minY:
+        let pos = blockPos(checkX, y, checkZ)
+        if isValidPortalAir(stateAt(world, pos)):
+          var bottomY = y
+          while bottomY > minY:
+            let below = blockPos(checkX, bottomY - 1'i32, checkZ)
+            if not isValidPortalAir(stateAt(world, below)):
+              break
+            bottomY -= 1'i32
+          let airHeight = y - bottomY
+          if airHeight >= 3'i32 and bottomY + 4'i32 <= topYLimit:
+            let floorPos = blockPos(checkX, bottomY, checkZ)
+            for checkAxis in [HorizontalAxis.X, HorizontalAxis.Z]:
+              if isValidPortalPos(world, floorPos, checkAxis, 0'i32):
+                let dist = float64(targetPos.squaredDistanceTo(floorPos.vec.x, floorPos.vec.y, floorPos.vec.z))
+                let isIdeal = isValidPortalPos(world, floorPos, checkAxis, -1'i32) and
+                  isValidPortalPos(world, floorPos, checkAxis, 1'i32)
+                if isIdeal:
+                  if not hasIdeal or dist < idealDist:
+                    hasIdeal = true
+                    idealPos = floorPos
+                    idealAxis = checkAxis
+                    idealDist = dist
+                elif not hasIdeal and (not hasAcceptable or dist < acceptableDist):
+                  hasAcceptable = true
+                  acceptablePos = floorPos
+                  acceptableAxis = checkAxis
+                  acceptableDist = dist
+          y = bottomY - 1'i32
+        else:
+          y -= 1'i32
+  if hasIdeal:
+    return some((idealPos, idealAxis, false))
+  if hasAcceptable:
+    return some((acceptablePos, acceptableAxis, false))
+  # Vanilla: clamp between max(bottomY, 70) and topYLimit - 9.
+  let fallbackY = clamp(targetPos.vec.y, max(minY, 70'i32), topYLimit - 9'i32)
+  let off = direction.toOffset()
+  let fallbackPos = blockPos(targetPos.vec.x - off.x, fallbackY, targetPos.vec.z - off.z)
+  var clampedX = fallbackPos.vec.x
+  var clampedZ = fallbackPos.vec.z
+  if world.borderClampBlock0 != nil:
+    let c = world.borderClampBlock0(fallbackPos.vec.x, fallbackPos.vec.z)
+    clampedX = c[0]
+    clampedZ = c[1]
+  some((blockPos(clampedX, fallbackY, clampedZ), axis, true))
+
+proc buildPortalFrame*(world: BlockWorld; lowerCorner: BlockPos; axis: HorizontalAxis; isFallback: bool) =
+  let direction = if axis == HorizontalAxis.X: BlockDirection.East else: BlockDirection.South
+  let perpendicular = if axis == HorizontalAxis.X: BlockDirection.South else: BlockDirection.West
+  let obsidianState = blockObsidian().defaultState.id
+  let airState = blockAir().defaultState.id
+  if isFallback:
+    # Clear the area around the portal, matching vanilla exactly: perpendicular -1..1, along the portal 0..1, height -1..2.
+    for perp in -1'i32 ..< 2'i32:
+      for portalDir in 0'i32 ..< 2'i32:
+        for height in -1'i32 ..< 3'i32:
+          let pos = lowerCorner.offsetDir(direction.toOffset(), portalDir).offsetDir(perpendicular.toOffset(), perp)
+            .offsetDir(BlockDirection.Up.toOffset(), height)
+          let state = if height < 0'i32: obsidianState else: airState
+          discard world.setBlockState(pos, state, BfNotifyAll)
+  for portalDir in -1'i32 ..< 3'i32:
+    for height in -1'i32 ..< 4'i32:
+      if portalDir == -1'i32 or portalDir == 2'i32 or height == -1'i32 or height == 3'i32:
+        let pos = lowerCorner.offsetDir(direction.toOffset(), portalDir).offsetDir(BlockDirection.Up.toOffset(), height)
+        discard world.setBlockState(pos, obsidianState, BfNotifyAll)
+  let portalStateId = portalState(axis)
+  for x in 0'i32 ..< 2'i32:
+    for y in 0'i32 ..< 3'i32:
+      let pos = lowerCorner.offsetDir(direction.toOffset(), x).offsetDir(BlockDirection.Up.toOffset(), y)
+      discard world.setBlockState(pos, portalStateId, BfNotifyListeners or BfForceState)
+      if world.portalPoiAdd0 != nil:
+        world.portalPoiAdd0(pos)

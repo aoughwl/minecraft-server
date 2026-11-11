@@ -1,0 +1,286 @@
+## Port of pumpkin/src/world/portal/mod.rs, with `try_use_portal` and `tick_portal` of entity/mod.rs, which are what drive it.
+##
+## `Entity.portal_manager` is `gPortalManagers`, one `PortalProcessor` per entity id: entitymod.aowl is below this file,
+## and `Entity` has no field for it. Importing this fills `gTickPortalHook` (entitymod's `tick_portal`); `tryUsePortal` is what block/worldhooks.aowl's `BlockActor.tryUsePortal0` calls.
+##
+## Bedrock's credits packet is left out, as everywhere. `TeleportTransition.new_world` is a `World`.
+
+{.feature: "untyped".}
+{.feature: "lenientnils".}
+
+import std/[options, tables, math]
+import "../../block/blockprelude"
+import ../../../data/block_ext
+from ../../../data/block_state import newBlockStateIdUnchecked
+import ../../../generated/[dimension, entity_type, game_rules]
+import ../../../protocol/java/client/play/game_event
+import ../../../util/math/boundingbox
+import ../../../util/math/position
+import ../../../util/vector3
+import ../../entity/entitymod
+import ../../serverbase
+import ../worldmod
+import "end"
+import nether
+
+type
+  SourcePortalInfo* = object
+    lowerCorner*: BlockPos
+    axis*: HorizontalAxis
+    width*: uint32
+    height*: uint32
+
+  PortalType* = enum
+    ptNether
+    ptEnd
+
+  TeleportTransition* = object
+    newWorld*: World
+    position*: Vector3[float64]
+    yaw*: Option[float32]
+    pitch*: Option[float32]
+
+  PortalProcessor* = ref object
+    portalType*: PortalType
+    entryPosition*: BlockPos
+    portalTime*: uint32
+    insidePortalThisTick*: bool
+    destinationWorld*: World
+    sourcePortal*: Option[SourcePortalInfo]
+
+proc sourcePortalInfoOf*(result: PortalSearchResult): SourcePortalInfo =
+  SourcePortalInfo(lowerCorner: result.lowerCorner, axis: result.axis, width: result.width, height: result.height)
+
+proc getPortalTransitionTime*(self: PortalType; currentWorld: World; entity: EntityBase): uint32 =
+  case self
+  of ptEnd: 0'u32
+  of ptNether:
+    let entityType = entity.entity.entityType
+    let levelInfo = currentWorld.levelInfo
+    if entityType.id == EntityType.PLAYER.id:
+      let player = currentWorld.getPlayerById(entity.entity.entityId)
+      if player == nil:
+        80'u32
+      elif player.gamemode == Creative:
+        uint32(levelInfo.gameRules.playersNetherPortalCreativeDelay)
+      else:
+        uint32(levelInfo.gameRules.playersNetherPortalDefaultDelay)
+    else:
+      0'u32
+
+proc getPortalDestination*(self: PortalType; currentLevel: World; destWorld: World; caller: EntityBase;
+    portalEntryPos: BlockPos; sourcePortal: Option[SourcePortalInfo]): Option[TeleportTransition] =
+  case self
+  of ptEnd:
+    let isEndPortal = destWorld.dimension.minecraftName == THE_END.minecraftName or
+      currentLevel.dimension.minecraftName == THE_END.minecraftName
+    if not isEndPortal:
+      return none[TeleportTransition]()
+    if destWorld.dimension.minecraftName == THE_END.minecraftName:
+      # Entering the End: the obsidian platform at (100, 49, 0) for players, (100, 50, 0) for other entities.
+      let isPlayer = caller.entity.entityType.id == EntityType.PLAYER.id
+      let y = if isPlayer: 49.0'f64 else: 50.0'f64
+      let dest = BlockWorld(destWorld.blockWorld)
+      # Ensure the chunks covering the platform are loaded.
+      discard dest.getBlockStateId(blockPos(98, 49, -2))
+      discard dest.getBlockStateId(blockPos(102, 49, 2))
+      # The platform: 5x5 obsidian at Y=48, and 5x5x3 air above it.
+      let platformPos = blockPos(100, 49, 0)
+      for dx in -2'i32 .. 2'i32:
+        for dz in -2'i32 .. 2'i32:
+          for dy in -1'i32 ..< 3'i32:
+            let blockRef = if dy == -1'i32: blockObsidian() else: blockAir()
+            let targetPos = blockPos(platformPos.vec.x + dx, platformPos.vec.y + dy, platformPos.vec.z + dz)
+            discard dest.setBlockState(targetPos, blockRef.defaultState.id, BfNotifyAll)
+      some(TeleportTransition(newWorld: destWorld, position: Vector3[float64](x: 100.5'f64, y: y, z: 0.5'f64),
+        yaw: some(90.0'f32), pitch: none[float32]()))
+    else:
+      # Leaving the End through the exit portal: back to the overworld spawn.
+      let player = currentLevel.getPlayerById(caller.entity.entityId)
+      if player != nil:
+        player.client.writePacketFor(newCGameEvent(geWinGame, 1.0'f32))
+      let info = destWorld.levelInfo
+      some(TeleportTransition(newWorld: destWorld,
+        position: Vector3[float64](x: float64(info.spawnX) + 0.5'f64, y: float64(info.spawnY), z: float64(info.spawnZ) + 0.5'f64),
+        yaw: none[float32](), pitch: none[float32]()))
+  of ptNether:
+    let pos = caller.entity.pos
+    let currentYaw = caller.entity.yaw
+    let dimensions = caller.entity.entityDimension
+    let scaleFactorNew = destWorld.dimension.coordinateScale
+    let scaleFactorCurrent = currentLevel.dimension.coordinateScale
+    let scaleFactor = scaleFactorCurrent / scaleFactorNew
+    let targetPos = floored(pos.x * scaleFactor, pos.y, pos.z * scaleFactor)
+    let sourceAxis = if sourcePortal.isSome: some(sourcePortal.unsafeGet.axis) else: none[HorizontalAxis]()
+    let dest = BlockWorld(destWorld.blockWorld)
+    var finalPos = Vector3[float64](x: 0.0, y: 0.0, z: 0.0)
+    var yaw = none[float32]()
+    let destResult = searchForPortal(dest, targetPos)
+    if destResult.isSome:
+      let found = destResult.unsafeGet
+      var basePos = found.getTeleportPosition()
+      if sourcePortal.isSome:
+        let source = sourcePortal.unsafeGet
+        let sourceResult = PortalSearchResult(lowerCorner: source.lowerCorner, axis: source.axis, width: source.width,
+          height: source.height)
+        let relativePos = sourceResult.entityPosInPortal(pos, dimensions)
+        basePos = found.calculateExitPosition(relativePos, dimensions)
+      finalPos = found.findOpenPosition(dest, basePos, dimensions)
+      yaw = some(found.calculateTeleportYaw(currentYaw, sourceAxis))
+    else:
+      let safe = findSafeLocation(dest, targetPos, HorizontalAxis.X)
+      if safe.isSome:
+        let (buildPos, axis, isFallback) = safe.unsafeGet
+        buildPortalFrame(dest, buildPos, axis, isFallback)
+        let newPortal = PortalSearchResult(lowerCorner: buildPos, axis: axis, width: 2'u32, height: 3'u32)
+        let centerPos = newPortal.getTeleportPosition()
+        finalPos = newPortal.findOpenPosition(dest, centerPos, dimensions)
+        yaw = some(newPortal.calculateTeleportYaw(currentYaw, sourceAxis))
+      else:
+        finalPos = targetPos.toF64()
+    some(TeleportTransition(newWorld: destWorld, position: finalPos, yaw: yaw, pitch: none[float32]()))
+
+proc newPortalProcessor*(portalType: PortalType; entryPosition: BlockPos; destinationWorld: World): PortalProcessor =
+  PortalProcessor(portalType: portalType, entryPosition: entryPosition, portalTime: 0'u32, insidePortalThisTick: true,
+    destinationWorld: destinationWorld, sourcePortal: none[SourcePortalInfo]())
+
+proc decayTick*(self: PortalProcessor) =
+  self.portalTime = if self.portalTime >= 4'u32: self.portalTime - 4'u32 else: 0'u32
+
+proc hasExpired*(self: PortalProcessor): bool = self.portalTime == 0'u32
+
+proc processPortalTeleportation*(self: PortalProcessor; currentWorld: World; entity: EntityBase;
+    allowedToTeleport: bool): bool =
+  if self.insidePortalThisTick:
+    self.insidePortalThisTick = false
+    if allowedToTeleport:
+      self.portalTime += 1'u32
+      let transitionTime = self.portalType.getPortalTransitionTime(currentWorld, entity)
+      self.portalTime >= transitionTime
+    else:
+      false
+  else:
+    self.decayTick()
+    false
+
+# ---------------------------------------------------------------------------
+# entity/mod.rs: try_use_portal and tick_portal
+# ---------------------------------------------------------------------------
+
+var gPortalManagers = initTable[int32, PortalProcessor]()
+
+proc defaultPortalCooldownOf(self: Entity): uint32 =
+  if self.entityType.id == EntityType.PLAYER.id: 10'u32 else: 300'u32
+
+proc tryUsePortal*(self: Entity; portalDelay: uint32; portalWorld: World; pos: BlockPos) =
+  ## `Entity::try_use_portal`
+  # Passengers don't teleport independently: they wait for their vehicle.
+  if self.hasVehicle():
+    return
+  if self.portalCooldown > 0'u32:
+    self.portalCooldown = self.defaultPortalCooldownOf()
+    return
+  let server = portalWorld.server
+  if (portalWorld.dimension.minecraftName == THE_NETHER.minecraftName and not server.basicConfig.allowNether) or
+      (portalWorld.dimension.minecraftName == THE_END.minecraftName and not server.basicConfig.allowEnd):
+    return
+  let world = self.world
+  if not gPortalManagers.hasKey(self.entityId):
+    let portalType = if portalWorld.dimension.minecraftName == THE_END.minecraftName or
+        world.dimension.minecraftName == THE_END.minecraftName: ptEnd else: ptNether
+    let manager = newPortalProcessor(portalType, pos, portalWorld)
+    let blockWorld = BlockWorld(world.blockWorld)
+    let onX = getOnAxis(blockWorld, pos, HorizontalAxis.X)
+    if onX.isSome and onX.unsafeGet.wasAlreadyValid():
+      let portal = onX.unsafeGet
+      manager.sourcePortal = some(SourcePortalInfo(lowerCorner: portal.lowerCorner(), axis: portal.axis,
+        width: portal.width, height: portal.height))
+    else:
+      let onZ = getOnAxis(blockWorld, pos, HorizontalAxis.Z)
+      if onZ.isSome and onZ.unsafeGet.wasAlreadyValid():
+        let portal = onZ.unsafeGet
+        manager.sourcePortal = some(SourcePortalInfo(lowerCorner: portal.lowerCorner(), axis: portal.axis,
+          width: portal.width, height: portal.height))
+    gPortalManagers[self.entityId] = manager
+  else:
+    let manager = gPortalManagers.getOrDefault(self.entityId)
+    manager.entryPosition = pos
+    manager.insidePortalThisTick = true
+
+proc teleportPassengersRecursive(entity: Entity; position: Vector3[float64]; yawDelta: Option[float32]; destWorld: World) =
+  for passenger in entity.passengers:
+    let passengerEntity = passenger.entity
+    let passengerYaw = if yawDelta.isSome: some(passengerEntity.yaw + yawDelta.unsafeGet) else: none[float32]()
+    passengerEntity.portalCooldown = passengerEntity.defaultPortalCooldownOf()
+    # Nested passengers before teleporting.
+    let nested = passengerEntity.passengers
+    passenger.teleport(position, passengerYaw, none[float32](), destWorld)
+    for n in nested:
+      teleportPassengersRecursive(n.entity, position, yawDelta, destWorld)
+
+proc tickPortal*(self: Entity; caller: EntityBase) =
+  ## `Entity::tick_portal`
+  if self.portalCooldown > 0'u32:
+    self.portalCooldown -= 1'u32
+  if not gPortalManagers.hasKey(self.entityId):
+    return
+  let processor = gPortalManagers.getOrDefault(self.entityId)
+  var shouldRemove = false
+  if processor.processPortalTeleportation(self.world, caller, true):
+    self.portalCooldown = self.defaultPortalCooldownOf()
+    let transition = processor.portalType.getPortalDestination(self.world, processor.destinationWorld, caller,
+      processor.entryPosition, processor.sourcePortal)
+    if transition.isSome:
+      let t = transition.unsafeGet
+      let yawDelta = if t.yaw.isSome: some(t.yaw.unsafeGet - self.yaw) else: none[float32]()
+      # Teleport the main entity.
+      caller.teleport(t.position, t.yaw, t.pitch, t.newWorld)
+      # Teleport all passengers recursively along with the vehicle.
+      teleportPassengersRecursive(self, t.position, yawDelta, t.newWorld)
+  elif processor.portalTime == 0'u32:
+    shouldRemove = true
+  if shouldRemove:
+    gPortalManagers.del(self.entityId)
+
+gTickPortalHook = proc(self: Entity; caller: EntityBase) {.closure.} = tickPortal(self, caller)
+
+proc tickPlayerPortals*(world: World; player: Player; server: Server) =
+  ## A player's share of `Entity::tick`: the portal blocks its box overlaps are `on_entity_collision` of the nether and end
+  ## portal blocks (what `check_block_collision` would reach), then `tick_portal`. The block adapter that fills
+  ## `gBlockHooks.onEntityCollision` makes the first half redundant, and `tryUsePortal` is the same call either way.
+  let base = playerBase(player)
+  let entity = base.entity
+  let aabb = entity.boundingBox
+  let lox = int32(floor(aabb.min.x + 0.001'f64))
+  let loy = int32(floor(aabb.min.y + 0.001'f64))
+  let loz = int32(floor(aabb.min.z + 0.001'f64))
+  let hix = int32(floor(aabb.max.x - 0.001'f64))
+  let hiy = int32(floor(aabb.max.y - 0.001'f64))
+  let hiz = int32(floor(aabb.max.z - 0.001'f64))
+  var inPortal = false
+  var targetIdx = -1
+  var entry = blockPos(0'i32, 0'i32, 0'i32)
+  for x in lox .. hix:
+    for y in loy .. hiy:
+      for z in loz .. hiz:
+        if inPortal:
+          continue
+        let pos = blockPos(x, y, z)
+        let blockRef = Block.fromStateId(newBlockStateIdUnchecked(uint16(world.getBlockStateId(pos))))
+        var targetName = ""
+        if blockRef == blockNetherPortal():
+          targetName = if world.dimension.minecraftName == THE_NETHER.minecraftName: OVERWORLD.minecraftName else: THE_NETHER.minecraftName
+        elif blockRef == blockEndPortal():
+          targetName = if world.dimension.minecraftName == THE_END.minecraftName: OVERWORLD.minecraftName else: THE_END.minecraftName
+        if targetName.len > 0:
+          for wi in 0 ..< server.worlds.len:
+            if server.worlds[wi].dimension.minecraftName == targetName and server.worlds[wi] != world:
+              inPortal = true
+              targetIdx = wi
+              entry = pos
+              break
+  if inPortal and targetIdx >= 0:
+    entity.tryUsePortal(0'u32, server.worlds[targetIdx], entry)
+  entity.tickPortal(base)
+
+gPlayerEntityTickHook = proc(world: World; player: Player; server: Server) {.closure.} = tickPlayerPortals(world, player, server)

@@ -1,0 +1,493 @@
+## Port of pumpkin/src/world/natural_spawner.rs
+## PARTIAL: pumpkin/src/world/natural_spawner.rs - the `GenerationCache` half is not here: `spawn_mobs_for_chunk_generation`, `get_top_non_colliding_pos`, `is_spawn_position_ok_cache` and `adjust_spawn_position_cache` are the spawns of a chunk that is being generated, and need the proto chunk's cache; nothing in the world generation here calls them.
+##
+## The state is rebuilt once per tick by `naturalSpawnTick` (upstream builds it in `update_active_chunks` and adjusts it as
+## entities come and go, which a rebuild per tick makes the same), so `add_entity` and `remove_entity` are not here.
+## `DashMap`s are tables and `AtomicI32`s plain ints: one thread ticks the world. The `rand` draws all come from one
+## `Xoroshiro` (`gSpawnRand`), which `seedSpawnRandom` makes a known sequence for a test; `get_random_pos_within`'s own
+## generator is `getSeed()`, as upstream. `Vec::choose` is `nextBoundedI32(len)`, `random_range(a..b)` is `a + nextBoundedI32(b - a)`.
+## Importing this fills `gNaturalSpawnHook`, which worldmod's `tickChunks` calls.
+
+{.feature: "untyped".}
+{.feature: "lenientnils".}
+
+import std/[math, options, tables, sequtils, syncio]
+import ../../data/block_ext
+from ../../data/block_state import asU16, newBlockStateIdUnchecked, BlockState, isFullCube, isLiquid, isSideSolid
+import ../../generated/[biome, block_properties, entity_type, fluid, tag]
+import ../../util/difficulty
+import ../../util/gamemode
+import ../../util/math/boundingbox
+import ../../util/math/mathmod
+import ../../util/math/position
+import ../../util/vector2
+import ../../util/uuid
+import ../../util/vector3
+import ../../util/xoroshiro128
+from ../../util/random/random import getSeed
+import ../../data/block_direction
+import ../../world/chunkdata
+import ../../world/level
+import ../entity/entitymod
+import ../entity/entitytype
+import ../serverbase
+import worldmod
+
+const MagicNumber* = 17'i32 * 17'i32
+
+proc rustPanic(what: string) {.noreturn.} =
+  echo what
+  quit(1)
+
+type
+  MobCounts* = object
+    counts*: array[8, int32]
+
+  PointCharge* = object
+    pos*: Vector3[float64]
+    charge*: float64
+
+  PotentialCalculator* = object
+    charges*: seq[PointCharge]
+
+  LocalMobCapCalculator* = ref object
+    playerMobCounts*: Table[int32, MobCounts]
+    playersNearChunk*: Table[int64, seq[int32]]
+
+  SpawnState* = ref object
+    spawnableChunkCount*: int32
+    mobCategoryCounts*: MobCounts
+    spawnPotential*: PotentialCalculator
+    localMobCapCalculator*: LocalMobCapCalculator
+    hasLastChecked*: bool
+    lastCheckedPos*: BlockPos
+    lastCheckedType*: uint16
+    lastCheckedCharge*: float64
+
+var gSpawnRand = fromSeed(getSeed())
+
+proc seedSpawnRandom*(seed: uint64) =
+  gSpawnRand = fromSeed(seed)
+
+proc randF32(): float32 = gSpawnRand.nextF32()
+proc randRange(lo, hi: int32): int32 =
+  ## `random_range(lo..hi)`, hi exclusive.
+  lo + gSpawnRand.nextBoundedI32(hi - lo)
+
+proc chunkKey2(p: Vector2[int32]): int64 =
+  (int64(p.x) shl 32) or (int64(cast[uint32](p.y)))
+
+# ---------------------------------------------------------------------------
+# MobCounts
+# ---------------------------------------------------------------------------
+
+proc add*(self: var MobCounts; category: MobCategory) =
+  self.counts[category.id] += 1'i32
+
+proc remove*(self: var MobCounts; category: MobCategory) =
+  self.counts[category.id] -= 1'i32
+
+proc canSpawn*(self: MobCounts; category: MobCategory): bool =
+  self.counts[category.id] < category.max
+
+# ---------------------------------------------------------------------------
+# LocalMobCapCalculator
+# ---------------------------------------------------------------------------
+
+proc newLocalMobCapCalculator*(): LocalMobCapCalculator =
+  LocalMobCapCalculator(playerMobCounts: initTable[int32, MobCounts](), playersNearChunk: initTable[int64, seq[int32]]())
+
+proc calcDistance*(chunkPos: Vector2[int32]; playerPos: Vector3[float64]): float64 =
+  let dx = float64((chunkPos.x shl 4) + 8'i32) - playerPos.x
+  let dy = float64((chunkPos.y shl 4) + 8'i32) - playerPos.z
+  dx * dx + dy * dy
+
+proc getPlayersNear(self: LocalMobCapCalculator; world: World; chunkPos: Vector2[int32]): seq[int32] =
+  let key = chunkKey2(chunkPos)
+  if self.playersNearChunk.hasKey(key):
+    return self.playersNearChunk.getOrDefault(key)
+  var players: seq[int32] = @[]
+  for player in world.players:
+    if player.gamemode != Spectator and calcDistance(chunkPos, player.pos) < 16384.0:
+      players.add(player.entityId)
+  self.playersNearChunk[key] = players
+  players
+
+proc addMob*(self: LocalMobCapCalculator; chunkPos: Vector2[int32]; world: World; category: MobCategory) =
+  for player in self.getPlayersNear(world, chunkPos):
+    var counts = self.playerMobCounts.getOrDefault(player)
+    counts.add(category)
+    self.playerMobCounts[player] = counts
+
+proc removeMob*(self: LocalMobCapCalculator; chunkPos: Vector2[int32]; world: World; category: MobCategory) =
+  for player in self.getPlayersNear(world, chunkPos):
+    if self.playerMobCounts.hasKey(player):
+      var counts = self.playerMobCounts.getOrDefault(player)
+      counts.remove(category)
+      self.playerMobCounts[player] = counts
+
+proc canSpawn*(self: LocalMobCapCalculator; category: MobCategory; world: World; chunkPos: Vector2[int32]): bool =
+  for player in self.getPlayersNear(world, chunkPos):
+    if self.playerMobCounts.hasKey(player):
+      if self.playerMobCounts.getOrDefault(player).canSpawn(category):
+        return true
+    else:
+      return true
+  false
+
+# ---------------------------------------------------------------------------
+# PotentialCalculator
+# ---------------------------------------------------------------------------
+
+proc getPotentialChange(self: PointCharge; pos: BlockPos): float64 =
+  let p = pos.toF64()
+  let dx = self.pos.x - p.x
+  let dy = self.pos.y - p.y
+  let dz = self.pos.z - p.z
+  let dst = sqrt(dx * dx + dy * dy + dz * dz)
+  self.charge / dst
+
+proc addCharge*(self: var PotentialCalculator; pos: BlockPos; charge: float64) =
+  if charge != 0.0:
+    self.charges.add(PointCharge(pos: pos.toF64(), charge: charge))
+
+proc removeCharge*(self: var PotentialCalculator; pos: BlockPos; charge: float64) =
+  if charge != 0.0:
+    let posF = pos.toF64()
+    for i in 0 ..< self.charges.len:
+      if self.charges[i].pos == posF and self.charges[i].charge == charge:
+        # swap_remove
+        let lastCharge = self.charges[self.charges.len - 1]
+        self.charges[i] = lastCharge
+        self.charges.setLen(self.charges.len - 1)
+        return
+
+proc getPotentialEnergyChange*(self: PotentialCalculator; pos: BlockPos; charge: float64): float64 =
+  if charge == 0.0:
+    return 0.0
+  var sum = 0.0'f64
+  for c in self.charges:
+    sum += c.getPotentialChange(pos)
+  sum * charge
+
+# ---------------------------------------------------------------------------
+# Biome lookups
+# ---------------------------------------------------------------------------
+
+proc biomeAt(world: World; pos: BlockPos): nil Biome =
+  Biome.fromId(uint8(getRoughBiome(world.level, pos)))
+
+proc spawnCostOf(biome: nil Biome; entityName: string): Option[SpawnCosts] =
+  if biome == nil:
+    return none[SpawnCosts]()
+  for e in biome.spawnCosts:
+    if e.entity == entityName:
+      return some(e.costs)
+  none[SpawnCosts]()
+
+proc spawnersFor(biome: Biome; category: MobCategory): seq[Spawner] =
+  let id = category.id
+  if id == MobCategory.MONSTER.id: biome.spawners.monster
+  elif id == MobCategory.CREATURE.id: biome.spawners.creature
+  elif id == MobCategory.AMBIENT.id: biome.spawners.ambient
+  elif id == MobCategory.AXOLOTLS.id: biome.spawners.axolotls
+  elif id == MobCategory.UNDERGROUND_WATER_CREATURE.id: biome.spawners.undergroundWaterCreature
+  elif id == MobCategory.WATER_CREATURE.id: biome.spawners.waterCreature
+  elif id == MobCategory.WATER_AMBIENT.id: biome.spawners.waterAmbient
+  elif id == MobCategory.MISC.id: biome.spawners.misc
+  else:
+    rustPanic("unknown mob category")
+
+# ---------------------------------------------------------------------------
+# SpawnState
+# ---------------------------------------------------------------------------
+
+proc emptySpawnState*(): SpawnState =
+  SpawnState(spawnableChunkCount: 0'i32, localMobCapCalculator: newLocalMobCapCalculator())
+
+proc newSpawnState*(chunkCount: int32; world: World): SpawnState =
+  ## `SpawnState::new`: counts the mobs of the active chunks.
+  result = SpawnState(spawnableChunkCount: chunkCount, localMobCapCalculator: newLocalMobCapCalculator())
+  for entity in entitiesOf(world).entities:
+    let e = entity.entity
+    let entityType = e.entityType
+    let chunkPos = e.chunkPos
+    var isActive = false
+    for c in world.activeChunks:
+      if c == chunkPos:
+        isActive = true
+        break
+    if entityType.mob and entityType.category != MobCategory.MISC and isActive:
+      let entityPos = e.blockPos
+      let biome = Biome.fromId(uint8(e.currentBiome))
+      let cost = spawnCostOf(biome, entityType.resourceName)
+      if cost.isSome:
+        result.spawnPotential.addCharge(entityPos, cost.unsafeGet.charge)
+      result.localMobCapCalculator.addMob(chunkPos, world, entityType.category)
+      result.mobCategoryCounts.add(entityType.category)
+
+proc canSpawnForCategoryGlobal*(self: SpawnState; category: MobCategory): bool =
+  self.mobCategoryCounts.counts[category.id] < category.max * self.spawnableChunkCount div MagicNumber
+
+proc canSpawnForCategoryLocal*(self: SpawnState; world: World; category: MobCategory; chunkPos: Vector2[int32]): bool =
+  self.localMobCapCalculator.canSpawn(category, world, chunkPos)
+
+proc canSpawn*(self: SpawnState; entityType: EntityType; pos: BlockPos; world: World): bool =
+  # TODO upstream: get biome
+  let biome = biomeAt(world, pos)
+  let cost = spawnCostOf(biome, entityType.resourceName)
+  if cost.isNone:
+    self.hasLastChecked = true
+    self.lastCheckedPos = pos
+    self.lastCheckedType = entityType.id
+    self.lastCheckedCharge = 0.0
+    true
+  else:
+    self.hasLastChecked = true
+    self.lastCheckedPos = pos
+    self.lastCheckedType = entityType.id
+    self.lastCheckedCharge = cost.unsafeGet.charge
+    self.spawnPotential.getPotentialEnergyChange(pos, cost.unsafeGet.charge) <= cost.unsafeGet.energyBudget
+
+proc afterSpawn*(self: SpawnState; entityType: EntityType; pos: BlockPos; world: World) =
+  var charge = 0.0'f64
+  if self.hasLastChecked and self.lastCheckedPos == pos and self.lastCheckedType == entityType.id:
+    charge = self.lastCheckedCharge
+  else:
+    let biome = biomeAt(world, pos)
+    let cost = spawnCostOf(biome, entityType.resourceName)
+    charge = if cost.isSome: cost.unsafeGet.charge else: 0.0
+  self.spawnPotential.addCharge(pos, charge)
+  self.mobCategoryCounts.add(entityType.category)
+  self.localMobCapCalculator.addMob(Vector2[int32](x: getSectionCord(pos.vec.x), y: getSectionCord(pos.vec.z)), world,
+    entityType.category)
+
+proc getFilteredSpawningCategories*(state: SpawnState; spawnFriendlies, spawnEnemies, spawnPassives: bool): seq[MobCategory] =
+  result = @[]
+  let categories = spawningCategories()
+  for category in categories:
+    let isTypeAllowed = if category.isFriendly: spawnFriendlies else: spawnEnemies
+    let passiveOk = not (category.isPersistent and not spawnPassives)
+    if isTypeAllowed and passiveOk and state.canSpawnForCategoryGlobal(category):
+      result.add(category)
+
+# ---------------------------------------------------------------------------
+# Position tests
+# ---------------------------------------------------------------------------
+
+proc stateAt(world: World; pos: BlockPos): BlockState =
+  BlockState.fromId(newBlockStateIdUnchecked(uint16(world.getBlockStateId(pos))))
+
+proc isValidEmptySpawnBlock*(state: BlockState): bool =
+  if state.isFullCube():
+    return false
+  # if state.is_signal_source() { return false }  (commented out upstream)
+  if state.isLiquid():
+    return false
+  if hasTag(asU16(Block.fromStateId(state.id).id), Block_MINECRAFT_PREVENT_MOB_SPAWNING_INSIDE):
+    return false
+  # TODO upstream: !entityType.isBlockDangerous(blockState)
+  true
+
+proc adjustSpawnPosition*(world: World; pos: BlockPos; entityType: EntityType): BlockPos =
+  if entityType.spawnRestriction.location == SpawnLocation.OnGround:
+    let below = pos.down()
+    let state = stateAt(world, below)
+    # Approximation of isPathfindable(LAND).
+    if not state.isFullCube() and not state.isLiquid():
+      return below
+  pos
+
+proc isSpawnPositionOk*(world: World; blockPos: BlockPos; entityType: EntityType): bool =
+  case entityType.spawnRestriction.location
+  of SpawnLocation.InLava:
+    hasTag(world.getFluid(blockPos).id, Fluid_MINECRAFT_LAVA)
+  of SpawnLocation.InWater:
+    # TODO upstream: !level.getBlockState(blockPos).isRedstoneConductor(level, blockPos)
+    let aboveState = stateAt(world, blockPos.up())
+    hasTag(world.getFluid(blockPos).id, Fluid_MINECRAFT_WATER) and not aboveState.isFullCube()
+  of SpawnLocation.OnGround:
+    let down = stateAt(world, blockPos.down())
+    let up = stateAt(world, blockPos.up())
+    let cur = stateAt(world, blockPos)
+    # TODO upstream: blockState.allowsSpawning
+    let isValidSpawnBelow = down.isSideSolid(BlockDirection.Up) and down.luminance < 14'u8
+    if isValidSpawnBelow:
+      isValidEmptySpawnBlock(cur) and isValidEmptySpawnBlock(up)
+    else:
+      false
+  of SpawnLocation.Unrestricted:
+    true
+
+proc isValidSpawnPositionForType*(world: World; blockPos: BlockPos; category: MobCategory; entityType: EntityType;
+    distance: float64; isThundering: bool): bool =
+  # TODO upstream: !SpawnPlacements.checkSpawnRules(entityType, level, EntitySpawnReason.NATURAL, pos, level.random)
+  if category == MobCategory.MISC:
+    return false
+  if not entityType.canSpawnFarFromPlayer and
+      distance > float64(entityType.category.despawnDistance) * float64(entityType.category.despawnDistance):
+    return false
+  if not entityType.summonable:
+    return false
+  if not isSpawnPositionOk(world, blockPos, entityType):
+    return false
+  if not checkSpawnRules(entityType, world, blockPos, isThundering):
+    return false
+  # TODO upstream: use getSpawnBox, which only slimes and magma slimes change.
+  if not world.isSpaceEmpty(BoundingBox.newFromPos(float64(blockPos.vec.x) + 0.5, float64(blockPos.vec.y),
+      float64(blockPos.vec.z) + 0.5, newEntityDimensions(entityType.dimension[0], entityType.dimension[1],
+      entityType.eyeHeight))):
+    return false
+  true
+
+proc getNearestPlayer*(pos: Vector3[float64]; playerPositions: seq[Vector3[float64]]): float64 =
+  var minDstSq = 1.7976931348623157e308
+  for playerPos in playerPositions:
+    let curDstSq = playerPos.squaredDistanceToVec(pos)
+    if curDstSq < minDstSq:
+      minDstSq = curDstSq
+  minDstSq
+
+proc isRightDistanceToPlayerAndSpawnPoint*(pos: BlockPos; distance: float64; chunkPos: Vector2[int32]): bool =
+  if distance <= 24.0 * 24.0:
+    return false
+  # TODO upstream: getSharedSpawnPos / WorldSpawnPoint
+  if pos.toCenteredF64().squaredDistanceTo(0.0, 0.0, 0.0) <= 24.0 * 24.0:
+    return false
+  # TODO upstream: canSpawnEntitiesInChunk(ChunkPos chunkPos)
+  chunkPos == Vector2[int32](x: getSectionCord(pos.vec.x), y: getSectionCord(pos.vec.z))
+
+proc getRandomSpawnMobAt*(world: World; category: MobCategory; blockPos: BlockPos): Option[Spawner] =
+  # TODO upstream: Holder<Biome> holder = level.getBiome(pos)
+  let biome = biomeAt(world, blockPos)
+  if biome == nil:
+    return none[Spawner]()
+  if category == MobCategory.WATER_AMBIENT and
+      hasTag(Taggable(tagKey: rkWorldgenBiome, registryKey: biome.registryId, registryId: uint16(biome.id)),
+        WorldgenBiome_MINECRAFT_REDUCE_WATER_AMBIENT_SPAWNS) and randF32() < 0.98'f32:
+    return none[Spawner]()
+  # TODO upstream: isInNetherFortressBounds, structureManager.getAllStructuresAt, ChunkGenerator::getMobsAt
+  let spawners = spawnersFor(biome, category)
+  if spawners.len == 0:
+    return none[Spawner]()
+  some(spawners[int(gSpawnRand.nextBoundedI32(int32(spawners.len)))])
+
+# ---------------------------------------------------------------------------
+# Spawning
+# ---------------------------------------------------------------------------
+
+proc entityTypeOf(name: string): EntityType =
+  var key = name
+  if key.len >= 10 and substr(key, 0, 9) == "minecraft:":
+    key = substr(key, 10)
+  let found = EntityType.fromName(key)
+  if found.isNone:
+    rustPanic("unknown spawner entity type " & name)
+  found.unsafeGet
+
+proc spawnCategoryForPosition*(category: MobCategory; world: World; pos: BlockPos; chunkPos: Vector2[int32];
+    spawnState: SpawnState; isThundering: bool): seq[EntityBase] =
+  result = @[]
+  var spawnClusterSize = 0'i32
+  var playerPositions: seq[Vector3[float64]] = @[]
+  for p in world.players:
+    playerPositions.add(p.pos)
+  for group in 0 ..< 3:
+    var newX = pos.vec.x
+    var newZ = pos.vec.z
+    var randomGroupSize = int32(ceil(float64(randF32() * 4.0'f32)))
+    var inc = 0'i32
+    var hasSpawner = false
+    var currentSpawner = Spawner()
+    var stopAll = false
+    while inc < randomGroupSize:
+      newX += randRange(0'i32, 6'i32) - randRange(0'i32, 6'i32)
+      newZ += randRange(0'i32, 6'i32) - randRange(0'i32, 6'i32)
+      var newPos = BlockPos(vec: vec3[int32](newX, pos.vec.y, newZ))
+      if not hasSpawner:
+        let spawner = getRandomSpawnMobAt(world, category, newPos)
+        if spawner.isNone:
+          break
+        currentSpawner = spawner.unsafeGet
+        hasSpawner = true
+        randomGroupSize = randRange(currentSpawner.minCount, currentSpawner.maxCount + 1'i32)
+      let entityType = entityTypeOf(currentSpawner.`type`)
+      newPos = adjustSpawnPosition(world, newPos, entityType)
+      let spawnPosF64 = Vector3[float64](x: float64(newPos.vec.x) + 0.5, y: float64(newPos.vec.y), z: float64(newPos.vec.z) + 0.5)
+      let playerDistance = getNearestPlayer(spawnPosF64, playerPositions)
+      var spawnedOne = false
+      if isRightDistanceToPlayerAndSpawnPoint(newPos, playerDistance, chunkPos) and
+          isValidSpawnPositionForType(world, newPos, category, entityType, playerDistance, isThundering) and
+          spawnState.canSpawn(entityType, newPos, world):
+        let entity = gFromType(entityType, spawnPosF64, world, newV4()[1])
+        if entity != nil:
+          entity.entity.setRotation(randF32() * 360.0'f32, 0.0'f32)
+          spawnClusterSize += 1'i32
+          result.add(entity)
+          spawnState.afterSpawn(entityType, newPos, world)
+          spawnedOne = true
+      if spawnedOne and spawnClusterSize >= entityType.limitPerChunk:
+        stopAll = true
+        break
+      inc += 1'i32
+    if stopAll:
+      break
+
+proc getRandomPosWithin*(minY: int32; chunkPos: Vector2[int32]; chunk: ChunkData): BlockPos =
+  var rng = fromSeed(getSeed())
+  let x = (chunkPos.x shl 4) + rng.nextBoundedI32(16'i32)
+  let z = (chunkPos.y shl 4) + rng.nextBoundedI32(16'i32)
+  let tempY = getHeightmap(chunk.heightmap, chmWorldSurface, x, z, chunk.section.minY) + 1'i32
+  let y = rng.nextInbetweenI32(minY, tempY)
+  BlockPos(vec: vec3[int32](x, y, z))
+
+proc spawnForChunk*(world: World; chunkPos: Vector2[int32]; chunk: ChunkData; spawnState: SpawnState;
+    spawnList: seq[MobCategory]; isThundering: bool): seq[EntityBase] =
+  result = @[]
+  for category in spawnList:
+    if spawnState.canSpawnForCategoryLocal(world, category, chunkPos):
+      let randomPos = getRandomPosWithin(world.minY, chunkPos, chunk)
+      if randomPos.vec.y > world.minY:
+        for e in spawnCategoryForPosition(category, world, randomPos, chunkPos, spawnState, isThundering):
+          result.add(e)
+
+proc tickSpawningChunk(world: World; chunkPos: Vector2[int32]; chunk: ChunkData; spawnList: seq[MobCategory];
+    spawnState: SpawnState) =
+  ## `World::tick_spawning_chunk`, the spawn half (the thunder-time lightning and skeleton trap is the weather's).
+  if spawnList.len == 0:
+    return
+  let entities = spawnForChunk(world, chunkPos, chunk, spawnState, spawnList, world.weather.thundering)
+  for entity in entities:
+    world.spawnEntity(entity)
+
+proc naturalSpawnTick*(world: World) =
+  ## The spawn part of `tick_chunks` and `update_active_chunks`: the state of this tick, the categories that may spawn now
+  ## and one pass over the loaded active chunks.
+  var spawnable = 0'i32
+  for pos in world.activeChunks:
+    if isChunkLoaded(world.level, pos.x, pos.y):
+      spawnable += 1'i32
+  let spawnState = newSpawnState(spawnable, world)
+  let rules = world.levelInfo.gameRules
+  let peaceful = world.levelInfo.difficulty == Peaceful
+  let spawnPassives0 = world.levelTime.timeOfDay mod 400'i64 == 0'i64
+  let spawnEnemies = not peaceful and rules.spawnMonsters and rules.spawnMobs
+  let spawnPassives = spawnPassives0 and rules.spawnMobs
+  let spawnList = getFilteredSpawningCategories(spawnState, rules.spawnMobs, spawnEnemies, spawnPassives)
+  if spawnList.len == 0:
+    return
+  var chunks: seq[(Vector2[int32], ChunkData)] = @[]
+  for pos in world.activeChunks:
+    let chunk = readChunkSync(world.level, pos.x, pos.y)
+    if chunk != nil:
+      chunks.add((pos, chunk))
+  # Shuffled, as upstream does.
+  var i = chunks.len - 1
+  while i >= 1:
+    let j = int(gSpawnRand.nextBoundedI32(int32(i + 1)))
+    swap(chunks[i], chunks[j])
+    i -= 1
+  for (pos, chunk) in chunks:
+    tickSpawningChunk(world, pos, chunk, spawnList, spawnState)
+
+gNaturalSpawnHook = proc(world: World) {.closure.} = naturalSpawnTick(world)
