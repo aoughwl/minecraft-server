@@ -1,0 +1,439 @@
+## Port of pumpkin/src/entity/projectile/fishing_bobber.rs
+## Port of pumpkin/src/entity/projectile/shulker_bullet.rs
+
+import std/[math, options]
+from ../../../data/block_state import isAir, isSolid, BlockState
+import ../../../data/block_ext
+import "../../../data/item_stack/mod"
+import ../../../generated/[effect, meta_data_type, particle, sound, sound_category, statistic, tracked_data]
+import ../../../protocol/java/client/play/[entity_position_sync, entity_velocity]
+import ../../world/chunker
+import thrown
+
+const
+  BobberWaterInertia = 0.8'f64
+  BobberAirInertia = 0.92'f64
+  BobberGravity = 0.03'f64
+  # Direction ordinal constants
+  DirDown = 0'u8
+  DirUp = 1'u8
+  DirNorth = 2'u8
+  DirSouth = 3'u8
+  DirWest = 4'u8
+  DirEast = 5'u8
+  DirNone = 255'u8
+  Speed = 0.15'f64
+
+type
+  FishingBobberEntity* = ref object of EntityBase
+    ownerId*: int32
+    hookedEntityId*: int32
+    inGround*: bool
+    hasHit*: bool
+    waitCountdown*: int32
+    biteCountdown*: int32
+
+  ShulkerBulletEntity* = ref object of EntityBase
+    ownerId*: int32
+    targetId*: int32      ## Entity id of the final target; -1 = no target, 0+ = valid target
+    currentDir*: uint8    ## Current movement direction (direction ordinal, or `DirNone`)
+    flightSteps*: int32   ## How many ticks remain on the current axis segment
+    targetDeltaX*, targetDeltaY*, targetDeltaZ*: float64  ## Steering velocity components (updated each tick)
+    hasHit*: bool
+    bulletAge*: int32     ## Tick counter; bullet is discarded after ~150 ticks if it never reaches its target
+
+# --- FishingBobberEntity ----------------------------------------------------------------------------------------------------------
+
+proc waitRoll(): int32 =
+  ## `rand::random::<i32>().abs() % 600 + 100`
+  randomRange(0'i32, 600'i32) + 100'i32
+
+proc reelIn*(self: FishingBobberEntity; player: Player): int32 =
+  ## `reel_in`
+  let world = self.entity.world
+  let hookedId = self.hookedEntityId
+  if hookedId != 0'i32:
+    let hooked = world.getEntityById(hookedId)
+    if hooked != nil:
+      let delta = player.pos - hooked.entity.pos
+      let motion = delta.multiply(0.1'f64, 0.1'f64, 0.1'f64).addRaw(0.0'f64, sqrt(delta.length()) * 0.08'f64, 0.0'f64)
+      hooked.entity.addVelocity(motion)
+      return 1'i32
+  if self.biteCountdown > 0'i32:
+    # Caught something!
+    gPlayerHooks.incrementStat(player, scCustom, int32(ord(csFishCaught)), 1'i32)
+    # TODO upstream: Use actual loot tables. For now, just give a raw cod. (Upstream never hands it over.)
+    world.playSound(sdEntityExperienceOrbPickup, scNeutral, player.pos)
+    return 1'i32
+  0'i32
+
+proc processTickBobber(self: FishingBobberEntity; caller: EntityBase) =
+  ## `process_tick`
+  let entity = self.entity
+  let world = entity.world
+  if self.inGround:
+    return
+  let hookedId = self.hookedEntityId
+  if hookedId != 0'i32:
+    let hooked = world.getEntityById(hookedId)
+    if hooked != nil:
+      if hooked.entity.removed:
+        self.hookedEntityId = 0'i32
+      else:
+        var hookedPos = hooked.entity.pos
+        hookedPos.y += hooked.entity.getEyeHeight() * 0.8'f64
+        entity.setPos(hookedPos)
+        return
+    else:
+      self.hookedEntityId = 0'i32
+  var velocity = entity.velocity
+  let startPos = entity.pos
+  if entity.touchingWater:
+    velocity.y += 0.02'f64 # Buoyancy
+    let bite = self.biteCountdown
+    if bite > 0'i32:
+      self.biteCountdown = bite - 1'i32
+      if bite mod 5'i32 == 0'i32:
+        world.spawnParticle(entity.pos, Vector3[float64](x: float64(0.1'f32), y: float64(0.1'f32), z: float64(0.1'f32)),
+          0.0'f32, 5'i32, ptBubble)
+    else:
+      let wait = self.waitCountdown
+      if wait > 0'i32:
+        self.waitCountdown = wait - 1'i32
+      else:
+        # Start bite
+        self.biteCountdown = 40'i32
+        self.waitCountdown = waitRoll()
+        world.playSound(sdEntityFishingBobberSplash, scNeutral, entity.pos)
+  else:
+    velocity.y -= BobberGravity
+  let inertia = if entity.touchingWater: BobberWaterInertia else: BobberAirInertia
+  velocity = velocity.multiply(inertia, inertia, inertia)
+  entity.velocity = velocity
+  let newPos = startPos.add(velocity)
+  let searchBox = newBoundingBox(
+    Vector3[float64](x: min(startPos.x, newPos.x), y: min(startPos.y, newPos.y), z: min(startPos.z, newPos.z)),
+    Vector3[float64](x: max(startPos.x, newPos.x), y: max(startPos.y, newPos.y), z: max(startPos.z, newPos.z))).expand(
+      0.3'f64, 0.3'f64, 0.3'f64)
+  # Basic block collision to stop bobber
+  let (blockCols, ignored) = world.getBlockCollisions(searchBox, caller)
+  discard ignored
+  if blockCols.len > 0:
+    self.inGround = true
+    entity.velocity = Vector3[float64](x: 0.0, y: 0.0, z: 0.0)
+    return
+  entity.setPos(newPos)
+  for cand in world.getEntitiesAtBox(searchBox):
+    if cand.entity.entityId == self.ownerId or cand.entity.entityId == entity.entityId:
+      continue
+    if isProjectile(cand.entity.entityType):
+      continue
+    let ebb = cand.entity.boundingBox.expand(0.3'f64, 0.3'f64, 0.3'f64)
+    if ebb.intersects(searchBox):
+      self.hookedEntityId = cand.entity.entityId
+      entity.sendMetaData(TrackedData_HOOKED_ENTITY, INT, cand.entity.entityId + 1'i32)
+      return
+
+proc markBobberHit(s: FishingBobberEntity) =
+  s.hasHit = true
+
+proc makeBobberVt(): EntityVt =
+  result = copyVt(entityVt())
+  result.onHit = proc(self: EntityBase; hit: ProjectileHit) {.closure.} =
+    markBobberHit(FishingBobberEntity(self))
+  result.tick = proc(self, caller: EntityBase; server: Server) {.closure.} =
+    let s = FishingBobberEntity(self)
+    s.processTickBobber(caller)
+  result.writeNbt = proc(self: EntityBase; nbt: var NbtCompound) {.closure.} = discard
+  result.readNbt = proc(self: EntityBase; nbt: NbtCompound) {.closure.} = discard
+
+let fishingBobberVt* = makeBobberVt()
+
+proc newFishingBobberEntity*(entity: Entity; owner: Player): FishingBobberEntity =
+  ## `FishingBobberEntity::new`
+  let ownerEntity = playerBase(owner).entity
+  var ownerPos = ownerEntity.pos
+  ownerPos.y += ownerEntity.getEyeHeight() - 0.1'f64
+  entity.pos = ownerPos
+  result = FishingBobberEntity(vt: fishingBobberVt, entity: entity)
+  result.ownerId = ownerEntity.entityId
+  result.hookedEntityId = 0'i32
+  result.waitCountdown = waitRoll()
+  entity.base = projectileBase(result)
+
+# --- ShulkerBulletEntity ----------------------------------------------------------------------------------------------------------
+
+proc dirStepX(dir: uint8): int32 =
+  case dir
+  of DirEast: 1'i32
+  of DirWest: -1'i32
+  else: 0'i32
+
+proc dirStepY(dir: uint8): int32 =
+  case dir
+  of DirUp: 1'i32
+  of DirDown: -1'i32
+  else: 0'i32
+
+proc dirStepZ(dir: uint8): int32 =
+  case dir
+  of DirSouth: 1'i32
+  of DirNorth: -1'i32
+  else: 0'i32
+
+proc dirAxis*(dir: uint8): uint8 =
+  ## `dir_axis`: the axis ordinal (0=X, 1=Y, 2=Z) of a direction. 255 for `DirNone` or any unknown value.
+  case dir
+  of DirEast, DirWest: 0'u8
+  of DirUp, DirDown: 1'u8
+  of DirNorth, DirSouth: 2'u8
+  else: 255'u8
+
+proc isEmptyBlock(world: World; fromPos: BlockPos; dir: uint8): bool =
+  ## `is_empty_block`: true if the block one step in `dir` is air. Unloaded chunks are treated as empty.
+  let nb = BlockPos(vec: Vector3[int32](x: fromPos.vec.x + dirStepX(dir), y: fromPos.vec.y + dirStepY(dir),
+    z: fromPos.vec.z + dirStepZ(dir)))
+  if not world.isLoaded(nb):
+    return true
+  BlockState.fromId(world.stateIdAt(nb)).isAir
+
+proc randomDir(): uint8 = uint8(randomRange(0'i32, 6'i32))
+
+proc selectNextDir(self: ShulkerBulletEntity; avoidAxis: uint8; targetPosOpt: Option[Vector3[float64]]) =
+  ## `select_next_dir`
+  const YOffset = 0.5'f64
+  let pos = self.entity.pos
+  let curBp = self.entity.blockPos
+  let world = self.entity.world
+  # Compute the target block position
+  var tbp = BlockPos(vec: Vector3[int32](x: curBp.vec.x, y: curBp.vec.y - 1'i32, z: curBp.vec.z)) # Default: below
+  if targetPosOpt.isSome:
+    let tp = targetPosOpt.unsafeGet
+    tbp = BlockPos(vec: Vector3[int32](x: asI32(floor(tp.x)), y: asI32(floor(tp.y + YOffset)), z: asI32(floor(tp.z))))
+  # ... and the "steering" target point.
+  let targetX = float64(tbp.vec.x) + 0.5'f64
+  let targetY = float64(tbp.vec.y) + YOffset
+  let targetZ = float64(tbp.vec.z) + 0.5'f64
+  # If target block center is more than 2 blocks from bullet -> pick axis step.
+  let tbpCx = float64(tbp.vec.x) + 0.5'f64
+  let tbpCy = float64(tbp.vec.y) + 0.5'f64
+  let tbpCz = float64(tbp.vec.z) + 0.5'f64
+  let centerDistSq = (tbpCx - pos.x) * (tbpCx - pos.x) + (tbpCy - pos.y) * (tbpCy - pos.y) + (tbpCz - pos.z) * (tbpCz - pos.z)
+  var chosenTx = targetX
+  var chosenTy = targetY
+  var chosenTz = targetZ
+  var selectedDir = DirNone
+  if centerDistSq > 4.0'f64:
+    # Pick an axis-aligned direction toward the target
+    var options: seq[uint8] = @[]
+    if avoidAxis != 0'u8:
+      if curBp.vec.x < tbp.vec.x and isEmptyBlock(world, curBp, DirEast):
+        options.add(DirEast)
+      elif curBp.vec.x > tbp.vec.x and isEmptyBlock(world, curBp, DirWest):
+        options.add(DirWest)
+    if avoidAxis != 1'u8:
+      if curBp.vec.y < tbp.vec.y and isEmptyBlock(world, curBp, DirUp):
+        options.add(DirUp)
+      elif curBp.vec.y > tbp.vec.y and isEmptyBlock(world, curBp, DirDown):
+        options.add(DirDown)
+    if avoidAxis != 2'u8:
+      if curBp.vec.z < tbp.vec.z and isEmptyBlock(world, curBp, DirSouth):
+        options.add(DirSouth)
+      elif curBp.vec.z > tbp.vec.z and isEmptyBlock(world, curBp, DirNorth):
+        options.add(DirNorth)
+    # If options empty, pick a random direction (up to 5 tries for an unobstructed one); ignore avoidAxis in this fallback.
+    var sel: uint8
+    if options.len == 0:
+      sel = randomDir()
+      for i in 0 ..< 4:
+        if isEmptyBlock(world, curBp, sel):
+          break
+        sel = randomDir()
+    else:
+      sel = options[int(randomRange(0'i32, int32(options.len)))]
+    chosenTx = pos.x + float64(dirStepX(sel))
+    chosenTy = pos.y + float64(dirStepY(sel))
+    chosenTz = pos.z + float64(dirStepZ(sel))
+    selectedDir = sel
+  # Compute normalized steering delta scaled by SPEED.
+  let xa = chosenTx - pos.x
+  let ya = chosenTy - pos.y
+  let za = chosenTz - pos.z
+  let dist = sqrt(xa * xa + ya * ya + za * za)
+  if dist == 0.0'f64:
+    self.targetDeltaX = 0.0'f64
+    self.targetDeltaY = 0.0'f64
+    self.targetDeltaZ = 0.0'f64
+  else:
+    self.targetDeltaX = xa / dist * Speed
+    self.targetDeltaY = ya / dist * Speed
+    self.targetDeltaZ = za / dist * Speed
+  self.currentDir = selectedDir
+  self.flightSteps = 10'i32 + randomRange(0'i32, 5'i32) * 10'i32
+
+proc burst(entity: Entity) =
+  ## The sound, particles and removal of a bullet that is done.
+  let world = entity.world
+  let pos = entity.pos
+  world.playSoundRaw(uint16(ord(sdEntityShulkerBulletHit)), scHostile, pos, 1.0'f32, 1.0'f32)
+  world.spawnParticle(pos, Vector3[float64](x: float64(0.2'f32), y: float64(0.2'f32), z: float64(0.2'f32)), 0.0'f32, 2'i32, ptExplosion)
+  entity.remove()
+
+proc makeBulletVt(): EntityVt =
+  result = copyVt(entityVt())
+  # Any hit destroys the bullet (melee, arrow, etc.).
+  result.damageWithContext = proc(self, caller: EntityBase; amount: float32; damageType: DamageType;
+      position: Option[Vector3[float64]]; source, cause: nil EntityBase): bool {.closure.} =
+    let s = ShulkerBulletEntity(self)
+    # Guard against double-hit
+    if s.hasHit:
+      return false
+    s.hasHit = true
+    burst(s.entity)
+    true
+  result.tick = proc(self, caller: EntityBase; server: Server) {.closure.} =
+    let s = ShulkerBulletEntity(self)
+    if s.hasHit:
+      return
+    # Discard bullet after 150 ticks if it never hits anything
+    s.bulletAge += 1'i32
+    if s.bulletAge > 150'i32:
+      s.hasHit = true
+      burst(s.entity)
+      return
+    let entity = s.entity
+    let world = entity.world
+    let targetOpt = if s.targetId >= 0'i32: world.getEntityById(s.targetId) else: nil
+    # Apply gravity only if target is null, dead, or a spectator.
+    var targetAlive = false
+    if targetOpt != nil:
+      targetAlive = targetOpt.entity.isAlive()
+    if not targetAlive and s.targetId >= 0'i32:
+      # Target ID is set but entity was not found (dead/left the world).
+      s.targetId = -1'i32
+    if targetAlive:
+      # Accelerate target deltas x 1.025, clamped
+      var tdx = max(min(s.targetDeltaX * 1.025'f64, 1.0'f64), -1.0'f64)
+      var tdy = max(min(s.targetDeltaY * 1.025'f64, 1.0'f64), -1.0'f64)
+      var tdz = max(min(s.targetDeltaZ * 1.025'f64, 1.0'f64), -1.0'f64)
+      s.targetDeltaX = tdx
+      s.targetDeltaY = tdy
+      s.targetDeltaZ = tdz
+      # Clamp initialised sentinel values
+      if abs(tdx) < 1e-10'f64 and abs(tdy) < 1e-10'f64 and abs(tdz) < 1e-10'f64:
+        tdx = 0.0'f64
+        tdy = 0.0'f64
+        tdz = 0.0'f64
+      # Lerp actual velocity toward steering delta
+      var vel = entity.velocity
+      vel.x += (tdx - vel.x) * 0.2'f64
+      vel.y += (tdy - vel.y) * 0.2'f64
+      vel.z += (tdz - vel.z) * 0.2'f64
+      entity.velocity = vel
+    else:
+      # No live target - apply gravity and drift
+      var vel = entity.velocity
+      vel.y -= 0.04'f64
+      entity.velocity = vel
+    let vel = entity.velocity
+    let newPos = entity.pos.add(vel)
+    entity.setPos(newPos)
+    # Broadcast position and velocity
+    let chunkPos = entity.chunkPos
+    world.broadcastToChunk(chunkPos, CEntityPositionSync(entityId: newVarInt(entity.entityId), position: newPos, delta: vel,
+      yaw: entity.yaw, pitch: entity.pitch, onGround: false))
+    world.broadcastToChunk(chunkPos, newCEntityVelocity(newVarInt(entity.entityId), vel))
+    # Check for block collisions
+    let state = BlockState.fromId(world.stateIdAt(entity.blockPos))
+    if not state.isAir and state.isSolid:
+      s.hasHit = true
+      burst(entity)
+      return
+    # Check for entity collisions
+    let bulletBb = entity.boundingBox.expand(0.1'f64, 0.1'f64, 0.1'f64)
+    var nearby = world.getEntitiesAtBox(bulletBb)
+    for p in world.getPlayersAtBox(bulletBb):
+      nearby.add(playerBase(p))
+    for hitEntity in nearby:
+      let he = hitEntity.entity
+      # Skip self
+      if he.entityId == entity.entityId:
+        continue
+      # Never hit the owner shulker
+      if he.entityId == s.ownerId:
+        continue
+      # Must be alive
+      if not he.isAlive():
+        continue
+      # Must be a living entity
+      let living = hitEntity.living
+      if living == nil:
+        continue
+      if s.hasHit:
+        break
+      s.hasHit = true
+      # Deal 4 (MOB_PROJECTILE) damage
+      let ownerArc = world.getEntityById(s.ownerId)
+      let damaged = hitEntity.damageWithContext(hitEntity, 4.0'f32, MOB_PROJECTILE, none[Vector3[float64]](), ownerArc, caller)
+      if damaged:
+        # Apply levitation for 200 ticks
+        living.addEffect(Effect(effectType: StatusEffect.LEVITATION, duration: 200'i32, amplifier: 0'u8, ambient: false,
+          showParticles: true, showIcon: true, blend: false))
+      world.spawnParticle(entity.pos, Vector3[float64](x: float64(0.2'f32), y: float64(0.2'f32), z: float64(0.2'f32)),
+        0.0'f32, 2'i32, ptExplosion)
+      entity.remove()
+      break
+    if not targetAlive or s.hasHit:
+      return
+    # `targetAlive` means `targetOpt` is set.
+    let tp = cast[EntityBase](targetOpt).entity.pos
+    let targetPos = some(tp)
+    let avoidAxis = dirAxis(s.currentDir)
+    # Decrement flight-step counter; re-select direction when it hits 0
+    s.flightSteps -= 1'i32
+    if s.flightSteps <= 0'i32:
+      s.selectNextDir(avoidAxis, targetPos)
+    # Check the block immediately ahead.
+    # If it is solid we must re-select; if we've aligned axes with the target we also re-select.
+    let dir = s.currentDir
+    if dir != DirNone:
+      let curBp = entity.blockPos
+      if not isEmptyBlock(world, curBp, dir):
+        # Solid obstacle -> navigate around it
+        s.selectNextDir(dirAxis(dir), targetPos)
+      else:
+        let axis = dirAxis(dir)
+        let tbp = BlockPos(vec: Vector3[int32](x: asI32(floor(tp.x)), y: asI32(floor(tp.y)), z: asI32(floor(tp.z))))
+        let reached = case axis
+          of 0'u8: curBp.vec.x == tbp.vec.x
+          of 1'u8: curBp.vec.y == tbp.vec.y
+          else: curBp.vec.z == tbp.vec.z
+        if reached:
+          # Aligned on this axis -> switch to next best axis
+          s.selectNextDir(axis, targetPos)
+  result.writeNbt = proc(self: EntityBase; nbt: var NbtCompound) {.closure.} = discard
+  result.readNbt = proc(self: EntityBase; nbt: NbtCompound) {.closure.} = discard
+
+let shulkerBulletVt* = makeBulletVt()
+
+proc buildBullet(entity: Entity; ownerId, targetId: int32; dir: uint8): ShulkerBulletEntity =
+  result = ShulkerBulletEntity(vt: shulkerBulletVt, entity: entity)
+  result.ownerId = ownerId
+  result.targetId = targetId
+  result.currentDir = dir
+  entity.base = projectileBase(result)
+
+proc newShulkerBulletEntity*(owner: Entity; targetId: int32; targetPos: Vector3[float64]; invalidAxis: uint8): ShulkerBulletEntity =
+  ## `ShulkerBulletEntity::new`. `invalidAxis` is a `dirAxis` ordinal: 0=X, 1=Y, 2=Z.
+  # Position at the center of the shulker's bounding box
+  let bb = owner.boundingBox
+  let origin = Vector3[float64](x: (bb.min.x + bb.max.x) / 2.0'f64, y: (bb.min.y + bb.max.y) / 2.0'f64,
+    z: (bb.min.z + bb.max.z) / 2.0'f64)
+  let entity = fromUuid(randomUuid(), owner.world, origin, EntityType.SHULKER_BULLET)
+  result = buildBullet(entity, owner.entityId, targetId, DirUp)
+  # Prime target_delta and flight_steps so movement begins on tick 1.
+  result.selectNextDir(invalidAxis, some(targetPos))
+
+proc orphanShulkerBullet*(entity: Entity): ShulkerBulletEntity =
+  ## `ShulkerBulletEntity::orphan`: from a pre-existing Entity (e.g. loaded from disk or /summon).
+  buildBullet(entity, 0'i32, -1'i32, DirNone)

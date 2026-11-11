@@ -1,0 +1,438 @@
+## Port of pumpkin/src/entity/projectile/arrow.rs
+## Port of pumpkin/src/entity/projectile/trident.rs
+##
+## `calculate_ray_intersection` and `get_hit_face` are each file's own copy upstream, identical to projectile/mod.rs's; the
+## one in thrown.aowl serves all three, as does `sweepForHit` for the arrow's and the trident's identical sweep.
+
+import std/[math, options]
+import "../../../data/item_stack/mod"
+import ../../../data/block_ext
+from ../../../data/block_state import asU16
+import ../../../generated/[enchantment, item_full, particle, sound, sound_category, sound_id_remap]
+import ../../../inventory/player_inventory
+import ../../../protocol/java/client/play/[entity_velocity, sound_effect]
+import ../../../protocol/proto
+import ../../world/chunker
+import ../combat
+import thrown
+
+const
+  ArrowBaseDamage = 2.0'f64
+  ArrowWaterInertia = 0.6'f64
+  ArrowAirInertia = 0.99'f64
+  ArrowGravity = 0.05'f64
+  DespawnTime = 1200'u32
+  TridentBaseDamage = 8.0'f64
+  TridentAirInertia = 0.99'f64
+  TridentWaterInertia = 0.9'f64
+  TridentGravity = 0.05'f64
+
+type
+  ArrowPickup* = enum
+    ## The pickup rules for arrows
+    apDisallowed = 0, apAllowed = 1, apCreativeOnly = 2
+
+  ArrowEntity* = ref object of EntityBase
+    ownerId*: Option[int32]
+    baseDamage*: float64
+    pickup*: ArrowPickup
+    isCritical*: bool
+    pierceLevel*: uint8
+    punchLevel*: uint8
+    isFlame*: bool
+    inGround*: bool
+    inGroundTime*: uint32
+    life*: uint32
+    shakeTime*: uint8
+    hasHit*: bool
+    lastBlockPos*: Option[BlockPos]
+
+  TridentEntity* = ref object of EntityBase
+    ownerId*: Option[int32]
+    itemStack*: ItemStack
+    pickup*: ArrowPickup
+    inGround*: bool
+    inGroundTime*: uint32
+    life*: uint32
+    shakeTime*: uint8
+    hasHit*: bool
+    lastBlockPos*: Option[BlockPos]
+
+proc arrowPickupFromByte*(b: uint8): ArrowPickup =
+  ## `from_byte`
+  case b
+  of 1'u8: apAllowed
+  of 2'u8: apCreativeOnly
+  else: apDisallowed
+
+proc toByte*(self: ArrowPickup): uint8 = uint8(ord(self))
+
+proc nextTriangular(mode, deviation: float64): float64 =
+  mulAdd(deviation, randomF64() - randomF64(), mode)
+
+proc shotVelocity(entity: Entity; x, y, z, power, uncertainty: float64) =
+  ## `set_velocity`, the same in both types.
+  let velocity = Vector3[float64](x: x, y: y, z: z).normalize().addRaw(
+    nextTriangular(0.0'f64, 0.017_227_5'f64 * uncertainty),
+    nextTriangular(0.0'f64, 0.017_227_5'f64 * uncertainty),
+    nextTriangular(0.0'f64, 0.017_227_5'f64 * uncertainty)).multiply(power, power, power)
+  entity.velocity = velocity
+  let len = velocity.horizontalLength()
+  entity.setRotation(float32(arctan2(velocity.x, velocity.z)) * 57.295_776'f32,
+    float32(arctan2(velocity.y, len)) * 57.295_776'f32)
+
+proc velocityFromRotation(entity: Entity; pitch, yaw, roll, speed, divergence: float32) =
+  ## `set_velocity_from_rotation`, the same in both types.
+  let yawRad = toRadiansF32(yaw)
+  let pitchRad = toRadiansF32(pitch)
+  let rollRad = toRadiansF32(pitch + roll)
+  let x = -sinF32(yawRad) * cosF32(pitchRad)
+  let y = -sinF32(rollRad)
+  let z = cosF32(yawRad) * cosF32(pitchRad)
+  shotVelocity(entity, float64(x), float64(y), float64(z), float64(speed), float64(divergence))
+
+proc sweepForHit(entity: Entity; caller: EntityBase; startPos, velocity, newPos: Vector3[float64];
+    skip: proc(other: EntityBase): bool {.closure.}): Option[ProjectileHit] =
+  ## "Check for collisions using raycasting" of `tick`.
+  let world = entity.world
+  let searchBox = newBoundingBox(
+    Vector3[float64](x: min(startPos.x, newPos.x), y: min(startPos.y, newPos.y), z: min(startPos.z, newPos.z)),
+    Vector3[float64](x: max(startPos.x, newPos.x), y: max(startPos.y, newPos.y), z: max(startPos.z, newPos.z))).expand(
+      0.3'f64, 0.3'f64, 0.3'f64)
+  var closestT = 1.0'f64
+  result = none[ProjectileHit]()
+  # Block collisions
+  let (blockCols, blockPositions) = world.getBlockCollisions(searchBox, caller)
+  for idx in 0 ..< blockCols.len:
+    let t = calculateRayIntersection(startPos, velocity, blockCols[idx])
+    if t.isSome and t.unsafeGet < closestT:
+      closestT = t.unsafeGet
+      # Map back to block pos
+      var curr = 0
+      for entry in blockPositions:
+        curr += entry[0]
+        if idx < curr:
+          let hitPos = startPos.add(velocity.multiply(closestT, closestT, closestT))
+          result = some(ProjectileHit(kind: phBlock, pos: entry[1], face: getHitFace(hitPos, entry[1]), hitPos: hitPos,
+            normal: velocity.normalize().multiply(-1.0'f64, -1.0'f64, -1.0'f64)))
+          break
+  # Entity collisions
+  for cand in world.getEntitiesAtBox(searchBox):
+    if skip(cand):
+      continue
+    let ebb = cand.entity.boundingBox.expand(0.3'f64, 0.3'f64, 0.3'f64)
+    let t = calculateRayIntersection(startPos, velocity, ebb)
+    if t.isSome and t.unsafeGet < closestT:
+      closestT = t.unsafeGet
+      let hitPos = startPos.add(velocity.multiply(closestT, closestT, closestT))
+      result = some(ProjectileHit(kind: phEntity, entity: cand, hitPos: hitPos,
+        normal: velocity.normalize().multiply(-1.0'f64, -1.0'f64, -1.0'f64)))
+
+proc soundPacketFor(soundRef: Sound; player: Player; position: Vector3[float64]; volume, pitch: float32): CSoundEffect =
+  let soundOrId = proto.IdOr[proto.SoundEvent](kind: iokId, id: remapSoundIdForVersion(uint16(ord(soundRef)), player.client.version))
+  newCSoundEffect(soundOrId, scNeutral, position, volume, pitch, 0.0'f64)
+
+proc broadcastSoundToChunk*(entity: Entity; soundRef: Sound; position: Vector3[float64]; volume, pitch: float32) =
+  ## `world.broadcast_to_chunk(chunk_pos, &CSoundEffect::new(...))`, neutral category, seed 0.
+  let world = entity.world
+  for player in world.players:
+    if isWithinViewDistance(entity.chunkPos, player.chunkPos, int32(getViewDistance(player, world.server))):
+      player.client.writePacketFor(soundPacketFor(soundRef, player, position, volume, pitch))
+
+proc broadcastHitSoundToAll(world: World; soundRef: Sound; position: Vector3[float64]) =
+  ## `world.broadcast_packet_all(&CSoundEffect::new(...))`
+  for player in world.players:
+    player.client.writePacketFor(soundPacketFor(soundRef, player, position, 1.0'f32, 1.0'f32))
+
+# --- ArrowEntity ------------------------------------------------------------------------------------------------------------------
+
+proc arrowShouldSkip(self: ArrowEntity; other: EntityBase): bool =
+  ## `should_skip_collision`
+  let otherEnt = other.entity
+  # Don't collide with self
+  if otherEnt.entityId == self.entity.entityId:
+    return true
+  # Skip owner for initial frames (5 ticks)
+  if self.ownerId.isSome and self.ownerId.unsafeGet == otherEnt.entityId and self.entity.age < 5'i32:
+    return true
+  # Skip other arrows, item entities, and falling block entities
+  let id = otherEnt.entityType.id
+  id == EntityType.ARROW.id or id == EntityType.ITEM.id or id == EntityType.FALLING_BLOCK.id
+
+proc makeArrowVt(): EntityVt =
+  result = copyVt(entityVt())
+  result.tick = proc(self, caller: EntityBase; server: Server) {.closure.} =
+    let s = ArrowEntity(self)
+    let entity = s.entity
+    let world = entity.world
+    # Handle shake time
+    if s.shakeTime > 0'u8:
+      s.shakeTime -= 1'u8
+    if s.inGround:
+      # Increment in-ground time and life
+      s.inGroundTime += 1'u32
+      let life = s.life
+      s.life += 1'u32
+      # Despawn after enough time
+      if life >= DespawnTime:
+        entity.remove()
+      return
+    # Arrow is flying
+    let startPos = entity.pos
+    var velocity = entity.velocity
+    # Apply gravity
+    velocity.y -= ArrowGravity
+    # Apply inertia (air resistance or water drag)
+    let inertia = if entity.touchingWater: ArrowWaterInertia else: ArrowAirInertia
+    velocity = velocity.multiply(inertia, inertia, inertia)
+    entity.velocity = velocity
+    # Update rotation based on velocity
+    let len = velocity.horizontalLength()
+    entity.setRotation(float32(arctan2(velocity.x, velocity.z)) * 57.295_776'f32,
+      float32(arctan2(velocity.y, len)) * 57.295_776'f32)
+    # Move arrow
+    let newPos = startPos.add(velocity)
+    entity.setPos(newPos)
+    # Spawn critical particle trail while arrow is flying and critical
+    if s.isCritical:
+      world.spawnParticle(entity.pos, Vector3[float64](x: 0.0, y: 0.0, z: 0.0), 0.0'f32, 1'i32, ptCrit)
+    # Broadcast velocity update
+    world.broadcastToChunk(entity.chunkPos, newCEntityVelocity(newVarInt(entity.entityId), velocity))
+    let hit = sweepForHit(entity, self, startPos, velocity, newPos,
+      proc(other: EntityBase): bool {.closure.} = arrowShouldSkip(s, other))
+    # Handle hit
+    if hit.isSome:
+      # Ensure hit is only processed once
+      let wasHit = s.hasHit
+      s.hasHit = true
+      if wasHit:
+        return
+      caller.onHit(hit.unsafeGet)
+  result.onHit = proc(self: EntityBase; hit: ProjectileHit) {.closure.} =
+    let s = ArrowEntity(self)
+    let entity = s.entity
+    let world = entity.world
+    if hit.kind == phBlock:
+      # Arrow hit a block - stick into it
+      s.inGround = true
+      s.shakeTime = 7'u8
+      s.lastBlockPos = some(hit.pos)
+      if world.getBlock(hit.pos).id == blockIdTarget and s.ownerId.isSome:
+        let player = getPlayerById(world, s.ownerId.unsafeGet)
+        if player != nil:
+          gPlayerHooks.triggerAdvancement(cast[Player](player), "Bullseye", "")
+      # Stop the arrow
+      entity.velocity = Vector3[float64](x: 0.0, y: 0.0, z: 0.0)
+      entity.setPos(hit.hitPos)
+      # Play sound
+      broadcastSoundToChunk(entity, sdEntityArrowHit, hit.hitPos, 1.0'f32, 1.0'f32)
+      # Reset critical flag
+      s.isCritical = false
+    else:
+      let target = hit.entity
+      # Calculate damage
+      let power = entity.velocity.length()
+      var damage = asI32(ceil(power * s.baseDamage))
+      # Apply critical hit bonus
+      if s.isCritical:
+        let bonus = randomRange(0'i32, damage div 2'i32 + 2'i32)
+        damage = damage + bonus
+      if s.isFlame:
+        target.entity.setOnFireForTicks(100'u32)
+      discard target.damage(target, float32(damage), damage_type.ARROW)
+      if target.living != nil:
+        let punch = s.punchLevel
+        if punch > 0'u8 and s.ownerId.isSome:
+          let ownerEntity = world.getEntityById(s.ownerId.unsafeGet)
+          if ownerEntity != nil:
+            handleKnockback(ownerEntity.entity, target, float64(punch) * 0.6'f64)
+        # Play hit sound
+        broadcastHitSoundToAll(world, sdEntityArrowHit, hit.hitPos)
+      # Check pierce level
+      if s.pierceLevel == 0'u8:
+        # No piercing - remove arrow
+        entity.remove()
+      # If piercing > 0, arrow continues (TODO upstream: would need to track pierced entities)
+  result.onPlayerCollision = proc(self: EntityBase; player: Player) {.closure.} =
+    let s = ArrowEntity(self)
+    # Only allow picking up grounded arrows
+    if not s.inGround:
+      return
+    if player.health <= 0.0'f32:
+      return
+    # Check pickup rules
+    if s.pickup == apDisallowed or (s.pickup == apCreativeOnly and player.gamemode != Creative):
+      return
+    # Try to insert an arrow into the player's inventory
+    var stack = newItemStack(1'u8, ITEM_ARROW)
+    if player.gamemode == Creative or player.inventory.insertStackAnywhere(stack):
+      mustLiving(playerBase(player)).pickup(s.entity, 1'u32)
+      # Remove arrow entity after pickup
+      s.entity.remove()
+  result.writeNbt = proc(self: EntityBase; nbt: var NbtCompound) {.closure.} = discard
+  result.readNbt = proc(self: EntityBase; nbt: NbtCompound) {.closure.} = discard
+
+let arrowVt* = makeArrowVt()
+
+proc newArrowEntity*(entity: Entity; ownerId: Option[int32]): ArrowEntity =
+  ## `ArrowEntity::new`
+  result = ArrowEntity(vt: arrowVt, entity: entity)
+  result.ownerId = ownerId
+  result.baseDamage = ArrowBaseDamage
+  result.pickup = apDisallowed
+  result.lastBlockPos = none[BlockPos]()
+  entity.base = projectileBase(result)
+
+proc newArrowShot*(entity, shooter: Entity; pickup: ArrowPickup): ArrowEntity =
+  ## `ArrowEntity::new_shot`
+  var ownerPos = shooter.pos
+  ownerPos.y = ownerPos.y + float64(shooter.entityDimension.eyeHeight) - 0.1'f64
+  entity.pos = ownerPos
+  entity.setVelocity(Vector3[float64](x: 0.0, y: 0.1, z: 0.0))
+  result = ArrowEntity(vt: arrowVt, entity: entity)
+  result.ownerId = some(shooter.entityId)
+  result.baseDamage = ArrowBaseDamage
+  result.pickup = pickup
+  result.lastBlockPos = none[BlockPos]()
+  entity.base = projectileBase(result)
+
+proc setVelocityFromRotation*(self: ArrowEntity; pitch, yaw, roll, speed, divergence: float32) =
+  velocityFromRotation(self.entity, pitch, yaw, roll, speed, divergence)
+
+proc setVelocity*(self: ArrowEntity; x, y, z, power, uncertainty: float64) =
+  shotVelocity(self.entity, x, y, z, power, uncertainty)
+
+proc setCritical*(self: ArrowEntity; critical: bool) = self.isCritical = critical
+proc setPierceLevel*(self: ArrowEntity; level: uint8) = self.pierceLevel = level
+proc setBaseDamage*(self: ArrowEntity; damage: float64) = discard ## TODO upstream: implement this
+
+# --- TridentEntity ----------------------------------------------------------------------------------------------------------------
+
+proc tridentShouldSkip(self: TridentEntity; other: EntityBase): bool =
+  ## `should_skip_collision`
+  let otherEnt = other.entity
+  # Don't collide with self
+  if otherEnt.entityId == self.entity.entityId:
+    return true
+  # Skip owner for initial frames (5 ticks)
+  if self.ownerId.isSome and self.ownerId.unsafeGet == otherEnt.entityId and self.entity.age < 5'i32:
+    return true
+  # Skip other projectiles and item entities
+  let id = otherEnt.entityType.id
+  id == EntityType.ARROW.id or id == EntityType.TRIDENT.id or id == EntityType.ITEM.id or id == EntityType.FALLING_BLOCK.id
+
+proc makeTridentVt(): EntityVt =
+  result = copyVt(entityVt())
+  result.tick = proc(self, caller: EntityBase; server: Server) {.closure.} =
+    let s = TridentEntity(self)
+    let entity = s.entity
+    let world = entity.world
+    # Handle shake time
+    if s.shakeTime > 0'u8:
+      s.shakeTime -= 1'u8
+    if s.inGround:
+      s.inGroundTime += 1'u32
+      let life = s.life
+      s.life += 1'u32
+      # Despawn after enough time
+      if life >= DespawnTime:
+        entity.remove()
+      return
+    # Trident is flying
+    let startPos = entity.pos
+    var velocity = entity.velocity
+    # Apply gravity
+    velocity.y -= TridentGravity
+    # Apply inertia (air resistance or water drag)
+    let inertia = if entity.touchingWater: TridentWaterInertia else: TridentAirInertia
+    velocity = velocity.multiply(inertia, inertia, inertia)
+    entity.velocity = velocity
+    # Update rotation based on velocity
+    let len = velocity.horizontalLength()
+    entity.setRotation(float32(arctan2(velocity.x, velocity.z)) * 57.295_776'f32,
+      float32(arctan2(velocity.y, len)) * 57.295_776'f32)
+    # Move trident
+    let newPos = startPos.add(velocity)
+    entity.setPos(newPos)
+    # Broadcast velocity update
+    world.broadcastToChunk(entity.chunkPos, newCEntityVelocity(newVarInt(entity.entityId), velocity))
+    let hit = sweepForHit(entity, self, startPos, velocity, newPos,
+      proc(other: EntityBase): bool {.closure.} = tridentShouldSkip(s, other))
+    # Handle hit
+    if hit.isSome:
+      let wasHit = s.hasHit
+      s.hasHit = true
+      if not wasHit:
+        caller.onHit(hit.unsafeGet)
+  result.onHit = proc(self: EntityBase; hit: ProjectileHit) {.closure.} =
+    let s = TridentEntity(self)
+    let entity = s.entity
+    if hit.kind == phBlock:
+      s.inGround = true
+      s.shakeTime = 7'u8
+      s.lastBlockPos = some(hit.pos)
+      # Stop the trident
+      entity.velocity = Vector3[float64](x: 0.0, y: 0.0, z: 0.0)
+      entity.setPos(hit.hitPos)
+      # Play sound
+      broadcastSoundToChunk(entity, sdItemTridentHitGround, hit.hitPos, 1.0'f32, 1.0'f32)
+    else:
+      let target = hit.entity
+      var damage = TridentBaseDamage
+      # Apply Impaling enchantment extra damage
+      let (has, enchantments) = s.itemStack.getDataComponent(EnchantmentsImpl)
+      if has:
+        for entry in enchantments.enchantment:
+          if entry.enchantment.id == Enchantment.IMPALING.id and target.entity.touchingWater:
+            damage += 1.25'f64 * float64(entry.level)
+      discard target.damage(target, float32(damage), damage_type.TRIDENT)
+      # Play hit sound
+      broadcastHitSoundToAll(entity.world, sdItemTridentHit, hit.hitPos)
+      # Standard bounce/fall-back behavior
+      entity.velocity = Vector3[float64](x: 0.0, y: -0.1'f64, z: 0.0)
+      s.hasHit = false # Let it hit the ground
+  result.onPlayerCollision = proc(self: EntityBase; player: Player) {.closure.} =
+    let s = TridentEntity(self)
+    # Can only pick up when on the ground
+    if not s.inGround:
+      return
+    if player.health <= 0.0'f32:
+      return
+    if s.pickup == apDisallowed or (s.pickup == apCreativeOnly and player.gamemode != Creative):
+      return
+    var stack = s.itemStack
+    if player.gamemode == Creative or player.inventory.insertStackAnywhere(stack):
+      mustLiving(playerBase(player)).pickup(s.entity, 1'u32)
+      s.entity.remove()
+  result.writeNbt = proc(self: EntityBase; nbt: var NbtCompound) {.closure.} = discard
+  result.readNbt = proc(self: EntityBase; nbt: NbtCompound) {.closure.} = discard
+
+let tridentVt* = makeTridentVt()
+
+proc newTridentEntity*(entity: Entity; ownerId: Option[int32]): TridentEntity =
+  ## `TridentEntity::new`
+  result = TridentEntity(vt: tridentVt, entity: entity)
+  result.ownerId = ownerId
+  result.itemStack = newItemStack(1'u8, ITEM_TRIDENT)
+  result.pickup = apDisallowed
+  result.lastBlockPos = none[BlockPos]()
+  entity.base = projectileBase(result)
+
+proc newTridentShot*(entity, shooter: Entity; itemStack: ItemStack; pickup: ArrowPickup): TridentEntity =
+  ## `TridentEntity::new_shot`
+  var ownerPos = shooter.pos
+  ownerPos.y = ownerPos.y + float64(shooter.entityDimension.eyeHeight) - 0.1'f64
+  entity.pos = ownerPos
+  entity.setVelocity(Vector3[float64](x: 0.0, y: 0.1, z: 0.0))
+  result = TridentEntity(vt: tridentVt, entity: entity)
+  result.ownerId = some(shooter.entityId)
+  result.itemStack = itemStack
+  result.pickup = pickup
+  result.lastBlockPos = none[BlockPos]()
+  entity.base = projectileBase(result)
+
+proc setVelocityFromRotation*(self: TridentEntity; pitch, yaw, roll, speed, divergence: float32) =
+  velocityFromRotation(self.entity, pitch, yaw, roll, speed, divergence)
+
+proc setVelocity*(self: TridentEntity; x, y, z, power, uncertainty: float64) =
+  shotVelocity(self.entity, x, y, z, power, uncertainty)

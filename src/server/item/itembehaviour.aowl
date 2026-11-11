@@ -1,165 +1,375 @@
-## Item behaviour interface and registry.
-## Port of upstream/pumpkin/src/item/mod.rs (`ItemBehaviour`/`ItemMetadata`
-## traits) and upstream/pumpkin/src/item/registry.rs (`ItemRegistry`).
+## Port of pumpkin/src/item/mod.rs
+## Port of pumpkin/src/item/registry.rs
 ##
-## Unlike `block/`, there is no `#[pumpkin_item]` registration macro here -
-## upstream registers items with plain `manager.register(SomeItem)` calls in
-## `items/mod.rs::default_registry()`, so this ports directly without
-## needing the "replace the macro with an explicit table" step
-## `blockbehaviour.aowl` had to take.
+## `trait ItemBehaviour` is a `ref object` of closures; each concrete item derives from it and sets the ones it overrides
+## on a vtable from `copyItemVt(defaultItemVt())`, so `behaviour of HoneyCombItem` stands for `as_any().downcast_ref`.
+## `ItemMetadata::ids` is the `ids` field, set when the item is built.
 ##
-## `ItemBehaviour` is a manual-vtable ref object (the established pattern
-## for Rust trait objects in this port - see `src/inventory/inventory.aowl`,
-## `src/server/entity/entity.aowl`, `src/server/block/blockbehaviour.aowl`).
-## Scoped to the methods that only need `Player` (which exists) - `use_on_block`
-## needs `Server`/`Block` (unported) and is left out with a TODO, matching
-## how `blockbehaviour.aowl` scoped itself to what its two proof cases needed.
+## Player methods the items call that src/server/entity/player.aowl does not have yet are here, on the real `Player`:
+## the item cooldowns (`start_cooldown`, `get_cooldown`, `is_on_cooldown`), `find_arrow`, `consume_arrow`,
+## `damage_item_in_slot`, `damage_held_item`, `drop_item`, `fishing_bobber`. They keep their state in tables keyed by entity
+## id, and importing this fills `gPlayerHooks.startCooldown`.
 ##
-## KNOWN AOWLMONY RUNTIME BUG (confirmed independently 4x elsewhere in this
-## port: src/command/, src/server/entity/, src/server/block/,
-## src/inventory/'s screen_handler): closures flowing through a manual
-## vtable crash at runtime (`eraiser.aowl`/`ParamsTagId` assertion) even when
-## `aowlmony check` passes clean, and one report found the crash triggers just
-## from such code being *reachable* in the compiled binary, not from it
-## executing. This file is therefore checked, not run - no `aowlmony c -r`
-## proof is claimed for the vtable-dispatch paths.
+## `gItemHooks` holds what lives on the block and world generation side: see `ItemHooks`.
 
-import ../entity/entity
-import ../../inventory/itemstub
+import std/[math, options, syncio, tables]
+import "../../data/item_stack/mod"
+import ../../data/block_ext
+import ../../generated/[enchantment, entity_status, sound, sound_category, statistic, tag, world_event]
+import ../../inventory/[inventory, player_inventory, stackbridge]
+import ../../protocol/java/client/play/[item_cooldown, set_player_inventory, worldevent]
+import ../../protocol/varint
+import ../../world/world as worldtraits
+import ../entity/entitymod
+import ../entity/itementity
+import ../entity/player
+import ../net/netbase
+import ../world/chunker
+
+export entitymod
 
 type
-  Hand* = enum
-    ## Port of `pumpkin_util::Hand`.
-    handMain
-    handOff
+  ItemVt* = ref object
+    ## `trait ItemBehaviour`.
+    normalUse*: proc(self: ItemBehaviour; item: Item; player: Player) {.closure.}
+    useOnBlock*: proc(self: ItemBehaviour; item: var ItemStack; player: Player; location: BlockPos; face: BlockDirection;
+      cursorPos: Vector3[float32]; blockRef: Block; server: Server) {.closure.}
+    useOnEntity*: proc(self: ItemBehaviour; item: var ItemStack; player: Player; entity: EntityBase) {.closure.}
+    onStoppedUsing*: proc(self: ItemBehaviour; stack: ItemStack; player: Player) {.closure.}
+    getUseDuration*: proc(self: ItemBehaviour): int32 {.closure.}
+    canMine*: proc(self: ItemBehaviour; player: Player): bool {.closure.}
 
-  BlockActionResult* = enum
-    ## Port of `block::registry::BlockActionResult`. Lives here rather than
-    ## in `src/server/block/` because `ItemBehaviour.useOnBlock` returns it
-    ## and block/'s own module isn't wired up to export it yet - move this
-    ## to block/ and re-export from here once that happens, rather than
-    ## defining it twice.
-    barSuccess           ## Action was successful (Java: SUCCESS)
-    barSuccessServer     ## Successful, server should swing the hand (SUCCESS_SERVER)
-    barConsume           ## Blocks other actions from running (CONSUME)
-    barFail              ## Allows other actions, but signals failure (FAIL)
-    barPass              ## Allows other actions to run (PASS)
-    barPassToDefaultBlockAction ## Falls through to the block's normal_use (PASS_TO_DEFAULT_BLOCK_ACTION)
-
-  ItemBehaviour* = ref object
-    ## Manual vtable for the `ItemBehaviour` trait. Every field defaults to
-    ## upstream's default trait-method body (a proc doing nothing / the
-    ## stated default value) via `newDefaultItemBehaviour`; a concrete item
-    ## overrides only the fields it needs, matching how a Rust `impl`
-    ## overrides only the methods it cares about.
-    normalUse*: proc (item: Item, player: Player) {.closure.}
-    normalUseWithRotation*: proc (item: Item, player: Player, yaw, pitch: float32) {.closure.}
-    normalUseWithHand*: proc (item: Item, player: Player, yaw, pitch: float32, hand: Hand) {.closure.}
-    onStoppedUsing*: proc (stack: ItemStack, player: Player) {.closure.}
-    onSpearJab*: proc (stack: ItemStack, player: Player) {.closure.}
-    onUseTick*: proc (stack: ItemStack, player: Player, remainingUseTicks: int32) {.closure.}
-    getUseDuration*: proc (): int32 {.closure.}
-    canMine*: proc (player: Player): bool {.closure.}
+  ItemBehaviour* = ref object of RootObj
+    vt*: ItemVt
+    ids*: seq[uint16] ## `ItemMetadata::ids`
 
   ItemRegistry* = ref object
-    ## Port of `ItemRegistry`. Upstream keys by `u16` item id via an
-    ## `FxHashMap`; a plain `Table[uint16, ItemBehaviour]` is the direct
-    ## aowlmony equivalent (no need for Rust's `Arc` - aowlmony `ref` already
-    ## gives shared, GC'd ownership).
-    items*: seq[(uint16, nil ItemBehaviour)]
+    items*: Table[uint16, nil ItemBehaviour]
 
-# --- default trait-method bodies -------------------------------------------
+  ItemCooldown = object
+    startTick: int32
+    duration: int32
 
-proc defaultNormalUse(item: Item, player: Player) {.closure.} =
-  discard
+  ItemHooks* = ref object
+    ## What items ask of src/server/block and src/world/generation, which reach a world through their own `BlockWorld`.
+    fireStateAt*: proc(world: World; pos: BlockPos): BlockStateId {.closure.}
+      ## `FireBlock.get_state_for_position(world, FireBlockBase::get_fire_type(world, pos), pos)`
+    canPlaceFireAt*: proc(world: World; pos: BlockPos): bool {.closure.}
+      ## `FireBlockBase::can_place_at`
+    getNewEndPortal*: proc(world: World; pos: BlockPos) {.closure.}
+      ## `EndPortal::get_new_portal`
+    findStronghold*: proc(world: World; origin: BlockPos): Option[BlockPos] {.closure.}
+      ## `find_nearest_structure` over the strongholds set, radius 100, the level's seed and global structure cache.
+    setSpawnerEntityType*: proc(world: World; pos: BlockPos; entityType: EntityType): bool {.closure.}
+      ## True when `pos` holds a `MobSpawnerBlockEntity`, which then got the type and `update_block_entity`.
+    nextMapId*: proc(server: Server): int32 {.closure.}
+      ## `Server::next_map_id`
+    createMap*: proc(server: Server; mapId: int32; world: World; x, z: int32; scale: uint8) {.closure.}
+      ## `server.map_manager.create_map`
 
-proc defaultGetUseDuration(): int32 {.closure.} =
-  0'i32
+var gItemCooldowns = initTable[string, ItemCooldown]()
+var gFishingBobbers = initTable[int32, int32]()
+var gItemHooks* = ItemHooks(
+  fireStateAt: proc(world: World; pos: BlockPos): BlockStateId {.closure.} = blockNamed("fire").defaultState.id,
+  canPlaceFireAt: proc(world: World; pos: BlockPos): bool {.closure.} = false,
+  getNewEndPortal: proc(world: World; pos: BlockPos) {.closure.} = discard,
+  findStronghold: proc(world: World; origin: BlockPos): Option[BlockPos] {.closure.} = none[BlockPos](),
+  setSpawnerEntityType: proc(world: World; pos: BlockPos; entityType: EntityType): bool {.closure.} = false,
+  nextMapId: proc(server: Server): int32 {.closure.} = 0'i32,
+  createMap: proc(server: Server; mapId: int32; world: World; x, z: int32; scale: uint8) {.closure.} = discard)
 
-proc defaultCanMine(player: Player): bool {.closure.} =
+# --- Player: item cooldowns, arrows, durability, dropping ------------------------------------------------------------------------
+
+proc cooldownKey(self: Player; group: string): string = $self.entityId & " " & group
+
+proc startCooldown*(self: Player; group: string; duration: int32) =
+  ## `start_cooldown`
+  gItemCooldowns[cooldownKey(self, group)] = ItemCooldown(startTick: self.tickCounter, duration: duration)
+  self.client.writePacketFor(CItemCooldown(group: group, cooldown: newVarInt(duration)))
+
+proc getCooldown*(self: Player; group: string): float32 =
+  ## `get_cooldown`
+  let cooldown = gItemCooldowns.getOrDefault(cooldownKey(self, group), ItemCooldown(startTick: 0'i32, duration: 0'i32))
+  let elapsed = self.tickCounter - cooldown.startTick
+  if elapsed < cooldown.duration:
+    return 1.0'f32 - float32(elapsed) / float32(cooldown.duration)
+  0.0'f32
+
+proc isOnCooldown*(self: Player; group: string): bool =
+  ## `is_on_cooldown`
+  let key = cooldownKey(self, group)
+  if gItemCooldowns.hasKey(key):
+    let cooldown = gItemCooldowns.getOrDefault(key, ItemCooldown(startTick: 0'i32, duration: 0'i32))
+    if self.tickCounter - cooldown.startTick < cooldown.duration:
+      return true
+    gItemCooldowns.del(key)
+  false
+
+proc fishingBobber*(self: Player): int32 =
+  ## `fishing_bobber`: -1 when there is none.
+  gFishingBobbers.getOrDefault(self.entityId, -1'i32)
+
+proc `fishingBobber=`*(self: Player; id: int32) =
+  gFishingBobbers[self.entityId] = id
+
+proc findArrow*(self: Player): Option[int] =
+  ## `find_arrow`
+  let inventory = self.inventory
+  # Check offhand first
+  let off = inventory.getStack(OffHandSlot)
+  if off.item.id == ITEM_ARROW.id and off.itemCount > 0'u8:
+    return some(OffHandSlot)
+  # Check hotbar and main inventory
+  for slot in 0 ..< MainSize:
+    let stack = inventory.getStack(slot)
+    if stack.item.id == ITEM_ARROW.id and stack.itemCount > 0'u8:
+      return some(slot)
+  none[int]()
+
+proc consumeArrow*(self: Player; slot: int): bool =
+  ## `consume_arrow`
+  if self.gamemode == Creative:
+    return true # Don't consume in creative
+  let inventory = self.inventory
+  var stack = inventory.getStack(slot)
+  if stack.itemCount >= 2'u8:
+    stack.itemCount -= 1'u8
+    inventory.setStack(slot, stack)
+    true
+  elif stack.itemCount == 1'u8:
+    inventory.setStack(slot, emptyItemStack())
+    true
+  else:
+    false
+
+proc damageItemInSlot*(self: Player; slot: EquipmentSlot; amount: int32): bool =
+  ## `damage_item_in_slot`
+  if self.gamemode == Creative or self.gamemode == Spectator:
+    return false
+  # Direct PlayerInventory slot indices (matches build_equipment_slots).
+  var slotIndex = 0
+  case slot
+  of esMainHand: slotIndex = int(self.inventory.getSelectedSlot())
+  of esOffHand: slotIndex = OffHandSlot
+  of esFeet: slotIndex = 36
+  of esLegs: slotIndex = 37
+  of esChest: slotIndex = 38
+  of esHead: slotIndex = 39
+  # Players do not have Body or Saddle equipment slots; these are only used by non-player entities (e.g. horses).
+  else: return false
+  var stack = self.inventory.getStack(slotIndex)
+  let damaged = stack.damageItem(amount)
+  self.inventory.setStack(slotIndex, stack)
+  if damaged == drUntouched:
+    return false
+  # Send the break status before clearing the slot so the client can use the item texture for break particles.
+  if damaged == drBroken:
+    gPlayerHooks.incrementStat(self, scBroken, int32(stack.item.id), 1'i32)
+    self.world.sendEntityStatus(playerBase(self).entity, equipmentBreakStatus(slot))
+  self.client.writePacketFor(CSetPlayerInventory(slot: newVarInt(int32(slotIndex)), item: toSerializer(stack)))
+  self.sendEquipmentChanges([(slot, stack)])
   true
 
-proc newDefaultItemBehaviour*(): ItemBehaviour =
-  ## Builds an `ItemBehaviour` with every field set to upstream's default
-  ## trait-method body. A concrete item's constructor calls this then
-  ## overrides the fields it needs - e.g.
-  ## `result.normalUse = proc (item: Item, player: Player) = ...`.
-  result = ItemBehaviour()
-  result.normalUse = defaultNormalUse
-  result.normalUseWithRotation = proc (item: Item, player: Player, yaw, pitch: float32) {.closure.} =
-    result.normalUse(item, player)
-  result.normalUseWithHand = proc (item: Item, player: Player, yaw, pitch: float32, hand: Hand) {.closure.} =
-    result.normalUseWithRotation(item, player, yaw, pitch)
-  result.onStoppedUsing = proc (stack: ItemStack, player: Player) {.closure.} = discard
-  result.onSpearJab = proc (stack: ItemStack, player: Player) {.closure.} = discard
-  result.onUseTick = proc (stack: ItemStack, player: Player, remainingUseTicks: int32) {.closure.} = discard
-  result.getUseDuration = defaultGetUseDuration
-  result.canMine = defaultCanMine
+proc damageHeldItem*(self: Player; amount: int32): bool {.discardable.} =
+  ## `damage_held_item`
+  self.damageItemInSlot(esMainHand, amount)
 
-# --- ItemRegistry ------------------------------------------------------------
+proc dropItem*(self: Player; itemStack: ItemStack) =
+  ## `drop_item`
+  gPlayerHooks.incrementStat(self, scDropped, int32(itemStack.item.id), int32(itemStack.itemCount))
+  gPlayerHooks.incrementStat(self, scCustom, int32(ord(csDrop)), 1'i32)
+  let entity = playerBase(self).entity
+  var itemPos = entity.pos
+  itemPos.y += entity.getEyeHeight() - 0.3'f64
+  let dropped = newEntity(self.world, itemPos, EntityType.ITEM)
+  let pitch = degToRad(float64(entity.pitch))
+  let yaw = degToRad(float64(entity.yaw))
+  let pitchSin = sin(pitch)
+  let pitchCos = cos(pitch)
+  let yawSin = sin(yaw)
+  let yawCos = cos(yaw)
+  let horizontalOffset = randomF64() * TAU
+  let l = 0.02'f64 * randomF64()
+  let velocity = Vector3[float64](
+    x: mulAdd(-yawSin * pitchCos, 0.3'f64, cos(horizontalOffset) * l),
+    y: mulAdd(randomF64() - randomF64(), 0.1'f64, mulAdd(-pitchSin, 0.3'f64, 0.1'f64)),
+    z: mulAdd(yawCos * pitchCos, 0.3'f64, sin(horizontalOffset) * l))
+  # TODO upstream: Merge stacks together
+  let itemEntity: EntityBase = newItemEntityWithVelocity(dropped, itemStack, velocity, 40'u8)
+  spawnEntity(self.world, itemEntity)
+
+# --- Things several items share ------------------------------------------------------------------------------------------------
+
+proc blockNamed*(name: string): Block =
+  ## `&Block::X`, by resource path.
+  let b = Block.fromRegistryKey(name)
+  if b == nil:
+    quit("unknown block: " & name)
+  cast[Block](b)
+
+proc hasBlockTag*(blockRef: Block; tag: TagRef): bool =
+  ## `Block::has_tag`
+  hasTag(asU16(blockRef.id), tag)
+
+proc itemTagIds*(tagName: string): seq[uint16] =
+  ## `tag::Item::X.1`
+  let (found, ids) = getTagIds(rkItem, tagName)
+  if found: ids else: @[]
+
+proc setBlock*(world: World; position: BlockPos; stateId: BlockStateId; flags: BlockFlags) =
+  ## `set_block_state`, for a caller with a `BlockStateId` and no use for what was replaced.
+  discard world.setBlockState(position, uint32(asU16(stateId)), flags)
+
+proc playBlockSound*(world: World; sound: Sound; category: SoundCategory; position: BlockPos) =
+  ## `play_block_sound`
+  world.playSound(sound, category, position.toCenteredF64())
+
+proc syncWorldEvent*(world: World; event: WorldEvent; position: BlockPos; data: int32) =
+  ## `sync_world_event`
+  world.broadcastToChunk(position.chunkPosition(), CWorldEvent(event: int32(ord(event)), location: position, data: data,
+    disableRelativeVolume: false))
+
+proc entityOf*(player: Player): Entity {.inline.} = playerBase(player).entity
+
+proc livingOf*(player: Player): LivingEntity {.inline.} = mustLiving(playerBase(player))
+
+proc consumeFromHand*(player: Player; ids: openArray[uint16]) =
+  ## The "Consume item" tail of each thrown item's `normal_use`: main hand when it holds one of `ids`, else off hand.
+  let gamemode = player.gamemode
+  var mainHand = player.inventory.heldItem()
+  if not mainHand.isEmpty() and mainHand.item.id in ids:
+    mainHand.decrementUnlessCreative(gamemode, 1'u8)
+    player.inventory.setHeldItem(mainHand)
+    return
+  var offHand = player.inventory.offHandItem()
+  if not offHand.isEmpty() and offHand.item.id in ids:
+    offHand.decrementUnlessCreative(gamemode, 1'u8)
+    player.inventory.setOffHandItem(offHand)
+
+proc enchantmentLevelOf*(stack: ItemStack; enchantment: Enchantment): Option[int32] =
+  ## The level of `enchantment` in the stack's own `EnchantmentsImpl`, the way bow.rs, crossbow.rs and trident.rs read it.
+  let (has, enchantments) = stack.getDataComponent(EnchantmentsImpl)
+  if has:
+    for entry in enchantments.enchantment:
+      if entry.enchantment.id == enchantment.id:
+        return some(int32(entry.level))
+  none[int32]()
+
+# --- trait ItemBehaviour ---------------------------------------------------------------------------------------------------------
+
+proc newItemVt*(): ItemVt =
+  ## The trait's default bodies.
+  ItemVt(
+    normalUse: proc(self: ItemBehaviour; item: Item; player: Player) {.closure.} = discard,
+    useOnBlock: proc(self: ItemBehaviour; item: var ItemStack; player: Player; location: BlockPos; face: BlockDirection;
+        cursorPos: Vector3[float32]; blockRef: Block; server: Server) {.closure.} = discard,
+    useOnEntity: proc(self: ItemBehaviour; item: var ItemStack; player: Player; entity: EntityBase) {.closure.} = discard,
+    onStoppedUsing: proc(self: ItemBehaviour; stack: ItemStack; player: Player) {.closure.} = discard,
+    getUseDuration: proc(self: ItemBehaviour): int32 {.closure.} = 0'i32,
+    canMine: proc(self: ItemBehaviour; player: Player): bool {.closure.} = true)
+
+proc normalUse*(self: ItemBehaviour; item: Item; player: Player) = self.vt.normalUse(self, item, player)
+proc useOnBlock*(self: ItemBehaviour; item: var ItemStack; player: Player; location: BlockPos; face: BlockDirection;
+    cursorPos: Vector3[float32]; blockRef: Block; server: Server) =
+  self.vt.useOnBlock(self, item, player, location, face, cursorPos, blockRef, server)
+proc useOnEntity*(self: ItemBehaviour; item: var ItemStack; player: Player; entity: EntityBase) =
+  self.vt.useOnEntity(self, item, player, entity)
+proc onStoppedUsing*(self: ItemBehaviour; stack: ItemStack; player: Player) = self.vt.onStoppedUsing(self, stack, player)
+proc getUseDuration*(self: ItemBehaviour): int32 = self.vt.getUseDuration(self)
+proc canMine*(self: ItemBehaviour; player: Player): bool = self.vt.canMine(self, player)
+
+proc getStartAndEndPos*(player: Player): (Vector3[float64], Vector3[float64]) =
+  ## `get_start_and_end_pos`, and bucket.rs's identical free function.
+  let startPos = player.eyePosition()
+  let yawRad = float64(toRadiansF32(player.yaw))
+  let pitchRad = float64(toRadiansF32(player.pitch))
+  let blockInteractionRange = 4.5'f64 # This is not the same as the block_interaction_range in the player entity.
+  let direction = Vector3[float64](
+    x: -sin(yawRad) * cos(pitchRad) * blockInteractionRange,
+    y: -sin(pitchRad) * blockInteractionRange,
+    z: cos(pitchRad) * cos(yawRad) * blockInteractionRange)
+  (startPos, startPos.add(direction))
+
+proc canMineUnlessCreativeVt*(): ItemVt =
+  ## `can_mine` of the sword, mace, dye and trident.
+  result = newItemVt()
+  result.canMine = proc(self: ItemBehaviour; player: Player): bool {.closure.} = player.gamemode != Creative
+
+# --- ItemRegistry ----------------------------------------------------------------------------------------------------------------
 
 proc newItemRegistry*(): ItemRegistry =
-  ItemRegistry(items: @[])
+  ItemRegistry(items: initTable[uint16, nil ItemBehaviour]())
 
-proc indexOf(reg: ItemRegistry, id: uint16): int =
-  var i = 0
-  while i < reg.items.len:
-    if reg.items[i][0] == id:
-      return i
-    inc i
-  result = -1
+proc register*(self: ItemRegistry; item: ItemBehaviour) =
+  ## `register`
+  for i in item.ids:
+    self.items[i] = item
 
-proc register*(reg: ItemRegistry, ids: openArray[uint16], behaviour: nil ItemBehaviour) =
-  ## Port of `ItemRegistry::register`: one behaviour instance can back
-  ## several item ids (e.g. a potion item's id set).
-  for id in ids:
-    let i = indexOf(reg, id)
-    if i >= 0:
-      reg.items[i] = (id, behaviour)
-    else:
-      reg.items.add((id, behaviour))
+proc getPumpkinItem*(self: ItemRegistry; item: uint16): nil ItemBehaviour =
+  ## `get_pumpkin_item`
+  self.items.getOrDefault(item, nil)
 
-proc getItemBehaviour*(reg: ItemRegistry, id: uint16): nil ItemBehaviour =
-  ## Returns `nil` if no behaviour is registered for `id`, matching
-  ## upstream's `Option<&Arc<dyn ItemBehaviour>>`.
-  let i = indexOf(reg, id)
-  if i >= 0: reg.items[i][1] else: nil
+proc cooldownGroupOf(stack: ItemStack): (Option[UseCooldownImpl], string) =
+  let cooldown = stack.getUseCooldown()
+  var group = stack.item.registryKey
+  if cooldown.isSome and cooldown.unsafeGet.cooldownGroup.isSome:
+    group = cooldown.unsafeGet.cooldownGroup.unsafeGet
+  (cooldown, group)
 
-proc onUse*(reg: ItemRegistry, stack: ItemStack, player: Player, hand: Hand) =
-  ## Port of `ItemRegistry::on_use`. Upstream also handles per-item-group
-  ## use cooldowns (`is_on_cooldown`/`start_cooldown`); `Player` doesn't
-  ## carry cooldown state yet, so that part is a TODO here, not silently
-  ## dropped - see `src/server/entity/entity.aowl` for what `Player` covers
-  ## so far.
-  let b = getItemBehaviour(reg, stack.item.id)
-  if b != nil:
-    b.normalUseWithHand(stack.item, player, 0.0'f32, 0.0'f32, hand)
+proc onUse*(self: ItemRegistry; stack: ItemStack; player: Player) =
+  ## `on_use`
+  let (cooldown, cooldownGroup) = cooldownGroupOf(stack)
+  if player.isOnCooldown(cooldownGroup):
+    return
+  let pumpkinItem = self.getPumpkinItem(stack.item.id)
+  if pumpkinItem != nil:
+    pumpkinItem.normalUse(stack.item, player)
+  if cooldown.isSome:
+    player.startCooldown(cooldownGroup, asI32(cooldown.unsafeGet.seconds * 20.0'f32))
 
-proc onStoppedUsing*(reg: ItemRegistry, stack: ItemStack, player: Player) =
-  let b = getItemBehaviour(reg, stack.item.id)
-  if b != nil:
-    b.onStoppedUsing(stack, player)
+proc onStoppedUsing*(self: ItemRegistry; stack: ItemStack; player: Player) =
+  ## `on_stopped_using`
+  let behaviour = self.getPumpkinItem(stack.item.id)
+  if behaviour != nil:
+    behaviour.onStoppedUsing(stack, player)
 
-proc onSpearJab*(reg: ItemRegistry, stack: ItemStack, player: Player) =
-  let b = getItemBehaviour(reg, stack.item.id)
-  if b != nil:
-    b.onSpearJab(stack, player)
+proc getUseDuration*(self: ItemRegistry; itemId: uint16): Option[int32] =
+  ## `get_use_duration`: the item's use duration in ticks, none when it has no registered behaviour or its duration is 0.
+  let behaviour = self.getPumpkinItem(itemId)
+  if behaviour != nil:
+    let d = behaviour.getUseDuration()
+    if d > 0'i32:
+      return some(d)
+  none[int32]()
 
-proc onUseTick*(reg: ItemRegistry, stack: ItemStack, player: Player, remainingUseTicks: int32) =
-  let b = getItemBehaviour(reg, stack.item.id)
-  if b != nil:
-    b.onUseTick(stack, player, remainingUseTicks)
+proc useOnBlock*(self: ItemRegistry; stack: var ItemStack; player: Player; location: BlockPos; face: BlockDirection;
+    cursorPos: Vector3[float32]; blockRef: Block; server: Server) =
+  ## `use_on_block`
+  let (cooldown, cooldownGroup) = cooldownGroupOf(stack)
+  if player.isOnCooldown(cooldownGroup):
+    return
+  let pumpkinItem = self.getPumpkinItem(stack.item.id)
+  if pumpkinItem != nil:
+    pumpkinItem.useOnBlock(stack, player, location, face, cursorPos, blockRef, server)
+  if cooldown.isSome:
+    player.startCooldown(cooldownGroup, asI32(cooldown.unsafeGet.seconds * 20.0'f32))
 
-proc getUseDuration*(reg: ItemRegistry, itemId: uint16): int32 =
-  ## Port of `ItemRegistry::get_use_duration`: 0 means "no behaviour-driven
-  ## duration", matching upstream's `Option` collapsing `Some(0)` to `None`.
-  let b = getItemBehaviour(reg, itemId)
-  if b != nil: b.getUseDuration() else: 0'i32
+proc useOnEntity*(self: ItemRegistry; stack: var ItemStack; player: Player; entity: EntityBase) =
+  ## `use_on_entity`
+  let (cooldown, cooldownGroup) = cooldownGroupOf(stack)
+  if player.isOnCooldown(cooldownGroup):
+    return
+  let pumpkinItem = self.getPumpkinItem(stack.item.id)
+  if pumpkinItem != nil:
+    pumpkinItem.useOnEntity(stack, player, entity)
+  if cooldown.isSome:
+    player.startCooldown(cooldownGroup, asI32(cooldown.unsafeGet.seconds * 20.0'f32))
 
-proc canMine*(reg: ItemRegistry, itemId: uint16, player: Player): bool =
-  let b = getItemBehaviour(reg, itemId)
-  if b != nil: b.canMine(player) else: true
+proc canMine*(self: ItemRegistry; item: Item; player: Player): bool =
+  ## `can_mine`
+  let pumpkinBlock = self.getPumpkinItem(item.id)
+  if pumpkinBlock != nil:
+    return pumpkinBlock.canMine(player)
+  true
 
-proc shouldTryBlockPlacement*(action: BlockActionResult): bool {.inline.} =
-  ## Port of `registry::should_try_block_placement`.
-  action == barPass
+gPlayerHooks.startCooldown = proc(player: Player; group: string; ticks: int32) {.closure.} = player.startCooldown(group, ticks)

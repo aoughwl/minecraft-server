@@ -1,0 +1,410 @@
+## Port of pumpkin/src/entity/projectile/egg.rs
+## Port of pumpkin/src/entity/projectile/ender_pearl.rs
+## Port of pumpkin/src/entity/projectile/splash_potion.rs
+## Port of pumpkin/src/entity/projectile/lingering_potion.rs
+## Port of pumpkin/src/entity/projectile/eye_of_ender.rs
+## PARTIAL: pumpkin/src/entity/projectile/egg.rs - `PlayerEggThrowEvent` is not fired: src/plugin_api has no event manager the server holds yet. With no plugin, upstream's outcome is the rolled one, which is what runs.
+
+import std/[math, options]
+import "../../../data/item_stack/mod"
+import ../../../data/block_ext
+from ../../../data/block_state import asU16
+import ../../../generated/[effect, entity_status, particle, sound, sound_category, tracked_data, meta_data_type,
+  world_event, item_full]
+from ../../../generated/potion import gPotions, WATER
+import ../../../inventory/stackbridge
+import ../../../protocol/java/client/play/[entity_metadata, worldevent]
+import ../../../util/difficulty
+import ../../../util/math/mathmod
+import ../../../world/world as worldtraits
+import ../../world/chunker
+import ../../item/potion
+import ../area_effect_cloud
+import ../itementity
+import thrown
+
+const
+  EggGravity = 0.03'f64
+  PearlGravity = 0.03'f64
+  PotionGravity = 0.05'f64
+  ParticleCount = 32
+  EndermiteSpawnChance = 0.05'f32
+  TooFarDistance = 12.0'f64      ## Maximum horizontal distance the eye will travel before signalling at an elevated height.
+  TooFarSignalHeight = 8.0'f64   ## Height offset used when the target is beyond `TooFarDistance`.
+  MaxLife = 80'u32               ## The eye despawns after this many ticks.
+  SurviveChance = 5'u32          ## Chance (1-in-5) the eye drops its item instead of playing the break effect.
+
+type
+  EggEntity* = ref object of ThrownItemEntity
+    itemStack*: ItemStack
+
+  EnderPearlEntity* = ref object of ThrownItemEntity
+
+  SplashPotionEntity* = ref object of ThrownItemEntity
+    itemStack*: ItemStack
+
+  LingeringPotionEntity* = ref object of ThrownItemEntity
+    itemStack*: ItemStack
+
+  EyeOfEnder* = ref object of EntityBase
+    itemStack*: ItemStack
+    target*: Option[Vector3[float64]]
+    life*: uint32
+    surviveAfterDeath*: bool
+
+proc shouldSpawnMonsters*(world: World): bool =
+  ## `World::should_spawn_monsters`
+  world.levelInfo.gameRules.spawnMobs and world.levelInfo.gameRules.spawnMonsters and world.levelInfo.difficulty != Peaceful
+
+proc initItemTracker(self: EntityBase; stack: ItemStack) =
+  # Sync the item stack so the client renders the correct color/variant
+  self.entity.sendMetaData(TrackedData_ITEM_STACK, ITEM_STACK, toSerializer(stack))
+
+# --- EggEntity ----------------------------------------------------------------------------------------------------------------------
+
+proc makeEggVt(): EntityVt =
+  result = copyVt(thrownVt())
+  result.initDataTracker = proc(self: EntityBase) {.closure.} =
+    let s = EggEntity(self)
+    initItemTracker(self, s.itemStack)
+  result.onHit = proc(self: EntityBase; hit: ProjectileHit) {.closure.} =
+    let s = EggEntity(self)
+    let world = s.entity.world
+    # Chicken spawn position offset slightly from hit position
+    let spawnPos = hit.hitPos.add(hit.normal.multiply(0.5'f64, 0.5'f64, 0.5'f64))
+    # Play egg break particles
+    world.sendEntityStatus(s.entity, esDeath)
+    # Decide spawn count per probabilities:
+    # r == 0 -> spawn 4 (1/256); r in 1..31 -> spawn 1 (31/256); else -> 0
+    let r = randomRange(0'i32, 256'i32)
+    let toSpawn = if r == 0'i32: 4 elif r < 32'i32: 1 else: 0
+    if toSpawn > 0:
+      let (hasVariant, variant) = s.itemStack.getDataComponent(ChickenVariantImpl)
+      for i in 0 ..< toSpawn:
+        let mobOpt = gFromType(EntityType.CHICKEN, spawnPos, world, randomUuid())
+        if mobOpt == nil:
+          continue
+        let mob = cast[EntityBase](mobOpt)
+        let yaw = randomF32() * 360.0'f32
+        mob.entity.setRotation(yaw, 0.0'f32)
+        mob.entity.setAge(-24000'i32)
+        if hasVariant:
+          mob.setVariantName(variant.value)
+        spawnEntity(world, mob)
+
+let eggVt* = makeEggVt()
+
+proc newEggEntity*(entity: Entity): EggEntity =
+  ## `EggEntity::new`
+  # Default velocity slightly upward for thrown egg
+  entity.setVelocity(Vector3[float64](x: 0.0, y: 0.1, z: 0.0))
+  result = EggEntity(vt: eggVt, entity: entity, itemStack: newItemStack(1'u8, ITEM_EGG))
+  initThrownFields(result, entity, EggGravity, none[int32]())
+
+proc newEggShot*(entity, shooter: Entity): EggEntity =
+  ## `EggEntity::new_shot`
+  let owner = placeAtShooter(entity, shooter)
+  # Default slight upward velocity
+  entity.setVelocity(Vector3[float64](x: 0.0, y: 0.1, z: 0.0))
+  result = EggEntity(vt: eggVt, entity: entity, itemStack: newItemStack(1'u8, ITEM_EGG))
+  initThrownFields(result, entity, EggGravity, owner)
+
+proc setItemStack*(self: EggEntity; itemStack: ItemStack) =
+  ## `set_item_stack`: the item stack shown by this thrown egg.
+  self.itemStack = itemStack
+
+# --- EnderPearlEntity ---------------------------------------------------------------------------------------------------------------
+
+proc makePearlVt(): EntityVt =
+  result = copyVt(thrownVt())
+  result.onHit = proc(self: EntityBase; hit: ProjectileHit) {.closure.} =
+    let s = EnderPearlEntity(self)
+    let entity = s.entity
+    let world = entity.world
+    let attacker = if s.ownerId.isSome: world.getEntityById(s.ownerId.unsafeGet) else: nil
+    if hit.kind == phEntity and attacker != nil:
+      let victim = hit.entity
+      discard victim.damageWithContext(victim, 0.0'f32, THROWN, some(hit.hitPos), attacker, victim)
+    # Spawn portal particles at hit position
+    let hitPos = hit.hitPos
+    for i in 0 ..< ParticleCount:
+      let offset = Vector3[float64](x: float64(randomF32()) - 0.5'f64, y: float64(randomF32()) * 2.0'f64,
+        z: float64(randomF32()) - 0.5'f64)
+      let speed = Vector3[float64](x: randomF64() - 0.5'f64, y: 0.0'f64, z: randomF64() - 0.5'f64)
+      world.spawnParticle(hitPos.add(offset), speed, 1.0'f32, 1'i32, ptPortal)
+    if s.ownerId.isSome:
+      let ownerOpt = world.getEntityById(s.ownerId.unsafeGet)
+      if ownerOpt != nil:
+        let owner = cast[EntityBase](ownerOpt)
+        let ownerLiving = owner.living
+        let usable = owner.entity.isAlive() and
+          (ownerLiving == nil or (mustLiving(owner).health > 0.0'f32 and owner.entity.pose != epSleeping))
+        if usable:
+          let shouldSpawnEndermite = randomF32() < EndermiteSpawnChance
+          if world.shouldSpawnMonsters() and shouldSpawnEndermite:
+            let endermite = gFromType(EntityType.ENDERMITE, owner.entity.pos, world, randomUuid())
+            if endermite != nil:
+              spawnEntity(world, cast[EntityBase](endermite))
+          # Teleport position should be position of entity from last tick (tick before collision)
+          let teleportPos = entity.lastPos
+          # In vanilla, teleport handles everything including sound
+          owner.teleport(teleportPos, some(owner.entity.yaw), some(owner.entity.pitch), world)
+          # Play teleport sound at new position
+          world.playSound(sdEntityPlayerTeleport, scPlayers, teleportPos)
+          # Deal 5 damage to owner
+          discard owner.damage(owner, 5.0'f32, damage_type.ENDER_PEARL)
+    world.sendEntityStatus(entity, esDeath)
+
+let enderPearlVt* = makePearlVt()
+
+proc newEnderPearlEntity*(entity: Entity): EnderPearlEntity =
+  ## `EnderPearlEntity::new`
+  entity.setVelocity(Vector3[float64](x: 0.0, y: 0.1, z: 0.0))
+  result = EnderPearlEntity(vt: enderPearlVt, entity: entity)
+  initThrownFields(result, entity, PearlGravity, none[int32]())
+
+proc newEnderPearlShot*(entity, shooter: Entity): EnderPearlEntity =
+  ## `EnderPearlEntity::new_shot`
+  let owner = placeAtShooter(entity, shooter)
+  entity.setVelocity(Vector3[float64](x: 0.0, y: 0.1, z: 0.0))
+  result = EnderPearlEntity(vt: enderPearlVt, entity: entity)
+  initThrownFields(result, entity, PearlGravity, owner)
+
+# --- SplashPotionEntity -----------------------------------------------------------------------------------------------------------
+
+proc isWaterPotion(stack: ItemStack): bool =
+  ## `is_water_potion`: `Potion::WATER.id`.
+  let (has, pc) = stack.getDataComponent(PotionContentsImpl)
+  has and pc.potionId.isSome and pc.potionId.unsafeGet == int32(Potion.WATER.id)
+
+proc extinguishFire(world: World; hitPos: Vector3[float64]) =
+  ## `extinguish_fire`: fire (including soul fire) at the hit position and its four horizontal neighbors.
+  let airStateId = uint32(asU16(blockAir().defaultState.id))
+  let neighbors = @[hitPos, Vector3[float64](x: hitPos.x + 1.0'f64, y: hitPos.y, z: hitPos.z),
+    Vector3[float64](x: hitPos.x - 1.0'f64, y: hitPos.y, z: hitPos.z),
+    Vector3[float64](x: hitPos.x, y: hitPos.y, z: hitPos.z + 1.0'f64),
+    Vector3[float64](x: hitPos.x, y: hitPos.y, z: hitPos.z - 1.0'f64)]
+  for p in neighbors:
+    let pos = flooredV(p)
+    let id = world.getBlock(pos).id
+    if id == blockIdFire or id == blockIdSoulFire:
+      discard world.setBlockState(pos, airStateId, BfNotifyAll)
+
+proc extinguishFireIfWaterPotion*(world: World; hitPos: Vector3[float64]; stack: ItemStack) =
+  ## `extinguish_fire_if_water_potion`
+  if isWaterPotion(stack):
+    extinguishFire(world, hitPos)
+
+proc potionColor*(stack: ItemStack; effects: seq[EffectEntry]): int32 =
+  ## The color both potions work out, with no alpha. Upstream writes this block out four times.
+  result = 0x385dc6'i32 # Default to water color if no effects/color found
+  let (has, pc) = stack.getDataComponent(PotionContentsImpl)
+  if has and pc.customColor.isSome:
+    return pc.customColor.unsafeGet
+  if effects.len > 0:
+    var rSum = 0.0'f32
+    var gSum = 0.0'f32
+    var bSum = 0.0'f32
+    let count = float32(effects.len)
+    for e in effects:
+      let c = e.effectType.color
+      rSum += float32((c shr 16) and 0xFF'i32)
+      gSum += float32((c shr 8) and 0xFF'i32)
+      bSum += float32(c and 0xFF'i32)
+    let r = int32(rSum / count)
+    let g = int32(gSum / count)
+    let b = int32(bSum / count)
+    result = (r shl 16) or (g shl 8) or b
+
+proc hasInstantEffect(effects: seq[EffectEntry]): bool =
+  for e in effects:
+    if e.effectType.id == StatusEffect.INSTANT_DAMAGE.id or e.effectType.id == StatusEffect.INSTANT_HEALTH.id:
+      return true
+  false
+
+proc broadcastSplash(world: World; hitPos: Vector3[float64]; stack: ItemStack; effects: seq[EffectEntry]) =
+  # Play splash particles
+  let eventId = if hasInstantEffect(effects): 2007'i32 else: 2002'i32
+  # Convert hit_pos to BlockPos
+  let blockPos = flooredV(hitPos)
+  let chunkPos = Vector2[int32](x: getSectionCord(blockPos.vec.x), y: getSectionCord(blockPos.vec.z))
+  world.broadcastToChunk(chunkPos, CWorldEvent(event: eventId, location: blockPos, data: potionColor(stack, effects),
+    disableRelativeVolume: false))
+
+proc makeSplashVt(): EntityVt =
+  result = copyVt(thrownVt())
+  result.initDataTracker = proc(self: EntityBase) {.closure.} =
+    let s = SplashPotionEntity(self)
+    initItemTracker(self, s.itemStack)
+  result.onHit = proc(self: EntityBase; hit: ProjectileHit) {.closure.} =
+    let s = SplashPotionEntity(self)
+    let world = s.entity.world
+    let hitPos = hit.hitPos
+    # Only extinguish fire for plain water potions
+    let stack = s.itemStack
+    extinguishFireIfWaterPotion(world, hitPos, stack)
+    let effects = readPotionEffects(stack)
+    broadcastSplash(world, hitPos, stack, effects)
+    # If no effects, just splash (like water bottles)
+    if effects.len == 0:
+      return
+    let radius = 4.0'f64
+    let aabb = newBoundingBox(Vector3[float64](x: hitPos.x - radius, y: hitPos.y - radius, z: hitPos.z - radius),
+      Vector3[float64](x: hitPos.x + radius, y: hitPos.y + radius, z: hitPos.z + radius))
+    # Gather entity and player candidates
+    var candidates = world.getEntitiesAtBox(aabb)
+    for p in world.getPlayersAtBox(aabb):
+      candidates.add(playerBase(p))
+    for cand in candidates:
+      let living = cand.living
+      if living != nil:
+        let pos = cand.entity.pos
+        let dx = pos.x - hitPos.x
+        let dy = pos.y - hitPos.y
+        let dz = pos.z - hitPos.z
+        let dist = sqrt(dx * dx + dy * dy + dz * dz)
+        if dist > radius:
+          continue
+        # Distance scaling
+        let scale = max(1.0'f32 - (float32(dist) / float32(radius)), 0.0'f32)
+        applyEffectsTo(living, effects, scale, pasNormal)
+
+let splashPotionVt* = makeSplashVt()
+
+proc newSplashPotionEntity*(entity: Entity): SplashPotionEntity =
+  ## `SplashPotionEntity::new`
+  entity.setVelocity(Vector3[float64](x: 0.0, y: 0.1, z: 0.0))
+  result = SplashPotionEntity(vt: splashPotionVt, entity: entity, itemStack: newItemStack(1'u8, ITEM_SPLASH_POTION))
+  initThrownFields(result, entity, PotionGravity, none[int32]())
+
+proc newSplashPotionShot*(entity, shooter: Entity): SplashPotionEntity =
+  ## `SplashPotionEntity::new_shot`
+  let owner = placeAtShooter(entity, shooter)
+  entity.setVelocity(Vector3[float64](x: 0.0, y: 0.1, z: 0.0))
+  result = SplashPotionEntity(vt: splashPotionVt, entity: entity, itemStack: newItemStack(1'u8, ITEM_SPLASH_POTION))
+  initThrownFields(result, entity, PotionGravity, owner)
+
+proc setItemStack*(self: SplashPotionEntity; itemStack: ItemStack) = self.itemStack = itemStack
+
+# --- LingeringPotionEntity --------------------------------------------------------------------------------------------------------
+
+proc makeLingeringVt(): EntityVt =
+  result = copyVt(thrownVt())
+  result.initDataTracker = proc(self: EntityBase) {.closure.} =
+    let s = LingeringPotionEntity(self)
+    initItemTracker(self, s.itemStack)
+  result.onHit = proc(self: EntityBase; hit: ProjectileHit) {.closure.} =
+    let s = LingeringPotionEntity(self)
+    let world = s.entity.world
+    let hitPos = hit.hitPos
+    # Only extinguish fire for plain water potions
+    let stack = s.itemStack
+    extinguishFireIfWaterPotion(world, hitPos, stack)
+    # Play impact particles
+    world.sendEntityStatus(s.entity, esDeath)
+    # Read stored item stack and compute potion effects
+    let effects = readPotionEffects(stack)
+    # If no effects, just splash (like water bottles)
+    if effects.len == 0:
+      return
+    # Play splash/break particles & sound
+    broadcastSplash(world, hitPos, stack, effects)
+    # Spawn and configure an `AreaEffectCloud` entity
+    let cloudEntity = fromUuid(randomUuid(), world, hitPos, EntityType.AREA_EFFECT_CLOUD)
+    let cloud: EntityBase = createAreaEffectCloud(cloudEntity, stack, effects, 600'i32, 3.0'f32, 20'i32, 20'i32, -0.5'f32, -100'i32)
+    spawnEntity(world, cloud)
+
+let lingeringPotionVt* = makeLingeringVt()
+
+proc newLingeringPotionEntity*(entity: Entity): LingeringPotionEntity =
+  ## `LingeringPotionEntity::new`
+  entity.setVelocity(Vector3[float64](x: 0.0, y: 0.1, z: 0.0))
+  result = LingeringPotionEntity(vt: lingeringPotionVt, entity: entity, itemStack: newItemStack(1'u8, ITEM_LINGERING_POTION))
+  initThrownFields(result, entity, PotionGravity, none[int32]())
+
+proc newLingeringPotionShot*(entity, shooter: Entity): LingeringPotionEntity =
+  ## `LingeringPotionEntity::new_shot`
+  let owner = placeAtShooter(entity, shooter)
+  entity.setVelocity(Vector3[float64](x: 0.0, y: 0.1, z: 0.0))
+  result = LingeringPotionEntity(vt: lingeringPotionVt, entity: entity, itemStack: newItemStack(1'u8, ITEM_LINGERING_POTION))
+  initThrownFields(result, entity, PotionGravity, owner)
+
+proc setItemStack*(self: LingeringPotionEntity; itemStack: ItemStack) = self.itemStack = itemStack
+
+# --- EyeOfEnder ---------------------------------------------------------------------------------------------------------------------
+
+proc computeNewVelocity*(oldVelo, position, target: Vector3[float64]): Vector3[float64] =
+  ## `compute_new_velocity`: mirrors the vanilla `updateDeltaMovement` logic.
+  let horizontalDelta = Vector3[float64](x: target.x - position.x, y: 0.0, z: target.z - position.z)
+  let horizontalLen = hypot(horizontalDelta.x, horizontalDelta.z)
+  let oldHSpeed = hypot(oldVelo.x, oldVelo.z)
+  # `lerp(0.0025, old_h_speed, horizontal_len)`
+  var wantedSpeed = oldHSpeed + 0.0025'f64 * (horizontalLen - oldHSpeed)
+  var moveY = oldVelo.y
+  if horizontalLen < 1.0'f64:
+    wantedSpeed *= 0.8'f64
+    moveY *= 0.8'f64
+  let wantedYDir = if position.y - oldVelo.y < target.y: 1.0'f64 else: -1.0'f64
+  let scale = wantedSpeed / horizontalLen
+  Vector3[float64](x: horizontalDelta.x * scale, y: moveY + (wantedYDir - moveY) * 0.015'f64, z: horizontalDelta.z * scale)
+
+proc signalTo*(self: EyeOfEnder; target: Vector3[float64]) =
+  ## `signal_to`: aim the eye at `target`, clamping to `TooFarDistance` if necessary, and randomly decide whether it should
+  ## drop its item on expiry.
+  let pos = self.entity.pos
+  let delta = target.sub(pos)
+  let horizontalDist = hypot(delta.x, delta.z)
+  let clampedTarget = if horizontalDist > TooFarDistance:
+      Vector3[float64](x: pos.x + delta.x / horizontalDist * TooFarDistance, y: pos.y + TooFarSignalHeight,
+        z: pos.z + delta.z / horizontalDist * TooFarDistance)
+    else:
+      target
+  self.target = some(clampedTarget)
+  self.life = 0'u32
+  # 4-in-5 chance to survive (drop item); 1-in-5 plays the break effect.
+  self.surviveAfterDeath = (uint32(randomRange(0'i32, high(int32))) mod SurviveChance) != 0'u32
+
+proc makeEyeVt(): EntityVt =
+  result = copyVt(entityVt())
+  result.tick = proc(self, caller: EntityBase; server: Server) {.closure.} =
+    let s = EyeOfEnder(self)
+    let entity = s.entity
+    entityTick(entity, caller, server)
+    # Advance position by current velocity.
+    let velocity = entity.velocity
+    let newPos = entity.pos.add(velocity)
+    # Server-side: steer toward target if one is set.
+    if s.target.isSome:
+      entity.velocity = computeNewVelocity(velocity, newPos, s.target.unsafeGet)
+    entity.setPos(newPos)
+    entity.sendPosRot()
+    # Tick lifetime and handle expiry.
+    s.life += 1'u32
+    if s.life > MaxLife:
+      entity.playSound(sdEntityEnderEyeDeath)
+      entity.remove()
+      if s.surviveAfterDeath:
+        # Drop the item at the current position.
+        let dropped = newEntity(entity.world, newPos, EntityType.ITEM)
+        let item: EntityBase = newItemEntity(dropped, s.itemStack)
+        spawnEntity(entity.world, item)
+      else:
+        let blockPos = newPos.toBlockPos()
+        entity.world.broadcastToChunk(blockPos.chunkPosition(), CWorldEvent(event: int32(ord(weParticlesEyeOfEnderDeath)),
+          location: blockPos, data: 0'i32, disableRelativeVolume: false))
+  result.initDataTracker = proc(self: EntityBase) {.closure.} =
+    let s = EyeOfEnder(self)
+    s.entity.sendMetaData(TrackedData_ITEM, ITEM_STACK, toSerializer(s.itemStack))
+  # Eye of Ender is not attackable.
+  result.damageWithContext = proc(self, caller: EntityBase; amount: float32; damageType: DamageType;
+      position: Option[Vector3[float64]]; source, cause: nil EntityBase): bool {.closure.} = false
+  result.writeNbt = proc(self: EntityBase; nbt: var NbtCompound) {.closure.} = discard
+  result.readNbt = proc(self: EntityBase; nbt: NbtCompound) {.closure.} = discard
+
+let eyeOfEnderVt* = makeEyeVt()
+
+proc newEyeOfEnder*(entity: Entity): EyeOfEnder =
+  ## `EyeOfEnder::new`
+  result = EyeOfEnder(vt: eyeOfEnderVt, entity: entity, itemStack: newItemStack(1'u8, ITEM_ENDER_EYE),
+    target: none[Vector3[float64]](), life: 0'u32, surviveAfterDeath: false)
+  entity.base = projectileBase(result)
