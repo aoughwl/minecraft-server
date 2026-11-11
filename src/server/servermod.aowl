@@ -17,10 +17,13 @@ import key_store
 import recipe
 import scheduler
 import serverbase
+import ../auth/winhttp
 import tick_rate_manager
 import entity/player as playermod
 import world/worldmod
+import "block/worldhooks"
 import commandbridge
+import ../plugin/pluginmgr
 
 type
   ServerLoadResult* = object
@@ -47,8 +50,16 @@ proc settingsFor(dim: Dimension): (int32, int32) =
     (gensettings.OVERWORLD.seaLevel, dim.minY)
 
 proc loadServer*(basicConfig: BasicConfiguration; advancedConfig: AdvancedConfiguration; levelFolder: string): ServerLoadResult =
-  ## `Server::new`, reading the worlds from an existing save.
-  let (ok, levelInfo, err) = readWorldInfo(levelFolder)
+  ## `Server::new`, reading the worlds from a save; a folder with no level.dat is a new world, as `Level::from_root_folder` makes it.
+  var (ok, levelInfo, err) = readWorldInfo(levelFolder)
+  if not ok and err.kind == wieInfoNotFound:
+    echo "No world at ", levelFolder, ": creating one with seed ", basicConfig.seed.value
+    if not createDirAllW(levelFolder):
+      return ServerLoadResult(ok: false, server: nil, error: "cannot create " & levelFolder)
+    let (written, writeErr) = writeWorldInfo(defaultLevelData(basicConfig.seed.value), levelFolder)
+    if not written:
+      return ServerLoadResult(ok: false, server: nil, error: "cannot write " & levelFolder & "/level.dat: " & $writeErr)
+    (ok, levelInfo, err) = readWorldInfo(levelFolder)
   if not ok:
     return ServerLoadResult(ok: false, server: nil, error: "cannot read " & levelFolder & ": " & $err)
   var dimensions = @[OVERWORLD]
@@ -60,19 +71,22 @@ proc loadServer*(basicConfig: BasicConfiguration; advancedConfig: AdvancedConfig
     tickCounter: 0'i64, nextEntityId: 1'i32, tickRateManager: newServerTickRateManager(basicConfig.tps), keyStore: nil,
     recipeManager: newRecipeManager(), scheduler: newTaskScheduler(), data: loadServerData(DataFolder),
     playerDataStorage: newPlayerDataStorage(joinPathW(levelFolder, "playerdata"), advancedConfig.playerData.savePlayerData),
-    levelFolder: levelFolder, playerIdleTimeout: 0'i32, mojangPublicKeys: @[], stopRequested: false)
+    levelFolder: levelFolder, playerIdleTimeout: 0'i32, mojangPublicKeys: @[], favicon: loadFavicon(basicConfig), authTransport: newWinHttpTransport(), stopRequested: false)
   for dim in dimensions:
     let level = intoLevel(advancedConfig, levelFolder, levelInfo.worldGenSettings.seed, dim)
     # `level.world_portal.store`: upstream's asks the block registry. Until that is here, `worldgenPortal` answers
     # `can_place_at` for what features place; `noOpWorldPortal` would grow trees on stone.
     level.worldPortal = worldgenPortal()
     let (seaLevel, minY) = settingsFor(dim)
-    server.worlds.add(loadWorld(level, levelInfo, dim, seaLevel, minY, server))
+    let loaded = loadWorld(level, levelInfo, dim, seaLevel, minY, server)
+    installBlockHooks(loaded)
+    server.worlds.add(loaded)
   let java = advancedConfig.networking.java
   if java.onlineMode or java.encryption:
     echo "Creating encryption keys..."
     server.keyStore = newKeyStore()
   installCommands(server)
+  startPlugins(server)
   ServerLoadResult(ok: true, server: server, error: "")
 
 proc getPlayerCount*(self: Server): int =
@@ -96,8 +110,13 @@ proc getPlayerByName*(self: Server; name: string): Option[Player] =
 
 proc getStatus*(self: Server): StatusResponse =
   ## `get_status`, built per request; see connection_cache.aowl.
+  var sample: seq[Sample] = @[]
+  for world in self.worlds:
+    for p in world.players:
+      if sample.len < MaxSamplePlayers:
+        sample.add(Sample(name: p.gameprofile.name, id: $p.gameprofile.id))
   buildStatusResponse(self.advancedConfig.networking.java.motd,
-    self.advancedConfig.networking.java.maxPlayers, uint32(self.getPlayerCount()))
+    self.advancedConfig.networking.java.maxPlayers, uint32(self.getPlayerCount()), self.favicon, sample)
 
 proc canNotJoin*(self: Server; profile: GameProfile): Option[TextComponent] =
   ## `can_not_join` from pumpkin/src/net/mod.rs. The banned-ip half needs the client's address, which `tryAccept` does not
@@ -142,6 +161,7 @@ proc addPlayer*(self: Server; client: JavaClient; profile: GameProfile; config: 
     player.readNbt(loaded.unsafeGet)
   player.screenHandlerSyncHandler.storePlayer(player.asInventoryPlayer())
   worldmod.addPlayer(world, player)
+  firePlayerJoin(player)
   self.data.userCache.upsert(profile.id, profile.name)
   (player, world)
 
@@ -151,6 +171,7 @@ proc removePlayer*(self: Server; player: Player) =
     return
   player.removed = true
   handlePlayerLeave(self, player)
+  firePlayerLeave(player)
   forgetCommandPlayer(player)
   let world = player.world
   worldmod.removePlayer(world, player, true)

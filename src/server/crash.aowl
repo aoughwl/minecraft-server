@@ -1,0 +1,251 @@
+## Port of pumpkin/src/crash.rs, and the panic handler of pumpkin/src/main.rs
+## PARTIAL: pumpkin/src/crash.rs - the backtrace is raw return addresses, not symbols (no DbgHelp), and the CPU section is the core count only (no brand, vendor or frequency). A failed `assert` in aowlmony ends the process without any hook to catch it, so only a fault (access violation, illegal instruction, stack overflow) and an abort reach the handler.
+##
+## Upstream's panic hook builds a `CrashReport`, prints it, saves it to `crash-reports/crash-<date>_<time>.txt` and, off the
+## main thread, stops the server so it saves. Here the loop is one thread, so a fault is always "the main thread
+## panicked": the report is written and the process exits with 1 ("Aborting due to the main thread panicking.").
+## `reportFatal` makes the same report for an error the code itself finds fatal.
+
+import std/[os, syncio]
+from std/paths import path, Path
+import std/dirs
+import logging
+
+const
+  CrashReportsDir* = "crash-reports"
+  BytesPerMebibyte* = 1024'u64 * 1024'u64
+  ServerVersion* = "0.1.0 (aowlmony)"
+  MinecraftVersion* = "1.21.11"
+
+type
+  SystemDetails* = object
+    available*: bool
+    osVersion*: string
+    usedMemoryMib*, totalMemoryMib*, freeMemoryMib*: uint64
+    usedSwapMib*, totalSwapMib*, freeSwapMib*: uint64
+    cores*: int
+
+  CrashReport* = object
+    time*: DateTime
+    message*: string        ## The panic payload; empty when there is none.
+    location*: string       ## "file:line:col", or an address here; empty when unknown.
+    threadName*: string
+    threadId*: string
+    backtrace*: seq[string]
+
+# --- Windows ---------------------------------------------------------------------------------------------------------
+
+type
+  MemoryStatusEx = object
+    length: uint32
+    memoryLoad: uint32
+    totalPhys, availPhys, totalPageFile, availPageFile, totalVirtual, availVirtual, availExtendedVirtual: uint64
+
+  SystemInfo = object
+    processorArchitecture: uint16
+    reserved: uint16
+    pageSize: uint32
+    minAddress, maxAddress: uint
+    activeProcessorMask: uint
+    numberOfProcessors: uint32
+    processorType: uint32
+    allocationGranularity: uint32
+    processorLevel: uint16
+    processorRevision: uint16
+
+  OsVersionInfo = object
+    size: uint32
+    major, minor, build, platform: uint32
+    csd: array[128, uint16]
+
+  ExceptionRecord = object
+    code: uint32
+    flags: uint32
+    next: uint
+    address: uint
+    numberParameters: uint32
+
+  ExceptionPointers = object
+    record: ptr ExceptionRecord
+    context: uint
+
+  UnhandledFilter = proc(info: ptr ExceptionPointers): int32 {.stdcall.}
+
+proc globalMemoryStatusEx(s: ptr MemoryStatusEx): int32 {.stdcall, importc: "GlobalMemoryStatusEx", dynlib: "kernel32.dll".}
+proc getSystemInfo(s: ptr SystemInfo) {.stdcall, importc: "GetSystemInfo", dynlib: "kernel32.dll".}
+proc rtlGetVersion(v: ptr OsVersionInfo): int32 {.stdcall, importc: "RtlGetVersion", dynlib: "ntdll.dll".}
+proc setUnhandledExceptionFilter(f: UnhandledFilter): pointer
+  {.stdcall, importc: "SetUnhandledExceptionFilter", dynlib: "kernel32.dll".}
+proc rtlCaptureStackBackTrace(skip, count: uint32; frames: ptr uint; hash: nil ptr uint32): uint16
+  {.stdcall, importc: "RtlCaptureStackBackTrace", dynlib: "kernel32.dll".}
+proc exitProcess(code: uint32) {.stdcall, importc: "ExitProcess", dynlib: "kernel32.dll".}
+
+proc hex(v: uint64): string =
+  const digits = "0123456789abcdef"
+  if v == 0'u64:
+    return "0x0"
+  var n = v
+  var s = ""
+  while n > 0'u64:
+    s = digits[int(n and 15'u64)] & s
+    n = n shr 4
+  "0x" & s
+
+proc querySystem*(): SystemDetails =
+  var mem = MemoryStatusEx()
+  mem.length = uint32(sizeof(MemoryStatusEx))
+  if globalMemoryStatusEx(addr mem) == 0'i32:
+    return SystemDetails(available: false)
+  var info = SystemInfo()
+  getSystemInfo(addr info)
+  var ver = OsVersionInfo()
+  ver.size = uint32(sizeof(OsVersionInfo))
+  var osText = "Unknown"
+  if rtlGetVersion(addr ver) == 0'i32:
+    osText = "Windows " & $ver.major & "." & $ver.minor & " (build " & $ver.build & ")"
+  # `ullTotalPageFile` is the commit limit, RAM plus the page file, so the swap is what is left over.
+  let swapTotal = if mem.totalPageFile > mem.totalPhys: mem.totalPageFile - mem.totalPhys else: 0'u64
+  let swapFree = if mem.availPageFile > mem.availPhys: mem.availPageFile - mem.availPhys else: 0'u64
+  SystemDetails(available: true, osVersion: osText,
+    usedMemoryMib: (mem.totalPhys - mem.availPhys) div BytesPerMebibyte, totalMemoryMib: mem.totalPhys div BytesPerMebibyte,
+    freeMemoryMib: mem.availPhys div BytesPerMebibyte,
+    usedSwapMib: (if swapTotal > swapFree: (swapTotal - swapFree) div BytesPerMebibyte else: 0'u64),
+    totalSwapMib: swapTotal div BytesPerMebibyte, freeSwapMib: swapFree div BytesPerMebibyte,
+    cores: int(info.numberOfProcessors))
+
+proc captureBacktrace*(skip: int): seq[string] =
+  var frames = newSeq[uint](62)
+  let n = int(rtlCaptureStackBackTrace(uint32(skip), 62'u32, addr frames[0], nil))
+  result = @[]
+  for i in 0 ..< n:
+    result.add(hex(uint64(frames[i])))
+
+# --- The report ------------------------------------------------------------------------------------------------------
+
+proc timeText*(t: DateTime): string =
+  ## `OffsetDateTime`'s Display, in UTC: `2026-11-11 14:55:00.0 +00:00:00`.
+  dateStamp(t) & " " & pad2(t.hour) & ":" & pad2(t.minute) & ":" & pad2(t.second) & ".0 +00:00:00"
+
+proc newCrashReport*(message, location: string; backtrace: seq[string]): CrashReport =
+  CrashReport(time: utcNow(), message: message, location: location, threadName: "main", threadId: "ThreadId(1)",
+    backtrace: backtrace)
+
+proc generateFileContent*(report: CrashReport; system: SystemDetails): string =
+  ## `generate_file_content`
+  var o = ""
+  o.add("====== Pumpkin Crash Report ======\n\n")
+  o.add("Time: " & timeText(report.time) & "\n")
+  o.add("Message: " & (if report.message.len > 0: report.message else: "<unknown>") & "\n")
+  if report.location.len > 0:
+    o.add("Panic Location: " & report.location & "\n")
+  o.add("\n--- Panicking Thread ---\n")
+  o.add("ID: " & report.threadId & "\n")
+  o.add("Name: " & report.threadName & "\n")
+  o.add("Backtrace:\n")
+  for i in 0 ..< report.backtrace.len:
+    o.add("  " & $i & ": " & report.backtrace[i] & "\n")
+  o.add("\n--- Server Details ---\n")
+  o.add("Pumpkin Version: " & ServerVersion & "\n")
+  o.add("Minecraft Version: " & MinecraftVersion & "\n")
+  o.add("Server compiled with aowlmony\n")
+  if system.available:
+    o.add("\n--- System Details ---\n")
+    o.add("Operating System: " & system.osVersion & "\n")
+    o.add("Physical Memory: " & $system.usedMemoryMib & " MiB/" & $system.totalMemoryMib & " MiB used, " &
+      $system.freeMemoryMib & " MiB free\n")
+    o.add("Swap Memory: " & $system.usedSwapMib & " MiB/" & $system.totalSwapMib & " MiB used, " &
+      $system.freeSwapMib & " MiB free\n")
+    o.add("\nTotal cores: " & $system.cores & "\n\n")
+  o
+
+proc crashFileName*(t: DateTime): string =
+  "crash-" & dateStamp(t) & "_" & pad2(t.hour) & "." & pad2(t.minute) & "." & pad2(t.second) & ".txt"
+
+proc save*(report: CrashReport; dir: string = CrashReportsDir): (bool, string) =
+  ## `save`: false and the reason on an I/O error. Like `File::create_new`, it will not overwrite a report.
+  let made = tryCreateFinalDir(path(dir))
+  if made != Success and made != NameExists:
+    return (false, "cannot create " & dir)
+  let target = dir & "/" & crashFileName(report.time)
+  if fileExists(target):
+    return (false, target & " already exists")
+  try:
+    writeFile(target, generateFileContent(report, querySystem()))
+  except ErrorCode:
+    return (false, "cannot write " & target)
+  (true, target)
+
+proc printToConsole*(report: CrashReport) =
+  ## `print_to_console`, through the logger.
+  const Red = "\x1b[31m"
+  const Reset = "\x1b[0m"
+  const Bold = "\x1b[1m"
+  error(Red & Bold & "Pumpkin has encountered a panic!" & Reset)
+  error("")
+  let message = if report.location.len > 0:
+      "Thread '" & report.threadName & "' with " & report.threadId & " panicked at " & report.location
+    else:
+      "Thread '" & report.threadName & "' " & report.threadId & " panicked"
+  if report.message.len > 0:
+    error(Red & message & ":" & Reset)
+    error(report.message)
+  else:
+    error(Red & message & Reset)
+  error("")
+  if report.backtrace.len > 0:
+    error(Red & "The full backtrace will be printed to the crash report." & Reset)
+  else:
+    error(Red & "Backtrace status is unknown, so no backtrace will be generated for the crash report." & Reset)
+
+proc saveAndLog*(report: CrashReport): bool =
+  ## `save_and_log`
+  let (ok, where0) = save(report)
+  if ok:
+    info("\x1b[32mSuccessfully saved the crash report to file:\x1b[0m " & where0)
+  else:
+    error("\x1b[31mCould not save the crash report:\x1b[0m " & where0)
+  ok
+
+proc reportFatal*(message: string): int =
+  ## A crash report for an error the server finds fatal: printed, saved, and the exit code to use.
+  let report = newCrashReport(message, "", captureBacktrace(1))
+  printToConsole(report)
+  discard saveAndLog(report)
+  1
+
+# --- The handler -----------------------------------------------------------------------------------------------------
+
+var handling = false
+
+proc exceptionName(code: uint32): string =
+  case code
+  of 0xC0000005'u32: "access violation"
+  of 0xC00000FD'u32: "stack overflow"
+  of 0xC000001D'u32: "illegal instruction"
+  of 0xC0000094'u32: "integer division by zero"
+  of 0xC0000096'u32: "privileged instruction"
+  of 0xC000008E'u32: "floating point division by zero"
+  of 0x80000003'u32: "breakpoint"
+  else: "exception"
+
+proc onUnhandled(info: ptr ExceptionPointers): int32 {.stdcall.} =
+  if handling:
+    exitProcess(1'u32)
+  handling = true
+  var code = 0'u32
+  var at = ""
+  if info != nil and info.record != nil:
+    code = info.record.code
+    at = hex(uint64(info.record.address))
+  let report = newCrashReport("Unhandled " & exceptionName(code) & " (" & hex(uint64(code)) & ")", "at address " & at,
+    captureBacktrace(0))
+  printToConsole(report)
+  discard saveAndLog(report)
+  error("\x1b[31mAborting due to the main thread panicking.\x1b[0m")
+  closeLogger()
+  exitProcess(1'u32)
+  1'i32
+
+proc installCrashHandler*() =
+  ## `std::panic::set_hook(Box::new(handle_panic))`
+  discard setUnhandledExceptionFilter(onUnhandled)

@@ -45,7 +45,9 @@ client must be told.
 Ids and layouts are protocol 774's, the ones aoughwl.mcnet (the game client's decoder) reads.
 """
 import argparse
+import base64
 import hashlib
+import hmac
 import os
 import json
 import socket
@@ -640,15 +642,22 @@ def read_commands(r):
     COMMAND_TREE['root'] = root
 
 
+META_LOG = []   # (entity id, index, kind, value) of every item-stack metadata --world has seen
+
+
 def read_metadata(r):
-    r.varint()
+    entity = r.varint()
     while True:
         index = r.u8()
         if index == 0xFF:
             return
         kind = r.varint()
-        check(kind in (0, 20), 'metadata type %d: this bot only reads bytes and arms' % kind)
+        check(kind in (0, 1, 7, 8, 20), 'metadata type %d: this bot only reads bytes, ints, stacks, booleans and arms' % kind)
         if kind == 0:
+            r.u8()
+        elif kind == 7:
+            META_LOG.append((entity, index, kind, read_slot(r)))
+        elif kind == 8:
             r.u8()
         else:
             r.varint()
@@ -694,12 +703,14 @@ class World:
         self.min_y = -64
         self.overrides = {}     # (x, y, z) -> state id, from block updates after the chunk
         self.pos = None
+        self.rot = None         # (yaw, pitch) of the last teleport
         self.window0 = None     # 46 (count, item)
         self.state_id = 0
         self.cursor = (0, 0)
         self.acked = -1
         self.health = None
         self.chat = []
+        self.events = []        # scoreboard, team, bossbar, border and ticking packets, as tuples
         self.pongs = []
         self.suggestions = []
         self.mode = None
@@ -754,6 +765,65 @@ def text_of(nbt_bytes):
             r.take(r.i32() * 8)
     walk(r.u8())
     return ' '.join(found), r.at
+
+
+PLAY_BOSS_EVENT, PLAY_BORDER_CENTER, PLAY_BORDER_LERP, PLAY_BORDER_SIZE = 9, 86, 87, 88
+PLAY_SET_DISPLAY_OBJECTIVE, PLAY_SET_OBJECTIVE, PLAY_SET_PLAYER_TEAM, PLAY_SET_SCORE, PLAY_TICKING_STATE = 96, 104, 107, 108, 125
+SCOREBOARD_PACKETS = (PLAY_BOSS_EVENT, PLAY_BORDER_CENTER, PLAY_BORDER_LERP, PLAY_BORDER_SIZE, PLAY_SET_DISPLAY_OBJECTIVE,
+                      PLAY_SET_OBJECTIVE, PLAY_SET_PLAYER_TEAM, PLAY_SET_SCORE)
+
+
+def record_scoreboard_packet(w, pid, r):
+    """Reads what the scoreboard, team, bossbar and border packets carry first and keeps it in w.events, as tuples."""
+    if pid == PLAY_SET_OBJECTIVE:
+        name = r.string()
+        w.events.append(('objective', name, r.u8()))
+    elif pid == PLAY_SET_DISPLAY_OBJECTIVE:
+        slot = r.varint()
+        w.events.append(('display', slot, r.string()))
+    elif pid == PLAY_SET_SCORE:
+        entity, objective = r.string(), r.string()
+        w.events.append(('score', entity, objective, r.varint()))
+    elif pid == PLAY_SET_PLAYER_TEAM:
+        name = r.string()
+        method = r.u8()
+        members = []
+        if method in (0, 3, 4):
+            if method == 0:
+                # display name (NBT), flags, visibility, collision, color, prefix, suffix
+                skip_network_nbt(r)
+                flags = r.u8()
+                vis, col, color = r.string(), r.string(), r.varint()
+                skip_network_nbt(r)
+                skip_network_nbt(r)
+                members = [r.string() for _ in range(r.varint())]
+                w.events.append(('team', name, method, flags, vis, col, color, members))
+                return
+            members = [r.string() for _ in range(r.varint())]
+        elif method == 2:
+            skip_network_nbt(r)
+            flags = r.u8()
+            vis, col, color = r.string(), r.string(), r.varint()
+            skip_network_nbt(r)
+            skip_network_nbt(r)
+            w.events.append(('team', name, method, flags, vis, col, color, members))
+            return
+        w.events.append(('team', name, method, members))
+    elif pid == PLAY_BOSS_EVENT:
+        uid = r.take(16)
+        action = r.varint()
+        info = None
+        if action == 2:
+            info = r.f32()
+        w.events.append(('boss', uid.hex(), action, info))
+    elif pid == PLAY_BORDER_CENTER:
+        w.events.append(('border_center', r.f64(), r.f64()))
+    elif pid == PLAY_BORDER_SIZE:
+        w.events.append(('border_size', r.f64()))
+    elif pid == PLAY_BORDER_LERP:
+        old, new = r.f64(), r.f64()
+        w.events.append(('border_lerp', old, new, r.varint()))
+    r.take(r.left())
 
 
 def handle_play_extra(w, pid, r):
@@ -817,6 +887,8 @@ def handle_play_extra(w, pid, r):
             read_slot(r)
             if not slot & 0x80:
                 break
+    elif pid in SCOREBOARD_PACKETS:
+        record_scoreboard_packet(w, pid, r)
     elif pid == PLAY_SUGGESTIONS:
         ident = r.varint()
         start, length = r.varint(), r.varint()
@@ -843,7 +915,19 @@ class Stages:
     COMMAND_NAMES = ['tree_parsed', 'tree_children', 'unknown_error', 'bad_block_error', 'bad_mode_error', 'kill_dead',
                       'kill_respawned', 'setblock_update', 'fill_update', 'give_slot', 'gamemode_creative',
                       'gamemode_survival', 'time_set', 'time_query', 'tp_moved', 'execute_run', 'suggest_root', 'suggest_arg']
+    COMMANDS2_NAMES = ['tree2_children', 'clone_copied', 'clone_moved', 'place_template', 'place_structure', 'item_slot',
+                       'item_mainhand', 'spreadplayers_teleport', 'rotate_absolute', 'rotate_facing', 'fillbiome_chunk',
+                       'loot_given', 'ride_not_riding', 'spectate_self', 'spectate_stopped']
+    SCOREBOARD_NAMES = ['objective_added', 'sidebar_shown', 'score_enabled', 'trigger_score', 'team_created', 'team_joined',
+                        'team_updated', 'bossbar_added', 'bossbar_health', 'bossbar_name', 'border_size', 'border_center',
+                        'border_lerp', 'tick_rate', 'tick_frozen', 'tick_query', 'data_get_player']
     COMMAND_VERIFY_NAMES = ['setblock_persisted', 'fill_persisted', 'give_persisted', 'tp_persisted', 'alive_on_return']
+    BLOCKS_NAMES = ['door_placed', 'door_opened', 'door_closed', 'lamp_line_placed', 'lamp_lit', 'lamp_dark', 'sand_fell',
+                    'water_flowed']
+    BLOCKS_VERIFY_NAMES = ['blocks_persisted']
+    WORLD_NAMES = ['world_survival', 'dirt_placed', 'dirt_broken', 'drop_spawned', 'drop_item', 'portal_built',
+                   'portal_entered', 'nether_respawn', 'nether_position', 'nether_portal_found', 'night_set',
+                   'mobs_spawned']
     WATCH_NAMES = ['other_appeared', 'other_moved', 'other_swung', 'other_block_change', 'other_chat', 'other_left']
 
     def __init__(self, extra=()):
@@ -877,10 +961,15 @@ def pump(c, st, w, biomes, ctx, until, what, seconds=8.0):
 
 def one_packet(c, st, w, biomes, ctx, pid, r):
     counts = ctx['counts']
+    tap = ctx.get('tap')
+    if tap:
+        tap(pid, r.data[r.at:])
     counts[pid] = counts.get(pid, 0) + 1
     if counts[pid] <= 3 or pid in (PLAY_KEEP_ALIVE, PLAY_DISCONNECT):
         print('play   packet 0x%02x (%d bytes)' % (pid, r.left()), flush=True)
     if pid in EXACT_PLAY:
+        if pid == PLAY_TICKING_STATE:
+            w.events.append(('ticking', struct.unpack('>f', r.data[r.at:r.at + 4])[0], r.data[r.at + 4] != 0))
         if pid == PLAY_TIME:
             w.time = struct.unpack('>qq', r.data[r.at:r.at + 16])
         if pid == PLAY_SYSTEM_CHAT:
@@ -931,7 +1020,8 @@ def one_packet(c, st, w, biomes, ctx, pid, r):
     elif pid == PLAY_POSITION:
         tid = r.varint()
         x, y, z = r.f64(), r.f64(), r.f64()
-        r.take(24 + 8)
+        r.take(24)
+        w.rot = (r.f32(), r.f32())
         flags = r.i32()
         check(r.left() == 0, 'player position: %d bytes left over' % r.left())
         print('  teleport id=%d to %.2f %.2f %.2f flags=%d' % (tid, x, y, z, flags))
@@ -1259,6 +1349,270 @@ def commands_session(c, st, w, biomes, ctx, args):
             json.dump(dict(setblock=[sx, sy, sz], fill=cube, tp=[tx, ty, tz]), f)
 
 
+def commands2_session(c, st, w, biomes, ctx, args):
+    """--commands2: /clone, /place, /item, /spreadplayers, /rotate, /fillbiome, /loot, /ride and /spectate, over the wire.
+    The bot must be an operator of level 4. Each command is judged by the packets it makes: the block updates a clone and a
+    placed template send, the slot packet of /item, the teleport of /spreadplayers and /rotate, and the chunk /fillbiome sends."""
+    def wait(cond, what, seconds=10.0):
+        pump(c, st, w, biomes, ctx, cond, what, seconds)
+
+    def run_command(line):
+        print('  /%s' % line, flush=True)
+        c.send(SB_CHAT_COMMAND, string(line))
+
+    def heard(fragment, since):
+        return any(fragment in said for said in w.chat[since:])
+
+    wait(lambda: w.pos is not None and ctx['chunk_parsed'], 'a position and a chunk', 40.0)
+    wait(lambda: w.window0 is not None and w.health is not None, 'the inventory and health')
+    wait(lambda: 'nodes' in COMMAND_TREE, 'the command tree')
+    nodes = COMMAND_TREE['nodes']
+    names = sorted(nodes[i]['name'] for i in nodes[COMMAND_TREE['root']]['children'])
+    for wanted in ('clone', 'place', 'item', 'spreadplayers', 'rotate', 'fillbiome', 'loot', 'ride', 'spectate'):
+        check(wanted in names, 'the root has no %s' % wanted)
+    st.hit('tree2_children')
+
+    x, y, z = int(w.pos[0] // 1), int(w.pos[1] // 1), int(w.pos[2] // 1)
+    wait(lambda: w.block(x, y, z) is not None, 'the chunk under the player', 30.0)
+
+    # /fill a pattern, /clone it elsewhere and read the copies back.
+    bx, by, bz = x + 2, y + 8, z + 2
+    run_command('fill %d %d %d %d %d %d granite' % (bx, by, bz, bx + 1, by + 1, bz + 1))
+    src = [(bx + i, by + j, bz + k) for i in (0, 1) for j in (0, 1) for k in (0, 1)]
+    wait(lambda: all(w.overrides.get(p) == 2 for p in src), 'the granite to clone')
+    run_command('setblock %d %d %d stone' % (bx, by + 1, bz))
+    wait(lambda: w.overrides.get((bx, by + 1, bz)) == 1, 'the stone in the pattern')
+    dx, dy, dz = x + 8, y + 8, z + 2
+    run_command('clone %d %d %d %d %d %d %d %d %d' % (bx, by, bz, bx + 1, by + 1, bz + 1, dx, dy, dz))
+    copy = [(dx + (p[0] - bx), dy + (p[1] - by), dz + (p[2] - bz)) for p in src]
+    expect = {q: (1 if p == (bx, by + 1, bz) else 2) for p, q in zip(src, copy)}
+    wait(lambda: all(w.overrides.get(q) == expect[q] for q in copy), 'the cloned blocks')
+    print('  cloned: %s' % [w.overrides[q] for q in copy])
+    st.hit('clone_copied')
+    mx, my, mz = x + 8, y + 8, z + 6
+    run_command('clone %d %d %d %d %d %d %d %d %d replace move' % (dx, dy, dz, dx + 1, dy + 1, dz + 1, mx, my, mz))
+    moved = [(mx + (p[0] - dx), my + (p[1] - dy), mz + (p[2] - dz)) for p in copy]
+    wait(lambda: all(w.overrides.get(q) in (1, 2) for q in moved) and all(w.overrides.get(q) == 0 for q in copy),
+         'the moved blocks, and the source cleared')
+    print('  moved: %s, source now %s' % ([w.overrides[q] for q in moved], [w.overrides[q] for q in copy]))
+    st.hit('clone_moved')
+
+    # /place template and /place structure: blocks appear.
+    before = len(w.overrides)
+    run_command('place template minecraft:igloo/top %d %d %d' % (x - 6, y + 12, z + 6))
+    wait(lambda: len(w.overrides) - before >= 20, 'the placed template blocks')
+    print('  place template: %d more block updates' % (len(w.overrides) - before))
+    st.hit('place_template')
+    before = len(w.overrides)
+    run_command('place structure minecraft:igloo %d %d %d' % (x - 8, y + 12, z - 8))
+    wait(lambda: len(w.overrides) - before >= 20, 'the placed structure blocks')
+    print('  place structure: %d more block updates' % (len(w.overrides) - before))
+    st.hit('place_structure')
+
+    # /item replace into a slot: the slot packet.
+    run_command('item replace entity @s hotbar.0 minecraft:diamond 5')
+    wait(lambda: w.window0[36][0] == 5, 'five items in the first hotbar slot')
+    diamond = w.window0[36][1]
+    print('  hotbar 0 holds 5 of item %d' % diamond)
+    check(diamond != STONE_ITEM, 'the item in the slot is the stone, not the diamond')
+    st.hit('item_slot')
+    run_command('item replace entity @s weapon.mainhand with minecraft:stick')
+    wait(lambda: w.window0[36][0] == 1 and w.window0[36][1] != diamond, 'the stick in the main hand slot')
+    st.hit('item_mainhand')
+
+    # /spreadplayers: a teleport onto the surface within the area.
+    w.rot = None
+    before_pos = w.pos
+    run_command('spreadplayers %d %d 1 8 false @s' % (x + 20, z + 20))
+    wait(lambda: abs(w.pos[0] - (x + 20.5)) < 8.6 and abs(w.pos[2] - (z + 20.5)) < 8.6 and w.pos != before_pos,
+         'the spreadplayers teleport')
+    print('  spread to %.2f %.2f %.2f' % w.pos)
+    check(abs(w.pos[0] % 1.0 - 0.5) < 1e-6 and abs(w.pos[2] % 1.0 - 0.5) < 1e-6, 'not at a block centre')
+    st.hit('spreadplayers_teleport')
+
+    # /rotate: a teleport in place with the new rotation.
+    here = w.pos
+    run_command('rotate @s 90 30')
+    wait(lambda: w.rot is not None and abs(w.rot[0] - 90.0) < 0.01 and abs(w.rot[1] - 30.0) < 0.01, 'the rotation teleport')
+    check(w.pos == here, 'rotate moved the player: %r to %r' % (here, w.pos))
+    print('  rotated to yaw %.1f pitch %.1f' % w.rot)
+    st.hit('rotate_absolute')
+    run_command('rotate @s facing %.1f %.2f %.1f' % (here[0] + 10.0, here[1] + 1.62, here[2]))
+    wait(lambda: w.rot is not None and abs(w.rot[0] + 90.0) < 0.01 and abs(w.rot[1]) < 0.05, 'the facing rotation')
+    print('  facing east: yaw %.1f pitch %.1f' % w.rot)
+    st.hit('rotate_facing')
+
+    # /fillbiome: the changed chunk is sent again.
+    seen = ctx['chunks']
+    at = len(w.chat)
+    run_command('fillbiome %d %d %d %d %d %d minecraft:desert' % (x, y, z, x + 4, y + 4, z + 4))
+    wait(lambda: ctx['chunks'] > seen and heard('commands.fillbiome.success', at), 'the chunk and the answer')
+    print('  said: %r' % w.chat[at:])
+    st.hit('fillbiome_chunk')
+
+    # /loot into the player.
+    filled = sum(1 for s in w.window0 if s[0] > 0)
+    run_command('loot give @s loot minecraft:chests/simple_dungeon')
+    wait(lambda: sum(1 for s in w.window0 if s[0] > 0) > filled, 'loot in the inventory')
+    print('  %d stacks in the inventory, was %d' % (sum(1 for s in w.window0 if s[0] > 0), filled))
+    st.hit('loot_given')
+
+    # /ride and /spectate answer as upstream does for a lone player.
+    at = len(w.chat)
+    run_command('ride @s dismount')
+    wait(lambda: heard('commands.ride.not_riding', at), 'the not riding error')
+    st.hit('ride_not_riding')
+    run_command('gamemode spectator')
+    wait(lambda: w.mode == 3, 'spectator')
+    at = len(w.chat)
+    run_command('spectate @s')
+    wait(lambda: heard('commands.spectate.self', at), 'the cannot spectate yourself error')
+    st.hit('spectate_self')
+    at = len(w.chat)
+    run_command('spectate')
+    wait(lambda: heard('commands.spectate.success.stopped', at), 'the spectate stopped message')
+    st.hit('spectate_stopped')
+    run_command('gamemode survival')
+    wait(lambda: w.mode == 0, 'survival')
+
+
+def scoreboard_session(c, st, w, biomes, ctx, args):
+    """--scoreboard: /scoreboard, /trigger, /team, /bossbar, /worldborder, /tick and /data, over the wire, with the packets
+    each one makes. The bot must be an operator of level 4. This is the second half of --commands."""
+    def wait(cond, what, seconds=10.0):
+        pump(c, st, w, biomes, ctx, cond, what, seconds)
+
+    def run_command(line):
+        print('  /%s' % line, flush=True)
+        c.send(SB_CHAT_COMMAND, string(line))
+
+    def heard(fragment, since):
+        return any(fragment in said for said in w.chat[since:])
+
+    def event(kind, since, where=lambda e: True):
+        return next((e for e in w.events[since:] if e[0] == kind and where(e)), None)
+
+    def expect(kind, where=lambda e: True, what=None):
+        """Waits for a packet of this kind after now-ish, and returns it."""
+        wait(lambda: event(kind, base, where) is not None, what or kind)
+        return event(kind, base, where)
+
+    wait(lambda: w.pos is not None and ctx['chunk_parsed'], 'a position and a chunk', 40.0)
+    wait(lambda: w.window0 is not None and w.health is not None, 'the inventory and health')
+    wait(lambda: 'nodes' in COMMAND_TREE, 'the command tree')
+    names = sorted(COMMAND_TREE['nodes'][i]['name'] for i in COMMAND_TREE['nodes'][COMMAND_TREE['root']]['children'])
+    for wanted in ('scoreboard', 'team', 'bossbar', 'worldborder', 'tick', 'data', 'trigger'):
+        check(wanted in names, 'the root has no %s' % wanted)
+    me = args.name
+
+    # Objectives and scores: an objective is announced, then shown on the sidebar; /scoreboard players enable primes
+    # a trigger objective and sends its score, /trigger adds to it.
+    base = len(w.events)
+    run_command('scoreboard objectives add kills trigger Kill count')
+    e = expect('objective', what='the objective packet')
+    check(e[1:] == ('kills', 0), 'objective packet %r' % (e,))
+    st.hit('objective_added')
+    e = expect('display', what='the sidebar packet')
+    check(e[2] == 'kills', 'display packet %r' % (e,))
+    st.hit('sidebar_shown')
+    base = len(w.events)
+    run_command('scoreboard players enable %s kills' % me)
+    e = expect('score', what='the score packet from enable')
+    check(e[1:] == (me, 'kills', 0), 'enable score %r' % (e,))
+    st.hit('score_enabled')
+    base = len(w.events)
+    run_command('trigger kills add 3')
+    e = expect('score', what='the score packet from trigger')
+    check(e[1:] == (me, 'kills', 3), 'trigger score %r' % (e,))
+    st.hit('trigger_score')
+    at = len(w.chat)
+    run_command('trigger kills')
+    wait(lambda: heard('commands.trigger.failed.unprimed', at), 'the unprimed error')
+
+    # Teams: created with the packet's name, joined by the bot, then changed.
+    base = len(w.events)
+    run_command('team add red Red Team')
+    e = expect('team', lambda e: e[1] == 'red' and e[2] == 0, 'the team create packet')
+    st.hit('team_created')
+    base = len(w.events)
+    run_command('team join red %s' % me)
+    e = expect('team', lambda e: e[1] == 'red' and e[2] == 3, 'the team add-players packet')
+    check(e[3] == [me], 'team members %r' % (e,))
+    st.hit('team_joined')
+    base = len(w.events)
+    run_command('team modify red color red')
+    e = expect('team', lambda e: e[1] == 'red' and e[2] == 2, 'the team update packet')
+    check(e[6] == 12, 'team colour red is 12, got %r' % (e,))
+    st.hit('team_updated')
+    at = len(w.chat)
+    run_command('teammsg hello team')
+    wait(lambda: heard('hello team', at), 'the team message')
+
+    # Bossbar: nothing is sent until the bar has players; then it is added with its health.
+    base = len(w.events)
+    run_command('bossbar add test:bar "Dragon"')
+    wait(lambda: heard('commands.bossbar.create.success', 0), 'the bossbar create message')
+    run_command('bossbar set test:bar players %s' % me)
+    e = expect('boss', lambda e: e[2] == 0, 'the bossbar add packet')
+    st.hit('bossbar_added')
+    base = len(w.events)
+    run_command('bossbar set test:bar value 30')
+    e = expect('boss', lambda e: e[2] == 2, 'the bossbar health packet')
+    check(abs(e[3] - 0.3) < 1e-6, 'bossbar health %r' % (e,))
+    st.hit('bossbar_health')
+    base = len(w.events)
+    run_command('bossbar set test:bar name "Wither"')
+    expect('boss', lambda e: e[2] == 3, 'the bossbar title packet')
+    st.hit('bossbar_name')
+    at = len(w.chat)
+    run_command('bossbar list')
+    wait(lambda: heard('commands.bossbar.list.bars.some', at), 'the bossbar list')
+
+    # World border.
+    base = len(w.events)
+    run_command('worldborder set 200')
+    e = expect('border_size', what='the border size packet')
+    check(e[1] == 200.0, 'border size %r' % (e,))
+    st.hit('border_size')
+    base = len(w.events)
+    run_command('worldborder center 10.0 20.0')
+    e = expect('border_center', what='the border centre packet')
+    check(e[1:] == (10.0, 20.0), 'border centre %r' % (e,))
+    st.hit('border_center')
+    base = len(w.events)
+    run_command('worldborder set 100 5')
+    e = expect('border_lerp', what='the border lerp packet')
+    check(e[1:] == (200.0, 100.0, 5000), 'border lerp %r' % (e,))
+    st.hit('border_lerp')
+    run_command('worldborder set 59999968')
+
+    # Tick rate: the manager tells the client, and /tick query answers.
+    base = len(w.events)
+    run_command('tick rate 10')
+    e = expect('ticking', what='the ticking state packet')
+    check(e[1] == 10.0 and not e[2], 'ticking %r' % (e,))
+    st.hit('tick_rate')
+    base = len(w.events)
+    run_command('tick freeze')
+    e = expect('ticking', lambda e: e[2], 'the frozen ticking state')
+    st.hit('tick_frozen')
+    run_command('tick unfreeze')
+    run_command('tick rate 20')
+    wait(lambda: any(e[0] == 'ticking' and e[1] == 20.0 and not e[2] for e in w.events[base:]), 'the rate back to 20')
+    at = len(w.chat)
+    run_command('tick query')
+    wait(lambda: heard('commands.tick.query.rate.running', at), 'the tick query')
+    print('  said: %r' % w.chat[at:])
+    st.hit('tick_query')
+
+    # /data get entity: the player's own NBT, coloured.
+    at = len(w.chat)
+    run_command('data get entity %s' % me)
+    wait(lambda: heard('commands.data.entity.query', at), 'the data answer')
+    print('  said: %r' % w.chat[at:][0][:200])
+    st.hit('data_get_player')
+
+
 def commands_verify_session(c, st, w, biomes, ctx, args):
     """--commands-verify: on return, what the commands did is still there."""
     with open(args.commands_verify) as f:
@@ -1284,6 +1638,519 @@ def commands_verify_session(c, st, w, biomes, ctx, args):
     print('  health %.1f' % w.health[0])
     check(w.health[0] > 0.0, 'dead on return')
     st.hit('alive_on_return')
+
+
+
+BLOCK_TABLE = {}
+
+
+
+
+
+def load_block_table(path):
+
+    """blocks.json of the pinned upstream: state id ranges and item ids, so the bot can name what it sees."""
+
+    with open(path) as f:
+
+        blocks = json.load(f)['blocks']
+
+    BLOCK_TABLE['ranges'] = sorted((b['states'][0]['id'], len(b['states']), b['name'], b['default_state_id'], b.get('item_id'))
+
+                                   for b in blocks)
+
+    BLOCK_TABLE['by_name'] = {b['name']: b for b in blocks}
+
+
+
+
+
+def block_name(state):
+
+    if state is None:
+
+        return None
+
+    for first, count, name, default, item in BLOCK_TABLE['ranges']:
+
+        if first <= state < first + count:
+
+            return name
+
+    return '?%d' % state
+
+
+
+
+
+def blocks_session(c, st, w, biomes, ctx, args):
+
+    """--blocks: what blocks do, over the wire. The bot must be an operator of level 4, on a COPY of a world.
+
+
+
+    Builds a stone stage with /fill, then plays: a door placed (both halves arrive) and opened and closed; a lever, three
+
+    dust and a lamp, the lamp lighting when the lever is thrown and going dark when it is thrown back; a sand block placed
+
+    against a pillar with air under it, which falls; and, where the server has fluids, a water source that flows."""
+
+    def wait(cond, what, seconds=10.0):
+
+        pump(c, st, w, biomes, ctx, cond, what, seconds)
+
+
+
+    def settle(seconds=0.6):
+
+        """Keeps reading for a while: block updates are flushed on the server's tick."""
+
+        end = time.time() + seconds
+
+        while time.time() < end:
+
+            try:
+
+                pid, r = c.recv()
+
+            except socket.timeout:
+
+                continue
+
+            one_packet(c, st, w, biomes, ctx, pid, r)
+
+
+
+    def cmd(line):
+
+        print('  /%s' % line, flush=True)
+
+        c.send(SB_CHAT_COMMAND, string(line))
+
+
+
+    token = [0x7000]
+
+
+
+    def sync():
+
+        token[0] += 1
+
+        c.send(SB_PING, struct.pack('>q', token[0]))
+
+        t = token[0]
+
+        wait(lambda: t in w.pongs, 'a pong')
+
+
+
+    def item_of(name):
+
+        return BLOCK_TABLE['by_name'][name]['item_id']
+
+
+
+    def hold(name):
+
+        c.send(SB_CREATIVE, struct.pack('>h', 36) + write_slot(64, item_of(name)))
+
+        c.send(SB_CARRIED, struct.pack('>h', 0))
+
+        sync()
+
+
+
+    seq = [100]
+
+
+
+    def use_on(x, y, z, face, cursor=(0.5, 0.5, 0.5)):
+
+        seq[0] += 1
+
+        c.send(SB_USE_ON, varint(0) + block_pos(x, y, z) + varint(face) + struct.pack('>fff', *cursor) + bytes([0, 0]) +
+
+               varint(seq[0]))
+
+
+
+    def state_at(x, y, z):
+
+        return w.block(x, y, z)
+
+
+
+    def name_at(x, y, z):
+
+        return block_name(state_at(x, y, z))
+
+
+
+    wait(lambda: w.pos is not None and ctx['chunk_parsed'], 'a position and a chunk', 40.0)
+
+    wait(lambda: w.health is not None, 'health')
+
+    c.send(SB_CHANGE_GAME_MODE, varint(1))
+
+    wait(lambda: w.mode == 1, 'creative')
+
+    px, py, pz = int(w.pos[0] // 1), int(w.pos[1] // 1), int(w.pos[2] // 1)
+
+    wait(lambda: w.block(px, py - 1, pz) is not None, 'the chunk under the player', 30.0)
+
+
+
+    # The stage: 12 wide, 7 deep, stone floor one below the feet, clear above, then stand in the middle of its south edge.
+
+    sx, fy, sz = px + 2, py - 1, pz + 2
+
+    cmd('fill %d %d %d %d %d %d minecraft:air' % (sx - 1, fy + 1, sz - 1, sx + 12, fy + 8, sz + 7))
+
+    cmd('fill %d %d %d %d %d %d minecraft:stone' % (sx - 1, fy, sz - 1, sx + 12, fy, sz + 7))
+
+    cmd('tp @s %d %d %d' % (sx + 6, fy + 1, sz + 6))
+
+    wait(lambda: name_at(sx + 6, fy, sz + 6) == 'stone' and name_at(sx + 6, fy + 3, sz + 6) == 'air', 'the stage')
+
+    settle(1.0)
+
+    check(name_at(sx, fy, sz) == 'stone', 'the stage floor is %s' % name_at(sx, fy, sz))
+
+    print('  stage floor y=%d from %d,%d' % (fy, sx, sz), flush=True)
+
+
+
+    # --- A door: both halves, then open and shut.
+
+    dx, dz = sx + 1, sz + 1
+
+    hold('oak_door')
+
+    use_on(dx, fy, dz, 1, (0.5, 1.0, 0.5))
+
+    wait(lambda: name_at(dx, fy + 1, dz) == 'oak_door' and name_at(dx, fy + 2, dz) == 'oak_door', 'both halves of a door')
+
+    closed = (state_at(dx, fy + 1, dz), state_at(dx, fy + 2, dz))
+
+    print('  door: lower %s upper %s' % closed)
+
+    check(closed[0] != closed[1], 'the two halves of a door are the same state')
+
+    st.hit('door_placed')
+
+    hold('stone')
+
+    use_on(dx, fy + 1, dz, 3)  # right-click the door's south face with stone in hand: a door answers before the item
+
+    wait(lambda: state_at(dx, fy + 1, dz) != closed[0] and state_at(dx, fy + 2, dz) != closed[1], 'the door to open')
+
+    opened = (state_at(dx, fy + 1, dz), state_at(dx, fy + 2, dz))
+
+    print('  door opened: lower %s upper %s' % opened)
+
+    st.hit('door_opened')
+
+    use_on(dx, fy + 1, dz, 3)
+
+    wait(lambda: (state_at(dx, fy + 1, dz), state_at(dx, fy + 2, dz)) == closed, 'the door to close')
+
+    st.hit('door_closed')
+
+
+
+    # --- A lamp at the end of a dust line, fed by a lever.
+
+    ly = fy + 1
+
+    lx, lz = sx + 4, sz + 1
+
+    hold('lever')
+
+    use_on(lx, fy, lz, 1, (0.5, 1.0, 0.5))
+
+    wait(lambda: name_at(lx, ly, lz) == 'lever', 'a lever')
+
+    hold('redstone')
+
+    for i in (1, 2, 3):
+
+        use_on(lx + i, fy, lz, 1, (0.5, 1.0, 0.5))
+
+        wait(lambda i=i: name_at(lx + i, ly, lz) == 'redstone_wire', 'dust %d' % i)
+
+    hold('redstone_lamp')
+
+    use_on(lx + 4, fy, lz, 1, (0.5, 1.0, 0.5))
+
+    wait(lambda: name_at(lx + 4, ly, lz) == 'redstone_lamp', 'a lamp')
+
+    settle(0.5)
+
+    dark = state_at(lx + 4, ly, lz)
+
+    check(dark == BLOCK_TABLE['by_name']['redstone_lamp']['default_state_id'], 'the lamp is not in its default state')
+
+    print('  lever, 3 dust, lamp placed: lamp state %d (unlit)' % dark)
+
+    st.hit('lamp_line_placed')
+
+    hold('stone')
+
+    use_on(lx, ly, lz, 1)
+
+    wait(lambda: state_at(lx + 4, ly, lz) != dark, 'the lamp to light', 8.0)
+
+    print('  lever thrown: lamp state %d' % state_at(lx + 4, ly, lz))
+
+    st.hit('lamp_lit')
+
+    use_on(lx, ly, lz, 1)
+
+    wait(lambda: state_at(lx + 4, ly, lz) == dark, 'the lamp to go dark again', 8.0)
+
+    st.hit('lamp_dark')
+
+
+
+    # --- Sand placed against a pillar, with nothing under it.
+
+    px2, pz2 = sx + 9, sz + 4
+
+    cmd('fill %d %d %d %d %d %d minecraft:stone' % (px2, fy + 1, pz2, px2, fy + 4, pz2))
+
+    wait(lambda: name_at(px2, fy + 4, pz2) == 'stone', 'the pillar')
+
+    hold('sand')
+
+    use_on(px2, fy + 4, pz2, 5, (1.0, 0.5, 0.5))  # its east face: sand at px2+1, fy+4, in the air
+
+    sand_at = (px2 + 1, fy + 4, pz2)
+
+    wait(lambda: name_at(*sand_at) == 'sand', 'sand in the air')
+
+    print('  sand placed at %s' % (sand_at,), flush=True)
+
+    wait(lambda: name_at(*sand_at) == 'air', 'the sand to fall', 8.0)
+
+    wait(lambda: name_at(px2 + 1, fy + 1, pz2) == 'sand', 'the sand to land', 8.0)
+
+    print('  sand landed at %d %d %d' % (px2 + 1, fy + 1, pz2))
+
+    st.hit('sand_fell')
+
+    ctx['blocks_state'] = dict(door=[dx, fy + 1, dz, closed[0], closed[1]], lamp=[lx + 4, ly, lz, dark],
+
+                               sand=[px2 + 1, fy + 1, pz2])
+
+
+
+    # --- Water, where the server has fluids.
+
+    wx, wz = sx + 6, sz + 1
+
+    cmd('setblock %d %d %d minecraft:water' % (wx, fy + 1, wz))
+
+    wait(lambda: name_at(wx, fy + 1, wz) == 'water', 'water from /setblock')
+
+    settle(3.0)
+
+    spread = [(wx + i, fy + 1, wz + j) for i, j in ((1, 0), (-1, 0), (0, 1), (0, -1))]
+
+    flowed = [p for p in spread if name_at(*p) == 'water']
+
+    print('  water source placed; %d of 4 neighbours became water' % len(flowed))
+
+    check(len(flowed) == 4, 'the water did not flow: %d of 4 neighbours' % len(flowed))
+
+    st.hit('water_flowed')
+
+
+
+
+
+def blocks_verify_session(c, st, w, biomes, ctx, args):
+
+    """--blocks-verify FILE: after a restart, the door, the lamp and the sand are still in the chunk the server sends."""
+
+    with open(args.blocks_verify) as f:
+
+        saved = json.load(f)
+
+    door, lamp, sand = saved['door'], saved['lamp'], saved['sand']
+
+    pump(c, st, w, biomes, ctx, lambda: w.pos is not None and ctx['chunk_parsed'], 'a position and a chunk', 40.0)
+
+    pump(c, st, w, biomes, ctx, lambda: w.block(door[0], door[1], door[2]) is not None, 'the stage chunk', 30.0)
+
+    check(w.block(door[0], door[1], door[2]) == door[3] and w.block(door[0], door[1] + 1, door[2]) == door[4],
+
+          'the door: %s %s' % (block_name(w.block(door[0], door[1], door[2])), block_name(w.block(door[0], door[1] + 1, door[2]))))
+
+    check(w.block(lamp[0], lamp[1], lamp[2]) == lamp[3], 'the lamp is %s' % block_name(w.block(lamp[0], lamp[1], lamp[2])))
+
+    check(block_name(w.block(sand[0], sand[1], sand[2])) == 'sand', 'the sand is %s' % block_name(w.block(*sand)))
+
+    st.hit('blocks_persisted')
+
+
+PLAY_RESPAWN = 80
+ITEM_META_INDEX = 8
+
+
+def world_session(c, st, w, biomes, ctx, args):
+    """--world: the world systems over the wire. The bot must be an operator of level 4, on a COPY of a world.
+
+    1. Survival: a dirt block is placed with /setblock and broken as a player would; an item entity must appear on the
+       wire next to the block, carrying dirt (the drop: loot table, then `drop_stack`).
+    2. A nether portal: an obsidian frame and its portal blocks are placed with /fill, the bot is put inside and stays for
+       longer than the survival portal delay; the server must send a Respawn into the Nether, a position there at one
+       eighth of the overworld coordinates, and chunks that hold a portal block (the one it found or built).
+    3. Back in the world it joined, /time set night and a wait: mobs must be spawned in the chunks around, none of them
+       within 24 blocks of the bot, which is where natural spawning puts them."""
+    def wait(cond, what, seconds=10.0):
+        pump(c, st, w, biomes, ctx, cond, what, seconds)
+
+    def settle(seconds=0.6):
+        end = time.time() + seconds
+        while time.time() < end:
+            try:
+                pid, r = c.recv()
+            except socket.timeout:
+                continue
+            one_packet(c, st, w, biomes, ctx, pid, r)
+
+    def cmd(line):
+        print('  /%s' % line, flush=True)
+        c.send(SB_CHAT_COMMAND, string(line))
+
+    spawned = []     # (entity id, type, x, y, z)
+    respawns = []    # dimension names
+
+    def tap(pid, data):
+        r = Reader(data)
+        if pid == PLAY_ADD_ENTITY:
+            eid = r.varint()
+            r.take(16)
+            kind = r.varint()
+            spawned.append((eid, kind, r.f64(), r.f64(), r.f64()))
+        elif pid == PLAY_RESPAWN:
+            r.varint()
+            name = r.string()
+            respawns.append(name)
+            if name != 'minecraft:overworld':
+                ctx['sections'], w.min_y = 16, 0
+            else:
+                ctx['sections'], w.min_y = DEFAULT_SECTIONS, -64
+            w.chunks.clear()
+            w.overrides.clear()
+            w.pos = None
+    ctx['tap'] = tap
+
+    wait(lambda: w.pos is not None and ctx['chunk_parsed'], 'a position and a chunk', 60.0)
+    wait(lambda: w.health is not None, 'a health packet')
+    home = w.pos
+    print('  joined at %.2f %.2f %.2f' % home)
+    # Survival, so a break is a real break and the portal takes its delay.
+    cmd('gamemode survival')
+    wait(lambda: w.mode == 0, 'survival mode')
+    st.hit('world_survival')
+    x, y, z = int(home[0] // 1), int(home[1] // 1), int(home[2] // 1)
+
+    # 1. The drop.
+    bx, by, bz = x + 3, y, z
+    dirt = BLOCK_TABLE['by_name']['dirt']
+    cmd('setblock %d %d %d minecraft:dirt' % (bx, by, bz))
+    wait(lambda: w.block(bx, by, bz) == dirt['default_state_id'], 'the dirt block', 15.0)
+    st.hit('dirt_placed')
+    settle(0.5)
+    before = len(spawned)
+    meta_before = len(META_LOG)
+    seq = 31
+    c.send(SB_ACTION, varint(0) + block_pos(bx, by, bz) + bytes([1]) + varint(seq))
+    # The server counts the progress itself; a client that has seen it long enough says it is done.
+    end = time.time() + 12.0
+    stopped = False
+    started = time.time()
+    while time.time() < end and w.block(bx, by, bz) != 0:
+        try:
+            pid, r = c.recv()
+        except socket.timeout:
+            continue
+        one_packet(c, st, w, biomes, ctx, pid, r)
+        if time.time() > started + 2.0 and not stopped:
+            seq += 1
+            c.send(SB_ACTION, varint(2) + block_pos(bx, by, bz) + bytes([1]) + varint(seq))
+            stopped = True
+    check(w.block(bx, by, bz) == 0, 'the dirt block was not broken (state %r)' % w.block(bx, by, bz))
+    st.hit('dirt_broken')
+    wait(lambda: len(spawned) > before, 'an entity spawn for the drop', 10.0)
+    settle(0.5)
+    drops = [e for e in spawned[before:] if abs(e[2] - (bx + 0.5)) <= 0.75 and abs(e[4] - (bz + 0.5)) <= 0.75
+             and abs(e[3] - (by + 0.5)) <= 1.0]
+    print('  spawned after the break: %r' % (spawned[before:],))
+    check(drops, 'no entity spawned within a block of the broken dirt')
+    st.hit('drop_spawned')
+    drop_ids = set(e[0] for e in drops)
+    stacks = [m for m in META_LOG[meta_before:] if m[0] in drop_ids and m[1] == ITEM_META_INDEX]
+    print('  drop stacks: %r' % (stacks,))
+    check(stacks, 'the dropped entity carried no item stack metadata')
+    dirt_item = 28   # minecraft:dirt in 774's item registry (blocks.json's item_id, 55, is 26.2's numbering)
+    check(any(m[3] == (1, dirt_item) for m in stacks), 'the drop is not one dirt (item %d): %r' % (dirt_item, stacks))
+    st.hit('drop_item')
+
+    # 2. The nether portal, east of the bot, in the plane of constant z.
+    px, py, pz = x + 8, y, z + 6
+    cmd('fill %d %d %d %d %d %d minecraft:air' % (px - 1, py - 1, pz - 1, px + 2, py + 4, pz + 1))
+    settle(0.8)
+    cmd('fill %d %d %d %d %d %d minecraft:obsidian hollow' % (px - 1, py - 1, pz, px + 2, py + 3, pz))
+    settle(0.8)
+    cmd('fill %d %d %d %d %d %d minecraft:nether_portal' % (px, py, pz, px + 1, py + 2, pz))
+    # blocks.json is 26.2's numbering and the wire is 774's, so the portal is known by the state the server sent for it.
+    wait(lambda: w.block(px, py, pz) not in (None, 0), 'the portal blocks', 15.0)
+    settle(1.0)
+    portal_state = w.block(px, py, pz)
+    print('  chat: %r' % (w.chat[-3:],))
+    check(all(w.block(px + dx, py + dy, pz) == portal_state for dx in (0, 1) for dy in (0, 1, 2)),
+          'the portal broke up: %r' % ([w.block(px + dx, py + dy, pz) for dx in (0, 1) for dy in (0, 1, 2)],))
+    st.hit('portal_built')
+    nether_target = (px + 1.0, py, pz + 0.5)
+    cmd('tp @s %.1f %.1f %.1f' % nether_target)
+    wait(lambda: w.pos is not None and abs(w.pos[0] - nether_target[0]) < 0.5, 'the teleport into the portal', 10.0)
+    st.hit('portal_entered')
+    # Survival's delay is 80 ticks; the nether chunks are generated meanwhile.
+    wait(lambda: 'minecraft:the_nether' in respawns, 'a Respawn into the Nether', 240.0)
+    print('  respawns: %r' % (respawns,))
+    st.hit('nether_respawn')
+    wait(lambda: w.pos is not None, 'a position in the Nether', 60.0)
+    nx, ny, nz = w.pos
+    print('  in the Nether at %.2f %.2f %.2f (the portal was at %d %d %d)' % (nx, ny, nz, px, py, pz))
+    check(abs(nx - px / 8.0) <= 40 and abs(nz - pz / 8.0) <= 40, 'not at one eighth of the overworld coordinates')
+    st.hit('nether_position')
+
+    def portal_near():
+        fx, fy, fz = int(nx // 1), int(ny // 1), int(nz // 1)
+        for dx in range(-6, 7):
+            for dy in range(-4, 6):
+                for dz in range(-6, 7):
+                    if w.block(fx + dx, fy + dy, fz + dz) == portal_state:
+                        return True
+        return False
+    wait(portal_near, 'a nether portal block near the arrival', 120.0)
+    st.hit('nether_portal_found')
+
+    # 3. Night, and what spawns. Back home first: the Nether has its own mobs.
+    cmd('tp @s %.1f %.1f %.1f' % (home[0], home[1], home[2]))
+    mark = len(spawned)
+    cmd('time set night')
+    st.hit('night_set')
+    wait(lambda: len([e for e in spawned[mark:] if e[1] != 0]) > 0, 'mobs to spawn at night', 120.0)
+    mobs = spawned[mark:]
+    print('  spawned at night: %d entities, types %s' % (len(mobs), sorted(set(e[1] for e in mobs))))
+    for eid, kind, mx, my, mz in mobs:
+        d2 = (mx - w.pos[0]) ** 2 + (mz - w.pos[2]) ** 2
+        print('    entity %d type %d at %.1f %.1f %.1f (%.1f blocks)' % (eid, kind, mx, my, mz, d2 ** 0.5))
+    st.hit('mobs_spawned')
 
 
 def watch_session(c, st, w, biomes, ctx, args):
@@ -1318,8 +2185,20 @@ def run(args):
         extra = list(extra) + Stages.WATCH_NAMES
     if args.commands:
         extra = list(extra) + Stages.COMMAND_NAMES
+    if args.commands2:
+        extra = list(extra) + Stages.COMMANDS2_NAMES
+    if args.scoreboard:
+        extra = list(extra) + Stages.SCOREBOARD_NAMES
     if args.commands_verify:
         extra = list(extra) + Stages.COMMAND_VERIFY_NAMES
+    if args.blocks or args.blocks_verify or args.world:
+        load_block_table(args.assets)
+    if args.world:
+        extra = list(extra) + Stages.WORLD_NAMES
+    if args.blocks:
+        extra = list(extra) + Stages.BLOCKS_NAMES
+    if args.blocks_verify:
+        extra = list(extra) + Stages.BLOCKS_VERIFY_NAMES
     st = Stages(extra)
     status = status_ping(args.host, args.port)
     print('status: %s' % json.dumps(status))
@@ -1327,8 +2206,19 @@ def run(args):
     st.hit('status')
     online_before = status['players']['online']
 
+    fake = None
+    if args.online_offline:
+        fake = FakeSession(args.session_port)
+    expect_id = None
+    expect_props = 0
+    address = args.host
+    if args.proxy == 'bungee':
+        props = json.dumps([{'name': 'textures', 'value': 'dmFsdWU=', 'signature': 'c2ln'}])
+        address = '\x00'.join([args.host, args.proxy_ip, args.proxy_uuid, props])
+        expect_id = bytes.fromhex(args.proxy_uuid)
+        expect_props = 1
     c = Conn(args.host, args.port)
-    c.send(0, handshake(args.host, args.port, 2))
+    c.send(0, handshake(address, args.port, 2))
     uuid = bytes(16)
     c.send(SB_LOGIN_HELLO, string(args.name) + uuid)
     print('offline uuid of %s: %s' % (args.name, offline_uuid(args.name).hex()))
@@ -1343,11 +2233,14 @@ def run(args):
             if args.expect_refusal and args.expect_refusal in reason:
                 print('  refused as expected: %s' % reason)
                 c.close()
+                if fake is not None:
+                    print('  session server was asked %d times: %s' % (len(fake.seen), fake.seen))
+                    fake.stop()
                 st.names = list(st.reached)
                 return st
             raise Fail('login refused: %s' % reason)
         if pid == LOGIN_HELLO:
-            check(args.encrypt, 'the server asked for encryption')
+            check(args.encrypt or args.online_offline, 'the server asked for encryption')
             r.string()
             der = r.take(r.varint())
             token = r.take(r.varint())
@@ -1358,10 +2251,30 @@ def run(args):
             print('  encryption: a %d-bit key, exponent %d, online=%s' % (n.bit_length(), e, authenticate))
             check(n.bit_length() == 1024 and e == 65537, 'not the key vanilla makes')
             secret = os.urandom(16)
+            if args.online_offline:
+                check(authenticate, 'an online server must ask for authentication')
+                if not args.no_register:
+                    fake.expected[args.name] = mc_digest(b'', secret, der)
+                expect_id = bytes.fromhex(FakeSession.PROFILE_ID)
+                expect_props = 1
             first = rsa_encrypt(n, e, secret)
             second = rsa_encrypt(n, e, token)
             c.send(SB_LOGIN_KEY, varint(len(first)) + first + varint(len(second)) + second)
             c.enc, c.dec = AesCfb8(secret), AesCfb8(secret)
+            continue
+        if pid == 4 and args.proxy == 'velocity':
+            message_id = r.varint()
+            channel = r.string()
+            data = r.take(r.left())
+            check(channel == 'velocity:player_info', 'plugin request channel %r' % channel)
+            check(data == b'\x04', 'the highest forwarding version asked for: %r' % data)
+            print('  velocity asked for forwarding up to version 4')
+            body = varint(4) + string(args.proxy_ip) + bytes.fromhex(args.proxy_uuid) + string(args.name) + varint(1) \
+                + string('textures') + string('dmFsdWU=') + b'\x01' + string('c2ln')
+            sig = hmac.new(args.proxy_secret.encode(), body, hashlib.sha256).digest()
+            c.send(2, varint(message_id) + b'\x01' + sig + body)
+            expect_id = bytes.fromhex(args.proxy_uuid)
+            expect_props = 1
             continue
         if pid == LOGIN_COMPRESSION:
             c.threshold = r.varint()
@@ -1369,14 +2282,23 @@ def run(args):
             st.hit('compression')
             continue
         if pid == LOGIN_FINISHED:
-            r.take(16)
+            got_id = r.take(16)
             name = r.string()
             check(name == args.name, 'login success for %r' % name)
+            if expect_id is not None:
+                check(got_id == expect_id, 'login success for uuid %s, wanted %s' % (got_id.hex(), expect_id.hex()))
+            props = 0
             for _ in range(r.varint()):
                 r.string()
                 r.string()
                 if r.boolean():
                     r.string()
+                props += 1
+            if expect_id is not None:
+                check(props == expect_props, 'login success carried %d properties, wanted %d' % (props, expect_props))
+            if fake is not None:
+                check(len(fake.seen) >= 1, 'the session server was never asked')
+                print('  session server was asked: %s' % fake.seen[-1])
             check(r.left() == 0, 'trailing bytes in login success: %d' % r.left())
             st.hit('login_success')
             c.send(SB_LOGIN_ACK)
@@ -1460,8 +2382,18 @@ def run(args):
             verify_session(c, st, w, biomes, ctx, args)
         if args.commands:
             commands_session(c, st, w, biomes, ctx, args)
+        if args.commands2:
+            commands2_session(c, st, w, biomes, ctx, args)
+        if args.scoreboard:
+            scoreboard_session(c, st, w, biomes, ctx, args)
         elif args.commands_verify:
             commands_verify_session(c, st, w, biomes, ctx, args)
+        if args.world:
+            world_session(c, st, w, biomes, ctx, args)
+        if args.blocks:
+            blocks_session(c, st, w, biomes, ctx, args)
+        elif args.blocks_verify:
+            blocks_verify_session(c, st, w, biomes, ctx, args)
         if args.far_chunk:
             far_session(c, st, w, biomes, ctx, args)
         if args.watch:
@@ -1475,6 +2407,9 @@ def run(args):
     except (ConnectionError, OSError) as e:
         raise Fail('connection lost %.1fs into play: %s' % (time.time() - start, e))
     counts, chunks, keep_alives = ctx['counts'], ctx['chunks'], ctx['keep_alives']
+    if args.blocks and args.save:
+        with open(args.save, 'w') as f:
+            json.dump(ctx['blocks_state'], f)
     if args.play and args.save:
         with open(args.save, 'w') as f:
             json.dump(dict(placed_at=ctx['placed_at'], walked_to=ctx['walked_to']), f)
@@ -1492,6 +2427,259 @@ def run(args):
     return st
 
 
+# --- Network services: RCON, query, status, proxies and online mode ---------------------------------------------------------
+
+def mc_digest(*parts):
+    """Minecraft's signed-hex SHA-1, as the session server's serverId."""
+    h = hashlib.sha1()
+    for part in parts:
+        h.update(part)
+    n = int.from_bytes(h.digest(), 'big', signed=True)
+    return format(n, 'x')
+
+
+class FakeSession:
+    """Stands in for sessionserver.mojang.com on a local port: answers hasJoined with a canned profile for exactly the
+    (username, serverId) pairs the bot registered, 204 for any other. `seen` holds every request path."""
+    PROFILE_ID = '069a79f444e94726a5befca90e38aaf5'
+
+    def __init__(self, port):
+        import threading
+        from http.server import BaseHTTPRequestHandler, HTTPServer
+        from urllib.parse import urlparse, parse_qs
+        outer = self
+        self.expected = {}
+        self.seen = []
+        self.texture = base64.b64encode(json.dumps({
+            'timestamp': 0, 'profileId': self.PROFILE_ID, 'profileName': 'x',
+            'textures': {'SKIN': {'url': 'http://textures.minecraft.net/texture/abc'}}}).encode()).decode()
+
+        class H(BaseHTTPRequestHandler):
+            def do_GET(self):
+                u = urlparse(self.path)
+                q = parse_qs(u.query)
+                outer.seen.append(self.path)
+                user = q.get('username', [''])[0]
+                sid = q.get('serverId', [''])[0]
+                if u.path != '/session/minecraft/hasJoined' or outer.expected.get(user) != sid:
+                    self.send_response(204)
+                    self.end_headers()
+                    return
+                body = json.dumps({'id': outer.PROFILE_ID, 'name': user,
+                                   'properties': [{'name': 'textures', 'value': outer.texture, 'signature': 'c2ln'}]}).encode()
+                self.send_response(200)
+                self.send_header('Content-Type', 'application/json')
+                self.send_header('Content-Length', str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, *a):
+                pass
+
+        self.httpd = HTTPServer(('127.0.0.1', port), H)
+        threading.Thread(target=self.httpd.serve_forever, daemon=True).start()
+
+    def stop(self):
+        self.httpd.shutdown()
+
+
+def rcon_packet(pid, ptype, body):
+    data = struct.pack('<ii', pid, ptype) + body.encode() + b'\x00\x00'
+    return struct.pack('<i', len(data)) + data
+
+
+def rcon_read(sock):
+    head = b''
+    while len(head) < 4:
+        chunk = sock.recv(4 - len(head))
+        check(chunk, 'the RCON connection closed')
+        head += chunk
+    size = struct.unpack('<i', head)[0]
+    check(10 <= size <= 4096, 'an RCON packet of size %d' % size)
+    data = b''
+    while len(data) < size:
+        chunk = sock.recv(size - len(data))
+        check(chunk, 'the RCON connection closed mid-packet')
+        data += chunk
+    pid, ptype = struct.unpack('<ii', data[:8])
+    check(data[-2:] == b'\x00\x00', 'an RCON packet without its two terminating zeros')
+    return pid, ptype, data[8:-2].decode()
+
+
+def rcon_session(args):
+    """RCON: a wrong password is answered with id -1 and the connection closes; the right one is answered with the request
+    id; a command is answered with type 0 output under its own id, and every command is answered."""
+    host, port = args.host, args.rcon
+    # Wrong password.
+    s = socket.create_connection((host, port), timeout=10)
+    s.sendall(rcon_packet(11, 3, 'definitely-wrong'))
+    pid, ptype, body = rcon_read(s)
+    check((pid, ptype) == (-1, 2), 'a wrong password was answered with id %d type %d' % (pid, ptype))
+    print('RCON wrong password: refused with id -1')
+    s.settimeout(5)
+    check(s.recv(1) == b'', 'the connection stayed open after a wrong password')
+    s.close()
+    # A command before logging in is not answered, and not run.
+    s = socket.create_connection((host, port), timeout=10)
+    s.sendall(rcon_packet(12, 2, args.rcon_command))
+    s.settimeout(1.0)
+    try:
+        got = s.recv(1)
+        check(got == b'', 'a command before auth was answered')
+    except socket.timeout:
+        pass
+    s.close()
+    # The right password, then commands, one packet and several in one write.
+    s = socket.create_connection((host, port), timeout=10)
+    s.sendall(rcon_packet(21, 3, args.rcon_password))
+    pid, ptype, body = rcon_read(s)
+    check((pid, ptype, body) == (21, 2, ''), 'auth answered with %r' % ((pid, ptype, body),))
+    print('RCON auth ok')
+    s.sendall(rcon_packet(22, 2, args.rcon_command))
+    pid, ptype, body = rcon_read(s)
+    check(pid == 22 and ptype == 0, 'a command answered with id %d type %d' % (pid, ptype))
+    check(body != '', 'the command printed nothing')
+    print('RCON %r -> %r' % (args.rcon_command, body))
+    wire = rcon_packet(23, 2, args.rcon_command) + rcon_packet(24, 2, args.rcon_command)
+    s.sendall(wire[:7])
+    time.sleep(0.2)
+    s.sendall(wire[7:])
+    first = rcon_read(s)
+    check(first[0] == 23 and first[1] == 0, 'split write: first answer %r' % (first,))
+    # Further output lines of the first command come before the second command's answer.
+    answers = [first]
+    while answers[-1][0] != 24:
+        answers.append(rcon_read(s))
+    check(answers[-1][0] == 24, 'the second command was never answered')
+    print('RCON split and pipelined writes ok (%d answer packets)' % len(answers))
+    # A command that prints nothing still gets an answer.
+    if args.rcon_silent:
+        s.sendall(rcon_packet(25, 2, args.rcon_silent))
+        pid, ptype, body = rcon_read(s)
+        check(pid == 25 and ptype == 0, 'a silent command was answered with id %d' % pid)
+        print('RCON silent command answered with an empty packet')
+    # An invalid length closes the connection.
+    s.sendall(struct.pack('<i', 4))
+    s.settimeout(5)
+    check(s.recv(1) == b'', 'an invalid packet length did not close the connection')
+    s.close()
+    print('RCON invalid length closes the connection')
+    st = Stages([])
+    st.names = ['rcon_ok']
+    st.hit('rcon_ok')
+    return st
+
+
+def query_stat(s, addr, session, token, full):
+    pkt = struct.pack('>HBii', 0xFEFD, 0, session, token) + (b'\x00\x00\x00\x00' if full else b'')
+    s.sendto(pkt, addr)
+    data, _ = s.recvfrom(4096)
+    return data
+
+
+def query_session(args):
+    """Query (GameSpy4 over UDP): handshake for a challenge token, then the basic and the full status."""
+    addr = (args.host, args.query)
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    s.settimeout(5)
+    session = 0x01020304
+    s.sendto(struct.pack('>HBi', 0xFEFD, 9, session), addr)
+    data, _ = s.recvfrom(4096)
+    check(data[0] == 9 and struct.unpack('>i', data[1:5])[0] == session and data[-1] == 0, 'handshake answer %r' % data)
+    token = int(data[5:-1].decode())
+    check(0 < token <= 0x7FFFFFFF, 'challenge token %d' % token)
+    print('query handshake: token %d' % token)
+    # A status with a token that was not handed out is not answered.
+    s.settimeout(1.5)
+    try:
+        query_stat(s, addr, session, token + 1, False)
+        raise Fail('a status with a made-up token was answered')
+    except socket.timeout:
+        pass
+    s.settimeout(5)
+    data = query_stat(s, addr, session, token, False)
+    check(data[0] == 0 and struct.unpack('>i', data[1:5])[0] == session, 'basic status header %r' % data[:5])
+    fields = data[5:].split(b'\x00')
+    motd, gametype, world, online, maxp = [f.decode() for f in fields[:5]]
+    skip = 5 + sum(len(f) + 1 for f in fields[:5])
+    port_le = struct.unpack('<H', data[skip:skip + 2])[0]
+    ip = data[skip + 2:].split(b'\x00')[0].decode()
+    print('query basic: motd=%r gametype=%s map=%s players=%s/%s port=%d ip=%s' % (motd, gametype, world, online, maxp, port_le, ip))
+    check(gametype == 'SMP' and world != '' and online.isdigit() and maxp.isdigit(), 'basic status fields')
+    if args.query_motd is not None:
+        check(motd == args.query_motd, 'motd %r, wanted %r' % (motd, args.query_motd))
+    data = query_stat(s, addr, session, token, True)
+    check(data[0] == 0 and data[5:16] == bytes([0x73, 0x70, 0x6C, 0x69, 0x74, 0x6E, 0x75, 0x6D, 0, 0x80, 0]), 'full status padding')
+    tail = data[16:]
+    marker = bytes([0x00, 0x01, 0x70, 0x6C, 0x61, 0x79, 0x65, 0x72, 0x5F, 0x00, 0x00])
+    at = tail.index(marker)
+    kv = tail[:at].split(b'\x00')
+    pairs = {kv[i].decode(): kv[i + 1].decode() for i in range(0, len(kv) - 1, 2)}
+    players = [p.decode() for p in tail[at + len(marker):].split(b'\x00') if p]
+    print('query full: %s players=%s' % (pairs, players))
+    check(pairs['gametype'] == 'SMP' and pairs['game_id'] == 'MINECRAFT', 'full status keys')
+    check(pairs['numplayers'] == online and pairs['maxplayers'] == maxp and pairs['hostport'] == str(port_le), 'full and basic disagree')
+    check(len(players) <= 4 and (args.query_players is None or players == args.query_players.split(',')), 'players %r' % players)
+    # Garbage and a wrong magic are not answered.
+    s.sendto(b'\xDE\xAD\x09\x00\x00\x00\x01', addr)
+    s.settimeout(1.5)
+    try:
+        s.recvfrom(4096)
+        raise Fail('a packet with the wrong magic was answered')
+    except socket.timeout:
+        pass
+    print('query ignores a wrong magic')
+    s.close()
+    st = Stages([])
+    st.names = ['query_ok']
+    st.hit('query_ok')
+    return st
+
+
+def favicon_check(status):
+    """A status response's favicon: a data URL of a 64x64 PNG."""
+    icon = status.get('favicon')
+    check(isinstance(icon, str) and icon.startswith('data:image/png;base64,'), 'no favicon in the status: %r' % (icon if not icon else icon[:30]))
+    png = base64.b64decode(icon.split(',', 1)[1])
+    check(png[:8] == b'\x89PNG\r\n\x1a\n', 'the favicon is not a PNG')
+    w, h = struct.unpack('>II', png[16:24])
+    check((w, h) == (64, 64), 'the favicon is %dx%d' % (w, h))
+    return len(png)
+
+
+def status_session(args):
+    """The status's favicon, and its player sample while a bot is in the game: a thread pings after the bot has joined."""
+    import threading
+    box = {}
+
+    def later():
+        time.sleep(args.status_delay)
+        try:
+            box['status'] = status_ping(args.host, args.port)
+        except Exception as e:  # reported after the join
+            box['error'] = e
+    t = threading.Thread(target=later)
+    t.start()
+    st = run(args)
+    t.join()
+    check('error' not in box, 'the status ping failed: %r' % box.get('error'))
+    status = box['status']
+    print('status while %s is online: %s' % (args.name, json.dumps(status)[:200]))
+    size = favicon_check(status)
+    print('favicon: a 64x64 PNG of %d bytes' % size)
+    sample = status['players'].get('sample', [])
+    names = [p['name'] for p in sample]
+    check(args.name in names, 'the sample %r lacks %s' % (names, args.name))
+    entry = [p for p in sample if p['name'] == args.name][0]
+    check(entry['id'].replace('-', '') == offline_uuid(args.name).hex() or args.online_offline or args.proxy,
+          'the sample id %r is not the offline uuid' % entry['id'])
+    check(status['players']['online'] >= 1, 'online count %r' % status['players'])
+    st.names = list(st.names) + ['status_favicon', 'status_sample']
+    st.hit('status_favicon')
+    st.hit('status_sample')
+    return st
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--host', default='127.0.0.1')
@@ -1503,16 +2691,45 @@ def main():
     ap.add_argument('--save', help='where --play writes what --verify checks')
     ap.add_argument('--verify', help='a file from --save: check it is all still there')
     ap.add_argument('--commands', action='store_true', help='run real commands as an operator; see commands_session')
+    ap.add_argument('--commands2', action='store_true', help='run /clone, /place, /item, /spreadplayers, /rotate, /fillbiome, /loot, /ride and /spectate; see commands2_session')
+    ap.add_argument('--scoreboard', action='store_true', help='run the scoreboard, team, bossbar, border, tick and data commands; see scoreboard_session')
     ap.add_argument('--commands-verify', help='a file from --commands --save: check what the commands did is still there')
+    ap.add_argument('--world', action='store_true', help='drops, a nether portal and night spawns as an operator; see world_session')
+    ap.add_argument('--blocks', action='store_true', help='play with blocks as an operator; see blocks_session')
+    ap.add_argument('--blocks-verify', help='a file from --blocks --save: check the door, lamp and sand are still there')
+    ap.add_argument('--assets', default=os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '..', 'ref', 'pumpkin-1.21.11', 'assets', 'blocks.json'), help='blocks.json of the pinned upstream, for --blocks')
     ap.add_argument('--watch', action='store_true', help='watch another player play')
     ap.add_argument('--encrypt', action='store_true', help='answer the encryption request; stops once in play')
     ap.add_argument('--expect-refusal', help='wants a login disconnect containing this')
     ap.add_argument('--dimension', help='wants CLogin to name this dimension')
     ap.add_argument('--far-chunk', type=lambda v: tuple(int(n) for n in v.split(',')), help='X,Z: walk so far this must generate')
+    ap.add_argument('--rcon', type=int, help='RCON port: test auth and commands against it; see rcon_session')
+    ap.add_argument('--rcon-password', default='secret')
+    ap.add_argument('--rcon-command', default='list')
+    ap.add_argument('--rcon-silent', help='a command that prints nothing, which must still be answered')
+    ap.add_argument('--query', type=int, help='query (UDP) port: handshake, basic and full status; see query_session')
+    ap.add_argument('--query-motd', help='the motd the query must report')
+    ap.add_argument('--query-players', help='comma separated names the full status must list')
+    ap.add_argument('--status', action='store_true', help='join, and check the status holds a favicon and the player sample')
+    ap.add_argument('--status-delay', type=float, default=6.0, help='seconds after the start that --status pings')
+    ap.add_argument('--online-offline', action='store_true', help='an online-mode server whose session server is --session-port here')
+    ap.add_argument('--session-port', type=int, help='the port the server was told to reach the session server on')
+    ap.add_argument('--no-register', action='store_true', help='with --online-offline: do not tell the session server we joined')
+    ap.add_argument('--proxy', choices=['bungee', 'velocity'], help='log in as a proxy forwards a player; see run')
+    ap.add_argument('--proxy-secret', default='sekret')
+    ap.add_argument('--proxy-uuid', default='069a79f444e94726a5befca90e38aaf5')
+    ap.add_argument('--proxy-ip', default='203.0.113.9')
     args = ap.parse_args()
     st = Stages()
     try:
-        st = run(args)
+        if args.rcon:
+            st = rcon_session(args)
+        elif args.query:
+            st = query_session(args)
+        elif args.status:
+            st = status_session(args)
+        else:
+            st = run(args)
     except (Fail, OSError, ValueError, KeyError, zlib.error, json.JSONDecodeError) as e:
         print('FAIL: %s: %s' % (type(e).__name__, e))
         return 1

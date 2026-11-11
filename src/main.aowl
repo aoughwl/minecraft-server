@@ -1,20 +1,37 @@
 ## Port of pumpkin/src/main.rs
-## PARTIAL: pumpkin/src/main.rs - reads a world folder and a port from the command line rather than configuration files, and has no console, logger or crash handler. A console interrupt saves and stops, as upstream's `STOP_INTERRUPT` does.
 ##
-## The server's network-transport entrypoint. Everything it does is in src/server/pumpkinlib.aowl and what that
-## drives; src/server/servercore.aowl stays the seam for an in-process host.
+## The server's entrypoint. Everything it does is in src/server/pumpkinlib.aowl and what that drives; src/server/servercore.aowl
+## stays the seam for an in-process host.
 ##
-##     main --world:<save folder> [--port:<port>] [--encryption] [--online] [--max-seconds:<n>]
+##     main [--dir:<server folder>] [--config:<folder with pumpkin.toml>] [--world:<save folder>] [--port:<port>]
+##          [--online | --offline] [--encryption] [--max-seconds:<n>]
 ##
-## Offline mode by default. `--encryption` turns the login's cipher on, offline. `--online` asks for Mojang's check, which
-## is a clean refusal for now (src/server/net/java/login.aowl). `--max-seconds` saves and stops after that long, for tests.
+## Like upstream, it reads `pumpkin.toml` from the server's folder (the current directory, or `--dir`), writing the
+## defaults when there is none, and fills in what an older file lacks. The save is `default_level_name` inside that folder,
+## made new when it is not there. Logging, the crash report and the console interrupt are the same as upstream's: see
+## src/server/logging.aowl, crash.aowl and pumpkinlib.aowl.
+##
+## `--world:` and `--port:` are the interface the test drivers use, and they start a server with no `pumpkin.toml`: when a
+## command line has either and there is no file, the server runs on built-in settings that are offline, unencrypted and write
+## no log file, and says so, instead of creating a config whose online mode would turn the drivers' offline bots away.
+## `--config:` or a `pumpkin.toml` that exists always wins.
 
-import std/[os, syncio]
+import std/[os, syncio, options]
+from std/paths import path, Path
+import std/dirs
+import auth/winhttp
 import server/net/winsock
+import server/net/authentication
+import protocol/java/server/handshake/handshakemod
 import config/lib as configlib
-import server/[serverbase, servermod, pumpkinlib]
+import config/logging as logconfig
+import server/[serverbase, servermod, pumpkinlib, logging, crash]
+import util/javaversion
 
-const DefaultPort = 25565'u16
+const
+  DefaultPort = 25565'u16
+  ServerVersionText = "0.1.0"
+  Usage = "usage: main [--dir:<folder>] [--config:<folder>] [--world:<save>] [--port:<n>] [--online|--offline] [--encryption] [--max-seconds:<n>]"
 
 proc parsePort(s: string): (bool, uint16) =
   var n = 0
@@ -31,53 +48,148 @@ proc parsePort(s: string): (bool, uint16) =
 proc startsWith(s, prefix: string): bool =
   s.len >= prefix.len and s[0 ..< prefix.len] == prefix
 
+type Options = object
+  dir: string
+  configDir: string
+  world: string
+  port: int          ## -1: the config's
+  online: bool
+  offline: bool
+  encryption: bool
+  maxSeconds: int
+  legacy: bool       ## `--world:` or `--port:` was given.
+
 proc runMain(): int =
-  var world = "world"
-  var port = DefaultPort
-  var encryption = false
-  var online = false
-  var maxSeconds = 0
+  installCrashHandler()
+  let startedAt = nowMs()
+  var opts = Options(dir: "", configDir: "", world: "", port: -1, online: false, offline: false, encryption: false,
+    maxSeconds: 0, legacy: false)
   for i in 1 .. paramCount():
     let arg = paramStr(i)
-    if startsWith(arg, "--world:"):
-      world = arg[8 ..< arg.len]
+    if startsWith(arg, "--dir:"):
+      opts.dir = arg[6 ..< arg.len]
+    elif startsWith(arg, "--config:"):
+      opts.configDir = arg[9 ..< arg.len]
+    elif startsWith(arg, "--world:"):
+      opts.world = arg[8 ..< arg.len]
+      opts.legacy = true
     elif startsWith(arg, "--port:"):
       let (ok, p) = parsePort(arg[7 ..< arg.len])
       if not ok:
         echo "FATAL: bad port ", arg
         return 1
-      port = p
+      opts.port = int(p)
+      opts.legacy = true
     elif arg == "--encryption":
-      encryption = true
+      opts.encryption = true
     elif arg == "--online":
-      online = true
-      encryption = true
+      opts.online = true
+      opts.encryption = true
+    elif arg == "--offline":
+      opts.offline = true
     elif startsWith(arg, "--max-seconds:"):
       let (ok, seconds) = parsePort(arg[14 ..< arg.len])
       if not ok:
         echo "FATAL: bad duration ", arg
         return 1
-      maxSeconds = int(seconds)
+      opts.maxSeconds = int(seconds)
+    elif arg == "--help" or arg == "-h":
+      echo Usage
+      return 0
     else:
       echo "FATAL: unknown argument ", arg
+      echo Usage
       return 1
 
-  let basic = defaultBasicConfiguration()
-  var advanced = defaultAdvancedConfiguration()
-  advanced.networking.java.onlineMode = online
-  advanced.networking.java.encryption = encryption
+  if opts.dir.len > 0:
+    try:
+      setCurrentDir(path(opts.dir))
+    except ErrorCode:
+      echo "FATAL: cannot enter the server folder ", opts.dir
+      return 1
 
-  let loaded = loadServer(basic, advanced, world)
+  # The configuration: `PumpkinConfig::load(&exec_dir)`.
+  let configDir = if opts.configDir.len > 0: opts.configDir else: "."
+  let haveFile = fileExists(configDir & "/" & ConfigFileName)
+  var config = defaultPumpkinConfig()
+  var noticeText = ""
+  if haveFile or opts.configDir.len > 0 or not opts.legacy:
+    let loaded = loadPumpkinConfig(configDir)
+    if not loaded.ok:
+      echo "FATAL: ", loaded.err
+      return 1
+    config = loaded.config
+    if loaded.created:
+      noticeText = "Created " & ConfigFileName & " with the default settings in " & configDir
+    elif loaded.changed:
+      noticeText = ConfigFileName & " changed because values were missing. The missing values were filled with default values."
+    if loaded.warning.len > 0:
+      noticeText = noticeText & " (" & loaded.warning & ")"
+  else:
+    config.advanced.networking.java.onlineMode = false
+    config.advanced.networking.java.encryption = false
+    config.advanced.logging.file = ""
+    config.basic.allowChatReports = false
+    noticeText = "No " & ConfigFileName & " here and --world/--port given: running on the test settings (offline, unencrypted)."
+  var basic = config.basic
+  var advanced = config.advanced
+  if opts.online:
+    advanced.networking.java.onlineMode = true
+  if opts.offline:
+    advanced.networking.java.onlineMode = false
+    basic.allowChatReports = false
+  if opts.encryption:
+    advanced.networking.java.encryption = true
+
+  initLogger(advanced.logging)
+  info("Starting \x1b[33maowlmony Minecraft server\x1b[0m \x1b[32m" & ServerVersionText & "\x1b[0m Minecraft (Protocol \x1b[34m" &
+    $WireTargetMcVersion.protocolVersion() & "\x1b[0m)")
+  if noticeText.len > 0:
+    info(noticeText)
+  if not advanced.networking.java.enabled:
+    error("networking.java.enabled is false: this server has only the Java Edition listener")
+    closeLogger()
+    return 1
+  if not advanced.networking.java.onlineMode:
+    warn("Online mode is off: players are not checked against Mojang, and anyone can join under any name.")
+  if advanced.networking.proxy.enabled and advanced.networking.proxy.bungeecord.enabled:
+    maxServerAddress = 4096
+
+  let worldFolder = if opts.world.len > 0: opts.world else: getWorldPath(basic)
+  let loaded = loadServer(basic, advanced, worldFolder)
   let server = loaded.server
   if server == nil:
-    echo "FATAL: ", loaded.error
+    error(loaded.error)
+    closeLogger()
     return 1
-  if maxSeconds > 0:
-    server.stopAtMs = nowMs() + int64(maxSeconds) * 1000'i64
+  if basic.allowChatReports and advanced.networking.java.onlineMode:
+    let configured = server.authTransport
+    let keys = if configured == nil: fetchMojangPublicKeys(newWinHttpTransport(), advanced.networking.java.authentication)
+               else: fetchMojangPublicKeys(configured, advanced.networking.java.authentication)
+    if keys.ok:
+      server.mojangPublicKeys = keys.keys
+    else:
+      error("Failed to fetch Mojang keys: " & keys.error.message)
+  if opts.maxSeconds > 0:
+    server.stopAtMs = nowMs() + int64(opts.maxSeconds) * 1000'i64
   installStopHandler(server)
-  if not serverLoop(server, port):
+  info("Started server; took \x1b[33m" & $(nowMs() - startedAt) & "ms\x1b[0m")
+
+  var port = advanced.networking.java.address.port
+  if opts.port >= 0:
+    port = uint16(opts.port)
+  elif port == 0'u16:
+    port = DefaultPort
+  let address = advanced.networking.java.address
+  if address.isV6:
+    error("The Java Edition address is IPv6; this server listens on IPv4 only")
+    closeLogger()
     return 1
-  0
+  let ip = ipv4(int(address.ip[0]), int(address.ip[1]), int(address.ip[2]), int(address.ip[3]))
+  let ran = serverLoop(server, port, ip)
+  info("\x1b[31mThe server has stopped.\x1b[0m")
+  closeLogger()
+  if ran: 0 else: 1
 
 when isMainModule:
   quit(runMain())

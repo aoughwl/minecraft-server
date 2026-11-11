@@ -1,0 +1,279 @@
+## Port of pumpkin/src/logging.rs, and `init_logger` of pumpkin/src/lib.rs
+## PARTIAL: pumpkin/src/logging.rs - no line editor (rustyline's `ReadlineLogWrapper`) and no tab completion (`PumpkinCommandCompleter`): the console is read by commandbridge.aowl's `pumpConsole`. The plugin log macros are not here (no plugins).
+##
+## Upstream sets `tracing_subscriber`'s fmt layer on stdout and a `GzipRollingLogger` on the file. The console line is
+## what that layer prints with `with_target(true)`, and with `threads` on `with_thread_names` and `with_thread_ids`:
+##
+##     2026-11-11 14:55:00  INFO main ThreadId(01) pumpkin: Server is now running
+##
+## the time in local time, the level right-aligned to five, ANSI colours when `color` is on. The file gets `[INFO] text`
+## with the colour codes taken out, into `logs/<file>`; an older `latest.log` is gzipped into `logs/<date>-<n>.log.gz`
+## when the logger starts, and again when the UTC day turns over. The level comes from `RUST_LOG` (`error`..`trace`,
+## `off`), `info` otherwise. This server has one thread, so the thread is always `main`, `ThreadId(01)`.
+##
+## `formatConsoleLine`, `formatFileLine`, `stripAnsi` and `newGzFilename` are pure, so a test pins them.
+
+import std/[os, syncio, envvars]
+from std/paths import path, Path
+import std/dirs
+import ../config/logging
+import ../nbt/zlibgz
+
+const MaxAttempts* = 1000
+
+var logDir* = "logs"
+  ## `LOG_DIR`. A variable so a test can point the logger at a scratch folder.
+
+type
+  LogLevel* = enum
+    llError
+    llWarn
+    llInfo
+    llDebug
+    llTrace
+      ## Ordered so that `level <= filter` means the line is shown.
+
+  LogFilter* = enum
+    lfOff
+    lfError
+    lfWarn
+    lfInfo
+    lfDebug
+    lfTrace
+
+  DateTime* = object
+    year*, month*, day*, hour*, minute*, second*: int
+
+  Logger = object
+    enabled: bool
+    color: bool
+    threads: bool
+    timestamp: bool
+    filter: LogFilter
+    file: File
+    fileOpen: bool
+    fileName: string
+    currentDay: int
+
+type SystemTime = object
+  year, month, dayOfWeek, day, hour, minute, second, millis: uint16
+
+proc getLocalTime(t: ptr SystemTime) {.stdcall, importc: "GetLocalTime", dynlib: "kernel32.dll".}
+proc getSystemTime(t: ptr SystemTime) {.stdcall, importc: "GetSystemTime", dynlib: "kernel32.dll".}
+
+var logger = Logger(enabled: false, color: false, threads: false, timestamp: false, filter: lfInfo, fileOpen: false,
+  fileName: "", currentDay: 0)
+
+proc localNow*(): DateTime =
+  var t = SystemTime()
+  getLocalTime(addr t)
+  DateTime(year: int(t.year), month: int(t.month), day: int(t.day), hour: int(t.hour), minute: int(t.minute), second: int(t.second))
+
+proc utcNow*(): DateTime =
+  var t = SystemTime()
+  getSystemTime(addr t)
+  DateTime(year: int(t.year), month: int(t.month), day: int(t.day), hour: int(t.hour), minute: int(t.minute), second: int(t.second))
+
+proc pad2*(v: int): string =
+  if v < 10: "0" & $v else: $v
+
+proc levelName*(level: LogLevel): string =
+  case level
+  of llError: "ERROR"
+  of llWarn: "WARN"
+  of llInfo: "INFO"
+  of llDebug: "DEBUG"
+  of llTrace: "TRACE"
+
+proc parseFilter*(text: string): (bool, LogFilter) =
+  ## `LevelFilter::from_str`: a name in any case, or a number 0 (off) to 5 (trace).
+  var lower = ""
+  for c in text:
+    lower.add(if c >= 'A' and c <= 'Z': char(ord(c) + 32) else: c)
+  case lower
+  of "off", "0": (true, lfOff)
+  of "error", "1": (true, lfError)
+  of "warn", "2": (true, lfWarn)
+  of "info", "3": (true, lfInfo)
+  of "debug", "4": (true, lfDebug)
+  of "trace", "5": (true, lfTrace)
+  else: (false, lfInfo)
+
+proc shown*(filter: LogFilter; level: LogLevel): bool =
+  ## Whether `filter` lets a line of this level through.
+  ord(filter) > ord(lfOff) and ord(level) + 1 <= ord(filter)
+
+proc levelColor(level: LogLevel): string =
+  case level
+  of llError: "\x1b[31m"
+  of llWarn: "\x1b[33m"
+  of llInfo: "\x1b[32m"
+  of llDebug: "\x1b[34m"
+  of llTrace: "\x1b[35m"
+
+proc formatConsoleLine*(time: DateTime; showTime, color, threads: bool; level: LogLevel; target, message: string): string =
+  ## What the fmt layer prints for one event.
+  const Reset = "\x1b[0m"
+  const Dim = "\x1b[2m"
+  result = ""
+  if showTime:
+    let stamp = $time.year & "-" & pad2(time.month) & "-" & pad2(time.day) & " " & pad2(time.hour) & ":" &
+      pad2(time.minute) & ":" & pad2(time.second)
+    result.add(if color: Dim & stamp & Reset else: stamp)
+    result.add(' ')
+  var name = levelName(level)
+  while name.len < 5:
+    name = " " & name
+  result.add(if color: levelColor(level) & name & Reset else: name)
+  result.add(' ')
+  if threads:
+    result.add("main ThreadId(01) ")
+  if color:
+    result.add(Dim & target & Reset & Dim & ":" & Reset & " ")
+  else:
+    result.add(target & ": ")
+  result.add(message)
+
+proc stripAnsi*(s: string): string =
+  ## `remove_ansi_color_code`: ESC and everything up to the next letter.
+  result = ""
+  var i = 0
+  while i < s.len:
+    if s[i] == '\x1b':
+      inc i
+      while i < s.len:
+        let c = s[i]
+        inc i
+        if (c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z'):
+          break
+    else:
+      result.add(s[i])
+      inc i
+
+proc formatFileLine*(level: LogLevel; message: string): string =
+  ## `writeln!(data.file, "[{level}] {clean_message}")`
+  "[" & levelName(level) & "] " & stripAnsi(message)
+
+proc dateStamp*(t: DateTime): string =
+  $t.year & "-" & pad2(t.month) & "-" & pad2(t.day)
+
+proc yesterday*(t: DateTime): DateTime =
+  ## One calendar day back, which `new_filename(true)` names the rolled file after.
+  var r = t
+  if r.day > 1:
+    r.day -= 1
+    return r
+  if r.month == 1:
+    return DateTime(year: r.year - 1, month: 12, day: 31, hour: r.hour, minute: r.minute, second: r.second)
+  let prev = r.month - 1
+  var days = 31
+  if prev == 4 or prev == 6 or prev == 9 or prev == 11:
+    days = 30
+  elif prev == 2:
+    let leap = (r.year mod 4 == 0 and r.year mod 100 != 0) or r.year mod 400 == 0
+    days = if leap: 29 else: 28
+  DateTime(year: r.year, month: prev, day: days, hour: r.hour, minute: r.minute, second: r.second)
+
+proc newGzFilename*(t: DateTime; taken: proc(path: string): bool {.closure.}): string =
+  ## `new_filename`: the first `logs/<date>-<id>.log.gz` that does not exist, for ids 1 to 1000. Upstream then overwrites
+  ## the oldest; this takes the last id.
+  let date = dateStamp(t)
+  for id in 1 .. MaxAttempts:
+    let name = logDir & "/" & date & "-" & $id & ".log.gz"
+    if not taken(name):
+      return name
+  logDir & "/" & date & "-" & $MaxAttempts & ".log.gz"
+
+proc gzipLatest(latestPath: string; day: DateTime): bool =
+  ## Rolls `latest_path` into a gzip named for the day it holds.
+  var content = ""
+  try:
+    content = readFile(latestPath)
+  except ErrorCode:
+    return false
+  var bytes = newSeq[byte](content.len)
+  for i in 0 ..< content.len:
+    bytes[i] = byte(content[i])
+  let packed = gzipCompressBytes(bytes)
+  if not packed.ok:
+    return false
+  let target = newGzFilename(day, proc(path: string): bool {.closure.} = fileExists(path))
+  var text = newString(packed.data.len)
+  for i in 0 ..< packed.data.len:
+    text[i] = char(packed.data[i])
+  try:
+    writeFile(target, text)
+    removeFile(path(latestPath))
+  except ErrorCode:
+    return false
+  true
+
+proc openLatest(): bool =
+  logger.fileOpen = open(logger.file, logDir & "/" & logger.fileName, fmWrite)
+  logger.fileOpen
+
+proc rotateLog() =
+  ## `rotate_log`, when the UTC day has changed.
+  let now = utcNow()
+  if logger.fileOpen:
+    flushFile(logger.file)
+    close(logger.file)
+    logger.fileOpen = false
+  discard gzipLatest(logDir & "/" & logger.fileName, yesterday(now))
+  discard openLatest()
+  logger.currentDay = now.day
+
+proc filterFromEnvironment*(): LogFilter =
+  let raw = getEnv("RUST_LOG")
+  if raw.len == 0:
+    return lfInfo
+  let (ok, filter) = parseFilter(raw)
+  if ok: filter else: lfInfo
+
+proc initLogger*(config: LoggingConfig) =
+  ## `init_logger`. Without `enabled` nothing is printed at all, as upstream's subscriber is never installed.
+  logger.enabled = config.enabled
+  logger.color = config.color
+  logger.threads = config.threads
+  logger.timestamp = config.timestamp
+  logger.filter = filterFromEnvironment()
+  if not config.enabled or config.file.len == 0:
+    return
+  let made = tryCreateFinalDir(path(logDir))
+  if made != Success and made != NameExists:
+    echo "Failed to initialize file logger."
+    return
+  logger.fileName = config.file
+  let latest = logDir & "/" & config.file
+  if fileExists(latest):
+    echo "Found existing log file at '", latest, "', gzipping it now..."
+    discard gzipLatest(latest, yesterday(utcNow()))
+  if not openLatest():
+    echo "Failed to initialize file logger."
+    return
+  logger.currentDay = utcNow().day
+
+proc closeLogger*() =
+  if logger.fileOpen:
+    flushFile(logger.file)
+    close(logger.file)
+    logger.fileOpen = false
+
+proc log*(level: LogLevel; target, message: string) =
+  ## One `tracing` event.
+  if not logger.enabled or not shown(logger.filter, level):
+    return
+  let line = formatConsoleLine(localNow(), logger.timestamp, logger.color, logger.threads, level, target, message)
+  echo line
+  stdout.flushFile()
+  if logger.fileOpen:
+    logger.file.write(formatFileLine(level, message) & "\n")
+    flushFile(logger.file)
+    if utcNow().day != logger.currentDay:
+      rotateLog()
+
+proc info*(message: string; target: string = "pumpkin") = log(llInfo, target, message)
+proc warn*(message: string; target: string = "pumpkin") = log(llWarn, target, message)
+proc error*(message: string; target: string = "pumpkin") = log(llError, target, message)
+proc debug*(message: string; target: string = "pumpkin") = log(llDebug, target, message)
+proc trace*(message: string; target: string = "pumpkin") = log(llTrace, target, message)
