@@ -1,0 +1,169 @@
+## Port of pumpkin/src/net/rcon/packet.rs and pumpkin/src/net/rcon/mod.rs
+##
+## Source RCON over TCP: a client sends type 3 (auth) with the password, then type 2 (exec) with a command; the server
+## answers an auth with type 2 (id -1 for a wrong password, then closes) and a command with type 0 output. Packets are
+## little-endian: length, id, type, body, two zero bytes. Upstream's `ServerboundPacket::from_i32` maps 2 to a command
+## and everything else to an auth, which is kept.
+##
+## Upstream gives each connection a task. Here `pumpRcon` is called from the server loop and never blocks: it accepts, reads
+## what has arrived, answers, and the loop goes on. The command runs inside that call, on the loop's thread, so it sees the
+## world between ticks. Where upstream sends nothing for a command that printed nothing, one empty `Output` packet is sent,
+## because RCON clients wait for an answer to every command (vanilla sends one).
+
+import std/options
+import ../../config/networking/rcon
+import ../logging
+import winsock
+import rconpacket
+
+const ReadBufferSize = 1460
+
+type
+  RconExec* = proc(line: string): seq[string] {.closure.}
+    ## Runs one command as the RCON sender and answers the lines it printed: the server's glue gives it.
+
+  RconClient* = ref object
+    socket: SocketHandle
+    address: string
+    loggedIn: bool
+    incoming: seq[byte]
+    outgoing: seq[byte]
+    closed: bool
+    closedPasses: int
+
+  RconServer* = ref object
+    listener: SocketHandle
+    password: string
+    config: RCONConfig
+    clients: seq[RconClient]
+    readBuffer: seq[byte]
+
+# --- The server ------------------------------------------------------------------------------------------------------
+
+const RconTarget = "pumpkin::net::rcon"
+
+proc startRcon*(config: RCONConfig): nil RconServer =
+  ## The bind half of `RCONServer::run`. Nil when the address cannot be used; upstream unwraps and dies.
+  if config.address.isV6:
+    error("RCON cannot listen on an IPv6 address", RconTarget)
+    return nil
+  let ip = ipv4(int(config.address.ip[0]), int(config.address.ip[1]), int(config.address.ip[2]), int(config.address.ip[3]))
+  let listener = listenOnNonBlockingAt(ip, config.address.port)
+  if int(listener) == int(InvalidSocket):
+    error("Could not bind RCON on port " & $config.address.port, RconTarget)
+    return nil
+  RconServer(listener: listener, password: config.password, config: config, clients: @[], readBuffer: newSeq[byte](ReadBufferSize))
+
+proc rconPort*(rs: RconServer): uint16 =
+  ## The port actually bound (what a test that asked for 0 needs).
+  udpLocalPort(rs.listener)
+
+proc send(client: RconClient; ptype: RconClientboundType; id: int32; body: string) =
+  let buf = rconWriteBuf(ptype, id, body)
+  for b in buf:
+    client.outgoing.add(b)
+
+proc flush(client: RconClient) =
+  var sent = 0
+  while sent < client.outgoing.len:
+    let n = trySend(client.socket, client.outgoing, sent)
+    if n == WouldBlock:
+      break
+    if n == SocketClosed:
+      client.closed = true
+      sent = client.outgoing.len   # the peer is gone: nothing more can be sent
+      break
+    sent += n
+  if sent > 0:
+    client.outgoing = client.outgoing[sent ..< client.outgoing.len]
+
+proc poll(rs: RconServer; exec: RconExec; client: RconClient) =
+  ## `RCONClient::poll`: one packet, if a whole one has arrived.
+  let parsed = rconDeserialize(client.incoming)
+  case parsed.kind
+  of rpkNeedMore:
+    return
+  of rpkInvalidLength, rpkMissingNullTerminator, rpkInvalidBody:
+    error("RCON error: " & (case parsed.kind
+      of rpkInvalidLength: "Invalid length"
+      of rpkMissingNullTerminator: "Missing packet lull terminator"
+      else: "Invalid packet string body"), RconTarget)
+    client.closed = true
+    return
+  of rpkPacket:
+    discard
+  let packet = parsed.packet
+  case packet.ptype
+  of rstAuth:
+    if packet.body == rs.password:
+      client.send(rctAuthResponse, packet.id, "")
+      if rs.config.logging.loggedSuccessfully:
+        info("RCON (" & client.address & "): Client logged in successfully", RconTarget)
+      client.loggedIn = true
+    else:
+      if rs.config.logging.wrongPassword:
+        info("RCON (" & client.address & "): Client tried the wrong password", RconTarget)
+      client.send(rctAuthResponse, -1'i32, "")
+      client.closed = true
+  of rstExecCommand:
+    if client.loggedIn:
+      let output = exec(packet.body)
+      if output.len == 0:
+        client.send(rctOutput, packet.id, "")
+      for line in output:
+        if rs.config.logging.commands:
+          info("RCON (" & client.address & "): " & line, RconTarget)
+        client.send(rctOutput, packet.id, line)
+
+proc pumpRcon*(rs: nil RconServer; exec: RconExec) =
+  ## Accepts, reads, answers and drops the closed. Called every pass of the loop.
+  if rs == nil:
+    return
+  while true:
+    let socket = tryAccept(rs.listener)
+    if int(socket) == int(InvalidSocket):
+      break
+    if rs.config.maxConnections != 0'u32 and uint32(rs.clients.len) >= rs.config.maxConnections:
+      closeClient(socket)
+      continue
+    rs.clients.add(RconClient(socket: socket, address: peerIp(socket), loggedIn: false, incoming: @[], outgoing: @[],
+      closed: false, closedPasses: 0))
+  var kept: seq[RconClient] = @[]
+  for client in rs.clients:
+    if not client.closed:
+      while true:
+        let n = tryRecv(client.socket, rs.readBuffer)
+        if n == WouldBlock:
+          break
+        if n == SocketClosed:
+          client.closed = true
+          break
+        for i in 0 ..< n:
+          client.incoming.add(rs.readBuffer[i])
+      # Whole packets, as many as have arrived. A close after an answer still sends that answer.
+      var guard = 0
+      while not client.closed and client.incoming.len >= 4 and guard < 64:
+        let before = client.incoming.len
+        poll(rs, exec, client)
+        inc guard
+        if client.incoming.len == before:
+          break
+    client.flush()
+    if client.closed:
+      inc client.closedPasses
+    # A last answer the kernel has not taken yet gets some passes more, then the connection goes anyway.
+    if client.closed and (client.outgoing.len == 0 or client.closedPasses > 500):
+      if rs.config.logging.quit:
+        info("RCON (" & client.address & "): Closed connection", RconTarget)
+      closeClient(client.socket)
+    else:
+      kept.add(client)
+  rs.clients = kept
+
+proc stopRcon*(rs: nil RconServer) =
+  if rs == nil:
+    return
+  for client in rs.clients:
+    closeClient(client.socket)
+  rs.clients = @[]
+  closeClient(rs.listener)

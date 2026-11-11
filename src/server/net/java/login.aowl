@@ -1,16 +1,19 @@
 ## Port of pumpkin/src/net/java/login.rs
-## PARTIAL: pumpkin/src/net/java/login.rs - `encryption` works end to end, with or without `online_mode`. With `online_mode`, `authenticate` is a clean refusal after the cipher is on: it needs an HTTP client with TLS to reach Mojang's session server (GET https://sessionserver.mojang.com/session/minecraft/hasJoined?username=..&serverId=<digest>), which src/auth/client.aowl cannot give yet, since ../requests does not compile (a seq literal inside a const array) and links curl-impersonate only for Linux. No proxy logins. Upstream does not compare the verify token the client echoes, and neither does this.
+## PARTIAL: pumpkin/src/net/java/login.rs - online mode asks Mojang's session server (src/auth/winhttp.aowl, ../authentication.aowl) from inside the loop, so a slow answer holds up every client for up to the config's `connect_timeout` plus `read_timeout`; upstream's await only holds the one connection. Upstream does not compare the verify token the client echoes, and neither does this. Unlike upstream, a failed session check ends the login there instead of carrying on after the kick.
 
 import std/[options, syncio]
 import ../../../protocol/java/client/config/[add_resource_pack, server_links, known_packs, plugin_message]
 import ../../../protocol/java/client/login/[encryption_request, login_success, set_compression]
-import ../../../protocol/java/server/login/[encryption_response, login_start, cookie_response]
+import ../../../protocol/java/server/login/[encryption_response, login_start, cookie_response, plugin_response]
 import ../../../protocol/uuid
 import ../../../generated/translation as tr
 import ../../../util/text/text
 import ../../../config/networking/compression
 import ../../connection_cache
+import ../../../auth/winhttp
 import ../../key_store
+import ../authentication
+import ../proxy
 import ../../serverbase
 import ../../servermod
 import javamod
@@ -44,6 +47,22 @@ proc handleLoginStart*(self: JavaClient; server: Server; loginStart: SLoginStart
 
   if not isValidPlayerName(loginStart.name):
     self.kick(text("Invalid characters in username"))
+    return
+
+  # Behind a proxy the player's identity is the proxy's to give: Velocity is asked over a login plugin message, which
+  # `handleLoginPluginResponse` reads; BungeeCord's is already in the handshake's server address.
+  let proxy = server.advancedConfig.networking.proxy
+  if proxy.enabled:
+    if proxy.velocity.enabled:
+      let (_, messageId) = newV4()
+      self.writePacketFor(velocityRequest(int32(messageId.lo and 0x7FFFFFFF'u64)))
+    elif proxy.bungeecord.enabled:
+      let forwarded = bungeecordLogin(self.peerIp, self.serverAddress, loginStart.name)
+      if forwarded.ok:
+        self.finishLogin(forwarded.profile)
+        self.gameprofile = some(forwarded.profile)
+      else:
+        self.kick(text(forwarded.error.message))
     return
 
   let java = server.advancedConfig.networking.java
@@ -94,14 +113,34 @@ proc handleEncryptionResponse*(self: JavaClient; server: Server; encryptionRespo
   if self.gameprofile.isNone:
     self.kick(text("No `GameProfile`"))
     return
-  let profile = self.gameprofile.unsafeGet
+  let profile0 = self.gameprofile.unsafeGet
 
+  var profile = profile0
   if server.advancedConfig.networking.java.onlineMode:
-    # `authenticate`: see the PARTIAL line. A client that cannot be verified is not let in.
-    echo "Refusing ", profile.name, ": online mode needs Mojang's session server, and there is no HTTP client yet. ",
-      "Their server hash would be ", store.getDigest(secret)
-    self.kick(translateCross(tr.JAVA_MULTIPLAYER_DISCONNECT_AUTHSERVERS_DOWN, tr.JAVA_MULTIPLAYER_DISCONNECT_AUTHSERVERS_DOWN))
-    return
+    # `authenticate`: the session server's say-so, then the profile's actions and textures. Upstream carries on after a
+    # failed check, having kicked; that is not done here.
+    let authConfig = server.advancedConfig.networking.java.authentication
+    let hash = store.getDigest(secret)
+    var found = AuthResult(ok: false, profile: profile, error: authError(aeFailedResponse))
+    let configured = server.authTransport
+    if configured == nil:
+      found = authenticate(newWinHttpTransport(), profile.name, hash, self.peerIp, authConfig)
+    else:
+      found = authenticate(configured, profile.name, hash, self.peerIp, authConfig)
+    var checked = found
+    if found.ok:
+      checked = checkProfile(found.profile, authConfig)
+    if not checked.ok:
+      case checked.error.kind
+      of aeFailedResponse:
+        self.kick(translateCross(tr.JAVA_MULTIPLAYER_DISCONNECT_AUTHSERVERS_DOWN, tr.JAVA_MULTIPLAYER_DISCONNECT_AUTHSERVERS_DOWN))
+      of aeUnverifiedUsername:
+        self.kick(translateCross(tr.JAVA_MULTIPLAYER_DISCONNECT_UNVERIFIED_USERNAME, tr.JAVA_MULTIPLAYER_DISCONNECT_UNVERIFIED_USERNAME))
+      else:
+        self.kick(text(checked.error.message))
+      return
+    profile = checked.profile
+    self.gameprofile = some(profile)
 
   # Do not allow duplicate UUIDs or a duplicate username.
   if server.getPlayerByUuid(profile.id).isSome or server.getPlayerByName(profile.name).isSome:
@@ -109,6 +148,18 @@ proc handleEncryptionResponse*(self: JavaClient; server: Server; encryptionRespo
     return
 
   self.finishLogin(profile)
+
+proc handleLoginPluginResponse*(self: JavaClient; server: Server; response: SLoginPluginResponse) =
+  ## `handle_plugin_response`: the proxy's answer to `velocityRequest`.
+  let velocity = server.advancedConfig.networking.proxy.velocity
+  if velocity.enabled:
+    let forwarded = receiveVelocityPluginResponse(0'u16, velocity, response.hasData, response.data)
+    if forwarded.ok:
+      self.finishLogin(forwarded.profile)
+      self.gameprofile = some(forwarded.profile)
+      self.peerIp = forwarded.address
+    else:
+      self.kick(text(forwarded.error.message))
 
 proc handleLoginCookieResponse*(self: JavaClient; packet: SLoginCookieResponse) =
   discard

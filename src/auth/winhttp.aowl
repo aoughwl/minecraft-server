@@ -1,0 +1,209 @@
+## A small std-only HTTP/HTTPS client over WinHTTP (winhttp.dll, always present on Windows).
+##
+## It replaces ../requests (curl-impersonate, Linux only) for what the server needs: GET a URL, read the status and
+## the body, with a timeout. TLS is WinHTTP's, with the system's certificate checks left on. The proxy is the
+## system's default. `HttpTransport` is the seam: `newWinHttpTransport()` goes to the network, `newFakeTransport` is
+## the stand-in for tests, and `get` on either one answers an `HttpResponse`. No exceptions: a transport failure is
+## `ok == false` with `error` set, and a server's own answer (any status) is `ok == true`.
+
+const WinHttpDll = "winhttp.dll"
+
+type
+  HttpResponse* = object
+    ok*: bool          ## The exchange finished; `status` and `body` are the server's.
+    status*: int
+    body*: string
+    error*: string
+
+  HttpGetProc* = proc(url: string; connectMs, readMs: int): HttpResponse {.closure.}
+
+  HttpTransport* = ref object
+    getFn*: HttpGetProc
+    urls*: seq[string]     ## Every URL asked for, for tests.
+
+  ParsedUrl* = object
+    ok*: bool
+    secure*: bool
+    host*: string
+    port*: int
+    path*: string          ## With the query, never empty.
+
+const
+  WinHttpFlagSecure = 0x00800000'u32
+  WinHttpQueryStatusCode = 19'u32
+  WinHttpQueryFlagNumber = 0x20000000'u32
+  WinHttpDefaultProxy = 0'u32
+
+proc winHttpOpen(agent: ptr uint16; accessType: uint32; proxy, bypass: nil ptr uint16; flags: uint32): nil pointer
+  {.stdcall, importc: "WinHttpOpen", dynlib: WinHttpDll.}
+proc winHttpConnect(session: pointer; server: ptr uint16; port: uint16; reserved: uint32): nil pointer
+  {.stdcall, importc: "WinHttpConnect", dynlib: WinHttpDll.}
+proc winHttpOpenRequest(connect: pointer; verb, path: ptr uint16; version, referrer: nil ptr uint16; accept: nil pointer;
+    flags: uint32): nil pointer {.stdcall, importc: "WinHttpOpenRequest", dynlib: WinHttpDll.}
+proc winHttpSetTimeouts(h: pointer; resolveMs, connectMs, sendMs, receiveMs: int32): int32
+  {.stdcall, importc: "WinHttpSetTimeouts", dynlib: WinHttpDll.}
+proc winHttpSendRequest(req: pointer; headers: nil ptr uint16; headersLen: uint32; optional: nil pointer;
+    optionalLen, totalLen: uint32; context: uint): int32
+  {.stdcall, importc: "WinHttpSendRequest", dynlib: WinHttpDll.}
+proc winHttpReceiveResponse(req: pointer; reserved: nil pointer): int32
+  {.stdcall, importc: "WinHttpReceiveResponse", dynlib: WinHttpDll.}
+proc winHttpQueryHeaders(req: pointer; level: uint32; name: nil ptr uint16; buffer: pointer; length: ptr uint32;
+    index: nil pointer): int32 {.stdcall, importc: "WinHttpQueryHeaders", dynlib: WinHttpDll.}
+proc winHttpReadData(req: pointer; buffer: pointer; toRead: uint32; read: ptr uint32): int32
+  {.stdcall, importc: "WinHttpReadData", dynlib: WinHttpDll.}
+proc winHttpCloseHandle(h: pointer): int32 {.stdcall, importc: "WinHttpCloseHandle", dynlib: WinHttpDll.}
+proc winHttpGetLastError(): uint32 {.stdcall, importc: "GetLastError", dynlib: "kernel32.dll".}
+
+proc toWide(s: string): seq[uint16] =
+  ## UTF-8 to UTF-16 with a terminating zero. A malformed sequence becomes U+FFFD.
+  result = @[]
+  var i = 0
+  while i < s.len:
+    let c = uint32(ord(s[i]))
+    var cp = 0xFFFD'u32
+    var n = 1
+    if c < 0x80'u32:
+      cp = c
+    elif c >= 0xC2'u32 and c < 0xE0'u32 and i + 1 < s.len:
+      cp = ((c and 0x1F'u32) shl 6) or (uint32(ord(s[i + 1])) and 0x3F'u32)
+      n = 2
+    elif c >= 0xE0'u32 and c < 0xF0'u32 and i + 2 < s.len:
+      cp = ((c and 0x0F'u32) shl 12) or ((uint32(ord(s[i + 1])) and 0x3F'u32) shl 6) or (uint32(ord(s[i + 2])) and 0x3F'u32)
+      n = 3
+    elif c >= 0xF0'u32 and c < 0xF5'u32 and i + 3 < s.len:
+      cp = ((c and 0x07'u32) shl 18) or ((uint32(ord(s[i + 1])) and 0x3F'u32) shl 12) or
+        ((uint32(ord(s[i + 2])) and 0x3F'u32) shl 6) or (uint32(ord(s[i + 3])) and 0x3F'u32)
+      n = 4
+    if cp >= 0x10000'u32:
+      let v = cp - 0x10000'u32
+      result.add(uint16(0xD800'u32 + (v shr 10)))
+      result.add(uint16(0xDC00'u32 + (v and 0x3FF'u32)))
+    else:
+      result.add(uint16(cp))
+    i += n
+  result.add(0'u16)
+
+proc parseUrl*(url: string): ParsedUrl =
+  ## `http://host[:port]/path?query` and the `https` form. No userinfo, no fragment.
+  var rest = ""
+  result = ParsedUrl(ok: false, secure: false, host: "", port: 0, path: "/")
+  if url.len > 8 and url[0 ..< 8] == "https://":
+    result.secure = true
+    result.port = 443
+    rest = url[8 ..< url.len]
+  elif url.len > 7 and url[0 ..< 7] == "http://":
+    result.port = 80
+    rest = url[7 ..< url.len]
+  else:
+    return
+  var hostEnd = rest.len
+  for i in 0 ..< rest.len:
+    if rest[i] == '/' or rest[i] == '?':
+      hostEnd = i
+      break
+  var hostPort = rest[0 ..< hostEnd]
+  if hostEnd < rest.len:
+    result.path = if rest[hostEnd] == '?': "/" & rest[hostEnd ..< rest.len] else: rest[hostEnd ..< rest.len]
+  var colon = -1
+  for i in 0 ..< hostPort.len:
+    if hostPort[i] == ':':
+      colon = i
+  if colon >= 0:
+    var n = 0
+    if colon + 1 >= hostPort.len:
+      return
+    for i in colon + 1 ..< hostPort.len:
+      let d = ord(hostPort[i]) - ord('0')
+      if d < 0 or d > 9:
+        return
+      n = n * 10 + d
+      if n > 65535:
+        return
+    result.port = n
+    hostPort = hostPort[0 ..< colon]
+  if hostPort.len == 0:
+    return
+  result.host = hostPort
+  result.ok = true
+
+proc failure(msg: string): HttpResponse =
+  HttpResponse(ok: false, status: 0, body: "", error: msg)
+
+proc winHttpGet*(url: string; connectMs, readMs: int): HttpResponse =
+  ## One GET. `connectMs` bounds name resolution, connecting and sending; `readMs` bounds waiting for the answer.
+  let u = parseUrl(url)
+  if not u.ok:
+    return failure("bad url " & url)
+  var agent = toWide("aowlmony-minecraft-server")
+  let session = winHttpOpen(addr agent[0], WinHttpDefaultProxy, nil, nil, 0'u32)
+  if session == nil:
+    return failure("WinHttpOpen failed " & $winHttpGetLastError())
+  var host = toWide(u.host)
+  let conn = winHttpConnect(session, addr host[0], uint16(u.port), 0'u32)
+  if conn == nil:
+    let e = winHttpGetLastError()
+    discard winHttpCloseHandle(session)
+    return failure("WinHttpConnect failed " & $e)
+  var verb = toWide("GET")
+  var path = toWide(u.path)
+  let req = winHttpOpenRequest(conn, addr verb[0], addr path[0], nil, nil, nil,
+    if u.secure: WinHttpFlagSecure else: 0'u32)
+  if req == nil:
+    let e = winHttpGetLastError()
+    discard winHttpCloseHandle(conn)
+    discard winHttpCloseHandle(session)
+    return failure("WinHttpOpenRequest failed " & $e)
+  discard winHttpSetTimeouts(req, int32(connectMs), int32(connectMs), int32(connectMs), int32(readMs))
+  var res = failure("")
+  if winHttpSendRequest(req, nil, 0'u32, nil, 0'u32, 0'u32, 0'u) == 0'i32:
+    res = failure("WinHttpSendRequest failed " & $winHttpGetLastError())
+  elif winHttpReceiveResponse(req, nil) == 0'i32:
+    res = failure("WinHttpReceiveResponse failed " & $winHttpGetLastError())
+  else:
+    var status = 0'u32
+    var size = 4'u32
+    if winHttpQueryHeaders(req, WinHttpQueryStatusCode or WinHttpQueryFlagNumber, nil, addr status, addr size, nil) == 0'i32:
+      res = failure("WinHttpQueryHeaders failed " & $winHttpGetLastError())
+    else:
+      var body = ""
+      var buf = newSeq[byte](8192)
+      var failed = false
+      while true:
+        var got = 0'u32
+        if winHttpReadData(req, addr buf[0], 8192'u32, addr got) == 0'i32:
+          res = failure("WinHttpReadData failed " & $winHttpGetLastError())
+          failed = true
+          break
+        if got == 0'u32:
+          break
+        for i in 0 ..< int(got):
+          body.add(char(buf[i]))
+        if body.len > 16 * 1024 * 1024:
+          res = failure("response too large")
+          failed = true
+          break
+      if not failed:
+        res = HttpResponse(ok: true, status: int(status), body: body, error: "")
+  discard winHttpCloseHandle(req)
+  discard winHttpCloseHandle(conn)
+  discard winHttpCloseHandle(session)
+  res
+
+proc newWinHttpTransport*(): HttpTransport =
+  HttpTransport(getFn: winHttpGet, urls: @[])
+
+proc newFakeTransport*(status: int; body: string): HttpTransport =
+  ## A stand-in that answers every GET with one canned response, and records the URLs.
+  result = HttpTransport(getFn: winHttpGet, urls: @[])
+  result.getFn = proc(url: string; connectMs, readMs: int): HttpResponse {.closure.} =
+    HttpResponse(ok: true, status: status, body: body, error: "")
+
+proc newDownTransport*(): HttpTransport =
+  ## A stand-in for an unreachable server.
+  result = HttpTransport(getFn: winHttpGet, urls: @[])
+  result.getFn = proc(url: string; connectMs, readMs: int): HttpResponse {.closure.} =
+    failure("unreachable")
+
+proc get*(t: HttpTransport; url: string; connectMs: int = 5000; readMs: int = 5000): HttpResponse =
+  t.urls.add(url)
+  t.getFn(url, connectMs, readMs)

@@ -1,0 +1,195 @@
+## Port of pumpkin/src/net/query.rs, and pumpkin/src/net/lan_broadcast.rs
+##
+## The query server (GameSpy4 over UDP) and the LAN broadcast that makes a server show up in a client's "LAN worlds".
+## Upstream gives each a task; here `pumpQuery` and `pumpLanBroadcast` are called from the server loop and never block.
+## A challenge token is bound to the address it was handed to, and all of them expire every 30 seconds. Plugins are not
+## listed (there are none). The version is the wire target's, where upstream's is `CURRENT_MC_VERSION`.
+
+import std/options
+from ../../config/networking/query import QueryConfig
+import ../../config/networking/lan_broadcast
+import ../../protocol/query
+import ../../util/javaversion
+import ../logging
+import winsock
+
+const
+  MaxQueryPlayers = 4
+  TokenLifetimeMs = 30000'i64
+  QueryTarget = "pumpkin::net::query"
+  LanTarget = "pumpkin::net::lan_broadcast"
+  LanIntervalMs = 1500'i64
+
+type
+  QueryInfo* = object
+    ## What a status answer is made of; the server's glue builds it when a request comes in.
+    motd*: string
+    maxPlayers*: int
+    numPlayers*: int
+    worldName*: string
+    players*: seq[string]   ## The first four are listed.
+
+  QueryInfoProc* = proc(): QueryInfo {.closure.}
+
+  ChallengeToken = object
+    token: int32
+    ip: uint32
+    port: uint16
+
+  QueryServer* = ref object
+    socket: SocketHandle
+    boundIp: uint32
+    boundPort: uint16
+    tokens: seq[ChallengeToken]
+    lastClear: int64
+    buffer: seq[byte]
+    seed: uint64
+
+  LanBroadcast* = ref object
+    socket: SocketHandle
+    advertisement: string
+    lastSent: int64
+
+proc startQuery*(config: QueryConfig): nil QueryServer =
+  ## The bind half of `start_query_handler`; nil when the address cannot be used.
+  if config.address.isV6:
+    error("Query cannot listen on an IPv6 address", QueryTarget)
+    return nil
+  let ip = ipv4(int(config.address.ip[0]), int(config.address.ip[1]), int(config.address.ip[2]), int(config.address.ip[3]))
+  let socket = bindUdp(ip, config.address.port, false)
+  if int(socket) == int(InvalidSocket):
+    error("Unable to bind the query server to port " & $config.address.port, QueryTarget)
+    return nil
+  let port = udpLocalPort(socket)
+  info("Server query running on port \x1b[34m" & $port & "\x1b[0m", QueryTarget)
+  QueryServer(socket: socket, boundIp: ip, boundPort: port, tokens: @[], lastClear: nowMs(), buffer: newSeq[byte](1024),
+    seed: uint64(nowMs()) * 6364136223846793005'u64 + 1442695040888963407'u64)
+
+proc queryPort*(q: QueryServer): uint16 = q.boundPort
+
+proc nextToken(q: QueryServer): int32 =
+  ## `random_range(1..=i32::MAX)`, from a generator seeded by the clock and the traffic.
+  q.seed = q.seed * 6364136223846793005'u64 + 1442695040888963407'u64
+  int32(1'u64 + ((q.seed shr 33) mod 2147483647'u64))
+
+proc worldNameOf*(levelFolder: string): string =
+  ## The save's folder name, "world" when there is none.
+  var s = levelFolder
+  while s.len > 0 and (s[s.len - 1] == '/' or s[s.len - 1] == '\\'):
+    s = s[0 ..< s.len - 1]
+  var start = 0
+  for i in 0 ..< s.len:
+    if s[i] == '/' or s[i] == '\\':
+      start = i + 1
+  if s.len - start > 0: s[start ..< s.len] else: "world"
+
+proc hostIpText(q: QueryServer): string =
+  peerText(UdpPeer(ip: q.boundIp, port: q.boundPort))
+
+proc respond(q: QueryServer; peer: UdpPeer; encoded: (bool, seq[byte])) =
+  if encoded[0]:
+    discard udpSend(q.socket, encoded[1], peer)
+  else:
+    # Only a zero byte inside a field gets here: something the server's owner has to correct.
+    error("Interior 0 bytes found! Cannot encode query response!", QueryTarget)
+
+proc handlePacket(q: QueryServer; provide: QueryInfoProc; data: seq[byte]; peer: UdpPeer) =
+  var raw = decodeRawQueryPacket(data)
+  if raw.err != qdOk:
+    return
+  case raw.packetType
+  of qptHandshake:
+    let (err, packet) = decodeQueryHandshake(raw)
+    if err != qdOk:
+      return
+    let token = nextToken(q)
+    q.respond(peer, encode(CQueryHandshake(sessionId: packet.sessionId, challengeToken: token)))
+    q.tokens.add(ChallengeToken(token: token, ip: peer.ip, port: peer.port))
+  of qptStatus:
+    let (err, packet) = decodeQueryStatusRequest(raw)
+    if err != qdOk:
+      return
+    var bound = false
+    for t in q.tokens:
+      if t.token == packet.challengeToken and t.ip == peer.ip and t.port == peer.port:
+        bound = true
+    if not bound:
+      return
+    let info = provide()
+    if packet.isFullRequest:
+      var players: seq[string] = @[]
+      for name in info.players:
+        if players.len < MaxQueryPlayers:
+          players.add(name)
+      q.respond(peer, encode(CQueryFullStatus(sessionId: packet.sessionId, hostname: info.motd,
+        version: $WireTargetMcVersion, plugins: "", map: info.worldName, numPlayers: info.numPlayers,
+        maxPlayers: info.maxPlayers, hostPort: q.boundPort, hostIp: hostIpText(q), players: players)))
+    else:
+      q.respond(peer, encode(CQueryBasicStatus(sessionId: packet.sessionId, motd: info.motd, map: info.worldName,
+        numPlayers: info.numPlayers, maxPlayers: info.maxPlayers, hostPort: q.boundPort,
+        hostIp: hostIpText(q))))
+
+proc pumpQuery*(q: nil QueryServer; provide: QueryInfoProc) =
+  if q == nil:
+    return
+  let now = nowMs()
+  if now - q.lastClear >= TokenLifetimeMs:
+    q.tokens = @[]
+    q.lastClear = now
+  var peer = UdpPeer(ip: 0'u32, port: 0'u16)
+  var budget = 64
+  while budget > 0:
+    dec budget
+    let n = udpRecv(q.socket, q.buffer, peer)
+    if n < 0:
+      break
+    handlePacket(q, provide, q.buffer[0 ..< n], peer)
+
+proc stopQuery*(q: nil QueryServer) =
+  if q != nil:
+    closeClient(q.socket)
+
+# --- LAN broadcast -----------------------------------------------------------------------------------------------------
+
+proc lanAdvertisement*(motd: string; port: uint16): string =
+  ## `[MOTD]{motd}[/MOTD][AD]{port}[/AD]`
+  "[MOTD]" & motd & "[/MOTD][AD]" & $port & "[/AD]"
+
+proc lanMotd*(config: LANBroadcastConfig; serverMotd: string): string =
+  ## `LANBroadcast::new`'s choice: the broadcast MOTD, else the server's with its newlines as spaces.
+  let own = if config.motd.isSome: config.motd.unsafeGet else: ""
+  if own.len > 0:
+    return own
+  var flat = ""
+  for c in serverMotd:
+    flat.add(if c == '\n': ' ' else: c)
+  flat
+
+proc startLanBroadcast*(config: LANBroadcastConfig; serverMotd: string; boundPort: uint16): nil LanBroadcast =
+  ## The bind half of `LANBroadcast::start`. The socket is bound to the configured port, 0 for any.
+  if config.motd.isNone or config.motd.unsafeGet.len == 0:
+    warn("Using the server MOTD as the LAN broadcast MOTD. Note that the LAN broadcast MOTD does not support multiple lines, RGB colors, or gradients so consider defining it accordingly.", LanTarget)
+  let port = if config.port.isSome: config.port.unsafeGet else: 0'u16
+  let socket = bindUdp(0'u32, port, true)
+  if int(socket) == int(InvalidSocket):
+    error("Unable to bind the LAN broadcast to port " & $port, LanTarget)
+    return nil
+  info("LAN broadcast running on 0.0.0.0:" & $udpLocalPort(socket), LanTarget)
+  LanBroadcast(socket: socket, advertisement: lanAdvertisement(lanMotd(config, serverMotd), boundPort), lastSent: 0'i64)
+
+proc pumpLanBroadcast*(b: nil LanBroadcast) =
+  ## Every 1500 ms, to 224.0.2.60:4445.
+  if b == nil:
+    return
+  let now = nowMs()
+  if b.lastSent != 0'i64 and now - b.lastSent < LanIntervalMs:
+    return
+  b.lastSent = now
+  var data = newSeq[byte](b.advertisement.len)
+  for i in 0 ..< b.advertisement.len:
+    data[i] = byte(b.advertisement[i])
+  discard udpSend(b.socket, data, udpPeer(224, 0, 2, 60, 4445'u16))
+
+proc stopLanBroadcast*(b: nil LanBroadcast) =
+  if b != nil:
+    closeClient(b.socket)

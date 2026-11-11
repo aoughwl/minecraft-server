@@ -1,0 +1,457 @@
+## Port of pumpkin/src/net/authentication.rs
+##
+## Mojang's session check and the public keys that sign a player's chat key. The HTTP is src/auth/winhttp.aowl, behind an
+## `HttpTransport` so a test can stand in for the network. JSON is src/auth/minijson.aowl, base64 is read here by hand,
+## since std/base64 raises on bad input. Differences from upstream: `fetch_mojang_public_keys` returns each key as its DER
+## bytes, which is what `Server.mojangPublicKeys` holds, and `rsaVerifySha1` is the RSASSA-PKCS1-v1_5 check upstream gets
+## from the `rsa` crate. The services URL's trailing slash is dropped before `/publickeys`, where upstream's default leaves
+## `//publickeys`. A `profileActions` that is absent and one that is empty are the same here. Query values are
+## percent-encoded, which upstream's `replace` does not do (a name is `[A-Za-z0-9_]` by then, so the result is the same).
+
+import std/options
+import ../../auth/[minijson, winhttp]
+import ../../config/networking/auth except ProfileAction
+import ../../util/uuid
+import ../key_store
+import bignum
+import netbase
+
+const
+  MojangAuthenticationUrl* = "https://sessionserver.mojang.com/session/minecraft/hasJoined?username={username}&serverId={server_hash}"
+  MojangPreventProxyAuthenticationUrl* = "https://sessionserver.mojang.com/session/minecraft/hasJoined?username={username}&serverId={server_hash}"
+  MojangServicesUrl* = "https://api.minecraftservices.com/"
+  MojangProfileByNameUrl* = "https://api.mojang.com/users/profiles/minecraft/{username}"
+
+type
+  AuthErrorKind* = enum
+    aeFailedResponse       ## Authentication servers are down
+    aeUnverifiedUsername   ## Failed to verify username
+    aeBanned               ## You are banned from Authentication servers
+    aeTextureError
+    aeDisallowedAction     ## You have disallowed actions from Authentication servers
+    aeFailedParse          ## Failed to parse JSON into Game Profile
+    aeUnknownStatusCode
+
+  AuthError* = object
+    kind*: AuthErrorKind
+    message*: string       ## `to_string()`, which for a texture error and a status code carries the detail.
+
+  AuthResult* = object
+    ok*: bool
+    profile*: GameProfile
+    error*: AuthError
+
+  TextureErrorKind* = enum
+    teInvalidUrl, teDisallowedUrlScheme, teDisallowedUrlDomain, teDecodeError, teJsonError
+
+  TextureError* = object
+    kind*: TextureErrorKind
+    message*: string
+
+  KeysResult* = object
+    ok*: bool
+    keys*: seq[seq[byte]]
+    error*: AuthError
+
+  NameLookup* = object
+    ok*: bool
+    found*: bool
+    id*: Uuid
+    name*: string
+    error*: AuthError
+
+proc authError*(kind: AuthErrorKind): AuthError =
+  case kind
+  of aeFailedResponse: AuthError(kind: kind, message: "Authentication servers are down")
+  of aeUnverifiedUsername: AuthError(kind: kind, message: "Failed to verify username")
+  of aeBanned: AuthError(kind: kind, message: "You are banned from Authentication servers")
+  of aeDisallowedAction: AuthError(kind: kind, message: "You have disallowed actions from Authentication servers")
+  of aeFailedParse: AuthError(kind: kind, message: "Failed to parse JSON into Game Profile")
+  else: AuthError(kind: kind, message: "")
+
+proc textureMessage(e: TextureError): string =
+  case e.kind
+  of teInvalidUrl: "Texture Error Invalid URL"
+  of teDisallowedUrlScheme: "Texture Error Invalid URL scheme for player texture: " & e.message
+  of teDisallowedUrlDomain: "Texture Error Invalid URL domain for player texture: " & e.message
+  of teDecodeError: "Texture Error Failed to decode base64 player texture: " & e.message
+  of teJsonError: "Texture Error Failed to parse JSON from player texture: " & e.message
+
+proc replaceAll(s, find, by: string): string =
+  result = ""
+  var i = 0
+  while i < s.len:
+    if i + find.len <= s.len and s[i ..< i + find.len] == find:
+      result.add(by)
+      i += find.len
+    else:
+      result.add(s[i])
+      inc i
+
+proc endsWith(s, suffix: string): bool =
+  s.len >= suffix.len and s[s.len - suffix.len ..< s.len] == suffix
+
+proc urlEncode*(s: string): string =
+  ## What goes into a query value or a path segment: everything but the unreserved characters is %XX.
+  const hex = "0123456789ABCDEF"
+  result = ""
+  for c in s:
+    if (c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z') or (c >= '0' and c <= '9') or c == '-' or c == '_' or
+        c == '.' or c == '~':
+      result.add(c)
+    else:
+      result.add('%')
+      result.add(hex[ord(c) shr 4])
+      result.add(hex[ord(c) and 15])
+
+proc base64Decode*(s: string): (bool, seq[byte]) =
+  ## STANDARD alphabet with `=` padding, as the `base64` crate's STANDARD engine; false on anything else.
+  var out0: seq[byte] = @[]
+  if s.len mod 4 != 0:
+    return (false, out0)
+  var i = 0
+  while i < s.len:
+    var vals = [0, 0, 0, 0]
+    var pad = 0
+    for j in 0 ..< 4:
+      let c = s[i + j]
+      if c >= 'A' and c <= 'Z': vals[j] = ord(c) - ord('A')
+      elif c >= 'a' and c <= 'z': vals[j] = ord(c) - ord('a') + 26
+      elif c >= '0' and c <= '9': vals[j] = ord(c) - ord('0') + 52
+      elif c == '+': vals[j] = 62
+      elif c == '/': vals[j] = 63
+      elif c == '=' and i + 4 == s.len and j >= 2:
+        vals[j] = 0
+        inc pad
+      else:
+        return (false, @[])
+    if pad == 1 and s[i + 2] == '=':
+      return (false, @[])
+    let n = (vals[0] shl 18) or (vals[1] shl 12) or (vals[2] shl 6) or vals[3]
+    out0.add(byte((n shr 16) and 255))
+    if pad < 2:
+      out0.add(byte((n shr 8) and 255))
+    if pad < 1:
+      out0.add(byte(n and 255))
+    i += 4
+  (true, out0)
+
+proc bytesToStr(b: seq[byte]): string =
+  result = newString(b.len)
+  for i in 0 ..< b.len:
+    result[i] = char(b[i])
+
+proc jsonStr(v: nil JsonValue; key: string): (bool, string) =
+  let f = objGet(v, key)
+  if f == nil or f.kind != jkString:
+    return (false, "")
+  (true, f.strVal)
+
+proc gameProfileFromJson*(body: string): (bool, GameProfile) =
+  ## serde's `GameProfile`: `id` (a uuid, simple or hyphenated), `name`, `properties` and an optional `profileActions`.
+  let empty = GameProfile(id: NilUuid, name: "", properties: @[], profileActions: @[])
+  let parsed = parseJson(body)
+  let root = parsed.value
+  if not parsed.ok or root == nil or root.kind != jkObject:
+    return (false, empty)
+  let (okId, idText) = jsonStr(root, "id")
+  let (okName, name) = jsonStr(root, "name")
+  if not okId or not okName:
+    return (false, empty)
+  let (okUuid, id) = parseStr(idText)
+  if not okUuid:
+    return (false, empty)
+  var props: seq[PropertyValue] = @[]
+  let arr = objGet(root, "properties")
+  if arr != nil:
+    if arr.kind != jkArray:
+      return (false, empty)
+    for item in arr.arrVal:
+      let (okN, pn) = jsonStr(item, "name")
+      let (okV, pv) = jsonStr(item, "value")
+      if not okN or not okV:
+        return (false, empty)
+      let (hasSig, sig) = jsonStr(item, "signature")
+      props.add(PropertyValue(name: pn, value: pv, signature: if hasSig: sig else: ""))
+  var actions: seq[ProfileAction] = @[]
+  let acts = objGet(root, "profileActions")
+  if acts != nil and acts.kind == jkArray:
+    for a in acts.arrVal:
+      if a.kind != jkString:
+        return (false, empty)
+      if a.strVal == "FORCED_NAME_CHANGE":
+        actions.add(paForcedNameChange)
+      elif a.strVal == "USING_BANNED_SKIN":
+        actions.add(paUsingBannedSkin)
+      else:
+        return (false, empty)
+  (true, GameProfile(id: id, name: name, properties: props, profileActions: actions))
+
+proc textureOk(): (bool, TextureError) =
+  (true, TextureError(kind: teInvalidUrl, message: ""))
+
+proc textureBad(kind: TextureErrorKind; message: string): (bool, TextureError) =
+  (false, TextureError(kind: kind, message: message))
+
+proc isTextureUrlValid*(url: string; config: TextureConfig): (bool, TextureError) =
+  ## `is_texture_url_valid`: the scheme and the authority, each checked with `ends_with` against the allowed lists.
+  var sep = -1
+  for i in 0 ..< url.len - 2:
+    if url[i] == ':' and url[i + 1] == '/' and url[i + 2] == '/':
+      sep = i
+      break
+  if sep <= 0:
+    return textureBad(teInvalidUrl, "")
+  let scheme = url[0 ..< sep]
+  var authEnd = url.len
+  for i in sep + 3 ..< url.len:
+    if url[i] == '/' or url[i] == '?' or url[i] == '#':
+      authEnd = i
+      break
+  let authority = url[sep + 3 ..< authEnd]
+  if authority.len == 0:
+    return textureBad(teInvalidUrl, "")
+  var schemeOk = false
+  for allowed in config.allowedUrlSchemes:
+    if endsWith(scheme, allowed):
+      schemeOk = true
+  if not schemeOk:
+    return textureBad(teDisallowedUrlScheme, scheme)
+  var domainOk = false
+  for allowed in config.allowedUrlDomains:
+    if endsWith(authority, allowed):
+      domainOk = true
+  if not domainOk:
+    return textureBad(teDisallowedUrlDomain, authority)
+  textureOk()
+
+proc validateTextures*(property: PropertyValue; config: TextureConfig): (bool, TextureError) =
+  ## `validate_textures`: the value is base64 JSON holding `timestamp`, `profileId`, `profileName` and `textures`, a map
+  ## of name to `{url, metadata?}`. Every url must pass `isTextureUrlValid`.
+  let (decoded, raw) = base64Decode(property.value)
+  if not decoded:
+    return textureBad(teDecodeError, "Invalid input")
+  let parsed = parseJson(bytesToStr(raw))
+  let root = parsed.value
+  if not parsed.ok or root == nil or root.kind != jkObject:
+    return textureBad(teJsonError, "expected a profile object")
+  let ts = objGet(root, "timestamp")
+  if ts == nil or ts.kind != jkNumber:
+    return textureBad(teJsonError, "missing field `timestamp`")
+  let (okId, idText) = jsonStr(root, "profileId")
+  if not okId or not parseStr(idText)[0]:
+    return textureBad(teJsonError, "missing or invalid field `profileId`")
+  let (okName, _) = jsonStr(root, "profileName")
+  if not okName:
+    return textureBad(teJsonError, "missing field `profileName`")
+  let sr = objGet(root, "signatureRequired")
+  if sr != nil and sr.kind != jkBool:
+    return textureBad(teJsonError, "invalid type for `signatureRequired`")
+  let textures = objGet(root, "textures")
+  if textures == nil or textures.kind != jkObject:
+    return textureBad(teJsonError, "missing field `textures`")
+  for i in 0 ..< textures.objVals.len:
+    let (okUrl, url) = jsonStr(textures.objVals[i], "url")
+    if not okUrl:
+      return textureBad(teJsonError, "missing field `url`")
+    let (valid, err) = isTextureUrlValid(url, config)
+    if not valid:
+      return (false, err)
+  textureOk()
+
+proc statusError(status: int): AuthError =
+  AuthError(kind: aeUnknownStatusCode, message: "Unknown Status Code " & $status)
+
+proc authFailed(error: AuthError): AuthResult =
+  AuthResult(ok: false, profile: GameProfile(id: NilUuid, name: "", properties: @[], profileActions: @[]), error: error)
+
+proc authenticate*(transport: HttpTransport; username, serverHash, ip: string;
+    config: AuthenticationConfig): AuthResult =
+  ## `authenticate`: asks the session server whether `username` has joined with this server hash.
+  var address = ""
+  if config.preventProxyConnections:
+    let authUrl = if config.preventProxyConnectionAuthUrl.isSome: config.preventProxyConnectionAuthUrl.unsafeGet
+                  else: MojangPreventProxyAuthenticationUrl
+    address = replaceAll(replaceAll(replaceAll(authUrl, "{username}", urlEncode(username)), "{server_hash}",
+      urlEncode(serverHash)), "{ip}", urlEncode(ip))
+  else:
+    let authUrl = if config.url.isSome: config.url.unsafeGet else: MojangAuthenticationUrl
+    address = replaceAll(replaceAll(authUrl, "{username}", urlEncode(username)), "{server_hash}", urlEncode(serverHash))
+  let res = transport.get(address, int(config.connectTimeout), int(config.readTimeout))
+  if not res.ok:
+    return authFailed(authError(aeFailedResponse))
+  if res.status == 204:
+    return authFailed(authError(aeUnverifiedUsername))
+  if res.status != 200:
+    return authFailed(statusError(res.status))
+  let (parsed, profile) = gameProfileFromJson(res.body)
+  if not parsed:
+    return authFailed(authError(aeFailedParse))
+  AuthResult(ok: true, profile: profile, error: authError(aeFailedParse))
+
+proc checkProfile*(profile: GameProfile; config: AuthenticationConfig): AuthResult =
+  ## The half of `Self::authenticate` (login.rs) that follows the request: the profile's actions, then its textures.
+  let actions = profile.profileActions
+  if actions.len > 0:
+    if config.playerProfile.allowBannedPlayers:
+      for allowed in config.playerProfile.allowedActions:
+        var present = false
+        for a in actions:
+          if (a == paForcedNameChange and allowed == ForcedNameChange) or
+              (a == paUsingBannedSkin and allowed == UsingBannedSkin):
+            present = true
+        if not present:
+          return authFailed(authError(aeDisallowedAction))
+    return authFailed(authError(aeBanned))
+  for property in profile.properties:
+    let (valid, err) = validateTextures(property, config.textures)
+    if not valid:
+      return authFailed(AuthError(kind: aeTextureError, message: textureMessage(err)))
+  AuthResult(ok: true, profile: profile, error: authError(aeFailedParse))
+
+# --- Mojang's public keys ----------------------------------------------------------------------------------------------
+
+type DerItem = object
+  ok: bool
+  tag: byte
+  start: int   ## The first content byte.
+  stop: int    ## One past the last.
+
+proc readDer(data: openArray[byte]; at: int): DerItem =
+  let bad = DerItem(ok: false, tag: 0'u8, start: 0, stop: 0)
+  if at + 2 > data.len:
+    return bad
+  let tag = data[at]
+  var len = int(data[at + 1])
+  var pos = at + 2
+  if len >= 0x80:
+    let n = len and 0x7F
+    if n == 0 or n > 3 or pos + n > data.len:
+      return bad
+    len = 0
+    for i in 0 ..< n:
+      len = (len shl 8) or int(data[pos + i])
+    pos += n
+  if pos + len > data.len:
+    return bad
+  DerItem(ok: true, tag: tag, start: pos, stop: pos + len)
+
+proc parseSpki*(der: openArray[byte]): (bool, seq[byte], seq[byte]) =
+  ## An RSA SubjectPublicKeyInfo to its modulus and public exponent (big-endian, no leading zero).
+  let bad = (false, newSeq[byte](), newSeq[byte]())
+  let outer = readDer(der, 0)
+  if not outer.ok or outer.tag != 0x30'u8 or outer.stop != der.len:
+    return bad
+  let algo = readDer(der, outer.start)
+  if not algo.ok or algo.tag != 0x30'u8:
+    return bad
+  let bits = readDer(der, algo.stop)
+  if not bits.ok or bits.tag != 0x03'u8 or bits.stop - bits.start < 2 or der[bits.start] != 0'u8:
+    return bad
+  let seqItem = readDer(der, bits.start + 1)
+  if not seqItem.ok or seqItem.tag != 0x30'u8:
+    return bad
+  let nItem = readDer(der, seqItem.start)
+  if not nItem.ok or nItem.tag != 0x02'u8:
+    return bad
+  let eItem = readDer(der, nItem.stop)
+  if not eItem.ok or eItem.tag != 0x02'u8:
+    return bad
+  var n: seq[byte] = @[]
+  var s = nItem.start
+  while s < nItem.stop - 1 and der[s] == 0'u8:
+    inc s
+  for i in s ..< nItem.stop:
+    n.add(der[i])
+  var e: seq[byte] = @[]
+  for i in eItem.start ..< eItem.stop:
+    e.add(der[i])
+  (true, n, e)
+
+const Sha1DigestInfo = [0x30'u8, 0x21'u8, 0x30'u8, 0x09'u8, 0x06'u8, 0x05'u8, 0x2b'u8, 0x0e'u8, 0x03'u8, 0x02'u8,
+  0x1a'u8, 0x05'u8, 0x00'u8, 0x04'u8, 0x14'u8]
+
+proc rsaVerifySha1*(spkiDer, message, signature: openArray[byte]): bool =
+  ## `VerifyingKey::<Sha1>::verify`: RSASSA-PKCS1-v1_5 over the SHA-1 of `message`.
+  let (ok, nBytes, eBytes) = parseSpki(spkiDer)
+  if not ok or nBytes.len == 0 or eBytes.len == 0:
+    return false
+  let n = bnFromBytesBE(nBytes)
+  let k = (bnBitLen(n) + 7) div 8
+  if signature.len != k or k < 11 + Sha1DigestInfo.len + 20:
+    return false
+  let s = bnFromBytesBE(signature)
+  if bnCmp(s, n) >= 0:
+    return false
+  let em = bnToBytesBE(fastModPow(s, bnFromBytesBE(eBytes), n), k)
+  let hash = sha1(message)
+  var expected = newSeq[byte](k)
+  expected[1] = 1'u8
+  let tLen = Sha1DigestInfo.len + 20
+  for i in 2 ..< k - tLen - 1:
+    expected[i] = 0xFF'u8
+  expected[k - tLen - 1] = 0'u8
+  for i in 0 ..< Sha1DigestInfo.len:
+    expected[k - tLen + i] = Sha1DigestInfo[i]
+  for i in 0 ..< 20:
+    expected[k - 20 + i] = hash[i]
+  var diff = 0'u8
+  for i in 0 ..< k:
+    diff = diff or (em[i] xor expected[i])
+  diff == 0'u8
+
+proc keysFailed(error: AuthError): KeysResult =
+  KeysResult(ok: false, keys: @[], error: error)
+
+proc fetchMojangPublicKeys*(transport: HttpTransport; config: AuthenticationConfig): KeysResult =
+  ## `fetch_mojang_public_keys`: the `playerCertificateKeys`, each as its DER bytes, checked to be RSA keys.
+  var servicesUrl = if config.servicesUrl.isSome: config.servicesUrl.unsafeGet else: MojangServicesUrl
+  while servicesUrl.len > 0 and servicesUrl[servicesUrl.len - 1] == '/':
+    servicesUrl = servicesUrl[0 ..< servicesUrl.len - 1]
+  let res = transport.get(servicesUrl & "/publickeys", int(config.connectTimeout), int(config.readTimeout))
+  if not res.ok or res.status == 204:
+    return keysFailed(authError(aeFailedResponse))
+  if res.status != 200:
+    return keysFailed(statusError(res.status))
+  let parsed = parseJson(res.body)
+  if not parsed.ok:
+    return keysFailed(authError(aeFailedParse))
+  let profileKeys = objGet(parsed.value, "profilePropertyKeys")
+  let certKeys = objGet(parsed.value, "playerCertificateKeys")
+  if profileKeys == nil or profileKeys.kind != jkArray or certKeys == nil or certKeys.kind != jkArray:
+    return keysFailed(authError(aeFailedParse))
+  var keys: seq[seq[byte]] = @[]
+  for item in certKeys.arrVal:
+    let (hasKey, b64) = jsonStr(item, "publicKey")
+    if not hasKey:
+      return keysFailed(authError(aeFailedParse))
+    let (decoded, der) = base64Decode(b64)
+    if not decoded or not parseSpki(der)[0]:
+      return keysFailed(authError(aeFailedParse))
+    keys.add(der)
+  KeysResult(ok: true, keys: keys, error: authError(aeFailedParse))
+
+proc lookupFailed(error: AuthError): NameLookup =
+  NameLookup(ok: false, found: false, id: NilUuid, name: "", error: error)
+
+proc lookupProfileByName*(transport: HttpTransport; name: string): NameLookup =
+  ## `lookup_profile_by_name`: Mojang's name to uuid, `found == false` for a name nobody has.
+  let url = replaceAll(MojangProfileByNameUrl, "{username}", urlEncode(name))
+  let res = transport.get(url)
+  if not res.ok:
+    return lookupFailed(authError(aeFailedResponse))
+  if res.status == 204 or res.status == 404:
+    return NameLookup(ok: true, found: false, id: NilUuid, name: "", error: authError(aeFailedParse))
+  if res.status != 200:
+    return lookupFailed(statusError(res.status))
+  let parsed = parseJson(res.body)
+  if not parsed.ok:
+    return lookupFailed(authError(aeFailedParse))
+  let (okId, idText) = jsonStr(parsed.value, "id")
+  let (okName, found) = jsonStr(parsed.value, "name")
+  if not okId or not okName:
+    return lookupFailed(authError(aeFailedParse))
+  let (okUuid, id) = parseStr(idText)
+  if not okUuid:
+    return lookupFailed(authError(aeFailedParse))
+  NameLookup(ok: true, found: true, id: id, name: found, error: authError(aeFailedParse))

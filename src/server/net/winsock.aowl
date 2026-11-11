@@ -79,6 +79,18 @@ proc cSend(s: SocketHandle, buf: pointer, len: cint, flags: cint): cint
 proc cCloseSocket(s: SocketHandle): cint
   {.stdcall, importc: "closesocket", dynlib: Ws2_32.}
 
+proc cRecvFrom(s: SocketHandle, buf: pointer, len: cint, flags: cint, fromAddr: ptr SockAddrIn, fromLen: ptr cint): cint
+  {.stdcall, importc: "recvfrom", dynlib: Ws2_32.}
+
+proc cSendTo(s: SocketHandle, buf: pointer, len: cint, flags: cint, toAddr: ptr SockAddrIn, toLen: cint): cint
+  {.stdcall, importc: "sendto", dynlib: Ws2_32.}
+
+proc cGetSockName(s: SocketHandle, name: ptr SockAddrIn, namelen: ptr cint): cint
+  {.stdcall, importc: "getsockname", dynlib: Ws2_32.}
+
+proc cGetPeerName(s: SocketHandle, name: ptr SockAddrIn, namelen: ptr cint): cint
+  {.stdcall, importc: "getpeername", dynlib: Ws2_32.}
+
 proc htons(hostshort: uint16): uint16 {.stdcall, importc: "htons", dynlib: Ws2_32.}
 
 proc setsockoptInt(s: SocketHandle, level, optname: cint, optval: ptr cint, optlen: cint): cint
@@ -94,9 +106,9 @@ proc initWinsock*(): bool =
 proc shutdownWinsock*() =
   discard wsaCleanup()
 
-proc listenOn*(port: uint16, backlog: cint = cint(128)): SocketHandle =
+proc listenOnAddr*(ip: uint32, port: uint16, backlog: cint = cint(128)): SocketHandle =
   ## Returns `InvalidSocket` on any failure (socket/bind/listen) - caller
-  ## checks with `int(result) == int(InvalidSocket)`.
+  ## checks with `int(result) == int(InvalidSocket)`. `ip` is in network byte order, 0 for any.
   result = cSocket(AfInet, SockStream, IpprotoTcp)
   if int(result) == int(InvalidSocket):
     return InvalidSocket
@@ -105,7 +117,7 @@ proc listenOn*(port: uint16, backlog: cint = cint(128)): SocketHandle =
   var addr4: SockAddrIn = SockAddrIn()
   addr4.sin_family = int16(AfInet)
   addr4.sin_port = htons(port)
-  addr4.sin_addr = 0'u32 # INADDR_ANY
+  addr4.sin_addr = ip
   let bindRes = cBind(result, addr addr4, cint(sizeof(SockAddrIn)))
   if bindRes == SocketErrorC:
     discard cCloseSocket(result)
@@ -114,6 +126,9 @@ proc listenOn*(port: uint16, backlog: cint = cint(128)): SocketHandle =
   if listenRes == SocketErrorC:
     discard cCloseSocket(result)
     return InvalidSocket
+
+proc listenOn*(port: uint16, backlog: cint = cint(128)): SocketHandle =
+  listenOnAddr(0'u32, port, backlog)
 
 proc acceptClient*(listener: SocketHandle): SocketHandle =
   ## Returns `InvalidSocket` on failure.
@@ -174,6 +189,23 @@ proc nowMs*(): int64 =
   ## Milliseconds on a monotonic clock, for keep-alives and the tick loop.
   int64(getTickCount64())
 
+proc queryPerformanceCounter(v: ptr int64): int32 {.stdcall, importc: "QueryPerformanceCounter", dynlib: "kernel32.dll".}
+proc queryPerformanceFrequency(v: ptr int64): int32 {.stdcall, importc: "QueryPerformanceFrequency", dynlib: "kernel32.dll".}
+
+var perfFrequency = 0'i64
+
+proc nowNanos*(): int64 =
+  ## Nanoseconds on a monotonic clock, for the tick loop's timing: `Instant::now()`. The counter's own tick is far under a
+  ## microsecond on Windows, where `nowMs` has the 15 ms or 1 ms granularity of the system timer.
+  if perfFrequency == 0'i64:
+    discard queryPerformanceFrequency(addr perfFrequency)
+    if perfFrequency == 0'i64:
+      perfFrequency = 1'i64
+  var counter = 0'i64
+  discard queryPerformanceCounter(addr counter)
+  # Split the division so a counter of many hours does not overflow the multiplication.
+  (counter div perfFrequency) * 1_000_000_000'i64 + ((counter mod perfFrequency) * 1_000_000_000'i64) div perfFrequency
+
 proc setNonBlocking*(s: SocketHandle): bool =
   var on = 1'u32
   ioctlSocket(s, Fionbio, addr on) == cint(0)
@@ -182,6 +214,12 @@ proc setNoDelay*(s: SocketHandle) =
   ## `set_nodelay(true)`, which upstream's accept does.
   var on: cint = cint(1)
   discard setsockoptInt(s, IpprotoTcp, TcpNoDelay, addr on, cint(sizeof(cint)))
+
+proc listenOnNonBlockingAt*(ip: uint32, port: uint16): SocketHandle =
+  result = listenOnAddr(ip, port)
+  if int(result) != int(InvalidSocket) and not setNonBlocking(result):
+    discard cCloseSocket(result)
+    return InvalidSocket
 
 proc listenOnNonBlocking*(port: uint16): SocketHandle =
   result = listenOn(port)
@@ -213,3 +251,84 @@ proc trySend*(s: SocketHandle, data: seq[byte], start: int): int =
   if n >= cint(0):
     return int(n)
   if wsaGetLastError() == WsaEWouldBlock: WouldBlock else: SocketClosed
+
+proc peerIp*(s: SocketHandle): string =
+  ## The remote IPv4 address in dotted form, "" when the socket has none. For `prevent_proxy_connections` and the logs.
+  var peer = SockAddrIn()
+  var len = cint(sizeof(SockAddrIn))
+  if cGetPeerName(s, addr peer, addr len) != cint(0):
+    return ""
+  let a = peer.sin_addr   # network byte order: the first octet is the low byte
+  $(a and 255'u32) & "." & $((a shr 8) and 255'u32) & "." & $((a shr 16) and 255'u32) & "." & $(a shr 24)
+
+# --- UDP, for the query server and the LAN broadcast -----------------------------------------------------------------
+
+type
+  UdpPeer* = object
+    ip*: uint32     ## Network byte order, as in `sockaddr_in`.
+    port*: uint16   ## Host order.
+
+const
+  SockDgram = cint(2)
+  IpprotoUdp = cint(17)
+  SoBroadcast = cint(0x0020)
+
+proc ipv4*(a, b, c, d: int): uint32 =
+  ## The four octets as `sockaddr_in` holds them.
+  uint32(a) or (uint32(b) shl 8) or (uint32(c) shl 16) or (uint32(d) shl 24)
+
+proc udpPeer*(a, b, c, d: int; port: uint16): UdpPeer =
+  UdpPeer(ip: ipv4(a, b, c, d), port: port)
+
+proc peerText*(p: UdpPeer): string =
+  let a = p.ip
+  $(a and 255'u32) & "." & $((a shr 8) and 255'u32) & "." & $((a shr 16) and 255'u32) & "." & $(a shr 24)
+
+proc bindUdp*(ip: uint32; port: uint16; broadcast: bool): SocketHandle =
+  ## A non-blocking UDP socket bound to `ip:port` (0 is any), `InvalidSocket` on failure.
+  result = cSocket(AfInet, SockDgram, IpprotoUdp)
+  if int(result) == int(InvalidSocket):
+    return InvalidSocket
+  var on: cint = cint(1)
+  if broadcast:
+    discard setsockoptInt(result, SolSocket, SoBroadcast, addr on, cint(sizeof(cint)))
+  var addr4: SockAddrIn = SockAddrIn()
+  addr4.sin_family = int16(AfInet)
+  addr4.sin_port = htons(port)
+  addr4.sin_addr = ip
+  if cBind(result, addr addr4, cint(sizeof(SockAddrIn))) == SocketErrorC or not setNonBlocking(result):
+    discard cCloseSocket(result)
+    return InvalidSocket
+
+proc udpLocalPort*(s: SocketHandle): uint16 =
+  ## The port a socket bound to port 0 got.
+  var local = SockAddrIn()
+  var len = cint(sizeof(SockAddrIn))
+  if cGetSockName(s, addr local, addr len) != cint(0):
+    return 0'u16
+  htons(local.sin_port)
+
+proc udpRecv*(s: SocketHandle, buf: var seq[byte], peer: var UdpPeer): int =
+  ## Bytes of one datagram, `WouldBlock` when none is waiting, `SocketClosed` on a failure. A datagram longer than `buf`
+  ## is cut, as the kernel does.
+  var from4 = SockAddrIn()
+  var len = cint(sizeof(SockAddrIn))
+  let n = cRecvFrom(s, addr buf[0], cint(buf.len), cint(0), addr from4, addr len)
+  if n >= cint(0):
+    peer = UdpPeer(ip: from4.sin_addr, port: htons(from4.sin_port))
+    return int(n)
+  let e = wsaGetLastError()
+  if e == WsaEWouldBlock:
+    return WouldBlock
+  if e == cint(10054):   # WSAECONNRESET: an earlier send to a closed port; the socket is fine.
+    return WouldBlock
+  SocketClosed
+
+proc udpSend*(s: SocketHandle, data: openArray[byte], peer: UdpPeer): bool =
+  var to4 = SockAddrIn()
+  to4.sin_family = int16(AfInet)
+  to4.sin_port = htons(peer.port)
+  to4.sin_addr = peer.ip
+  if data.len == 0:
+    return true
+  cSendTo(s, unsafeAddr data[0], cint(data.len), cint(0), addr to4, cint(sizeof(SockAddrIn))) >= cint(0)

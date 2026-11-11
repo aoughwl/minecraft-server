@@ -1,0 +1,208 @@
+## Port of pumpkin/src/net/proxy/mod.rs, pumpkin/src/net/proxy/bungeecord.rs and pumpkin/src/net/proxy/velocity.rs
+##
+## Two ways for a proxy in front of the server to tell it who is really connecting. BungeeCord ("IP forwarding") puts the
+## real address, the player's uuid and their profile properties into the handshake's server address, split by zero bytes:
+## `host \0 ip \0 uuid \0 properties-json`. Velocity ("modern forwarding") asks, during login, over the
+## `velocity:player_info` channel, and the proxy answers with an HMAC-SHA256 signature (32 bytes, keyed by a shared secret)
+## followed by the data: forwarding version, the player's address, uuid, name and properties.
+##
+## Both are only for a server that sits behind the proxy and is not reachable otherwise: with BungeeCord forwarding anybody
+## who can connect can claim any uuid. Nothing here talks to a socket; src/server/net/java/login.aowl calls it.
+
+import std/options
+import hmac
+import ../../auth/minijson
+import ../../config/networking/proxy
+import ../../protocol/[netcodec, protobase, varint]
+import ../../protocol/java/client/login/plugin_request
+import ../../util/uuid
+import netbase
+
+const
+  MaxSupportedForwardingVersion* = 4'u8
+  PlayerInfoChannel* = "velocity:player_info"
+
+type
+  ProxyError* = object
+    ## `to_string()` of upstream's error enums.
+    message*: string
+
+  BungeeLogin* = object
+    ok*: bool
+    ip*: string
+    profile*: GameProfile
+    error*: ProxyError
+
+  VelocityLogin* = object
+    ok*: bool
+    profile*: GameProfile
+    address*: string      ## The player's real address, from the proxy.
+    error*: ProxyError
+
+proc blankProfile(): GameProfile =
+  GameProfile(id: NilUuid, name: "", properties: @[], profileActions: @[])
+
+proc bungeeFailed(message: string): BungeeLogin =
+  BungeeLogin(ok: false, ip: "", profile: blankProfile(), error: ProxyError(message: message))
+
+proc velocityFailed(message: string): VelocityLogin =
+  VelocityLogin(ok: false, profile: blankProfile(), address: "", error: ProxyError(message: message))
+
+proc splitZero(s: string): seq[string] =
+  ## `server_address.split('\0')`
+  result = @[]
+  var cur = ""
+  for c in s:
+    if c == '\0':
+      result.add(cur)
+      cur = ""
+    else:
+      cur.add(c)
+  result.add(cur)
+
+proc parseIp(s: string): bool =
+  ## `IpAddr::from_str`: four decimal octets without leading zeros, or an IPv6 text (colons and hex digits, at most one `::`).
+  if s.len == 0:
+    return false
+  var colons = 0
+  for c in s:
+    if c == ':':
+      inc colons
+  if colons > 0:
+    if colons > 7 + 1:
+      return false
+    var doubles = 0
+    var i = 0
+    while i + 1 < s.len:
+      if s[i] == ':' and s[i + 1] == ':':
+        inc doubles
+      inc i
+    if doubles > 1:
+      return false
+    for c in s:
+      let hexDigit = (c >= '0' and c <= '9') or (c >= 'a' and c <= 'f') or (c >= 'A' and c <= 'F') or c == ':' or c == '.'
+      if not hexDigit:
+        return false
+    return colons >= 2
+  var octets = 0
+  var cur = ""
+  for i in 0 .. s.len:
+    if i == s.len or s[i] == '.':
+      if cur.len == 0 or cur.len > 3 or (cur.len > 1 and cur[0] == '0'):
+        return false
+      var n = 0
+      for c in cur:
+        n = n * 10 + (ord(c) - ord('0'))
+      if n > 255:
+        return false
+      inc octets
+      cur = ""
+    elif s[i] >= '0' and s[i] <= '9':
+      cur.add(s[i])
+    else:
+      return false
+  octets == 4
+
+proc bungeecordLogin*(clientAddress, serverAddress, name: string): BungeeLogin =
+  ## `bungeecord_login`. `clientAddress` is the socket's own address, used when the proxy sent none.
+  var parts = splitZero(serverAddress)
+  # The first part is the host the client typed.
+  var ip = clientAddress
+  if parts.len > 1 and parts[1].len > 0:
+    if not parseIp(parts[1]):
+      return bungeeFailed("Failed to parse address")
+    ip = parts[1]
+  var id = offlineUuid(name)
+  if parts.len > 2 and parts[2].len > 0:
+    let (ok, parsed) = parseStr(parts[2])
+    if not ok:
+      return bungeeFailed("Failed to parse UUID")
+    id = parsed
+  var properties: seq[PropertyValue] = @[]
+  if parts.len > 3 and parts[3].len > 0:
+    let json = parseJson(parts[3])
+    let root = json.value
+    if not json.ok or root == nil or root.kind != jkArray:
+      return bungeeFailed("Failed to parse properties")
+    for item in root.arrVal:
+      let pn = objGet(item, "name")
+      let pv = objGet(item, "value")
+      if pn == nil or pn.kind != jkString or pv == nil or pv.kind != jkString:
+        return bungeeFailed("Failed to parse properties")
+      let sig = objGet(item, "signature")
+      properties.add(PropertyValue(name: pn.strVal, value: pv.strVal,
+        signature: if sig != nil and sig.kind == jkString: sig.strVal else: ""))
+  BungeeLogin(ok: true, ip: ip, profile: GameProfile(id: id, name: name, properties: properties, profileActions: @[]),
+    error: ProxyError(message: ""))
+
+proc velocityRequest*(messageId: int32): CLoginPluginRequest =
+  ## `velocity_login`: the question, which holds the highest forwarding version this server reads.
+  CLoginPluginRequest(messageId: newVarInt(messageId), channel: PlayerInfoChannel, data: @[MaxSupportedForwardingVersion])
+
+proc checkIntegrity*(signature, data: openArray[byte]; secret: string): bool =
+  ## `check_integrity`: HMAC-SHA256 of `data` under the secret, equal to `signature`.
+  var key = newSeq[byte](secret.len)
+  for i in 0 ..< secret.len:
+    key[i] = byte(secret[i])
+  let mac = hmacSha256(key, data)
+  if signature.len != 32:
+    return false
+  var diff = 0'u8
+  for i in 0 ..< 32:
+    diff = diff or (mac[i] xor signature[i])
+  diff == 0'u8
+
+proc receiveVelocityPluginResponse*(port: uint16; config: VelocityConfig; hasData: bool;
+    payload: seq[byte]): VelocityLogin =
+  ## `receive_velocity_plugin_response`. `port` is only carried to the caller's new address; the address is the proxy's text.
+  if not hasData:
+    return velocityFailed("No response data received")
+  if payload.len < 32:
+    return velocityFailed("Unable to verify player details")
+  let signature = payload[0 ..< 32]
+  let body = payload[32 ..< payload.len]
+  if not checkIntegrity(signature, body, config.secret):
+    return velocityFailed("Unable to verify player details")
+  var r = newNetReader(body)
+  let version = getVarInt(r)
+  if not version.isOk:
+    return velocityFailed("Failed to read forward version")
+  let v = uint8(version.value.value and 255'i32)
+  if v > MaxSupportedForwardingVersion:
+    return velocityFailed("Unsupported forwarding version " & $v & ". Maximum supported version is " &
+      $MaxSupportedForwardingVersion)
+  let address = getStr(r)
+  if not address.isOk:
+    return velocityFailed("Failed to read address")
+  if not parseIp(address.value):
+    return velocityFailed("Failed to parse address")
+  let idPair = getUuidPair(r)
+  if not idPair.isOk:
+    return velocityFailed("Failed to read game profile UUID")
+  let name = getStr(r)
+  if not name.isOk:
+    return velocityFailed("Failed to read game profile name")
+  let count = getVarInt(r)
+  if not count.isOk or count.value.value < 0 or count.value.value > 65536:
+    return velocityFailed("Failed to read game profile properties")
+  var properties: seq[PropertyValue] = @[]
+  for i in 0 ..< int(count.value.value):
+    let pn = getStr(r)
+    if not pn.isOk:
+      return velocityFailed("Failed to read game profile properties")
+    let pv = getStr(r)
+    if not pv.isOk:
+      return velocityFailed("Failed to read game profile properties")
+    let hasSig = getBool(r)
+    if not hasSig.isOk:
+      return velocityFailed("Failed to read game profile properties")
+    var sig = ""
+    if hasSig.value:
+      let s = getStr(r)
+      if not s.isOk:
+        return velocityFailed("Failed to read game profile properties")
+      sig = s.value
+    properties.add(PropertyValue(name: pn.value, value: pv.value, signature: sig))
+  VelocityLogin(ok: true, address: address.value, error: ProxyError(message: ""),
+    profile: GameProfile(id: Uuid(hi: idPair.value[0], lo: idPair.value[1]), name: name.value, properties: properties,
+      profileActions: @[]))

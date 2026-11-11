@@ -1,5 +1,5 @@
 ## Port of pumpkin/src/lib.rs
-## PARTIAL: pumpkin/src/lib.rs - `PumpkinServer` with the Java listener and the tick loop. No Bedrock socket, console, RCON, query, LAN broadcast, plugins or logger.
+## PARTIAL: pumpkin/src/lib.rs - `PumpkinServer` with the Java listener, the tick loop, the console, RCON, the query server and the LAN broadcast, and the logger (logging.aowl). No Bedrock socket and no plugins. The listener binds an IPv4 address; an IPv6 one in the config is refused.
 ##
 ## Upstream runs an accept task, tasks per client, a tick task and chunk generation threads. Here `serverLoop` is all of
 ## them in turn, on one thread, over non-blocking sockets; see src/server/net/winsock.aowl. Generation is time-sliced: a
@@ -9,6 +9,10 @@
 
 import std/[options, syncio]
 import commandbridge, serverbase, servermod, ticker
+import logging
+import ../command/[cmdsource, cmddispatch]
+import ../protocol/java/client/play/disconnect
+import net/[rcon, queryserver]
 import entity/player as playermod
 import world/worldmod
 import net/java/[dispatch]
@@ -23,7 +27,13 @@ proc setConsoleCtrlHandler(handler: ConsoleCtrlHandler; add: int32): int32
 var stopFlag: int32 = 0'i32
   ## Set from the console's handler thread; the loop only reads it. A plain word, so no refcounts cross threads.
 
+proc exitProcess(code: uint32) {.stdcall, importc: "ExitProcess", dynlib: "kernel32.dll".}
+
 proc onConsoleCtrl(ctrlType: uint32): int32 {.stdcall.} =
+  ## `handle_interrupt` / `stop_or_exit_server`: the first signal asks the loop to stop and save, a second one while it is
+  ## stopping ends the process at once, as upstream's `SERVER_IS_STOPPING` check does.
+  if stopFlag != 0'i32:
+    exitProcess(0'u32)
   stopFlag = 1'i32
   1'i32
 
@@ -87,16 +97,48 @@ proc finished(conn: Connection; now: int64): bool =
     conn.closingSince = now
   conn.client.gone or not conn.client.hasOutgoing() or now - conn.closingSince > FlushGraceMs
 
-proc serverLoop*(server: Server; port: uint16): bool =
-  ## `PumpkinServer::start`. Returns false when the socket cannot be opened; otherwise when asked to stop.
+proc queryInfoOf(server: Server): QueryInfo =
+  ## What a query answer says: the motd, the counts, the save's name, and up to four players.
+  var names: seq[string] = @[]
+  for world in server.worlds:
+    for p in world.players:
+      names.add(p.gameprofile.name)
+  QueryInfo(motd: server.advancedConfig.networking.java.motd, maxPlayers: int(server.advancedConfig.networking.java.maxPlayers),
+    numPlayers: server.getPlayerCount(), worldName: worldNameOf(server.levelFolder), players: names)
+
+proc serverLoop*(server: Server; port: uint16; ip: uint32 = 0'u32): bool =
+  ## `PumpkinServer::new` and `start`. Returns false when the socket cannot be opened; otherwise when asked to stop.
   if not initWinsock():
-    echo "FATAL: WSAStartup failed"
+    error("WSAStartup failed")
     return false
-  let listener = listenOnNonBlocking(port)
+  let listener = listenOnNonBlockingAt(ip, port)
   if int(listener) == int(InvalidSocket):
-    echo "FATAL: could not bind/listen on port ", port, " (already in use?)"
+    error("Error: Address " & peerText(UdpPeer(ip: ip, port: port)) & ":" & $port & " is already in use, or not available on this machine.")
+    error("Make sure another instance of the server isn't already running")
     return false
-  echo "aowlmony Minecraft server listening on port ", port
+  let networking = server.advancedConfig.networking
+  var rconServer: nil RconServer = nil
+  if networking.rcon.enabled:
+    warn("RCON is enabled, but it's highly insecure as it transmits passwords and commands in plain text. This makes it vulnerable to interception and exploitation by anyone on the network")
+    rconServer = startRcon(networking.rcon)
+  var queryServer: nil QueryServer = nil
+  var lanBroadcast: nil LanBroadcast = nil
+  if networking.query.enabled:
+    info("Query protocol is enabled. Starting...")
+    queryServer = startQuery(networking.query)
+  if networking.lanBroadcast.enabled:
+    info("LAN broadcast is enabled. Starting...")
+    lanBroadcast = startLanBroadcast(networking.lanBroadcast, networking.java.motd, port)
+  let rconExec = proc(line: string): seq[string] {.closure.} =
+    let buffer = RconBuffer(lines: @[])
+    let dispatcher = server.commandDispatcher
+    let commandServer = server.commandServer
+    if dispatcher != nil and commandServer != nil:
+      handleCommand(dispatcher, intoSource(senderRcon(buffer), commandServer), line)
+    buffer.lines
+  let queryProvide = proc(): QueryInfo {.closure.} = queryInfoOf(server)
+  info("Server is now running. Connect using port: \x1b[33mJava Edition:\x1b[0m \x1b[34m" & peerText(UdpPeer(ip: ip, port: port)) &
+    ":" & $port & "\x1b[0m")
   stdout.flushFile()
   var connections: seq[Connection] = @[]
   var masterClientIdCounter = 0'u64
@@ -110,11 +152,16 @@ proc serverLoop*(server: Server; port: uint16): bool =
         break
       let clientId = masterClientIdCounter
       masterClientIdCounter += 1'u64
-      connections.add(Connection(client: newJavaClient(socket, clientId), player: none[Player](), closingSince: 0'i64))
+      let accepted = newJavaClient(socket, clientId)
+      accepted.peerIp = peerIp(socket)
+      connections.add(Connection(client: accepted, player: none[Player](), closingSince: 0'i64))
 
     for conn in connections:
       pumpConnection(conn, server)
     pumpConsole(server)
+    pumpRcon(rconServer, rconExec)
+    pumpQuery(queryServer, queryProvide)
+    pumpLanBroadcast(lanBroadcast)
 
     if ticker.stepTicker(server):
       for conn in connections:
@@ -146,6 +193,18 @@ proc serverLoop*(server: Server; port: uint16): bool =
     if not worked:
       sleepMs(1)
 
+  if stopFlag != 0'i32:
+    warn("\x1b[31mReceived interrupt signal; stopping server...\x1b[0m")
+  info("Stopped accepting incoming connections")
+  stopRcon(rconServer)
+  stopQuery(queryServer)
+  stopLanBroadcast(lanBroadcast)
+  closeClient(listener)
+  # Players are told, then removed, which saves each one; upstream saves them all first and then kicks.
+  for conn in connections:
+    if conn.player.isSome and not conn.client.isClosed:
+      conn.client.kick(text("Server stopped"))
+  info("Ending player tasks")
   for conn in connections:
     if conn.player.isSome:
       server.removePlayer(conn.player.unsafeGet)
@@ -153,5 +212,7 @@ proc serverLoop*(server: Server; port: uint16): bool =
     conn.client.close()
     conn.client.flushOutgoing()
     closeClient(conn.client.socket)
+  info("Starting save.")
   server.shutdown()
+  info("Completed save!")
   true
