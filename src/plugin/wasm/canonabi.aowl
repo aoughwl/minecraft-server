@@ -1,0 +1,806 @@
+## Component model: value types and the canonical ABI (lift and lower between core wasm values and
+## `CVal`, a typed dynamic value). Replaces what wasmtime::component does with `Val` and the generated
+## bindings. Follows the Component Model's CanonicalABI.md: flattening (at most 16 flat params, one flat
+## result, otherwise through memory), alignment and size, variant joining, strings (utf8 and utf16; latin1 is not
+## implemented), lists through `realloc`, resources through per-type handle tables.
+##
+## A `CmType` tree is built by component.aowl from the component's own type section, so no WIT text is
+## needed at run time: whatever types a plugin declares are the types it is lifted and lowered with.
+
+import wasmvm
+
+type
+  CKind* = enum
+    ckBool, ckS8, ckU8, ckS16, ckU16, ckS32, ckU32, ckS64, ckU64, ckF32, ckF64, ckChar, ckString,
+    ckList, ckRecord, ckTuple, ckVariant, ckEnum, ckOption, ckResult, ckFlags, ckOwn, ckBorrow, ckResource, ckNone
+
+  CmType* = ref object
+    kind*: CKind
+    names*: seq[string]     ## record/flags/enum/variant field or case names
+    types*: seq[CmType]      ## record/tuple fields; variant case payloads (NoT = none); [elem] of list, option, own, borrow (resource node); [ok, err] of result
+    name*: string           ## resource: name
+    resId*: int             ## resource: process-unique id, indexes handle tables
+
+  CVal* = ref object
+    i*: int64               ## ints, bool, char, enum index, variant case index, option present, result is-error, flags, handle rep
+    f*: float64
+    s*: string
+    items*: seq[CVal]       ## record/tuple fields, list elements, variant/option/result payload (0 or 1 item)
+
+  HEntry* = object
+    rep*: int
+    live*: bool
+    isOwn*: bool
+
+  HandleTables* = ref object
+    tables*: seq[seq[HEntry]]    ## by resource id
+
+  CanonCtx* = ref object
+    vm*: WasmVm
+    mem*: int
+    realloc*: int            ## store function address or -1
+    utf16*: bool
+    handles*: HandleTables
+    err*: string
+
+# ---- constructors ----------------------------------------------------------------------------
+
+var gNextRes = 1
+
+let NoT* = CmType(kind: ckNone, names: @[], types: @[])
+  ## placeholder for "no type" (a variant case without payload, a result without ok type)
+
+proc isNone*(t: CmType): bool = t.kind == ckNone
+
+proc newScalar*(k: CKind): CmType = CmType(kind: k, names: @[], types: @[])
+
+proc newResource*(name: string): CmType =
+  result = CmType(kind: ckResource, name: name, names: @[], types: @[], resId: gNextRes)
+  inc gNextRes
+
+proc vInt*(i: int64): CVal = CVal(i: i, items: @[])
+proc vBool*(b: bool): CVal = CVal(i: (if b: 1 else: 0), items: @[])
+proc vFloat*(f: float64): CVal = CVal(f: f, items: @[])
+proc vStr*(s: string): CVal = CVal(s: s, items: @[])
+proc vList*(items: seq[CVal]): CVal = CVal(items: items)
+proc vRecord*(items: seq[CVal]): CVal = CVal(items: items)
+proc vVariant*(caseIdx: int): CVal = CVal(i: int64(caseIdx), items: @[])
+proc vVariant*(caseIdx: int; payload: CVal): CVal =
+  result = CVal(i: int64(caseIdx), items: @[payload])
+proc vNone*(): CVal = CVal(i: 0, items: @[])
+proc vSome*(v: CVal): CVal = CVal(i: 1, items: @[v])
+
+proc caseIndex*(t: CmType; name: string): int =
+  var i = 0
+  while i < t.names.len:
+    if t.names[i] == name: return i
+    inc i
+  result = -1
+
+proc fieldIndex*(t: CmType; name: string): int = caseIndex(t, name)
+
+# ---- layout ----------------------------------------------------------------------------------
+
+proc alignTo(p, a: int): int = ((p + a - 1) div a) * a
+
+proc discSize(n: int): int =
+  if n <= 0x100: 1 elif n <= 0x10000: 2 else: 4
+
+proc alignOf*(t: CmType): int
+proc sizeOf*(t: CmType): int
+
+proc maxCaseAlign(t: CmType): int =
+  result = 1
+  if t.kind == ckOption:
+    return alignOf(t.types[0])
+  if t.kind == ckResult:
+    if not isNone(t.types[0]): result = max(result, alignOf(t.types[0]))
+    if not isNone(t.types[1]): result = max(result, alignOf(t.types[1]))
+    return
+  var i = 0
+  while i < t.types.len:
+    if not isNone(t.types[i]): result = max(result, alignOf(t.types[i]))
+    inc i
+
+proc caseCount(t: CmType): int =
+  case t.kind
+  of ckOption, ckResult: 2
+  else: t.names.len
+
+proc alignOf*(t: CmType): int =
+  case t.kind
+  of ckBool, ckS8, ckU8, ckNone: 1
+  of ckS16, ckU16: 2
+  of ckS32, ckU32, ckF32, ckChar, ckOwn, ckBorrow, ckResource, ckString, ckList: 4
+  of ckS64, ckU64, ckF64: 8
+  of ckRecord, ckTuple:
+    var a = 1
+    var i = 0
+    while i < t.types.len:
+      a = max(a, alignOf(t.types[i]))
+      inc i
+    a
+  of ckVariant, ckOption, ckResult:
+    max(discSize(caseCount(t)), maxCaseAlign(t))
+  of ckEnum: discSize(t.names.len)
+  of ckFlags:
+    if t.names.len <= 8: 1 elif t.names.len <= 16: 2 else: 4
+
+proc sizeOf*(t: CmType): int =
+  case t.kind
+  of ckBool, ckS8, ckU8, ckNone: 1
+  of ckS16, ckU16: 2
+  of ckS32, ckU32, ckF32, ckChar, ckOwn, ckBorrow, ckResource: 4
+  of ckS64, ckU64, ckF64, ckString, ckList: 8
+  of ckRecord, ckTuple:
+    var s = 0
+    var i = 0
+    while i < t.types.len:
+      s = alignTo(s, alignOf(t.types[i]))
+      s += sizeOf(t.types[i])
+      inc i
+    alignTo(s, alignOf(t))
+  of ckVariant, ckOption, ckResult:
+    var cs = 0
+    if t.kind == ckOption: cs = sizeOf(t.types[0])
+    elif t.kind == ckResult:
+      if not isNone(t.types[0]): cs = max(cs, sizeOf(t.types[0]))
+      if not isNone(t.types[1]): cs = max(cs, sizeOf(t.types[1]))
+    else:
+      var i = 0
+      while i < t.types.len:
+        if not isNone(t.types[i]): cs = max(cs, sizeOf(t.types[i]))
+        inc i
+    var s = discSize(caseCount(t))
+    s = alignTo(s, maxCaseAlign(t))
+    s += cs
+    alignTo(s, alignOf(t))
+  of ckEnum: discSize(t.names.len)
+  of ckFlags:
+    if t.names.len <= 8: 1 elif t.names.len <= 16: 2 else: 4 * ((t.names.len + 31) div 32)
+
+proc caseType(t: CmType; i: int): CmType =
+  case t.kind
+  of ckOption: (if i == 1: t.types[0] else: NoT)
+  of ckResult: (if i == 0: t.types[0] else: t.types[1])
+  else: t.types[i]
+
+# ---- flattening ------------------------------------------------------------------------------
+
+proc flatten*(t: CmType; outv: var seq[int])
+
+proc joinFlat(a, b: int): int =
+  if a == b: return a
+  if (a == vtI32 and b == vtF32) or (a == vtF32 and b == vtI32): return vtI32
+  result = vtI64
+
+proc flattenVariant(t: CmType; outv: var seq[int]) =
+  var joined: seq[int] = @[]
+  var c = 0
+  while c < caseCount(t):
+    let ct = caseType(t, c)
+    if not isNone(ct):
+      var fl: seq[int] = @[]
+      flatten(ct, fl)
+      var k = 0
+      while k < fl.len:
+        if k < joined.len: joined[k] = joinFlat(joined[k], fl[k])
+        else: joined.add fl[k]
+        inc k
+    inc c
+  outv.add vtI32
+  var k = 0
+  while k < joined.len:
+    outv.add joined[k]
+    inc k
+
+proc flatten*(t: CmType; outv: var seq[int]) =
+  case t.kind
+  of ckBool, ckS8, ckU8, ckS16, ckU16, ckS32, ckU32, ckChar, ckOwn, ckBorrow, ckResource, ckEnum, ckNone:
+    outv.add vtI32
+  of ckS64, ckU64: outv.add vtI64
+  of ckF32: outv.add vtF32
+  of ckF64: outv.add vtF64
+  of ckString, ckList:
+    outv.add vtI32
+    outv.add vtI32
+  of ckRecord, ckTuple:
+    var i = 0
+    while i < t.types.len:
+      flatten(t.types[i], outv)
+      inc i
+  of ckVariant, ckOption, ckResult: flattenVariant(t, outv)
+  of ckFlags:
+    var n = (if t.names.len <= 32: 1 else: (t.names.len + 31) div 32)
+    if t.names.len == 0: n = 0
+    var i = 0
+    while i < n:
+      outv.add vtI32
+      inc i
+
+const
+  MaxFlatParams* = 16
+  MaxFlatResults* = 1
+
+# ---- raw memory ------------------------------------------------------------------------------
+
+proc fail(c: CanonCtx; msg: string) =
+  if c.err.len == 0: c.err = msg
+
+proc loadN(c: CanonCtx; p, n: int): uint64 =
+  if p < 0 or p + n > memSize(c.vm, c.mem):
+    fail(c, "out-of-bounds memory read")
+    return 0
+  result = 0'u64
+  var i = n - 1
+  while i >= 0:
+    result = (result shl 8) or uint64(memByte(c.vm, c.mem, p + i))
+    dec i
+
+proc storeN(c: CanonCtx; p, n: int; v: uint64) =
+  if p < 0 or p + n > memSize(c.vm, c.mem):
+    fail(c, "out-of-bounds memory write")
+    return
+  var i = 0
+  while i < n:
+    setMemByte(c.vm, c.mem, p + i, int((v shr uint64(8 * i)) and 0xFF'u64))
+    inc i
+
+proc signExt(v: uint64; bits: int): int64 =
+  let sh = uint64(64 - bits)
+  result = int64(v shl sh) shr int64(sh)
+
+proc f32OfBits(b: uint32): float64 = float64(cast[float32](b))
+proc bitsOfF32(f: float64): uint32 = cast[uint32](float32(f))
+proc f64OfBits(b: uint64): float64 = cast[float64](b)
+proc bitsOfF64(f: float64): uint64 = cast[uint64](f)
+
+# ---- strings ---------------------------------------------------------------------------------
+
+proc validUtf8(s: string): bool =
+  var i = 0
+  while i < s.len:
+    let b = int(s[i])
+    var n = 0
+    if b < 0x80: n = 0
+    elif b >= 0xC2 and b <= 0xDF: n = 1
+    elif b >= 0xE0 and b <= 0xEF: n = 2
+    elif b >= 0xF0 and b <= 0xF4: n = 3
+    else: return false
+    if i + n >= s.len + (if n == 0: 1 else: 0) and n > 0: return false
+    var k = 1
+    while k <= n:
+      if i + k >= s.len or (int(s[i + k]) and 0xC0) != 0x80: return false
+      inc k
+    i += n + 1
+  result = true
+
+proc utf8ToUtf16(s: string): string =
+  ## little-endian utf16 code units as bytes
+  result = ""
+  var i = 0
+  while i < s.len:
+    var cp = 0
+    let b = int(s[i])
+    var n = 0
+    if b < 0x80: cp = b
+    elif b < 0xE0:
+      cp = b and 0x1F
+      n = 1
+    elif b < 0xF0:
+      cp = b and 0x0F
+      n = 2
+    else:
+      cp = b and 0x07
+      n = 3
+    var k = 1
+    while k <= n and i + k < s.len:
+      cp = (cp shl 6) or (int(s[i + k]) and 0x3F)
+      inc k
+    i += n + 1
+    if cp >= 0x10000:
+      let v = cp - 0x10000
+      let hi = 0xD800 + (v shr 10)
+      let lo = 0xDC00 + (v and 0x3FF)
+      result.add char(hi and 0xFF)
+      result.add char(hi shr 8)
+      result.add char(lo and 0xFF)
+      result.add char(lo shr 8)
+    else:
+      result.add char(cp and 0xFF)
+      result.add char(cp shr 8)
+
+proc utf16ToUtf8(b: string): string =
+  result = ""
+  var i = 0
+  while i + 1 < b.len:
+    var u = int(b[i]) or (int(b[i + 1]) shl 8)
+    i += 2
+    if u >= 0xD800 and u < 0xDC00 and i + 1 < b.len:
+      let lo = int(b[i]) or (int(b[i + 1]) shl 8)
+      if lo >= 0xDC00 and lo < 0xE000:
+        i += 2
+        u = 0x10000 + ((u - 0xD800) shl 10) + (lo - 0xDC00)
+    if u < 0x80: result.add char(u)
+    elif u < 0x800:
+      result.add char(0xC0 or (u shr 6))
+      result.add char(0x80 or (u and 0x3F))
+    elif u < 0x10000:
+      result.add char(0xE0 or (u shr 12))
+      result.add char(0x80 or ((u shr 6) and 0x3F))
+      result.add char(0x80 or (u and 0x3F))
+    else:
+      result.add char(0xF0 or (u shr 18))
+      result.add char(0x80 or ((u shr 12) and 0x3F))
+      result.add char(0x80 or ((u shr 6) and 0x3F))
+      result.add char(0x80 or (u and 0x3F))
+
+proc callRealloc*(c: CanonCtx; oldP, oldS, align, newS: int): int =
+  if c.realloc < 0:
+    fail(c, "canon option realloc missing")
+    return 0
+  var res: seq[WSlot] = @[]
+  let st = call(c.vm, c.realloc, @[i32(int32(oldP)), i32(int32(oldS)), i32(int32(align)), i32(int32(newS))], res)
+  if st != wsOk or res.len != 1:
+    fail(c, "realloc trapped: " & c.vm.s.trapMsg)
+    return 0
+  result = int(uint32(asI32(res[0])))
+  if result mod align != 0 or result + newS > memSize(c.vm, c.mem):
+    fail(c, "realloc returned a bad pointer")
+
+proc encodeString(c: CanonCtx; s: string; p0, n0: var int) =
+  ## writes the bytes into guest memory; (pointer, code-unit count)
+  var bytes = s
+  var units = s.len
+  if c.utf16:
+    bytes = utf8ToUtf16(s)
+    units = bytes.len div 2
+  p0 = callRealloc(c, 0, 0, (if c.utf16: 2 else: 1), bytes.len)
+  if c.err.len > 0: return
+  if not memWrite(c.vm, c.mem, p0, bytes): fail(c, "string write out of bounds")
+  n0 = units
+
+proc decodeString(c: CanonCtx; p, units: int): string =
+  let nbytes = (if c.utf16: units * 2 else: units)
+  var ok = false
+  let raw = memRead(c.vm, c.mem, p, nbytes, ok)
+  if not ok:
+    fail(c, "string out of bounds")
+    return ""
+  if c.utf16: return utf16ToUtf8(raw)
+  if not validUtf8(raw):
+    fail(c, "invalid utf-8 string")
+    return ""
+  result = raw
+
+# ---- handles ---------------------------------------------------------------------------------
+
+proc newHandleTables*(): HandleTables = HandleTables(tables: @[])
+
+proc tableOf(h: HandleTables; resId: int): int =
+  while h.tables.len <= resId: h.tables.add(@[HEntry(rep: 0, live: false, isOwn: false)])  # index 0 is never a handle
+  result = resId
+
+proc addHandle*(h: HandleTables; resId, rep: int; isOwn: bool): int =
+  let t = tableOf(h, resId)
+  var i = 1
+  while i < h.tables[t].len:
+    if not h.tables[t][i].live:
+      h.tables[t][i] = HEntry(rep: rep, live: true, isOwn: isOwn)
+      return i
+    inc i
+  h.tables[t].add HEntry(rep: rep, live: true, isOwn: isOwn)
+  result = h.tables[t].len - 1
+
+proc getHandle*(h: HandleTables; resId, idx: int; rep: var int): bool =
+  let t = tableOf(h, resId)
+  if idx <= 0 or idx >= h.tables[t].len or not h.tables[t][idx].live: return false
+  rep = h.tables[t][idx].rep
+  result = true
+
+proc dropHandle*(h: HandleTables; resId, idx: int; rep: var int): bool =
+  ## removes a handle; false when it was not live
+  let t = tableOf(h, resId)
+  if idx <= 0 or idx >= h.tables[t].len or not h.tables[t][idx].live: return false
+  rep = h.tables[t][idx].rep
+  h.tables[t][idx].live = false
+  result = true
+
+# ---- memory lift and lower ---------------------------------------------------------------
+
+proc loadVal*(c: CanonCtx; t: CmType; p: int): CVal
+proc storeVal*(c: CanonCtx; t: CmType; v: CVal; p: int)
+
+proc loadVariantLike(c: CanonCtx; t: CmType; p: int): CVal =
+  let n = caseCount(t)
+  let ds = discSize(n)
+  let disc = int(loadN(c, p, ds))
+  if disc >= n:
+    fail(c, "variant discriminant out of range")
+    return vInt(0)
+  let ct = caseType(t, disc)
+  result = CVal(i: int64(disc), items: @[])
+  if not isNone(ct):
+    # payload offset: disc size aligned to the variant's maximum case alignment
+    result.items.add loadVal(c, ct, p + alignTo(ds, maxCaseAlign(t)))
+
+proc loadVal*(c: CanonCtx; t: CmType; p: int): CVal =
+  result = vInt(0)
+  case t.kind
+  of ckBool: result = vBool(loadN(c, p, 1) != 0)
+  of ckU8: result = vInt(int64(loadN(c, p, 1)))
+  of ckS8: result = vInt(signExt(loadN(c, p, 1), 8))
+  of ckU16: result = vInt(int64(loadN(c, p, 2)))
+  of ckS16: result = vInt(signExt(loadN(c, p, 2), 16))
+  of ckU32: result = vInt(int64(loadN(c, p, 4)))
+  of ckS32: result = vInt(signExt(loadN(c, p, 4), 32))
+  of ckU64, ckS64: result = vInt(cast[int64](loadN(c, p, 8)))
+  of ckF32: result = vFloat(f32OfBits(uint32(loadN(c, p, 4))))
+  of ckF64: result = vFloat(f64OfBits(loadN(c, p, 8)))
+  of ckChar: result = vInt(int64(loadN(c, p, 4)))
+  of ckString:
+    let q = int(loadN(c, p, 4))
+    let n = int(loadN(c, p + 4, 4))
+    result = vStr(decodeString(c, q, n))
+  of ckList:
+    let q = int(loadN(c, p, 4))
+    let n = int(loadN(c, p + 4, 4))
+    result = vList(@[])
+    let es = sizeOf(t.types[0])
+    if q mod alignOf(t.types[0]) != 0 or q + n * es > memSize(c.vm, c.mem):
+      fail(c, "list out of bounds")
+      return
+    var i = 0
+    while i < n and c.err.len == 0:
+      result.items.add loadVal(c, t.types[0], q + i * es)
+      inc i
+  of ckRecord, ckTuple:
+    result = vRecord(@[])
+    var q = p
+    var i = 0
+    while i < t.types.len:
+      q = alignTo(q, alignOf(t.types[i]))
+      result.items.add loadVal(c, t.types[i], q)
+      q += sizeOf(t.types[i])
+      inc i
+  of ckVariant, ckOption, ckResult: result = loadVariantLike(c, t, p)
+  of ckEnum:
+    result = vInt(int64(loadN(c, p, discSize(t.names.len))))
+    if int(result.i) >= t.names.len: fail(c, "enum out of range")
+  of ckFlags:
+    let n = (if t.names.len <= 8: 1 elif t.names.len <= 16: 2 else: 4)
+    result = vInt(0)
+    if t.names.len <= 32: result.i = int64(loadN(c, p, n))
+    else:
+      var w = 0
+      while w < (t.names.len + 31) div 32:
+        result.items.add vInt(int64(loadN(c, p + 4 * w, 4)))
+        inc w
+  of ckOwn, ckBorrow:
+    let idx = int(loadN(c, p, 4))
+    var rep = 0
+    if t.kind == ckOwn:
+      if not dropHandle(c.handles, t.types[0].resId, idx, rep): fail(c, "bad own handle")
+    else:
+      if not getHandle(c.handles, t.types[0].resId, idx, rep): fail(c, "bad borrow handle")
+    result = vInt(int64(rep))
+  of ckResource, ckNone: fail(c, "resource type used as a value")
+
+proc storeVariantLike(c: CanonCtx; t: CmType; v: CVal; p: int) =
+  let n = caseCount(t)
+  let ds = discSize(n)
+  storeN(c, p, ds, uint64(v.i))
+  if int(v.i) < n:
+    let ct = caseType(t, int(v.i))
+    if not isNone(ct) and v.items.len > 0:
+      storeVal(c, ct, v.items[0], p + alignTo(ds, maxCaseAlign(t)))
+
+proc storeVal*(c: CanonCtx; t: CmType; v: CVal; p: int) =
+  case t.kind
+  of ckBool, ckU8, ckS8: storeN(c, p, 1, uint64(v.i))
+  of ckU16, ckS16: storeN(c, p, 2, uint64(v.i))
+  of ckU32, ckS32, ckChar: storeN(c, p, 4, uint64(v.i))
+  of ckU64, ckS64: storeN(c, p, 8, cast[uint64](v.i))
+  of ckF32: storeN(c, p, 4, uint64(bitsOfF32(v.f)))
+  of ckF64: storeN(c, p, 8, bitsOfF64(v.f))
+  of ckString:
+    var q = 0
+    var n = 0
+    encodeString(c, v.s, q, n)
+    storeN(c, p, 4, uint64(q))
+    storeN(c, p + 4, 4, uint64(n))
+  of ckList:
+    let es = sizeOf(t.types[0])
+    let q = callRealloc(c, 0, 0, alignOf(t.types[0]), es * v.items.len)
+    if c.err.len > 0: return
+    var i = 0
+    while i < v.items.len and c.err.len == 0:
+      storeVal(c, t.types[0], v.items[i], q + i * es)
+      inc i
+    storeN(c, p, 4, uint64(q))
+    storeN(c, p + 4, 4, uint64(v.items.len))
+  of ckRecord, ckTuple:
+    var q = p
+    var i = 0
+    while i < t.types.len:
+      q = alignTo(q, alignOf(t.types[i]))
+      storeVal(c, t.types[i], v.items[i], q)
+      q += sizeOf(t.types[i])
+      inc i
+  of ckVariant, ckOption, ckResult: storeVariantLike(c, t, v, p)
+  of ckEnum: storeN(c, p, discSize(t.names.len), uint64(v.i))
+  of ckFlags:
+    if t.names.len <= 32:
+      storeN(c, p, (if t.names.len <= 8: 1 elif t.names.len <= 16: 2 else: 4), uint64(v.i))
+    else:
+      var w = 0
+      while w < v.items.len:
+        storeN(c, p + 4 * w, 4, uint64(v.items[w].i))
+        inc w
+  of ckOwn:
+    storeN(c, p, 4, uint64(addHandle(c.handles, t.types[0].resId, int(v.i), true)))
+  of ckBorrow:
+    storeN(c, p, 4, uint64(addHandle(c.handles, t.types[0].resId, int(v.i), false)))
+  of ckResource, ckNone: fail(c, "resource type used as a value")
+
+# ---- flat lift and lower -----------------------------------------------------------------
+
+type
+  FlatCursor* = object
+    vals*: seq[WSlot]
+    pos*: int
+
+proc nextFlat(cur: var FlatCursor): WSlot =
+  if cur.pos >= cur.vals.len: return WSlot(lo: 0, hi: 0)
+  result = cur.vals[cur.pos]
+  inc cur.pos
+
+proc liftFlat*(c: CanonCtx; t: CmType; cur: var FlatCursor): CVal
+proc lowerFlat*(c: CanonCtx; t: CmType; v: CVal; outv: var seq[WSlot])
+
+proc coerceDown(x: WSlot; have, want: int): WSlot =
+  ## joined type `have` to a case's own flat type `want`
+  result = x
+  if have == vtI32 and want == vtF32: return x
+  if have == vtI64 and want == vtI32: return WSlot(lo: x.lo and 0xFFFFFFFF'u64, hi: 0)
+  if have == vtI64 and want == vtF32: return WSlot(lo: x.lo and 0xFFFFFFFF'u64, hi: 0)
+
+proc joinedOf(t: CmType): seq[int] =
+  var f: seq[int] = @[]
+  flattenVariant(t, f)
+  result = f
+
+proc liftVariantFlat(c: CanonCtx; t: CmType; cur: var FlatCursor): CVal =
+  let joined = joinedOf(t)
+  let startPos = cur.pos
+  let disc = int(nextFlat(cur).lo and 0xFFFFFFFF'u64)
+  let n = caseCount(t)
+  if disc >= n:
+    fail(c, "variant discriminant out of range")
+    return vInt(0)
+  result = CVal(i: int64(disc), items: @[])
+  let ct = caseType(t, disc)
+  var payloadFlat: seq[int] = @[]
+  if not isNone(ct): flatten(ct, payloadFlat)
+  # take the case's own flat values from the joined slots, coercing each
+  var sub = FlatCursor(vals: @[], pos: 0)
+  var k = 0
+  while k < payloadFlat.len:
+    sub.vals.add coerceDown(cur.vals[startPos + 1 + k], joined[1 + k], payloadFlat[k])
+    inc k
+  if not isNone(ct): result.items.add liftFlat(c, ct, sub)
+  # consume all joined slots
+  cur.pos = startPos + joined.len
+
+proc liftFlat*(c: CanonCtx; t: CmType; cur: var FlatCursor): CVal =
+  result = vInt(0)
+  case t.kind
+  of ckBool: result = vBool((nextFlat(cur).lo and 0xFFFFFFFF'u64) != 0)
+  of ckU8: result = vInt(int64(nextFlat(cur).lo and 0xFF'u64))
+  of ckS8: result = vInt(signExt(nextFlat(cur).lo and 0xFF'u64, 8))
+  of ckU16: result = vInt(int64(nextFlat(cur).lo and 0xFFFF'u64))
+  of ckS16: result = vInt(signExt(nextFlat(cur).lo and 0xFFFF'u64, 16))
+  of ckU32, ckChar: result = vInt(int64(nextFlat(cur).lo and 0xFFFFFFFF'u64))
+  of ckS32: result = vInt(signExt(nextFlat(cur).lo and 0xFFFFFFFF'u64, 32))
+  of ckU64, ckS64: result = vInt(cast[int64](nextFlat(cur).lo))
+  of ckF32: result = vFloat(f32OfBits(uint32(nextFlat(cur).lo and 0xFFFFFFFF'u64)))
+  of ckF64: result = vFloat(f64OfBits(nextFlat(cur).lo))
+  of ckString:
+    let p = int(nextFlat(cur).lo and 0xFFFFFFFF'u64)
+    let n = int(nextFlat(cur).lo and 0xFFFFFFFF'u64)
+    result = vStr(decodeString(c, p, n))
+  of ckList:
+    let p = int(nextFlat(cur).lo and 0xFFFFFFFF'u64)
+    let n = int(nextFlat(cur).lo and 0xFFFFFFFF'u64)
+    result = vList(@[])
+    let es = sizeOf(t.types[0])
+    if p mod alignOf(t.types[0]) != 0 or p + n * es > memSize(c.vm, c.mem):
+      fail(c, "list out of bounds")
+      return
+    var i = 0
+    while i < n and c.err.len == 0:
+      result.items.add loadVal(c, t.types[0], p + i * es)
+      inc i
+  of ckRecord, ckTuple:
+    result = vRecord(@[])
+    var i = 0
+    while i < t.types.len:
+      result.items.add liftFlat(c, t.types[i], cur)
+      inc i
+  of ckVariant, ckOption, ckResult: result = liftVariantFlat(c, t, cur)
+  of ckEnum:
+    result = vInt(int64(nextFlat(cur).lo and 0xFFFFFFFF'u64))
+    if int(result.i) >= t.names.len: fail(c, "enum out of range")
+  of ckFlags:
+    result = vInt(0)
+    if t.names.len <= 32:
+      result.i = int64(nextFlat(cur).lo and 0xFFFFFFFF'u64)
+    else:
+      var w = 0
+      while w < (t.names.len + 31) div 32:
+        result.items.add vInt(int64(nextFlat(cur).lo and 0xFFFFFFFF'u64))
+        inc w
+  of ckOwn, ckBorrow:
+    let idx = int(nextFlat(cur).lo and 0xFFFFFFFF'u64)
+    var rep = 0
+    if t.kind == ckOwn:
+      if not dropHandle(c.handles, t.types[0].resId, idx, rep): fail(c, "bad own handle")
+    else:
+      if not getHandle(c.handles, t.types[0].resId, idx, rep): fail(c, "bad borrow handle")
+    result = vInt(int64(rep))
+  of ckResource, ckNone: fail(c, "resource type used as a value")
+
+proc coerceUp(x: WSlot; have, want: int): WSlot =
+  ## a case's flat value of type `have` into the joined slot type `want`
+  result = x
+  if have == want: return
+  if want == vtI64 and (have == vtI32 or have == vtF32): return WSlot(lo: x.lo and 0xFFFFFFFF'u64, hi: 0)
+  # f32 into i32 slot: identical bits already
+
+proc lowerVariantFlat(c: CanonCtx; t: CmType; v: CVal; outv: var seq[WSlot]) =
+  let joined = joinedOf(t)
+  outv.add WSlot(lo: uint64(v.i), hi: 0)
+  let ct = (if int(v.i) < caseCount(t): caseType(t, int(v.i)) else: NoT)
+  var payload: seq[WSlot] = @[]
+  var pf: seq[int] = @[]
+  if not isNone(ct) and v.items.len > 0:
+    lowerFlat(c, ct, v.items[0], payload)
+    flatten(ct, pf)
+  var k = 1
+  while k < joined.len:
+    if k - 1 < payload.len: outv.add coerceUp(payload[k - 1], pf[k - 1], joined[k])
+    else: outv.add WSlot(lo: 0, hi: 0)
+    inc k
+
+proc lowerFlat*(c: CanonCtx; t: CmType; v: CVal; outv: var seq[WSlot]) =
+  case t.kind
+  of ckBool, ckU8, ckS8, ckU16, ckS16, ckU32, ckS32, ckChar, ckEnum:
+    outv.add WSlot(lo: uint64(v.i) and 0xFFFFFFFF'u64, hi: 0)
+  of ckU64, ckS64: outv.add WSlot(lo: cast[uint64](v.i), hi: 0)
+  of ckF32: outv.add WSlot(lo: uint64(bitsOfF32(v.f)), hi: 0)
+  of ckF64: outv.add WSlot(lo: bitsOfF64(v.f), hi: 0)
+  of ckString:
+    var p = 0
+    var n = 0
+    encodeString(c, v.s, p, n)
+    outv.add WSlot(lo: uint64(p), hi: 0)
+    outv.add WSlot(lo: uint64(n), hi: 0)
+  of ckList:
+    let es = sizeOf(t.types[0])
+    let q = callRealloc(c, 0, 0, alignOf(t.types[0]), es * v.items.len)
+    if c.err.len > 0: return
+    var i = 0
+    while i < v.items.len and c.err.len == 0:
+      storeVal(c, t.types[0], v.items[i], q + i * es)
+      inc i
+    outv.add WSlot(lo: uint64(q), hi: 0)
+    outv.add WSlot(lo: uint64(v.items.len), hi: 0)
+  of ckRecord, ckTuple:
+    var i = 0
+    while i < t.types.len:
+      lowerFlat(c, t.types[i], v.items[i], outv)
+      inc i
+  of ckVariant, ckOption, ckResult: lowerVariantFlat(c, t, v, outv)
+  of ckFlags:
+    if t.names.len <= 32: outv.add WSlot(lo: uint64(v.i) and 0xFFFFFFFF'u64, hi: 0)
+    else:
+      var w = 0
+      while w < v.items.len:
+        outv.add WSlot(lo: uint64(v.items[w].i) and 0xFFFFFFFF'u64, hi: 0)
+        inc w
+  of ckOwn:
+    outv.add WSlot(lo: uint64(addHandle(c.handles, t.types[0].resId, int(v.i), true)), hi: 0)
+  of ckBorrow:
+    outv.add WSlot(lo: uint64(addHandle(c.handles, t.types[0].resId, int(v.i), false)), hi: 0)
+  of ckResource, ckNone: fail(c, "resource type used as a value")
+
+# ---- whole calls -------------------------------------------------------------------------
+
+proc flatCount*(ts: seq[CmType]): int =
+  var fl: seq[int] = @[]
+  for t in ts: flatten(t, fl)
+  result = fl.len
+
+proc liftArgs*(c: CanonCtx; params: seq[CmType]; flat: seq[WSlot]): seq[CVal] =
+  ## core arguments of a lifted call or lowered callee -> values. More than 16 flat values arrive as one
+  ## pointer to a record in memory.
+  result = @[]
+  if flatCount(params) > MaxFlatParams:
+    var q = int(flat[0].lo and 0xFFFFFFFF'u64)
+    var i = 0
+    while i < params.len:
+      q = alignTo(q, alignOf(params[i]))
+      result.add loadVal(c, params[i], q)
+      q += sizeOf(params[i])
+      inc i
+    return
+  var cur = FlatCursor(vals: flat, pos: 0)
+  var i = 0
+  while i < params.len:
+    result.add liftFlat(c, params[i], cur)
+    inc i
+
+proc lowerArgs*(c: CanonCtx; params: seq[CmType]; vals: seq[CVal]): seq[WSlot] =
+  result = @[]
+  if flatCount(params) > MaxFlatParams:
+    var total = 0
+    var al = 1
+    var i = 0
+    while i < params.len:
+      total = alignTo(total, alignOf(params[i])) + sizeOf(params[i])
+      al = max(al, alignOf(params[i]))
+      inc i
+    let q = callRealloc(c, 0, 0, al, total)
+    if c.err.len > 0: return
+    var o = q
+    i = 0
+    while i < params.len:
+      o = alignTo(o, alignOf(params[i]))
+      storeVal(c, params[i], vals[i], o)
+      o += sizeOf(params[i])
+      inc i
+    result.add WSlot(lo: uint64(q), hi: 0)
+    return
+  var i = 0
+  while i < params.len:
+    lowerFlat(c, params[i], vals[i], result)
+    inc i
+
+proc resultsType(ts: seq[CmType]): CmType =
+  ## zero or one result type of a function type; several results act as a tuple
+  if ts.len == 0: return NoT
+  if ts.len == 1: return ts[0]
+  result = CmType(kind: ckTuple, names: @[], types: ts)
+
+proc liftResults*(c: CanonCtx; results: seq[CmType]; flat: seq[WSlot]): seq[CVal] =
+  ## results of a call into the guest (or of a lowered callee seen by the host)
+  result = @[]
+  let rt = resultsType(results)
+  if isNone(rt): return
+  var fl: seq[int] = @[]
+  flatten(rt, fl)
+  if fl.len > MaxFlatResults:
+    let p = int(flat[0].lo and 0xFFFFFFFF'u64)
+    result.add loadVal(c, rt, p)
+  else:
+    var cur = FlatCursor(vals: flat, pos: 0)
+    result.add liftFlat(c, rt, cur)
+
+proc lowerResults*(c: CanonCtx; results: seq[CmType]; vals: seq[CVal]; retPtr: int): seq[WSlot] =
+  ## values -> core results; with more than one flat value they go to the caller's return area `retPtr`
+  result = @[]
+  let rt = resultsType(results)
+  if isNone(rt) or vals.len == 0: return
+  var fl: seq[int] = @[]
+  flatten(rt, fl)
+  if fl.len > MaxFlatResults:
+    storeVal(c, rt, vals[0], retPtr)
+  else:
+    lowerFlat(c, rt, vals[0], result)
+
+proc flatResultCount*(results: seq[CmType]): int =
+  let rt = resultsType(results)
+  if isNone(rt): return 0
+  var fl: seq[int] = @[]
+  flatten(rt, fl)
+  result = fl.len

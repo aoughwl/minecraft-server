@@ -1,0 +1,2894 @@
+## Copied from the titicaca app's aoughwl.web.dom mod (Desktop/jester_data/apps/titicaca/basemods): stdlib-only WebAssembly decoder,
+## validator and interpreter written in aowlmony. Used here as the plugin runtime; see ../README.md.
+## WebAssembly: the binary format, the type system and validation.
+##
+## Pure, like every `web*.aowl` module: bytes in, a checked and pre-compiled
+## `WModule` out, or a reason it is not a module at all. `webwasmrt.aowl` runs
+## what this file produces; `jsdomwasm.aowl` is the JavaScript API over both.
+##
+## WHAT IT FOLLOWS
+## ---------------
+## The WebAssembly 3.0 core specification: the binary format (chapter 5), and
+## validation as the specification's appendix "Validation Algorithm" writes
+## it - an operand stack of value types and a stack of control frames, walked
+## once, in order. Beyond the 1.0 MVP that means multi-value, bulk memory,
+## reference types, typed function references, GC types (iso-recursive type
+## canonicalisation, subtyping), exception handling (`try_table`, `throw`,
+## `throw_ref`), tail calls, multiple memories, 64-bit memories and tables,
+## fixed-width and relaxed SIMD, sign extension and non-trapping conversions.
+##
+## THE SAME WALK COMPILES
+## ----------------------
+## Validation and compilation are one pass. As each instruction is checked it
+## is also emitted into `WModule.code` as a fixed-size `Ins` whose branch
+## targets are already resolved to instruction indices and whose stack
+## adjustments (how many values a branch carries, where they land) are already
+## worked out from the static stack heights. The interpreter therefore never
+## scans for an `end` or keeps a label stack: a `br` is a copy and a jump.
+##
+## TYPES
+## -----
+## A value type is one `int`. The numeric and vector types are their binary
+## codes (0x7F i32 .. 0x7B v128). A reference type is `0x1000 + (heap + 64) *
+## 2 + nullable`, where `heap` is either a canonical type id (>= 0) or one of
+## the abstract heap types below (negative). Canonical ids live in a
+## `TypeReg`, shared by every module of a realm, so two modules that declare
+## the same recursion group get the same ids - which is what makes
+## `call_indirect` and import matching across modules the iso-recursive
+## equivalence the specification defines rather than name equality.
+
+const
+  vtI32* = 0x7F
+  vtI64* = 0x7E
+  vtF32* = 0x7D
+  vtF64* = 0x7C
+  vtV128* = 0x7B
+  vtBot* = -1          ## the validator's "unknown" type on an unreachable stack
+  stI8* = 0x78         ## packed storage types, only in struct and array fields
+  stI16* = 0x77
+
+  htFunc* = -1
+  htExtern* = -2
+  htAny* = -3
+  htEq* = -4
+  htI31* = -5
+  htStruct* = -6
+  htArray* = -7
+  htExn* = -8
+  htNone* = -9
+  htNoExtern* = -10
+  htNoFunc* = -11
+  htNoExn* = -12
+  htBot* = -13
+
+  ckFunc* = 0
+  ckStruct* = 1
+  ckArray* = 2
+
+  ekFunc* = 0
+  ekTable* = 1
+  ekMem* = 2
+  ekGlobal* = 3
+  ekTag* = 4
+
+  # Implementation limits: the JavaScript API's (JS API section "Limits").
+  MaxTypes = 1_000_000
+  MaxFuncs = 1_000_000
+  MaxImports = 100_000
+  MaxExports = 100_000
+  MaxGlobals = 1_000_000
+  MaxDataSegs = 100_000
+  MaxTables = 100_000
+  MaxMems = 100
+  MaxLocals = 50_000
+  MaxParams = 1_000
+  MaxResults = 1_000
+  MaxBodySize = 7_654_321
+  MaxTableSize* = 10_000_000'u64
+  MaxPages32* = 65536'u64
+  MaxPages64* = 0x1_0000_0000_0000'u64   ## 2^48
+
+  # Internal opcodes: never in a binary, only in `WModule.code`.
+  opJump* = 0x600        ## a = target
+  opBr* = 0x601          ## a = target, b = arity, c = destination offset
+  opBrIf* = 0x602
+  opIfFalse* = 0x603     ## a = target
+  opBrTable* = 0x604     ## a = index of the table in `brTab`, b = arity
+  opReturn* = 0x605
+  opEndExpr* = 0x606     ## the end of a constant expression
+  opBrOnNull* = 0x607
+  opBrOnNonNull* = 0x608
+  opBrOnCast* = 0x609    ## followed by an `opData` with the cast's heap type
+  opBrOnCastFail* = 0x60A
+  opData* = 0x60B        ## payload for the instruction before it; never run
+  opLocalGet* = 0x20
+  opSelect* = 0x1B
+
+proc refT*(ht: int; nullable: bool): int =
+  result = 0x1000 + (ht + 64) * 2
+  if nullable: result = result + 1
+proc isRefT*(vt: int): bool = vt >= 0x1000
+proc heapOf*(vt: int): int = ((vt - 0x1000) shr 1) - 64
+proc nullableOf*(vt: int): bool = (vt and 1) == 1
+proc isNumT*(vt: int): bool = vt == vtI32 or vt == vtI64 or vt == vtF32 or vt == vtF64
+proc isVecT*(vt: int): bool = vt == vtV128
+
+proc cp(x: int): int = x
+
+proc wIts*(v: int): string =
+  if v == 0: return "0"
+  var x = v
+  var neg = false
+  if x < 0:
+    neg = true
+    x = 0 - x
+  var d = ""
+  while x > 0:
+    d.add char(int('0') + (x mod 10))
+    x = x div 10
+  result = ""
+  if neg: result.add '-'
+  var i = d.len - 1
+  while i >= 0:
+    result.add d[i]
+    dec i
+
+# ---------------------------------------------------------------------------
+# Canonical types.
+
+type
+  CType* = object
+    kind*: int
+    final*: bool
+    super*: int              ## canonical id of the declared supertype, or -1
+    depth*: int              ## length of the supertype chain
+    params*: seq[int]
+    results*: seq[int]
+    fields*: seq[int]        ## storage types: a value type, stI8 or stI16
+    muts*: seq[bool]
+
+  TypeReg* = object
+    types*: seq[CType]
+    keys*: seq[string]
+    keyBase*: seq[int]
+    buckets*: seq[int]       ## open addressing over `keys`, -1 empty
+
+proc newTypeReg*(): TypeReg =
+  result = TypeReg(types: @[], keys: @[], keyBase: @[], buckets: @[])
+  result.buckets.setLen 1024
+  var i = 0
+  while i < 1024:
+    result.buckets[i] = -1
+    inc i
+
+proc strHash(s: string): int =
+  var h = 5381
+  var i = 0
+  while i < s.len:
+    h = ((h * 33) xor int(s[i])) and 0x3FFFFFFF
+    inc i
+  result = h
+
+proc regFind(r: TypeReg; key: string): int =
+  let n = r.buckets.len
+  var at = strHash(key) mod n
+  while true:
+    let k = r.buckets[at]
+    if k < 0: return -1
+    if r.keys[k] == key: return r.keyBase[k]
+    at = (at + 1) mod n
+
+proc regAdd(r: var TypeReg; key: string; base: int) =
+  r.keys.add key
+  r.keyBase.add base
+  if r.keys.len * 2 > r.buckets.len:
+    let n = r.buckets.len * 2
+    r.buckets.setLen n
+    var i = 0
+    while i < n:
+      r.buckets[i] = -1
+      inc i
+    var k = 0
+    while k < r.keys.len:
+      var at = strHash(r.keys[k]) mod n
+      while r.buckets[at] >= 0: at = (at + 1) mod n
+      r.buckets[at] = k
+      inc k
+  else:
+    let n = r.buckets.len
+    var at = strHash(key) mod n
+    while r.buckets[at] >= 0: at = (at + 1) mod n
+    r.buckets[at] = r.keys.len - 1
+
+proc isSubCanon*(r: TypeReg; a, b: int): bool =
+  if a == b: return true
+  if a < 0 or b < 0 or a >= r.types.len or b >= r.types.len: return false
+  let db = r.types[b].depth
+  var x = a
+  while x >= 0 and r.types[x].depth > db:
+    x = r.types[x].super
+  result = x == b
+
+proc heapSub*(r: TypeReg; h1, h2: int): bool =
+  if h1 == h2: return true
+  if h1 == htBot: return true
+  if h2 >= 0:
+    if h1 >= 0: return isSubCanon(r, h1, h2)
+    let k = r.types[h2].kind
+    if h1 == htNone: return k == ckStruct or k == ckArray
+    if h1 == htNoFunc: return k == ckFunc
+    return false
+  let k1 = (if h1 >= 0: r.types[h1].kind else: -1)
+  case h2
+  of htAny:
+    result = h1 == htEq or h1 == htI31 or h1 == htStruct or h1 == htArray or
+             h1 == htNone or k1 == ckStruct or k1 == ckArray
+  of htEq:
+    result = h1 == htI31 or h1 == htStruct or h1 == htArray or h1 == htNone or
+             k1 == ckStruct or k1 == ckArray
+  of htI31: result = h1 == htNone
+  of htStruct: result = h1 == htNone or k1 == ckStruct
+  of htArray: result = h1 == htNone or k1 == ckArray
+  of htFunc: result = h1 == htNoFunc or k1 == ckFunc
+  of htExtern: result = h1 == htNoExtern
+  of htExn: result = h1 == htNoExn
+  else: result = false
+
+proc vtMatch*(r: TypeReg; t1, t2: int): bool =
+  if t1 == t2: return true
+  if t1 == vtBot: return true
+  if isRefT(t1) and isRefT(t2):
+    if nullableOf(t1) and not nullableOf(t2): return false
+    return heapSub(r, heapOf(t1), heapOf(t2))
+  result = false
+
+proc topHeap*(r: TypeReg; h: int): int =
+  ## The top of the hierarchy a heap type lives in: any, func, extern or exn.
+  if h >= 0:
+    if r.types[h].kind == ckFunc: return htFunc
+    return htAny
+  case h
+  of htFunc, htNoFunc: result = htFunc
+  of htExtern, htNoExtern: result = htExtern
+  of htExn, htNoExn: result = htExn
+  else: result = htAny
+
+proc bottomHeap*(r: TypeReg; h: int): int =
+  let t = topHeap(r, h)
+  if t == htFunc: return htNoFunc
+  if t == htExtern: return htNoExtern
+  if t == htExn: return htNoExn
+  result = htNone
+
+proc funcTypeEq*(r: TypeReg; a, b: int): bool = a == b
+
+# ---------------------------------------------------------------------------
+# The module.
+
+type
+  Ins* = object
+    op*: int
+    a*: int
+    b*: int
+    c*: uint64
+
+  TableType* = object
+    elem*: int
+    min*: uint64
+    max*: uint64
+    hasMax*: bool
+    is64*: bool
+
+  MemType* = object
+    min*: uint64
+    max*: uint64
+    hasMax*: bool
+    is64*: bool
+    shared*: bool
+
+  GlobalType* = object
+    vt*: int
+    mut*: bool
+
+  WImport* = object
+    module*: string
+    name*: string
+    kind*: int
+    typeIdx*: int            ## a function's or a tag's type index
+    tt*: TableType
+    mt*: MemType
+    gt*: GlobalType
+
+  WExport* = object
+    name*: string
+    kind*: int
+    idx*: int
+
+  WElem* = object
+    mode*: int               ## 0 passive, 1 active, 2 declarative
+    table*: int
+    offset*: int             ## where its offset expression starts in `code`
+    elemType*: int
+    items*: seq[int]         ## each item's expression start
+
+  WData* = object
+    mode*: int               ## 0 passive, 1 active
+    mem*: int
+    offset*: int
+    bytes*: string
+
+  WFuncCode* = object
+    start*: int              ## first instruction in `code`
+    nparams*: int
+    nresults*: int
+    nlocals*: int            ## parameters included
+    maxStack*: int           ## locals plus the deepest operand stack
+    tryLo*: int              ## its `try_table`s: tries[tryLo ..< tryHi]
+    tryHi*: int
+
+  TryCatch* = object
+    kind*: int               ## 0 catch, 1 catch_ref, 2 catch_all, 3 catch_all_ref
+    tag*: int
+    target*: int
+    dest*: int               ## wSlot offset from the frame the values land at
+
+  TryEntry* = object
+    startPc*: int
+    endPc*: int
+    catches*: seq[TryCatch]
+
+  WModule* = object
+    ok*: bool
+    error*: string
+    types*: seq[int]         ## local type index -> canonical id
+    imports*: seq[WImport]
+    funcs*: seq[int]         ## every function, imported first: type index
+    nImpFuncs*, nImpTables*, nImpMems*, nImpGlobals*, nImpTags*: int
+    tables*: seq[TableType]
+    tableInit*: seq[int]     ## an expression start, or -1 (null)
+    mems*: seq[MemType]
+    globals*: seq[GlobalType]
+    globalInit*: seq[int]
+    tags*: seq[int]          ## type index
+    exports*: seq[WExport]
+    start*: int
+    elems*: seq[WElem]
+    datas*: seq[WData]
+    hasDataCount*: bool
+    code*: seq[Ins]
+    fcode*: seq[WFuncCode]   ## one per defined function
+    brTab*: seq[int]         ## br_table: count, then (target, dest) pairs
+    v128*: seq[uint64]       ## pairs (lo, hi)
+    tries*: seq[TryEntry]
+    customNames*: seq[string]
+    customData*: seq[string]
+    declared*: seq[bool]     ## per function: may be named by ref.func
+
+# ---------------------------------------------------------------------------
+# Reading bytes.
+
+type
+  Rd = object
+    b: string
+    p: int
+    e: int
+    err: string
+
+proc fail(r: var Rd; msg: string) =
+  if r.err.len == 0: r.err = msg
+
+proc more(r: Rd): bool = r.err.len == 0 and r.p < r.e
+
+proc byte1(r: var Rd): int =
+  if r.err.len > 0: return 0
+  if r.p >= r.e:
+    fail(r, "unexpected end")
+    return 0
+  result = int(r.b[r.p])
+  inc r.p
+
+proc leb(r: var Rd; bits: int; signed: bool): uint64 =
+  ## LEB128 of at most `bits` bits: "integer representation too long" when it
+  ## runs past ceil(bits/7) bytes, "integer too large" when the unused bits of
+  ## the last byte are not the sign extension (or zero).
+  result = 0
+  var shift = 0
+  let maxBytes = (bits + 6) div 7
+  var n = 0
+  while true:
+    if r.err.len > 0: return 0
+    if r.p >= r.e:
+      fail(r, "unexpected end")
+      return 0
+    let c = int(r.b[r.p])
+    inc r.p
+    inc n
+    if n > maxBytes:
+      fail(r, "integer representation too long")
+      return 0
+    if n == maxBytes:
+      # the last permitted byte: check the bits beyond `bits`
+      let used = bits - shift       # bits this byte may carry
+      if (c and 0x80) != 0:
+        fail(r, "integer representation too long")
+        return 0
+      if signed:
+        # the remaining bits must all equal the sign bit
+        let signBit = (c shr (used - 1)) and 1
+        let rest = c shr used
+        let want = (if signBit == 1: (0x7F shr used) else: 0)
+        if used < 7 and rest != want:
+          fail(r, "integer too large")
+          return 0
+      else:
+        if used < 7 and (c shr used) != 0:
+          fail(r, "integer too large")
+          return 0
+    result = result or (uint64(c and 0x7F) shl uint64(shift))
+    shift = shift + 7
+    if (c and 0x80) == 0:
+      if signed and shift < 64 and (c and 0x40) != 0:
+        result = result or (not 0'u64 shl uint64(shift))
+      break
+  if bits < 64 and signed:
+    discard
+
+proc u32(r: var Rd): int = int(leb(r, 32, false))
+proc u64v(r: var Rd): uint64 = leb(r, 64, false)
+proc s32(r: var Rd): uint64 =
+  let v = leb(r, 32, true)
+  result = v and 0xFFFF_FFFF'u64
+proc s64(r: var Rd): uint64 = leb(r, 64, true)
+proc s33(r: var Rd): int64 = cast[int64](leb(r, 33, true))
+
+proc fixed32(r: var Rd): uint64 =
+  result = 0
+  var i = 0
+  while i < 4:
+    result = result or (uint64(byte1(r)) shl uint64(8 * i))
+    inc i
+
+proc fixed64(r: var Rd): uint64 =
+  result = 0
+  var i = 0
+  while i < 8:
+    result = result or (uint64(byte1(r)) shl uint64(8 * i))
+    inc i
+
+proc wValidUtf8*(s: string): bool =
+  var i = 0
+  while i < s.len:
+    let c = int(s[i])
+    if c < 0x80:
+      inc i
+      continue
+    var need = 0
+    var cp = 0
+    if c >= 0xC2 and c < 0xE0:
+      need = 1
+      cp = c and 0x1F
+    elif c >= 0xE0 and c < 0xF0:
+      need = 2
+      cp = c and 0x0F
+    elif c >= 0xF0 and c < 0xF5:
+      need = 3
+      cp = c and 0x07
+    else:
+      return false
+    if i + need >= s.len + 0 and i + need > s.len - 1: return false
+    var k = 1
+    while k <= need:
+      let b = int(s[i + k])
+      if (b and 0xC0) != 0x80: return false
+      cp = (cp shl 6) or (b and 0x3F)
+      inc k
+    if need == 2 and (cp < 0x800 or (cp >= 0xD800 and cp <= 0xDFFF)): return false
+    if need == 3 and (cp < 0x10000 or cp > 0x10FFFF): return false
+    i = i + need + 1
+  result = true
+
+proc name(r: var Rd): string =
+  let n = u32(r)
+  result = ""
+  if r.err.len > 0: return
+  if n > r.e - r.p:
+    fail(r, "length out of bounds")
+    return
+  result = r.b.substr(r.p, r.p + n - 1)
+  r.p = r.p + n
+  if not wValidUtf8(result): fail(r, "malformed UTF-8 encoding")
+
+# ---------------------------------------------------------------------------
+# The decoder's state and the validator's.
+
+type
+  Ctrl = object
+    kind: int          ## 0 block, 1 loop, 2 if, 3 else, 4 try_table, 5 function
+    params: seq[int]
+    results: seq[int]
+    height: int
+    unreachable: bool
+    startPc: int
+    ifPc: int
+    fixups: seq[int]   ## ins index * 2, or brTab wSlot * 2 + 1
+    initH: int
+    tryIdx: int
+
+  Dec = object
+    r: Rd
+    m: WModule
+    reg: ptr TypeReg
+    localTypes: seq[int]      ## type index -> is it a function type (kind)
+    vals: seq[int]
+    ctrls: seq[Ctrl]
+    locals: seq[int]
+    linit: seq[bool]
+    initStack: seq[int]
+    maxH: int
+    nlocals: int
+    fnResults: seq[int]
+    dataCount: int
+    usesDataCount: bool
+    inConst: bool
+    constGlobalLimit: int     ## globals visible to a constant expression
+    refsDeclared: seq[int]
+
+template R(d: Dec): TypeReg = d.reg[]
+
+proc dfail(d: var Dec; msg: string) =
+  if d.r.err.len == 0: d.r.err = msg
+
+template bad(d: Dec): bool = d.r.err.len > 0
+
+# ---- type helpers over module-local indices ----
+
+proc canonOf(d: var Dec; idx: int): int =
+  if idx < 0 or idx >= d.m.types.len:
+    dfail(d, "unknown type")
+    return 0
+  result = d.m.types[idx]
+
+proc ctypeOf(d: var Dec; idx: int): CType =
+  let c = canonOf(d, idx)
+  if bad(d): return CType(kind: -1, final: true, super: -1, depth: 0,
+                          params: @[], results: @[], fields: @[], muts: @[])
+  result = d.reg[].types[c]
+
+proc funcTypeOf(d: var Dec; idx: int): CType =
+  result = ctypeOf(d, idx)
+  if bad(d): return
+  if result.kind != ckFunc: dfail(d, "type mismatch: not a function type")
+
+proc readHeapType(d: var Dec): int =
+  ## A heap type in the binary: an abstract one (a negative s33) or a type
+  ## index. Returns the internal heap-type value (canonical id or abstract).
+  let v = s33(d.r)
+  if bad(d): return 0
+  if v >= 0:
+    if v >= int64(d.m.types.len):
+      dfail(d, "unknown type")
+      return 0
+    return d.m.types[int(v)]
+  case int(v)
+  of -0x10: result = htFunc
+  of -0x11: result = htExtern
+  of -0x12: result = htAny
+  of -0x13: result = htEq
+  of -0x14: result = htI31
+  of -0x15: result = htStruct
+  of -0x16: result = htArray
+  of -0x17: result = htExn
+  of -0x0F: result = htNone
+  of -0x0E: result = htNoExtern
+  of -0x0D: result = htNoFunc
+  of -0x0C: result = htNoExn
+  else:
+    dfail(d, "malformed heap type")
+    result = 0
+
+proc absHeapByte(c: int): int =
+  case c
+  of 0x70: htFunc
+  of 0x6F: htExtern
+  of 0x6E: htAny
+  of 0x6D: htEq
+  of 0x6C: htI31
+  of 0x6B: htStruct
+  of 0x6A: htArray
+  of 0x69: htExn
+  of 0x71: htNone
+  of 0x72: htNoExtern
+  of 0x73: htNoFunc
+  of 0x74: htNoExn
+  else: 999
+
+proc readValTypeByte(d: var Dec; c: int): int =
+  if c == 0x7F or c == 0x7E or c == 0x7D or c == 0x7C or c == 0x7B: return c
+  let h = absHeapByte(c)
+  if h != 999: return refT(h, true)
+  if c == 0x63 or c == 0x64:
+    let ht = readHeapType(d)
+    return refT(ht, c == 0x63)
+  dfail(d, "malformed value type")
+  result = vtI32
+
+proc readValType(d: var Dec): int =
+  let c = byte1(d.r)
+  if bad(d): return vtI32
+  result = readValTypeByte(d, c)
+
+proc readRefType(d: var Dec): int =
+  let c = byte1(d.r)
+  if bad(d): return refT(htFunc, true)
+  let h = absHeapByte(c)
+  if h != 999: return refT(h, true)
+  if c == 0x63 or c == 0x64:
+    let ht = readHeapType(d)
+    return refT(ht, c == 0x63)
+  dfail(d, "malformed reference type")
+  result = refT(htFunc, true)
+
+# ---- the type section: recursion groups and canonicalisation ----
+
+type
+  RawSub = object
+    final: bool
+    supers: seq[int]      ## local indices
+    kind: int
+    params, results: seq[int]   ## raw: value types whose heap is a LOCAL index + 0x40000000 marker
+    fields: seq[int]
+    muts: seq[bool]
+
+const LocalMark = 0x2000000   ## a raw heap reference to a local type index
+
+proc rawHeap(d: var Dec; groupEnd: int): int =
+  ## Like readHeapType, but a type index stays local (marked) because the
+  ## group it may point into is not canonical yet.
+  let v = s33(d.r)
+  if bad(d): return 0
+  if v >= 0:
+    if v >= int64(groupEnd):
+      dfail(d, "unknown type")
+      return 0
+    return LocalMark + int(v)
+  case int(v)
+  of -0x10: result = htFunc
+  of -0x11: result = htExtern
+  of -0x12: result = htAny
+  of -0x13: result = htEq
+  of -0x14: result = htI31
+  of -0x15: result = htStruct
+  of -0x16: result = htArray
+  of -0x17: result = htExn
+  of -0x0F: result = htNone
+  of -0x0E: result = htNoExtern
+  of -0x0D: result = htNoFunc
+  of -0x0C: result = htNoExn
+  else:
+    dfail(d, "malformed heap type")
+    result = 0
+
+proc rawVal(d: var Dec; groupEnd: int; storage: bool): int =
+  let c = byte1(d.r)
+  if bad(d): return vtI32
+  if c == 0x7F or c == 0x7E or c == 0x7D or c == 0x7C or c == 0x7B: return c
+  if storage and (c == stI8 or c == stI16): return c
+  let h = absHeapByte(c)
+  if h != 999: return refT(h, true)
+  if c == 0x63 or c == 0x64:
+    let ht = rawHeap(d, groupEnd)
+    return refT(ht, c == 0x63)
+  dfail(d, "malformed value type")
+  result = vtI32
+
+proc readComp(d: var Dec; s: var RawSub; groupEnd: int) =
+  let c = byte1(d.r)
+  if bad(d): return
+  if c == 0x60:
+    s.kind = ckFunc
+    let np = u32(d.r)
+    if np > MaxParams and not bad(d):
+      dfail(d, "too many params")
+      return
+    var i = 0
+    while i < np and not bad(d):
+      s.params.add rawVal(d, groupEnd, false)
+      inc i
+    let nr = u32(d.r)
+    if nr > MaxResults and not bad(d):
+      dfail(d, "too many results")
+      return
+    i = 0
+    while i < nr and not bad(d):
+      s.results.add rawVal(d, groupEnd, false)
+      inc i
+  elif c == 0x5F:
+    s.kind = ckStruct
+    let n = u32(d.r)
+    if n > 10000 and not bad(d):
+      dfail(d, "too many fields")
+      return
+    var i = 0
+    while i < n and not bad(d):
+      s.fields.add rawVal(d, groupEnd, true)
+      let mu = byte1(d.r)
+      if mu > 1: dfail(d, "malformed mutability")
+      s.muts.add mu == 1
+      inc i
+  elif c == 0x5E:
+    s.kind = ckArray
+    s.fields.add rawVal(d, groupEnd, true)
+    let mu = byte1(d.r)
+    if mu > 1: dfail(d, "malformed mutability")
+    s.muts.add mu == 1
+  else:
+    dfail(d, "malformed composite type")
+
+proc readSub(d: var Dec; s: var RawSub; groupEnd: int) =
+  let c = byte1(d.r)
+  if bad(d): return
+  s.final = true
+  if c == 0x50 or c == 0x4F:
+    s.final = c == 0x4F
+    let n = u32(d.r)
+    if n > 1 and not bad(d):
+      dfail(d, "multiple supertypes")
+      return
+    var i = 0
+    while i < n and not bad(d):
+      let x = u32(d.r)
+      s.supers.add x
+      inc i
+    readComp(d, s, groupEnd)
+  else:
+    dec d.r.p
+    readComp(d, s, groupEnd)
+
+proc keyVal(d: Dec; vt: int; g0, gn: int; key: var string) =
+  if isRefT(vt):
+    let h = heapOf(vt)
+    key.add (if nullableOf(vt): 'n' else: 'r')
+    if h >= LocalMark:
+      let li = h - LocalMark
+      if li >= g0 and li < g0 + gn:
+        key.add 'R'
+        key.add wIts(li - g0)
+      else:
+        key.add 'C'
+        key.add wIts(d.m.types[li])
+    else:
+      key.add 'A'
+      key.add wIts(h)
+  else:
+    key.add 'v'
+    key.add wIts(vt)
+  key.add ','
+
+proc resolveVal(d: Dec; vt: int; g0, base: int): int =
+  if isRefT(vt):
+    let h = heapOf(vt)
+    if h >= LocalMark:
+      let li = h - LocalMark
+      var c = 0
+      if li >= g0: c = base + (li - g0)
+      else: c = d.m.types[li]
+      return refT(c, nullableOf(vt))
+  result = vt
+
+proc storageMatch(r: TypeReg; a, b: int): bool =
+  if a == stI8 or a == stI16 or b == stI8 or b == stI16: return a == b
+  result = vtMatch(r, a, b)
+
+proc checkSubtype(d: var Dec; c: int) =
+  ## A declared supertype must be non-final and structurally a supertype.
+  let t = d.reg[].types[c]
+  if t.super < 0: return
+  let s = d.reg[].types[t.super]
+  if s.final:
+    dfail(d, "sub type of final type")
+    return
+  if s.kind != t.kind:
+    dfail(d, "sub type mismatch")
+    return
+  let r = d.reg[]
+  if t.kind == ckFunc:
+    if t.params.len != s.params.len or t.results.len != s.results.len:
+      dfail(d, "sub type mismatch")
+      return
+    var i = 0
+    while i < t.params.len:
+      if not vtMatch(r, s.params[i], t.params[i]):
+        dfail(d, "sub type mismatch")
+        return
+      inc i
+    i = 0
+    while i < t.results.len:
+      if not vtMatch(r, t.results[i], s.results[i]):
+        dfail(d, "sub type mismatch")
+        return
+      inc i
+  else:
+    if t.fields.len < s.fields.len or (t.kind == ckArray and t.fields.len != s.fields.len):
+      dfail(d, "sub type mismatch")
+      return
+    var i = 0
+    while i < s.fields.len:
+      if t.muts[i] != s.muts[i]:
+        dfail(d, "sub type mismatch")
+        return
+      if t.muts[i]:
+        if not (storageMatch(r, t.fields[i], s.fields[i]) and storageMatch(r, s.fields[i], t.fields[i])):
+          dfail(d, "sub type mismatch")
+          return
+      elif not storageMatch(r, t.fields[i], s.fields[i]):
+        dfail(d, "sub type mismatch")
+        return
+      inc i
+
+proc addGroup(d: var Dec; subs: seq[RawSub]; g0: int) =
+  ## Canonicalise one recursion group starting at local index `g0`.
+  let gn = subs.len
+  var key = ""
+  var i = 0
+  while i < gn:
+    let s = subs[i]
+    key.add (if s.final: 'F' else: 'O')
+    key.add wIts(s.kind)
+    key.add ':'
+    var j = 0
+    while j < s.supers.len:
+      let li = s.supers[j]
+      if li >= g0 + i:
+        dfail(d, "unknown type: supertype must precede")
+        return
+      if li >= g0:
+        key.add 'R'
+        key.add wIts(li - g0)
+      else:
+        key.add 'C'
+        key.add wIts(d.m.types[li])
+      inc j
+    key.add '|'
+    j = 0
+    while j < s.params.len:
+      keyVal(d, s.params[j], g0, gn, key)
+      inc j
+    key.add '>'
+    j = 0
+    while j < s.results.len:
+      keyVal(d, s.results[j], g0, gn, key)
+      inc j
+    key.add '#'
+    j = 0
+    while j < s.fields.len:
+      keyVal(d, s.fields[j], g0, gn, key)
+      key.add (if s.muts[j]: 'm' else: 'c')
+      inc j
+    key.add ';'
+    inc i
+  var base = regFind(d.reg[], key)
+  var fresh = false
+  if base < 0:
+    fresh = true
+    base = d.reg[].types.len
+    regAdd(d.reg[], key, base)
+    i = 0
+    while i < gn:
+      d.reg[].types.add CType(kind: subs[i].kind, final: subs[i].final,
+                             super: -1, depth: 0, params: @[], results: @[],
+                             fields: @[], muts: @[])
+      inc i
+  i = 0
+  while i < gn:
+    d.m.types.add base + i
+    inc i
+  if not fresh: return
+  i = 0
+  while i < gn:
+    let s = subs[i]
+    let c = base + i
+    var j = 0
+    while j < s.params.len:
+      d.reg[].types[c].params.add resolveVal(d, s.params[j], g0, base)
+      inc j
+    j = 0
+    while j < s.results.len:
+      d.reg[].types[c].results.add resolveVal(d, s.results[j], g0, base)
+      inc j
+    j = 0
+    while j < s.fields.len:
+      d.reg[].types[c].fields.add resolveVal(d, s.fields[j], g0, base)
+      d.reg[].types[c].muts.add s.muts[j]
+      inc j
+    if s.supers.len > 0:
+      let li = s.supers[0]
+      let sc = (if li >= g0: base + (li - g0) else: d.m.types[li])
+      d.reg[].types[c].super = sc
+      d.reg[].types[c].depth = d.reg[].types[sc].depth + 1
+    inc i
+  i = 0
+  while i < gn:
+    checkSubtype(d, base + i)
+    if bad(d):
+      # a bad group must not stay registered as if it were fine
+      d.reg[].keys[d.reg[].keys.len - 1] = "\x00dead"
+      return
+    inc i
+
+proc typeSection(d: var Dec) =
+  let n = u32(d.r)
+  if n > MaxTypes and not bad(d):
+    dfail(d, "too many types")
+    return
+  var i = 0
+  while i < n and not bad(d):
+    let c = byte1(d.r)
+    if bad(d): return
+    if c == 0x4E:
+      let k = u32(d.r)
+      let g0 = d.m.types.len
+      if g0 + k > MaxTypes and not bad(d):
+        dfail(d, "too many types")
+        return
+      var subs: seq[RawSub] = @[]
+      var j = 0
+      while j < k and not bad(d):
+        var s = RawSub(final: true, supers: @[], kind: 0, params: @[], results: @[],
+                       fields: @[], muts: @[])
+        readSub(d, s, g0 + k)
+        subs.add s
+        inc j
+      if bad(d): return
+      addGroup(d, subs, g0)
+    else:
+      dec d.r.p
+      let g0 = d.m.types.len
+      var s = RawSub(final: true, supers: @[], kind: 0, params: @[], results: @[],
+                     fields: @[], muts: @[])
+      readSub(d, s, g0 + 1)
+      if bad(d): return
+      var subs: seq[RawSub] = @[]
+      subs.add s
+      addGroup(d, subs, g0)
+    inc i
+
+# ---- limits, imports ----
+
+proc readLimits(d: var Dec; isTable: bool; mn, mx: var uint64; hasMax, is64, shared: var bool) =
+  let f = byte1(d.r)
+  if bad(d): return
+  if isTable:
+    if f != 0 and f != 1 and f != 4 and f != 5:
+      dfail(d, "malformed limits flags")
+      return
+  else:
+    if f > 7 or f == 2 or f == 6:
+      dfail(d, (if f == 2 or f == 6: "shared memory must have maximum" else: "malformed limits flags"))
+      return
+  hasMax = (f and 1) != 0
+  shared = (f and 2) != 0
+  is64 = (f and 4) != 0
+  if is64:
+    mn = u64v(d.r)
+    if hasMax: mx = u64v(d.r)
+  else:
+    mn = uint64(u32(d.r))
+    if hasMax: mx = uint64(u32(d.r))
+
+proc readTableType(d: var Dec): TableType =
+  result = TableType(elem: refT(htFunc, true), min: 0, max: 0, hasMax: false, is64: false)
+  result.elem = readRefType(d)
+  var sh = false
+  readLimits(d, true, result.min, result.max, result.hasMax, result.is64, sh)
+
+proc readMemType(d: var Dec): MemType =
+  result = MemType(min: 0, max: 0, hasMax: false, is64: false, shared: false)
+  readLimits(d, false, result.min, result.max, result.hasMax, result.is64, result.shared)
+
+proc checkTableType(d: var Dec; t: TableType) =
+  let lim = (if t.is64: 0xFFFF_FFFF_FFFF_FFFF'u64 else: 0xFFFF_FFFF'u64)
+  if t.min > lim:
+    dfail(d, "table size must be at most 2^32-1")
+    return
+  if t.hasMax and t.max > lim:
+    dfail(d, "table size must be at most 2^32-1")
+    return
+  if t.hasMax and t.max < t.min:
+    dfail(d, "size minimum must not be greater than maximum")
+
+proc checkMemType(d: var Dec; t: MemType) =
+  let lim = (if t.is64: MaxPages64 else: MaxPages32)
+  if t.min > lim:
+    dfail(d, "memory size must be at most 65536 pages (4GiB)")
+    return
+  if t.hasMax and t.max > lim:
+    dfail(d, "memory size must be at most 65536 pages (4GiB)")
+    return
+  if t.hasMax and t.max < t.min:
+    dfail(d, "size minimum must not be greater than maximum")
+
+proc readGlobalType(d: var Dec): GlobalType =
+  result = GlobalType(vt: vtI32, mut: false)
+  result.vt = readValType(d)
+  let m = byte1(d.r)
+  if bad(d): return
+  if m > 1:
+    dfail(d, "malformed mutability")
+    return
+  result.mut = m == 1
+
+proc readTagType(d: var Dec): int =
+  let attr = byte1(d.r)
+  if bad(d): return 0
+  if attr != 0:
+    dfail(d, "malformed tag attribute")
+    return 0
+  let ti = u32(d.r)
+  if bad(d): return 0
+  let t = funcTypeOf(d, ti)
+  if bad(d): return 0
+  if t.results.len != 0:
+    dfail(d, "non-empty tag result type")
+  result = ti
+
+proc importSection(d: var Dec) =
+  let n = u32(d.r)
+  if n > MaxImports and not bad(d):
+    dfail(d, "too many imports")
+    return
+  var i = 0
+  while i < n and not bad(d):
+    var im = WImport(module: "", name: "", kind: 0, typeIdx: 0,
+                     tt: TableType(elem: 0, min: 0, max: 0, hasMax: false, is64: false),
+                     mt: MemType(min: 0, max: 0, hasMax: false, is64: false, shared: false),
+                     gt: GlobalType(vt: 0, mut: false))
+    im.module = name(d.r)
+    im.name = name(d.r)
+    let k = byte1(d.r)
+    if bad(d): return
+    im.kind = k
+    case k
+    of 0:
+      im.typeIdx = u32(d.r)
+      if bad(d): return
+      discard funcTypeOf(d, im.typeIdx)
+      d.m.funcs.add im.typeIdx
+      inc d.m.nImpFuncs
+    of 1:
+      im.tt = readTableType(d)
+      checkTableType(d, im.tt)
+      d.m.tables.add im.tt
+      d.m.tableInit.add -1
+      inc d.m.nImpTables
+    of 2:
+      im.mt = readMemType(d)
+      checkMemType(d, im.mt)
+      d.m.mems.add im.mt
+      inc d.m.nImpMems
+    of 3:
+      im.gt = readGlobalType(d)
+      d.m.globals.add im.gt
+      d.m.globalInit.add -1
+      inc d.m.nImpGlobals
+    of 4:
+      im.typeIdx = readTagType(d)
+      d.m.tags.add im.typeIdx
+      inc d.m.nImpTags
+    else:
+      dfail(d, "malformed import kind")
+      return
+    d.m.imports.add im
+    inc i
+
+# ---------------------------------------------------------------------------
+# The validator proper: operand and control stacks.
+
+proc emit(d: var Dec; op, a, b: int; c: uint64 = 0'u64): int =
+  d.m.code.add Ins(op: op, a: a, b: b, c: c)
+  result = d.m.code.len - 1
+
+proc pushV(d: var Dec; t: int) =
+  d.vals.add t
+  if d.vals.len > d.maxH: d.maxH = d.vals.len
+
+proc popAny(d: var Dec): int =
+  let f = d.ctrls.len - 1
+  if d.vals.len == d.ctrls[f].height:
+    if d.ctrls[f].unreachable: return vtBot
+    dfail(d, "type mismatch: operand stack underflow")
+    return vtBot
+  result = d.vals[d.vals.len - 1]
+  d.vals.setLen d.vals.len - 1
+
+proc popV(d: var Dec; expect: int): int =
+  let t = popAny(d)
+  if bad(d): return expect
+  if t == vtBot:
+    return vtBot
+  if not vtMatch(d.reg[], t, expect):
+    dfail(d, "type mismatch")
+  result = t
+
+proc popVals(d: var Dec; ts: seq[int]) =
+  var i = ts.len - 1
+  while i >= 0:
+    discard popV(d, ts[i])
+    dec i
+
+proc pushVals(d: var Dec; ts: seq[int]) =
+  var i = 0
+  while i < ts.len:
+    pushV(d, ts[i])
+    inc i
+
+proc popRef(d: var Dec): int =
+  ## Pops any reference; bottom gives a bottom reference.
+  let t = popAny(d)
+  if bad(d): return refT(htBot, true)
+  if t == vtBot: return refT(htBot, true)
+  if not isRefT(t):
+    dfail(d, "type mismatch: expected a reference")
+    return refT(htBot, true)
+  result = t
+
+proc pushCtrl(d: var Dec; kind: int; params, results: seq[int]) =
+  d.ctrls.add Ctrl(kind: kind, params: params, results: results,
+                   height: d.vals.len, unreachable: false, startPc: d.m.code.len,
+                   ifPc: -1, fixups: @[], initH: d.initStack.len, tryIdx: -1)
+  pushVals(d, params)
+
+proc labelTypes(c: Ctrl): seq[int] =
+  if c.kind == 1: c.params else: c.results
+
+proc setUnreachable(d: var Dec) =
+  let f = d.ctrls.len - 1
+  d.vals.setLen d.ctrls[f].height
+  d.ctrls[f].unreachable = true
+
+proc resetInits(d: var Dec; h: int) =
+  while d.initStack.len > h:
+    d.linit[d.initStack[d.initStack.len - 1]] = false
+    d.initStack.setLen d.initStack.len - 1
+
+proc popCtrlCheck(d: var Dec): Ctrl =
+  let f = d.ctrls.len - 1
+  result = d.ctrls[f]
+  popVals(d, result.results)
+  if bad(d): return
+  if d.vals.len != result.height:
+    dfail(d, "type mismatch: values remaining on stack at end of block")
+    return
+  resetInits(d, result.initH)
+  d.ctrls.setLen f
+
+proc patchTo(d: var Dec; fixups: seq[int]; target: int) =
+  var i = 0
+  while i < fixups.len:
+    let fx = fixups[i]
+    if (fx and 1) == 0: d.m.code[fx shr 1].a = target
+    else: d.m.brTab[fx shr 1] = target
+    inc i
+
+proc labelIdx(d: var Dec; l: int): int =
+  if l < 0 or l >= d.ctrls.len:
+    dfail(d, "unknown label")
+    return -1
+  result = d.ctrls.len - 1 - l
+
+proc branchTo(d: var Dec; ci: int; insIdx: int; isTab: bool) =
+  ## Record where a branch to control frame `ci` must land.
+  let fx = (if isTab: insIdx * 2 + 1 else: insIdx * 2)
+  if d.ctrls[ci].kind == 1:
+    if isTab: d.m.brTab[insIdx] = d.ctrls[ci].startPc
+    else: d.m.code[insIdx].a = d.ctrls[ci].startPc
+  else:
+    d.ctrls[ci].fixups.add fx
+
+proc destOf(d: Dec; ci: int): int = d.nlocals + d.ctrls[ci].height
+
+proc readBlockType(d: var Dec; params, results: var seq[int]) =
+  params = @[]
+  results = @[]
+  let c = byte1(d.r)
+  if bad(d): return
+  if c == 0x40: return
+  if c == 0x7F or c == 0x7E or c == 0x7D or c == 0x7C or c == 0x7B or
+     absHeapByte(c) != 999 or c == 0x63 or c == 0x64:
+    results.add readValTypeByte(d, c)
+    return
+  dec d.r.p
+  let v = s33(d.r)
+  if bad(d): return
+  if v < 0 or v >= int64(d.m.types.len):
+    dfail(d, "unknown type")
+    return
+  let t = funcTypeOf(d, int(v))
+  if bad(d): return
+  params = t.params
+  results = t.results
+
+# ---- memory arguments ----
+
+proc readMemarg(d: var Dec; natural: int; mem: var int; offset: var uint64) =
+  var flags = u32(d.r)
+  if bad(d): return
+  mem = 0
+  if (flags and 0x40) != 0:
+    flags = flags and (not 0x40)
+    mem = u32(d.r)
+  if flags >= 64:
+    dfail(d, "malformed memop flags")
+    return
+  offset = u64v(d.r)
+  if bad(d): return
+  if mem >= d.m.mems.len:
+    dfail(d, "unknown memory " & wIts(mem))
+    return
+  if flags >= 16 or (1 shl flags) > natural:
+    dfail(d, "alignment must not be larger than natural")
+    return
+  if not d.m.mems[mem].is64 and offset > 0xFFFF_FFFF'u64:
+    dfail(d, "offset out of range")
+
+proc addrT(d: Dec; mem: int): int =
+  if mem < d.m.mems.len and d.m.mems[mem].is64: vtI64 else: vtI32
+
+proc tabAddrT(d: Dec; t: int): int =
+  if t < d.m.tables.len and d.m.tables[t].is64: vtI64 else: vtI32
+
+# ---- numeric signatures ----
+
+proc unop(d: var Dec; a, r: int) =
+  discard popV(d, a)
+  pushV(d, r)
+
+proc binop(d: var Dec; a, r: int) =
+  discard popV(d, a)
+  discard popV(d, a)
+  pushV(d, r)
+
+proc numericSig(d: var Dec; op: int): bool =
+  ## Validation for the plain numeric opcodes 0x45 .. 0xC4. True if handled.
+  result = true
+  if op == 0x45: unop(d, vtI32, vtI32)
+  elif op >= 0x46 and op <= 0x4F: binop(d, vtI32, vtI32)
+  elif op == 0x50: unop(d, vtI64, vtI32)
+  elif op >= 0x51 and op <= 0x5A: binop(d, vtI64, vtI32)
+  elif op >= 0x5B and op <= 0x60: binop(d, vtF32, vtI32)
+  elif op >= 0x61 and op <= 0x66: binop(d, vtF64, vtI32)
+  elif op >= 0x67 and op <= 0x69: unop(d, vtI32, vtI32)
+  elif op >= 0x6A and op <= 0x78: binop(d, vtI32, vtI32)
+  elif op >= 0x79 and op <= 0x7B: unop(d, vtI64, vtI64)
+  elif op >= 0x7C and op <= 0x8A: binop(d, vtI64, vtI64)
+  elif op >= 0x8B and op <= 0x91: unop(d, vtF32, vtF32)
+  elif op >= 0x92 and op <= 0x98: binop(d, vtF32, vtF32)
+  elif op >= 0x99 and op <= 0x9F: unop(d, vtF64, vtF64)
+  elif op >= 0xA0 and op <= 0xA6: binop(d, vtF64, vtF64)
+  else:
+    case op
+    of 0xA7: unop(d, vtI64, vtI32)
+    of 0xA8, 0xA9: unop(d, vtF32, vtI32)
+    of 0xAA, 0xAB: unop(d, vtF64, vtI32)
+    of 0xAC, 0xAD: unop(d, vtI32, vtI64)
+    of 0xAE, 0xAF: unop(d, vtF32, vtI64)
+    of 0xB0, 0xB1: unop(d, vtF64, vtI64)
+    of 0xB2, 0xB3: unop(d, vtI32, vtF32)
+    of 0xB4, 0xB5: unop(d, vtI64, vtF32)
+    of 0xB6: unop(d, vtF64, vtF32)
+    of 0xB7, 0xB8: unop(d, vtI32, vtF64)
+    of 0xB9, 0xBA: unop(d, vtI64, vtF64)
+    of 0xBB: unop(d, vtF32, vtF64)
+    of 0xBC: unop(d, vtF32, vtI32)
+    of 0xBD: unop(d, vtF64, vtI64)
+    of 0xBE: unop(d, vtI32, vtF32)
+    of 0xBF: unop(d, vtI64, vtF64)
+    of 0xC0, 0xC1: unop(d, vtI32, vtI32)
+    of 0xC2, 0xC3, 0xC4: unop(d, vtI64, vtI64)
+    else: result = false
+
+proc loadInfo(op: int; natural: var int; vt: var int): bool =
+  result = true
+  case op
+  of 0x28: natural = 4; vt = vtI32
+  of 0x29: natural = 8; vt = vtI64
+  of 0x2A: natural = 4; vt = vtF32
+  of 0x2B: natural = 8; vt = vtF64
+  of 0x2C, 0x2D: natural = 1; vt = vtI32
+  of 0x2E, 0x2F: natural = 2; vt = vtI32
+  of 0x30, 0x31: natural = 1; vt = vtI64
+  of 0x32, 0x33: natural = 2; vt = vtI64
+  of 0x34, 0x35: natural = 4; vt = vtI64
+  of 0x36: natural = 4; vt = vtI32
+  of 0x37: natural = 8; vt = vtI64
+  of 0x38: natural = 4; vt = vtF32
+  of 0x39: natural = 8; vt = vtF64
+  of 0x3A: natural = 1; vt = vtI32
+  of 0x3B: natural = 2; vt = vtI32
+  of 0x3C: natural = 1; vt = vtI64
+  of 0x3D: natural = 2; vt = vtI64
+  of 0x3E: natural = 4; vt = vtI64
+  else: result = false
+
+# ---- SIMD signatures ----
+
+const
+  sgUn = 1       ## v128 -> v128
+  sgBin = 2      ## v128 v128 -> v128
+  sgTest = 3     ## v128 -> i32
+  sgShift = 4    ## v128 i32 -> v128
+  sgTer = 5      ## v128 v128 v128 -> v128
+
+proc simdSigOf*(sub: int): int =
+  ## The shape of the lane-wise SIMD instructions, 0 for the ones with
+  ## immediates or special shapes (handled explicitly) and -1 for unknown.
+  case sub
+  of 0x0E: sgBin
+  of 0x23 .. 0x4C: sgBin
+  of 0x4D: sgUn
+  of 0x4E, 0x4F, 0x50, 0x51: sgBin
+  of 0x52: sgTer
+  of 0x53: sgTest
+  of 0x5E, 0x5F: sgUn
+  of 0x60, 0x61, 0x62: sgUn
+  of 0x63, 0x64: sgTest
+  of 0x65, 0x66: sgBin
+  of 0x67, 0x68, 0x69, 0x6A: sgUn
+  of 0x6B, 0x6C, 0x6D: sgShift
+  of 0x6E, 0x6F, 0x70, 0x71, 0x72, 0x73: sgBin
+  of 0x74, 0x75: sgUn
+  of 0x76, 0x77, 0x78, 0x79: sgBin
+  of 0x7A: sgUn
+  of 0x7B: sgBin
+  of 0x7C, 0x7D, 0x7E, 0x7F: sgUn
+  of 0x80, 0x81: sgUn
+  of 0x82: sgBin
+  of 0x83, 0x84: sgTest
+  of 0x85, 0x86: sgBin
+  of 0x87, 0x88, 0x89, 0x8A: sgUn
+  of 0x8B, 0x8C, 0x8D: sgShift
+  of 0x8E, 0x8F, 0x90, 0x91, 0x92, 0x93: sgBin
+  of 0x94: sgUn
+  of 0x95, 0x96, 0x97, 0x98, 0x99: sgBin
+  of 0x9B: sgBin
+  of 0x9C, 0x9D, 0x9E, 0x9F: sgBin
+  of 0xA0, 0xA1: sgUn
+  of 0xA3, 0xA4: sgTest
+  of 0xA7, 0xA8, 0xA9, 0xAA: sgUn
+  of 0xAB, 0xAC, 0xAD: sgShift
+  of 0xAE, 0xB1: sgBin
+  of 0xB5, 0xB6, 0xB7, 0xB8, 0xB9, 0xBA: sgBin
+  of 0xBC, 0xBD, 0xBE, 0xBF: sgBin
+  of 0xC0, 0xC1: sgUn
+  of 0xC3, 0xC4: sgTest
+  of 0xC7, 0xC8, 0xC9, 0xCA: sgUn
+  of 0xCB, 0xCC, 0xCD: sgShift
+  of 0xCE, 0xD1, 0xD5: sgBin
+  of 0xD6, 0xD7, 0xD8, 0xD9, 0xDA, 0xDB: sgBin
+  of 0xDC, 0xDD, 0xDE, 0xDF: sgBin
+  of 0xE0, 0xE1, 0xE3: sgUn
+  of 0xE4 .. 0xEB: sgBin
+  of 0xEC, 0xED, 0xEF: sgUn
+  of 0xF0 .. 0xF7: sgBin
+  of 0xF8 .. 0xFF: sgUn
+  # relaxed SIMD
+  of 0x100: sgBin
+  of 0x101, 0x102, 0x103, 0x104: sgUn
+  of 0x105, 0x106, 0x107, 0x108: sgTer
+  of 0x109, 0x10A, 0x10B, 0x10C: sgTer
+  of 0x10D, 0x10E, 0x10F, 0x110: sgBin
+  of 0x111, 0x112: sgBin
+  of 0x113: sgTer
+  else: -1
+
+# ---------------------------------------------------------------------------
+# Constant expressions and function bodies share one instruction walker.
+
+proc checkFuncIdx(d: var Dec; f: int): bool =
+  if f < 0 or f >= d.m.funcs.len:
+    dfail(d, "unknown function " & wIts(f))
+    return false
+  result = true
+
+proc funcRefType(d: var Dec; f: int): int =
+  refT(d.m.types[d.m.funcs[f]], false)
+
+proc tableOk(d: var Dec; t: int): bool =
+  if t < 0 or t >= d.m.tables.len:
+    dfail(d, "unknown table " & wIts(t))
+    return false
+  result = true
+
+proc memOk(d: var Dec; m: int): bool =
+  if m < 0 or m >= d.m.mems.len:
+    dfail(d, "unknown memory " & wIts(m))
+    return false
+  result = true
+
+proc elemOk(d: var Dec; e: int): bool =
+  if e < 0 or e >= d.m.elems.len:
+    dfail(d, "unknown elem segment " & wIts(e))
+    return false
+  result = true
+
+proc dataOk(d: var Dec; x: int): bool =
+  if not d.m.hasDataCount:
+    dfail(d, "data count section required")
+    return false
+  if x < 0 or x >= d.dataCount:
+    dfail(d, "unknown data segment " & wIts(x))
+    return false
+  result = true
+
+proc structType(d: var Dec; ti: int): CType =
+  result = ctypeOf(d, ti)
+  if bad(d): return
+  if result.kind != ckStruct: dfail(d, "type mismatch: not a struct type")
+
+proc arrayType(d: var Dec; ti: int): CType =
+  result = ctypeOf(d, ti)
+  if bad(d): return
+  if result.kind != ckArray: dfail(d, "type mismatch: not an array type")
+
+proc unpacked(t: int): int =
+  if t == stI8 or t == stI16: vtI32 else: t
+
+proc isDefaultable(t: int): bool =
+  not isRefT(t) or nullableOf(t)
+
+proc callSig(d: var Dec; t: CType) =
+  popVals(d, t.params)
+  pushVals(d, t.results)
+
+proc returnCallCheck(d: var Dec; t: CType) =
+  # the callee's results must match the caller's
+  if t.results.len != d.fnResults.len:
+    dfail(d, "type mismatch: tail call result arity")
+    return
+  var i = 0
+  while i < t.results.len:
+    if not vtMatch(d.reg[], t.results[i], d.fnResults[i]):
+      dfail(d, "type mismatch: tail call results")
+      return
+    inc i
+  popVals(d, t.params)
+  setUnreachable(d)
+
+proc instr(d: var Dec; op0: int): bool
+
+proc bodyLoop(d: var Dec) =
+  ## Instructions until the frame that is open when this is called is closed
+  ## by its `end`.
+  let base = d.ctrls.len
+  while d.ctrls.len >= base and not bad(d):
+    if d.r.p >= d.r.e:
+      dfail(d, "unexpected end of section or function")
+      return
+    let op = byte1(d.r)
+    if bad(d): return
+    discard instr(d, op)
+
+proc brArity(d: var Dec; ci: int): int = labelTypes(d.ctrls[ci]).len
+
+proc instr(d: var Dec; op0: int): bool =
+  result = true
+  let op = op0
+  if d.inConst:
+    # Constant expressions admit a short list of instructions.
+    var okc = false
+    case op
+    of 0x0B, 0x41, 0x42, 0x43, 0x44, 0xD0, 0xD2, 0x23: okc = true
+    of 0x6A, 0x6B, 0x6C, 0x7C, 0x7D, 0x7E: okc = true
+    of 0xFB, 0xFD: okc = true   # checked per sub-opcode below
+    else: okc = false
+    if not okc:
+      dfail(d, "constant expression required")
+      return
+  case op
+  of 0x00:
+    discard emit(d, 0x00, 0, 0)
+    setUnreachable(d)
+  of 0x01: discard
+  of 0x02, 0x03:
+    var ps: seq[int] = @[]
+    var rs: seq[int] = @[]
+    readBlockType(d, ps, rs)
+    if bad(d): return
+    popVals(d, ps)
+    pushCtrl(d, (if op == 0x02: 0 else: 1), ps, rs)
+  of 0x04:
+    var ps: seq[int] = @[]
+    var rs: seq[int] = @[]
+    readBlockType(d, ps, rs)
+    if bad(d): return
+    discard popV(d, vtI32)
+    popVals(d, ps)
+    let at = emit(d, opIfFalse, 0, 0)
+    pushCtrl(d, 2, ps, rs)
+    d.ctrls[d.ctrls.len - 1].ifPc = at
+  of 0x05:
+    let f = d.ctrls.len - 1
+    if d.ctrls[f].kind != 2:
+      dfail(d, "else without if")
+      return
+    let c = popCtrlCheck(d)
+    if bad(d): return
+    let j = emit(d, opJump, 0, 0)
+    d.m.code[c.ifPc].a = d.m.code.len
+    var nc = c
+    nc.kind = 3
+    nc.height = d.vals.len
+    nc.unreachable = false
+    nc.fixups.add j * 2
+    nc.initH = d.initStack.len
+    d.ctrls.add nc
+    pushVals(d, c.params)
+  of 0x0B:
+    let f = d.ctrls.len - 1
+    let c = popCtrlCheck(d)
+    if bad(d): return
+    if c.kind == 2:
+      # an `if` without `else` must have matching params and results
+      if c.params.len != c.results.len:
+        dfail(d, "type mismatch: if without else")
+        return
+      var i = 0
+      while i < c.params.len:
+        if not vtMatch(d.reg[], c.params[i], c.results[i]):
+          dfail(d, "type mismatch: if without else")
+          return
+        inc i
+      d.m.code[c.ifPc].a = d.m.code.len
+    if c.kind == 4:
+      d.m.tries[c.tryIdx].endPc = d.m.code.len
+    if c.kind == 5 or f == 0:
+      # a branch to the function's own label is a return: it lands on the
+      # final instruction, which is one
+      patchTo(d, c.fixups, d.m.code.len)
+      if d.inConst: discard emit(d, opEndExpr, 0, 0)
+      else: discard emit(d, opReturn, 0, 0)
+      pushVals(d, c.results)
+      return
+    patchTo(d, c.fixups, d.m.code.len)
+    pushVals(d, c.results)
+  of 0x0C:
+    let l = u32(d.r)
+    let ci = labelIdx(d, l)
+    if bad(d): return
+    let lt = labelTypes(d.ctrls[ci])
+    popVals(d, lt)
+    let at = emit(d, opBr, 0, lt.len, uint64(destOf(d, ci)))
+    branchTo(d, ci, at, false)
+    setUnreachable(d)
+  of 0x0D:
+    let l = u32(d.r)
+    let ci = labelIdx(d, l)
+    if bad(d): return
+    discard popV(d, vtI32)
+    let lt = labelTypes(d.ctrls[ci])
+    popVals(d, lt)
+    let at = emit(d, opBrIf, 0, lt.len, uint64(destOf(d, ci)))
+    branchTo(d, ci, at, false)
+    pushVals(d, lt)
+  of 0x0E:
+    let n = u32(d.r)
+    if bad(d): return
+    if n > d.r.e - d.r.p:
+      dfail(d, "unexpected end")
+      return
+    var labels: seq[int] = @[]
+    var i = 0
+    while i <= n and not bad(d):
+      labels.add u32(d.r)
+      inc i
+    if bad(d): return
+    discard popV(d, vtI32)
+    let dci = labelIdx(d, labels[n])
+    if bad(d): return
+    let arity = brArity(d, dci)
+    let tabAt = d.m.brTab.len
+    d.m.brTab.add n + 1
+    i = 0
+    while i <= n and not bad(d):
+      let ci = labelIdx(d, labels[i])
+      if bad(d): return
+      let lt = labelTypes(d.ctrls[ci])
+      if lt.len != arity:
+        dfail(d, "type mismatch: br_table arity")
+        return
+      # every target's types must accept the operands
+      var k = lt.len - 1
+      var j = d.vals.len - 1
+      var popped: seq[int] = @[]
+      while k >= 0 and not bad(d):
+        popped.add popV(d, lt[k])
+        dec k
+      # push back what was popped, in order, to check the next label
+      k = popped.len - 1
+      while k >= 0:
+        pushV(d, popped[k])
+        dec k
+      discard j
+      d.m.brTab.add 0
+      d.m.brTab.add destOf(d, ci)
+      branchTo(d, ci, tabAt + 1 + i * 2, true)
+      inc i
+    if bad(d): return
+    # pop the default label's types
+    popVals(d, labelTypes(d.ctrls[dci]))
+    discard emit(d, opBrTable, tabAt, arity)
+    setUnreachable(d)
+  of 0x0F:
+    let frs = d.fnResults
+    popVals(d, frs)
+    discard emit(d, opReturn, 0, 0)
+    setUnreachable(d)
+  of 0x10:
+    let f = u32(d.r)
+    if bad(d) or not checkFuncIdx(d, f): return
+    let t = funcTypeOf(d, cp(d.m.funcs[f]))
+    if bad(d): return
+    callSig(d, t)
+    discard emit(d, 0x10, f, 0)
+  of 0x11, 0x13:
+    let ti = u32(d.r)
+    let tab = u32(d.r)
+    if bad(d): return
+    if not tableOk(d, tab): return
+    let t = funcTypeOf(d, ti)
+    if bad(d): return
+    if not vtMatch(d.reg[], d.m.tables[tab].elem, refT(htFunc, true)):
+      dfail(d, "type mismatch: call_indirect on a non-funcref table")
+      return
+    discard popV(d, tabAddrT(d, tab))
+    if op == 0x11: callSig(d, t)
+    else: returnCallCheck(d, t)
+    discard emit(d, op, ti, tab)
+  of 0x12:
+    let f = u32(d.r)
+    if bad(d) or not checkFuncIdx(d, f): return
+    let t = funcTypeOf(d, cp(d.m.funcs[f]))
+    if bad(d): return
+    returnCallCheck(d, t)
+    discard emit(d, 0x12, f, 0)
+  of 0x14, 0x15:
+    let ti = u32(d.r)
+    if bad(d): return
+    let t = funcTypeOf(d, ti)
+    if bad(d): return
+    discard popV(d, refT(d.m.types[ti], true))
+    if op == 0x14: callSig(d, t)
+    else: returnCallCheck(d, t)
+    discard emit(d, op, ti, 0)
+  of 0x08:
+    let x = u32(d.r)
+    if bad(d): return
+    if x >= d.m.tags.len:
+      dfail(d, "unknown tag " & wIts(x))
+      return
+    let t = funcTypeOf(d, cp(d.m.tags[x]))
+    if bad(d): return
+    popVals(d, t.params)
+    discard emit(d, 0x08, x, 0)
+    setUnreachable(d)
+  of 0x0A:
+    discard popV(d, refT(htExn, true))
+    discard emit(d, 0x0A, 0, 0)
+    setUnreachable(d)
+  of 0x1F:
+    var ps: seq[int] = @[]
+    var rs: seq[int] = @[]
+    readBlockType(d, ps, rs)
+    if bad(d): return
+    let n = u32(d.r)
+    if bad(d): return
+    var entry = TryEntry(startPc: d.m.code.len, endPc: 0, catches: @[])
+    var i = 0
+    while i < n and not bad(d):
+      let k = byte1(d.r)
+      if bad(d): return
+      if k > 3:
+        dfail(d, "malformed catch clause")
+        return
+      var tag = -1
+      if k == 0 or k == 1:
+        tag = u32(d.r)
+        if bad(d): return
+        if tag >= d.m.tags.len:
+          dfail(d, "unknown tag " & wIts(tag))
+          return
+      let l = u32(d.r)
+      if bad(d): return
+      let ci = labelIdx(d, l)
+      if bad(d): return
+      # what the catch clause pushes must match the label's types
+      var pushed: seq[int] = @[]
+      if k == 0 or k == 1:
+        let t = funcTypeOf(d, cp(d.m.tags[tag]))
+        if bad(d): return
+        pushed = t.params
+      if k == 1 or k == 3: pushed.add refT(htExn, false)
+      let lt = labelTypes(d.ctrls[ci])
+      if lt.len != pushed.len:
+        dfail(d, "type mismatch: catch label")
+        return
+      var j = 0
+      while j < lt.len:
+        if not vtMatch(d.reg[], pushed[j], lt[j]):
+          dfail(d, "type mismatch: catch label")
+          return
+        inc j
+      let wSlot = d.m.brTab.len
+      d.m.brTab.add 0
+      branchTo(d, ci, wSlot, true)
+      entry.catches.add TryCatch(kind: k, tag: tag, target: wSlot, dest: destOf(d, ci))
+      inc i
+    if bad(d): return
+    popVals(d, ps)
+    let ti = d.m.tries.len
+    d.m.tries.add entry
+    pushCtrl(d, 4, ps, rs)
+    d.ctrls[d.ctrls.len - 1].tryIdx = ti
+  of 0x1A:
+    let t = popAny(d)
+    discard t
+    discard emit(d, 0x1A, 0, 0)
+  of 0x1B, 0x1C:
+    var want = vtBot
+    if op == 0x1C:
+      let n = u32(d.r)
+      if bad(d): return
+      if n != 1:
+        dfail(d, "invalid result arity")
+        return
+      want = readValType(d)
+      if bad(d): return
+    discard popV(d, vtI32)
+    if op == 0x1C:
+      discard popV(d, want)
+      discard popV(d, want)
+      pushV(d, want)
+    else:
+      let t1 = popAny(d)
+      let t2 = popAny(d)
+      if bad(d): return
+      if (t1 != vtBot and not (isNumT(t1) or isVecT(t1))) or
+         (t2 != vtBot and not (isNumT(t2) or isVecT(t2))):
+        dfail(d, "type mismatch: select needs a type annotation")
+        return
+      if t1 != vtBot and t2 != vtBot and t1 != t2:
+        dfail(d, "type mismatch")
+        return
+      pushV(d, (if t1 == vtBot: t2 else: t1))
+    discard emit(d, opSelect, 0, 0)
+  of 0x20, 0x21, 0x22:
+    let x = u32(d.r)
+    if bad(d): return
+    if x >= d.locals.len:
+      dfail(d, "unknown local " & wIts(x))
+      return
+    let t = d.locals[x]
+    if op == 0x20:
+      if not d.linit[x]:
+        dfail(d, "uninitialized local " & wIts(x))
+        return
+      pushV(d, t)
+    else:
+      discard popV(d, t)
+      if not d.linit[x]:
+        d.linit[x] = true
+        d.initStack.add x
+      if op == 0x22: pushV(d, t)
+    discard emit(d, op, x, 0)
+  of 0x23, 0x24:
+    let x = u32(d.r)
+    if bad(d): return
+    if x >= d.m.globals.len or (d.inConst and x >= d.constGlobalLimit):
+      dfail(d, "unknown global " & wIts(x))
+      return
+    let g = d.m.globals[x]
+    if op == 0x23:
+      if d.inConst and g.mut:
+        dfail(d, "constant expression required")
+        return
+      pushV(d, g.vt)
+    else:
+      if not g.mut:
+        dfail(d, "global is immutable")
+        return
+      discard popV(d, g.vt)
+    discard emit(d, op, x, 0)
+  of 0x25, 0x26:
+    let t = u32(d.r)
+    if bad(d) or not tableOk(d, t): return
+    let et = d.m.tables[t].elem
+    if op == 0x25:
+      discard popV(d, tabAddrT(d, t))
+      pushV(d, et)
+    else:
+      discard popV(d, et)
+      discard popV(d, tabAddrT(d, t))
+    discard emit(d, op, t, 0)
+  of 0x28 .. 0x3E:
+    var natural = 0
+    var vt = 0
+    discard loadInfo(op, natural, vt)
+    var mem = 0
+    var off = 0'u64
+    readMemarg(d, natural, mem, off)
+    if bad(d): return
+    if op <= 0x35:
+      discard popV(d, addrT(d, mem))
+      pushV(d, vt)
+    else:
+      discard popV(d, vt)
+      discard popV(d, addrT(d, mem))
+    discard emit(d, op, mem, 0, off)
+  of 0x3F, 0x40:
+    let mem = u32(d.r)
+    if bad(d) or not memOk(d, mem): return
+    let at = addrT(d, mem)
+    if op == 0x40: discard popV(d, at)
+    pushV(d, at)
+    discard emit(d, op, mem, 0)
+  of 0x41:
+    let v = s32(d.r)
+    if bad(d): return
+    pushV(d, vtI32)
+    discard emit(d, 0x41, 0, 0, v)
+  of 0x42:
+    let v = s64(d.r)
+    if bad(d): return
+    pushV(d, vtI64)
+    discard emit(d, 0x42, 0, 0, v)
+  of 0x43:
+    let v = fixed32(d.r)
+    if bad(d): return
+    pushV(d, vtF32)
+    discard emit(d, 0x43, 0, 0, v)
+  of 0x44:
+    let v = fixed64(d.r)
+    if bad(d): return
+    pushV(d, vtF64)
+    discard emit(d, 0x44, 0, 0, v)
+  of 0x45 .. 0xC4:
+    if d.inConst:
+      # extended constant expressions: add, sub, mul only
+      if not (op == 0x6A or op == 0x6B or op == 0x6C or op == 0x7C or op == 0x7D or op == 0x7E):
+        dfail(d, "constant expression required")
+        return
+    discard numericSig(d, op)
+    discard emit(d, op, 0, 0)
+  of 0xD0:
+    let ht = readHeapType(d)
+    if bad(d): return
+    pushV(d, refT(ht, true))
+    discard emit(d, 0xD0, 0, 0)
+  of 0xD1:
+    discard popRef(d)
+    pushV(d, vtI32)
+    discard emit(d, 0xD1, 0, 0)
+  of 0xD2:
+    let f = u32(d.r)
+    if bad(d) or not checkFuncIdx(d, f): return
+    if d.inConst:
+      d.m.declared[f] = true
+    elif not d.m.declared[f]:
+      dfail(d, "undeclared function reference")
+      return
+    pushV(d, funcRefType(d, f))
+    discard emit(d, 0xD2, f, 0)
+  of 0xD3:
+    discard popV(d, refT(htEq, true))
+    discard popV(d, refT(htEq, true))
+    pushV(d, vtI32)
+    discard emit(d, 0xD3, 0, 0)
+  of 0xD4:
+    let t = popRef(d)
+    if bad(d): return
+    pushV(d, refT(heapOf(t), false))
+    discard emit(d, 0xD4, 0, 0)
+  of 0xD5, 0xD6:
+    let l = u32(d.r)
+    let ci = labelIdx(d, l)
+    if bad(d): return
+    let t = popRef(d)
+    if bad(d): return
+    var lt = labelTypes(d.ctrls[ci])
+    if op == 0xD5:
+      popVals(d, lt)
+      pushVals(d, lt)
+      let at = emit(d, opBrOnNull, 0, lt.len, uint64(destOf(d, ci)))
+      branchTo(d, ci, at, false)
+      pushV(d, refT(heapOf(t), false))
+    else:
+      if lt.len == 0:
+        dfail(d, "type mismatch: br_on_non_null needs a reference label")
+        return
+      let last = lt[lt.len - 1]
+      if not vtMatch(d.reg[], refT(heapOf(t), false), last):
+        dfail(d, "type mismatch")
+        return
+      var rest: seq[int] = @[]
+      var i = 0
+      while i < lt.len - 1:
+        rest.add lt[i]
+        inc i
+      popVals(d, rest)
+      pushVals(d, rest)
+      let at = emit(d, opBrOnNonNull, 0, lt.len, uint64(destOf(d, ci)))
+      branchTo(d, ci, at, false)
+  of 0xFC:
+    let sub = u32(d.r)
+    if bad(d): return
+    case sub
+    of 0, 1: unop(d, vtF32, vtI32)
+    of 2, 3: unop(d, vtF64, vtI32)
+    of 4, 5: unop(d, vtF32, vtI64)
+    of 6, 7: unop(d, vtF64, vtI64)
+    of 8:
+      let x = u32(d.r)
+      let mem = u32(d.r)
+      if bad(d) or not memOk(d, mem) or not dataOk(d, x): return
+      discard popV(d, vtI32)
+      discard popV(d, vtI32)
+      discard popV(d, addrT(d, mem))
+      discard emit(d, 0x100 + sub, x, mem)
+      return
+    of 9:
+      let x = u32(d.r)
+      if bad(d) or not dataOk(d, x): return
+      discard emit(d, 0x100 + sub, x, 0)
+      return
+    of 10:
+      let m1 = u32(d.r)
+      let m2 = u32(d.r)
+      if bad(d) or not memOk(d, m1) or not memOk(d, m2): return
+      let a1 = addrT(d, m1)
+      let a2 = addrT(d, m2)
+      let an = (if a1 == vtI64 and a2 == vtI64: vtI64 else: vtI32)
+      discard popV(d, an)
+      discard popV(d, a2)
+      discard popV(d, a1)
+      discard emit(d, 0x100 + sub, m1, m2)
+      return
+    of 11:
+      let mem = u32(d.r)
+      if bad(d) or not memOk(d, mem): return
+      let a = addrT(d, mem)
+      discard popV(d, a)
+      discard popV(d, vtI32)
+      discard popV(d, a)
+      discard emit(d, 0x100 + sub, mem, 0)
+      return
+    of 12:
+      let x = u32(d.r)
+      let t = u32(d.r)
+      if bad(d) or not elemOk(d, x) or not tableOk(d, t): return
+      if not vtMatch(d.reg[], d.m.elems[x].elemType, d.m.tables[t].elem):
+        dfail(d, "type mismatch: table.init")
+        return
+      discard popV(d, vtI32)
+      discard popV(d, vtI32)
+      discard popV(d, tabAddrT(d, t))
+      discard emit(d, 0x100 + sub, x, t)
+      return
+    of 13:
+      let x = u32(d.r)
+      if bad(d) or not elemOk(d, x): return
+      discard emit(d, 0x100 + sub, x, 0)
+      return
+    of 14:
+      let t1 = u32(d.r)
+      let t2 = u32(d.r)
+      if bad(d) or not tableOk(d, t1) or not tableOk(d, t2): return
+      if not vtMatch(d.reg[], d.m.tables[t2].elem, d.m.tables[t1].elem):
+        dfail(d, "type mismatch: table.copy")
+        return
+      let a1 = tabAddrT(d, t1)
+      let a2 = tabAddrT(d, t2)
+      let an = (if a1 == vtI64 and a2 == vtI64: vtI64 else: vtI32)
+      discard popV(d, an)
+      discard popV(d, a2)
+      discard popV(d, a1)
+      discard emit(d, 0x100 + sub, t1, t2)
+      return
+    of 15:
+      let t = u32(d.r)
+      if bad(d) or not tableOk(d, t): return
+      let a = tabAddrT(d, t)
+      discard popV(d, a)
+      discard popV(d, cp(d.m.tables[t].elem))
+      pushV(d, a)
+      discard emit(d, 0x100 + sub, t, 0)
+      return
+    of 16:
+      let t = u32(d.r)
+      if bad(d) or not tableOk(d, t): return
+      pushV(d, tabAddrT(d, t))
+      discard emit(d, 0x100 + sub, t, 0)
+      return
+    of 19, 20:
+      # wide arithmetic: i64.add128 / i64.sub128
+      discard popV(d, vtI64)
+      discard popV(d, vtI64)
+      discard popV(d, vtI64)
+      discard popV(d, vtI64)
+      pushV(d, vtI64)
+      pushV(d, vtI64)
+      discard emit(d, 0x100 + sub, 0, 0)
+      return
+    of 21, 22:
+      # wide arithmetic: i64.mul_wide_s / i64.mul_wide_u
+      discard popV(d, vtI64)
+      discard popV(d, vtI64)
+      pushV(d, vtI64)
+      pushV(d, vtI64)
+      discard emit(d, 0x100 + sub, 0, 0)
+      return
+    of 17:
+      let t = u32(d.r)
+      if bad(d) or not tableOk(d, t): return
+      let a = tabAddrT(d, t)
+      discard popV(d, a)
+      discard popV(d, cp(d.m.tables[t].elem))
+      discard popV(d, a)
+      discard emit(d, 0x100 + sub, t, 0)
+      return
+    else:
+      dfail(d, "illegal opcode")
+      return
+    discard emit(d, 0x100 + sub, 0, 0)
+  of 0xFD:
+    let sub = u32(d.r)
+    if bad(d): return
+    if d.inConst and sub != 0x0C:
+      dfail(d, "constant expression required")
+      return
+    case sub
+    of 0x00 .. 0x0B, 0x5C, 0x5D:
+      var natural = 16
+      case sub
+      of 0x01 .. 0x06: natural = 8
+      of 0x07: natural = 1
+      of 0x08: natural = 2
+      of 0x09, 0x5C: natural = 4
+      of 0x0A, 0x5D: natural = 8
+      else: natural = 16
+      var mem = 0
+      var off = 0'u64
+      readMemarg(d, natural, mem, off)
+      if bad(d): return
+      if sub == 0x0B:
+        discard popV(d, vtV128)
+        discard popV(d, addrT(d, mem))
+      else:
+        discard popV(d, addrT(d, mem))
+        pushV(d, vtV128)
+      discard emit(d, 0x200 + sub, mem, 0, off)
+    of 0x0C:
+      let lo = fixed64(d.r)
+      let hi = fixed64(d.r)
+      if bad(d): return
+      let at = d.m.v128.len div 2
+      d.m.v128.add lo
+      d.m.v128.add hi
+      pushV(d, vtV128)
+      discard emit(d, 0x200 + sub, at, 0)
+    of 0x0D:
+      var lo = 0'u64
+      var hi = 0'u64
+      var i = 0
+      while i < 16:
+        let l = byte1(d.r)
+        if bad(d): return
+        if l >= 32:
+          dfail(d, "invalid lane index")
+          return
+        if i < 8: lo = lo or (uint64(l) shl uint64(8 * i))
+        else: hi = hi or (uint64(l) shl uint64(8 * (i - 8)))
+        inc i
+      discard popV(d, vtV128)
+      discard popV(d, vtV128)
+      pushV(d, vtV128)
+      let at = d.m.v128.len div 2
+      d.m.v128.add lo
+      d.m.v128.add hi
+      discard emit(d, 0x200 + sub, at, 0)
+    of 0x0F .. 0x14:
+      let st = (case sub
+                of 0x0F, 0x10, 0x11: vtI32
+                of 0x12: vtI64
+                of 0x13: vtF32
+                else: vtF64)
+      discard popV(d, st)
+      pushV(d, vtV128)
+      discard emit(d, 0x200 + sub, 0, 0)
+    of 0x15 .. 0x22:
+      let lane = byte1(d.r)
+      if bad(d): return
+      var lanes = 16
+      var st = vtI32
+      var isReplace = false
+      case sub
+      of 0x15, 0x16: lanes = 16
+      of 0x17: lanes = 16; isReplace = true
+      of 0x18, 0x19: lanes = 8
+      of 0x1A: lanes = 8; isReplace = true
+      of 0x1B: lanes = 4
+      of 0x1C: lanes = 4; isReplace = true
+      of 0x1D: lanes = 2; st = vtI64
+      of 0x1E: lanes = 2; st = vtI64; isReplace = true
+      of 0x1F: lanes = 4; st = vtF32
+      of 0x20: lanes = 4; st = vtF32; isReplace = true
+      of 0x21: lanes = 2; st = vtF64
+      else: lanes = 2; st = vtF64; isReplace = true
+      if lane >= lanes:
+        dfail(d, "invalid lane index")
+        return
+      if isReplace:
+        discard popV(d, st)
+        discard popV(d, vtV128)
+        pushV(d, vtV128)
+      else:
+        discard popV(d, vtV128)
+        pushV(d, st)
+      discard emit(d, 0x200 + sub, lane, 0)
+    of 0x54 .. 0x5B:
+      var natural = 1
+      var lanes = 16
+      case sub
+      of 0x54, 0x58: natural = 1; lanes = 16
+      of 0x55, 0x59: natural = 2; lanes = 8
+      of 0x56, 0x5A: natural = 4; lanes = 4
+      else: natural = 8; lanes = 2
+      var mem = 0
+      var off = 0'u64
+      readMemarg(d, natural, mem, off)
+      if bad(d): return
+      let lane = byte1(d.r)
+      if bad(d): return
+      if lane >= lanes:
+        dfail(d, "invalid lane index")
+        return
+      discard popV(d, vtV128)
+      discard popV(d, addrT(d, mem))
+      if sub <= 0x57: pushV(d, vtV128)
+      discard emit(d, 0x200 + sub, mem, lane, off)
+    else:
+      let sg = simdSigOf(sub)
+      case sg
+      of sgUn: unop(d, vtV128, vtV128)
+      of sgBin: binop(d, vtV128, vtV128)
+      of sgTest: unop(d, vtV128, vtI32)
+      of sgShift:
+        discard popV(d, vtI32)
+        discard popV(d, vtV128)
+        pushV(d, vtV128)
+      of sgTer:
+        discard popV(d, vtV128)
+        discard popV(d, vtV128)
+        discard popV(d, vtV128)
+        pushV(d, vtV128)
+      else:
+        dfail(d, "illegal opcode")
+        return
+      discard emit(d, 0x200 + sub, 0, 0)
+  of 0xFB:
+    let sub = u32(d.r)
+    if bad(d): return
+    if d.inConst and not (sub == 0 or sub == 1 or sub == 6 or sub == 7 or sub == 8 or
+                          sub == 26 or sub == 27 or sub == 28):
+      dfail(d, "constant expression required")
+      return
+    case sub
+    of 0, 1:
+      let ti = u32(d.r)
+      if bad(d): return
+      let t = structType(d, ti)
+      if bad(d): return
+      if sub == 0:
+        var i = t.fields.len - 1
+        while i >= 0:
+          discard popV(d, unpacked(t.fields[i]))
+          dec i
+      else:
+        var i = 0
+        while i < t.fields.len:
+          if not isDefaultable(t.fields[i]):
+            dfail(d, "field type is not defaultable")
+            return
+          inc i
+      pushV(d, refT(d.m.types[ti], false))
+      discard emit(d, 0x400 + sub, ti, 0)
+    of 2, 3, 4, 5:
+      let ti = u32(d.r)
+      let fi = u32(d.r)
+      if bad(d): return
+      let t = structType(d, ti)
+      if bad(d): return
+      if fi >= t.fields.len:
+        dfail(d, "unknown field " & wIts(fi))
+        return
+      let ft = t.fields[fi]
+      let packed = ft == stI8 or ft == stI16
+      if sub == 2 and packed:
+        dfail(d, "type mismatch: packed field needs get_s or get_u")
+        return
+      if (sub == 3 or sub == 4) and not packed:
+        dfail(d, "type mismatch: field is not packed")
+        return
+      if sub == 5:
+        if not t.muts[fi]:
+          dfail(d, "field is immutable")
+          return
+        discard popV(d, unpacked(ft))
+        discard popV(d, refT(d.m.types[ti], true))
+      else:
+        discard popV(d, refT(d.m.types[ti], true))
+        pushV(d, unpacked(ft))
+      discard emit(d, 0x400 + sub, ti, fi)
+    of 6, 7, 8, 9, 10:
+      let ti = u32(d.r)
+      if bad(d): return
+      let t = arrayType(d, ti)
+      if bad(d): return
+      let et = t.fields[0]
+      var extra = 0
+      case sub
+      of 6:
+        discard popV(d, vtI32)
+        discard popV(d, unpacked(et))
+      of 7:
+        if not isDefaultable(et):
+          dfail(d, "array type is not defaultable")
+          return
+        discard popV(d, vtI32)
+      of 8:
+        extra = u32(d.r)
+        if bad(d): return
+        var i = 0
+        while i < extra:
+          discard popV(d, unpacked(et))
+          inc i
+      of 9:
+        extra = u32(d.r)
+        if bad(d) or not dataOk(d, extra): return
+        if isRefT(et):
+          dfail(d, "type mismatch: array.new_data of a reference array")
+          return
+        discard popV(d, vtI32)
+        discard popV(d, vtI32)
+      else:
+        extra = u32(d.r)
+        if bad(d) or not elemOk(d, extra): return
+        if not vtMatch(d.reg[], d.m.elems[extra].elemType, et):
+          dfail(d, "type mismatch: array.new_elem")
+          return
+        discard popV(d, vtI32)
+        discard popV(d, vtI32)
+      pushV(d, refT(d.m.types[ti], false))
+      discard emit(d, 0x400 + sub, ti, extra)
+    of 11, 12, 13, 14:
+      let ti = u32(d.r)
+      if bad(d): return
+      let t = arrayType(d, ti)
+      if bad(d): return
+      let et = t.fields[0]
+      let packed = et == stI8 or et == stI16
+      if sub == 11 and packed:
+        dfail(d, "type mismatch: packed array needs get_s or get_u")
+        return
+      if (sub == 12 or sub == 13) and not packed:
+        dfail(d, "type mismatch: array is not packed")
+        return
+      if sub == 14:
+        if not t.muts[0]:
+          dfail(d, "array is immutable")
+          return
+        discard popV(d, unpacked(et))
+        discard popV(d, vtI32)
+        discard popV(d, refT(d.m.types[ti], true))
+      else:
+        discard popV(d, vtI32)
+        discard popV(d, refT(d.m.types[ti], true))
+        pushV(d, unpacked(et))
+      discard emit(d, 0x400 + sub, ti, 0)
+    of 15:
+      discard popV(d, refT(htArray, true))
+      pushV(d, vtI32)
+      discard emit(d, 0x400 + sub, 0, 0)
+    of 16:
+      let ti = u32(d.r)
+      if bad(d): return
+      let t = arrayType(d, ti)
+      if bad(d): return
+      if not t.muts[0]:
+        dfail(d, "array is immutable")
+        return
+      discard popV(d, vtI32)
+      discard popV(d, unpacked(t.fields[0]))
+      discard popV(d, vtI32)
+      discard popV(d, refT(d.m.types[ti], true))
+      discard emit(d, 0x400 + sub, ti, 0)
+    of 17:
+      let t1 = u32(d.r)
+      let t2 = u32(d.r)
+      if bad(d): return
+      let a1 = arrayType(d, t1)
+      if bad(d): return
+      let a2 = arrayType(d, t2)
+      if bad(d): return
+      if not a1.muts[0]:
+        dfail(d, "array is immutable")
+        return
+      if not storageMatch(d.reg[], a2.fields[0], a1.fields[0]):
+        dfail(d, "type mismatch: array.copy")
+        return
+      discard popV(d, vtI32)
+      discard popV(d, vtI32)
+      discard popV(d, refT(d.m.types[t2], true))
+      discard popV(d, vtI32)
+      discard popV(d, refT(d.m.types[t1], true))
+      discard emit(d, 0x400 + sub, t1, t2)
+    of 18, 19:
+      let ti = u32(d.r)
+      let x = u32(d.r)
+      if bad(d): return
+      let t = arrayType(d, ti)
+      if bad(d): return
+      if not t.muts[0]:
+        dfail(d, "array is immutable")
+        return
+      if sub == 18:
+        if not dataOk(d, x): return
+        if isRefT(t.fields[0]):
+          dfail(d, "type mismatch: array.init_data of a reference array")
+          return
+      else:
+        if not elemOk(d, x): return
+        if not vtMatch(d.reg[], d.m.elems[x].elemType, t.fields[0]):
+          dfail(d, "type mismatch: array.init_elem")
+          return
+      discard popV(d, vtI32)
+      discard popV(d, vtI32)
+      discard popV(d, vtI32)
+      discard popV(d, refT(d.m.types[ti], true))
+      discard emit(d, 0x400 + sub, ti, x)
+    of 20, 21, 22, 23:
+      let ht = readHeapType(d)
+      if bad(d): return
+      let t = popRef(d)
+      if bad(d): return
+      let nullable = sub == 21 or sub == 23
+      let rt = refT(ht, nullable)
+      # the operand and the target must share a hierarchy
+      if heapOf(t) != htBot and topHeap(d.reg[], heapOf(t)) != topHeap(d.reg[], ht):
+        dfail(d, "type mismatch: cast across hierarchies")
+        return
+      if sub <= 21: pushV(d, vtI32)
+      else: pushV(d, rt)
+      discard emit(d, 0x400 + sub, ht, (if nullable: 1 else: 0))
+    of 24, 25:
+      let flags = byte1(d.r)
+      let l = u32(d.r)
+      if bad(d): return
+      let h1 = readHeapType(d)
+      let h2 = readHeapType(d)
+      if bad(d): return
+      if flags > 3:
+        dfail(d, "malformed cast flags")
+        return
+      let rt1 = refT(h1, (flags and 1) != 0)
+      let rt2 = refT(h2, (flags and 2) != 0)
+      let ci = labelIdx(d, l)
+      if bad(d): return
+      if not vtMatch(d.reg[], rt2, rt1):
+        dfail(d, "type mismatch: cast target is not a subtype")
+        return
+      discard popV(d, rt1)
+      if bad(d): return
+      var lt = labelTypes(d.ctrls[ci])
+      if lt.len == 0:
+        dfail(d, "type mismatch: cast label")
+        return
+      let last = lt[lt.len - 1]
+      # the difference type: rt1 minus rt2
+      let diff = refT(h1, nullableOf(rt1) and not nullableOf(rt2))
+      if sub == 24:
+        if not vtMatch(d.reg[], rt2, last):
+          dfail(d, "type mismatch")
+          return
+      else:
+        if not vtMatch(d.reg[], diff, last):
+          dfail(d, "type mismatch")
+          return
+      var rest: seq[int] = @[]
+      var i = 0
+      while i < lt.len - 1:
+        rest.add lt[i]
+        inc i
+      popVals(d, rest)
+      pushVals(d, rest)
+      if sub == 24: pushV(d, diff)
+      else: pushV(d, rt2)
+      let at = emit(d, (if sub == 24: opBrOnCast else: opBrOnCastFail), 0, lt.len,
+                    uint64(destOf(d, ci)))
+      branchTo(d, ci, at, false)
+      discard emit(d, opData, h2, (if (flags and 2) != 0: 1 else: 0))
+    of 26:
+      let t = popV(d, refT(htExtern, true))
+      if bad(d): return
+      let nl = (if t == vtBot: false else: nullableOf(t))
+      pushV(d, refT(htAny, nl))
+      discard emit(d, 0x400 + sub, 0, 0)
+    of 27:
+      let t = popV(d, refT(htAny, true))
+      if bad(d): return
+      let nl = (if t == vtBot: false else: nullableOf(t))
+      pushV(d, refT(htExtern, nl))
+      discard emit(d, 0x400 + sub, 0, 0)
+    of 28:
+      discard popV(d, vtI32)
+      pushV(d, refT(htI31, false))
+      discard emit(d, 0x400 + sub, 0, 0)
+    of 29, 30:
+      discard popV(d, refT(htI31, true))
+      pushV(d, vtI32)
+      discard emit(d, 0x400 + sub, 0, 0)
+    else:
+      dfail(d, "illegal opcode")
+  else:
+    dfail(d, "illegal opcode " & wIts(op))
+
+# ---------------------------------------------------------------------------
+# Constant expressions.
+
+proc constExpr(d: var Dec; want: int; globalsVisible: int): int =
+  ## Compile a constant expression producing `want`; returns its start.
+  result = d.m.code.len
+  d.inConst = true
+  d.constGlobalLimit = globalsVisible
+  d.vals = @[]
+  d.ctrls = @[]
+  d.nlocals = 0
+  d.maxH = 0
+  pushCtrl(d, 5, @[], @[want])
+  bodyLoop(d)
+  d.inConst = false
+
+# ---------------------------------------------------------------------------
+# Sections.
+
+proc funcSection(d: var Dec; nDefined: var int) =
+  let n = u32(d.r)
+  if bad(d): return
+  if n + d.m.funcs.len > MaxFuncs:
+    dfail(d, "too many functions")
+    return
+  nDefined = n
+  var i = 0
+  while i < n and not bad(d):
+    let ti = u32(d.r)
+    if bad(d): return
+    discard funcTypeOf(d, ti)
+    d.m.funcs.add ti
+    inc i
+
+proc tableSection(d: var Dec) =
+  let n = u32(d.r)
+  if bad(d): return
+  if n + d.m.tables.len > MaxTables:
+    dfail(d, "too many tables")
+    return
+  var i = 0
+  while i < n and not bad(d):
+    var hasInit = false
+    if d.r.p < d.r.e and int(d.r.b[d.r.p]) == 0x40:
+      inc d.r.p
+      let z = byte1(d.r)
+      if z != 0:
+        dfail(d, "malformed table")
+        return
+      hasInit = true
+    let tt = readTableType(d)
+    if bad(d): return
+    checkTableType(d, tt)
+    if bad(d): return
+    d.m.tables.add tt
+    if hasInit:
+      d.m.tableInit.add -2 # patched below
+      let at = constExpr(d, tt.elem, d.m.globals.len)
+      d.m.tableInit[d.m.tableInit.len - 1] = at
+    else:
+      if not nullableOf(tt.elem):
+        dfail(d, "type mismatch: non-defaultable table needs an initializer")
+        return
+      d.m.tableInit.add -1
+    inc i
+
+proc memorySection(d: var Dec) =
+  let n = u32(d.r)
+  if bad(d): return
+  if n + d.m.mems.len > MaxMems:
+    dfail(d, "too many memories")
+    return
+  var i = 0
+  while i < n and not bad(d):
+    let mt = readMemType(d)
+    if bad(d): return
+    checkMemType(d, mt)
+    d.m.mems.add mt
+    inc i
+
+proc tagSection(d: var Dec) =
+  let n = u32(d.r)
+  var i = 0
+  while i < n and not bad(d):
+    let ti = readTagType(d)
+    if bad(d): return
+    d.m.tags.add ti
+    inc i
+
+proc globalSection(d: var Dec) =
+  let n = u32(d.r)
+  if bad(d): return
+  if n + d.m.globals.len > MaxGlobals:
+    dfail(d, "too many globals")
+    return
+  var i = 0
+  while i < n and not bad(d):
+    let gt = readGlobalType(d)
+    if bad(d): return
+    let visible = d.m.globals.len
+    d.m.globals.add gt
+    d.m.globalInit.add -1
+    let at = constExpr(d, gt.vt, visible)
+    d.m.globalInit[d.m.globalInit.len - 1] = at
+    inc i
+
+proc exportSection(d: var Dec) =
+  let n = u32(d.r)
+  if bad(d): return
+  if n > MaxExports:
+    dfail(d, "too many exports")
+    return
+  var i = 0
+  while i < n and not bad(d):
+    let nm = name(d.r)
+    let k = byte1(d.r)
+    let x = u32(d.r)
+    if bad(d): return
+    var j = 0
+    while j < d.m.exports.len:
+      if d.m.exports[j].name == nm:
+        dfail(d, "duplicate export name")
+        return
+      inc j
+    case k
+    of 0:
+      if not checkFuncIdx(d, x): return
+      d.m.declared[x] = true
+    of 1:
+      if x >= d.m.tables.len:
+        dfail(d, "unknown table")
+        return
+    of 2:
+      if x >= d.m.mems.len:
+        dfail(d, "unknown memory")
+        return
+    of 3:
+      if x >= d.m.globals.len:
+        dfail(d, "unknown global")
+        return
+    of 4:
+      if x >= d.m.tags.len:
+        dfail(d, "unknown tag")
+        return
+    else:
+      dfail(d, "malformed export kind")
+      return
+    d.m.exports.add WExport(name: nm, kind: k, idx: x)
+    inc i
+
+proc elemSection(d: var Dec) =
+  let n = u32(d.r)
+  if bad(d): return
+  var i = 0
+  while i < n and not bad(d):
+    let flags = u32(d.r)
+    if bad(d): return
+    if flags > 7:
+      dfail(d, "malformed elements segment kind")
+      return
+    var e = WElem(mode: 0, table: 0, offset: -1, elemType: refT(htFunc, true), items: @[])
+    let passiveOrDecl = (flags and 1) != 0
+    let explicitTable = (flags and 2) != 0
+    let usesExprs = (flags and 4) != 0
+    if not passiveOrDecl:
+      e.mode = 1
+      if explicitTable:
+        e.table = u32(d.r)
+        if bad(d): return
+      if not tableOk(d, e.table): return
+      e.offset = constExpr(d, tabAddrT(d, e.table), d.m.globals.len)
+      if bad(d): return
+    else:
+      e.mode = (if explicitTable: 2 else: 0)
+    # element kind / type
+    if passiveOrDecl or explicitTable:
+      if usesExprs:
+        e.elemType = readRefType(d)
+      else:
+        let ek = byte1(d.r)
+        if bad(d): return
+        if ek != 0:
+          dfail(d, "malformed element kind")
+          return
+        e.elemType = refT(htFunc, false)
+    else:
+      e.elemType = (if usesExprs: refT(htFunc, true) else: refT(htFunc, false))
+    if bad(d): return
+    let cnt = u32(d.r)
+    if bad(d): return
+    if cnt > d.r.e - d.r.p:
+      dfail(d, "unexpected end")
+      return
+    var j = 0
+    while j < cnt and not bad(d):
+      if usesExprs:
+        e.items.add constExpr(d, e.elemType, d.m.globals.len)
+      else:
+        let f = u32(d.r)
+        if bad(d): return
+        if not checkFuncIdx(d, f): return
+        d.m.declared[f] = true
+        let at = d.m.code.len
+        d.m.code.add Ins(op: 0xD2, a: f, b: 0, c: 0)
+        d.m.code.add Ins(op: opEndExpr, a: 0, b: 0, c: 0)
+        e.items.add at
+      inc j
+    if bad(d): return
+    if e.mode == 1:
+      if not vtMatch(d.reg[], e.elemType, d.m.tables[e.table].elem):
+        dfail(d, "type mismatch: element segment does not match the table")
+        return
+    d.m.elems.add e
+    inc i
+
+proc dataSection(d: var Dec) =
+  let n = u32(d.r)
+  if bad(d): return
+  if n > MaxDataSegs:
+    dfail(d, "too many data segments")
+    return
+  if d.m.hasDataCount and n != d.dataCount:
+    dfail(d, "data count and data section have inconsistent lengths")
+    return
+  var i = 0
+  while i < n and not bad(d):
+    let flags = u32(d.r)
+    if bad(d): return
+    var ds = WData(mode: 0, mem: 0, offset: -1, bytes: "")
+    case flags
+    of 0:
+      ds.mode = 1
+      if not memOk(d, 0): return
+      ds.offset = constExpr(d, addrT(d, 0), d.m.globals.len)
+    of 1:
+      ds.mode = 0
+    of 2:
+      ds.mode = 1
+      ds.mem = u32(d.r)
+      if bad(d) or not memOk(d, ds.mem): return
+      ds.offset = constExpr(d, addrT(d, ds.mem), d.m.globals.len)
+    else:
+      dfail(d, "malformed data segment kind")
+      return
+    if bad(d): return
+    let len = u32(d.r)
+    if bad(d): return
+    if len > d.r.e - d.r.p:
+      dfail(d, "unexpected end of section or function")
+      return
+    ds.bytes = d.r.b.substr(d.r.p, d.r.p + len - 1)
+    d.r.p = d.r.p + len
+    d.m.datas.add ds
+    inc i
+
+proc codeBody(d: var Dec; fidx: int) =
+  ## One function body: locals, then instructions to the final `end`.
+  let size = u32(d.r)
+  if bad(d): return
+  if size > d.r.e - d.r.p:
+    dfail(d, "unexpected end")
+    return
+  if size > MaxBodySize:
+    dfail(d, "function body too big")
+    return
+  let bodyEnd = d.r.p + size
+  let saveE = d.r.e
+  d.r.e = bodyEnd
+  let t = funcTypeOf(d, cp(d.m.funcs[fidx]))
+  if bad(d): return
+  d.locals = t.params
+  d.linit = @[]
+  var i = 0
+  while i < t.params.len:
+    d.linit.add true
+    inc i
+  let ngroups = u32(d.r)
+  if bad(d): return
+  var total = t.params.len
+  i = 0
+  while i < ngroups and not bad(d):
+    let cnt = u32(d.r)
+    if bad(d): return
+    total = total + cnt
+    if total > MaxLocals:
+      dfail(d, "too many locals")
+      return
+    let vt = readValType(d)
+    if bad(d): return
+    var j = 0
+    while j < cnt:
+      d.locals.add vt
+      d.linit.add isDefaultable(vt)
+      inc j
+    inc i
+  d.nlocals = d.locals.len
+  d.fnResults = t.results
+  d.vals = @[]
+  d.ctrls = @[]
+  d.initStack = @[]
+  d.maxH = 0
+  let start = d.m.code.len
+  let firstTry = d.m.tries.len
+  pushCtrl(d, 5, @[], t.results)
+  bodyLoop(d)
+  if bad(d): return
+  if d.r.p != bodyEnd:
+    dfail(d, "section size mismatch: function body")
+    return
+  d.r.e = saveE
+  d.m.fcode.add WFuncCode(start: start, nparams: t.params.len, nresults: t.results.len,
+                          nlocals: d.nlocals, maxStack: d.nlocals + d.maxH + 4,
+                          tryLo: firstTry, tryHi: d.m.tries.len)
+
+proc codeSection(d: var Dec; nDefined: int) =
+  let n = u32(d.r)
+  if bad(d): return
+  if n != nDefined:
+    dfail(d, "function and code section have inconsistent lengths")
+    return
+  var i = 0
+  while i < n and not bad(d):
+    codeBody(d, d.m.nImpFuncs + i)
+    inc i
+
+proc sectionOrder(id: int): int =
+  case id
+  of 1: 1
+  of 2: 2
+  of 3: 3
+  of 4: 4
+  of 5: 5
+  of 13: 6
+  of 6: 7
+  of 7: 8
+  of 8: 9
+  of 9: 10
+  of 12: 11
+  of 10: 12
+  of 11: 13
+  else: -1
+
+proc decodeModule*(bytes: string; reg: var TypeReg): WModule =
+  ## Decode and validate a module. `ok` false with `error` set if it is
+  ## malformed or invalid.
+  var d = Dec(r: Rd(b: bytes, p: 0, e: bytes.len, err: ""),
+              m: WModule(ok: false, error: "", types: @[], imports: @[], funcs: @[],
+                         nImpFuncs: 0, nImpTables: 0, nImpMems: 0, nImpGlobals: 0,
+                         nImpTags: 0, tables: @[], tableInit: @[], mems: @[],
+                         globals: @[], globalInit: @[], tags: @[], exports: @[],
+                         start: -1, elems: @[], datas: @[], hasDataCount: false,
+                         code: @[], fcode: @[], brTab: @[], v128: @[], tries: @[],
+                         customNames: @[], customData: @[], declared: @[]),
+              reg: addr reg, localTypes: @[], vals: @[], ctrls: @[], locals: @[],
+              linit: @[], initStack: @[], maxH: 0, nlocals: 0, fnResults: @[],
+              dataCount: 0, usesDataCount: false, inConst: false,
+              constGlobalLimit: 0, refsDeclared: @[])
+  if bytes.len < 4 or bytes.substr(0, 3) != "\x00asm":
+    d.m.error = "magic header not detected"
+    return d.m
+  if bytes.len < 8:
+    d.m.error = "unexpected end"
+    return d.m
+  if bytes.substr(4, 7) != "\x01\x00\x00\x00":
+    d.m.error = "unknown binary version"
+    return d.m
+  d.r.p = 8
+  var last = 0
+  var nDefined = 0
+  var sawFunc = false
+  var sawCode = false
+  var declaredSized = false
+  while d.r.p < bytes.len and not bad(d):
+    let id = byte1(d.r)
+    let size = u32(d.r)
+    if bad(d): break
+    if size > bytes.len - d.r.p:
+      dfail(d, "length out of bounds")
+      break
+    let secEnd = d.r.p + size
+    d.r.e = secEnd
+    if id == 0:
+      let nm = name(d.r)
+      if bad(d): break
+      d.m.customNames.add nm
+      d.m.customData.add bytes.substr(d.r.p, secEnd - 1)
+      d.r.p = secEnd
+      d.r.e = bytes.len
+      continue
+    let ord = sectionOrder(id)
+    if ord < 0:
+      dfail(d, "malformed section id")
+      break
+    if ord <= last:
+      dfail(d, "unexpected content after last section")
+      break
+    last = ord
+    # functions must be declarable by index before the code section is read
+    if ord >= 3 and d.m.declared.len != d.m.funcs.len and id != 3:
+      discard
+    case id
+    of 1: typeSection(d)
+    of 2: importSection(d)
+    of 3:
+      funcSection(d, nDefined)
+      sawFunc = true
+    of 4, 5, 13, 6, 7, 8, 9, 12, 10, 11:
+      # from here on functions may be referenced
+      while d.m.declared.len < d.m.funcs.len: d.m.declared.add false
+      case id
+      of 4: tableSection(d)
+      of 5: memorySection(d)
+      of 13: tagSection(d)
+      of 6: globalSection(d)
+      of 7: exportSection(d)
+      of 8:
+        let s = u32(d.r)
+        if not bad(d):
+          if not checkFuncIdx(d, s): discard
+          else:
+            let t = funcTypeOf(d, cp(d.m.funcs[s]))
+            if not bad(d) and (t.params.len != 0 or t.results.len != 0):
+              dfail(d, "start function must have type [] -> []")
+            d.m.start = s
+      of 9: elemSection(d)
+      of 12:
+        d.dataCount = u32(d.r)
+        d.m.hasDataCount = true
+      of 10:
+        codeSection(d, nDefined)
+        sawCode = true
+      of 11: dataSection(d)
+      else: discard
+    else: discard
+    if bad(d): break
+    if d.r.p != secEnd:
+      dfail(d, "section size mismatch")
+      break
+    d.r.e = bytes.len
+  discard declaredSized
+  if not bad(d):
+    while d.m.declared.len < d.m.funcs.len: d.m.declared.add false
+    if nDefined > 0 and not sawCode:
+      dfail(d, "function and code section have inconsistent lengths")
+    elif d.m.hasDataCount and d.m.datas.len != d.dataCount:
+      dfail(d, "data count and data section have inconsistent lengths")
+  if bad(d):
+    d.m.error = d.r.err
+    d.m.ok = false
+  else:
+    d.m.ok = true
+  result = d.m

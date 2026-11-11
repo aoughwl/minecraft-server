@@ -1,0 +1,177 @@
+## Core WebAssembly runtime for plugins: a thin host layer over webwasm.aowl (decode, validate)
+## and webwasmrt.aowl (store and interpreter). Replaces wasmtime::Engine / Store / Instance for core modules.
+## One `WasmVm` is one store, which is one plugin (upstream: one wasmtime Store per plugin).
+##
+## Host functions are closures registered in a process-wide table; a module import resolves by
+## ("module", "name") against `WasmVm.hostFns`, and the interpreter calls them back with the owning
+## vm so they can read and write linear memory through `memRead` / `memWrite`.
+
+import webwasm, webwasmrt
+
+export webwasm, webwasmrt
+
+type
+  HostProc* = proc (vm: WasmVm; args: seq[WSlot]; results: var seq[WSlot]): int {.closure.}
+    ## returns wsOk, or wsTrap after setting vm.s.trapMsg
+
+  HostEntry* = ref object
+    fn*: HostProc
+
+  HostBinding* = object
+    module*: string
+    name*: string
+    entry*: HostEntry
+
+  WasmVm* = ref object
+    s*: WStore
+    bank*: seq[seq[int]]
+    mods*: seq[int]          ## module ids loaded into the store
+    insts*: seq[int]         ## instance ids
+    hostFns*: seq[HostBinding]
+    lastError*: string
+
+var gHostTable: seq[HostEntry] = @[]
+var gVmTable: seq[WasmVm] = @[]
+
+proc hostHook(ctx: nil pointer; s: var WStore; bank: var seq[seq[int]]; host: int;
+              args: seq[WSlot]; results: var seq[WSlot]): int {.nimcall.} =
+  # `host` packs the owning vm's index (high bits) and the host table index (low 24 bits).
+  let vmIdx = host shr 24
+  let hIdx = host and 0xFFFFFF
+  result = gHostTable[hIdx].fn(gVmTable[vmIdx], args, results)
+
+proc newWasmVm*(): WasmVm =
+  result = WasmVm(s: newWStore(), bank: @[], mods: @[], insts: @[], hostFns: @[], lastError: "")
+  result.s.hostCall = hostHook
+  gVmTable.add result
+
+proc vmIndex(vm: WasmVm): int =
+  var i = 0
+  while i < gVmTable.len:
+    if gVmTable[i] == vm: return i
+    inc i
+  result = -1
+
+proc defineHost*(vm: WasmVm; module, name: string; fn: HostProc) =
+  let e = HostEntry(fn: fn)
+  gHostTable.add e
+  vm.hostFns.add HostBinding(module: module, name: name, entry: e)
+
+proc defineAnonHost*(vm: WasmVm; canon: int; fn: HostProc): int =
+  ## A host function for a module import whose type is `canon`; returns its store function address.
+  let e = HostEntry(fn: fn)
+  gHostTable.add e
+  result = wAllocHostFunc(vm.s, canon, (vmIndex(vm) shl 24) or (gHostTable.len - 1))
+
+proc hostIndexOf(e: HostEntry): int =
+  var i = 0
+  while i < gHostTable.len:
+    if gHostTable[i] == e: return i
+    inc i
+  result = -1
+
+proc loadModule*(vm: WasmVm; bytes: string): int =
+  ## Module id, or -1 with vm.lastError set.
+  let m = decodeModule(bytes, vm.s.reg)
+  if not m.ok:
+    vm.lastError = m.error
+    return -1
+  result = wLoadModule(vm.s, m)
+  vm.mods.add result
+
+proc instantiate*(vm: WasmVm; modId: int; inst: var int): int =
+  ## Resolves function imports from defineHost entries. Returns wsOk or a ws* status.
+  let m = vm.s.mods[modId].m
+  var ext: seq[WExternVal] = @[]
+  let vmi = vmIndex(vm)
+  var i = 0
+  while i < m.imports.len:
+    let im = m.imports[i]
+    var ev = WExternVal(kind: im.kind, addr0: -1)
+    if im.kind == ekFunc:
+      var k = 0
+      while k < vm.hostFns.len:
+        if vm.hostFns[k].module == im.module and vm.hostFns[k].name == im.name:
+          let canon = m.types[im.typeIdx]
+          ev.addr0 = wAllocHostFunc(vm.s, canon, (vmi shl 24) or hostIndexOf(vm.hostFns[k].entry))
+          break
+        inc k
+    if ev.addr0 < 0:
+      vm.lastError = "unresolved import " & im.module & "." & im.name
+      return wsTrap
+    var why = ""
+    if not wExternMatches(vm.s, vm.bank, m, im, ev, why):
+      vm.lastError = "import " & im.module & "." & im.name & ": " & why
+      return wsTrap
+    ext.add ev
+    inc i
+  result = wInstantiate(vm.s, vm.bank, modId, ext, inst)
+  if result == wsOk: vm.insts.add inst
+  else: vm.lastError = "instantiate failed: " & vm.s.trapMsg
+
+proc exportFunc*(vm: WasmVm; inst: int; name: string): int =
+  ## store function address, or -1
+  let ex = vm.s.insts[inst].exports
+  var i = 0
+  while i < ex.len:
+    if ex[i].name == name and ex[i].kind == ekFunc:
+      return vm.s.insts[inst].funcs[ex[i].idx]
+    inc i
+  result = -1
+
+proc exportMem*(vm: WasmVm; inst: int; name: string): int =
+  let ex = vm.s.insts[inst].exports
+  var i = 0
+  while i < ex.len:
+    if ex[i].name == name and ex[i].kind == ekMem:
+      return vm.s.insts[inst].mems[ex[i].idx]
+    inc i
+  result = -1
+
+proc call*(vm: WasmVm; f: int; args: seq[WSlot]; results: var seq[WSlot]): int =
+  vm.s.trapMsg = ""
+  result = wInvoke(vm.s, vm.bank, f, args, results)
+
+proc i32*(v: int32): WSlot = WSlot(lo: uint64(uint32(v)), hi: 0'u64)
+proc i64*(v: int64): WSlot = WSlot(lo: uint64(v), hi: 0'u64)
+proc asI32*(x: WSlot): int32 = int32(uint32(x.lo and 0xFFFFFFFF'u64))
+proc asI64*(x: WSlot): int64 = int64(x.lo)
+
+# ---- linear memory access ------------------------------------------------------------------
+
+proc memSize*(vm: WasmVm; m: int): int = wMemBytes(vm.s, vm.bank, m)
+
+proc memByte*(vm: WasmVm; m: int; i: int): int =
+  if vm.s.mems[m].row >= 0: vm.bank[vm.s.mems[m].row][i] else: int(vm.s.mems[m].data[i])
+
+proc setMemByte*(vm: WasmVm; m: int; i: int; v: int) =
+  if vm.s.mems[m].row >= 0: vm.bank[vm.s.mems[m].row][i] = v and 0xFF
+  else: vm.s.mems[m].data[i] = uint8(v and 0xFF)
+
+proc memRead*(vm: WasmVm; m: int; ptr0, n: int; ok: var bool): string =
+  ## n bytes at ptr0, or "" with ok false when out of bounds.
+  ok = ptr0 >= 0 and n >= 0 and ptr0 + n <= memSize(vm, m)
+  result = ""
+  if not ok: return
+  var i = 0
+  while i < n:
+    result.add char(memByte(vm, m, ptr0 + i))
+    inc i
+
+proc memWrite*(vm: WasmVm; m: int; ptr0: int; data: string): bool =
+  if ptr0 < 0 or ptr0 + data.len > memSize(vm, m): return false
+  var i = 0
+  while i < data.len:
+    setMemByte(vm, m, ptr0 + i, int(data[i]))
+    inc i
+  result = true
+
+proc memU32*(vm: WasmVm; m: int; p: int): uint32 =
+  result = uint32(memByte(vm, m, p)) or (uint32(memByte(vm, m, p + 1)) shl 8) or
+    (uint32(memByte(vm, m, p + 2)) shl 16) or (uint32(memByte(vm, m, p + 3)) shl 24)
+
+proc setMemU32*(vm: WasmVm; m: int; p: int; v: uint32) =
+  var i = 0
+  while i < 4:
+    setMemByte(vm, m, p + i, int((v shr uint32(8 * i)) and 0xFF'u32))
+    inc i

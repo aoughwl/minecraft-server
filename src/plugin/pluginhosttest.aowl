@@ -1,0 +1,277 @@
+## End to end through the plugin host with a component assembled by hand against the shapes of the v0.1 WIT
+## (logging, server, command, event and context interfaces, and the plugin world's on-load / handle-command /
+## handle-event exports). The plugin logs when loaded, registers the command `hello` and an event handler for
+## player-join-event; the test then runs the command through the legacy dispatcher and fires a join event.
+import std/[syncio, assertions, options, os]
+import wasm/[wasmvm, canonabi, component]
+import pluginhost
+import ../command/[fallbackdispatch, cmdsource]
+
+proc leb(n: int): string =
+  result = ""
+  var x = n
+  while true:
+    let b = x and 0x7F
+    x = x shr 7
+    if x == 0:
+      result.add char(b)
+      break
+    result.add char(b or 0x80)
+
+proc nm(s: string): string = leb(s.len) & s
+proc sec(id: int; body: string): string =
+  result = ""
+  result.add char(id)
+  result.add leb(body.len)
+  result.add body
+proc bs(xs: openArray[int]): string =
+  result = ""
+  for x in xs: result.add char(x)
+proc vec(items: openArray[string]): string =
+  result = leb(items.len)
+  for it in items: result.add it
+proc names(xs: openArray[string]): string =
+  result = leb(xs.len)
+  for x in xs: result.add nm(x)
+const hdr = "\0asm\x01\0\0\0"
+
+# core function signatures of the five lowered host functions: (params, results)
+const hostParams = [3, 4, 2, 4, 5]
+const hostResults = [0, 1, 0, 0, 0]
+
+proc coreType(np, nr: int): string =
+  result = bs([0x60, np])
+  for i in 0 ..< np: result.add char(0x7f)
+  result.add char(nr)
+  if nr == 1: result.add char(0x7f)
+
+proc shimModule(): string =
+  var types: seq[string] = @[]
+  var funcs: seq[string] = @[]
+  var codes: seq[string] = @[]
+  var exps: seq[string] = @[]
+  for i in 0 ..< 5:
+    types.add coreType(hostParams[i], hostResults[i])
+    funcs.add bs([i])
+    var body = bs([0x00])
+    for k in 0 ..< hostParams[i]: body.add bs([0x20, k])
+    body.add bs([0x41, i, 0x11, i, 0x00, 0x0b])
+    codes.add leb(body.len) & body
+    exps.add nm($i) & bs([0, i])
+  exps.add nm("$imports") & bs([1, 0])
+  result = hdr & sec(1, vec(types)) & sec(3, vec(funcs)) & sec(4, vec([bs([0x70, 0, 5])])) &
+    sec(7, vec(exps)) & sec(10, vec(codes))
+
+proc fixupModule(): string =
+  var types: seq[string] = @[]
+  var imps: seq[string] = @[]
+  for i in 0 ..< 5:
+    types.add coreType(hostParams[i], hostResults[i])
+    imps.add nm("") & nm($i) & bs([0, i])
+  imps.add nm("") & nm("$imports") & bs([1, 0x70, 0, 5])
+  result = hdr & sec(1, vec(types)) & sec(2, vec(imps)) &
+    sec(9, vec([bs([0, 0x41, 0, 0x0b, 5, 0, 1, 2, 3, 4])]))
+
+proc mainModule(): string =
+  let t0 = coreType(3, 0)       # log
+  let t1 = coreType(4, 1)       # constructor
+  let t2 = coreType(2, 0)       # execute-with-handler-id
+  let t3 = coreType(4, 0)       # register-command
+  let t4 = coreType(5, 0)       # register-event
+  let t5 = bs([0x60, 4, 0x7f, 0x7f, 0x7f, 0x7f, 1, 0x7f])   # cabi_realloc
+  let t6 = coreType(1, 1)       # on_load
+  let t7 = coreType(4, 1)       # handle_command
+  let t8 = coreType(6, 1)       # handle_event
+  let reallocBody = bs([0x01, 0x01, 0x7f,
+    0x23,0x00,0x20,0x02,0x6a,0x41,0x01,0x6b,0x41,0x00,0x20,0x02,0x6b,0x71,0x21,0x04,
+    0x20,0x04,0x20,0x03,0x6a,0x24,0x00, 0x20,0x04,0x0b])
+  proc sl(n: int): string =
+    result = ""
+    var x = n
+    while true:
+      let b = x and 0x7F
+      x = x shr 7
+      if x == 0 and (b and 0x40) == 0:
+        result.add char(b)
+        break
+      result.add char(b or 0x80)
+  proc ic(n: int): string = bs([0x41]) & sl(n)           # i32.const n
+  proc lg(i: int): string = bs([0x20, i])                 # local.get i
+  proc cl(i: int): string = bs([0x10, i])                 # call i
+  proc st(addr0: int; v: string): string = ic(addr0) & v & bs([0x36, 2, 0])   # i32.store [addr0] = v
+  # on_load(ctx): log, build and register the command, register the join handler, return the result area at 256
+  let onLoad = bs([0x01, 0x01, 0x7f]) &
+    ic(2) & ic(96) & ic(13) & cl(0) &                                  # log(info, "plugin loaded")
+    ic(32) & ic(1) & ic(48) & ic(12) & cl(1) & bs([0x21, 1]) &         # cmd = command(["hello"], "demo command")
+    lg(1) & ic(7) & cl(2) &                                            # cmd.execute-with-handler-id(7)
+    lg(0) & ic(3) & ic(0) & ic(2) & ic(0) & cl(4) &                    # ctx.register-event(3, player-join, normal, false)
+    lg(0) & lg(1) & ic(64) & ic(18) & cl(3) &                          # ctx.register-command(cmd, "demo:command.hello")
+    st(256, ic(0)) & ic(256) & bs([0x0b])
+  let handleCommand = bs([0x00]) &
+    ic(2) & ic(112) & ic(11) & cl(0) &                                 # log(info, "command ran")
+    st(288, ic(0)) & st(292, ic(1)) & ic(288) & bs([0x0b])
+  let handleEvent = bs([0x00]) &
+    ic(2) & ic(128) & ic(13) & cl(0) &                                 # log(info, "player joined")
+    st(320, lg(2)) & st(324, lg(3)) & st(328, lg(4)) & st(332, lg(5)) & ic(320) & bs([0x0b])
+  proc seg(addr0: int; data: string): string =
+    bs([0x00, 0x41]) & leb(addr0) & bs([0x0b]) & leb(data.len) & data
+  # leb of a positive int in `i32.const` form needs sleb: addresses below 64 are the same, larger ones need the sign bit clear
+  proc sseg(addr0: int; data: string): string =
+    var o = ""
+    var x = addr0
+    while true:
+      let b = x and 0x7F
+      x = x shr 7
+      if (x == 0 and (b and 0x40) == 0):
+        o.add char(b)
+        break
+      o.add char(b or 0x80)
+    bs([0x00, 0x41]) & o & bs([0x0b]) & leb(data.len) & data
+  let listElem = bs([16, 0, 0, 0, 5, 0, 0, 0])
+  result = hdr &
+    sec(1, vec([t0, t1, t2, t3, t4, t5, t6, t7, t8])) &
+    sec(2, vec([nm("host") & nm("0") & bs([0, 0]), nm("host") & nm("1") & bs([0, 1]), nm("host") & nm("2") & bs([0, 2]),
+                nm("host") & nm("3") & bs([0, 3]), nm("host") & nm("4") & bs([0, 4])])) &
+    sec(3, vec([bs([5]), bs([6]), bs([7]), bs([8])])) &
+    sec(5, vec([bs([0, 1])])) &
+    sec(6, vec([bs([0x7f, 1, 0x41, 0x80, 0x08, 0x0b])])) &
+    sec(7, vec([nm("memory") & bs([2, 0]), nm("cabi_realloc") & bs([0, 5]), nm("on_load") & bs([0, 6]),
+                nm("handle_command") & bs([0, 7]), nm("handle_event") & bs([0, 8])])) &
+    sec(10, vec([leb(reallocBody.len) & reallocBody, leb(onLoad.len) & onLoad, leb(handleCommand.len) & handleCommand,
+                 leb(handleEvent.len) & handleEvent])) &
+    sec(11, vec([sseg(16, "hello"), sseg(32, listElem), sseg(48, "demo command"), sseg(64, "demo:command.hello"),
+                 sseg(96, "plugin loaded"), sseg(112, "command ran"), sseg(128, "player joined")]))
+
+proc buildPlugin(): string =
+  # --- instance types ---
+  let i1 = bs([0x42]) & vec([
+    bs([0x01, 0x6d]) & names(["trace", "debug", "info", "warn", "error"]),
+    bs([0x01, 0x40, 2]) & nm("level") & bs([0x00]) & nm("message") & bs([0x73, 1, 0]),
+    bs([0x04, 0x00]) & nm("log") & bs([0x01, 1])])
+  let i2 = bs([0x42]) & vec([bs([0x04, 0x00]) & nm("server") & bs([0x03, 0x01])])
+  let i3 = bs([0x42]) & vec([
+    bs([0x04, 0x00]) & nm("command-sender") & bs([0x03, 0x01]),
+    bs([0x04, 0x00]) & nm("consumed-args") & bs([0x03, 0x01]),
+    bs([0x04, 0x00]) & nm("command") & bs([0x03, 0x01]),
+    bs([0x01, 0x69, 2]), bs([0x01, 0x68, 2]), bs([0x01, 0x70, 0x73]),
+    bs([0x01, 0x40, 2]) & nm("names") & bs([5]) & nm("description") & bs([0x73, 0, 3]),
+    bs([0x01, 0x40, 2]) & nm("self") & bs([4]) & nm("handler-id") & bs([0x79, 1, 0]),
+    bs([0x04, 0x00]) & nm("[constructor]command") & bs([0x01, 6]),
+    bs([0x04, 0x00]) & nm("[method]command.execute-with-handler-id") & bs([0x01, 7])])
+  let i5 = bs([0x42]) & vec([
+    bs([0x04, 0x00]) & nm("player") & bs([0x03, 0x01]),
+    bs([0x04, 0x00]) & nm("text-component") & bs([0x03, 0x01]),
+    bs([0x01, 0x69, 0]), bs([0x01, 0x69, 1]),
+    bs([0x01, 0x72, 3]) & nm("player") & bs([2]) & nm("join-message") & bs([3]) & nm("cancelled") & bs([0x7f]),
+    bs([0x01, 0x6d]) & names(["player-join-event", "player-leave-event"]),
+    bs([0x01, 0x6d]) & names(["highest", "high", "normal", "low", "lowest"]),
+    bs([0x01, 0x71, 2]) & nm("player-join-event") & bs([1, 4, 0]) & nm("player-leave-event") & bs([1, 4, 0]),
+    bs([0x04, 0x00]) & nm("event-type") & bs([0x03, 0x00, 5]),
+    bs([0x04, 0x00]) & nm("event-priority") & bs([0x03, 0x00, 6]),
+    bs([0x04, 0x00]) & nm("event") & bs([0x03, 0x00, 7])])
+  # t0 logging, t1 server, t2 command, t3 event; then aliases t4..t12
+  let i4 = bs([0x42]) & vec([
+    bs([0x02, 0x03, 0x02, 1, 7]), bs([0x02, 0x03, 0x02, 1, 10]), bs([0x02, 0x03, 0x02, 1, 11]),
+    bs([0x01, 0x69, 0]),
+    bs([0x04, 0x00]) & nm("context") & bs([0x03, 0x01]),
+    bs([0x01, 0x68, 4]),
+    bs([0x01, 0x40, 3]) & nm("self") & bs([5]) & nm("command") & bs([3]) & nm("permission") & bs([0x73, 1, 0]),
+    bs([0x01, 0x40, 5]) & nm("self") & bs([5]) & nm("handler-id") & bs([0x79]) & nm("event-type") & bs([1]) &
+      nm("event-priority") & bs([2]) & nm("blocking") & bs([0x7f, 1, 0]),
+    bs([0x04, 0x00]) & nm("[method]context.register-command") & bs([0x01, 6]),
+    bs([0x04, 0x00]) & nm("[method]context.register-event") & bs([0x01, 7])])
+  let opts = vec([bs([0x03, 0]), bs([0x04, 0])])
+  let ver = "@0.1.0"
+  result = "\0asm\x0d\0\x01\0" &
+    sec(7, vec([i1, i2, i3, i5])) &
+    sec(10, vec([bs([0x00]) & nm("pumpkin:plugin/logging" & ver) & bs([0x05, 0]),
+                 bs([0x00]) & nm("pumpkin:plugin/server" & ver) & bs([0x05, 1]),
+                 bs([0x00]) & nm("pumpkin:plugin/command" & ver) & bs([0x05, 2]),
+                 bs([0x00]) & nm("pumpkin:plugin/event" & ver) & bs([0x05, 3])])) &
+    sec(6, vec([bs([0x01, 0x00, 0]) & nm("log"),
+                bs([0x03, 0x00, 1]) & nm("server"),
+                bs([0x03, 0x00, 2]) & nm("command-sender"), bs([0x03, 0x00, 2]) & nm("consumed-args"), bs([0x03, 0x00, 2]) & nm("command"),
+                bs([0x03, 0x00, 3]) & nm("player"), bs([0x03, 0x00, 3]) & nm("text-component"),
+                bs([0x03, 0x00, 3]) & nm("event-type"), bs([0x03, 0x00, 3]) & nm("event-priority"), bs([0x03, 0x00, 3]) & nm("event"),
+                bs([0x01, 0x00, 2]) & nm("[constructor]command"),
+                bs([0x01, 0x00, 2]) & nm("[method]command.execute-with-handler-id")])) &
+    sec(7, vec([i4])) &
+    sec(10, vec([bs([0x00]) & nm("pumpkin:plugin/context" & ver) & bs([0x05, 13])])) &
+    sec(6, vec([bs([0x03, 0x00, 4]) & nm("context"),
+                bs([0x01, 0x00, 4]) & nm("[method]context.register-command"),
+                bs([0x01, 0x00, 4]) & nm("[method]context.register-event")])) &
+    sec(7, vec([bs([0x69, 14]), bs([0x69, 5]), bs([0x69, 6]), bs([0x68, 4]),
+                bs([0x6a, 0x00, 0x01, 0x73]),
+                bs([0x40, 1]) & nm("context") & bs([15, 0, 19]),
+                bs([0x6a, 0x01, 0x7a, 0x01, 0x73]),
+                bs([0x40, 4]) & nm("command-id") & bs([0x79]) & nm("sender") & bs([16]) & nm("server") & bs([18]) & nm("args") & bs([17]) & bs([0, 21]),
+                bs([0x40, 3]) & nm("event-id") & bs([0x79]) & nm("server") & bs([18]) & nm("event") & bs([12]) & bs([0, 12])])) &
+    sec(1, shimModule()) & sec(1, mainModule()) & sec(1, fixupModule()) &
+    sec(2, vec([bs([0x00, 0]) & vec([]),
+                bs([0x00, 1]) & vec([nm("host") & bs([0x12, 0])])])) &
+    sec(6, vec([bs([0x00, 0x02, 0x01, 1]) & nm("memory"),
+                bs([0x00, 0x00, 0x01, 1]) & nm("cabi_realloc"),
+                bs([0x00, 0x00, 0x01, 1]) & nm("on_load"),
+                bs([0x00, 0x00, 0x01, 1]) & nm("handle_command"),
+                bs([0x00, 0x00, 0x01, 1]) & nm("handle_event"),
+                bs([0x00, 0x01, 0x01, 0]) & nm("$imports")])) &
+    sec(8, vec([bs([0x01, 0x00, 0]) & opts, bs([0x01, 0x00, 1]) & opts, bs([0x01, 0x00, 2]) & opts,
+                bs([0x01, 0x00, 3]) & opts, bs([0x01, 0x00, 4]) & opts,
+                bs([0x00, 0x00, 1]) & opts & bs([20]),
+                bs([0x00, 0x00, 2]) & opts & bs([22]),
+                bs([0x00, 0x00, 3]) & opts & bs([23])])) &
+    sec(2, vec([bs([0x01]) & vec([nm("0") & bs([0x00, 4]), nm("1") & bs([0x00, 5]), nm("2") & bs([0x00, 6]),
+                                  nm("3") & bs([0x00, 7]), nm("4") & bs([0x00, 8]), nm("$imports") & bs([0x01, 0])]),
+                bs([0x00, 2]) & vec([nm("") & bs([0x12, 2])])])) &
+    sec(11, vec([bs([0x00]) & nm("on-load") & bs([0x01, 5, 0]),
+                 bs([0x00]) & nm("handle-command") & bs([0x01, 6, 0]),
+                 bs([0x00]) & nm("handle-event") & bs([0x01, 7, 0])]))
+
+var lines: seq[string] = @[]
+var trees: seq[CommandTree] = @[]
+var perms: seq[string] = @[]
+
+proc ck(ok: bool; msg: string) =
+  if not ok:
+    echo "FAILED ", msg
+    for l in lines: echo "  line: ", l
+    quit 1
+
+proc main() =
+  if paramCount() >= 2 and paramStr(1) == "--write":
+    try:
+      writeFile(paramStr(2), buildPlugin())
+    except:
+      echo "write failed"
+    echo "wrote ", paramStr(2)
+    return
+  let host = newPluginHost("plugins/data")
+  host.logLine = proc (line: string) {.closure.} = lines.add line
+  host.registerTree = proc (tree: CommandTree; permission: string) {.closure.} =
+    trees.add tree
+    perms.add permission
+  let err = loadPlugin(host, "demo", buildPlugin())
+  if err.len > 0:
+    echo "load failed: ", err
+    quit 1
+  ck(host.activeCount() == 1, "check 1 at 'host.activeCount() == 1'")
+  ck(lines.len == 1 and lines[0] == "[demo] INFO: plugin loaded", "check 2 at 'lines.len == 1 and lines[0] == \"[demo] INFO: plug'")
+  ck(trees.len == 1 and perms[0] == "demo:command.hello", "check 3 at 'trees.len == 1 and perms[0] == \"demo:command.hell'")
+  ck(trees[0].names == @["hello"] and trees[0].description == "demo command", "check 4 at 'trees[0].names == @[\"hello\"] and trees[0].descri'")
+  # run the command through the legacy dispatcher
+  let d = newFallbackDispatcher()
+  register(d, trees[0], perms[0])
+  let r = dispatch(d, senderConsole(), nil, "hello")
+  ck(r.isOk, "check 5 at 'r.isOk'")
+  ck(lines.len == 2 and lines[1] == "[demo] INFO: command ran", "check 6 at 'lines.len == 2 and lines[1] == \"[demo] INFO: comm'")
+  # fire the join event the plugin registered for
+  let o = fireEvent(host, "player-join-event", @["player", "join-message", "cancelled"], @[vInt(5), vInt(0), vBool(false)])
+  ck(o.handled == 1 and not o.cancelled, "check 7 at 'o.handled == 1 and not o.cancelled'")
+  ck(lines.len == 3 and lines[2] == "[demo] INFO: player joined", "check 8 at 'lines.len == 3 and lines[2] == \"[demo] INFO: play'")
+  # an event nobody registered for runs nothing
+  let o2 = fireEvent(host, "player-leave-event", @["player"], @[vInt(5)])
+  ck(o2.handled == 0, "check 9 at 'o2.handled == 0'")
+  ck(unloadPlugin(host, 0).len == 0 and host.activeCount() == 0, "check 10 at 'unloadPlugin(host, 0).len == 0 and host.activeCoun'")
+  echo "pluginhosttest ok"
+
+main()

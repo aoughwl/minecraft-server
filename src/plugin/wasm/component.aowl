@@ -1,0 +1,844 @@
+## Component model: decoder, linker and call layer. Replaces `wasmtime::component::{Component, Linker,
+## Instance}`. A component binary (layer 1, version 0x0d) is read section by section while its index spaces are
+## filled in, which instantiates it as it goes: core modules go to the `WasmVm`, core instances are linked from
+## earlier ones, `canon lower` turns a component function (here always a host function from the registry) into a
+## core function that lifts its arguments with the canonical ABI and calls the host, `canon lift` turns a core
+## function into an exported component function that `callExport` drives.
+##
+## PARTIAL: nested components (section 4) and component-in-component instantiation; async/stream/future canon
+## built-ins; resource.new/rep (resources defined by the guest); latin1 strings; start sections.
+
+import wasmvm, canonabi
+
+type
+  HostFn* = proc (ci: CompInst; args: seq[CVal]; results: var seq[CVal]): string {.closure.}
+    ## "" on success, otherwise the trap message
+
+  HostFnBox* = ref object
+    fn*: HostFn
+
+  HostRegistry* = ref object
+    keys*: seq[string]       ## "pumpkin:plugin/logging#log" (version suffix stripped)
+    fns*: seq[HostFnBox]
+    dropHooks*: seq[string]  ## resource names ("iface/res") the host wants drop callbacks for
+
+  FuncSig* = object
+    pnames*: seq[string]
+    params*: seq[CmType]
+    results*: seq[CmType]
+
+  # entries of the component type index space
+  TypeEntry* = object
+    kind*: int               ## 0 value type, 1 function type, 2 instance type, 3 other
+    val*: CmType
+    idx*: int                ## sig or instance-type arena index
+
+  InstTypeDesc* = object
+    names*: seq[string]
+    kinds*: seq[int]         ## 0 func, 1 type, 2 instance
+    sigs*: seq[int]
+    vals*: seq[CmType]
+    insts*: seq[int]
+
+  CompFunc* = object
+    sig*: int
+    isHost*: bool
+    key*: string             ## host function key
+    coreFunc*: int           ## lifted: store function address
+    mem*: int
+    realloc*: int
+    postReturn*: int
+    utf16*: bool
+
+  CoreFunc* = object
+    kind*: int               ## 0 real store function, 1 lowered host function, 2 resource.drop
+    addr0*: int
+    cf*: int                 ## lowered: component function index
+    mem*: int
+    realloc*: int
+    utf16*: bool
+    resId*: int
+
+  CoreItem* = object
+    name*: string
+    kind*: int               ## ekFunc.. 
+    idx*: int                ## raw: the store address; otherwise a function's index in coreFuncs (other kinds always store addresses)
+    raw*: bool
+
+  CoreInst* = object
+    isReal*: bool
+    inst*: int
+    items*: seq[CoreItem]
+
+  InstObj* = object
+    names*: seq[string]
+    kinds*: seq[int]         ## 1 func, 3 type, 5 instance
+    idxs*: seq[int]
+    itype*: int              ## imported instance: its instance type (exports resolve lazily on alias); else -1
+    key*: string             ## imported instance: host key prefix (version stripped)
+
+  CompInst* = ref object
+    vm*: WasmVm
+    reg*: HostRegistry
+    handles*: HandleTables
+    user*: int               ## the host's plugin id
+    curFn*: int              ## component function index of the host call in progress
+    err*: string
+    sigs*: seq[FuncSig]
+    itypes*: seq[InstTypeDesc]
+    types*: seq[TypeEntry]
+    funcs*: seq[CompFunc]
+    insts*: seq[InstObj]
+    coreMods*: seq[int]
+    coreInsts*: seq[CoreInst]
+    coreFuncs*: seq[CoreFunc]
+    coreMems*: seq[int]
+    coreTables*: seq[int]
+    coreGlobals*: seq[int]
+    exportNames*: seq[string]
+    exportKinds*: seq[int]
+    exportIdx*: seq[int]
+    unresolved*: seq[string]   ## host function keys the plugin imports that the registry lacks
+
+  Rd = object
+    b: string
+    p: int
+    e: int
+
+# ---- registry --------------------------------------------------------------------------------
+
+proc newHostRegistry*(): HostRegistry = HostRegistry(keys: @[], fns: @[], dropHooks: @[])
+
+proc stripVersion*(name: string): string =
+  var i = name.len - 1
+  while i >= 0 and name[i] != '@':
+    if name[i] == '/' or name[i] == '#': return name
+    dec i
+  if i < 0: return name
+  result = name[0 ..< i]
+
+proc defineHostFn*(r: HostRegistry; iface, fname: string; fn: HostFn) =
+  r.keys.add iface & "#" & fname
+  r.fns.add HostFnBox(fn: fn)
+
+proc findHostFn(r: HostRegistry; key: string): int =
+  var i = 0
+  while i < r.keys.len:
+    if r.keys[i] == key: return i
+    inc i
+  result = -1
+
+# ---- reader ----------------------------------------------------------------------------------
+
+proc rdByte(r: var Rd): int =
+  if r.p >= r.e: return 0
+  result = int(r.b[r.p])
+  inc r.p
+
+proc rdU32(r: var Rd): int =
+  var res = 0
+  var shift = 0
+  while true:
+    let b = rdByte(r)
+    res = res or ((b and 0x7F) shl shift)
+    if (b and 0x80) == 0 or r.p >= r.e: break
+    shift += 7
+  result = res
+
+proc rdS33(r: var Rd): int =
+  var res = 0
+  var shift = 0
+  var b = 0
+  while true:
+    b = rdByte(r)
+    res = res or ((b and 0x7F) shl shift)
+    shift += 7
+    if (b and 0x80) == 0 or r.p >= r.e: break
+  if shift < 40 and (b and 0x40) != 0: res = res or (-1 shl shift)
+  result = res
+
+proc rdName(r: var Rd): string =
+  let n = rdU32(r)
+  result = ""
+  if r.p + n > r.e: return
+  result = r.b[r.p ..< r.p + n]
+  r.p += n
+
+proc rdExportName(r: var Rd): string =
+  ## importname / exportname: 0x00 name, or 0x01 name version
+  let tag = rdByte(r)
+  result = rdName(r)
+  if tag == 1: discard rdName(r)
+
+# ---- types -----------------------------------------------------------------------------------
+
+proc fail(ci: CompInst; msg: string) =
+  if ci.err.len == 0: ci.err = msg
+
+proc primType(b: int): CmType =
+  case b
+  of 0x7f: newScalar(ckBool)
+  of 0x7e: newScalar(ckS8)
+  of 0x7d: newScalar(ckU8)
+  of 0x7c: newScalar(ckS16)
+  of 0x7b: newScalar(ckU16)
+  of 0x7a: newScalar(ckS32)
+  of 0x79: newScalar(ckU32)
+  of 0x78: newScalar(ckS64)
+  of 0x77: newScalar(ckU64)
+  of 0x76: newScalar(ckF32)
+  of 0x75: newScalar(ckF64)
+  of 0x74: newScalar(ckChar)
+  of 0x73: newScalar(ckString)
+  else: NoT
+
+proc readValType(ci: CompInst; r: var Rd; scope: seq[TypeEntry]): CmType =
+  let save = r.p
+  let b = rdByte(r)
+  let p = primType(b)
+  if not isNone(p): return p
+  r.p = save
+  let idx = rdS33(r)
+  if idx < 0 or idx >= scope.len or scope[idx].kind != 0:
+    fail(ci, "bad value type index")
+    return NoT
+  result = scope[idx].val
+
+proc readOptValType(ci: CompInst; r: var Rd; scope: seq[TypeEntry]): CmType =
+  if rdByte(r) == 0: return NoT
+  result = readValType(ci, r, scope)
+
+proc readFuncSig(ci: CompInst; r: var Rd; scope: seq[TypeEntry]): FuncSig =
+  result = FuncSig(pnames: @[], params: @[], results: @[])
+  let np = rdU32(r)
+  var i = 0
+  while i < np:
+    result.pnames.add rdName(r)
+    result.params.add readValType(ci, r, scope)
+    inc i
+  let tag = rdByte(r)
+  if tag == 0: result.results.add readValType(ci, r, scope)
+  else:
+    let nr = rdU32(r)
+    i = 0
+    while i < nr:
+      discard rdName(r)
+      result.results.add readValType(ci, r, scope)
+      inc i
+
+proc readInstanceType(ci: CompInst; r: var Rd; parent: seq[TypeEntry]): InstTypeDesc
+
+proc readDefType(ci: CompInst; r: var Rd; scope: var seq[TypeEntry]) =
+  ## one entry of a type section, appended to `scope`
+  let tag = rdByte(r)
+  case tag
+  of 0x72:
+    let t = CmType(kind: ckRecord, names: @[], types: @[])
+    let n = rdU32(r)
+    var i = 0
+    while i < n:
+      t.names.add rdName(r)
+      t.types.add readValType(ci, r, scope)
+      inc i
+    scope.add TypeEntry(kind: 0, val: t, idx: 0)
+  of 0x71:
+    let t = CmType(kind: ckVariant, names: @[], types: @[])
+    let n = rdU32(r)
+    var i = 0
+    while i < n:
+      t.names.add rdName(r)
+      t.types.add readOptValType(ci, r, scope)
+      if rdByte(r) == 1: discard rdU32(r)
+      inc i
+    scope.add TypeEntry(kind: 0, val: t, idx: 0)
+  of 0x70:
+    scope.add TypeEntry(kind: 0, val: CmType(kind: ckList, names: @[], types: @[readValType(ci, r, scope)]), idx: 0)
+  of 0x6f:
+    let t = CmType(kind: ckTuple, names: @[], types: @[])
+    let n = rdU32(r)
+    var i = 0
+    while i < n:
+      t.types.add readValType(ci, r, scope)
+      inc i
+    scope.add TypeEntry(kind: 0, val: t, idx: 0)
+  of 0x6e, 0x6d:
+    let t = CmType(kind: (if tag == 0x6e: ckFlags else: ckEnum), names: @[], types: @[])
+    let n = rdU32(r)
+    var i = 0
+    while i < n:
+      t.names.add rdName(r)
+      inc i
+    scope.add TypeEntry(kind: 0, val: t, idx: 0)
+  of 0x6b:
+    scope.add TypeEntry(kind: 0, val: CmType(kind: ckOption, names: @[], types: @[readValType(ci, r, scope)]), idx: 0)
+  of 0x6a:
+    let ok = readOptValType(ci, r, scope)
+    let er = readOptValType(ci, r, scope)
+    scope.add TypeEntry(kind: 0, val: CmType(kind: ckResult, names: @[], types: @[ok, er]), idx: 0)
+  of 0x69, 0x68:
+    let ti = rdU32(r)
+    if ti >= scope.len or scope[ti].val.kind != ckResource:
+      fail(ci, "own/borrow of a non-resource")
+      scope.add TypeEntry(kind: 3, val: NoT, idx: 0)
+    else:
+      scope.add TypeEntry(kind: 0, val: CmType(kind: (if tag == 0x69: ckOwn else: ckBorrow), names: @[], types: @[scope[ti].val]), idx: 0)
+  of 0x40:
+    ci.sigs.add readFuncSig(ci, r, scope)
+    scope.add TypeEntry(kind: 1, val: NoT, idx: ci.sigs.len - 1)
+  of 0x42:
+    ci.itypes.add readInstanceType(ci, r, scope)
+    scope.add TypeEntry(kind: 2, val: NoT, idx: ci.itypes.len - 1)
+  of 0x3f:
+    discard rdByte(r)         # rep: i32
+    if rdByte(r) == 1: discard rdU32(r)
+    scope.add TypeEntry(kind: 0, val: newResource(""), idx: 0)
+  else:
+    fail(ci, "unsupported component type form " & wIts(tag))
+    scope.add TypeEntry(kind: 3, val: NoT, idx: 0)
+
+proc readInstanceType(ci: CompInst; r: var Rd; parent: seq[TypeEntry]): InstTypeDesc =
+  result = InstTypeDesc(names: @[], kinds: @[], sigs: @[], vals: @[], insts: @[])
+  var scope: seq[TypeEntry] = @[]
+  let n = rdU32(r)
+  var d = 0
+  while d < n and ci.err.len == 0:
+    let tag = rdByte(r)
+    case tag
+    of 0x01: readDefType(ci, r, scope)
+    of 0x02:
+      # alias: only `outer` type aliases occur inside instance types
+      let sort = rdByte(r)
+      let target = rdByte(r)
+      if sort == 0x03 and target == 0x02:
+        let count = rdU32(r)
+        let idx = rdU32(r)
+        if count == 1 and idx < parent.len: scope.add parent[idx]
+        else: fail(ci, "unsupported outer alias depth")
+      else: fail(ci, "unsupported alias inside an instance type")
+    of 0x04:
+      let name = rdExportName(r)
+      let kind = rdByte(r)
+      case kind
+      of 0x01:
+        let ti = rdU32(r)
+        result.names.add name
+        result.kinds.add 0
+        result.sigs.add (if ti < scope.len: scope[ti].idx else: 0)
+        result.vals.add NoT
+        result.insts.add 0
+      of 0x03:
+        let bound = rdByte(r)
+        let ti = (if bound == 0: rdU32(r) else: 0)
+        if bound == 0:
+          scope.add (if ti < scope.len: scope[ti] else: TypeEntry(kind: 3, val: NoT, idx: 0))
+        else:
+          scope.add TypeEntry(kind: 0, val: newResource(name), idx: 0)
+        result.names.add name
+        result.kinds.add 1
+        result.sigs.add 0
+        result.vals.add scope[scope.len - 1].val
+        result.insts.add 0
+      of 0x05:
+        let ti = rdU32(r)
+        result.names.add name
+        result.kinds.add 2
+        result.sigs.add 0
+        result.vals.add NoT
+        result.insts.add (if ti < scope.len: scope[ti].idx else: 0)
+      else:
+        fail(ci, "unsupported export kind in an instance type")
+    else:
+      fail(ci, "unsupported declaration in an instance type")
+    inc d
+
+# ---- core instance linking -------------------------------------------------------------------
+
+proc coreSortKind(sort: int): int =
+  ## core sort byte -> wasm extern kind or other
+  case sort
+  of 0x00: ekFunc
+  of 0x01: ekTable
+  of 0x02: ekMem
+  of 0x03: ekGlobal
+  else: 100 + sort
+
+proc newCompInst*(vm: WasmVm; reg: HostRegistry; user: int): CompInst =
+  CompInst(vm: vm, reg: reg, handles: newHandleTables(), user: user, curFn: -1, err: "", sigs: @[], itypes: @[], types: @[],
+           funcs: @[], insts: @[], coreMods: @[], coreInsts: @[], coreFuncs: @[], coreMems: @[], coreTables: @[],
+           coreGlobals: @[], exportNames: @[], exportKinds: @[], exportIdx: @[], unresolved: @[])
+
+proc hostCallFor(ci: CompInst; cfIdx: int; args: seq[CVal]; results: var seq[CVal]): string =
+  let key = ci.funcs[cfIdx].key
+  let h = findHostFn(ci.reg, key)
+  if h < 0: return "unimplemented host function " & key
+  result = ci.reg.fns[h].fn(ci, args, results)
+
+proc makeLowered(ci: CompInst; cfIdx: int; mem, realloc: int; utf16: bool): HostProc =
+  result = proc (vm: WasmVm; args: seq[WSlot]; results: var seq[WSlot]): int {.closure.} =
+    let sigIdx = ci.funcs[cfIdx].sig
+    var ctx = CanonCtx(vm: vm, mem: mem, realloc: realloc, utf16: utf16, handles: ci.handles, err: "")
+    let nres = flatResultCount(ci.sigs[sigIdx].results)
+    var flatIn: seq[WSlot] = @[]
+    var retPtr = 0
+    var i = 0
+    let nin = (if nres > MaxFlatResults and args.len > 0: args.len - 1 else: args.len)
+    while i < nin:
+      flatIn.add args[i]
+      inc i
+    if nres > MaxFlatResults and args.len > 0: retPtr = int(args[args.len - 1].lo and 0xFFFFFFFF'u64)
+    let vals = liftArgs(ctx, ci.sigs[sigIdx].params, flatIn)
+    if ctx.err.len > 0:
+      vm.s.trapMsg = ctx.err
+      return wsTrap
+    var outv: seq[CVal] = @[]
+    ci.curFn = cfIdx
+    let e = hostCallFor(ci, cfIdx, vals, outv)
+    if e.len > 0:
+      vm.s.trapMsg = e
+      return wsTrap
+    let lowered = lowerResults(ctx, ci.sigs[sigIdx].results, outv, retPtr)
+    if ctx.err.len > 0:
+      vm.s.trapMsg = ctx.err
+      return wsTrap
+    i = 0
+    while i < lowered.len:
+      results.add lowered[i]
+      inc i
+    result = wsOk
+
+proc makeResDrop(ci: CompInst; resId: int): HostProc =
+  result = proc (vm: WasmVm; args: seq[WSlot]; results: var seq[WSlot]): int {.closure.} =
+    var rep = 0
+    if not dropHandle(ci.handles, resId, int(args[0].lo and 0xFFFFFFFF'u64), rep):
+      vm.s.trapMsg = "resource.drop of an invalid handle"
+      return wsTrap
+    result = wsOk
+
+proc resolveCoreItem(ci: CompInst; it: CoreItem; im: WImport; m: WModule; ev: var WExternVal): bool =
+  ev = WExternVal(kind: im.kind, addr0: -1)
+  case im.kind
+  of ekFunc:
+    if it.kind != ekFunc: return false
+    if it.raw:
+      ev.addr0 = it.idx
+      return true
+    if it.idx >= ci.coreFuncs.len: return false
+    let cf = ci.coreFuncs[it.idx]
+    case cf.kind
+    of 0: ev.addr0 = cf.addr0
+    of 1:
+      let h = makeLowered(ci, cf.cf, cf.mem, cf.realloc, cf.utf16)
+      ev.addr0 = defineAnonHost(ci.vm, m.types[im.typeIdx], h)
+    else:
+      let h = makeResDrop(ci, cf.resId)
+      ev.addr0 = defineAnonHost(ci.vm, m.types[im.typeIdx], h)
+  of ekMem: ev.addr0 = it.idx
+  of ekTable: ev.addr0 = it.idx
+  of ekGlobal: ev.addr0 = it.idx
+  else: return false
+  result = ev.addr0 >= 0
+
+proc instantiateCore(ci: CompInst; modIdx: int; argNames: seq[string]; argInsts: seq[int]): bool =
+  let modId = ci.coreMods[modIdx]
+  let m = ci.vm.s.mods[modId].m
+  var ext: seq[WExternVal] = @[]
+  var i = 0
+  while i < m.imports.len:
+    let im = m.imports[i]
+    var found = false
+    var ev = WExternVal(kind: im.kind, addr0: -1)
+    var a = 0
+    while a < argNames.len and not found:
+      if argNames[a] == im.module:
+        let src = ci.coreInsts[argInsts[a]]
+        var k = 0
+        while k < src.items.len and not found:
+          if src.items[k].name == im.name:
+            found = resolveCoreItem(ci, src.items[k], im, m, ev)
+          inc k
+      inc a
+    if not found:
+      fail(ci, "core import not satisfied: " & im.module & " " & im.name)
+      return false
+    var why = ""
+    if not wExternMatches(ci.vm.s, ci.vm.bank, m, im, ev, why):
+      fail(ci, "core import " & im.module & " " & im.name & ": " & why)
+      return false
+    ext.add ev
+    inc i
+  var inst = -1
+  let st = wInstantiate(ci.vm.s, ci.vm.bank, modId, ext, inst)
+  if st != wsOk:
+    fail(ci, "core instantiate failed: " & ci.vm.s.trapMsg)
+    return false
+  ci.vm.insts.add inst
+  # record the instance's exports as items
+  var ci2 = CoreInst(isReal: true, inst: inst, items: @[])
+  let ex = ci.vm.s.insts[inst].exports
+  var e = 0
+  while e < ex.len:
+    var item = CoreItem(name: ex[e].name, kind: ex[e].kind, idx: 0, raw: true)
+    case ex[e].kind
+    of ekFunc: item.idx = ci.vm.s.insts[inst].funcs[ex[e].idx]
+    of ekMem: item.idx = ci.vm.s.insts[inst].mems[ex[e].idx]
+    of ekTable: item.idx = ci.vm.s.insts[inst].tables[ex[e].idx]
+    of ekGlobal: item.idx = ci.vm.s.insts[inst].globals[ex[e].idx]
+    else: discard
+    ci2.items.add item
+    inc e
+  ci.coreInsts.add ci2
+  result = true
+
+# ---- section walk ----------------------------------------------------------------------------
+
+proc readSortIdx(r: var Rd; sort: var int; core: var bool): int =
+  let s = rdByte(r)
+  if s == 0:
+    core = true
+    sort = rdByte(r)
+  else:
+    core = false
+    sort = s
+  result = rdU32(r)
+
+proc addInstanceImport(ci: CompInst; name: string; itIdx: int) =
+  ## An imported instance. Its exports are not in any index space until an `alias export` names them; the
+  ## instance only remembers its type and the host key prefix. Resource types it defines get their name now.
+  let key0 = stripVersion(name)
+  var i = 0
+  while i < ci.itypes[itIdx].names.len:
+    if ci.itypes[itIdx].kinds[i] == 1 and ci.itypes[itIdx].vals[i].kind == ckResource:
+      ci.itypes[itIdx].vals[i].name = key0 & "/" & ci.itypes[itIdx].names[i]
+    inc i
+  ci.insts.add InstObj(names: @[], kinds: @[], idxs: @[], itype: itIdx, key: key0)
+
+proc aliasInstanceExport(ci: CompInst; ii: int; nm: string; sort: int) =
+  let io = ci.insts[ii]
+  if io.itype < 0:
+    var q = 0
+    while q < io.names.len:
+      if io.names[q] == nm:
+        let idx = io.idxs[q]
+        case sort
+        of 0x01:
+          let fcopy = ci.funcs[idx]
+          ci.funcs.add fcopy
+        of 0x03:
+          let tcopy = ci.types[idx]
+          ci.types.add tcopy
+        of 0x05:
+          let icopy = ci.insts[idx]
+          ci.insts.add icopy
+        else: discard
+        return
+      inc q
+    fail(ci, "alias of a missing export " & nm)
+    return
+  let d = ci.itypes[io.itype]
+  var i = 0
+  while i < d.names.len:
+    if d.names[i] == nm:
+      case sort
+      of 0x01:
+        if d.kinds[i] != 0: fail(ci, "alias kind mismatch for " & nm)
+        else: ci.funcs.add CompFunc(sig: d.sigs[i], isHost: true, key: io.key & "#" & nm, coreFunc: -1, mem: -1, realloc: -1, postReturn: -1, utf16: false)
+      of 0x03:
+        if d.kinds[i] != 1: fail(ci, "alias kind mismatch for " & nm)
+        else: ci.types.add TypeEntry(kind: 0, val: d.vals[i], idx: 0)
+      else: fail(ci, "unsupported alias sort from an imported instance")
+      return
+    inc i
+  fail(ci, "alias of a missing export " & nm & " of " & io.key)
+
+proc canonOpts(ci: CompInst; r: var Rd; mem, realloc, postRet: var int; utf16: var bool) =
+  mem = -1
+  realloc = -1
+  postRet = -1
+  utf16 = false
+  let n = rdU32(r)
+  var i = 0
+  while i < n:
+    let o = rdByte(r)
+    case o
+    of 0x00: utf16 = false
+    of 0x01: utf16 = true
+    of 0x02: fail(ci, "latin1+utf16 string encoding is not implemented")
+    of 0x03:
+      let mi = rdU32(r)
+      mem = (if mi < ci.coreMems.len: ci.coreMems[mi] else: -1)
+    of 0x04:
+      let fi = rdU32(r)
+      realloc = (if fi < ci.coreFuncs.len and ci.coreFuncs[fi].kind == 0: ci.coreFuncs[fi].addr0 else: -1)
+    of 0x05:
+      let fi = rdU32(r)
+      postRet = (if fi < ci.coreFuncs.len and ci.coreFuncs[fi].kind == 0: ci.coreFuncs[fi].addr0 else: -1)
+    of 0x06: fail(ci, "async canon option")
+    of 0x07, 0x08: discard rdU32(r)
+    else: fail(ci, "unknown canon option")
+    inc i
+
+proc instantiateComponent*(ci: CompInst; bytes: string): bool =
+  ## Decodes and instantiates the component. On failure `ci.err` says why.
+  if bytes.len < 8 or bytes[0 ..< 4] != "\0asm" or int(bytes[4]) != 0x0d or int(bytes[6]) != 0x01:
+    fail(ci, "not a component binary")
+    return false
+  var r = Rd(b: bytes, p: 8, e: bytes.len)
+  while r.p < r.e and ci.err.len == 0:
+    let id = rdByte(r)
+    let size = rdU32(r)
+    let secEnd = r.p + size
+    if secEnd > r.e:
+      fail(ci, "section overruns the component")
+      break
+    case id
+    of 0: discard
+    of 1:
+      let mid = ci.vm.loadModule(bytes[r.p ..< secEnd])
+      if mid < 0: fail(ci, "core module: " & ci.vm.lastError)
+      else: ci.coreMods.add mid
+    of 2:
+      let n = rdU32(r)
+      var i = 0
+      while i < n and ci.err.len == 0:
+        let tag = rdByte(r)
+        if tag == 0x00:
+          let mi = rdU32(r)
+          let na = rdU32(r)
+          var an: seq[string] = @[]
+          var ai: seq[int] = @[]
+          var a = 0
+          while a < na:
+            an.add rdName(r)
+            discard rdByte(r)          # 0x12 instance
+            ai.add rdU32(r)
+            inc a
+          if not instantiateCore(ci, mi, an, ai) and ci.err.len == 0: fail(ci, "core instantiate")
+        else:
+          let ne = rdU32(r)
+          var bag = CoreInst(isReal: false, inst: -1, items: @[])
+          var e = 0
+          while e < ne:
+            let nm = rdName(r)
+            let sort = rdByte(r)
+            let idx = rdU32(r)
+            var real = idx
+            if sort == 0x02 and idx < ci.coreMems.len: real = ci.coreMems[idx]
+            elif sort == 0x01 and idx < ci.coreTables.len: real = ci.coreTables[idx]
+            elif sort == 0x03 and idx < ci.coreGlobals.len: real = ci.coreGlobals[idx]
+            bag.items.add CoreItem(name: nm, kind: coreSortKind(sort), idx: real, raw: sort != 0x00)
+            inc e
+          ci.coreInsts.add bag
+        inc i
+    of 3:
+      # core types are not needed by the linker; consume entry by skipping the section
+      discard
+    of 4: fail(ci, "nested components are not implemented")
+    of 5:
+      let n = rdU32(r)
+      var i = 0
+      while i < n and ci.err.len == 0:
+        let tag = rdByte(r)
+        if tag == 0x01:
+          let ne = rdU32(r)
+          var io = InstObj(names: @[], kinds: @[], idxs: @[], itype: -1, key: "")
+          var e = 0
+          while e < ne:
+            let nm = rdName(r)
+            var sort = 0
+            var core = false
+            let idx = readSortIdx(r, sort, core)
+            io.names.add nm
+            io.kinds.add sort
+            io.idxs.add idx
+            inc e
+          ci.insts.add io
+        else: fail(ci, "component instantiation is not implemented")
+        inc i
+    of 6:
+      let n = rdU32(r)
+      var i = 0
+      while i < n and ci.err.len == 0:
+        var sort = 0
+        var core = false
+        let s0 = rdByte(r)
+        if s0 == 0:
+          core = true
+          sort = rdByte(r)
+        else: sort = s0
+        let target = rdByte(r)
+        if target == 0x00 or target == 0x01:
+          let ii = rdU32(r)
+          let nm = rdName(r)
+          if target == 0x01:
+            # core instance export
+            if ii >= ci.coreInsts.len:
+              fail(ci, "alias of an unknown core instance")
+            else:
+              var k = 0
+              var found = false
+              while k < ci.coreInsts[ii].items.len:
+                if ci.coreInsts[ii].items[k].name == nm:
+                  found = true
+                  let it = ci.coreInsts[ii].items[k]
+                  case sort
+                  of 0x00:
+                    if it.raw: ci.coreFuncs.add CoreFunc(kind: 0, addr0: it.idx, cf: 0, mem: 0, realloc: 0, utf16: false, resId: 0)
+                    elif it.idx < ci.coreFuncs.len:
+                      let ccopy = ci.coreFuncs[it.idx]
+                      ci.coreFuncs.add ccopy
+                    else: fail(ci, "alias of a bad core function")
+                  of 0x01: ci.coreTables.add it.idx
+                  of 0x02: ci.coreMems.add it.idx
+                  of 0x03: ci.coreGlobals.add it.idx
+                  else: discard
+                  break
+                inc k
+              if not found: fail(ci, "alias of a missing core export " & nm)
+          else:
+            if ii >= ci.insts.len: fail(ci, "alias of an unknown instance")
+            else: aliasInstanceExport(ci, ii, nm, sort)
+        else:
+          # outer alias: inside the top-level component there is no enclosing scope
+          discard rdU32(r)
+          discard rdU32(r)
+          fail(ci, "outer alias at top level")
+        inc i
+    of 7:
+      let n = rdU32(r)
+      var i = 0
+      while i < n and ci.err.len == 0:
+        var sc = ci.types
+        readDefType(ci, r, sc)
+        ci.types = sc
+        inc i
+    of 8:
+      let n = rdU32(r)
+      var i = 0
+      while i < n and ci.err.len == 0:
+        let a = rdByte(r)
+        let b = rdByte(r)
+        if a == 0x00 and b == 0x00:
+          let fi = rdU32(r)
+          var mem = -1
+          var realloc = -1
+          var postRet = -1
+          var u16 = false
+          canonOpts(ci, r, mem, realloc, postRet, u16)
+          let ti = rdU32(r)
+          if fi >= ci.coreFuncs.len or ti >= ci.types.len or ci.types[ti].kind != 1:
+            fail(ci, "canon lift refers to a missing function or type")
+          else:
+            ci.funcs.add CompFunc(sig: ci.types[ti].idx, isHost: false, key: "", coreFunc: ci.coreFuncs[fi].addr0,
+                                  mem: mem, realloc: realloc, postReturn: postRet, utf16: u16)
+        elif a == 0x01 and b == 0x00:
+          let fi = rdU32(r)
+          var mem = -1
+          var realloc = -1
+          var postRet = -1
+          var u16 = false
+          canonOpts(ci, r, mem, realloc, postRet, u16)
+          if fi >= ci.funcs.len: fail(ci, "canon lower of a missing function")
+          else:
+            ci.coreFuncs.add CoreFunc(kind: 1, addr0: -1, cf: fi, mem: mem, realloc: realloc, utf16: u16, resId: 0)
+        elif a == 0x03:
+          # resource.drop <type>: the second byte is the first byte of the type index
+          r.p -= 1
+          let ti = rdU32(r)
+          if ti >= ci.types.len or ci.types[ti].val.kind != ckResource: fail(ci, "resource.drop of a non-resource")
+          else:
+            ci.coreFuncs.add CoreFunc(kind: 2, addr0: -1, cf: 0, mem: 0, realloc: 0, utf16: false, resId: ci.types[ti].val.resId)
+        else:
+          fail(ci, "unsupported canon built-in")
+        inc i
+    of 9: discard
+    of 10:
+      let n = rdU32(r)
+      var i = 0
+      while i < n and ci.err.len == 0:
+        let nm = rdExportName(r)
+        let kind = rdByte(r)
+        case kind
+        of 0x05:
+          let ti = rdU32(r)
+          if ti >= ci.types.len or ci.types[ti].kind != 2: fail(ci, "instance import with a bad type")
+          else: addInstanceImport(ci, nm, ci.types[ti].idx)
+        of 0x01:
+          let ti = rdU32(r)
+          if ti >= ci.types.len or ci.types[ti].kind != 1: fail(ci, "function import with a bad type")
+          else:
+            ci.funcs.add CompFunc(sig: ci.types[ti].idx, isHost: true, key: stripVersion(nm), coreFunc: -1, mem: -1, realloc: -1, postReturn: -1, utf16: false)
+        of 0x03:
+          let bound = rdByte(r)
+          let ti = (if bound == 0: rdU32(r) else: 0)
+          if bound == 0: ci.types.add (if ti < ci.types.len: ci.types[ti] else: TypeEntry(kind: 3, val: NoT, idx: 0))
+          else: ci.types.add TypeEntry(kind: 0, val: newResource(nm), idx: 0)
+        else: fail(ci, "unsupported import kind")
+        inc i
+    of 11:
+      let n = rdU32(r)
+      var i = 0
+      while i < n and ci.err.len == 0:
+        let nm = rdExportName(r)
+        var sort = 0
+        var core = false
+        let idx = readSortIdx(r, sort, core)
+        if rdByte(r) == 1: discard rdByte(r) # optional externdesc, only its tag is skipped
+        ci.exportNames.add nm
+        ci.exportKinds.add sort
+        ci.exportIdx.add idx
+        inc i
+    else:
+      discard
+    r.p = secEnd
+  # host functions the plugin imports but the registry does not provide
+  var f = 0
+  while f < ci.funcs.len:
+    if ci.funcs[f].isHost and findHostFn(ci.reg, ci.funcs[f].key) < 0:
+      ci.unresolved.add ci.funcs[f].key
+    inc f
+  result = ci.err.len == 0
+
+# ---- calling exports -------------------------------------------------------------------------
+
+proc findExportFunc*(ci: CompInst; name: string): int =
+  ## component function index of a top-level exported function, or an export nested in an instance
+  ## ("iface#fn" form: instance export name, then function name)
+  var i = 0
+  while i < ci.exportNames.len:
+    if ci.exportNames[i] == name and ci.exportKinds[i] == 0x01: return ci.exportIdx[i]
+    inc i
+  let hash = name.find('#')
+  if hash > 0:
+    let iname = name[0 ..< hash]
+    let fname = name[hash + 1 ..< name.len]
+    i = 0
+    while i < ci.exportNames.len:
+      if stripVersion(ci.exportNames[i]) == iname and ci.exportKinds[i] == 0x05:
+        let io = ci.insts[ci.exportIdx[i]]
+        var q = 0
+        while q < io.names.len:
+          if io.names[q] == fname and io.kinds[q] == 0x01: return io.idxs[q]
+          inc q
+      inc i
+  result = -1
+
+proc funcSig*(ci: CompInst; cf: int): FuncSig = ci.sigs[ci.funcs[cf].sig]
+
+proc callExport*(ci: CompInst; cfIdx: int; args: seq[CVal]; results: var seq[CVal]): string =
+  ## Calls a lifted function: lower the arguments into the guest, run it, lift the results, run post-return.
+  if cfIdx < 0 or cfIdx >= ci.funcs.len or ci.funcs[cfIdx].isHost: return "not an exported function"
+  let cf = ci.funcs[cfIdx]
+  let sig = ci.sigs[cf.sig]
+  var ctx = CanonCtx(vm: ci.vm, mem: cf.mem, realloc: cf.realloc, utf16: cf.utf16, handles: ci.handles, err: "")
+  let flatArgs = lowerArgs(ctx, sig.params, args)
+  if ctx.err.len > 0: return ctx.err
+  var raw: seq[WSlot] = @[]
+  let st = call(ci.vm, cf.coreFunc, flatArgs, raw)
+  if st != wsOk:
+    return "guest trapped: " & ci.vm.s.trapMsg
+  results = liftResults(ctx, sig.results, raw)
+  if ctx.err.len > 0: return ctx.err
+  if cf.postReturn >= 0:
+    var dummy: seq[WSlot] = @[]
+    discard call(ci.vm, cf.postReturn, raw, dummy)
+  result = ""

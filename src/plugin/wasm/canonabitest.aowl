@@ -1,0 +1,185 @@
+## Canonical ABI tests: known-answer layouts worked out from CanonicalABI.md, plus round trips through a real
+## wasm module's linear memory and its `realloc` export (a bump allocator assembled by hand).
+import std/[syncio, assertions]
+import wasmvm, canonabi
+
+proc bytesOf(xs: openArray[int]): string =
+  result = ""
+  for x in xs: result.add char(x)
+
+# (module (memory (export "memory") 1) (global (mut i32) (i32.const 1024))
+#   (func (export "realloc") (param i32 i32 i32 i32) (result i32) (local i32)
+#     a = (g0 + align - 1) & -align ; g0 = a + new_size ; a))
+let modAlloc = bytesOf([0x00,0x61,0x73,0x6d,0x01,0x00,0x00,0x00,
+  0x01,0x09,0x01,0x60,0x04,0x7f,0x7f,0x7f,0x7f,0x01,0x7f,
+  0x03,0x02,0x01,0x00,
+  0x05,0x03,0x01,0x00,0x01,
+  0x06,0x07,0x01,0x7f,0x01,0x41,0x80,0x08,0x0b,
+  0x07,0x14,0x02,0x06,0x6d,0x65,0x6d,0x6f,0x72,0x79,0x02,0x00,0x07,0x72,0x65,0x61,0x6c,0x6c,0x6f,0x63,0x00,0x00,
+  0x0a,0x1f,0x01,0x1d,0x01,0x01,0x7f,
+    0x23,0x00,0x20,0x02,0x6a,0x41,0x01,0x6b,0x41,0x00,0x20,0x02,0x6b,0x71,0x21,0x04,
+    0x20,0x04,0x20,0x03,0x6a,0x24,0x00,
+    0x20,0x04,0x0b])
+
+proc mk(): CanonCtx =
+  let vm = newWasmVm()
+  let m = vm.loadModule(modAlloc)
+  assert m >= 0
+  var inst = -1
+  assert vm.instantiate(m, inst) == wsOk
+  result = CanonCtx(vm: vm, mem: vm.exportMem(inst, "memory"), realloc: vm.exportFunc(inst, "realloc"),
+                    utf16: false, handles: newHandleTables(), err: "")
+
+proc mkRec(names: seq[string]; ts: seq[CmType]): CmType =
+  CmType(kind: ckRecord, names: names, types: ts)
+
+proc main() =
+  let u8 = newScalar(ckU8)
+  let u16 = newScalar(ckU16)
+  let u32 = newScalar(ckU32)
+  let s8 = newScalar(ckS8)
+  let f32 = newScalar(ckF32)
+  let f64 = newScalar(ckF64)
+  let str = newScalar(ckString)
+
+  # layout
+  let r1 = mkRec(@["a", "b", "c"], @[u8, u32, str])
+  assert alignOf(r1) == 4 and sizeOf(r1) == 16
+  let v1 = CmType(kind: ckVariant, names: @["a", "b", "c", "d"], types: @[u32, f32, f64, NoT])
+  assert alignOf(v1) == 8 and sizeOf(v1) == 16
+  let o8 = CmType(kind: ckOption, names: @[], types: @[s8])
+  assert sizeOf(o8) == 2 and alignOf(o8) == 1
+  var fl: seq[int] = @[]
+  flatten(v1, fl)
+  assert fl == @[vtI32, vtI64]
+  fl = @[]
+  flatten(r1, fl)
+  assert fl == @[vtI32, vtI32, vtI32, vtI32]
+
+  # string lowered flat: pointer, byte length; memory holds utf-8
+  var c = mk()
+  var flat: seq[WSlot] = @[]
+  lowerFlat(c, str, vStr("h\xC3\xA9llo"), flat)
+  assert c.err.len == 0 and flat.len == 2 and flat[1].lo == 6'u64
+  var ok = false
+  assert memRead(c.vm, c.mem, int(flat[0].lo), 6, ok) == "h\xC3\xA9llo"
+  var cur = FlatCursor(vals: flat, pos: 0)
+  assert liftFlat(c, str, cur).s == "h\xC3\xA9llo"
+  # invalid utf-8 is rejected
+  assert memWrite(c.vm, c.mem, 2000, "\xFF\xFE")
+  cur = FlatCursor(vals: @[WSlot(lo: 2000'u64, hi: 0), WSlot(lo: 2'u64, hi: 0)], pos: 0)
+  discard liftFlat(c, str, cur)
+  assert c.err.len > 0
+
+  # record in memory, exact bytes
+  c = mk()
+  storeVal(c, r1, vRecord(@[vInt(7), vInt(0x01020304), vStr("ab")]), 3000)
+  assert c.err.len == 0
+  assert memByte(c.vm, c.mem, 3000) == 7
+  assert memU32(c.vm, c.mem, 3004) == 0x01020304'u32
+  let sp = int(memU32(c.vm, c.mem, 3008))
+  assert memU32(c.vm, c.mem, 3012) == 2'u32
+  assert memRead(c.vm, c.mem, sp, 2, ok) == "ab"
+  let back = loadVal(c, r1, 3000)
+  assert back.items[0].i == 7 and back.items[1].i == 0x01020304 and back.items[2].s == "ab"
+
+  # list<u16>
+  c = mk()
+  let l16 = CmType(kind: ckList, names: @[], types: @[u16])
+  flat = @[]
+  lowerFlat(c, l16, vList(@[vInt(1), vInt(2), vInt(0xABCD)]), flat)
+  assert flat[1].lo == 3'u64
+  let lp = int(flat[0].lo)
+  assert memRead(c.vm, c.mem, lp, 6, ok) == "\x01\x00\x02\x00\xCD\xAB"
+  cur = FlatCursor(vals: flat, pos: 0)
+  let lv = liftFlat(c, l16, cur)
+  assert lv.items.len == 3 and lv.items[2].i == 0xABCD
+
+  # variant flat: join of u32 / f32 / f64
+  flat = @[]
+  lowerFlat(c, v1, vVariant(1, vFloat(1.5)), flat)
+  assert flat.len == 2 and flat[0].lo == 1'u64 and flat[1].lo == 0x3FC00000'u64
+  cur = FlatCursor(vals: flat, pos: 0)
+  let vb = liftFlat(c, v1, cur)
+  assert vb.i == 1 and vb.items[0].f == 1.5
+  flat = @[]
+  lowerFlat(c, v1, vVariant(2, vFloat(2.5)), flat)
+  assert flat[1].lo == 0x4004000000000000'u64
+  cur = FlatCursor(vals: flat, pos: 0)
+  assert liftFlat(c, v1, cur).items[0].f == 2.5
+  flat = @[]
+  lowerFlat(c, v1, vVariant(3), flat)
+  assert flat.len == 2 and flat[1].lo == 0'u64
+
+  # option<s8> and result<u32, string> through memory
+  c = mk()
+  storeVal(c, o8, vSome(vInt(-1)), 4000)
+  assert memByte(c.vm, c.mem, 4000) == 1 and memByte(c.vm, c.mem, 4001) == 0xFF
+  assert loadVal(c, o8, 4000).items[0].i == -1
+  storeVal(c, o8, vNone(), 4010)
+  assert loadVal(c, o8, 4010).i == 0
+  let res = CmType(kind: ckResult, names: @[], types: @[u32, str])
+  assert sizeOf(res) == 12 and alignOf(res) == 4
+  storeVal(c, res, vVariant(1, vStr("boom")), 4100)
+  let rb = loadVal(c, res, 4100)
+  assert rb.i == 1 and rb.items[0].s == "boom"
+  storeVal(c, res, vVariant(0, vInt(42)), 4120)
+  assert loadVal(c, res, 4120).items[0].i == 42
+
+  # flags and enum
+  let fg = CmType(kind: ckFlags, names: @["x", "y", "z"], types: @[])
+  assert sizeOf(fg) == 1
+  storeVal(c, fg, vInt(5), 4200)
+  assert loadVal(c, fg, 4200).i == 5
+  let en = CmType(kind: ckEnum, names: @["trace", "debug", "info"], types: @[])
+  flat = @[]
+  lowerFlat(c, en, vInt(2), flat)
+  cur = FlatCursor(vals: flat, pos: 0)
+  assert liftFlat(c, en, cur).i == 2
+
+  # resources: own lowered to a guest handle, borrowed back, dropped
+  c = mk()
+  let rsrc = newResource("command-node")
+  let own = CmType(kind: ckOwn, names: @[], types: @[rsrc])
+  let bor = CmType(kind: ckBorrow, names: @[], types: @[rsrc])
+  flat = @[]
+  lowerFlat(c, own, vInt(99), flat)
+  assert flat[0].lo == 1'u64
+  cur = FlatCursor(vals: flat, pos: 0)
+  assert liftFlat(c, bor, cur).i == 99
+  cur = FlatCursor(vals: flat, pos: 0)
+  assert liftFlat(c, own, cur).i == 99
+  assert c.err.len == 0
+  cur = FlatCursor(vals: flat, pos: 0)
+  discard liftFlat(c, bor, cur)
+  assert c.err.len > 0      # the handle was dropped by the own lift
+
+  # more than 16 flat params spill to memory through one pointer
+  c = mk()
+  var ps: seq[CmType] = @[]
+  var vs: seq[CVal] = @[]
+  var i = 0
+  while i < 18:
+    ps.add u32
+    vs.add vInt(int64(i * 3))
+    inc i
+  let lowered = lowerArgs(c, ps, vs)
+  assert lowered.len == 1
+  let lifted = liftArgs(c, ps, lowered)
+  assert lifted.len == 18 and lifted[17].i == 51 and c.err.len == 0
+
+  # exactly 16 stay flat
+  ps.setLen 16
+  vs.setLen 16
+  assert lowerArgs(c, ps, vs).len == 16
+
+  # results: one flat value comes back as a value, a string (2 flat) through a return area
+  let out1 = lowerResults(c, @[u32], @[vInt(5)], 0)
+  assert out1.len == 1 and out1[0].lo == 5'u64
+  let ret = callRealloc(c, 0, 0, 4, 8)
+  discard lowerResults(c, @[str], @[vStr("zz")], ret)
+  let got = liftResults(c, @[str], @[WSlot(lo: uint64(ret), hi: 0)])
+  assert got[0].s == "zz"
+  echo "canonabitest ok"
+
+main()
