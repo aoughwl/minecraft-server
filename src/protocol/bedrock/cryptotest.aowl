@@ -1,0 +1,234 @@
+## Test for crypto.aowl, aes256.aowl, packet_encoder.aowl, packet_decoder.aowl and rawdeflate.aowl.
+## Expected bytes: AES-256 from FIPS-197 C.3 and upstream's `gcm_compatibility` vector; CTR streams, SHA-256
+## checksums and raw deflate streams were produced by OpenSSL and Python's zlib (struct/hashlib) following the
+## layout in the pinned crypto.rs, packet_encoder.rs and packet_decoder.rs. Upstream's own `#[test]`s are
+## ported at the end: `gcm_compatibility`, `bedrock_compression_cycle`, `decodes_payload_larger_than_two_mib`.
+import bedrocktestutil
+import ../proto
+import bedrockmod, crypto, aes256, packet_encoder, packet_decoder, rawdeflate
+
+proc seq32(f: proc(i: int): uint8): array[32, uint8] =
+  var k = default(array[32, uint8])
+  for i in 0 ..< 32:
+    k[i] = f(i)
+  k
+
+proc ones(i: int): uint8 = 1'u8
+proc counting(i: int): uint8 = uint8(i)
+
+# FIPS-197 C.3: AES-256, key 00..1f, plaintext 00112233445566778899aabbccddeeff.
+block:
+  let key = seq32(counting)
+  let aes = newAes256(key)
+  var state = default(array[16, uint8])
+  let pt = hx("00112233445566778899aabbccddeeff")
+  for i in 0 ..< 16:
+    state[i] = pt[i]
+  aes.encryptBlock(state)
+  eqHex(state, "8ea2b7ca516745bfeafc49904b496089", "FIPS-197 C.3 AES-256")
+
+# Upstream `gcm_compatibility`: key = [1; 32], iv = key[..12] ++ 00 00 00 02.
+block:
+  let key = seq32(ones)
+  var iv = default(array[16, uint8])
+  for i in 0 ..< 12:
+    iv[i] = key[i]
+  iv[15] = 2'u8
+  var cipher = newAes256Ctr(key, iv)
+  var data: seq[byte] = @[]
+  for ch in "Hello Bedrock encryption!":
+    data.add(uint8(ch))
+  cipher.applyKeystream(data)
+  eqHex(data, "fa 1c d6 f6 06 d7 47 96 8e d7 60 fe c5 1c 2b c7 7e 46 17 74 25 96 34 0c ac", "gcm_compatibility")
+  # The keystream carries across calls: two halves equal the whole.
+  var c2 = newAes256Ctr(key, iv)
+  var a: seq[byte] = data[0 ..< 7]
+  var b: seq[byte] = data[7 ..< 25]
+  c2.applyKeystream(a)
+  c2.applyKeystream(b)
+  var plain: seq[byte] = @[]
+  for ch in "Hello Bedrock encryption!":
+    plain.add(uint8(ch))
+  check(a == plain[0 ..< 7] and b == plain[7 ..< 25], "ctr decrypts in pieces")
+
+# Encryptor / decryptor: payload ++ sha256(counter_le ++ payload ++ key)[..8], one CTR stream across packets.
+block:
+  let key = seq32(counting)
+  var enc = newBedrockEncryptor(key)
+  var p0 = hx(utf8Hex("Hello Bedrock"))
+  enc.encrypt(p0)
+  eqHex(p0, "0f67ba77aac5807ee933f8e8dae59dc51dea0831c2", "encrypt packet 0")
+  var p1 = hx(utf8Hex("second packet!!"))
+  enc.encrypt(p1)
+  eqHex(p1, "083a1f570981a56d0863d964648fdd24dc9a82f9cd1646", "encrypt packet 1 (counter 1, stream continues)")
+
+  var dec = newBedrockDecryptor(key)
+  var c0 = hx("0f67ba77aac5807ee933f8e8dae59dc51dea0831c2")
+  let r0 = dec.decrypt(c0)
+  check(r0.isOk and c0 == hx(utf8Hex("Hello Bedrock")), "decrypt packet 0")
+  var c1 = hx("083a1f570981a56d0863d964648fdd24dc9a82f9cd1646")
+  let r1 = dec.decrypt(c1)
+  check(r1.isOk and c1 == hx(utf8Hex("second packet!!")), "decrypt packet 1")
+
+  # Too short: nothing to checksum.
+  var dec2 = newBedrockDecryptor(key)
+  var tiny = hx("0102030405")
+  let rt = dec2.decrypt(tiny)
+  check(not rt.isOk and rt.error == "Encrypted packet must be at least 8 bytes long", "short packet")
+
+  # A flipped bit fails the checksum, with upstream's message.
+  var dec3 = newBedrockDecryptor(key)
+  var bad = hx("0f67ba77aac5807ee933f8e8dae59dc51dea0831c3")
+  let rb = dec3.decrypt(bad)
+  check(not rb.isOk, "bad checksum rejected")
+  let want = "Invalid checksum: expected [c, e5, a8, 9e, 3c, 8f, 5, 32], got [c, e5, a8, 9e, 3c, 8f, 5, 33]. " &
+    "Cipher prefix: [f, 67, ba, 77, aa, c5, 80, 7e, e9, 33, f8, e8, da, e5, 9d, c5], " &
+    "Plain prefix: [48, 65, 6c, 6c, 6f, 20, 42, 65, 64, 72, 6f, 63, 6b, c, e5, a8], " &
+    "Key: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, a, b, c, d, e, f, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 1a, 1b, 1c, 1d, 1e, 1f], Counter: 0"
+  check(rb.error == want, "bad checksum text: " & rb.error)
+
+# Packet encoder, no compression: fe, VarUInt(len), VarUInt(14-bit header), payload.
+block:
+  var enc = newUDPNetworkEncoder()
+  var w = newNetWriter()
+  check(enc.writeGamePacket(1'u16, scMain, scMain, hx("48656c6c6f"), w).isOk, "write plain")
+  eqHex(w.buf, "fe 06 01 48656c6c6f", "plain game packet")
+  # Sender SubClient1 (2 << 10) and target SubClient0 (1 << 12): header 0x1801 is a two byte VarUInt.
+  var w2 = newNetWriter()
+  check(enc.writeGamePacket(1'u16, scSubClient1, scSubClient0, hx("48656c6c6f"), w2).isOk, "write subclients")
+  eqHex(w2.buf, "fe 07 8130 48656c6c6f", "game packet with subclient ids")
+  # Ids above 10 bits are truncated by the 14-bit mask, not rejected.
+  var w3 = newNetWriter()
+  check(enc.writeGamePacket(0x0309'u16, scMain, scMain, hx(""), w3).isOk, "write empty payload")
+  eqHex(w3.buf, "fe 02 8906", "game packet with an empty payload")
+
+  # With compression: 00, then the raw deflate of the batch.
+  var cenc = newUDPNetworkEncoder()
+  cenc.setCompression(256, 6'u32)
+  var w4 = newNetWriter()
+  check(cenc.writeGamePacket(1'u16, scMain, scMain, hx("48656c6c6f"), w4).isOk, "write compressed")
+  eqHex(w4.buf, "fe 00 6363f448cdc9c90700", "compressed game packet")
+  # Level 0 stores the batch.
+  var senc = newUDPNetworkEncoder()
+  senc.setCompression(256, 0'u32)
+  var w5 = newNetWriter()
+  check(senc.writeGamePacket(1'u16, scMain, scMain, hx("48656c6c6f"), w5).isOk, "write stored")
+  eqHex(w5.buf, "fe 00 010700f8ff060148656c6c6f", "stored game packet")
+  # A level zlib cannot take is an error, not a crash.
+  var benc = newUDPNetworkEncoder()
+  benc.setCompression(256, 10'u32)
+  var w6 = newNetWriter()
+  check(not benc.writeGamePacket(1'u16, scMain, scMain, hx("48"), w6).isOk, "bad compression level")
+  # Setting encryption twice is refused.
+  var e2 = newUDPNetworkEncoder()
+  check(e2.setEncryption(seq32(counting)).isOk, "first set_encryption")
+  let again = e2.setEncryption(seq32(counting))
+  check(not again.isOk and again.error.msg == "Encryption already enabled", "second set_encryption")
+
+# Packet decoder: payload, then game packets.
+block:
+  var dec = newUDPNetworkDecoder()
+  let p = dec.getPacketPayload(hx("fe 06 01 48656c6c6f"))
+  check(p.isOk and p.value == hx("06 01 48656c6c6f"), "plain payload")
+  var rd = newNetReader(p.value)
+  let g = dec.getGamePacket(rd)
+  check(g.isOk and g.value.id == 1'i32 and g.value.payload == hx("48656c6c6f") and remaining(rd) == 0, "plain game packet read")
+  # Subclient bits are masked off the id: 0x1801 is packet 1.
+  var rd2 = newNetReader(hx("07 8130 48656c6c6f"))
+  let g2 = dec.getGamePacket(rd2)
+  check(g2.isOk and g2.value.id == 1'i32, "subclient bits ignored")
+  # Two packets in one batch.
+  var rd3 = newNetReader(hx("02 01 01 03 02 aabb"))
+  let a1 = dec.getGamePacket(rd3)
+  let a2 = dec.getGamePacket(rd3)
+  check(a1.isOk and a1.value.id == 1'i32 and a1.value.payload == hx("01") and
+    a2.isOk and a2.value.id == 2'i32 and a2.value.payload == hx("aabb") and remaining(rd3) == 0, "two packets")
+  let eof = dec.getGamePacket(rd3)
+  check(not eof.isOk and eof.error.kind == pdeConnectionClosed, "clean EOF is connection closed")
+
+  let e0 = dec.getPacketPayload(@[])
+  check(not e0.isOk and e0.error.msg == "malformed packet length VarInt: Empty packet", "empty packet")
+  let e1 = dec.getPacketPayload(hx("84 00"))
+  check(not e1.isOk and e1.error.msg == "malformed packet length VarInt: Missing 0xfe header (found 0x84)", "missing 0xfe")
+  var z = newNetReader(hx("00"))
+  let ez = dec.getGamePacket(z)
+  check(not ez.isOk and ez.error.msg == "malformed packet length VarInt: Bedrock game packet length is zero", "zero length")
+  var big = newNetReader(hx("09 01 aa"))
+  let eb = dec.getGamePacket(big)
+  check(not eb.isOk and eb.error.msg == "malformed packet length VarInt: Bedrock game packet payload length 8 exceeds remaining batch bytes 1",
+    "length past the batch")
+  var tooLong = newNetReader(hx("808080 08"))  # 2^24... above MaxPacketDataSize (8388608 = 2^23)
+  let etl = dec.getGamePacket(tooLong)
+  check(not etl.isOk and etl.error.msg == "packet exceeds maximum length", "length over the cap")
+
+  # Compression on: method byte 0x00 raw deflate, 0xff none, anything else refused.
+  var cdec = newUDPNetworkDecoder()
+  cdec.setCompression(256)
+  let c1 = cdec.getPacketPayload(hx("fe 00 6363f448cdc9c90700"))
+  check(c1.isOk and c1.value == hx("06 01 48656c6c6f"), "inflate")
+  let c2 = cdec.getPacketPayload(hx("fe ff 06 01 48656c6c6f"))
+  check(c2.isOk and c2.value == hx("06 01 48656c6c6f"), "compression method none")
+  let c3 = cdec.getPacketPayload(hx("fe 07 06"))
+  check(not c3.isOk and c3.error.msg == "failed to decompress packet: Unsupported compression method: 0x07", "unknown method")
+  let c4 = cdec.getPacketPayload(hx("fe"))
+  check(not c4.isOk and c4.error.msg == "malformed packet length VarInt: Missing Bedrock compression method", "missing method")
+  let c5 = cdec.getPacketPayload(hx("fe 00 ffffffff"))
+  check(not c5.isOk and c5.error.kind == pdeFailedDecompression, "corrupt deflate")
+  let c6 = cdec.getPacketPayload(hx("fe 00 6363f448"))
+  check(not c6.isOk and c6.error.kind == pdeFailedDecompression, "truncated deflate")
+
+  # Encryption on: the 0xfe byte stays clear, the rest is ciphertext with the checksum.
+  var edec = newUDPNetworkDecoder()
+  check(edec.setEncryption(seq32(counting)).isOk, "decoder set_encryption")
+  check(not edec.setEncryption(seq32(counting)).isOk, "decoder set_encryption twice")
+  let ep = edec.getPacketPayload(hx("fe 0f67ba77aac5807ee933f8e8dae59dc51dea0831c2"))
+  check(ep.isOk and ep.value == hx(utf8Hex("Hello Bedrock")), "encrypted payload")
+  let ebad = edec.getPacketPayload(hx("fe 0f67ba77aac5807ee933f8e8dae59dc51dea0831c2"))
+  check(not ebad.isOk and ebad.error.kind == pdeMessage, "stream moved on; replay fails the checksum")
+
+# Upstream `bedrock_compression_cycle`: level 6, threshold 256, id 1, "Hello Bedrock Compression!".
+block:
+  var enc = newUDPNetworkEncoder()
+  enc.setCompression(256, 6'u32)
+  var payload: seq[byte] = @[]
+  for ch in "Hello Bedrock Compression!":
+    payload.add(uint8(ch))
+  var buf = newNetWriter()
+  check(enc.writeGamePacket(1'u16, scMain, scMain, payload, buf).isOk, "cycle encode")
+  eqHex(buf.buf, "fe 00 9366f448cdc9c957704a4d29ca4fce5670cecf2d284a2d2ececccf530400", "cycle wire bytes")
+  var dec = newUDPNetworkDecoder()
+  dec.setCompression(256)
+  let decompressed = dec.getPacketPayload(buf.buf)
+  check(decompressed.isOk, "cycle payload")
+  var cursor = newNetReader(decompressed.value)
+  let raw = dec.getGamePacket(cursor)
+  check(raw.isOk and raw.value.id == 1'i32 and raw.value.payload == payload, "cycle game packet")
+
+# Upstream `decodes_payload_larger_than_two_mib`: a 2 MiB + 1 payload, uncompressed, id 1.
+block:
+  const PayloadLen = 2 * 1024 * 1024 + 1
+  var payload = newSeq[byte](PayloadLen)
+  for i in 0 ..< PayloadLen:
+    payload[i] = 0x2a'u8
+  var wire = newNetWriter()
+  let enc = newUDPNetworkEncoder()
+  check(enc.writeGamePacket(0x01'u16, scMain, scMain, payload, wire).isOk, "big encode")
+  var cursor = newNetReader(wire.buf[1 ..< wire.buf.len])
+  let dec = newUDPNetworkDecoder()
+  let packet = dec.getGamePacket(cursor)
+  check(packet.isOk and packet.value.id == 1'i32 and packet.value.payload.len == PayloadLen, "big decode")
+  check(packet.value.payload == payload, "big payload intact")
+
+# rawdeflate on its own: round trip, and the limit.
+block:
+  var data: seq[byte] = @[]
+  for i in 0 ..< 5000:
+    data.add(uint8(i mod 7))
+  let c = rawDeflateCompress(data, 9'u32)
+  check(c.ok and c.data.len < data.len, "deflate shrinks")
+  let d = rawInflate(c.data, data.len + 1)
+  check(d.ok and d.data == data, "inflate round trip")
+  let small = rawInflate(c.data, 100)
+  check(small.data.len <= 100, "inflate honours the limit")
+
+echo "all crypto and codec checks passed"

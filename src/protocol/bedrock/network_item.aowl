@@ -1,0 +1,389 @@
+## Port of pumpkin-protocol/src/bedrock/network_item.rs
+## The item shapes Bedrock puts on the wire: `NetworkItemDescriptor` (VarInt id, used in crafting data and
+## creative content), `ItemStackWrapper` (i16 id, used in transactions and requests),
+## `NetworkItemStackDescriptor` (inventory packets), `NetworkItemStack`, and `FullContainerName` with its
+## `ContainerName`.
+##
+## Option fields: `net_id: Option<NonZeroI32>` is an `int32` where 0 is `None`, which is what a non-zero type
+## means. `Option<VarUInt>` stays an `Option`.
+##
+## `From<&ItemStack>` is `fromItemStack`, one per descriptor type. They call the generated Java-to-Bedrock
+## mapping in generated/item_full.aowl, so a program that imports this module links the item tables.
+##
+## Upstream quirks kept, and tested: the two block lists in the user data buffer are written with a
+## little-endian u32 count (`(len as u32).write`) but read with a VarUInt count.
+
+import std/options
+import ../protobase, ../netcodec, ../serial, ../varint
+import ../../nbt/[nbtbase, nbtdoc, deserializer, tag]
+import ../../generated/item_full
+import "../../data/item_stack/mod"
+import ../../data/data_component_impl/item_decode
+
+type
+  NetworkItemDescriptor* = object
+    ## https://mojang.github.io/bedrock-protocol-docs/html/NetworkItemInstanceDescriptor.html
+    id*: VarInt
+    stackSize*: uint16
+    auxValue*: VarUInt
+    blockRuntimeId*: VarInt
+    # remainder is expansion of `User Data Buffer` (ItemInstanceUserData)
+    nbtData*: Nbt
+    placeOnBlocks*: seq[string]
+    destroyBlocks*: seq[string]
+    shieldBlockingTick*: int64
+
+  ItemStackWrapper* = object
+    id*: int16
+    stackSize*: uint16
+    auxValue*: VarUInt
+    blockRuntimeId*: VarInt
+    nbtData*: Nbt
+    placeOnBlocks*: seq[string]
+    destroyBlocks*: seq[string]
+    shieldBlockingTick*: int64
+    netId*: int32 ## `Option<NonZeroI32>`; 0 is `None`.
+
+  NetworkItemStackDescriptor* = object
+    id*: int16
+    stackSize*: uint16
+    auxValue*: VarUInt
+    blockRuntimeId*: VarUInt
+    extraData*: seq[byte]
+    netIdVariant*: Option[VarUInt]
+    netId*: int32 ## `Option<NonZeroI32>`; 0 is `None`.
+
+  ContainerName* = enum
+    cnAnvilInput
+    cnAnvilMaterial
+    cnAnvilResultPreview
+    cnSmithingTableInput
+    cnSmithingTableMaterial
+    cnSmithingTableResultPreview
+    cnArmor
+    cnLevelEntity
+    cnBeaconPayment
+    cnBrewingStandInput
+    cnBrewingStandResult
+    cnBrewingStandFuel
+    cnCombinedHotBarAndInventory
+    cnCraftingInput
+    cnCraftingOutputPreview
+    cnRecipeConstruction
+    cnRecipeNature
+    cnRecipeItems
+    cnRecipeSearch
+    cnRecipeSearchBar
+    cnRecipeEquipment
+    cnRecipeBook
+    cnEnchantingInput
+    cnEnchantingMaterial
+    cnFurnaceFuel
+    cnFurnaceIngredient
+    cnFurnaceResult
+    cnHorseEquip
+    cnHotBar
+    cnInventory
+    cnShulkerBox
+    cnTradeIngredient1
+    cnTradeIngredient2
+    cnTradeResultPreview
+    cnOffhand
+    cnCompoundCreatorInput
+    cnCompoundCreatorOutputPreview
+    cnElementConstructorOutputPreview
+    cnMaterialReducerInput
+    cnMaterialReducerOutput
+    cnLabTableInput
+    cnLoomInput
+    cnLoomDye
+    cnLoomMaterial
+    cnLoomResultPreview
+    cnBlastFurnaceIngredient
+    cnSmokerIngredient
+    cnTrade2Ingredient1
+    cnTrade2Ingredient2
+    cnTrade2ResultPreview
+    cnGrindstoneInput
+    cnGrindstoneAdditional
+    cnGrindstoneResultPreview
+    cnStonecutterInput
+    cnStonecutterResultPreview
+    cnCartographyInput
+    cnCartographyAdditional
+    cnCartographyResultPreview
+    cnBarrel
+    cnCursor
+    cnCreatedOutput
+    cnSmithingTableTemplate
+    cnCrafterLevelEntity
+    cnDynamic
+    cnRecipeFood
+    cnRecipeBlocks
+    cnRecipeFurnaceItems
+
+  FullContainerName* = object
+    containerName*: ContainerName
+    dynamicId*: Option[uint32]
+
+  NetworkItemStack* = object
+    id*: VarInt
+    count*: uint16
+    auxValue*: VarUInt
+    blockRuntimeId*: VarInt
+    extraData*: seq[byte]
+
+const ShieldBedrockId = 355'i16 # placeholder, replaced below by the generated table
+
+proc shieldId(): int16 =
+  ## `BedrockItem::SHIELD.id`.
+  let item = bedrockItemByKey("minecraft:shield")
+  if item == nil: ShieldBedrockId else: item.id
+
+# --- the user data buffer shared by the first two shapes -----------------------------------------------
+
+proc writeUserData(nbtData: Nbt; placeOnBlocks, destroyBlocks: seq[string]; isShield: bool;
+    shieldBlockingTick: int64; w: var NetWriter) =
+  ## The `buf` built inside `write_with_net_id` / `ItemStackWrapper::write`, then written with a VarUInt length.
+  var buf = newNetWriter()
+  if nbtData.rootTag.isEmpty():
+    packetWrite(0'i16, buf)
+  else:
+    packetWrite(-1'i16, buf)
+    packetWrite(1'i8, buf)
+    for b in nbtData.writeBedrock():
+      writeU8(buf, b)
+  packetWrite(uint32(placeOnBlocks.len), buf)
+  for s in placeOnBlocks:
+    packetWrite(s, buf)
+  packetWrite(uint32(destroyBlocks.len), buf)
+  for s in destroyBlocks:
+    packetWrite(s, buf)
+  if isShield:
+    packetWrite(shieldBlockingTick, buf)
+  packetWrite(newVarUInt(uint32(buf.buf.len)), w)
+  writeSlice(w, buf.buf)
+
+type
+  UserData = object
+    nbtData: Nbt
+    placeOnBlocks: seq[string]
+    destroyBlocks: seq[string]
+    shieldBlockingTick: int64
+
+proc readUserData(r: var NetReader; isShield: bool): ProtoReadResult[UserData] =
+  ## The `user_data` section of the two `PacketRead` impls: a VarUInt length, then a buffer holding an NBT
+  ## header (-1 means NBT follows), two string lists, and the shield tick.
+  let userDataLen = int(tryRead(UserData, packetRead(VarUInt, r)).value)
+  let userData = tryRead(UserData, readSlice(r, userDataLen))
+  var res = UserData(nbtData: Nbt(), placeOnBlocks: @[], destroyBlocks: @[], shieldBlockingTick: 0'i64)
+  if userData.len > 0:
+    var cursor = newNetReader(userData)
+    let nbtVersion = tryRead(UserData, packetRead(int16, cursor))
+    if nbtVersion == -1'i16:
+      discard tryRead(UserData, packetRead(int8, cursor))
+      var nr = newNbtReader(nrmBedrock, cursor.data[cursor.pos ..< cursor.data.len])
+      let parsed = nbtdoc.read(nr)
+      if not parsed.isOk:
+        return readErr[UserData](messageRead($parsed.error))
+      cursor.pos += nr.pos
+      res.nbtData = parsed.value
+    let placeOnLen = tryRead(UserData, packetRead(VarUInt, cursor)).value
+    var i = 0'u32
+    while i < placeOnLen:
+      res.placeOnBlocks.add(tryRead(UserData, packetRead(string, cursor)))
+      i += 1'u32
+    let destroyLen = tryRead(UserData, packetRead(VarUInt, cursor)).value
+    i = 0'u32
+    while i < destroyLen:
+      res.destroyBlocks.add(tryRead(UserData, packetRead(string, cursor)))
+      i += 1'u32
+    if isShield:
+      res.shieldBlockingTick = tryRead(UserData, packetRead(int64, cursor))
+  readOk(res)
+
+# --- NetworkItemDescriptor -----------------------------------------------------------------------------
+
+proc defaultNetworkItemDescriptor*(): NetworkItemDescriptor =
+  NetworkItemDescriptor(id: newVarInt(0'i32), stackSize: 0'u16, auxValue: newVarUInt(0'u32),
+    blockRuntimeId: newVarInt(0'i32), nbtData: Nbt(), placeOnBlocks: @[], destroyBlocks: @[], shieldBlockingTick: 0'i64)
+
+proc packetWrite*(self: NetworkItemDescriptor; w: var NetWriter) =
+  ## `write` is `write_with_net_id(writer, None)`: no net id is written. `write_with_net_id` itself is private
+  ## upstream and only ever called with `None`, so it has no other form here.
+  packetWrite(self.id, w)
+  if self.id.value != 0'i32:
+    packetWrite(self.stackSize, w)
+    packetWrite(self.auxValue, w)
+    packetWrite(self.blockRuntimeId, w)
+    writeUserData(self.nbtData, self.placeOnBlocks, self.destroyBlocks, self.id.value == int32(shieldId()),
+      self.shieldBlockingTick, w)
+
+proc packetRead*(_: typedesc[NetworkItemDescriptor]; r: var NetReader): ProtoReadResult[NetworkItemDescriptor] =
+  let id = tryRead(NetworkItemDescriptor, packetRead(VarInt, r))
+  if id.value == 0'i32:
+    return readOk(defaultNetworkItemDescriptor())
+  let stackSize = tryRead(NetworkItemDescriptor, packetRead(uint16, r))
+  let auxValue = tryRead(NetworkItemDescriptor, packetRead(VarUInt, r))
+  let hasNetId = tryRead(NetworkItemDescriptor, packetRead(bool, r))
+  if hasNetId:
+    discard tryRead(NetworkItemDescriptor, packetRead(VarUInt, r))
+    discard tryRead(NetworkItemDescriptor, packetRead(VarInt, r))
+  let blockRuntimeId = tryRead(NetworkItemDescriptor, packetRead(VarInt, r))
+  let ud = tryRead(NetworkItemDescriptor, readUserData(r, id.value == int32(shieldId())))
+  readOk(NetworkItemDescriptor(id: id, stackSize: stackSize, auxValue: auxValue, blockRuntimeId: blockRuntimeId,
+    nbtData: ud.nbtData, placeOnBlocks: ud.placeOnBlocks, destroyBlocks: ud.destroyBlocks,
+    shieldBlockingTick: ud.shieldBlockingTick))
+
+proc networkItemDescriptorFromItemStack*(stack: ItemStack): NetworkItemDescriptor =
+  ## `From<&ItemStack> for NetworkItemDescriptor`: empty, or no Bedrock mapping, gives the default (air).
+  result = defaultNetworkItemDescriptor()
+  if stack.isEmpty():
+    return
+  let mapping = JavaToBedrockItemMapping.fromJavaItemId(stack.getItem().id)
+  if mapping != nil:
+    result = NetworkItemDescriptor(id: newVarInt(int32(mapping.bedrockItem.id)), stackSize: uint16(stack.itemCount),
+      auxValue: newVarUInt(mapping.bedrockData), blockRuntimeId: newVarInt(int32(mapping.bedrockBlockState)),
+      nbtData: Nbt(), placeOnBlocks: @[], destroyBlocks: @[], shieldBlockingTick: 0'i64)
+
+# --- ItemStackWrapper ----------------------------------------------------------------------------------
+
+proc defaultItemStackWrapper*(): ItemStackWrapper =
+  ItemStackWrapper(id: 0'i16, stackSize: 0'u16, auxValue: newVarUInt(0'u32), blockRuntimeId: newVarInt(0'i32),
+    nbtData: Nbt(), placeOnBlocks: @[], destroyBlocks: @[], shieldBlockingTick: 0'i64, netId: 0'i32)
+
+proc packetWrite*(self: ItemStackWrapper; w: var NetWriter) =
+  packetWrite(newVarInt(int32(self.id)), w)
+  if self.id != 0'i16:
+    packetWrite(self.stackSize, w)
+    packetWrite(self.auxValue, w)
+    packetWrite(self.netId != 0'i32, w)
+    if self.netId != 0'i32:
+      packetWrite(newVarInt(self.netId), w)
+    packetWrite(self.blockRuntimeId, w)
+    writeUserData(self.nbtData, self.placeOnBlocks, self.destroyBlocks, self.id == shieldId(),
+      self.shieldBlockingTick, w)
+
+proc packetRead*(_: typedesc[ItemStackWrapper]; r: var NetReader): ProtoReadResult[ItemStackWrapper] =
+  ## Reads the id as a plain little-endian i16, where `write` writes it as a VarInt: upstream's asymmetry.
+  let id = tryRead(ItemStackWrapper, packetRead(int16, r))
+  if id == 0'i16:
+    return readOk(defaultItemStackWrapper())
+  let stackSize = tryRead(ItemStackWrapper, packetRead(uint16, r))
+  let auxValue = tryRead(ItemStackWrapper, packetRead(VarUInt, r))
+  let hasNetId = tryRead(ItemStackWrapper, packetRead(bool, r))
+  var netId = 0'i32
+  if hasNetId:
+    netId = tryRead(ItemStackWrapper, packetRead(VarInt, r)).value
+  let blockRuntimeId = tryRead(ItemStackWrapper, packetRead(VarInt, r))
+  let ud = tryRead(ItemStackWrapper, readUserData(r, id == shieldId()))
+  readOk(ItemStackWrapper(id: id, stackSize: stackSize, auxValue: auxValue, blockRuntimeId: blockRuntimeId,
+    nbtData: ud.nbtData, placeOnBlocks: ud.placeOnBlocks, destroyBlocks: ud.destroyBlocks,
+    shieldBlockingTick: ud.shieldBlockingTick, netId: netId))
+
+proc itemStackWrapperFromItemStack*(stack: ItemStack): ItemStackWrapper =
+  result = defaultItemStackWrapper()
+  if stack.isEmpty():
+    return
+  let mapping = JavaToBedrockItemMapping.fromJavaItemId(stack.getItem().id)
+  if mapping != nil:
+    result = ItemStackWrapper(id: mapping.bedrockItem.id, stackSize: uint16(stack.itemCount),
+      auxValue: newVarUInt(mapping.bedrockData), blockRuntimeId: newVarInt(int32(mapping.bedrockBlockState)),
+      nbtData: Nbt(), placeOnBlocks: @[], destroyBlocks: @[], shieldBlockingTick: 0'i64, netId: stack.uid)
+
+# --- NetworkItemStackDescriptor ------------------------------------------------------------------------
+
+proc defaultNetworkItemStackDescriptor*(): NetworkItemStackDescriptor =
+  NetworkItemStackDescriptor(id: 0'i16, stackSize: 0'u16, auxValue: newVarUInt(0'u32),
+    blockRuntimeId: newVarUInt(0'u32), extraData: @[], netIdVariant: none[VarUInt](), netId: 0'i32)
+
+proc packetWrite*(self: NetworkItemStackDescriptor; w: var NetWriter) =
+  packetWrite(self.id, w)
+  packetWrite(self.stackSize, w)
+  packetWrite(self.auxValue, w)
+  packetWrite(self.netId != 0'i32, w)
+  if self.netId != 0'i32:
+    let variant = if self.netIdVariant.isSome: self.netIdVariant.unsafeGet else: newVarUInt(0'u32)
+    packetWrite(variant, w)
+    packetWrite(newVarInt(self.netId), w)
+  packetWrite(self.blockRuntimeId, w)
+  packetWrite(newVarUInt(uint32(self.extraData.len)), w)
+  writeSlice(w, self.extraData)
+
+proc packetRead*(_: typedesc[NetworkItemStackDescriptor]; r: var NetReader): ProtoReadResult[NetworkItemStackDescriptor] =
+  let id = tryRead(NetworkItemStackDescriptor, packetRead(int16, r))
+  let stackSize = tryRead(NetworkItemStackDescriptor, packetRead(uint16, r))
+  let auxValue = tryRead(NetworkItemStackDescriptor, packetRead(VarUInt, r))
+  let hasNetId = tryRead(NetworkItemStackDescriptor, packetRead(bool, r))
+  var netIdVariant = none[VarUInt]()
+  var netId = 0'i32
+  if hasNetId:
+    let variant = tryRead(NetworkItemStackDescriptor, packetRead(VarUInt, r))
+    let stackId = tryRead(NetworkItemStackDescriptor, packetRead(VarInt, r))
+    netIdVariant = some(variant)
+    netId = stackId.value
+  let blockRuntimeId = tryRead(NetworkItemStackDescriptor, packetRead(VarUInt, r))
+  let extraDataLen = int(tryRead(NetworkItemStackDescriptor, packetRead(VarUInt, r)).value)
+  let extraData = tryRead(NetworkItemStackDescriptor, readSlice(r, extraDataLen))
+  readOk(NetworkItemStackDescriptor(id: id, stackSize: stackSize, auxValue: auxValue,
+    blockRuntimeId: blockRuntimeId, extraData: extraData, netIdVariant: netIdVariant, netId: netId))
+
+proc networkItemStackDescriptorFromItemStack*(stack: ItemStack): NetworkItemStackDescriptor =
+  result = defaultNetworkItemStackDescriptor()
+  if stack.isEmpty():
+    return
+  let mapping = JavaToBedrockItemMapping.fromJavaItemId(stack.getItem().id)
+  if mapping != nil:
+    result = NetworkItemStackDescriptor(id: mapping.bedrockItem.id, stackSize: uint16(stack.itemCount),
+      auxValue: newVarUInt(mapping.bedrockData), blockRuntimeId: newVarUInt(uint32(mapping.bedrockBlockState)),
+      extraData: @[0'u8, 0'u8], netIdVariant: some(newVarUInt(0'u32)), netId: stack.uid)
+
+# --- ContainerName / FullContainerName -----------------------------------------------------------------
+
+proc containerNameFromU8*(value: uint8): ProtoReadResult[ContainerName] =
+  ## `TryFrom<u8> for ContainerName`.
+  if value <= 66'u8:
+    readOk(ContainerName(int(value)))
+  else:
+    readErr[ContainerName](messageRead("Invalid ContainerName ID: " & $value))
+
+proc packetWrite*(self: ContainerName; w: var NetWriter) =
+  packetWrite(uint8(ord(self)), w)
+
+proc packetRead*(_: typedesc[ContainerName]; r: var NetReader): ProtoReadResult[ContainerName] =
+  let value = tryRead(ContainerName, packetRead(uint8, r))
+  containerNameFromU8(value)
+
+proc packetWrite*(self: FullContainerName; w: var NetWriter) =
+  ## Derived `PacketWrite`: the name byte, then `Option<u32>` as a bool and a little-endian u32.
+  packetWrite(self.containerName, w)
+  if self.dynamicId.isSome:
+    packetWrite(true, w)
+    packetWrite(self.dynamicId.unsafeGet, w)
+  else:
+    packetWrite(false, w)
+
+proc packetRead*(_: typedesc[FullContainerName]; r: var NetReader): ProtoReadResult[FullContainerName] =
+  let name = tryRead(FullContainerName, packetRead(ContainerName, r))
+  var dynamicId = none[uint32]()
+  if tryRead(FullContainerName, packetRead(bool, r)):
+    dynamicId = some(tryRead(FullContainerName, packetRead(uint32, r)))
+  readOk(FullContainerName(containerName: name, dynamicId: dynamicId))
+
+proc `==`*(a, b: FullContainerName): bool =
+  a.containerName == b.containerName and a.dynamicId == b.dynamicId
+
+# --- NetworkItemStack ----------------------------------------------------------------------------------
+
+proc packetRead*(_: typedesc[NetworkItemStack]; r: var NetReader): ProtoReadResult[NetworkItemStack] =
+  let id = tryRead(NetworkItemStack, packetRead(VarInt, r))
+  if id.value == 0'i32:
+    return readOk(NetworkItemStack(id: id, count: 0'u16, auxValue: newVarUInt(0'u32),
+      blockRuntimeId: newVarInt(0'i32), extraData: @[]))
+  let count = tryRead(NetworkItemStack, packetRead(uint16, r))
+  let auxValue = tryRead(NetworkItemStack, packetRead(VarUInt, r))
+  let blockRuntimeId = tryRead(NetworkItemStack, packetRead(VarInt, r))
+  let extraDataLen = int(tryRead(NetworkItemStack, packetRead(VarUInt, r)).value)
+  let extraData = tryRead(NetworkItemStack, readSlice(r, extraDataLen))
+  readOk(NetworkItemStack(id: id, count: count, auxValue: auxValue, blockRuntimeId: blockRuntimeId,
+    extraData: extraData))

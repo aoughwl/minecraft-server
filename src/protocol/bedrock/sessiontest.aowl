@@ -1,0 +1,91 @@
+{.feature: "untyped".}
+## Test for the layers working together, as a server session sees them: a RequestNetworkSettings game packet in a
+## RakNet frame set (sequence numbers, acknowledgement, MTU), the NetworkSettings reply, then compression and AES
+## encryption switched on with a chat packet each way. Expected bytes were produced with struct.pack, Python's zlib
+## and OpenSSL's AES-256-CTR, following the pinned packet_encoder.rs, packet_decoder.rs and crypto.rs.
+import std/options
+import bedrocktestutil
+import bedrockmod, ack, frame_set, crypto, packet_decoder, packet_encoder
+import client/network_settings
+import server/[request_network_settings, text]
+import ../proto
+
+proc key32(): array[32, uint8] =
+  var k = default(array[32, uint8])
+  for i in 0 ..< 32:
+    k[i] = uint8(i)
+  k
+
+# 1. The client's datagram: frame set 4, one ReliableOrdered frame carrying `fe` + a batch.
+var decoder = newUDPNetworkDecoder()
+block:
+  let datagram = hx("8404000060004003000003000000fe06c101000003e9")
+  check(datagram.len <= MTU - UDP_HEADER_SIZE, "fits the MTU")
+  var r = newNetReader(datagram)
+  check((getU8(r).value and 0xF0'u8) == RAKNET_VALID, "frame set")
+  let fs = readFrameSet(r)
+  check(fs.isOk and fs.value.sequence.value == 4'u32 and fs.value.frames.len == 1, "frame set parse")
+  check(fs.value.frames[0].payload == hx("fe06c101000003e9"), "frame payload")
+  # It is acknowledged by sequence number 4.
+  var ackW = newNetWriter()
+  newAcknowledge(@[fs.value.sequence.value]).write(ackW, RAKNET_ACK)
+  eqHex(ackW.buf, "c0 0001 01 040000", "ack of datagram 4")
+  # The game packet: no compression yet, so the payload is the batch itself.
+  let payload = decoder.getPacketPayload(fs.value.frames[0].payload)
+  check(payload.isOk, "payload")
+  var batchReader = newNetReader(payload.value)
+  let packet = decoder.getGamePacket(batchReader)
+  check(packet.isOk and packet.value.id == int32(SRequestNetworkSettingsPacketId) and remaining(batchReader) == 0, "game packet 0xC1")
+  var body = newNetReader(packet.value.payload)
+  let settings = packetRead(SRequestNetworkSettings, body)
+  check(settings.isOk and settings.value.protocolVersion == 1001'i32, "protocol 1001")
+
+# 2. The reply, and the datagram around it.
+var encoder = newUDPNetworkEncoder()
+block:
+  var body = newNetWriter()
+  packetWrite(newCNetworkSettings(1'u16, 0'u16, false, 0'i8, 0.0'f32), body)
+  var batch = newNetWriter()
+  check(encoder.writeGamePacket(uint16(CNetworkSettingsPacketId), scMain, scMain, body.buf, batch).isOk, "write settings")
+  eqHex(batch.buf, "fe0c8f0101000000000000000000", "settings game packet")
+  var frame = defaultFrame()
+  frame.payload = batch.buf
+  var datagramOut = newNetWriter()
+  FrameSet(sequence: U24(value: 0'u32), frames: @[frame]).writePacketData(datagramOut, 0x84'u8)
+  eqHex(datagramOut.buf, "8400000060007000000000000000fe0c8f0101000000000000000000", "settings datagram")
+  check(datagramOut.buf.len <= MTU - UDP_HEADER_SIZE, "reply fits the MTU")
+
+# 3. Compression (level 6) and encryption (key 00..1f) on both sides.
+encoder.setCompression(1, 6'u32)
+decoder.setCompression(1)
+check(encoder.setEncryption(key32()).isOk and decoder.setEncryption(key32()).isOk, "encryption on")
+let chat = SText(needsTranslation: false, typ: tptChat, sourceName: "Steve", message: "hi", parameters: @[], xuid: "123",
+  platformChatId: "pcid", filteredMessage: none[string]())
+block:
+  var textBody = newNetWriter()
+  packetWrite(chat, textBody)
+  eqHex(textBody.buf, "00010105537465766502686903313233047063696400", "chat packet body")
+  for n in 0 ..< 2:
+    var wire = newNetWriter()
+    check(encoder.writeGamePacket(uint16(STextPacketId), scMain, scMain, textBody.buf, wire).isOk, "write chat")
+    var rest = wire.buf[1 ..< wire.buf.len]
+    eqHex(rest, "0013e7646064640d2e492d4b65cac864363432662948ce4c610000", "compressed batch, method byte 00 then raw deflate")
+    encoder.encryptor.encrypt(rest)
+    var sent = @[0xFE'u8]
+    for b in rest:
+      sent.add(b)
+    eqHex(sent, (if n == 0: "fe4711317fa581a616a308bac0d423b009b5e2b552d93391305967e5ee48286ef834c5c0" else: "fefcbc2676f810c072c3c1aa635d249104bb6ee4c5f37759667818e3ed8ceae9833f0678"), "encrypted packet " & $n)
+    # The other side decrypts, inflates and parses it; the counters advance in step.
+    let payload = decoder.getPacketPayload(sent)
+    check(payload.isOk, "decrypt packet " & $n)
+    var batchReader = newNetReader(payload.value)
+    let packet = decoder.getGamePacket(batchReader)
+    check(packet.isOk and packet.value.id == int32(STextPacketId) and packet.value.payload == textBody.buf, "game packet " & $n)
+    var tr = newNetReader(packet.value.payload)
+    let parsed = packetRead(SText, tr)
+    check(parsed.isOk and parsed.value.message == "hi" and parsed.value.sourceName == "Steve", "chat read " & $n)
+  # A replayed packet is rejected: its checksum was made with counter 0, and the receiver is at 2.
+  let replay = decoder.getPacketPayload(hx("fe4711317fa581a616a308bac0d423b009b5e2b552d93391305967e5ee48286ef834c5c0"))
+  check(not replay.isOk and replay.error.kind == pdeMessage, "replay is refused")
+
+echo "all session checks passed"

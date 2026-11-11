@@ -1,0 +1,151 @@
+## Port of pumpkin-protocol/src/bedrock/mod.rs
+## `mod` is an operator here, so a mod.rs is named after its directory.
+##
+## BEDROCK PROTOCOL MODULE: public API
+## ===================================
+## This directory ports every file of pumpkin-protocol/src/bedrock: RakNet framing and reliability
+## (`bedrockmod` constants and `RakReliability`, `ack`, `frame_set`), the game-packet envelope
+## (`packet_encoder`, `packet_decoder`, `crypto`), and one file per packet under `client/` (server ->
+## client) and `server/` (client -> server). `client/raknet` and `server/raknet` hold the offline
+## handshake and connection-level RakNet packets. The network layer (pumpkin/src/net/bedrock) sits on
+## top of this and should need nothing but what follows.
+##
+## Packet convention (see proto.aowl for the Java twin)
+## ----------------------------------------------------
+## * One module per upstream file, same file name, same type names (`CPlayStatus`, `SLogin`), fields in
+##   upstream's order and camelCase.
+## * `const CFooPacketId* = N'i32` is `#[packet(N)]` / `Packet::PACKET_ID`. Bedrock ids do not depend on a
+##   version. The id is NOT part of the packet body: `UDPNetworkEncoder.writeGamePacket` puts it in the
+##   14-bit game packet header, exactly as upstream does.
+## * Clientbound (`C...`) packets, `PacketWrite`: `proc packetWrite*(p: CFoo; w: var NetWriter)` from
+##   serial.aowl's overload set, all numbers little-endian, VarInt ZigZag. Writing to the buffer cannot
+##   fail, so no result, except where upstream's `write` can itself return an error: those return
+##   `ProtoWriteVoidResult` and are marked in their file.
+## * Serverbound (`S...`) packets, `PacketRead`: `proc packetRead*(_: typedesc[SFoo]; r: var NetReader):
+##   ProtoReadResult[SFoo]`.
+## * `#[serial(big_endian)]` fields use `packetWriteBe`/`packetReadBe`. A `Vec<u8>` field that is not
+##   `#[serial(no_prefix)]` carries a VarUInt length; `Vec<T>` of anything else is written without a
+##   length, as upstream's `Vec<T>: PacketWrite` does, so the packet writes its own count.
+## * Offline RakNet packets (unconnected ping/pong, open connection) are written/read by the caller with
+##   their one-byte id first. `rakPacketBytes(id, w)` gives that framing. The id byte of a read packet has
+##   been consumed by the caller before `packetRead`.
+## * RakNet datagrams: `FrameSet`/`Frame` (frame_set.aowl) and `Acknowledge` (ack.aowl) carry the id
+##   byte (0x80..0x8f frame set, `RAKNET_ACK` 0xC0, `RAKNET_NACK` 0xA0) as a parameter of `write`, as
+##   upstream's `id: u8` argument. Reading starts after the id byte: `readFrameSet`, `readAcknowledge`.
+## * Game packets travel as `0xfe`, an optional compression method byte and an optional encryption layer
+##   (crypto.aowl, AES-256-CTR plus an 8-byte SHA-256 checksum); compression is raw deflate (rawdeflate.aowl).
+##   `UDPNetworkEncoder.writeGamePacket` builds one, `UDPNetworkDecoder.getPacketPayload` and `getGamePacket`
+##   take one apart. The socket, the encryptor's call order and every handshake decision are the network layer's.
+## * Public entry points: `import bedrockapi` for this folder's framing layer, `import client/clientmod` and
+##   `import server/servermod` for the packets (each links item tables; import single packet modules to avoid
+##   that), `import client/raknet/raknetmod` and `import server/raknet/raknetmod` for the RakNet packets.
+## * Packet fields that upstream spells with a Rust keyword (`block`, `type`, `end`) get a suffix or a synonym,
+##   noted at the field. Rust enums with variants of different shapes become a `kind` plus the fields that
+##   variant uses.
+## * Things worth knowing before building on this: (1) the offline replies COpenConnectionReply1/2 and
+##   CAlreadyConnected etc. write their GUID and MTU little-endian, because upstream's derive writes them so
+##   (a real RakNet client reads big-endian); (2) `CPlayStatus` is a BIG-endian i32; (3) `CNetworkChunkPublisherUpdate`
+##   counts its chunk list with a little-endian u32; (4) `ItemStackWrapper` writes its id as a VarInt and reads
+##   an i16; `NetworkItemDescriptor` writes no net-id flag but reads one; the user data block lists are written
+##   with a u32 count and read with a VarUInt count. All are upstream's, kept and covered by tests.
+##
+## Wire target
+## -----------
+## The pinned tree targets Bedrock game protocol 1001 (Minecraft 1.26.30): `CURRENT_BEDROCK_MC_PROTOCOL`
+## and `CURRENT_BEDROCK_MC_VERSION` in pumpkin-world/src/lib.rs (it also knows 671, 1.21).
+## `RAKNET_PROTOCOL_VERSION` below is RakNet's own 11. Every packet test here is the exact bytes `write`
+## produces for the field layout in the pinned Rust, worked out by hand for that protocol.
+##
+## ZigZag: upstream's pinned `VarInt::read` decodes negatives wrongly; src/protocol/varint.aowl follows the
+## newer tree (../ref/pumpkin), which decodes `(v >> 1) ^ -(v & 1)`. Every Bedrock VarInt read here goes
+## through it. The newer tree's other Bedrock additions (biome definitions, mob effects, container data,
+## and so on) are not in the pinned crate and are not ported here.
+
+import ../protobase, ../netcodec
+
+const
+  CurrentBedrockMcProtocol* = 1001'u32
+  CurrentBedrockMcVersion* = "1.26.30"
+  RAKNET_PROTOCOL_VERSION* = 11'u8
+  UDP_HEADER_SIZE* = 28
+  MTU* = 1400
+  ## 26 bytes is RakNet header for FrameSet containing a single, ReliableOrdered, split/fragmented frame
+  SPLIT_FRAME_MAX_CONTENT* = MTU - UDP_HEADER_SIZE - 26
+
+  RAKNET_MAGIC*: array[16, uint8] = [0x00'u8, 0xff, 0xff, 0x00, 0xfe, 0xfe, 0xfe, 0xfe,
+    0xfd, 0xfd, 0xfd, 0xfd, 0x12, 0x34, 0x56, 0x78]
+
+  RAKNET_VALID* = 0x80'u8
+  RAKNET_ACK* = 0xC0'u8
+  RAKNET_NACK* = 0xA0'u8
+
+  RAKNET_GAME_PACKET* = 0xfe'i32
+
+  RAKNET_SPLIT* = 0x10'u8
+
+type
+  RakReliability* = enum
+    ## Declared in upstream's order; `ReliableOrdered` is the default.
+    rrUnreliable
+    rrUnreliableSequenced
+    rrReliable
+    rrReliableOrdered
+    rrReliableSequenced
+    rrUnreliableWithAckReceipt
+    rrReliableWithAckReceipt
+    rrReliableOrderedWithAckReceipt
+
+  SubClient* = enum
+    ## `#[repr(u16)]`; the value is the enum's ordinal (`scMain` is 0). Upstream spells the last
+    ## variant `SubClietn2`.
+    scMain
+    scSubClient0
+    scSubClient1
+    scSubClietn2
+
+proc defaultRakReliability*(): RakReliability = rrReliableOrdered
+
+proc isReliable*(self: RakReliability): bool =
+  self in {rrReliable, rrReliableOrdered, rrReliableSequenced, rrReliableWithAckReceipt,
+    rrReliableOrderedWithAckReceipt}
+
+proc isSequenced*(self: RakReliability): bool =
+  self in {rrReliableSequenced, rrUnreliableSequenced}
+
+proc isOrdered*(self: RakReliability): bool =
+  self in {rrUnreliableSequenced, rrReliableOrdered, rrReliableSequenced, rrReliableOrderedWithAckReceipt}
+
+proc isOrderExclusive*(self: RakReliability): bool =
+  self in {rrReliableOrdered, rrReliableOrderedWithAckReceipt}
+
+proc rakReliabilityFromId*(id: uint8): (bool, RakReliability) =
+  ## `RakReliability::from_id`: `(false, ...)` is upstream's `None`.
+  if id <= 7'u8:
+    (true, RakReliability(int(id)))
+  else:
+    (false, rrReliableOrdered)
+
+proc toId*(self: RakReliability): uint8 = uint8(ord(self))
+
+proc subClientValue*(self: SubClient): uint32 = uint32(ord(self))
+
+proc rakPacketBytes*(id: uint8; w: NetWriter): seq[byte] =
+  ## An offline RakNet packet as it goes on the wire: the id byte, then the body.
+  result = @[id]
+  for b in w.buf:
+    result.add(b)
+
+proc writeRakMagic*(w: var NetWriter) =
+  ## `magic: [u8; 16]` set to `RAKNET_MAGIC`, written as sixteen bytes with no length.
+  for b in RAKNET_MAGIC:
+    writeU8(w, b)
+
+proc readRakMagic*(r: var NetReader): ProtoReadResult[array[16, uint8]] =
+  ## `magic: [u8; 16]` as read by `PacketRead`. Upstream does not check the value; neither does this.
+  var magic = RAKNET_MAGIC
+  for i in 0 ..< 16:
+    let b = getU8(r)
+    if not b.isOk:
+      return readErr[array[16, uint8]](b.error)
+    magic[i] = b.value
+  readOk(magic)

@@ -1,0 +1,119 @@
+## Port of pumpkin-protocol/src/bedrock/crypto.rs
+## Bedrock packet encryption: AES-256 in CTR mode over `payload ++ checksum`, where the checksum is the first
+## 8 bytes of SHA-256(counter_le ++ payload ++ key). The IV is the first 12 bytes of the key followed by
+## `00 00 00 02`. Encryptor and decryptor each keep their own cipher stream and a packet counter.
+##
+## `aes256.aowl` is the `aes`/`ctr` crates; SHA-256 is `sha2.nim` of the sibling `jwt` library, the one
+## src/server/net/netbase.aowl already uses (`-p:../jwt/src`).
+##
+## `BedrockDecryptor::decrypt` returns `Result<(), String>`; here it is a `DecryptResult` with the same text.
+
+import sha2
+import aes256
+
+export aes256
+
+type
+  BedrockEncryptor* = object
+    cipher: Aes256Ctr
+    key: array[32, uint8]
+    sendCounter: uint64
+
+  BedrockDecryptor* = object
+    cipher: Aes256Ctr
+    key: array[32, uint8]
+    sendCounter: uint64
+
+  DecryptResult* = object
+    ## `Result<(), String>`: `isOk` false carries upstream's error string in `error`.
+    isOk*: bool
+    error*: string
+
+const
+  Zero16: array[16, uint8] = [0'u8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+  Zero8: array[8, uint8] = [0'u8, 0, 0, 0, 0, 0, 0, 0]
+
+proc bedrockIv(key: array[32, uint8]): array[16, uint8] =
+  var iv = Zero16
+  for i in 0 ..< 12:
+    iv[i] = key[i]
+  iv[12] = 0'u8
+  iv[13] = 0'u8
+  iv[14] = 0'u8
+  iv[15] = 2'u8
+  iv
+
+proc counterLe(counter: uint64): array[8, uint8] =
+  var b = Zero8
+  for i in 0 ..< 8:
+    b[i] = uint8((counter shr uint64(i * 8)) and 0xFF'u64)
+  b
+
+proc checksumOf(counter: uint64; payload: openArray[byte]; key: array[32, uint8]): array[8, uint8] =
+  ## `Sha256(counter.to_le_bytes() ++ payload ++ key)[..8]`.
+  var input: seq[byte] = @[]
+  for b in counterLe(counter):
+    input.add(b)
+  for b in payload:
+    input.add(b)
+  for b in key:
+    input.add(b)
+  let hash = sha256(input)
+  var sum = Zero8
+  for i in 0 ..< 8:
+    sum[i] = hash[i]
+  sum
+
+proc newBedrockEncryptor*(key: array[32, uint8]): BedrockEncryptor =
+  let iv = bedrockIv(key)
+  BedrockEncryptor(cipher: newAes256Ctr(key, iv), key: key, sendCounter: 0'u64)
+
+proc newBedrockDecryptor*(key: array[32, uint8]): BedrockDecryptor =
+  let iv = bedrockIv(key)
+  BedrockDecryptor(cipher: newAes256Ctr(key, iv), key: key, sendCounter: 0'u64)
+
+proc encrypt*(self: var BedrockEncryptor; data: var seq[byte]) =
+  ## `data` holds the payload after the 0xfe byte; the 8-byte checksum is appended, then everything is
+  ## enciphered, and the send counter advances.
+  let sum = checksumOf(self.sendCounter, data, self.key)
+  for b in sum:
+    data.add(b)
+  self.cipher.applyKeystream(data)
+  self.sendCounter += 1'u64
+
+const HexDigits = "0123456789abcdef"
+
+proc hexDebug(b: openArray[byte]): string =
+  ## Rust's `{:x?}` of a byte slice: `[fa, 1c, 6]`, lowercase and without zero padding.
+  result = "["
+  for i in 0 ..< b.len:
+    if i > 0:
+      result.add(", ")
+    if b[i] >= 16'u8:
+      result.add(HexDigits[int(b[i] shr 4)])
+    result.add(HexDigits[int(b[i] and 15'u8)])
+  result.add("]")
+
+proc decrypt*(self: var BedrockDecryptor; data: var seq[byte]): DecryptResult =
+  ## Deciphers `data` in place, checks the trailing checksum, and truncates it off. The cipher stream has
+  ## advanced either way, as upstream's has when the checksum is wrong.
+  let ciphertext = data
+  self.cipher.applyKeystream(data)
+  if data.len < 8:
+    return DecryptResult(isOk: false, error: "Encrypted packet must be at least 8 bytes long")
+  let payloadLen = data.len - 8
+  let checksum = data[payloadLen ..< data.len]
+  let ours = checksumOf(self.sendCounter, data[0 ..< payloadLen], self.key)
+  var same = true
+  for i in 0 ..< 8:
+    if checksum[i] != ours[i]:
+      same = false
+  if not same:
+    let cipherPrefix = if ciphertext.len > 16: ciphertext[0 ..< 16] else: ciphertext
+    let plainPrefix = if data.len > 16: data[0 ..< 16] else: data
+    return DecryptResult(isOk: false, error: "Invalid checksum: expected " & hexDebug(ours) & ", got " &
+      hexDebug(checksum) & ". Cipher prefix: " & hexDebug(cipherPrefix) & ", Plain prefix: " &
+      hexDebug(plainPrefix) & ", Key: " & hexDebug(self.key) & ", Counter: " & $self.sendCounter)
+  data.setLen(payloadLen)
+  self.sendCounter += 1'u64
+  DecryptResult(isOk: true, error: "")

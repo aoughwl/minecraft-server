@@ -1,0 +1,282 @@
+## Test for the RakNet layer: bedrockmod.aowl, ack.aowl, frame_set.aowl and the client/server raknet packets.
+## Every expected byte string was built independently from the field layout in the pinned Rust (struct.pack in
+## a scratch script), not from this port. It walks a full offline handshake as a server sees it, then the
+## connected part inside frame sets: unconnected ping/pong, open connection request 1 and reply 1, request 2
+## and reply 2, connection request and accepted, new incoming connection, with the sequence numbers and
+## acknowledgements that go with them.
+import bedrocktestutil
+import bedrockmod, ack, frame_set
+import client/raknet/raknetmod
+import server/raknet/raknetmod as srv
+
+const
+  Magic = "00ffff00fefefefefdfdfdfd12345678"
+  ServerGuid = 0x1122334455667788'u64
+  ClientGuid = 0x0102030405060708'u64
+  Addr = "04 7f000001 4abc"
+
+let clientAddr = SocketAddr(isV6: false, ip: @[127'u8, 0, 0, 1], port: 19132'u16)
+
+# bedrockmod.aowl constants and reliability helpers.
+check(RAKNET_PROTOCOL_VERSION == 11'u8, "raknet version")
+check(MTU == 1400 and UDP_HEADER_SIZE == 28 and SPLIT_FRAME_MAX_CONTENT == 1346, "mtu constants")
+check(CurrentBedrockMcProtocol == 1001'u32, "protocol 1001")
+check(RAKNET_ACK == 0xC0'u8 and RAKNET_NACK == 0xA0'u8 and RAKNET_VALID == 0x80'u8 and RAKNET_SPLIT == 0x10'u8, "flags")
+check(RAKNET_GAME_PACKET == 0xfe'i32, "game packet id")
+check(defaultRakReliability() == rrReliableOrdered, "default reliability")
+for id in 0'u8 .. 7'u8:
+  let (ok, rel) = rakReliabilityFromId(id)
+  check(ok and rel.toId() == id, "reliability id round trip")
+check(not rakReliabilityFromId(8'u8)[0], "reliability 8 is none")
+check(not rrUnreliable.isReliable() and rrReliable.isReliable() and rrReliableWithAckReceipt.isReliable() and
+  not rrUnreliableWithAckReceipt.isReliable(), "is_reliable")
+check(rrReliableSequenced.isSequenced() and rrUnreliableSequenced.isSequenced() and not rrReliableOrdered.isSequenced(),
+  "is_sequenced")
+check(rrReliableOrdered.isOrdered() and rrUnreliableSequenced.isOrdered() and not rrReliable.isOrdered() and
+  rrReliableOrderedWithAckReceipt.isOrdered(), "is_ordered")
+check(rrReliableOrdered.isOrderExclusive() and rrReliableOrderedWithAckReceipt.isOrderExclusive() and
+  not rrReliableSequenced.isOrderExclusive(), "is_order_exclusive")
+check(scSubClietn2.subClientValue() == 3'u32, "subclient")
+
+# --- 1. Unconnected ping, then the pong ------------------------------------------------------------------
+block:
+  var r = newNetReader(hx("01 0000000000012345 " & Magic & " 0102030405060708"))
+  check(remaining(r) == 33, "ping length")
+  let id = getU8(r)
+  check(id.isOk and int32(id.value) == SUnconnectedPingPacketId, "ping id")
+  let ping = packetRead(SUnconnectedPing, r)
+  check(ping.isOk and remaining(r) == 0, "ping parse")
+  check(ping.value.time == 0x12345'u64 and ping.value.clientGuid == ClientGuid and ping.value.magic == RAKNET_MAGIC,
+    "ping fields")
+  # ping open connections is the same layout under id 0x02
+  var r2 = newNetReader(hx("0000000000012345 " & Magic & " 0102030405060708"))
+  let ping2 = packetRead(SUnconnectedPingOpenConnections, r2)
+  check(ping2.isOk and ping2.value.clientGuid == ClientGuid, "ping open connections")
+  check(SUnconnectedPingOpenConnectionsPacketId == 2'i32, "ping2 id")
+  # a short ping fails, it does not read past the end
+  var shortR = newNetReader(hx("0000000000012345 " & Magic))
+  check(not packetRead(SUnconnectedPing, shortR).isOk, "short ping")
+
+  let info = ServerInfo(edition: "MCPE", motdLine1: "Pumpkin", protocolVersion: 1001'u32, versionName: "1.26.30",
+    playerCount: 3'i32, maxPlayerCount: 20'u32, serverUniqueId: ServerGuid, motdLine2: "World", gameMode: "Survival",
+    gameModeNumeric: 1'u32, portIpv4: 19132'u16, portIpv6: 19133'u16)
+  let shown = $info
+  check(shown == "MCPE;Pumpkin;1001;1.26.30;3;20;1234605616436508552;World;Survival;1;19132;19133;0;", "server info display")
+  let pong = newCUnconnectedPong(ping.value.time, ServerGuid, RAKNET_MAGIC, shown)
+  check(CUnconnectedPongPacketId == 0x1c'i32, "pong id")
+  eqHex(wire(CUnconnectedPongPacketId, pong),
+    "1c 0000000000012345 1122334455667788 " & Magic & " 0052 " & utf8Hex(shown), "unconnected pong")
+
+# --- 2. Open connection request 1 / reply 1 --------------------------------------------------------------
+block:
+  var r = newNetReader(hx("05 " & Magic & " 0b 0578"))
+  discard getU8(r)
+  let req = packetRead(SOpenConnectionRequest1, r)
+  check(req.isOk and remaining(r) == 0, "request 1 parse")
+  check(req.value.protocolVersion == RAKNET_PROTOCOL_VERSION and req.value.mtu == 1400'u16, "request 1 fields")
+  # A different RakNet version gets the incompatible-protocol packet.
+  let bad = newCIncompatibleProtocolVersion(RAKNET_PROTOCOL_VERSION, ServerGuid)
+  eqHex(wire(CIncompatibleProtocolVersionPacketId, bad),
+    "19 0b " & Magic & " 8877665544332211", "incompatible protocol")
+  # Reply: guid and mtu go out little-endian, as the derive writes them.
+  let rep = newCOpenConnectionReply1(ServerGuid, false, uint16(MTU))
+  eqHex(wire(COpenConnectionReply1PacketId, rep),
+    "06 " & Magic & " 8877665544332211 00 7805", "open connection reply 1")
+
+# --- 3. Open connection request 2 / reply 2 --------------------------------------------------------------
+block:
+  var r = newNetReader(hx("07 " & Magic & " " & Addr & " 0578 0102030405060708"))
+  discard getU8(r)
+  let req = packetRead(SOpenConnectionRequest2, r)
+  check(req.isOk and remaining(r) == 0, "request 2 parse")
+  check(req.value.serverAddress.port == 19132'u16 and req.value.serverAddress.ip == @[127'u8, 0, 0, 1], "request 2 addr")
+  check(req.value.mtu == 1400'u16 and req.value.clientGuid == ClientGuid, "request 2 fields")
+  let rep = newCOpenConnectionReply2(ServerGuid, clientAddr, req.value.mtu, false)
+  eqHex(wire(COpenConnectionReply2PacketId, rep),
+    "08 " & Magic & " 8877665544332211 " & Addr & " 7805 00", "open connection reply 2")
+  # IPv6 address shape: version 6, family 10 (little-endian), port, flow info, 16 octets, scope id.
+  let v6 = SocketAddr(isV6: true, ip: @[0'u8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1], port: 19133'u16,
+    flowInfo: 1'u32, scopeId: 2'u32)
+  eqHex(wrote(v6), "06 0a00 4abd 00000001 00000000000000000000000000000001 00000002", "ipv6 address")
+  var rv6 = newNetReader(wrote(v6))
+  let back = packetRead(SocketAddr, rv6)
+  check(back.isOk and back.value.isV6 and back.value.scopeId == 2'u32 and back.value.port == 19133'u16, "ipv6 read")
+
+# --- 4. Connection request inside frame set 0, the accept, the new incoming connection -------------------
+block:
+  # Datagram 0x84 (a frame set), sequence 0, one ReliableOrdered frame carrying the connection request.
+  let datagram = hx("84 000000 60 0090 000000 000000 00 09 0102030405060708 0000000000012345 00")
+  var r = newNetReader(datagram)
+  let head = getU8(r)
+  check(head.isOk and (head.value and 0xF0'u8) == RAKNET_VALID, "frame set header")
+  let fs = readFrameSet(r)
+  check(fs.isOk and fs.value.sequence.value == 0'u32 and fs.value.frames.len == 1, "frame set parse")
+  check(fs.value.frames[0].reliability == rrReliableOrdered and fs.value.frames[0].payload.len == 18, "frame fields")
+  check(fs.value.frames[0].reliableNumber == 0'u32 and fs.value.frames[0].orderIndex == 0'u32, "frame numbers")
+  var pr = newNetReader(fs.value.frames[0].payload)
+  discard getU8(pr)
+  let creq = packetRead(SConnectionRequest, pr)
+  check(creq.isOk and creq.value.clientGuid == ClientGuid and creq.value.time == 0x12345'u64 and not creq.value.security,
+    "connection request")
+  # The datagram is acknowledged by its sequence number.
+  var ackW = newNetWriter()
+  newAcknowledge(@[fs.value.sequence.value]).write(ackW, RAKNET_ACK)
+  eqHex(ackW.buf, "c0 0001 01 000000", "ack of datagram 0")
+
+  # Connection request accepted: ten system addresses, little-endian timestamps.
+  var sys: seq[SocketAddr] = @[]
+  for i in 0 ..< 10:
+    sys.add(SocketAddr(isV6: false, ip: @[127'u8, 0, 0, 1], port: 0'u16))
+  let acc = newCConnectionRequestAccepted(clientAddr, 0'u16, sys, creq.value.time, creq.value.time + 5'u64)
+  var sysHex = ""
+  for i in 0 ..< 10:
+    sysHex.add("047f0000010000")
+  let accBytes = wire(CConnectionRequestAcceptedPacketId, acc)
+  eqHex(accBytes, "10 " & Addr & " 0000 " & sysHex & " 4523010000000000 4a23010000000000", "connection request accepted")
+
+  # The reply travels back as sequence 0 of the server's datagrams, in a ReliableOrdered frame.
+  var frame = defaultFrame()
+  frame.payload = accBytes
+  var outSet = FrameSet(sequence: U24(value: 0'u32), frames: @[frame])
+  var ow = newNetWriter()
+  outSet.writePacketData(ow, 0x84'u8)
+  check(accBytes.len == 1 + 7 + 2 + 70 + 8 + 8, "accepted payload length")
+  check(ow.buf.len == 1 + 3 + 1 + 2 + 3 + 3 + 1 + accBytes.len, "accepted datagram length")
+  check(ow.buf[0] == 0x84'u8 and ow.buf[4] == 0x60'u8, "accepted datagram header")
+  let bits = (uint16(ow.buf[5]) shl 8) or uint16(ow.buf[6])
+  check(int(bits) == accBytes.len * 8, "frame bit length")
+
+  # New incoming connection arrives in frame set 1, reliable number 1, order index 1.
+  let d2 = hx("84 010000 60 00f8 010000 010000 00 13 " & Addr & " " & Addr & " 000000000001234a 000000000001234e")
+  var r2 = newNetReader(d2)
+  discard getU8(r2)
+  let fs2 = readFrameSet(r2)
+  check(fs2.isOk and fs2.value.sequence.value == 1'u32 and fs2.value.frames[0].reliableNumber == 1'u32 and
+    fs2.value.frames[0].orderIndex == 1'u32, "frame set 1")
+  var pr2 = newNetReader(fs2.value.frames[0].payload)
+  discard getU8(pr2)
+  let inc = packetRead(SNewIncomingConnection, pr2)
+  check(inc.isOk and remaining(pr2) == 0, "new incoming parse")
+  check(inc.value.serverAddress.port == 19132'u16 and inc.value.internalAddress.port == 19132'u16, "new incoming addrs")
+  check(inc.value.pingTime == 0x1234a'u64 and inc.value.pongTime == 0x1234e'u64, "new incoming times")
+  check(SDisconnectPacketId == 0x15'i32 and SConnectionLostPacketId == 0x16'i32 and CDisconnectPacketId == 0x15'i32,
+    "disconnect ids")
+
+# Connected ping/pong: the ping is big-endian, the pong little-endian (derive without big_endian).
+block:
+  var r = newNetReader(hx("0000000000012345"))
+  let ping = packetRead(SConnectedPing, r)
+  check(ping.isOk and ping.value.time == 0x12345'u64, "connected ping")
+  eqHex(wrote(newCConnectedPong(0x12345'u64, 0x12349'u64)), "4523010000000000 4923010000000000", "connected pong")
+  check(CConnectedPongPacketId == 3'i32, "pong id 3")
+
+# Refusals carry the magic and the guid.
+eqHex(wrote(newCAlreadyConnected(ServerGuid)), Magic & " 8877665544332211", "already connected")
+eqHex(wrote(newCNoFreeIncomingConnections(ServerGuid)), Magic & " 8877665544332211", "no free incoming")
+eqHex(wrote(newCConnectionBanned(ServerGuid)), Magic & " 8877665544332211", "banned")
+eqHex(wrote(newCIpRecentlyConnected(ServerGuid)), Magic & " 8877665544332211", "ip recently connected")
+check(CAlreadyConnectedPacketId == 0x12'i32 and CNoFreeIncomingConnectionsPacketId == 0x14'i32 and
+  CConnectionBannedPacketId == 0x17'i32 and CIpRecentlyConnectedPacketId == 0x1A'i32, "refusal ids")
+eqHex(wrote(CDisconnect()), "", "disconnect has no body")
+
+# --- Acknowledge ---------------------------------------------------------------------------------------
+block:
+  var w = newNetWriter()
+  newAcknowledge(@[5'u32, 3'u32, 4'u32, 9'u32]).write(w, RAKNET_ACK)
+  eqHex(w.buf, "c0 0002 00 030000 050000 01 090000", "ack sorts and merges runs")
+  var rr = newNetReader(w.buf)
+  discard getU8(rr)
+  let got = readAcknowledge(rr)
+  check(got.isOk and got.value.sequences == @[3'u32, 4'u32, 5'u32, 9'u32], "ack read expands ranges")
+  var w2 = newNetWriter()
+  newAcknowledge(@[7'u32]).write(w2, RAKNET_NACK)
+  eqHex(w2.buf, "a0 0001 01 070000", "nack")
+  var w3 = newNetWriter()
+  newAcknowledge(@[]).write(w3, RAKNET_ACK)
+  eqHex(w3.buf, "c0 0000", "empty ack")
+  var tooMany = newNetReader(hx("1001"))
+  let tm = readAcknowledge(tooMany)
+  check(not tm.isOk and tm.error.msg == "Acknowledge packet range is too large.", "4097 records rejected")
+  var edge = newNetReader(hx("1000 01 000000"))
+  check(not readAcknowledge(edge).isOk, "truncated ack")
+  # Duplicates are not merged: a repeated sequence starts a new record.
+  var w4 = newNetWriter()
+  newAcknowledge(@[1'u32, 1'u32, 2'u32]).write(w4, RAKNET_ACK)
+  eqHex(w4.buf, "c0 0002 01 010000 00 010000 020000", "duplicate sequence")
+
+# --- Frames --------------------------------------------------------------------------------------------
+block:
+  # Unreliable frame: no numbers at all. Header byte 0x00, bit length 0x0018.
+  var r1 = newNetReader(hx("00 0018 fe0102"))
+  let f1 = readFrames(r1)
+  check(f1.isOk and f1.value.len == 1 and f1.value[0].reliability == rrUnreliable and f1.value[0].payload == hx("fe0102"),
+    "unreliable frame")
+  var w = newNetWriter()
+  f1.value[0].write(w)
+  eqHex(w.buf, "00 0018 fe0102", "unreliable frame write")
+  var fw = newNetWriter()
+  FrameSet(sequence: U24(value: 2'u32), frames: @[newUnreliable(hx("fe0102"))]).writePacketData(fw, 0x84'u8)
+  eqHex(fw.buf, "84 020000 00 0018 fe0102", "frame set with an unreliable frame")
+
+  # Split fragment: reliable ordered, split flag set, big-endian split size/id/index.
+  var sp = defaultFrame()
+  sp.payload = hx("aabb")
+  sp.reliableNumber = 5'u32
+  sp.orderIndex = 6'u32
+  sp.splitSize = 3'u32
+  sp.splitId = 9'u16
+  sp.splitIndex = 1'u32
+  var sw = newNetWriter()
+  FrameSet(sequence: U24(value: 3'u32), frames: @[sp]).writePacketData(sw, 0x84'u8)
+  eqHex(sw.buf, "84 030000 70 0010 050000 060000 00 00000003 0009 00000001 aabb", "split frame")
+  var sr = newNetReader(sw.buf)
+  discard getU8(sr)
+  let back = readFrameSet(sr)
+  check(back.isOk and back.value.frames[0].splitSize == 3'u32 and back.value.frames[0].splitId == 9'u16 and
+    back.value.frames[0].splitIndex == 1'u32 and back.value.frames[0].payload == hx("aabb"), "split frame read")
+
+  # Sequenced shapes: unreliable sequenced has a sequence index and an order index, no reliable number.
+  var us = defaultFrame()
+  us.reliability = rrUnreliableSequenced
+  us.payload = hx("7f")
+  us.sequenceIndex = 0x010203'u32
+  us.orderIndex = 0x040506'u32
+  us.orderChannel = 2'u8
+  var uw = newNetWriter()
+  us.write(uw)
+  eqHex(uw.buf, "20 0008 030201 060504 02 7f", "unreliable sequenced")
+  var rs = defaultFrame()
+  rs.reliability = rrReliableSequenced
+  rs.payload = hx("7f")
+  rs.reliableNumber = 7'u32
+  rs.sequenceIndex = 0x010203'u32
+  rs.orderIndex = 0x040506'u32
+  rs.orderChannel = 2'u8
+  var rw = newNetWriter()
+  rs.write(rw)
+  eqHex(rw.buf, "80 0008 070000 030201 060504 02 7f", "reliable sequenced")
+  var rsr = newNetReader(rw.buf)
+  let rsb = readFrames(rsr)
+  check(rsb.isOk and rsb.value[0].reliability == rrReliableSequenced and rsb.value[0].sequenceIndex == 0x010203'u32 and
+    rsb.value[0].orderChannel == 2'u8, "reliable sequenced read")
+
+  # Several frames in one datagram, and the refusals.
+  var two = newNetWriter()
+  FrameSet(sequence: U24(value: 0'u32), frames: @[newUnreliable(hx("01")), newUnreliable(hx("0203"))]).writePacketData(two, 0x84'u8)
+  var tr = newNetReader(two.buf)
+  discard getU8(tr)
+  let tf = readFrameSet(tr)
+  check(tf.isOk and tf.value.frames.len == 2 and tf.value.frames[1].payload == hx("0203"), "two frames")
+  # All eight values of the three reliability bits are valid, so upstream's "Invalid reliability" is unreachable.
+  var tooBig = newNetReader(hx("00 2c48"))  # 11336 bits = 1417 bytes > MTU
+  let tb = readFrames(tooBig)
+  check(not tb.isOk and tb.error.msg == "Frame payload length exceeds RakNet MTU", "frame over MTU")
+  var truncated = newNetReader(hx("00 0018 fe01"))
+  check(not readFrames(truncated).isOk, "truncated frame payload")
+  # Bit length rounds up to whole bytes.
+  var odd = newNetReader(hx("00 0009 0102"))
+  let od = readFrames(odd)
+  check(od.isOk and od.value[0].payload.len == 2, "bit length rounds up")
+  check(defaultFrameSet().frames.len == 0 and defaultFrameSet().sequence.value == 0'u32, "frame set default")
+
+echo "all raknet checks passed"

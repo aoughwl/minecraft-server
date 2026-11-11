@@ -1,0 +1,148 @@
+## Port of pumpkin-protocol/src/bedrock/packet_decoder.rs
+##
+## decrypt -> decompress -> raw
+##
+## Upstream's `get_packet_payload` is async only because the deflate decoder is; here it is a plain call.
+## `DecryptionReader` (the AES-128 CFB8 stream wrapper, unused by Bedrock) is gone with the async stream, as in
+## ../java/packet_decoder.aowl.
+##
+## `getPacketPayload` takes one whole datagram body starting at the 0xfe byte, and returns the decompressed
+## batch. `getGamePacket` then takes one packet from a `NetReader` over that batch; call it until the
+## reader is empty (upstream's callers loop on the cursor).
+
+import ../protobase, ../proto, ../varint, ../netcodec
+import bedrockmod, crypto, rawdeflate
+
+type
+  UDPNetworkDecoder* = object
+    ## Decoder: Client -> Server
+    ## Supports zlib (raw deflate) decoding and AES-256 encryption.
+    hasCompression*: bool
+    compression*: CompressionThreshold
+    hasDecryptor*: bool
+    decryptor*: BedrockDecryptor
+
+  EncryptionAlreadyEnabledError* = object
+    ## `EncryptionAlreadyEnabledError`: "Encryption already enabled".
+    msg*: string
+
+  SetDecryptionResult* = object
+    isOk*: bool
+    error*: EncryptionAlreadyEnabledError
+
+  PayloadResult* = object
+    case isOk*: bool
+    of true: value*: seq[byte]
+    of false: error*: PacketDecodeError
+
+  GamePacketResult* = object
+    case isOk*: bool
+    of true: value*: RawPacket
+    of false: error*: PacketDecodeError
+
+proc payloadOk(v: sink seq[byte]): PayloadResult = PayloadResult(isOk: true, value: v)
+proc payloadErr(e: PacketDecodeError): PayloadResult = PayloadResult(isOk: false, error: e)
+proc gameOk(v: sink RawPacket): GamePacketResult = GamePacketResult(isOk: true, value: v)
+proc gameErr(e: PacketDecodeError): GamePacketResult = GamePacketResult(isOk: false, error: e)
+
+proc newUDPNetworkDecoder*(): UDPNetworkDecoder =
+  UDPNetworkDecoder(hasCompression: false, hasDecryptor: false)
+
+proc setCompression*(self: var UDPNetworkDecoder; threshold: CompressionThreshold) =
+  self.hasCompression = true
+  self.compression = threshold
+
+proc setEncryption*(self: var UDPNetworkDecoder; key: array[32, uint8]): SetDecryptionResult =
+  if self.hasDecryptor:
+    return SetDecryptionResult(isOk: false, error: EncryptionAlreadyEnabledError(msg: "Encryption already enabled"))
+  self.decryptor = newBedrockDecryptor(key)
+  self.hasDecryptor = true
+  SetDecryptionResult(isOk: true)
+
+const HexDigits = "0123456789abcdef"
+
+proc hex2(b: uint8): string =
+  var r = ""
+  r.add(HexDigits[int(b shr 4)])
+  r.add(HexDigits[int(b and 15'u8)])
+  r
+
+proc getPacketPayload*(self: var UDPNetworkDecoder; fullPacket: seq[byte]): PayloadResult =
+  ## `get_packet_payload`.
+  if fullPacket.len == 0:
+    return payloadErr(packetDecodeError(pdeMalformedLength, "Empty packet"))
+
+  # If the first byte is not 0xfe, it is likely a RakNet control packet or encrypted.
+  if fullPacket[0] != 0xfe'u8:
+    return payloadErr(packetDecodeError(pdeMalformedLength, "Missing 0xfe header (found 0x" & hex2(fullPacket[0]) & ")"))
+
+  var dataToDecrypt: seq[byte] = fullPacket[1 ..< fullPacket.len]
+  if self.hasDecryptor:
+    let dec = self.decryptor.decrypt(dataToDecrypt)
+    if not dec.isOk:
+      return payloadErr(packetDecodeError(pdeMessage, dec.error))
+
+  let fullPacketPayload = dataToDecrypt
+
+  # If compression is NOT enabled yet, the payload starts at index 0.
+  if not self.hasCompression:
+    if fullPacketPayload.len > MaxPacketDataSize:
+      return payloadErr(packetDecodeError(pdeTooLong))
+    return payloadOk(fullPacketPayload)
+
+  # If compression IS enabled, Bedrock expects a compression method byte at index 0.
+  if fullPacketPayload.len == 0:
+    return payloadErr(packetDecodeError(pdeMalformedLength, "Missing Bedrock compression method"))
+  let compressionMethod = fullPacketPayload[0]
+  let body = fullPacketPayload[1 ..< fullPacketPayload.len]
+
+  case compressionMethod
+  of 0x00'u8:
+    let inflated = rawInflate(body, MaxPacketDataSize + 1)
+    if not inflated.ok:
+      return payloadErr(packetDecodeError(pdeFailedDecompression, inflated.msg))
+    if inflated.data.len > MaxPacketDataSize:
+      return payloadErr(packetDecodeError(pdeTooLong))
+    payloadOk(inflated.data)
+  of 0xff'u8:
+    # None (Compression enabled but this specific packet is raw)
+    if body.len > MaxPacketDataSize:
+      return payloadErr(packetDecodeError(pdeTooLong))
+    payloadOk(body)
+  else:
+    payloadErr(packetDecodeError(pdeFailedDecompression, "Unsupported compression method: 0x" & hex2(compressionMethod)))
+
+proc getGamePacket*(self: UDPNetworkDecoder; reader: var NetReader): GamePacketResult =
+  ## `get_game_packet`: one `VarUInt` length, the 14-bit header, then the payload that fills the length.
+  let lenRes = getVarUInt(reader)
+  if not lenRes.isOk:
+    if lenRes.error.kind == reCleanEof:
+      return gameErr(packetDecodeError(pdeConnectionClosed))
+    return gameErr(packetDecodeError(pdeMalformedLength, lenRes.error.msg))
+  let packetLen = int(lenRes.value.value)
+  if packetLen == 0:
+    return gameErr(packetDecodeError(pdeMalformedLength, "Bedrock game packet length is zero"))
+  if packetLen > MaxPacketDataSize:
+    return gameErr(packetDecodeError(pdeTooLong))
+
+  let headRes = getVarUInt(reader)
+  if not headRes.isOk:
+    return gameErr(toPacketDecodeError(headRes.error))
+  let header = headRes.value.value and 0x3FFF'u32
+  let gamepacketId = uint16(header and 0x3FF'u32)
+
+  let headerSize = writtenSizeVarUInt(headRes.value)
+  if packetLen < headerSize:
+    return gameErr(packetDecodeError(pdeMalformedLength, "Bedrock game packet length " & $packetLen &
+      " is smaller than header size " & $headerSize))
+
+  let payloadLen = packetLen - headerSize
+  let remainingBytes = remaining(reader)
+  if payloadLen > remainingBytes:
+    return gameErr(packetDecodeError(pdeMalformedLength, "Bedrock game packet payload length " & $payloadLen &
+      " exceeds remaining batch bytes " & $remainingBytes))
+
+  let payload = readSlice(reader, payloadLen)
+  if not payload.isOk:
+    return gameErr(packetDecodeError(pdeFailedDecompression, payload.error.msg))
+  gameOk(RawPacket(id: int32(gamepacketId), payload: payload.value))
