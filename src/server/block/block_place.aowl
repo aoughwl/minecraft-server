@@ -1,17 +1,26 @@
-## `BlockRegistry::place_block` from pumpkin/src/block/registry.rs and `calc_block_breaking`'s neighbours there.
-## PARTIAL: pumpkin/src/block/registry.rs - `place_block` only, with every block behaving as the trait's defaults: `can_update_at` is false, `can_place_at` is true and `on_place` is the block's default state, so a log has no axis and a torch stands on anything. The behaviour lives in `src/server/block` and the registry that would look it up waits on the compiler fix for closures with a `ref of RootObj` parameter in a module-level table (`lookupBlock` in blockbehaviour.aowl), after which this is where `BlockBehaviour.onPlace` is called. `use_with_item`, `on_use` and `player_placed` are `barPass`, nothing and nothing for the same reason.
+## `BlockRegistry::place_block` from pumpkin/src/block/registry.rs, with its helpers `entity_blocks_block_placement` and
+## `has_blocking_entity_in_box`. The block behaviour it calls is the registry in registry.aowl, through the world's `BlockWorld`.
+## PARTIAL: pumpkin/src/block/registry.rs - the plugin event (`BlockPlaceEvent`) and the `PlacedBlock` advancement trigger are not fired: there are no plugins or advancements here yet. `use_with_item` and `on_use` are not called from here: `handleUseItemOn` in server/net/java/play.aowl is where upstream's `call_use_item_on` sits.
 
 import std/options
+import ../../protocol/java/client/play/block_update
 import ../../protocol/java/server/play/use_item_on
+import "../../data/item_stack/mod"
+import ../../inventory/[inventory, player_inventory]
 import ../../data/block_ext
 from ../../data/block_state import newBlockStateIdUnchecked, asU16, replaceable, getBlockCollisionShapes
+import ../../generated/block_properties
+import ../../generated/entity_type
 import ../../generated/translation as tr
 import ../../util/math/boundingbox
 import ../../util/text/text
 import ../serverbase
+import ../entity/entitymod
 import ../entity/player as playermod
 import ../world/worldmod
-import ../../world/world as worldtraits
+import "../../world/world" as worldtraits
+import blockbehaviour
+import worldhooks
 
 type
   BlockPlacingErrorKind* = enum
@@ -29,16 +38,34 @@ proc faceOffset*(face: BlockDirection): Vector3[int32] =
   ## `BlockDirection::to_offset`
   face.toOffset()
 
-proc blocksPlacement(player: Player): bool =
-  ## `entity_blocks_block_placement`: a spectator does not.
-  player.gamemode != Spectator
+proc endsWith(s, suffix: string): bool =
+  s.len >= suffix.len and s[s.len - suffix.len ..< s.len] == suffix
+
+proc entityBlocksBlockPlacement(base: EntityBase): bool =
+  ## `entity_blocks_block_placement`
+  let entity = base.entity
+  if entity.removed or entity.removalReason.isSome or entity.noClip or base.isSpectator():
+    return false
+  if base.living != nil:
+    return true
+  let resourceName = entity.entityType.resourceName
+  entity.entityType.id == EntityType.END_CRYSTAL.id or entity.entityType.id == EntityType.FALLING_BLOCK.id or
+    entity.entityType.id == EntityType.TNT.id or resourceName.endsWith("_minecart") or resourceName.endsWith("_boat") or
+    resourceName.endsWith("_raft")
 
 proc hasBlockingEntityInBox(world: World; placedBox: BoundingBox): bool =
-  ## `has_blocking_entity_in_box`, over the players: other entities are the later batch.
+  ## `has_blocking_entity_in_box`
   for player in world.players:
-    if blocksPlacement(player) and player.boundingBox().intersects(placedBox):
+    if entityBlocksBlockPlacement(playerBase(player)) and player.boundingBox().intersects(placedBox):
+      return true
+  for base in world.getEntitiesAtBox(placedBox):
+    if entityBlocksBlockPlacement(base):
       return true
   false
+
+proc waterReplacing(blockRef: Block; stateId: BlockStateId): BlockIsReplacing =
+  let props = WaterLikeProperties.fromStateId(stateId, blockRef)
+  BlockIsReplacing(kind: BlockIsReplacingKind.kWater, f0Water: props.level)
 
 proc placeBlock*(player: Player; placedBlock: Block; useItemOn: SUseItemOn; location: BlockPos;
     face: BlockDirection): PlaceBlockResult =
@@ -51,6 +78,8 @@ proc placeBlock*(player: Player; placedBlock: Block; useItemOn: SUseItemOn; loca
     discard
 
   let world = player.world
+  let blockWorld = BlockWorld(world.blockWorld)
+  let registry = blockWorld.blockRegistry
   let offset = faceOffset(face)
   if location.vec.y + offset.y < world.getBottomY():
     return PlaceBlockResult(ok: false, error: bpeBlockOutOfWorld)
@@ -59,23 +88,52 @@ proc placeBlock*(player: Player; placedBlock: Block; useItemOn: SUseItemOn; loca
       [text($world.getTopY())]).colorNamed(ncRed), true)
     return PlaceBlockResult(ok: false, error: bpeBlockOutOfWorld)
 
+  let blockPlayer = blockPlayerOf(player)
+  let server = BlockServer(tickCount: world.server.tickCounter)
   let clickedBlockPos = location
   let (clickedBlock, clickedBlockState) = world.getBlockAndState(clickedBlockPos)
 
-  # `can_update_at` is false for every block without behaviour.
+  var replacing = BlockIsReplacing(kind: BlockIsReplacingKind.kNone)
+  var replaceClicked = false
+  if sameBlock(clickedBlock, placedBlock):
+    if registry.canUpdateAt(blockWorld, clickedBlock, clickedBlockState.id, clickedBlockPos, face, useItemOn, blockPlayer):
+      replaceClicked = true
+      replacing = BlockIsReplacing(kind: BlockIsReplacingKind.kItself, f0Itself: clickedBlockState.id)
+  elif clickedBlockState.replaceable():
+    replaceClicked = true
+    if clickedBlock.name == "water":
+      replacing = waterReplacing(clickedBlock, clickedBlockState.id)
+    else:
+      replacing = BlockIsReplacing(kind: BlockIsReplacingKind.kOther)
+
   var finalBlockPos = clickedBlockPos
-  if sameBlock(clickedBlock, placedBlock) or not clickedBlockState.replaceable():
+  var finalFace = face.opposite()
+  if not replaceClicked:
     let blockPos0 = newBlockPos(location.vec.x + offset.x, location.vec.y + offset.y, location.vec.z + offset.z)
     let (previousBlock, previousBlockState) = world.getBlockAndState(blockPos0)
-    if sameBlock(previousBlock, placedBlock) or not previousBlockState.replaceable():
+    var replacePrevious = false
+    if sameBlock(previousBlock, placedBlock):
+      if registry.canUpdateAt(blockWorld, previousBlock, previousBlockState.id, blockPos0, face.opposite(), useItemOn, blockPlayer):
+        replacePrevious = true
+        replacing = BlockIsReplacing(kind: BlockIsReplacingKind.kItself, f0Itself: previousBlockState.id)
+    elif previousBlockState.replaceable():
+      replacePrevious = true
+      if previousBlock.name == "water":
+        replacing = waterReplacing(previousBlock, previousBlockState.id)
+      else:
+        replacing = BlockIsReplacing(kind: BlockIsReplacingKind.kNone)
+    if not replacePrevious:
       return
     finalBlockPos = blockPos0
 
-  # `on_place`: the trait's default.
-  let newState = placedBlock.defaultState
+  if not registry.canPlaceAt(server, blockWorld, blockWorld, blockPlayer, placedBlock, placedBlock.defaultState, finalBlockPos,
+      some(finalFace), some(useItemOn)):
+    return
+
+  let newState = registry.onPlace(server, blockWorld, blockPlayer, placedBlock, finalBlockPos, finalFace, replacing, useItemOn)
 
   # Mirror vanilla obstruction checks: only entities that block building should prevent placement.
-  let shapes = newState.getBlockCollisionShapes()
+  let shapes = BlockState.fromId(newState).getBlockCollisionShapes()
   for shape in shapes:
     let p = finalBlockPos.vec
     let placedBox = BoundingBox(
@@ -84,5 +142,34 @@ proc placeBlock*(player: Player; placedBlock: Block; useItemOn: SUseItemOn; loca
     if hasBlockingEntityInBox(world, placedBox):
       return
 
-  discard world.setBlockState(finalBlockPos, uint32(asU16(newState.id)), BfNotifyAll)
-  PlaceBlockResult(ok: true, placed: true, position: finalBlockPos, newState: asU16(newState.id))
+  discard world.setBlockState(finalBlockPos, uint32(asU16(newState)), BfNotifyAll)
+  registry.playerPlaced(blockWorld, placedBlock, newState, finalBlockPos, face, blockPlayer)
+  PlaceBlockResult(ok: true, placed: true, position: finalBlockPos, newState: asU16(newState))
+proc consumesAction*(r: BlockActionResult): bool =
+  ## `BlockActionResult::consumes_action`
+  r == barConsume or r == barSuccess or r == barSuccessServer
+
+proc isSuccessServer*(r: BlockActionResult): bool = r == barSuccessServer
+
+proc callUseItemOn*(player: Player; position: BlockPos; useItemOn: SUseItemOn; face: BlockDirection;
+    mainHand: bool): BlockActionResult =
+  ## `call_use_item_on`: the block's `use_with_item`, then its `on_use` if that said to.
+  let world = player.world
+  let blockWorld = BlockWorld(world.blockWorld)
+  let registry = blockWorld.blockRegistry
+  let blockPlayer = blockPlayerOf(player)
+  let server = BlockServer(tickCount: world.server.tickCounter)
+  let blockRef = world.getBlock(position)
+  let hit = BlockHitResult(face: face, cursorPos: useItemOn.cursorPos)
+  let before = if mainHand: player.inventory.heldItem() else: player.inventory.offHandItem()
+  let held = ItemStackRef(stack: before)
+  let outcome = registry.useWithItem(blockRef, blockPlayer, position, hit, held, (if mainHand: 0 else: 1), server, blockWorld)
+  if not held.stack.areEqual(before):
+    if mainHand: player.inventory.setHeldItem(held.stack) else: player.inventory.setOffHandItem(held.stack)
+  if outcome.consumesAction():
+    return outcome
+  if outcome == barPassToDefaultBlockAction:
+    let used = registry.onUse(blockRef, blockPlayer, position, hit, server, blockWorld)
+    if used.consumesAction():
+      return used
+  barPass

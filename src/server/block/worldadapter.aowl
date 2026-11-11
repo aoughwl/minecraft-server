@@ -1,9 +1,8 @@
-## The `BlockWorld` of a real `World`: what blocks call, on top of src/server/world/worldmod.aowl.
+## The `BlockWorld` of a real `World`: what blocks call, on top of the level and the world's own queues.
 ##
-## Where worldmod has the call this goes to it. The rest stay nil in the vtable, which blockbehaviour.aowl treats as "does
-## nothing" (sounds, world events, entities, tick scheduling through the block's name), until the world side has them;
-## see the hooks listed at the end of this file. Nothing here changes how worldmod itself behaves: it must call
-## `setBlockState` below in place of its own for blocks to hear of a change.
+## worldmod.aowl builds this in `loadWorld`, so this does not import worldmod. What can be reached without entities is here;
+## what needs them (sounds, particles, drops, entities and players at a box) is filled by worldhooks.aowl, on top of
+## entitymod, which servermod.aowl calls for each world. A hook that stays nil is "does nothing" in blockbehaviour.aowl.
 
 {.feature: "untyped".}
 {.feature: "lenientnils".}
@@ -11,42 +10,234 @@
 import std/[options, tables]
 import ../../data/block_ext
 from ../../data/block_state import BlockStateId, asU16, newBlockStateIdUnchecked
-import ../../generated/fluid
+import ../../generated/[fluid, world_event]
+import ../../nbt/tag as nbttag
+import ../../protocol/java/client/play/worldevent
 import ../../util/math/position
 import ../../world/tick
 import ../../world/level
+import ../../world/chunkdata
+import ../../world/lightingruntime
+import ../../world/poi
 import ../serverbase
-import ../world/worldmod
+import ../entity/player as playermod
+import ../net/winsock
+import ../world/chunker
+import ../world/border
 import blockbehaviour
+import registry
+
+var gDefaultRegistry: nil BlockRegistry = nil
+
+proc sharedRegistry*(): BlockRegistry =
+  ## `Server.block_registry`: built once. One `default_registry` serves every world, as upstream's does.
+  if gDefaultRegistry == nil:
+    gDefaultRegistry = defaultRegistry()
+  BlockRegistry(gDefaultRegistry)
+
+proc tickName*(name: string): string =
+  ## What a tick's `i` holds on disk, `minecraft:stone`. `Level` keeps these strings as they are.
+  "minecraft:" & name
+
+template toChunkOf(world: World; position: BlockPos; packet: untyped) =
+  ## `broadcast_to_chunk`
+  let tcPacket = packet
+  let tcChunk = position.chunkPosition()
+  for tcPlayer in world.players:
+    if isWithinViewDistance(tcChunk, tcPlayer.chunkPos, int32(getViewDistance(tcPlayer, world.server))):
+      tcPlayer.client.writePacketFor(tcPacket)
 
 proc newBlockWorldOf*(world: World; registry: BlockRegistry): BlockWorld =
   ## The world's raw half. Upstream's `set_block_state` in its first lines: the write and the queued client update.
   let theLevel = world.level
-  let w = BlockWorld(blockRegistry: registry, minY: world.getBottomY(), topY: world.getTopY(),
-    dimensionName: world.dimension.minecraftName, blockEntities: initTable[int64, BlockEntity]())
+  let w = BlockWorld(blockRegistry: registry, minY: world.dimension.minY, topY: world.dimension.minY + world.dimension.height - 1'i32,
+    dimensionName: world.dimension.minecraftName, dimension: world.dimension, blockEntities: initTable[int64, BlockEntity]())
   w.getRaw = proc(position: BlockPos): BlockStateId {.closure.} =
-    newBlockStateIdUnchecked(uint16(world.getBlockStateId(position)))
+    newBlockStateIdUnchecked(uint16(getBlockState(theLevel, position)))
   w.setRaw = proc(position: BlockPos; id: BlockStateId): BlockStateId {.closure.} =
     let wanted = uint32(asU16(id))
     let replaced = uint32(setBlockState(theLevel, position, wanted))
     if replaced != wanted:
-      world.registerBlockChange(position, wanted)
+      world.unsentBlockChanges[position.asLong()] = BlockChange(position: position, stateId: wanted)
     newBlockStateIdUnchecked(uint16(replaced))
-  w.isLoaded0 = proc(position: BlockPos): bool {.closure.} = world.isLoaded(position)
+  w.isLoaded0 = proc(position: BlockPos): bool {.closure.} =
+    let chunk = position.chunkPosition()
+    isChunkLoaded(theLevel, chunk.x, chunk.y)
   w.updateLighting0 = proc(position: BlockPos) {.closure.} = updateLightingAt(theLevel, position)
-  w.closeContainerScreensAt0 = proc(position: BlockPos) {.closure.} = world.closeContainerScreensAt(position)
+  w.closeContainerScreensAt0 = proc(position: BlockPos) {.closure.} =
+    for p in world.players:
+      if p.openContainerPos.isSome and p.openContainerPos.unsafeGet == position:
+        p.closeHandledScreen()
   w.scheduleBlockTick0 = proc(blockRef: Block; position: BlockPos; delay: uint8; priority: TickPriority) {.closure.} =
-    scheduleBlockTick(theLevel, blockRef.name, position, delay, priority)
+    scheduleBlockTick(theLevel, tickName(blockRef.name), position, delay, priority)
   w.scheduleFluidTick0 = proc(fluid: Fluid; position: BlockPos; delay: uint8; priority: TickPriority) {.closure.} =
-    scheduleFluidTick(theLevel, fluid.name, position, delay, priority)
+    scheduleFluidTick(theLevel, tickName(fluid.name), position, delay, priority)
   w.isBlockTickScheduled0 = proc(position: BlockPos; blockRef: Block): bool {.closure.} =
-    isBlockTickScheduled(theLevel, position, blockRef.name)
+    isBlockTickScheduled(theLevel, position, tickName(blockRef.name))
   w.isFluidTickScheduled0 = proc(position: BlockPos; fluid: Fluid): bool {.closure.} =
-    isFluidTickScheduled(theLevel, position, fluid.name)
+    isFluidTickScheduled(theLevel, position, tickName(fluid.name))
   w.addSyncedBlockEvent0 = proc(position: BlockPos; kind, data: uint8) {.closure.} =
-    world.addSyncedBlockEvent(position, kind, data)
+    world.syncedBlockEventQueue.add(BlockEvent(position: position, eventType: kind, data: data))
+  w.levelInfo0 = proc(): LevelData {.closure.} = world.levelInfo
   w.worldAge0 = proc(): int64 {.closure.} = world.levelTime.worldAge
   w.timeOfDay0 = proc(): int64 {.closure.} = world.levelTime.timeOfDay
   w.isRaining0 = proc(): bool {.closure.} = world.weather.raining
   w.isThundering0 = proc(): bool {.closure.} = world.weather.thundering
+  w.syncWorldEvent0 = proc(event: WorldEvent; position: BlockPos; data: int32) {.closure.} =
+    ## `sync_world_event`
+    world.toChunkOf(position, CWorldEvent(event: int32(ord(event)), location: position, data: data, disableRelativeVolume: false))
+  w.broadcastBlockBreakParticles0 = proc(position: BlockPos; stateId: BlockStateId; cause: nil BlockPlayer) {.closure.} =
+    ## The particles of `break_block`: everybody but whoever broke it, whose client has already drawn them.
+    let packet = CWorldEvent(event: int32(ord(weParticlesDestroyBlock)), location: position, data: int32(asU16(stateId)),
+      disableRelativeVolume: false)
+    let chunk = position.chunkPosition()
+    for p in world.players:
+      if (cause == nil or p.entityId != cause.entityId) and
+          isWithinViewDistance(chunk, p.chunkPos, int32(getViewDistance(p, world.server))):
+        p.client.writePacketFor(packet)
+  w.blockLight0 = proc(position: BlockPos): Option[uint8] {.closure.} =
+    let (found, light) = getBlockLightLevel(theLevel.lightAccess, position)
+    if found: some(light) else: none[uint8]()
+  w.skyLight0 = proc(position: BlockPos): uint8 {.closure.} = getSkyLightLevel(theLevel.lightAccess, position)
+  w.pendingBlockEntity0 = proc(position: BlockPos): Option[NbtCompound] {.closure.} =
+    ## What the chunk read from disk. Kept in the chunk, not taken as upstream does: `chunk_data` writes these to clients.
+    let c = position.chunkPosition()
+    let chunk = theLevel.loadedChunks.getOrDefault(chunkKey(c.x, c.y), nil)
+    if chunk != nil:
+      for entry in chunk.pendingBlockEntities:
+        if entry.pos == position:
+          return some(entry.nbt)
+    none[NbtCompound]()
+  w.blockEntityRemoved0 = proc(position: BlockPos) {.closure.} =
+    let c = position.chunkPosition()
+    let chunk = theLevel.loadedChunks.getOrDefault(chunkKey(c.x, c.y), nil)
+    if chunk != nil:
+      var kept: seq[BlockEntityEntry] = @[]
+      for entry in chunk.pendingBlockEntities:
+        if entry.pos != position:
+          kept.add(entry)
+      chunk.pendingBlockEntities = kept
+      chunk.dirty = true
+  # The portal search's half: world/portal/nether.aowl.
+  w.portalPoiAdd0 = proc(position: BlockPos) {.closure.} = world.portalPoi.addPortal(position)
+  w.portalPoiRemove0 = proc(position: BlockPos) {.closure.} = discard world.portalPoi.remove(position)
+  w.portalPoiInSquare0 = proc(center: BlockPos; radius: int32): seq[BlockPos] {.closure.} =
+    world.portalPoi.getInSquare(center, radius, PoiTypeNetherPortal)
+  w.borderContainsBlock0 = proc(x, z: int32): bool {.closure.} = world.worldborder.containsBlock(x, z)
+  w.borderClampBlock0 = proc(x, z: int32): (int32, int32) {.closure.} = world.worldborder.clampBlock(x, z)
+  w.motionBlockingHeight0 = proc(x, z: int32): int32 {.closure.} =
+    # `get_heightmap_height_async`: the chunk is fetched (and generated) when it is not there.
+    let fetched = fetchChunk(theLevel, x shr 4, z shr 4)
+    if fetched.chunk == nil:
+      return world.minY
+    getHeightmap(fetched.chunk.heightmap, chmMotionBlocking, x, z, world.minY)
   w
+
+proc saveBlockEntity*(world: World; entity: BlockEntity) =
+  ## The save half upstream's `add_block_entity_nbt` is for, with the whole of `write_nbt`: a chest's items are not in its
+  ## `chunk_data_nbt`, and a block entity that lived only in the table would be lost with the chunk.
+  let position = entity.getPosition()
+  let c = position.chunkPosition()
+  let chunk = world.level.loadedChunks.getOrDefault(chunkKey(c.x, c.y), nil)
+  if chunk == nil:
+    return
+  var nbt = newCompound()
+  entity.writeNbt(nbt)
+  put(nbt, "id", NbtTag(kind: ntkString, stringVal: entity.resourceLocation()))
+  put(nbt, "x", NbtTag(kind: ntkInt, intVal: position.vec.x))
+  put(nbt, "y", NbtTag(kind: ntkInt, intVal: position.vec.y))
+  put(nbt, "z", NbtTag(kind: ntkInt, intVal: position.vec.z))
+  for entry in chunk.pendingBlockEntities:
+    if entry.pos == position and entry.nbt == nbt:
+      return
+  putBlockEntity(chunk, position, nbt)
+  chunk.dirty = true
+
+proc saveBlockEntities*(world: World) =
+  ## Writes every live block entity into its chunk, ahead of a save or an unload.
+  let w = world.blockWorld
+  if w != nil:
+    for _, entity in BlockWorld(w).blockEntities:
+      world.saveBlockEntity(entity)
+
+proc migrateBlockEntities*(world: World) =
+  ## `migrate_pending_block_entities`, for each active chunk not yet seen. A chunk comes back through this after an unload.
+  let w0 = world.blockWorld
+  if w0 == nil:
+    return
+  let w = BlockWorld(w0)
+  for pos in world.activeChunks:
+    let key = chunkKey(pos.x, pos.y)
+    let chunk = world.level.loadedChunks.getOrDefault(key, nil)
+    if chunk != nil and not world.blockEntityChunks.hasKey(key):
+      world.blockEntityChunks[key] = true
+      for entry in chunk.pendingBlockEntities:
+        discard w.getBlockEntity(entry.pos)
+
+proc forgetUnloadedBlockEntities*(world: World; cleaned: openArray[(int32, int32)]) =
+  ## `self.block_entities.remove(chunk_pos)` on an unload. `saveBlockEntities` has run: the chunk holds them.
+  let w0 = world.blockWorld
+  if w0 == nil or cleaned.len == 0:
+    return
+  let w = BlockWorld(w0)
+  var gone: seq[int64] = @[]
+  for key, entity in w.blockEntities:
+    let c = entity.getPosition().chunkPosition()
+    for u in cleaned:
+      if u[0] == c.x and u[1] == c.y:
+        gone.add(key)
+        break
+  for key in gone:
+    w.blockEntities.del(key)
+  for u in cleaned:
+    world.blockEntityChunks.del(chunkKey(u[0], u[1]))
+
+proc tickBlockEntities*(world: World) =
+  ## The block entity half of `tick`: those in active chunks. Copied first: a tick may add or remove one.
+  let w0 = world.blockWorld
+  if w0 == nil:
+    return
+  let w = BlockWorld(w0)
+  world.migrateBlockEntities()
+  var active = initTable[int64, bool]()
+  for pos in world.activeChunks:
+    active[chunkKey(pos.x, pos.y)] = true
+  var entities: seq[BlockEntity] = @[]
+  for _, entity in w.blockEntities:
+    let c = entity.getPosition().chunkPosition()
+    if active.hasKey(chunkKey(c.x, c.y)):
+      entities.add(entity)
+  for entity in entities:
+    entity.tick(w)
+
+proc runTickData*(world: World; data: TickData) =
+  ## `tick_chunks`: the block, fluid and random ticks that `get_tick_data` drew.
+  let w0 = world.blockWorld
+  if w0 == nil:
+    return
+  let w = BlockWorld(w0)
+  let registry = w.blockRegistry
+  for scheduled in data.blockTicks:
+    let blockRef = w.getBlock(scheduled.position)
+    let b = registry.behaviourOf(blockRef.id)
+    if b != nil:
+      b.onScheduledTick(OnScheduledTickArgs(world: w, block0: blockRef, position: scheduled.position))
+  for scheduled in data.fluidTicks:
+    let fluid = w.getFluid(scheduled.position)
+    let f = registry.fluidBehaviourOf(fluid.id)
+    if f != nil:
+      let on = f.onScheduledTickImpl
+      on(w, fluid, scheduled.position)
+  for sample in data.randomTicks:
+    let position = sample.position
+    if sample.tickBlock:
+      let blockRef = w.getBlock(position)
+      let b = registry.behaviourOf(blockRef.id)
+      if b != nil:
+        b.randomTick(RandomTickArgs(world: w, block0: blockRef, position: position))
+    if sample.tickFluid:
+      let fluid = w.getFluid(position)
+      let f = registry.fluidBehaviourOf(fluid.id)
+      if f != nil:
+        let on = f.randomTickImpl
+        on(fluid, w, position)
