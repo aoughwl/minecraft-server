@@ -1,0 +1,375 @@
+## `/clone` through a real dispatcher over an in-memory block world.
+import std/[options, syncio, tables]
+import ../../command/[cmddispatch, cmderrors, cmdsource, cmdtree]
+import ../../generated/blockdata
+import ../../util/[permission, vector2, vector3]
+import clone, item, rotate, spectate, ride, fillbiome, spreadplayers, loot, cmdtestutil
+import ../../util/gamemode
+import ../../command/fallbackdispatch
+import ../../util/text/[textbase, text]
+import std/math
+
+proc check(ok: bool; what: string) =
+  echo "check ", what, ": ", ok
+  stdout.flushFile()
+  if not ok:
+    echo "FAILED: ", what
+    stdout.flushFile()
+    quit(1)
+
+proc key(x, y, z: int32): string = $x & "," & $y & "," & $z
+
+type Blocks = ref object
+  t: Table[string, uint16]
+
+proc at(b: Blocks; x, y, z: int32): uint16 = b.t.getOrDefault(key(x, y, z), 0'u16)
+proc put(b: Blocks; x, y, z: int32; s: uint16) = b.t[key(x, y, z)] = s
+
+proc newBlockWorld(blocks: Blocks): CommandWorld =
+  result = CommandWorld(dimensionName: "minecraft:overworld")
+  result.getBlockStateId = proc(x, y, z: int32): uint16 {.closure.} = blocks.at(x, y, z)
+  result.setBlockState = proc(x, y, z: int32; s: uint16; f: uint32) {.closure.} = blocks.put(x, y, z, s)
+  result.getBlockId = proc(x, y, z: int32): int {.closure.} = int(blocks.at(x, y, z))
+  result.isAirState = proc(s: uint16): bool {.closure.} = s == 0'u16
+  result.isChunkLoaded = proc(x, z: int32): bool {.closure.} = x >= -4'i32 and x <= 4'i32 and z >= -4'i32 and z <= 4'i32
+  result.isInBuildLimit = proc(x, y, z: int32): bool {.closure.} = y >= -64'i32 and y < 320'i32
+
+proc cloneTests() =
+  let blocks = Blocks(t: initTable[string, uint16]())
+  let world = newBlockWorld(blocks)
+  let server = newServerWithWorld(world)
+  let registry = newPermissionRegistry()
+  let d = newCommandDispatcher()
+  clone.register(d, registry)
+  let source = consoleSource(server, world)
+  let stone = uint16(blockByName("stone")[1].defaultStateId)
+  let dirt = uint16(blockByName("dirt")[1].defaultStateId)
+  blocks.put(0, 0, 0, stone)
+  blocks.put(1, 0, 0, dirt)
+  blocks.put(0, 1, 0, stone)
+  # (1,1,0) stays air.
+  let r = executeInput(d, "clone 0 0 0 1 1 0 10 0 0", source)
+  check(r.isOk, "clone ok")
+  check(r.value == 4'i32, "clone count")
+  check(blocks.at(10, 0, 0) == stone and blocks.at(11, 0, 0) == dirt and blocks.at(10, 1, 0) == stone, "cloned blocks")
+  check(blocks.at(11, 1, 0) == 0'u16, "air cloned")
+  # masked skips air.
+  blocks.put(11, 11, 0, dirt)
+  check(executeInput(d, "clone 0 0 0 1 1 0 10 10 0 masked", source).value == 3'i32, "masked count")
+  check(not blocks.t.hasKey(key(11, 11, 0)) or blocks.at(11, 11, 0) == dirt, "masked keeps the old block")
+  # filtered copies only stone.
+  check(executeInput(d, "clone 0 0 0 1 1 0 20 0 0 filtered stone", source).value == 2'i32, "filtered count")
+  check(blocks.at(21, 0, 0) == 0'u16 and blocks.at(20, 0, 0) == stone, "filtered result")
+  # Overlap fails without force.
+  check(not executeInput(d, "clone 0 0 0 1 1 0 1 0 0", source).isOk, "overlap")
+  # Force copies from the old state of the region: (0,0)->(1,0) and (1,0)->(2,0).
+  check(executeInput(d, "clone 0 0 0 1 0 0 1 0 0 replace force", source).isOk, "force")
+  check(blocks.at(1, 0, 0) == stone and blocks.at(2, 0, 0) == dirt, "force reads old region")
+  # Move clears the source blocks that are not part of the destination.
+  check(executeInput(d, "clone 0 1 0 0 1 0 30 1 0 replace move", source).isOk, "move")
+  check(blocks.at(30, 1, 0) == stone and blocks.at(0, 1, 0) == 0'u16, "move cleared source")
+  # Too big, unloaded.
+  check(not executeInput(d, "clone 0 0 0 40 40 40 100 0 0", source).isOk, "toobig")
+  check(not executeInput(d, "clone 0 0 0 1 1 1 1000 0 0", source).isOk, "unloaded destination")
+
+type SlotBox = ref object
+  stacks: seq[CmdItemStack]
+
+type SentBox = ref object
+  names: seq[string]
+
+proc makeSlot(box: SlotBox; idx: int): CmdItemSlot =
+  CmdItemSlot(
+    getStack: proc(): CmdItemStack {.closure.} = box.stacks[idx],
+    setStack: proc(st: CmdItemStack) {.closure.} = box.stacks[idx] = st,
+    isEmpty: proc(): bool {.closure.} = box.stacks[idx].itemKey.len == 0)
+
+proc makePlayer(box: SlotBox; sent: SentBox): CommandPlayer =
+  let pl = CommandPlayer()
+  pl.entity = CommandEntity(player: pl, entityTypeName: "pl")
+  pl.entity.getDisplayName = proc(): TextComponent {.closure.} = text("Steve")
+  pl.hasPermission = proc(node: string): bool {.closure.} = true
+  pl.getPermissionLvl = proc(): PermissionLvl {.closure.} = Four
+  pl.getSelectedSlot = proc(): int32 {.closure.} = 2'i32
+  pl.getInventorySlots = proc(): seq[CmdItemSlot] {.closure.} =
+    var list: seq[CmdItemSlot] = @[]
+    for i in 0 ..< 41:
+      list.add(makeSlot(box, i))
+    list
+  pl.sendEquipmentChange = proc(slot: string; st: CmdItemStack) {.closure.} = sent.names.add(slot)
+  pl
+
+proc itemTests() =
+  let box = SlotBox(stacks: newSeq[CmdItemStack](41))
+  let sent = SentBox(names: @[])
+  let pl = makePlayer(box, sent)
+  let world = CommandWorld(dimensionName: "minecraft:overworld")
+  pl.entity.getPos = proc(): Vector3[float64] {.closure.} = Vector3[float64](x: 0.0, y: 64.0, z: 0.0)
+  pl.entity.getRotation = proc(): Vector2[float32] {.closure.} = Vector2[float32](x: 0.0'f32, y: 0.0'f32)
+  pl.entity.getEyeHeight = proc(): float64 {.closure.} = 1.62
+  pl.entity.getWorld = proc(): nil CommandWorld {.closure.} = world
+  let server = newServerWithWorld(world)
+  server.getAllPlayers = proc(): seq[CommandPlayer] {.closure.} = @[pl]
+  server.selectEntities = proc(selector: TargetSelector; sender: CommandSender): seq[CommandEntity] {.closure.} = @[pl.entity]
+  server.selectPlayers = proc(selector: TargetSelector; sender: CommandSender): seq[CommandPlayer] {.closure.} = @[pl]
+  let d = newFallbackDispatcher()
+  register(d, item.initCommandTree(), "minecraft:command.item")
+  let r = dispatch(d, senderPlayer(pl), server, "item replace entity @s hotbar.0 minecraft:diamond 5")
+  check(r.isOk, "item replace entity")
+  check(box.stacks[0].itemKey == "diamond" and box.stacks[0].count == 5'i32, "slot 0 holds 5 diamonds")
+  check(dispatch(d, senderPlayer(pl), server, "item replace entity @s weapon.mainhand with minecraft:stick").isOk, "mainhand")
+  check(box.stacks[2].itemKey == "stick" and box.stacks[2].count == 1'i32, "selected slot got the stick")
+  check(sent.names.len == 1 and sent.names[0] == "mainhand", "equipment change sent")
+  check(dispatch(d, senderPlayer(pl), server, "item replace entity @s armor.head minecraft:stone").isOk, "head")
+  check(box.stacks[39].itemKey == "stone", "head slot 39")
+  check(not dispatch(d, senderPlayer(pl), server, "item replace entity @s hotbar.0 minecraft:nothing").isOk, "bad item")
+  check(not dispatch(d, senderPlayer(pl), server, "item replace block 0 0 0 container.0 minecraft:stone").isOk, "not a container")
+
+type TeleBox = ref object
+  count: int
+  yaw: float32
+  pitch: float32
+  y: float64
+
+proc rotateTests() =
+  let box = SlotBox(stacks: newSeq[CmdItemStack](41))
+  let sent = SentBox(names: @[])
+  let pl = makePlayer(box, sent)
+  let tele = TeleBox()
+  let world = CommandWorld(dimensionName: "minecraft:overworld")
+  pl.entity.getPos = proc(): Vector3[float64] {.closure.} = Vector3[float64](x: 0.0, y: 64.0, z: 0.0)
+  pl.entity.getRotation = proc(): Vector2[float32] {.closure.} = Vector2[float32](x: 5.0'f32, y: 30.0'f32)
+  pl.entity.getEyeHeight = proc(): float64 {.closure.} = 1.62
+  pl.entity.getWorld = proc(): nil CommandWorld {.closure.} = world
+  pl.entity.teleport = proc(pos: Vector3[float64]; yaw, pitch: Option[float32]; w: CommandWorld) {.closure.} =
+    inc tele.count
+    tele.yaw = yaw.get
+    tele.pitch = pitch.get
+    tele.y = pos.y
+  let server = newServerWithWorld(world)
+  server.selectEntities = proc(selector: TargetSelector; sender: CommandSender): seq[CommandEntity] {.closure.} = @[pl.entity]
+  let d = newFallbackDispatcher()
+  register(d, rotate.initCommandTree(), "minecraft:command.rotate")
+  check(dispatch(d, senderPlayer(pl), server, "rotate @s 90 -10").isOk, "rotate absolute")
+  check(tele.count == 1 and tele.yaw == 90.0'f32 and tele.pitch == -10.0'f32 and tele.y == 64.0, "absolute rotation teleports in place")
+  check(dispatch(d, senderPlayer(pl), server, "rotate @s ~10 ~100").isOk, "rotate relative")
+  check(tele.yaw == 40.0'f32 and tele.pitch == 90.0'f32, "relative adds, pitch clamps")
+  check(dispatch(d, senderPlayer(pl), server, "rotate @s facing 0.0 64.0 10.0").isOk, "rotate facing")
+  check(abs(tele.yaw) < 0.001'f32 and tele.pitch > 9.1'f32 and tele.pitch < 9.3'f32, "facing yaw and pitch")
+  check(dispatch(d, senderPlayer(pl), server, "rotate @s facing entity @s eyes").isOk, "rotate facing entity")
+
+proc spectateTests() =
+  let box = SlotBox(stacks: newSeq[CmdItemStack](41))
+  let sent = SentBox(names: @[])
+  let pl = makePlayer(box, sent)
+  let tele = TeleBox()
+  let world = CommandWorld(dimensionName: "minecraft:overworld")
+  let other = CommandWorld(dimensionName: "minecraft:the_nether")
+  var camera = -1'i32
+  var mode = Survival
+  pl.entity.entityId = 5'i32
+  pl.entity.getWorld = proc(): nil CommandWorld {.closure.} = world
+  pl.entity.getPos = proc(): Vector3[float64] {.closure.} = Vector3[float64](x: 0.0, y: 64.0, z: 0.0)
+  pl.entity.getRotation = proc(): Vector2[float32] {.closure.} = Vector2[float32](x: 0.0'f32, y: 0.0'f32)
+  pl.entity.teleport = proc(pos: Vector3[float64]; yaw, pitch: Option[float32]; w: CommandWorld) {.closure.} =
+    inc tele.count
+    tele.yaw = yaw.get
+    tele.pitch = pitch.get
+    tele.y = pos.y
+  pl.getGameMode = proc(): GameMode {.closure.} = mode
+  pl.setCameraTarget = proc(id: int32) {.closure.} = camera = id
+  let victim = CommandEntity(entityId: 9'i32, entityTypeName: "pig")
+  victim.getDisplayName = proc(): TextComponent {.closure.} = text("Pig")
+  victim.getWorld = proc(): nil CommandWorld {.closure.} = world
+  victim.getPos = proc(): Vector3[float64] {.closure.} = Vector3[float64](x: 7.0, y: 70.0, z: 8.0)
+  victim.getRotation = proc(): Vector2[float32] {.closure.} = Vector2[float32](x: 15.0'f32, y: 45.0'f32)
+  let server = newServerWithWorld(world)
+  server.selectEntities = proc(selector: TargetSelector; sender: CommandSender): seq[CommandEntity] {.closure.} = @[victim]
+  let d = newFallbackDispatcher()
+  register(d, spectate.initCommandTree(), "minecraft:command.spectate")
+  check(not dispatch(d, senderPlayer(pl), server, "spectate @e[limit=1]").isOk, "survival cannot spectate")
+  mode = Spectator
+  let rr = dispatch(d, senderPlayer(pl), server, "spectate @e[limit=1]")
+  check(rr.isOk, "spectate")
+  check(camera == 9'i32 and tele.count == 1 and tele.y == 70.0 and tele.yaw == 45.0'f32 and tele.pitch == 15.0'f32,
+    "camera set and teleported onto the target")
+  check(dispatch(d, senderPlayer(pl), server, "spectate").isOk, "stop")
+  check(camera == 5'i32, "camera back to self")
+  victim.getWorld = proc(): nil CommandWorld {.closure.} = other
+  check(not dispatch(d, senderPlayer(pl), server, "spectate @e[limit=1]").isOk, "other dimension")
+
+proc rideTests() =
+  let world = CommandWorld(dimensionName: "minecraft:overworld")
+  let nether = CommandWorld(dimensionName: "minecraft:the_nether")
+  let rider = CommandEntity(entityId: 1'i32, entityTypeName: "pig", entityTypeId: "minecraft:pig")
+  rider.getDisplayName = proc(): TextComponent {.closure.} = text("Rider")
+  rider.getWorld = proc(): nil CommandWorld {.closure.} = world
+  rider.getPos = proc(): Vector3[float64] {.closure.} = Vector3[float64](x: 0.0, y: 0.0, z: 0.0)
+  rider.isAlive = proc(): bool {.closure.} = true
+  let mount = CommandEntity(entityId: 2'i32, entityTypeName: "horse", entityTypeId: "minecraft:horse")
+  mount.getDisplayName = proc(): TextComponent {.closure.} = text("Mount")
+  mount.getWorld = proc(): nil CommandWorld {.closure.} = world
+  mount.getPos = proc(): Vector3[float64] {.closure.} = Vector3[float64](x: 0.0, y: 0.0, z: 0.0)
+  mount.isAlive = proc(): bool {.closure.} = true
+  var passengers: seq[int32] = @[]
+  mount.addPassenger = proc(p: CommandEntity) {.closure.} =
+    passengers.add(p.entityId)
+    rider.getVehicle = proc(): nil CommandEntity {.closure.} = mount
+  mount.removePassenger = proc(id: int32) {.closure.} =
+    passengers = @[]
+    rider.getVehicle = nil
+  let steve = CommandEntity(entityId: 3'i32, entityTypeName: "player", entityTypeId: "minecraft:player", player: CommandPlayer())
+  steve.getDisplayName = proc(): TextComponent {.closure.} = text("Steve")
+  steve.getWorld = proc(): nil CommandWorld {.closure.} = world
+  steve.getPos = proc(): Vector3[float64] {.closure.} = Vector3[float64](x: 0.0, y: 0.0, z: 0.0)
+  steve.isAlive = proc(): bool {.closure.} = true
+  let everyone = @[rider, mount, steve]
+  world.getEntities = proc(): seq[CommandEntity] {.closure.} = everyone
+  let server = newServerWithWorld(world)
+  let d = newCommandDispatcher()
+  ride.register(d, newPermissionRegistry())
+  let source = consoleSource(server, world)
+  let mr = executeInput(d, "ride @e[type=pig] mount @e[type=horse,limit=1]", source)
+  check(mr.isOk and mr.value == 1'i32, "mount")
+  check(passengers == @[1'i32], "passenger added")
+  check(not executeInput(d, "ride @e[type=pig] mount @e[type=horse,limit=1]", source).isOk, "already riding")
+  check(executeInput(d, "ride @e[type=pig] dismount", source).isOk and passengers.len == 0, "dismount")
+  check(not executeInput(d, "ride @e[type=pig] dismount", source).isOk, "not riding")
+  check(not executeInput(d, "ride @e[type=pig] mount @e[type=player,limit=1]", source).isOk, "cannot ride players")
+  mount.getWorld = proc(): nil CommandWorld {.closure.} = nether
+  check(not executeInput(d, "ride @e[type=pig] mount @e[type=horse,limit=1]", source).isOk, "wrong dimension")
+
+type BiomeBox = ref object
+  calls: int
+  cells: int
+  target: int32
+  replace: int32
+  hasReplace: bool
+
+proc fillBiomeTests() =
+  let box = BiomeBox()
+  let world = CommandWorld(dimensionName: "minecraft:overworld")
+  world.isInBuildLimit = proc(x, y, z: int32): bool {.closure.} = y >= -64'i32 and y < 320'i32
+  world.getMinY = proc(): int32 {.closure.} = -64'i32
+  world.fillBiomeChunk = proc(cx, cz: int32; cells: seq[Vector3[int32]]; target: int32; hasReplace: bool; replace: int32): int32 {.closure.} =
+    inc box.calls
+    box.cells += cells.len
+    box.target = target
+    box.hasReplace = hasReplace
+    box.replace = replace
+    int32(cells.len)
+  let server = newServerWithWorld(world)
+  let d = newCommandDispatcher()
+  fillbiome.register(d, newPermissionRegistry())
+  let source = consoleSource(server, world)
+  # 0..16 on x and z is 5 biome cells each way and spans two chunks; y 0..3 is one cell row.
+  let r = executeInput(d, "fillbiome 0 0 0 16 3 16 minecraft:plains", source)
+  check(r.isOk, "fillbiome runs")
+  check(box.calls == 2 or box.calls == 4, "cells grouped by chunk")
+  check(r.value == 25'i32 and box.cells == 25, "25 biome cells")
+  check(not box.hasReplace and box.target >= 0'i32, "no replace")
+  check(executeInput(d, "fillbiome 0 0 0 4 3 4 minecraft:plains minecraft:desert", source).isOk and box.hasReplace, "replace form")
+  check(not executeInput(d, "fillbiome 0 0 0 4 3 4 minecraft:nothere", source).isOk, "unknown biome")
+  check(not executeInput(d, "fillbiome 0 0 0 4000 3 4000 minecraft:plains", source).isOk, "too big")
+  check(not executeInput(d, "fillbiome 0 -100 0 4 3 4 minecraft:plains", source).isOk, "out of build limit")
+
+type TeleList = ref object
+  xs: seq[float64]
+  zs: seq[float64]
+  ys: seq[float64]
+
+proc spreadTests() =
+  let world = CommandWorld(dimensionName: "minecraft:overworld")
+  world.getSurfaceHeight = proc(x, z: int32): int32 {.closure.} = 70'i32
+  world.isLiquidAt = proc(x, y, z: int32): bool {.closure.} = false
+  let tl = TeleList()
+  var list: seq[CommandEntity] = @[]
+  for i in 0 ..< 3:
+    let e = CommandEntity(entityId: int32(i), entityTypeName: "pig")
+    e.getDisplayName = proc(): TextComponent {.closure.} = text("Pig")
+    e.isAlive = proc(): bool {.closure.} = true
+    e.getPos = proc(): Vector3[float64] {.closure.} = Vector3[float64](x: 0.0, y: 0.0, z: 0.0)
+    e.teleport = proc(pos: Vector3[float64]; yaw, pitch: Option[float32]; w: CommandWorld) {.closure.} =
+      tl.xs.add(pos.x)
+      tl.ys.add(pos.y)
+      tl.zs.add(pos.z)
+    list.add(e)
+  let server = newServerWithWorld(world)
+  world.getEntities = proc(): seq[CommandEntity] {.closure.} = list
+  let d = newCommandDispatcher()
+  spreadplayers.register(d, newPermissionRegistry())
+  let source = consoleSource(server, world)
+  let r = executeInput(d, "spreadplayers 100 200 8 30 false @e", source)
+  check(r.isOk and r.value == 3'i32, "spreadplayers three piles")
+  check(tl.xs.len == 3, "three teleports")
+  for i in 0 ..< 3:
+    check(tl.xs[i] >= 100.5 - 30.0 - 1.0 and tl.xs[i] <= 100.5 + 30.0 + 1.0 and tl.zs[i] >= 200.5 - 31.0 and tl.zs[i] <= 200.5 + 31.0, "inside the area")
+    check(tl.ys[i] == 71.0, "stands on the surface")
+  check(hypot(tl.xs[0] - tl.xs[1], tl.zs[0] - tl.zs[1]) >= 6.5 and hypot(tl.xs[0] - tl.xs[2], tl.zs[0] - tl.zs[2]) >= 6.5 and
+    hypot(tl.xs[1] - tl.xs[2], tl.zs[1] - tl.zs[2]) >= 6.5, "spread apart")
+  # respectTeams gathers everyone on one pile.
+  tl.xs = @[]
+  tl.zs = @[]
+  tl.ys = @[]
+  check(executeInput(d, "spreadplayers 0 0 5 10 true @e", source).value == 1'i32, "one team pile")
+  check(tl.xs.len == 3 and tl.xs[0] == tl.xs[1] and tl.zs[1] == tl.zs[2], "same spot")
+  # Impossible: 3 piles 100 apart inside a 2 block area.
+  check(not executeInput(d, "spreadplayers 0 0 100 2 false @e", source).isOk, "cannot fit")
+  # Water surface retries until it gives up.
+  world.isLiquidAt = proc(x, y, z: int32): bool {.closure.} = true
+  check(not executeInput(d, "spreadplayers 0 0 5 10 false @e", source).isOk, "all water")
+
+type GiveBox = ref object
+  given: seq[CmdItemStack]
+  dropped: int
+
+proc lootTests() =
+  let box = SlotBox(stacks: newSeq[CmdItemStack](5))
+  let gb = GiveBox()
+  let world = CommandWorld(dimensionName: "minecraft:overworld")
+  let pl = makePlayer(box, SentBox(names: @[]))
+  pl.gameProfile = CmdGameProfile(name: "Steve")
+  pl.insertOrDropStack = proc(st: CmdItemStack) {.closure.} = gb.given.add(st)
+  pl.entity.getPos = proc(): Vector3[float64] {.closure.} = Vector3[float64](x: 0.0, y: 0.0, z: 0.0)
+  pl.entity.isAlive = proc(): bool {.closure.} = true
+  pl.entity.getWorld = proc(): nil CommandWorld {.closure.} = world
+  world.getPlayers = proc(): seq[CommandPlayer] {.closure.} = @[pl]
+  world.getEntities = proc(): seq[CommandEntity] {.closure.} = @[pl.entity]
+  world.dropStack = proc(x, y, z: int32; st: CmdItemStack) {.closure.} = inc gb.dropped
+  world.generateBlockLoot = proc(x, y, z: int32; hasTool: bool; tool: string; found: var bool): seq[CmdItemStack] {.closure.} =
+    found = true
+    @[CmdItemStack(itemKey: (if hasTool: tool else: "dirt"), count: 1'i32)]
+  var slots: seq[CmdItemSlot] = @[]
+  for i in 0 ..< 5:
+    slots.add(makeSlot(box, i))
+  world.getBlockContainer = proc(x, y, z: int32): seq[CmdItemSlot] {.closure.} = (if x == 7'i32: slots else: @[])
+  let server = newServerWithWorld(world)
+  server.getAllPlayers = proc(): seq[CommandPlayer] {.closure.} = @[pl]
+  server.generateChestLoot = proc(key: string; seed: int64; found: var bool): seq[CmdItemStack] {.closure.} =
+    found = key == "minecraft:chests/test"
+    if found: @[CmdItemStack(itemKey: "diamond", count: 3'i32), CmdItemStack(itemKey: "stick", count: 2'i32)] else: @[]
+  let d = newCommandDispatcher()
+  loot.register(d, newPermissionRegistry())
+  let source = consoleSource(server, world)
+  let r = executeInput(d, "loot give @a loot chests/test", source)
+  check(r.isOk and r.value == 5'i32, "loot give total")
+  check(gb.given.len == 2 and gb.given[0].itemKey == "diamond" and gb.given[1].count == 2'i32, "given stacks")
+  check(not executeInput(d, "loot give @a loot chests/nothing", source).isOk, "unknown table")
+  check(executeInput(d, "loot spawn 1 2 3 mine 4 5 6 minecraft:diamond_pickaxe", source).value == 1'i32 and gb.dropped == 1, "spawn mine with tool")
+  # insert tops up matching stacks then fills the first empty slot.
+  box.stacks[1] = CmdItemStack(itemKey: "diamond", count: 62'i32)
+  check(executeInput(d, "loot insert 7 0 0 loot chests/test", source).value == 5'i32, "insert")
+  check(box.stacks[1].count == 64'i32 and box.stacks[0].itemKey == "diamond" and box.stacks[0].count == 1'i32, "topped up, remainder in the first empty slot")
+  check(box.stacks[2].itemKey == "stick" and box.stacks[2].count == 2'i32, "next stack in the next empty slot")
+  check(not executeInput(d, "loot insert 9 0 0 loot chests/test", source).isOk, "not a container")
+  check(not executeInput(d, "loot give @a kill @e", source).isOk, "entity without a loot table")
+
+cloneTests()
+lootTests()
+itemTests()
+rideTests()
+fillBiomeTests()
+spreadTests()
+spectateTests()
+rotateTests()
+echo "batch4: all checks passed"

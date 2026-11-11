@@ -1,0 +1,304 @@
+## The `/place` command.
+## Port of pumpkin/src/command/commands/place.rs
+## The blocks go through `CommandWorld.setBlockState` (upstream's `WorldBlockPlacer`); the synthetic chunks that `feature`
+## and the non-jigsaw `structure` generate into are built from `CommandWorld.getGenParams`.
+## PARTIAL: pumpkin/src/command/commands/place.rs - block entities and entities of the placed pieces are dropped (the world has no `add_block_entity`, and no entity list to spawn into), so a placed chest is empty; the registry for non-jigsaw pieces keeps states as they are where upstream asks the block to rotate or mirror them.
+
+import std/[options, strutils]
+import ../../command/[cmderrors, cmdsource, cmdtree, argument_builder, argtype, argument_types, coordinates, cmddispatch]
+import ../../util/[vector3, permission, identifier, legacy_rand]
+import ../../util/math/[position, block_box]
+import ../../util/random/random
+import ../../util/text/[textbase, text]
+import ../../nbt/tag
+import ../../data/block_rotation
+import ../../generated/[translation, structures, placed_feature, blockdata]
+import ../../world/blockstates
+import ../../world/world as worldtraits
+import ../../world/generation/protochunkbase
+import ../../world/generation/proto_chunk
+import ../../world/generation/structurehooks
+import ../../world/generation/structure/structuremod
+import ../../world/generation/structure/structures/[structuresmod, jigsaw, jigsaw_placement]
+import "../../world/generation/structure/template/cache"
+import "../../world/generation/structure/template/processor"
+import "../../world/generation/structure/template/templatemod"
+
+const
+  Description = "Places a structure template in the world."
+  Permission0 = "minecraft:command.place"
+  ChunkDim = 16'i32
+
+type
+  WorldPlacer = ref object of BlockPlacer
+    ## `WorldBlockPlacer`: writes through the world's hooks and remembers what it touched.
+    world: CommandWorld
+    changed: seq[Vector3[int32]]
+
+proc worldGetState(self: BlockPlacer; pos: Vector3[int32]): BlockStateId {.nimcall.} =
+  let p = cast[WorldPlacer](self)
+  if p.world.getBlockStateId == nil:
+    return 0'u32
+  BlockStateId(p.world.getBlockStateId(pos.x, pos.y, pos.z))
+
+proc worldSetState(self: BlockPlacer; pos: Vector3[int32]; state: BlockStateId) {.nimcall.} =
+  let p = cast[WorldPlacer](self)
+  if p.world.setBlockState == nil:
+    return
+  p.world.setBlockState(pos.x, pos.y, pos.z, uint16(state), cbfForceState)
+  p.changed.add(pos)
+
+proc worldAddEntity(self: BlockPlacer; nbt: NbtCompound) {.nimcall.} =
+  discard ## See the PARTIAL line.
+
+proc newWorldPlacer(world: CommandWorld): WorldPlacer =
+  WorldPlacer(getStateFn: worldGetState, setStateFn: worldSetState, addEntityFn: worldAddEntity, world: world, changed: @[])
+
+proc finalize(placer: WorldPlacer) =
+  ## `queue_block_updates` then `flush_block_updates`: the neighbours of everything written.
+  if placer.world.updateNeighbors != nil:
+    for i in 0 ..< placer.changed.len:
+      placer.world.updateNeighbors(placer.changed[i].x, placer.changed[i].y, placer.changed[i].z)
+
+proc templateInvalid(): CommandErrorType = errorType1(JAVA_COMMANDS_PLACE_TEMPLATE_INVALID, "commands.place.template.invalid")
+proc jigsawFailed(): CommandErrorType = errorType1(JAVA_COMMANDS_PLACE_JIGSAW_FAILED, "commands.place.jigsaw.failed")
+proc structureInvalid(): CommandErrorType = errorType1(JAVA_COMMANDS_PLACE_STRUCTURE_INVALID, "commands.place.structure.invalid")
+proc featureInvalid(): CommandErrorType = errorType1(JAVA_COMMANDS_PLACE_FEATURE_INVALID, "commands.place.feature.invalid")
+
+proc groundY(blockY, chunkMinY, chunkHeight: int32): int32 =
+  ## Clamps a world Y into valid chunk bounds, placing the surface one block below the target.
+  clamp(blockY - 1'i32, chunkMinY, chunkMinY + chunkHeight - 1'i32)
+
+proc chunkPopulationSeed(cx, cz: int32; worldSeed: uint64): uint64 =
+  ## Vanilla-style chunk-seed derivation used by structure pieces and feature generators.
+  cast[uint64](int64(cx) * 341873128712'i64 + int64(cz) * 132897987541'i64 + cast[int64](worldSeed))
+
+proc posOr(context: CommandContext): BlockPos =
+  ## `get_block_pos("pos")`, or the source position truncated.
+  let r = getBlockPos(context, "pos")
+  if r.isOk:
+    return r.value
+  let p = context.source.position
+  newBlockPos(int32(p.x), int32(p.y), int32(p.z))
+
+proc genParams(world: CommandWorld): CmdGenParams =
+  if world.getGenParams != nil: world.getGenParams() else: CmdGenParams()
+
+proc newSyntheticChunk(world: CommandWorld; params: CmdGenParams; cx, cz, surfaceY: int32): ProtoChunk =
+  ## A chunk of stone under a grass surface, with the heightmaps at the surface, for features and pieces to work in.
+  result = newProtoChunkRaw(cx, cz, params.defaultBlock, params.biomeMixerSeed, params.logicalHeight, params.minY)
+  let ground = int16(surfaceY)
+  for i in 0 ..< ChunkAreaI:
+    result.flatSurfaceHeightMap[i] = ground
+    result.flatOceanFloorHeightMap[i] = ground
+    result.flatMotionBlockingHeightMap[i] = ground
+    result.flatMotionBlockingNoLeavesHeightMap[i] = ground
+  let (okStone, stone) = defaultStateByName("stone")
+  let (okGrass, grass) = defaultStateByName("grass_block")
+  for x in 0'i32 ..< ChunkDim:
+    for z in 0'i32 ..< ChunkDim:
+      for y in params.minY ..< surfaceY:
+        setBlockState(result, (cx shl 4) + x, y, (cz shl 4) + z, stone)
+      setBlockState(result, (cx shl 4) + x, surfaceY, (cz shl 4) + z, grass)
+
+proc snapshotBlocks(chunk: ProtoChunk; cx, cz, minY, height: int32): seq[BlockStateId] =
+  result = @[]
+  for x in 0'i32 ..< ChunkDim:
+    for y in minY ..< minY + height:
+      for z in 0'i32 ..< ChunkDim:
+        result.add(getBlockState(chunk, Vector3[int32](x: (cx shl 4) + x, y: y, z: (cz shl 4) + z)))
+
+proc applyDelta(chunk: ProtoChunk; snapshot: seq[BlockStateId]; cx, cz, minY, height: int32; placer: WorldPlacer) =
+  ## The synthetic chunk is seeded with terrain so pieces can carve against it, so air changes propagate too.
+  var idx = 0
+  for x in 0'i32 ..< ChunkDim:
+    for y in minY ..< minY + height:
+      for z in 0'i32 ..< ChunkDim:
+        let pos = Vector3[int32](x: (cx shl 4) + x, y: y, z: (cz shl 4) + z)
+        let newId = getBlockState(chunk, pos)
+        if newId != snapshot[idx]:
+          setState(placer, pos, newId)
+        inc idx
+
+proc feedback(context: CommandContext; key, name: string; p: BlockPos) =
+  sendFeedback(context.source, translateCross(key, key, [text(name), text($p.vec.x), text($p.vec.y), text($p.vec.z)]), true)
+
+proc placeTemplateExecutor(context: CommandContext): CmdResult[int32] =
+  let nameR = getString(context, "template")
+  if not nameR.isOk:
+    return cmdFail[int32](nameR.error)
+  let world = context.source.world
+  if world == nil:
+    return cmdFail[int32](createWithoutContext(templateInvalid(), text(nameR.value)))
+  let blockPos = posOr(context)
+  let templateName = stripMinecraftPrefix(nameR.value)
+  let t = getTemplate(templateName)
+  if t == nil:
+    return cmdFail[int32](createWithoutContext(templateInvalid(), text(templateName)))
+  let placer = newWorldPlacer(world)
+  placeTemplate(placer, t, blockPos.vec, (0'i32, 0'i32), Rotation.None, false, false, newSeq[StructureProcessor](0),
+    false, newBlockBox(0'i32, 0'i32, 0'i32, 0'i32, 0'i32, 0'i32))
+  finalize(placer)
+  feedback(context, JAVA_COMMANDS_PLACE_TEMPLATE_SUCCESS, templateName, blockPos)
+  cmdOk[int32](1'i32)
+
+proc placeJigsawPieces(placer: BlockPlacer; position: nil StructurePosition): int =
+  if position == nil:
+    return 0
+  let collector = position.collector
+  result = collector.pieces.len
+  for i in 0 ..< collector.pieces.len:
+    if collector.pieces[i].isPoolElement:
+      placePoolElementTemplates(PoolElementStructurePiece(collector.pieces[i]), placer, false,
+        newBlockBox(0'i32, 0'i32, 0'i32, 0'i32, 0'i32, 0'i32))
+
+proc placeJigsawExecutor(context: CommandContext): CmdResult[int32] =
+  let poolR = getIdentifier(context, "pool")
+  if not poolR.isOk:
+    return cmdFail[int32](poolR.error)
+  let targetR = getIdentifier(context, "target")
+  if not targetR.isOk:
+    return cmdFail[int32](targetR.error)
+  let depthR = getInt(context, "max_depth")
+  if not depthR.isOk:
+    return cmdFail[int32](depthR.error)
+  let world = context.source.world
+  let pool = $poolR.value
+  if world == nil:
+    return cmdFail[int32](createWithoutContext(jigsawFailed(), text(pool)))
+  let blockPos = posOr(context)
+  let params = genParams(world)
+  let seed = cast[uint64](hashBlockPos(blockPos.vec.x, blockPos.vec.y, blockPos.vec.z))
+  var structureContext = StructureGeneratorContext(seed: cast[int64](seed), chunkX: 0'i32, chunkZ: 0'i32,
+    random: toRandomGenerator(fromSeed(seed)), seaLevel: params.seaLevel, minY: params.minY, height: params.logicalHeight,
+    heightSampler: nil, hasStructureKey: false)
+  var aliasRandom = toRandomGenerator(fromSeed(seed))
+  let position = addPieces(structureContext, pool, true, $targetR.value, depthR.value, blockPos, false, false,
+    newMaxDistance(128'i32), DimensionPadding(top: 0'i32, bottom: 0'i32), LiquidSettings.ApplyWaterlog,
+    poolAliasLookupFromBindings(@[], aliasRandom))
+  if position == nil:
+    return cmdFail[int32](createWithoutContext(jigsawFailed(), text(pool)))
+  let placer = newWorldPlacer(world)
+  let pieceCount = placeJigsawPieces(placer, position)
+  finalize(placer)
+  feedback(context, JAVA_COMMANDS_PLACE_JIGSAW_SUCCESS, $pieceCount, blockPos)
+  cmdOk[int32](1'i32)
+
+proc placeStructureExecutor(context: CommandContext): CmdResult[int32] =
+  let idR = getIdentifier(context, "structure")
+  if not idR.isOk:
+    return cmdFail[int32](idR.error)
+  let structureName = $idR.value
+  let (okKey, key) = fromName(StructureKeys, structureName)
+  if not okKey:
+    return cmdFail[int32](createWithoutContext(structureInvalid(), text(structureName)))
+  let structure = structures.get(key)
+  let world = context.source.world
+  if world == nil:
+    return cmdFail[int32](createWithoutContext(structureInvalid(), text(structureName)))
+  let blockPos = posOr(context)
+  let params = genParams(world)
+  let seed = cast[uint64](hashBlockPos(blockPos.vec.x, blockPos.vec.y, blockPos.vec.z))
+  let placer = newWorldPlacer(world)
+  if structure.structureType == StructureType.Jigsaw:
+    if not structure.hasStartPool or not structure.hasSize:
+      return cmdFail[int32](createWithoutContext(structureInvalid(), text(structureName)))
+    var structureContext = StructureGeneratorContext(seed: cast[int64](seed), chunkX: blockPos.vec.x shr 4,
+      chunkZ: blockPos.vec.z shr 4, random: toRandomGenerator(fromSeed(seed)), seaLevel: params.seaLevel, minY: params.minY,
+      height: params.logicalHeight, heightSampler: nil, hasStructureKey: true, structureKey: key)
+    var aliasRandom = toRandomGenerator(fromSeed(seed))
+    let position = addPieces(structureContext, structure.startPool, structure.hasStartJigsawName, structure.startJigsawName,
+      structure.size, blockPos, structure.hasUseExpansionHack and structure.useExpansionHack,
+      structure.hasProjectStartToHeightmap, newMaxDistance(if structure.hasMaxDistanceFromCenter: structure.maxDistanceFromCenter else: 128'i32),
+      DimensionPadding(top: 0'i32, bottom: 0'i32), LiquidSettings.ApplyWaterlog, poolAliasLookupFromBindings(@[], aliasRandom))
+    if position == nil:
+      return cmdFail[int32](createWithoutContext(jigsawFailed(), text(structureName)))
+    discard placeJigsawPieces(placer, position)
+  else:
+    var structureContext = StructureGeneratorContext(seed: cast[int64](seed), chunkX: blockPos.vec.x shr 4,
+      chunkZ: blockPos.vec.z shr 4, random: toRandomGenerator(fromSeed(seed)), seaLevel: params.seaLevel, minY: params.minY,
+      height: params.logicalHeight, heightSampler: nil, hasStructureKey: true, structureKey: key)
+    let position = generateStructurePosition(key, structure, structureContext)
+    if position == nil:
+      return cmdFail[int32](createWithoutContext(structureInvalid(), text(structureName)))
+    let collector = position.collector
+    discard placeJigsawPieces(placer, position)
+    var hasNonJigsaw = false
+    for i in 0 ..< collector.pieces.len:
+      if not collector.pieces[i].isPoolElement:
+        hasNonJigsaw = true
+    if hasNonJigsaw:
+      let registry = noOpWorldPortal()
+      var minX = int32.high
+      var minZ = int32.high
+      var maxX = int32.low
+      var maxZ = int32.low
+      for i in 0 ..< collector.pieces.len:
+        if not collector.pieces[i].isPoolElement:
+          let bb = boundingBox(collector.pieces[i])
+          minX = min(minX, bb.min.x)
+          minZ = min(minZ, bb.min.z)
+          maxX = max(maxX, bb.max.x)
+          maxZ = max(maxZ, bb.max.z)
+      for cx in (minX shr 4) .. (maxX shr 4):
+        for cz in (minZ shr 4) .. (maxZ shr 4):
+          let surfaceY = groundY(blockPos.vec.y, params.minY, params.logicalHeight)
+          let chunk = newSyntheticChunk(world, params, cx, cz, surfaceY)
+          let chunkBox = newBlockBox(cx shl 4, params.minY, cz shl 4, (cx shl 4) + ChunkDim - 1'i32,
+            params.minY + params.logicalHeight - 1'i32, (cz shl 4) + ChunkDim - 1'i32)
+          let snapshot = snapshotBlocks(chunk, cx, cz, params.minY, params.logicalHeight)
+          var rng = toRandomGenerator(fromSeed(chunkPopulationSeed(cx, cz, seed)))
+          for i in 0 ..< collector.pieces.len:
+            if intersects(boundingBox(collector.pieces[i]), chunkBox):
+              place(collector.pieces[i], chunk, registry, rng, cast[int64](seed), chunkBox)
+          applyDelta(chunk, snapshot, cx, cz, params.minY, params.logicalHeight, placer)
+  finalize(placer)
+  feedback(context, JAVA_COMMANDS_PLACE_STRUCTURE_SUCCESS, structureName, blockPos)
+  cmdOk[int32](1'i32)
+
+proc placeFeatureExecutor(context: CommandContext): CmdResult[int32] =
+  let idR = getIdentifier(context, "feature")
+  if not idR.isOk:
+    return cmdFail[int32](idR.error)
+  let featureName = $idR.value
+  let (okKey, key) = fromName(PlacedFeature, featureName)
+  if not okKey:
+    return cmdFail[int32](createWithoutContext(featureInvalid(), text(featureName)))
+  let world = context.source.world
+  if world == nil:
+    return cmdFail[int32](createWithoutContext(featureInvalid(), text(featureName)))
+  let blockPos = posOr(context)
+  let params = genParams(world)
+  let cx = blockPos.vec.x shr 4
+  let cz = blockPos.vec.z shr 4
+  let surfaceY = groundY(blockPos.vec.y, params.minY, params.logicalHeight)
+  # Feature generation runs against a synthetic solid terrain, not the live chunk: features that depend on existing
+  # air, caves, or fluids may differ from normal world generation.
+  let chunk = newSyntheticChunk(world, params, cx, cz, surfaceY)
+  let snapshot = snapshotBlocks(chunk, cx, cz, params.minY, params.logicalHeight)
+  let seed = cast[uint64](hashBlockPos(blockPos.vec.x, blockPos.vec.y, blockPos.vec.z))
+  var random = toRandomGenerator(fromSeed(seed))
+  generatePlacedFeatureInProtoChunk(key, chunk, noOpWorldPortal(), random, blockPos)
+  let placer = newWorldPlacer(world)
+  applyDelta(chunk, snapshot, cx, cz, params.minY, params.logicalHeight, placer)
+  finalize(placer)
+  feedback(context, JAVA_COMMANDS_PLACE_FEATURE_SUCCESS, featureName, blockPos)
+  cmdOk[int32](1'i32)
+
+proc register*(dispatcher: CommandDispatcher; registry: PermissionRegistry) =
+  registerPermissionOrPanic(registry, newPermission(Permission0, Description, permissionOp(Two)))
+  let templateN = then(literal("template"), then(executes(argument("template", newTemplateArgumentType(allTemplateNames())), placeTemplateExecutor),
+    executes(argument("pos", newBlockPosArgumentType()), placeTemplateExecutor)))
+  let jigsawN = then(literal("jigsaw"), then(argument("pool", newPoolArgumentType(allPoolNames())),
+    then(argument("target", newIdentifierArgumentType()), then(executes(argument("max_depth", newIntegerArgumentType(1'i32, 20'i32)), placeJigsawExecutor),
+      executes(argument("pos", newBlockPosArgumentType()), placeJigsawExecutor)))))
+  let structureN = then(literal("structure"), then(executes(argument("structure", newStructureArgumentType()), placeStructureExecutor),
+    executes(argument("pos", newBlockPosArgumentType()), placeStructureExecutor)))
+  let featureN = then(literal("feature"), then(executes(argument("feature", newPlacedFeatureArgumentType()), placeFeatureExecutor),
+    executes(argument("pos", newBlockPosArgumentType()), placeFeatureExecutor)))
+  var root = requires(command("place", Description), Permission0)
+  root = then(root, templateN)
+  root = then(root, jigsawN)
+  root = then(root, structureN)
+  root = then(root, featureN)
+  discard register(dispatcher, root)

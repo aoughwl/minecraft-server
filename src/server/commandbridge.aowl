@@ -27,6 +27,8 @@ import ../generated/translation as tr
 import ../generated/dimension
 import ../inventory/[inventory, player_inventory, screenhandler]
 import ../protocol/proto
+import ../protocol/recipe as protorecipe
+import ../protocol/java/client/play/recipe_book_add
 import ../protocol/varint
 import ../protocol/java/client/config/config_disconnect
 import ../protocol/java/client/login/login_disconnect
@@ -47,7 +49,12 @@ import entity/player as playermod
 import net/java/javamod
 import net/winsock
 import serverbase
-import world/[time, weather, worldmod]
+import ../world/chunkdata
+import ../world/generation/[proto_chunk, protochunkbase]
+import ../protocol/java/client/play/[chunk_data, set_camera]
+import ../generated/[block_loot, chest_loot]
+import world/loot as lootmod
+import world/[time, weather, worldmod, scoreboard, border, bossbar, custom_bossbar]
 
 const DataFolder = "data"
 
@@ -65,7 +72,58 @@ proc flagsOf(bits: uint32): uint32 =
 
 proc playerOf(server: Server; player: Player): CommandPlayer = server.commandPlayerOf(player)
 
+type
+  ScoreboardBox = ref object
+    board: Scoreboard
+
+  BossbarBox = ref object
+    bars: CustomBossbars
+
+proc cmdTeamOf(t: Team): CmdTeamInfo =
+  CmdTeamInfo(name: t.name, displayName: t.displayName, color: t.color, players: t.players, options: t.options,
+    nametagVisibility: int32(ord(t.nametagVisibility)), collisionRule: int32(ord(t.collisionRule)),
+    playerPrefix: t.playerPrefix, playerSuffix: t.playerSuffix)
+
+proc teamFromCmd(t: CmdTeamInfo): Team =
+  Team(name: t.name, displayName: t.displayName, options: t.options, nametagVisibility: NameTagVisibility(t.nametagVisibility),
+    collisionRule: CollisionRule(t.collisionRule), color: t.color, playerPrefix: t.playerPrefix,
+    playerSuffix: t.playerSuffix, players: t.players)
+
+proc statusOf(u: BossbarUpdate): CmdBossbarStatus =
+  CmdBossbarStatus(kind: int32(ord(u.kind)), location: u.location, what: u.what, detail: u.detail)
+
+proc cmdBossbarOf(b: CustomBossbar): CmdBossbar =
+  CmdBossbar(namespace: b.namespace, title: b.bossbarData.title, max: b.max, value: b.value, visible: b.visible,
+    color: int32(ord(b.bossbarData.color)), division: int32(ord(b.bossbarData.division)), players: b.players)
+
+proc recipeIdOf(recipe: DynamicRecipe): string =
+  ## `get_recipe_id` in recipe.rs.
+  case recipe.kind
+  of drCrafting: recipe.crafting.result.itemId
+  of drCooking: recipe.cooking.recipe.recipeId
+
 # ---- CommandWorld -------------------------------------------------------------------------------------------------
+
+proc toItemStack(stack: CmdItemStack; res: var ItemStack): bool =
+  ## The item by name. A patch is not applied yet: see the note on `insertOrDropStack`.
+  let key = if stack.itemKey.startsWith("minecraft:"): stack.itemKey[10 ..< stack.itemKey.len] else: stack.itemKey
+  let it = Item.fromRegistryKey(key)
+  if it == nil:
+    return false
+  res = newItemStack(uint8(stack.count), it)
+  true
+
+proc fromItemStack(stack: ItemStack): CmdItemStack =
+  if stack.isEmpty():
+    return CmdItemStack(itemKey: "", count: 0'i32, patchNames: @[], patchValues: @[])
+  CmdItemStack(itemKey: stack.item.registryKey, count: int32(stack.itemCount), patchNames: @[], patchValues: @[])
+
+proc chunkOf(theWorld: World; chunkX, chunkZ: int32): ChunkData =
+  ## `get_or_fetch_chunk`: in memory, then disk, then generation.
+  let fetched = fetchChunk(theWorld.level, chunkX, chunkZ)
+  if fetched.kind != lkLoaded:
+    return nil
+  fetched.chunk
 
 proc buildCommandWorld(server: Server; world: World): CommandWorld =
   let rules = proc(): GameRuleRegistry {.closure.} = world.levelInfo.gameRules
@@ -132,6 +190,156 @@ proc buildCommandWorld(server: Server; world: World): CommandWorld =
     uint16(worldmod.getBlockStateId(world, newBlockPos(x, y, z)))
   result.isAirState = proc(stateId: uint16): bool {.closure.} = isAir(BlockState.fromId(newBlockStateIdUnchecked(stateId)))
   result.getBlockId = proc(x, y, z: int32): int {.closure.} = int(worldmod.getBlock(world, newBlockPos(x, y, z)).id)
+  result.getMinY = proc(): int32 {.closure.} = world.dimension.minY
+  result.getGenParams = proc(): CmdGenParams {.closure.} =
+    discard ensureChunkSystem(world.level)
+    let sample = newProtoChunk(0'i32, 0'i32, world.level.worldGen)
+    CmdGenParams(seed: world.levelInfo.worldGenSettings.seed, defaultBlock: sample.defaultBlock,
+      biomeMixerSeed: sample.biomeMixerSeed, logicalHeight: int32(height(sample)), minY: int32(bottomY(sample)),
+      seaLevel: world.seaLevel)
+  result.fillBiomeChunk = proc(chunkX, chunkZ: int32; cells: seq[Vector3[int32]]; target: int32; hasReplace: bool;
+                               replace: int32): int32 {.closure.} =
+    let chunk = chunkOf(world, chunkX, chunkZ)
+    if chunk == nil:
+      return 0'i32
+    var count = 0'i32
+    for i in 0 ..< cells.len:
+      let (ok, current) = getNoiseBiome(chunk.section, int(cells[i].y) div 4, int(cells[i].x), int(cells[i].y) mod 4, int(cells[i].z))
+      if ok and (not hasReplace or int32(current) == replace):
+        setRelativeBiome(chunk.section, int(cells[i].x), int(cells[i].y), int(cells[i].z), uint8(target))
+        inc count
+    if count > 0'i32:
+      chunk.dirty = true
+      world.broadcastToChunk(Vector2[int32](x: chunkX, y: chunkZ), CChunkData(data: chunk))
+    count
+  result.getSurfaceHeight = proc(x, z: int32): int32 {.closure.} =
+    let chunk = chunkOf(world, x shr 4, z shr 4)
+    if chunk == nil:
+      return world.dimension.minY
+    getHeightmap(chunk.heightmap, chmWorldSurface, x, z, world.dimension.minY)
+  result.isLiquidAt = proc(x, y, z: int32): bool {.closure.} =
+    isLiquid(BlockState.fromId(newBlockStateIdUnchecked(uint16(worldmod.getBlockStateId(world, newBlockPos(x, y, z))))))
+  result.generateBlockLoot = proc(x, y, z: int32; hasTool: bool; tool: string; found: var bool): seq[CmdItemStack] {.closure.} =
+    let pos = newBlockPos(x, y, z)
+    let stateId = worldmod.getBlockStateId(world, pos)
+    let blockRef = worldmod.getBlock(world, pos)
+    let table = blockLootTable(asU16(blockRef.id))
+    found = table != nil
+    result = @[]
+    if table == nil:
+      return
+    var toolStack = none[ItemStack]()
+    if hasTool:
+      let it = Item.fromRegistryKey(tool)
+      if it != nil:
+        toolStack = some(newItemStack(1'u8, it))
+    let params = LootContextParameters(blockState: some(newBlockStateIdUnchecked(uint16(stateId))), tool: toolStack,
+      position: some(Vector3[float64](x: float64(x), y: float64(y), z: float64(z))),
+      worldTime: cast[uint64](world.levelInfo.dayTime), isRaining: some(world.weather.raining),
+      isThundering: some(world.weather.thundering))
+    for stack in lootmod.getLoot(table, params):
+      result.add(fromItemStack(stack))
+
+  # Scoreboard, teams and the border. `World` holds no scoreboard (scoreboard.aowl imports serverbase), so the one of
+  # this world lives in the closures here.
+  let board = ScoreboardBox(board: newScoreboard())
+  result.getObjectiveNames = proc(): seq[string] {.closure.} =
+    var names: seq[string] = @[]
+    for o in board.board.objectives:
+      names.add(o.name)
+    names
+  result.getObjective = proc(name: string; res: var CmdObjective): bool {.closure.} =
+    for o in board.board.objectives:
+      if o.name == name:
+        res = CmdObjective(name: o.name, displayName: o.displayName, criterion: o.criterion)
+        return true
+    false
+  result.addObjective = proc(name: string; displayName: TextComponent; criterion: string) {.closure.} =
+    board.board.addObjective(world, newScoreboardObjective(name, displayName, criterion))
+  result.getScore = proc(playerName, objective: string): int32 {.closure.} =
+    for sc in board.board.scores:
+      if sc.entityName == playerName and sc.objectiveName == objective:
+        return sc.value.value
+    0'i32
+  result.getScoreEntry = proc(entity, objective: string; res: var CmdScore): bool {.closure.} =
+    for sc in board.board.scores:
+      if sc.entityName == entity and sc.objectiveName == objective:
+        res = CmdScore(value: sc.value.value, locked: sc.locked)
+        return true
+    false
+  result.setScoreEntry = proc(entity, objective: string; value: int32; locked: bool) {.closure.} =
+    var next = newScoreboardScore(entity, objective, newVarInt(value), none[TextComponent](), none[NumberFormat]())
+    for sc in board.board.scores:
+      if sc.entityName == entity and sc.objectiveName == objective:
+        next.displayName = sc.displayName
+        next.numberFormat = sc.numberFormat
+    next.locked = locked
+    board.board.updateScore(world, next)
+  result.getTeamNames = proc(): seq[string] {.closure.} =
+    var names: seq[string] = @[]
+    for t in board.board.teams:
+      names.add(t.name)
+    names
+  result.teamHasPlayer = proc(team, playerName: string): bool {.closure.} =
+    for t in board.board.teams:
+      if t.name == team:
+        return playerName in t.players
+    false
+  result.getTeam = proc(name: string; res: var CmdTeamInfo): bool {.closure.} =
+    for t in board.board.teams:
+      if t.name == name:
+        res = cmdTeamOf(t)
+        return true
+    false
+  result.getTeamOf = proc(playerName: string; res: var CmdTeamInfo): bool {.closure.} =
+    for t in board.board.teams:
+      if playerName in t.players:
+        res = cmdTeamOf(t)
+        return true
+    false
+  result.addTeam = proc(team: CmdTeamInfo) {.closure.} = board.board.addTeam(world, teamFromCmd(team))
+  result.updateTeam = proc(team: CmdTeamInfo) {.closure.} = board.board.updateTeam(world, teamFromCmd(team))
+  result.removeTeam = proc(name: string) {.closure.} = board.board.removeTeam(world, name)
+  result.addPlayerToTeam = proc(team, player: string) {.closure.} = board.board.addPlayerToTeam(world, team, player)
+  result.removePlayerFromTeam = proc(team, player: string) {.closure.} =
+    board.board.removePlayerFromTeam(world, team, player)
+  result.getForcedChunks = proc(): seq[Vector2[int32]] {.closure.} = world.forcedChunks
+  result.setForcedChunk = proc(x, z: int32; forced: bool) {.closure.} =
+    var kept: seq[Vector2[int32]] = @[]
+    for c in world.forcedChunks:
+      if c.x != x or c.y != z:
+        kept.add(c)
+    if forced:
+      kept.add(Vector2[int32](x: x, y: z))
+    world.forcedChunks = kept
+    worldmod.updateActiveChunks(world)
+  result.clearForcedChunks = proc(): int32 {.closure.} =
+    let count = int32(world.forcedChunks.len)
+    world.forcedChunks = @[]
+    worldmod.updateActiveChunks(world)
+    count
+  result.getBorder = proc(): CmdBorder {.closure.} =
+    let b = world.worldborder
+    CmdBorder(centerX: b.centerX, centerZ: b.centerZ, newDiameter: b.newDiameter, warningBlocks: b.warningBlocks,
+      warningTime: b.warningTime, damagePerBlock: b.damagePerBlock, buffer: b.buffer)
+  result.setBorderCenter = proc(x, z: float64) {.closure.} =
+    var b = world.worldborder   # a copy: the border is a field of `world`, which setCenter also takes
+    b.setCenter(world, x, z)
+    world.worldborder = b
+  result.setBorderDiameter = proc(diameter: float64; hasSpeed: bool; speed: int64) {.closure.} =
+    var b = world.worldborder
+    b.setDiameter(world, diameter, hasSpeed, speed)
+    world.worldborder = b
+  result.setBorderWarningDelay = proc(delay: int32) {.closure.} =
+    var b = world.worldborder
+    b.setWarningDelay(world, delay)
+    world.worldborder = b
+  result.setBorderWarningDistance = proc(distance: int32) {.closure.} =
+    var b = world.worldborder
+    b.setWarningDistance(world, distance)
+    world.worldborder = b
+  result.setBorderDamageAmount = proc(amount: float32) {.closure.} = world.worldborder.damagePerBlock = amount
+  result.setBorderDamageBuffer = proc(buffer: float32) {.closure.} = world.worldborder.buffer = buffer
 
 proc commandWorldOf(server: Server; world: World): CommandWorld =
   let existing = world.commandWorld
@@ -149,20 +357,6 @@ proc soundId(id: uint16): proto.IdOr[proto.SoundEvent] =
   proto.IdOr[proto.SoundEvent](kind: iokId, id: id)
 
 # ---- CommandPlayer and its CommandEntity ---------------------------------------------------------------------------
-
-proc toItemStack(stack: CmdItemStack; res: var ItemStack): bool =
-  ## The item by name. A patch is not applied yet: see the note on `insertOrDropStack`.
-  let key = if stack.itemKey.startsWith("minecraft:"): stack.itemKey[10 ..< stack.itemKey.len] else: stack.itemKey
-  let it = Item.fromRegistryKey(key)
-  if it == nil:
-    return false
-  res = newItemStack(uint8(stack.count), it)
-  true
-
-proc fromItemStack(stack: ItemStack): CmdItemStack =
-  if stack.isEmpty():
-    return CmdItemStack(itemKey: "", count: 0'i32, patchNames: @[], patchValues: @[])
-  CmdItemStack(itemKey: stack.item.registryKey, count: int32(stack.itemCount), patchNames: @[], patchValues: @[])
 
 proc killPlayer(player: Player) =
   ## `Entity::kill` on a player: health to nothing and the death screen, which `handleClientStatus` answers with a
@@ -243,6 +437,18 @@ proc inventorySlot(player: Player; index: int): CmdItemSlot =
     else:
       inventory.setStack(inv, index, s)
     player.currentScreenHandler.sendContentUpdates()
+  result.isEmpty = proc(): bool {.closure.} = inventory.getStack(inv, index).isEmpty()
+
+proc enderChestSlot(player: Player; index: int): CmdItemSlot =
+  result = CmdItemSlot()
+  let inv = Inventory(player.enderChestInventory)
+  result.getStack = proc(): CmdItemStack {.closure.} = fromItemStack(inventory.getStack(inv, index))
+  result.setStack = proc(stack: CmdItemStack) {.closure.} =
+    var s = ItemStack()
+    if stack.itemKey.len == 0 or not toItemStack(stack, s):
+      inventory.setStack(inv, index, emptyItemStack())
+    else:
+      inventory.setStack(inv, index, s)
   result.isEmpty = proc(): bool {.closure.} = inventory.getStack(inv, index).isEmpty()
 
 proc buildCommandPlayer(server: Server; player: Player): CommandPlayer =
@@ -344,6 +550,12 @@ proc buildCommandPlayer(server: Server; player: Player): CommandPlayer =
       if not s.isEmpty():
         player.asInventoryPlayer().dropItem(s, false)
       player.currentScreenHandler.sendContentUpdates()
+  result.sendRecipeBook = proc(replace: bool; ids: seq[string]) {.closure.} =
+    var picked: seq[DynamicRecipe] = @[]
+    for recipe in server.recipeManager.dynamicRecipes:
+      if recipeIdOf(recipe) in ids:
+        picked.add(recipe)
+    player.client.writePacketFor(CRecipeBookAdd(replace: replace, dynamicRecipes: picked))
   result.getHeldStack = proc(): CmdItemStack {.closure.} = fromItemStack(player.inventory.heldItem())
   result.getInventorySlots = proc(): seq[CmdItemSlot] {.closure.} =
     var list: seq[CmdItemSlot] = @[]
@@ -353,6 +565,31 @@ proc buildCommandPlayer(server: Server; player: Player): CommandPlayer =
       list.add(inventorySlot(player, i))
       inc i
     list
+  result.getSelectedSlot = proc(): int32 {.closure.} = int32(player.inventory.getSelectedSlot())
+  result.getEnderChestSlots = proc(): seq[CmdItemSlot] {.closure.} =
+    var list: seq[CmdItemSlot] = @[]
+    var i = 0
+    let ender = Inventory(player.enderChestInventory)
+    let total = inventory.size(ender)
+    while i < total:
+      list.add(enderChestSlot(player, i))
+      inc i
+    list
+  result.sendEquipmentChange = proc(slot: string; stack: CmdItemStack) {.closure.} =
+    var s = ItemStack()
+    if stack.itemKey.len == 0 or not toItemStack(stack, s):
+      s = emptyItemStack()
+    let which = case slot
+      of "mainhand": esMainHand
+      of "offhand": esOffHand
+      of "feet": esFeet
+      of "legs": esLegs
+      of "chest": esChest
+      else: esHead
+    playermod.sendEquipmentChanges(player, [(which, s)])
+  result.setCameraTarget = proc(entityId: int32) {.closure.} =
+    player.cameraTargetId = (if entityId == player.entityId: none[int32]() else: some(entityId))
+    player.client.writePacketFor(CSetCamera(cameraId: newVarInt(entityId)))
 
 proc forgetCommandPlayer*(player: Player) =
   ## `Player::remove`'s half here: break the cycle between a player and its hooks.
@@ -528,6 +765,11 @@ proc buildCommandServer(server: Server; registry: PermissionRegistry): CommandSe
       list.add(playerOf(server, p).entity)
     list
   result.stopServer = proc() {.closure.} = server.stopRequested = true
+  result.getRecipeIds = proc(): seq[string] {.closure.} =
+    var ids: seq[string] = @[]
+    for recipe in server.recipeManager.dynamicRecipes:
+      ids.add(recipeIdOf(recipe))
+    ids
   result.configuredTps = proc(): float64 {.closure.} = float64(server.basicConfig.tps)
   result.javaMaxPlayers = proc(): int32 {.closure.} = int32(server.advancedConfig.networking.java.maxPlayers)
   result.bedrockMaxPlayers = proc(): int32 {.closure.} = int32(server.advancedConfig.networking.java.maxPlayers)
@@ -666,6 +908,13 @@ proc buildCommandServer(server: Server; registry: PermissionRegistry): CommandSe
   result.offlineUuid = proc(name: string; res: var Uuid): bool {.closure.} =
     res = offlineUuid(name)
     true
+  result.generateChestLoot = proc(key: string; seed: int64; found: var bool): seq[CmdItemStack] {.closure.} =
+    let table = getChestLootTable(key)
+    found = table.isSome
+    result = @[]
+    if table.isSome:
+      for stack in lootmod.generateChestLoot(table.unsafeGet, seed):
+        result.add(fromItemStack(stack))
   result.getGameRule = proc(rule: string): CmdGameRuleValue {.closure.} =
     let (ok, r) = gameRuleFromName(rule)
     if not ok:
@@ -692,6 +941,36 @@ proc buildCommandServer(server: Server; registry: PermissionRegistry): CommandSe
       w.levelInfo.spawnZ = spawn.z
       w.levelInfo.spawnYaw = spawn.yaw
       w.levelInfo.spawnPitch = spawn.pitch
+
+  # Custom bossbars (`Server.bossbars`): the server's one set lives in these closures, as `World`'s scoreboard does.
+  let boxes = BossbarBox(bars: newCustomBossbars())
+  result.bossbarGet = proc(location: string; res: var CmdBossbar): bool {.closure.} =
+    let found = boxes.bars.getBossbar(location)
+    if found.isNone:
+      return false
+    res = cmdBossbarOf(found.unsafeGet)
+    true
+  result.bossbarAll = proc(): seq[CmdBossbar] {.closure.} =
+    var list: seq[CmdBossbar] = @[]
+    for b in boxes.bars.getAllBossbars():
+      list.add(cmdBossbarOf(b))
+    list
+  result.bossbarCreate = proc(namespace: string; title: TextComponent) {.closure.} =
+    boxes.bars.createBossbar(namespace, newBossbar(title))
+  result.bossbarRemove = proc(location: string): CmdBossbarStatus {.closure.} =
+    statusOf(boxes.bars.removeBossbar(server, location))
+  result.bossbarSetHealth = proc(location: string; max, value: int32): CmdBossbarStatus {.closure.} =
+    statusOf(boxes.bars.updateHealth(server, location, max, value))
+  result.bossbarSetVisible = proc(location: string; visible: bool): CmdBossbarStatus {.closure.} =
+    statusOf(boxes.bars.updateVisibility(server, location, visible))
+  result.bossbarSetName = proc(location: string; title: TextComponent): CmdBossbarStatus {.closure.} =
+    statusOf(boxes.bars.updateName(server, location, title))
+  result.bossbarSetColor = proc(location: string; color: int32): CmdBossbarStatus {.closure.} =
+    statusOf(boxes.bars.updateColor(server, location, BossbarColor(color)))
+  result.bossbarSetDivision = proc(location: string; division: int32): CmdBossbarStatus {.closure.} =
+    statusOf(boxes.bars.updateDivision(server, location, BossbarDivisions(division)))
+  result.bossbarSetPlayers = proc(location: string; players: seq[Uuid]): CmdBossbarStatus {.closure.} =
+    statusOf(boxes.bars.updatePlayers(server, location, players))
 
 proc consoleLine(line: string) =
   echo line

@@ -1,0 +1,218 @@
+## `/scoreboard`, `/team` and `/tick` through a real dispatcher, over hooks that record what they were asked.
+import std/[options, syncio]
+import ../../command/[argument_builder, cmddispatch, cmderrors, cmdsource, cmdtree]
+import ../../util/[permission, vector2, vector3, uuid]
+import ../../util/text/[textbase, text, color]
+import scoreboard, team, tick, trigger, cmdtestutil
+
+proc check(ok: bool; what: string) =
+  if not ok:
+    echo "FAILED: ", what
+    stdout.flushFile()
+    quit(1)
+
+type
+  Fake = ref object
+    objectives: seq[CmdObjective]
+    scores: seq[(string, string, int32, bool)]
+    teams: seq[CmdTeamInfo]
+    messages: seq[string]
+
+proc teamIndex(f: Fake; name: string): int =
+  for i in 0 ..< f.teams.len:
+    if f.teams[i].name == name:
+      return i
+  -1
+
+proc hook(f: Fake): CommandWorld =
+  result = CommandWorld(dimensionName: "minecraft:overworld")
+  result.getObjective = proc(name: string; res: var CmdObjective): bool {.closure.} =
+    for o in f.objectives:
+      if o.name == name:
+        res = o
+        return true
+    false
+  result.addObjective = proc(name: string; displayName: TextComponent; criterion: string) {.closure.} =
+    f.objectives.add(CmdObjective(name: name, displayName: displayName, criterion: criterion))
+  result.getObjectiveNames = proc(): seq[string] {.closure.} =
+    var n: seq[string] = @[]
+    for o in f.objectives:
+      n.add(o.name)
+    n
+  result.getScoreEntry = proc(entity, objective: string; res: var CmdScore): bool {.closure.} =
+    for s in f.scores:
+      if s[0] == entity and s[1] == objective:
+        res = CmdScore(value: s[2], locked: s[3])
+        return true
+    false
+  result.setScoreEntry = proc(entity, objective: string; value: int32; locked: bool) {.closure.} =
+    for i in 0 ..< f.scores.len:
+      if f.scores[i][0] == entity and f.scores[i][1] == objective:
+        f.scores[i] = (entity, objective, value, locked)
+        return
+    f.scores.add((entity, objective, value, locked))
+  result.getTeam = proc(name: string; res: var CmdTeamInfo): bool {.closure.} =
+    let i = f.teamIndex(name)
+    if i < 0:
+      return false
+    res = f.teams[i]
+    true
+  result.getTeamOf = proc(player: string; res: var CmdTeamInfo): bool {.closure.} =
+    for t in f.teams:
+      if player in t.players:
+        res = t
+        return true
+    false
+  result.getTeamNames = proc(): seq[string] {.closure.} =
+    var n: seq[string] = @[]
+    for t in f.teams:
+      n.add(t.name)
+    n
+  result.addTeam = proc(t: CmdTeamInfo) {.closure.} = f.teams.add(t)
+  result.updateTeam = proc(t: CmdTeamInfo) {.closure.} = f.teams[f.teamIndex(t.name)] = t
+  result.removeTeam = proc(name: string) {.closure.} =
+    let i = f.teamIndex(name)
+    if i >= 0:
+      f.teams.delete(i)
+  result.addPlayerToTeam = proc(team, player: string) {.closure.} =
+    let i = f.teamIndex(team)
+    if i >= 0 and player notin f.teams[i].players:
+      f.teams[i].players.add(player)
+  result.removePlayerFromTeam = proc(team, player: string) {.closure.} =
+    let i = f.teamIndex(team)
+    if i >= 0:
+      var kept: seq[string] = @[]
+      for p in f.teams[i].players:
+        if p != player:
+          kept.add(p)
+      f.teams[i].players = kept
+
+proc scoreboardAndTeam() =
+  let f = Fake()
+  let world = hook(f)
+  let server = newServerWithWorld(world)
+  let player = CommandPlayer(entity: CommandEntity(entityTypeId: "minecraft:player"), gameProfile: CmdGameProfile(name: "Steve"))
+  player.entity.player = player
+  player.entity.getWorld = proc(): nil CommandWorld {.closure.} = world
+  world.sendCommandFeedback = proc(): bool {.closure.} = true
+  player.hasPermission = proc(node: string): bool {.closure.} = true
+  player.sendSystemMessage = proc(m: TextComponent) {.closure.} = discard
+  player.getPermissionLvl = proc(): PermissionLvl {.closure.} = Four
+  let players = @[player]
+  server.getAllPlayers = proc(): seq[CommandPlayer] {.closure.} = players
+  server.getPlayerByName = proc(name: string): nil CommandPlayer {.closure.} =
+    if name == "Steve":
+      return player
+    nil
+  server.selectPlayers = proc(selector: TargetSelector; sender: CommandSender): seq[CommandPlayer] {.closure.} = players
+  let source = consoleSource(server, world)
+  let registry = newPermissionRegistry()
+  let d = newCommandDispatcher()
+  scoreboard.register(d, registry)
+  team.register(d, registry)
+  trigger.register(d, registry)
+  proc run(line: string): CmdResult[int32] {.closure.} = executeInput(d, line, source)
+
+  # /scoreboard
+  check(run("scoreboard objectives add kills dummy Kill count").isOk, "objectives add")
+  check(f.objectives.len == 1 and f.objectives[0].criterion == "dummy" and getText(f.objectives[0].displayName) == "Kill count",
+    "objective display name takes the greedy phrase")
+  check(not run("scoreboard objectives add kills dummy").isOk, "duplicate objective")
+  check(run("scoreboard objectives add bare dummy").isOk and getText(f.objectives[1].displayName) == "bare", "default display name")
+  check(not run("scoreboard players enable Steve kills").isOk, "enable needs a trigger objective")
+  check(run("scoreboard objectives add t trigger").isOk, "trigger objective")
+  let enabled = run("scoreboard players enable Steve t")
+  check(enabled.isOk and enabled.value == 1'i32, "enable a trigger")
+  check(f.scores.len == 1 and f.scores[0] == ("Steve", "t", 0'i32, false), "score unlocked")
+  check(not run("scoreboard players enable Steve t").isOk, "already enabled fails")
+
+  # /trigger: primed by `players enable`, locked again by each use.
+  let steveSource = newCommandSource(senderPlayer(player), world, player.entity, Vector3[float64](x: 0.0, y: 0.0, z: 0.0),
+    Vector2[float32](x: 0.0'f32, y: 0.0'f32), "Steve", text("Steve"), server)
+  proc runAsSteve(line: string): CmdResult[int32] {.closure.} = executeInput(d, line, steveSource)
+  check(not runAsSteve("trigger kills").isOk, "a non-trigger objective is invalid")
+  check(not run("trigger t").isOk, "the console is not a player")
+  let trig = runAsSteve("trigger t")
+  check(trig.isOk and trig.value == 1'i32 and f.scores[0] == ("Steve", "t", 1'i32, true), "simple trigger bumps and relocks")
+  check(not runAsSteve("trigger t").isOk, "unprimed after use")
+  check(run("scoreboard players enable Steve t").isOk, "prime again")
+  check(runAsSteve("trigger t add 5").value == 6'i32, "trigger add")
+  check(run("scoreboard players enable Steve t").isOk, "prime once more")
+  check(runAsSteve("trigger t set -3").value == -3'i32 and f.scores[0][2] == -3'i32, "trigger set")
+
+  # /team
+  check(run("team add red Red Team").isOk, "team add")
+  check(f.teams.len == 1 and getText(f.teams[0].displayName) == "Red Team" and f.teams[0].color == ncWhite, "team fields")
+  check(not run("team add red").isOk, "duplicate team")
+  check(not run("team remove nope").isOk, "unknown team")
+  let joined = run("team join red Steve")
+  check(joined.isOk and joined.value == 1'i32 and f.teams[0].players == @["Steve"], "join")
+  check(run("team modify red color dark_blue").isOk and f.teams[0].color == ncDarkBlue, "color")
+  check(not run("team modify red color dark_blue").isOk, "color unchanged")
+  check(run("team modify red friendlyFire true").isOk and f.teams[0].options == 1'i8, "friendly fire bit")
+  check(not run("team modify red friendlyFire true").isOk, "friendly fire already on")
+  check(run("team modify red seeFriendlyInvisibles true").isOk and f.teams[0].options == 3'i8, "invisibles bit")
+  check(run("team modify red friendlyFire false").isOk and f.teams[0].options == 2'i8, "friendly fire off keeps the other bit")
+  check(run("team modify red prefix [R] ").isOk and getText(f.teams[0].playerPrefix) == "[R] ", "prefix")
+  check(run("team modify red nametagVisibility never").isOk and f.teams[0].nametagVisibility == 1'i32, "nametag")
+  check(not run("team modify red nametagVisibility never").isOk, "nametag unchanged")
+  check(run("team modify red collisionRule pushOwnTeam").isOk and f.teams[0].collisionRule == 3'i32, "collision")
+  check(run("team modify red displayName Crimson").isOk and getText(f.teams[0].displayName) == "Crimson", "display name")
+  let listed = run("team list red")
+  check(listed.isOk and listed.value == 1'i32, "list members")
+  check(run("team list").value == 1'i32, "list teams")
+  let left = run("team leave Steve")
+  check(left.isOk and left.value == 1'i32 and f.teams[0].players.len == 0, "leave")
+  check(not run("team empty red").isOk, "empty on an empty team fails")
+  check(run("team join red Steve").isOk, "rejoin")
+  let emptied = run("team empty red")
+  check(emptied.isOk and emptied.value == 1'i32 and f.teams[0].players.len == 0, "empty")
+  check(run("team remove red").isOk and f.teams.len == 0, "remove")
+
+proc tickBlock() =
+  var rate = 20.0'f32
+  var frozen = false
+  var stepped = 0'i32
+  var sprinting = false
+  let world = CommandWorld(dimensionName: "minecraft:overworld")
+  let server = newServerWithWorld(world)
+  server.getTickRate = proc(): float32 {.closure.} = rate
+  server.getNanosecondsPerTick = proc(): int64 {.closure.} = 50_000_000'i64
+  server.isTickFrozen = proc(): bool {.closure.} = frozen
+  server.isTickSprinting = proc(): bool {.closure.} = sprinting
+  server.getAverageTickTimeNanos = proc(): int64 {.closure.} = 12_000_000'i64
+  server.getTickTimesNanos = proc(): seq[int64] {.closure.} = @[30_000_000'i64, 10_000_000'i64, 20_000_000'i64, 40_000_000'i64]
+  server.setTickRate = proc(r: float32) {.closure.} = rate = r
+  server.setTickFrozen = proc(v: bool) {.closure.} = frozen = v
+  server.stepGameIfPaused = proc(t: int32): bool {.closure.} =
+    if frozen:
+      stepped = t
+    frozen
+  server.stopTickStepping = proc(): bool {.closure.} = stepped > 0'i32
+  server.requestGameToSprint = proc(t: int64): bool {.closure.} =
+    sprinting = true
+    false
+  server.stopTickSprinting = proc(): bool {.closure.} =
+    let was = sprinting
+    sprinting = false
+    was
+  let source = consoleSource(server, world)
+  let d = newCommandDispatcher()
+  tick.register(d, newPermissionRegistry())
+  proc run(line: string): CmdResult[int32] {.closure.} = executeInput(d, line, source)
+  check(run("tick query").value == 20'i32, "query returns the rate")
+  check(run("tick rate 40").isOk and rate == 40.0'f32, "rate")
+  check(not run("tick rate 0").isOk and not run("tick rate 20000").isOk, "rate is bounded 1..10000")
+  check(run("tick step").isOk and stepped == 0'i32, "step while running does nothing")
+  check(run("tick freeze").value == 1'i32 and frozen, "freeze")
+  check(run("tick step 5t").isOk and stepped == 5'i32, "step 5t")
+  check(run("tick step 2s").isOk and stepped == 40'i32, "step 2s is 40 ticks")
+  check(not run("tick step 0t").isOk, "step needs at least a tick")
+  check(run("tick unfreeze").value == 0'i32 and not frozen, "unfreeze")
+  check(run("tick sprint 60s").isOk and sprinting, "sprint")
+  check(run("tick sprint stop").value == 1'i32 and not sprinting, "sprint stop")
+  check(run("tick sprint stop").value == 0'i32, "sprint stop when not sprinting reports 0")
+
+scoreboardAndTeam()
+tickBlock()
+echo "scoreboard, team and tick command tests: all checks passed"
