@@ -1,0 +1,162 @@
+## `/scoreboard players operation|list|get|set`, `objectives list` and the read-only check, over a fake scoreboard.
+## The operation vectors are those of upstream's scoreboard.rs tests (newer tree).
+import std/[options, syncio]
+import ../../command/[cmddispatch, cmderrors, cmdsource, cmdtree, score_holder]
+import ../../util/[permission, uuid]
+import ../../util/text/[textbase, text]
+import scoreboard, cmdtestutil
+
+var failures = 0
+
+proc check(ok: bool; what: string) =
+  if not ok:
+    echo "FAILED: ", what
+    inc failures
+
+type
+  Row = object
+    holder: string
+    objective: string
+    value: int32
+    locked: bool
+
+  Fake = ref object
+    objectives: seq[CmdObjective]
+    rows: seq[Row]
+
+proc find(f: Fake; holder, objective: string): int =
+  for i in 0 ..< f.rows.len:
+    if f.rows[i].holder == holder and f.rows[i].objective == objective:
+      return i
+  -1
+
+proc makeWorld(f: Fake): CommandWorld =
+  let w = CommandWorld(dimensionName: "minecraft:overworld")
+  w.getObjectiveNames = proc(): seq[string] {.closure.} =
+    var r: seq[string] = @[]
+    for o in f.objectives:
+      r.add(o.name)
+    r
+  w.getObjective = proc(name: string; res: var CmdObjective): bool {.closure.} =
+    for i in 0 ..< f.objectives.len:
+      if f.objectives[i].name == name:
+        res = f.objectives[i]
+        return true
+    false
+  w.addObjective = proc(name: string; displayName: TextComponent; criterion: string) {.closure.} =
+    f.objectives.add(CmdObjective(name: name, displayName: displayName, criterion: criterion))
+  w.getScoreEntry = proc(entity, objective: string; res: var CmdScore): bool {.closure.} =
+    let i = find(f, entity, objective)
+    if i < 0:
+      return false
+    res = CmdScore(value: f.rows[i].value, locked: f.rows[i].locked)
+    true
+  w.setScoreEntry = proc(entity, objective: string; value: int32; locked: bool) {.closure.} =
+    let i = find(f, entity, objective)
+    if i >= 0:
+      f.rows[i].value = value
+      f.rows[i].locked = locked
+    else:
+      f.rows.add(Row(holder: entity, objective: objective, value: value, locked: locked))
+  w.removeScoreEntry = proc(entity, objective: string) {.closure.} =
+    let i = find(f, entity, objective)
+    if i >= 0:
+      f.rows.delete(i)
+  w.getScoreHolderNames = proc(): seq[string] {.closure.} =
+    var r: seq[string] = @[]
+    for row in f.rows:
+      if row.holder notin r:
+        r.add(row.holder)
+    r
+  w
+
+proc valueOf(f: Fake; holder, objective: string): Option[int32] =
+  let i = find(f, holder, objective)
+  if i < 0: none[int32]() else: some(f.rows[i].value)
+
+proc holder(name: string): ResolvedScoreHolder =
+  ResolvedScoreHolder(name: name, displayName: text(name))
+
+proc main() =
+  let f = Fake(objectives: @[], rows: @[])
+  let world = makeWorld(f)
+  let server = newServerWithWorld(world)
+  let source = consoleSource(server, world)
+  let d = newCommandDispatcher()
+  scoreboard.register(d, newPermissionRegistry())
+  proc run(line: string): CmdResult[int32] {.closure.} = executeInput(d, line, source)
+
+  check(run("scoreboard objectives list").value == 0'i32, "no objectives")
+  check(run("scoreboard objectives add test dummy").isOk, "add test")
+  check(run("scoreboard objectives add hp health").isOk, "add a read-only one")
+  check(run("scoreboard objectives list").value == 2'i32, "two objectives listed")
+
+  # holders: fake names are literal, `*` is the wildcard, a single holder takes no wildcard
+  let noHolders = run("scoreboard players get * test")
+  check(not noHolders.isOk and noHolders.error.isType(noWildcardResults()), "get * on an empty scoreboard fails with scoreHolder.empty")
+  check(run("scoreboard players set $x test 4").isOk, "set a fake holder")
+  check(run("scoreboard players set #temp test 9").isOk, "set a #name")
+  check(run("scoreboard players set Offline test 1").isOk, "set an offline name")
+  check(valueOf(f, "$x", "test") == some(4'i32), "$x holds 4")
+  check(run("scoreboard players get $x test").value == 4'i32, "get returns 4")
+  let star = run("scoreboard players get * test")
+  check(not star.isOk and star.error.isType(noWildcardResults()), "get * is not accepted as a single holder")
+  check(run("scoreboard players add * test 1").isOk, "add to every holder")
+  check(valueOf(f, "$x", "test") == some(5'i32) and valueOf(f, "#temp", "test") == some(10'i32) and
+    valueOf(f, "Offline", "test") == some(2'i32), "* reached all three")
+  check(run("scoreboard players remove $x test 5").value == 0'i32, "remove returns the new score")
+  check(not run("scoreboard players add $x test -1").isOk, "add takes only non-negative")
+  check(not run("scoreboard players get @a test").isOk, "a multi selector is not a single holder")
+  check(not run("scoreboard players get nobody test").isOk, "a holder with no score has no value")
+  check(run("scoreboard players list").value == 3'i32, "three holders tracked")
+  check(run("scoreboard players list #temp").value == 1'i32, "one score for #temp")
+  check(run("scoreboard players list nobody").value == 0'i32, "no scores for nobody")
+
+  # read-only criteria
+  let ro = run("scoreboard players set $x hp 3")
+  check(not ro.isOk and getText(ro.error.message).len > 0, "health is read-only")
+  check(not run("scoreboard players add $x hp 1").isOk and not run("scoreboard players remove $x hp 1").isOk, "add/remove refuse it too")
+  check(not run("scoreboard players set $x missing 3").isOk, "unknown objective")
+  for (criterion, writable) in [("dummy", true), ("trigger", true), ("deathCount", true), ("playerKillCount", true),
+      ("totalKillCount", true), ("teamkill.red", true), ("killedByTeam.blue", true), ("minecraft.mined:minecraft.stone", true),
+      ("minecraft.custom:minecraft.jump", true), ("health", false), ("food", false), ("air", false), ("armor", false),
+      ("xp", false), ("level", false)]:
+    check(isReadOnlyCriterion(criterion) == not writable, "read-only " & criterion)
+
+  # operation through the command
+  check(run("scoreboard players set a test 7").isOk, "set a")
+  check(run("scoreboard players operation a test = src test").isOk, "assign from a missing source")
+  check(valueOf(f, "src", "test") == some(0'i32), "the missing source is created at 0")
+  check(valueOf(f, "a", "test") == some(0'i32), "assign copied 0")
+  check(run("scoreboard players set a test 7").isOk, "reset a")
+  let dz = run("scoreboard players operation a test /= src test")
+  check(not dz.isOk and dz.error.isType(divideByZeroError()), "divide by zero")
+  check(valueOf(f, "a", "test") == some(7'i32), "target unchanged after the error")
+  check(run("scoreboard players operation a test %= src test").isOk == false, "modulo by zero")
+  check(run("scoreboard players operation a test >< src test").isOk, "swap")
+  check(valueOf(f, "a", "test") == some(0'i32) and valueOf(f, "src", "test") == some(7'i32), "swapped")
+
+  # apply(): sum only the final target values, swap sequentially (upstream test)
+  let g = Fake(objectives: @[], rows: @[])
+  let gw = makeWorld(g)
+  for (n, v) in [("a", 1'i32), ("b", 4'i32), ("source1", 2'i32), ("source2", 3'i32)]:
+    gw.setScoreEntry(n, "test", v, false)
+  var total = 0'i32
+  var r = applyOperationTo(gw, @[holder("a"), holder("b")], "test", soPlus, @[holder("source1"), holder("source2")], "test", total)
+  check(r.isOk and total == 15'i32, "operation sum is 15")
+  check(valueOf(g, "a", "test") == some(6'i32) and valueOf(g, "b", "test") == some(9'i32), "a=6 b=9")
+  r = applyOperationTo(gw, @[holder("a"), holder("b")], "test", soSwap, @[holder("source1")], "test", total)
+  check(r.isOk and total == 8'i32, "swap sum is 8")
+  check(valueOf(g, "a", "test") == some(2'i32) and valueOf(g, "b", "test") == some(6'i32) and
+    valueOf(g, "source1", "test") == some(9'i32), "swapped sequentially")
+
+  # reset
+  check(run("scoreboard players reset *").isOk, "reset every holder")
+  check(f.rows.len == 0, "no scores left")
+
+  if failures > 0:
+    echo "scoreboardopstest: ", failures, " FAILED"
+    quit(1)
+
+main()
+echo "scoreboard ops tests: all checks passed"

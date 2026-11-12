@@ -1,6 +1,5 @@
 ## Builds the `CCommands` packet: the fallback dispatcher's trees for this player, then the node dispatcher's tree.
 ## Port of pumpkin/src/command/client_suggestions.rs
-## PARTIAL: pumpkin/src/command/client_suggestions.rs - `send_bedrock_commands_packet` and its overload builders are not ported: `pumpkin_protocol::bedrock` has no `CAvailableCommands` here yet.
 ##
 ## Upstream's `send_c_commands_packet` enqueues the packet; `buildCCommands` returns it and the network code writes it.
 ## As upstream does, the node tree goes out in full whatever the player may use (`satisfies_requirements` is always
@@ -8,6 +7,7 @@
 
 import std/[options, tables]
 import ../protocol/java/client/play/commands
+import ../protocol/bedrock/client/available_commands as bac
 import ../protocol/varint
 import cmdsource, cmdtree, cmddispatch, fallbackdispatch
 
@@ -114,3 +114,138 @@ proc buildCCommands*(sender: CommandSender; server: nil CommandServer; dispatche
     for c in rootNodeChildrenSecond:
       protoNodes[rootNodeIndex].children.add(c)
   CCommands(nodes: protoNodes, rootNodeIndex: newVarInt(int32(rootNodeIndex)))
+
+# --- the Bedrock half: `send_bedrock_commands_packet` ---------------------------------------------------------------
+
+type
+  BedrockBuilder = object
+    enumValues: seq[string]
+    enums: seq[bac.CommandEnum]
+
+proc ensureEnumValue(b: var BedrockBuilder; value: string): int =
+  for i in 0 ..< b.enumValues.len:
+    if b.enumValues[i] == value:
+      return i
+  b.enumValues.add(value)
+  b.enumValues.len - 1
+
+proc ensureCommandEnum(b: var BedrockBuilder; name: string; values: seq[string]): int =
+  for i in 0 ..< b.enums.len:
+    if b.enums[i].name == name:
+      return i
+  var indices: seq[int] = @[]
+  for v in values:
+    indices.add(ensureEnumValue(b, v))
+  b.enums.add(bac.CommandEnum(name: name, valueIndices: indices))
+  b.enums.len - 1
+
+proc bedrockParamType(arg: ArgumentType): uint32 =
+  ## `bedrock_param_type`.
+  let base = case arg.kind
+    of atInteger, atLong, atTime, atBool: ARG_TYPE_INT
+    of atFloat, atDouble: ARG_TYPE_FLOAT
+    of atEntity, atGameProfile, atScoreHolder: ARG_TYPE_TARGET
+    of atBlockPos, atColumnPos: ARG_TYPE_BLOCK_POS
+    of atVec3, atVec2, atRotation, atAngle: ARG_TYPE_ENTITY_POS
+    of atString: (if arg.behavior == spGreedyPhrase: ARG_TYPE_RAW_TEXT else: ARG_TYPE_STRING)
+    of atMessage: ARG_TYPE_MESSAGE
+    of atIntRange, atFloatRange: ARG_TYPE_INT_RANGE
+    of atItemSlot, atItemSlots: ARG_TYPE_EQUIPMENT_SLOT
+    of atComponent, atStyle, atNbtCompound, atNbtTag, atNbtPath: ARG_TYPE_JSON
+    of atOperation: ARG_TYPE_OPERATOR
+    else: ARG_TYPE_STRING
+  base or ARG_FLAG_VALID
+
+proc literalParam(b: var BedrockBuilder; name: string): bac.CommandParameter =
+  let enumIdx = ensureCommandEnum(b, "SubCommand_" & name, @[name])
+  bac.CommandParameter(name: name, typeInfo: ARG_FLAG_VALID or ARG_FLAG_ENUM or uint32(enumIdx), optional: false, options: 0'u8)
+
+proc collectOverloadsFromNodes(b: var BedrockBuilder; nodes: seq[Node]; children: seq[int];
+    current: seq[bac.CommandParameter]; overloads: var seq[bac.CommandOverload]) =
+  ## `collect_overloads_from_nodes`.
+  var hasExecutable = false
+  for i in children:
+    let node = nodes[i]
+    case node.kind
+    of lnExecuteLeaf:
+      hasExecutable = true
+    of lnLiteral:
+      var params = current
+      params.add(literalParam(b, node.str))
+      collectOverloadsFromNodes(b, nodes, node.children, params, overloads)
+    of lnArgument:
+      var params = current
+      let consumer = node.consumer
+      params.add(bac.CommandParameter(name: node.name, typeInfo: bedrockParamType(consumer.clientParser), optional: false,
+        options: 0'u8))
+      collectOverloadsFromNodes(b, nodes, node.children, params, overloads)
+    of lnRequire:
+      collectOverloadsFromNodes(b, nodes, node.children, current, overloads)
+  if hasExecutable:
+    overloads.add(bac.CommandOverload(chaining: false, parameters: current))
+
+proc collectOverloadsFromAttached(b: var BedrockBuilder; tree: Tree; childIds: seq[NodeId];
+    current: seq[bac.CommandParameter]; overloads: var seq[bac.CommandOverload]) =
+  ## `collect_overloads_from_attached`.
+  for childId in childIds:
+    let idx = childId - 1
+    if idx < 0 or idx >= tree.nodes.len:
+      continue
+    let node = tree.nodes[idx]
+    case node.kind
+    of nkLiteral, nkCommand:
+      var params = current
+      params.add(literalParam(b, node.literal))
+      if node.command != nil:
+        overloads.add(bac.CommandOverload(chaining: false, parameters: params))
+      collectOverloadsFromAttached(b, tree, node.childIds, params, overloads)
+    of nkArgument:
+      let argType = node.argumentType
+      var params = current
+      params.add(bac.CommandParameter(name: node.name,
+        typeInfo: (if argType != nil: bedrockParamType(argType.clientParser) else: ARG_TYPE_STRING or ARG_FLAG_VALID),
+        optional: false, options: 0'u8))
+      if node.command != nil:
+        overloads.add(bac.CommandOverload(chaining: false, parameters: params))
+      collectOverloadsFromAttached(b, tree, node.childIds, params, overloads)
+    of nkRoot:
+      discard
+
+proc buildBedrockCommands*(sender: CommandSender; server: nil CommandServer; dispatcher: CommandDispatcher): bac.CAvailableCommands =
+  ## `send_bedrock_commands_packet`'s packet: the fallback commands the player may use, then the first level of the node tree.
+  var b = BedrockBuilder(enumValues: @[], enums: @[])
+  var commands: seq[bac.Command] = @[]
+  let fallback = dispatcher.fallbackDispatcher
+  for key in fallback.commandKeys:
+    var tree = newCommandTree([key], "")
+    if not getTree(fallback, key, tree).isOk:
+      continue
+    if not fallback.permissions.hasKey(key):
+      continue
+    if not hasPermission(sender, server, permissionOf(fallback, key)):
+      continue
+    var overloads: seq[bac.CommandOverload] = @[]
+    collectOverloadsFromNodes(b, tree.nodes, tree.children, @[], overloads)
+    if overloads.len == 0:
+      overloads.add(bac.CommandOverload(chaining: false, parameters: @[]))
+    commands.add(bac.Command(name: key, description: "", flags: 0'u16, permission: COMMAND_PERMISSION_ANY, aliasesEnumIndex: -1'i32,
+      chainedSubcommandOffsets: @[], overloads: overloads))
+  let tree = dispatcher.tree
+  if tree.nodes.len > 0 and tree.nodes[0].kind == nkRoot:
+    for childId in tree.nodes[0].childIds:
+      let idx = childId - 1
+      if idx < 0 or idx >= tree.nodes.len:
+        continue
+      let node = tree.nodes[idx]
+      if node.kind != nkLiteral and node.kind != nkCommand:
+        continue
+      var overloads: seq[bac.CommandOverload] = @[]
+      if node.command != nil:
+        overloads.add(bac.CommandOverload(chaining: false, parameters: @[]))
+      collectOverloadsFromAttached(b, tree, node.childIds, @[], overloads)
+      if overloads.len == 0:
+        overloads.add(bac.CommandOverload(chaining: false, parameters: @[]))
+      commands.add(bac.Command(name: node.literal, description: "", flags: 0'u16, permission: COMMAND_PERMISSION_ANY,
+        aliasesEnumIndex: -1'i32, chainedSubcommandOffsets: @[], overloads: overloads))
+  bac.CAvailableCommands(enumValues: b.enumValues, chainedSubcommandValues: @[], suffixes: @[], chainedSubcommands: @[],
+    enums: b.enums, commands: commands, softEnums: @[], constraints: @[])

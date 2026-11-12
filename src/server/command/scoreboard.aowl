@@ -1,10 +1,14 @@
 ## The `/scoreboard` command.
 ## Port of pumpkin/src/command/commands/scoreboard.rs
 ##
-## Upstream's command has `objectives add` and `players enable` only.
+## The pinned tree's command has `objectives add` and `players enable` only. From the newer tree: `objectives remove` and
+## `players set|add|remove|get|reset|operation`, with the score holder argument type (offline and fake names, `*`,
+## selectors) and the read-only criterion check. Added from vanilla, which upstream's tree lacks: `objectives list` and
+## `players list`.
+## PARTIAL: pumpkin/src/command/commands/scoreboard.rs - no `objectives modify|setdisplay` and no `players display`: neither upstream tree has them, the world scoreboard keeps no display slots and the hooks carry no render type or number format.
 
 import std/options
-import ../../command/[cmderrors, cmdsource, cmdtree, argument_builder, argtype, argument_types, cmddispatch, entity_selector]
+import ../../command/[cmderrors, cmdsource, cmdtree, argument_builder, argtype, argument_types, cmddispatch, entity_selector, score_holder]
 import ../../util/permission
 import ../../util/text/[textbase, text]
 import ../../generated/translation
@@ -18,6 +22,10 @@ const
   ArgCriterion = "criterion"
   ArgDisplayName = "display_name"
   ArgTargets = "targets"
+  ArgScore = "score"
+  ArgOperation = "operation"
+  ArgSource = "source"
+  ArgSourceObjective = "sourceObjective"
 
 proc duplicateObjectiveError(): CommandErrorType =
   errorType0(JAVA_COMMANDS_SCOREBOARD_OBJECTIVES_ADD_DUPLICATE, JAVA_COMMANDS_SCOREBOARD_OBJECTIVES_ADD_DUPLICATE)
@@ -27,6 +35,334 @@ proc invalidEnableError(): CommandErrorType =
 
 proc failedEnableError(): CommandErrorType =
   errorType0(JAVA_COMMANDS_SCOREBOARD_PLAYERS_ENABLE_FAILED, JAVA_COMMANDS_SCOREBOARD_PLAYERS_ENABLE_FAILED)
+
+proc noScoreError(): CommandErrorType =
+  errorType2(JAVA_COMMANDS_SCOREBOARD_PLAYERS_GET_NULL, JAVA_COMMANDS_SCOREBOARD_PLAYERS_GET_NULL)
+
+proc objectiveNotFoundError(): CommandErrorType =
+  errorType1(JAVA_ARGUMENTS_OBJECTIVE_NOTFOUND, JAVA_ARGUMENTS_OBJECTIVE_NOTFOUND)
+
+proc readOnlyError(): CommandErrorType =
+  errorType1(JAVA_ARGUMENTS_OBJECTIVE_READONLY, JAVA_ARGUMENTS_OBJECTIVE_READONLY)
+
+proc isReadOnlyCriterion*(criterion: string): bool =
+  ## The six criteria vanilla's `ObjectiveCriteria` registers as read-only.
+  criterion == "health" or criterion == "food" or criterion == "air" or criterion == "armor" or criterion == "xp" or
+    criterion == "level"
+
+proc objectiveOrError(world: CommandWorld; name: string): CmdResult[CmdObjective] =
+  ## `objective_or_error`.
+  var objective = CmdObjective()
+  let getter = world.getObjective
+  if getter == nil or not getter(name, objective):
+    return cmdFail[CmdObjective](createWithoutContext(objectiveNotFoundError(), text(name)))
+  cmdOk[CmdObjective](objective)
+
+proc writableObjectiveOrError(world: CommandWorld; name: string): CmdResult[CmdObjective] =
+  ## `writable_objective_or_error`.
+  let objective = objectiveOrError(world, name)
+  if not objective.isOk:
+    return objective
+  if isReadOnlyCriterion(objective.value.criterion):
+    return cmdFail[CmdObjective](createWithoutContext(readOnlyError(), text(name)))
+  objective
+
+proc holderText(holders: seq[ResolvedScoreHolder]): (TextComponent, bool) =
+  ## `holder_component`: the holder's name for one, the count otherwise.
+  if holders.len == 1: (holders[0].displayName, true) else: (text($holders.len), false)
+
+proc wrapAdd(a, b: int32): int32 = cast[int32](cast[uint32](a) + cast[uint32](b))
+
+proc scoreValue(world: CommandWorld; holder, objective: string; value: var int32): bool =
+  var current = CmdScore()
+  if world.getScoreEntry != nil and world.getScoreEntry(holder, objective, current):
+    value = current.value
+    return true
+  false
+
+proc putScore(world: CommandWorld; holder, objective: string; value: int32) =
+  ## `set_score_value`: keeps the entry's lock.
+  var current = CmdScore()
+  let has = world.getScoreEntry != nil and world.getScoreEntry(holder, objective, current)
+  if world.setScoreEntry != nil:
+    world.setScoreEntry(holder, objective, value, has and current.locked)
+
+proc objectivesRemoveExecutor(context: CommandContext): CmdResult[int32] =
+  let objectiveName = getString(context, ArgObjective)
+  if not objectiveName.isOk:
+    return cmdFail[int32](objectiveName.error)
+  let world0 = context.source.world
+  if world0 == nil:
+    return cmdOk[int32](0'i32)
+  let world: CommandWorld = world0
+  let objective = objectiveOrError(world, objectiveName.value)
+  if not objective.isOk:
+    return cmdFail[int32](objective.error)
+  if world.removeObjective != nil:
+    world.removeObjective(objectiveName.value)
+  sendFeedback(context.source, tc(JAVA_COMMANDS_SCOREBOARD_OBJECTIVES_REMOVE_SUCCESS, [objective.value.displayName]), true)
+  cmdOk[int32](1'i32)
+
+proc objectivesListExecutor(context: CommandContext): CmdResult[int32] =
+  ## Vanilla's `objectives list`; neither upstream tree has it.
+  let world0 = context.source.world
+  if world0 == nil:
+    return cmdOk[int32](0'i32)
+  let world: CommandWorld = world0
+  var names: seq[string] = @[]
+  if world.getObjectiveNames != nil:
+    names = world.getObjectiveNames()
+  if names.len == 0:
+    sendFeedback(context.source, tc(JAVA_COMMANDS_SCOREBOARD_OBJECTIVES_LIST_EMPTY), false)
+    return cmdOk[int32](0'i32)
+  var list = empty()
+  for i in 0 ..< names.len:
+    var objective = CmdObjective()
+    var shown = text(names[i])
+    if world.getObjective != nil and world.getObjective(names[i], objective):
+      shown = objective.displayName
+    if i > 0:
+      list = addChild(list, text(", "))
+    list = addChild(addChild(addChild(list, text("[")), shown), text("]"))
+  sendFeedback(context.source, tc(JAVA_COMMANDS_SCOREBOARD_OBJECTIVES_LIST_SUCCESS, [text($names.len), list]), false)
+  cmdOk[int32](int32(names.len))
+
+proc playersSetExecutor(context: CommandContext): CmdResult[int32] =
+  let holders = getScoreHolders(context, ArgTargets)
+  if not holders.isOk:
+    return cmdFail[int32](holders.error)
+  let objectiveName = getString(context, ArgObjective)
+  if not objectiveName.isOk:
+    return cmdFail[int32](objectiveName.error)
+  let value = getInt(context, ArgScore)
+  if not value.isOk:
+    return cmdFail[int32](value.error)
+  let world0 = context.source.world
+  if world0 == nil:
+    return cmdOk[int32](0'i32)
+  let world: CommandWorld = world0
+  let objective = writableObjectiveOrError(world, objectiveName.value)
+  if not objective.isOk:
+    return cmdFail[int32](objective.error)
+  for holder in holders.value:
+    putScore(world, holder.name, objectiveName.value, value.value)
+  # Java 26.3 uses the nonzero result count for `players set` feedback: a zero is counted as no holders.
+  var shown = text("0")
+  var single = false
+  if value.value != 0'i32:
+    let (t, one) = holderText(holders.value)
+    shown = t
+    single = one
+  let key = if single: JAVA_COMMANDS_SCOREBOARD_PLAYERS_SET_SUCCESS_SINGLE else: JAVA_COMMANDS_SCOREBOARD_PLAYERS_SET_SUCCESS_MULTIPLE
+  sendFeedback(context.source, tc(key, [objective.value.displayName, shown, text($value.value)]), true)
+  cmdOk[int32](cast[int32](cast[uint32](int32(holders.value.len)) * cast[uint32](value.value)))
+
+proc playersGetExecutor(context: CommandContext): CmdResult[int32] =
+  let holder = getScoreHolder(context, ArgTargets)
+  if not holder.isOk:
+    return cmdFail[int32](holder.error)
+  let objectiveName = getString(context, ArgObjective)
+  if not objectiveName.isOk:
+    return cmdFail[int32](objectiveName.error)
+  let world0 = context.source.world
+  if world0 == nil:
+    return cmdOk[int32](0'i32)
+  let world: CommandWorld = world0
+  let objective = objectiveOrError(world, objectiveName.value)
+  if not objective.isOk:
+    return cmdFail[int32](objective.error)
+  var current = CmdScore()
+  if world.getScoreEntry == nil or not world.getScoreEntry(holder.value.name, objectiveName.value, current):
+    return cmdFail[int32](createWithoutContext(noScoreError(), text(objectiveName.value), holder.value.displayName))
+  sendFeedback(context.source, tc(JAVA_COMMANDS_SCOREBOARD_PLAYERS_GET_SUCCESS,
+    [holder.value.displayName, text($current.value), objective.value.displayName]), false)
+  cmdOk[int32](current.value)
+
+proc playersAddRemoveExecutor(remove: bool): CommandExecutor =
+  result = proc(context: CommandContext): CmdResult[int32] {.closure.} =
+    let holders = getScoreHolders(context, ArgTargets)
+    if not holders.isOk:
+      return cmdFail[int32](holders.error)
+    let objectiveName = getString(context, ArgObjective)
+    if not objectiveName.isOk:
+      return cmdFail[int32](objectiveName.error)
+    let value = getInt(context, ArgScore)
+    if not value.isOk:
+      return cmdFail[int32](value.error)
+    let delta = if remove: cast[int32](0'u32 - cast[uint32](value.value)) else: value.value
+    let world0 = context.source.world
+    if world0 == nil:
+      return cmdOk[int32](0'i32)
+    let world: CommandWorld = world0
+    let objective = writableObjectiveOrError(world, objectiveName.value)
+    if not objective.isOk:
+      return cmdFail[int32](objective.error)
+    var total = 0'i32
+    for holder in holders.value:
+      var cur = 0'i32
+      discard scoreValue(world, holder.name, objectiveName.value, cur)
+      let next = wrapAdd(cur, delta)
+      putScore(world, holder.name, objectiveName.value, next)
+      total = wrapAdd(total, next)
+    let (holderText0, single) = holderText(holders.value)
+    var key = ""
+    if remove:
+      key = if single: JAVA_COMMANDS_SCOREBOARD_PLAYERS_REMOVE_SUCCESS_SINGLE else: JAVA_COMMANDS_SCOREBOARD_PLAYERS_REMOVE_SUCCESS_MULTIPLE
+    else:
+      key = if single: JAVA_COMMANDS_SCOREBOARD_PLAYERS_ADD_SUCCESS_SINGLE else: JAVA_COMMANDS_SCOREBOARD_PLAYERS_ADD_SUCCESS_MULTIPLE
+    if single:
+      sendFeedback(context.source, tc(key, [text($value.value), objective.value.displayName, holderText0, text($total)]), true)
+    else:
+      sendFeedback(context.source, tc(key, [text($value.value), objective.value.displayName, holderText0]), true)
+    cmdOk[int32](total)
+
+proc playersResetExecutor(hasObjective: bool): CommandExecutor =
+  result = proc(context: CommandContext): CmdResult[int32] {.closure.} =
+    let holders = getScoreHolders(context, ArgTargets)
+    if not holders.isOk:
+      return cmdFail[int32](holders.error)
+    let world0 = context.source.world
+    if world0 == nil:
+      return cmdOk[int32](0'i32)
+    let world: CommandWorld = world0
+    let (holderText0, single) = holderText(holders.value)
+    if hasObjective:
+      let objectiveName = getString(context, ArgObjective)
+      if not objectiveName.isOk:
+        return cmdFail[int32](objectiveName.error)
+      let objective = objectiveOrError(world, objectiveName.value)
+      if not objective.isOk:
+        return cmdFail[int32](objective.error)
+      for holder in holders.value:
+        if world.removeScoreEntry != nil:
+          world.removeScoreEntry(holder.name, objectiveName.value)
+      let key = if single: JAVA_COMMANDS_SCOREBOARD_PLAYERS_RESET_SPECIFIC_SINGLE else: JAVA_COMMANDS_SCOREBOARD_PLAYERS_RESET_SPECIFIC_MULTIPLE
+      sendFeedback(context.source, tc(key, [objective.value.displayName, holderText0]), true)
+    else:
+      # `reset_scores_for_entity`: every objective's entry for the holder
+      let names = if world.getObjectiveNames != nil: world.getObjectiveNames() else: @[]
+      for holder in holders.value:
+        for objectiveName in names:
+          if world.removeScoreEntry != nil:
+            world.removeScoreEntry(holder.name, objectiveName)
+      let key = if single: JAVA_COMMANDS_SCOREBOARD_PLAYERS_RESET_ALL_SINGLE else: JAVA_COMMANDS_SCOREBOARD_PLAYERS_RESET_ALL_MULTIPLE
+      sendFeedback(context.source, tc(key, [holderText0]), true)
+    cmdOk[int32](int32(holders.value.len))
+
+proc applyOperationTo*(world: CommandWorld; holders: seq[ResolvedScoreHolder]; objective: string; op: ScoreboardOperation;
+                       sources: seq[ResolvedScoreHolder]; sourceObjective: string; total: var int32): CmdVoidResult =
+  ## `PlayersOperationExecutor::apply`: each source in turn, then the sum of the targets' final scores.
+  total = 0'i32
+  for holder in holders:
+    var cur = 0'i32
+    if not scoreValue(world, holder.name, objective, cur):
+      putScore(world, holder.name, objective, 0'i32)
+    for source in sources:
+      var sourceValue = 0'i32
+      if not scoreValue(world, source.name, sourceObjective, sourceValue):
+        putScore(world, source.name, sourceObjective, 0'i32)
+        sourceValue = 0'i32
+      var targetValue = 0'i32
+      discard scoreValue(world, holder.name, objective, targetValue)
+      if op == soSwap:
+        putScore(world, holder.name, objective, sourceValue)
+        putScore(world, source.name, sourceObjective, targetValue)
+      else:
+        var nv = 0'i32
+        let r = applyOperation(op, targetValue, sourceValue, nv)
+        if not r.isOk:
+          return r
+        putScore(world, holder.name, objective, nv)
+    var finalValue = 0'i32
+    discard scoreValue(world, holder.name, objective, finalValue)
+    total = wrapAdd(total, finalValue)
+  cmdOkVoid()
+
+proc playersOperationExecutor(context: CommandContext): CmdResult[int32] =
+  let holders = getScoreHolders(context, ArgTargets)
+  if not holders.isOk:
+    return cmdFail[int32](holders.error)
+  let objectiveName = getString(context, ArgObjective)
+  if not objectiveName.isOk:
+    return cmdFail[int32](objectiveName.error)
+  let op = getOperation(context, ArgOperation)
+  if not op.isOk:
+    return cmdFail[int32](op.error)
+  let sources = getScoreHolders(context, ArgSource)
+  if not sources.isOk:
+    return cmdFail[int32](sources.error)
+  let sourceObjective = getString(context, ArgSourceObjective)
+  if not sourceObjective.isOk:
+    return cmdFail[int32](sourceObjective.error)
+  let world0 = context.source.world
+  if world0 == nil:
+    return cmdOk[int32](0'i32)
+  let world: CommandWorld = world0
+  let objective = writableObjectiveOrError(world, objectiveName.value)
+  if not objective.isOk:
+    return cmdFail[int32](objective.error)
+  let sourceObj = objectiveOrError(world, sourceObjective.value)
+  if not sourceObj.isOk:
+    return cmdFail[int32](sourceObj.error)
+  var total = 0'i32
+  let done = applyOperationTo(world, holders.value, objectiveName.value, op.value, sources.value, sourceObjective.value, total)
+  if not done.isOk:
+    return cmdFail[int32](done.error)
+  let (holderText0, single) = holderText(holders.value)
+  if single:
+    sendFeedback(context.source, tc(JAVA_COMMANDS_SCOREBOARD_PLAYERS_OPERATION_SUCCESS_SINGLE,
+      [objective.value.displayName, holderText0, text($total)]), true)
+  else:
+    sendFeedback(context.source, tc(JAVA_COMMANDS_SCOREBOARD_PLAYERS_OPERATION_SUCCESS_MULTIPLE,
+      [objective.value.displayName, holderText0]), true)
+  cmdOk[int32](total)
+
+proc playersListExecutor(hasTarget: bool): CommandExecutor =
+  ## Vanilla's `players list [<target>]`; neither upstream tree has it.
+  result = proc(context: CommandContext): CmdResult[int32] {.closure.} =
+    let world0 = context.source.world
+    if world0 == nil:
+      return cmdOk[int32](0'i32)
+    let world: CommandWorld = world0
+    if not hasTarget:
+      var names: seq[string] = @[]
+      if world.getScoreHolderNames != nil:
+        names = world.getScoreHolderNames()
+      if names.len == 0:
+        sendFeedback(context.source, tc(JAVA_COMMANDS_SCOREBOARD_PLAYERS_LIST_EMPTY), false)
+        return cmdOk[int32](0'i32)
+      var list = empty()
+      for i in 0 ..< names.len:
+        if i > 0:
+          list = addChild(list, text(", "))
+        list = addChild(list, text(names[i]))
+      sendFeedback(context.source, tc(JAVA_COMMANDS_SCOREBOARD_PLAYERS_LIST_SUCCESS, [text($names.len), list]), false)
+      return cmdOk[int32](int32(names.len))
+    let holder = getScoreHolder(context, ArgTargets)
+    if not holder.isOk:
+      return cmdFail[int32](holder.error)
+    var entries: seq[TextComponent] = @[]
+    if world.getObjectiveNames != nil:
+      let names = world.getObjectiveNames()
+      for n in names:
+        var current = CmdScore()
+        if world.getScoreEntry != nil and world.getScoreEntry(holder.value.name, n, current):
+          var objective = CmdObjective()
+          var shown = text(n)
+          if world.getObjective != nil and world.getObjective(n, objective):
+            shown = objective.displayName
+          entries.add(tc(JAVA_COMMANDS_SCOREBOARD_PLAYERS_LIST_ENTITY_ENTRY, [shown, text($current.value)]))
+    if entries.len == 0:
+      sendFeedback(context.source, tc(JAVA_COMMANDS_SCOREBOARD_PLAYERS_LIST_ENTITY_EMPTY, [holder.value.displayName]), false)
+      return cmdOk[int32](0'i32)
+    var list = empty()
+    for i in 0 ..< entries.len:
+      if i > 0:
+        list = addChild(list, text(", "))
+      list = addChild(list, entries[i])
+    sendFeedback(context.source, tc(JAVA_COMMANDS_SCOREBOARD_PLAYERS_LIST_ENTITY_SUCCESS,
+      [holder.value.displayName, text($entries.len), list]), false)
+    cmdOk[int32](int32(entries.len))
 
 proc objectivesAddExecutor(hasDisplayName: bool): CommandExecutor =
   result = proc(context: CommandContext): CmdResult[int32] {.closure.} =
@@ -93,7 +429,26 @@ proc register*(dispatcher: CommandDispatcher; registry: PermissionRegistry) =
   registerPermissionOrPanic(registry, newPermission(Permission0, Description, permissionOp(Two)))
   var criterion = executes(argument(ArgCriterion, newStringArgumentType(spSingleWord)), objectivesAddExecutor(false))
   criterion = then(criterion, executes(argument(ArgDisplayName, newStringArgumentType(spGreedyPhrase)), objectivesAddExecutor(true)))
-  let objectives = then(literal("objectives"), then(literal("add"), then(argument(ArgObjective, newStringArgumentType(spSingleWord)), criterion)))
-  let players = then(literal("players"), then(literal("enable"), then(argument(ArgTargets, newEntityArgumentType(eakPlayers)),
+  var objectives = then(literal("objectives"), then(literal("add"), then(argument(ArgObjective, newStringArgumentType(spSingleWord)), criterion)))
+  objectives = then(objectives, then(literal("remove"), executes(argument(ArgObjective, newObjectiveArgumentType()), objectivesRemoveExecutor)))
+  objectives = then(objectives, executes(literal("list"), objectivesListExecutor))
+  proc holders(): ArgumentBuilder = argument(ArgTargets, newScoreHolderArgumentType(true))
+  proc objective(): ArgumentBuilder = argument(ArgObjective, newObjectiveArgumentType())
+  proc score(executor: CommandExecutor): ArgumentBuilder = executes(argument(ArgScore, newIntegerArgumentType()), executor)
+  proc nonNegative(executor: CommandExecutor): ArgumentBuilder = executes(argument(ArgScore, newIntegerArgumentType(0'i32)), executor)
+  var players = then(literal("players"), then(literal("enable"), then(argument(ArgTargets, newEntityArgumentType(eakPlayers)),
     executes(argument(ArgObjective, newObjectiveArgumentType()), playersEnableExecutor))))
+  players = then(players, then(literal("set"), then(holders(), then(objective(), score(playersSetExecutor)))))
+  players = then(players, then(literal("add"), then(holders(), then(objective(), nonNegative(playersAddRemoveExecutor(false))))))
+  players = then(players, then(literal("remove"), then(holders(), then(objective(), nonNegative(playersAddRemoveExecutor(true))))))
+  players = then(players, then(literal("get"), then(argument(ArgTargets, newScoreHolderArgumentType(false)),
+    executes(objective(), playersGetExecutor))))
+  players = then(players, then(literal("reset"), executes(then(holders(), executes(objective(), playersResetExecutor(true))),
+    playersResetExecutor(false))))
+  var sourceObjective = executes(argument(ArgSourceObjective, newObjectiveArgumentType()), playersOperationExecutor)
+  let sourceNode = then(argument(ArgSource, newScoreHolderArgumentType(true)), sourceObjective)
+  players = then(players, then(literal("operation"), then(holders(), then(objective(),
+    then(argument(ArgOperation, newOperationArgumentType()), sourceNode)))))
+  players = then(players, then(executes(literal("list"), playersListExecutor(false)),
+    executes(argument(ArgTargets, newScoreHolderArgumentType(false)), playersListExecutor(true))))
   discard register(dispatcher, then(then(requires(command("scoreboard", Description), Permission0), objectives), players))

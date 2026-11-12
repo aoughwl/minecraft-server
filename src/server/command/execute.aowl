@@ -1,13 +1,16 @@
 ## The `/execute` command.
 ## Port of pumpkin/src/command/commands/execute.rs
-## PARTIAL: pumpkin/src/command/commands/execute.rs - no `if|unless biome`, `predicate`, `data`; `store` writes scores only (no bossbar, entity, block, storage); `run` hands commands the new dispatcher lacks to the fallback dispatcher with this source's world, position and entity in force (DEVIATION from upstream)
+## PARTIAL: pumpkin/src/command/commands/execute.rs - `if|unless biome` takes a biome by name, not a `#tag`; no `if|unless predicate` (no predicate registry in this port); `run` hands commands the new dispatcher lacks to the fallback dispatcher with this source's world, position and entity in force (DEVIATION from upstream)
 
 import std/[math, options, strutils]
 import ../../command/[argument_builder, argument_types, argtype, cmddispatch, cmderrors, cmdsource, cmdtree, coordinates,
   entity_selector]
 from ../../command/fallbackdispatch import dispatch, intoMessages, CommandResult, CommandError, ceSyntaxError
 import ../../util/math/bounds
-import ../../generated/blockdata
+import ../../generated/[blockdata, translation]
+import ../../nbt/tag
+import ../../command/nbt_path
+from data import TargetKind, tkEntity, tkBlock, tkStorage, DataAccessor, accessTarget, getData, setData
 import ../../protocol/java/client/play/commands
 import ../../util/[identifier, permission, vector2, vector3]
 import ../../util/math/position
@@ -16,6 +19,9 @@ import ../../util/text/[textbase, text]
 const
   Description = "Execute a command with a modified context."
   Permission0 = "minecraft:command.execute"
+
+proc unknownBossbarError(): CommandErrorType =
+  errorType1(JAVA_COMMANDS_BOSSBAR_UNKNOWN, JAVA_COMMANDS_BOSSBAR_UNKNOWN)
 
 proc invalidDimensionError(): CommandErrorType =
   errorType1("argument.dimension.invalid", "argument.dimension.invalid")
@@ -251,6 +257,35 @@ proc unlessDimensionModifier(context: CommandContext): CmdResult[seq[CommandSour
   let world = context.source.world
   if world == nil or world.dimensionName != $key.value: one(context.source) else: none0()
 
+proc biomeAtMatches(context: CommandContext; matches: var bool; hasWorld: var bool): CmdResult[int32] =
+  let pos = getBlockPos(context, "pos")
+  if not pos.isOk:
+    return cmdFail[int32](pos.error)
+  let expected = getBiome(context, "biome")
+  if not expected.isOk:
+    return cmdFail[int32](expected.error)
+  let world = context.source.world
+  hasWorld = world != nil
+  if world != nil and world.getBiomeAt != nil:
+    matches = world.getBiomeAt(pos.value.vec.x, pos.value.vec.y, pos.value.vec.z) == int32(expected.value.id)
+  cmdOk[int32](0'i32)
+
+proc ifBiomeModifier(context: CommandContext): CmdResult[seq[CommandSource]] =
+  var matches = false
+  var hasWorld = false
+  let r = biomeAtMatches(context, matches, hasWorld)
+  if not r.isOk:
+    return cmdFail[seq[CommandSource]](r.error)
+  if matches: one(context.source) else: none0()
+
+proc unlessBiomeModifier(context: CommandContext): CmdResult[seq[CommandSource]] =
+  var matches = false
+  var hasWorld = false
+  let r = biomeAtMatches(context, matches, hasWorld)
+  if not r.isOk:
+    return cmdFail[seq[CommandSource]](r.error)
+  if not hasWorld or not matches: one(context.source) else: none0()
+
 proc holderName(e: CommandEntity): string =
   ## Scoreboard key: a player's name, anything else's UUID.
   if e.entityTypeName == "player": getText(e.getName()) else: $e.uuid
@@ -412,15 +447,173 @@ proc forkTo(b: ArgumentBuilder; f: RedirectModifierExecutor): ArgumentBuilder =
 proc redirectTo(b: ArgumentBuilder; f: RedirectModifierExecutor): ArgumentBuilder =
   redirectWithModifier(b, redirectRoot(), customModifier(f))
 
+
+# ---- `if|unless data` and `store ... bossbar|entity|block|storage` -------------------------------------------------
+
+proc dataMatches(context: CommandContext; kind: TargetKind; matches: var bool): CmdVoidResult =
+  ## `check_matching_data`: whether the path finds anything in the target's data.
+  let acc = accessTarget(context, kind, "target")
+  if not acc.isOk:
+    return cmdFailVoid(acc.error)
+  let path = getNbtPath(context, "path")
+  if not path.isOk:
+    return cmdFailVoid(path.error)
+  let data = getData(acc.value)
+  if not data.isOk:
+    return cmdFailVoid(data.error)
+  matches = countMatching(path.value, NbtTag(kind: ntkCompound, compoundVal: data.value)) > 0
+  cmdOkVoid()
+
+proc dataCondition(kind: TargetKind; negate: bool): RedirectModifierExecutor =
+  result = proc(context: CommandContext): CmdResult[seq[CommandSource]] {.closure.} =
+    var matched = false
+    let r = dataMatches(context, kind, matched)
+    if not r.isOk:
+      return cmdFail[seq[CommandSource]](r.error)
+    if matched != negate: one(context.source) else: none0()
+
+proc saturateI32(d: float64): int32 =
+  ## Java's `(int) d`.
+  if d != d: return 0'i32
+  if d >= 2147483647.0: return int32.high
+  if d <= -2147483648.0: return int32.low
+  int32(d)
+
+proc saturateI64(d: float64): int64 =
+  ## Java's `(long) d`.
+  if d != d: return 0'i64
+  if d >= 9223372036854775807.0: return int64.high
+  if d <= -9223372036854775808.0: return int64.low
+  int64(d)
+
+proc storeTag(typeName: string; value: int32; scale: float64): NbtTag =
+  ## The `NumericType` of `store ... <type> <scale>`: `(T)(int)(value * scale)`; float and double keep the fraction.
+  let d = float64(value) * scale
+  case typeName
+  of "byte": NbtTag(kind: ntkByte, byteVal: cast[int8](saturateI32(d) and 0xFF'i32))
+  of "short": NbtTag(kind: ntkShort, shortVal: cast[int16](saturateI32(d) and 0xFFFF'i32))
+  of "long": NbtTag(kind: ntkLong, longVal: saturateI64(d))
+  of "float": NbtTag(kind: ntkFloat, floatVal: float32(d))
+  of "double": NbtTag(kind: ntkDouble, doubleVal: d)
+  else: NbtTag(kind: ntkInt, intVal: saturateI32(d))
+
+proc writeStore(acc: DataAccessor; path: NbtPath; tag: NbtTag) =
+  ## One target of a data store: `path.set` into its data, then back. A player's data is left alone, as vanilla does.
+  if acc.kind == tkEntity and acc.entity.player != nil:
+    return
+  let data = getData(acc)
+  if not data.isOk:
+    return
+  var root = NbtTag(kind: ntkCompound, compoundVal: data.value)
+  let r = path.set(root, tag)
+  if not r.isOk or root.kind != ntkCompound:
+    return
+  discard setData(acc, root.compoundVal)
+
+proc storeData(kind: TargetKind; storeResult: bool; typeName: string): RedirectModifierExecutor =
+  result = proc(context: CommandContext): CmdResult[seq[CommandSource]] {.closure.} =
+    let path = getNbtPath(context, "path")
+    if not path.isOk:
+      return cmdFail[seq[CommandSource]](path.error)
+    let scale = getDouble(context, "scale")
+    if not scale.isOk:
+      return cmdFail[seq[CommandSource]](scale.error)
+    var targets: seq[DataAccessor] = @[]
+    if kind == tkEntity:
+      let es = getOptionalEntities(context, "targets")
+      if not es.isOk:
+        return cmdFail[seq[CommandSource]](es.error)
+      for e in es.value:
+        targets.add(DataAccessor(kind: tkEntity, entity: e))
+    else:
+      let acc = accessTarget(context, kind, "target")
+      if not acc.isOk:
+        return cmdFail[seq[CommandSource]](acc.error)
+      targets.add(acc.value)
+    let p = path.value
+    let s = scale.value
+    let cb: ReturnValueCallback = proc(value: ReturnValue) {.closure.} =
+      let v = if storeResult: resultValue(value) else: (if successValue(value): 1'i32 else: 0'i32)
+      for i in 0 ..< targets.len:
+        writeStore(targets[i], p, storeTag(typeName, v, s))
+    one(mergeCommandResultTaker(context.source, ResultValueTaker(callbacks: @[cb])))
+
+proc storeBossbar(storeResult, isMax: bool): RedirectModifierExecutor =
+  result = proc(context: CommandContext): CmdResult[seq[CommandSource]] {.closure.} =
+    let id = getIdentifier(context, "id")
+    if not id.isOk:
+      return cmdFail[seq[CommandSource]](id.error)
+    let server = context.source.server
+    let location = $id.value
+    var bar = CmdBossbar()
+    if server == nil:
+      return cmdFail[seq[CommandSource]](createWithoutContext(unknownBossbarError(), text(location)))
+    let getBar = server.bossbarGet
+    let setHealth = server.bossbarSetHealth
+    if getBar == nil or setHealth == nil or not getBar(location, bar):
+      return cmdFail[seq[CommandSource]](createWithoutContext(unknownBossbarError(), text(location)))
+    let cb: ReturnValueCallback = proc(value: ReturnValue) {.closure.} =
+      let v = if storeResult: resultValue(value) else: (if successValue(value): 1'i32 else: 0'i32)
+      var current = CmdBossbar()
+      if server == nil:
+        return
+      let getNow = server.bossbarGet
+      if getNow == nil or not getNow(location, current):
+        return
+      let setNow = server.bossbarSetHealth
+      if setNow == nil:
+        return
+      if isMax:
+        if v >= 1'i32:
+          discard setNow(location, v, current.value)
+      else:
+        discard setNow(location, current.max, v)
+    one(mergeCommandResultTaker(context.source, ResultValueTaker(callbacks: @[cb])))
+
+const NumericTypes = ["int", "float", "short", "long", "double", "byte"]
+
+proc storeNodes(storeResult: bool): ArgumentBuilder =
+  ## One `store result|success`: score, bossbar, entity, block and storage targets.
+  var node = literal(if storeResult: "result" else: "success")
+  node = then(node, then(literal("score"), then(entitiesArg(),
+    redirectTo(argument("objective", newObjectiveArgumentType()), (if storeResult: storeResultScore else: storeSuccessScore)))))
+  var barNode = argument("id", newIdentifierArgumentType())
+  barNode = then(barNode, redirectTo(literal("value"), storeBossbar(storeResult, false)))
+  barNode = then(barNode, redirectTo(literal("max"), storeBossbar(storeResult, true)))
+  node = then(node, then(literal("bossbar"), barNode))
+  for kind in [tkEntity, tkBlock, tkStorage]:
+    var typeNodes = argument("path", newNbtPathArgumentType())
+    for tn in NumericTypes:
+      typeNodes = then(typeNodes, then(literal(tn), redirectTo(argument("scale", newDoubleArgumentType()), storeData(kind, storeResult, tn))))
+    case kind
+    of tkEntity: node = then(node, then(literal("entity"), then(entitiesArg(), typeNodes)))
+    of tkBlock: node = then(node, then(literal("block"), then(argument("target", newBlockPosArgumentType()), typeNodes)))
+    of tkStorage: node = then(node, then(literal("storage"), then(argument("target", newIdentifierArgumentType()), typeNodes)))
+  node
+
+proc dataConditionNode(negate: bool): ArgumentBuilder =
+  ## `data entity|block|storage <target> <path>` under `if` or `unless`.
+  var node = literal("data")
+  node = then(node, then(literal("entity"), then(argument("target", newEntityArgumentType(eakEntity)),
+    redirectTo(argument("path", newNbtPathArgumentType()), dataCondition(tkEntity, negate)))))
+  node = then(node, then(literal("block"), then(argument("target", newBlockPosArgumentType()),
+    redirectTo(argument("path", newNbtPathArgumentType()), dataCondition(tkBlock, negate)))))
+  node = then(node, then(literal("storage"), then(argument("target", newIdentifierArgumentType()),
+    redirectTo(argument("path", newNbtPathArgumentType()), dataCondition(tkStorage, negate)))))
+  node
+
+
 proc dimensionArg(): ArgumentBuilder = argument("dimension", newResourceKeyArgument(dimensionRegistry()))
 
-proc condition(name: string; entityF, blockF, loadedF, dimensionF, scoreMatchesF, blocksF, blocksMaskedF: RedirectModifierExecutor; negateScore: bool): ArgumentBuilder =
+proc condition(name: string; entityF, blockF, loadedF, dimensionF, biomeF, scoreMatchesF, blocksF, blocksMaskedF: RedirectModifierExecutor; negateScore: bool): ArgumentBuilder =
   var b = literal(name)
   b = then(b, then(literal("entity"), redirectTo(entitiesArg(), entityF)))
   b = then(b, then(literal("block"), then(argument("pos", newBlockPosArgumentType()),
     redirectTo(argument("block", newBlockArgumentType()), blockF))))
   b = then(b, then(literal("loaded"), redirectTo(argument("pos", newBlockPosArgumentType()), loadedF)))
   b = then(b, then(literal("dimension"), redirectTo(dimensionArg(), dimensionF)))
+  b = then(b, then(literal("biome"), then(argument("pos", newBlockPosArgumentType()),
+    redirectTo(argument("biome", newResourceKeyArgument(biomeRegistry())), biomeF))))
   var objNode = argument("targetObjective", newObjectiveArgumentType())
   objNode = then(objNode, then(literal("matches"), redirectTo(argument("range", newIntRangeArgumentType()), scoreMatchesF)))
   for op in ["<", "<=", "=", ">=", ">"]:
@@ -459,15 +652,13 @@ proc register*(dispatcher: CommandDispatcher; registry: PermissionRegistry) =
   b = then(b, then(then(literal("facing"), then(literal("entity"), then(entitiesArg(),
       forkTo(argument("anchor", newEntityAnchorArgumentType()), facingEntityModifier)))),
     redirectTo(argument("pos", newVec3ArgumentType()), facingModifier)))
-  b = then(b, condition("if", ifEntityModifier, ifBlockModifier, ifLoadedModifier, ifDimensionModifier,
-    ifScoreMatches, ifBlocksModifier, ifBlocksMasked, false))
-  b = then(b, condition("unless", unlessEntityModifier, unlessBlockModifier, unlessLoadedModifier, unlessDimensionModifier,
-    unlessScoreMatches, unlessBlocksModifier, unlessBlocksMasked, true))
+  b = then(b, then(condition("if", ifEntityModifier, ifBlockModifier, ifLoadedModifier, ifDimensionModifier, ifBiomeModifier,
+    ifScoreMatches, ifBlocksModifier, ifBlocksMasked, false), dataConditionNode(false)))
+  b = then(b, then(condition("unless", unlessEntityModifier, unlessBlockModifier, unlessLoadedModifier, unlessDimensionModifier, unlessBiomeModifier,
+    unlessScoreMatches, unlessBlocksModifier, unlessBlocksMasked, true), dataConditionNode(true)))
   var storeNode = literal("store")
-  storeNode = then(storeNode, then(literal("result"), then(literal("score"), then(entitiesArg(),
-    redirectTo(argument("objective", newObjectiveArgumentType()), storeResultScore)))))
-  storeNode = then(storeNode, then(literal("success"), then(literal("score"), then(entitiesArg(),
-    redirectTo(argument("objective", newObjectiveArgumentType()), storeSuccessScore)))))
+  storeNode = then(storeNode, storeNodes(true))
+  storeNode = then(storeNode, storeNodes(false))
   b = then(b, storeNode)
   let executeNode = register(dispatcher, b)
   setRedirectsToExecute(dispatcher.tree, executeNode, executeNode)

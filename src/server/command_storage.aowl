@@ -1,0 +1,159 @@
+## Command storage: the named NBT compounds `/data ... storage <id>` reads and writes, kept per namespace in
+## `<world>/data/command_storage_<namespace>.dat`.
+## Port of the server's `command_storage` (a `Mutex<HashMap<String, NbtCompound>>` in the newer upstream tree), with
+## the vanilla file format added: a gzip NBT compound `{data: {contents: {<path>: <compound>}}, DataVersion: int}`, one
+## file per namespace, as `CommandStorage` in the game saves them.
+##
+## Upstream keeps the map in memory only. Loading and saving here are this port's addition: `loadCommandStorage` reads
+## every `command_storage_*.dat` of a folder, `saveCommandStorage` writes the namespaces that changed.
+
+import std/[paths, dirs, strutils, syncio]
+import ../nbt/[tag, nbt_compress]
+import ../world/worldfs
+
+const
+  StorageDataVersion* = 4671'i32 ## vanilla 1.21.11 level data version, as the advancement files write it.
+  FilePrefix = "command_storage_"
+  FileSuffix = ".dat"
+
+type
+  CommandStorage* = ref object
+    folder*: string        ## `<world>/data`
+    ids*: seq[string]      ## `namespace:path`
+    values*: seq[NbtCompound]
+    dirty*: seq[string]    ## namespaces to write
+
+proc newCommandStorage*(folder: string): CommandStorage =
+  CommandStorage(folder: folder, ids: @[], values: @[], dirty: @[])
+
+proc splitId(id: string; ns, path: var string) =
+  let colon = id.find(':')
+  if colon < 0:
+    ns = "minecraft"
+    path = id
+  else:
+    ns = id[0 ..< colon]
+    path = id[colon + 1 .. ^1]
+
+proc indexOf(s: CommandStorage; id: string): int =
+  for i in 0 ..< s.ids.len:
+    if s.ids[i] == id:
+      return i
+  -1
+
+proc lastSlash(s: string): int =
+  result = -1
+  for i in 0 ..< s.len:
+    if s[i] == '/' or s[i] == char(92):
+      result = i
+
+proc normalize(id: string): string =
+  var ns = ""
+  var path = ""
+  splitId(id, ns, path)
+  ns & ":" & path
+
+proc getStorage*(s: CommandStorage; id: string): NbtCompound =
+  ## `storage.get(&id).cloned().unwrap_or_default()`.
+  let i = indexOf(s, normalize(id))
+  if i < 0:
+    return newCompound()
+  s.values[i]
+
+proc markDirty(s: CommandStorage; ns: string) =
+  if ns notin s.dirty:
+    s.dirty.add(ns)
+
+proc setStorage*(s: CommandStorage; id: string; value: NbtCompound) =
+  ## `storage.insert(id, tag)`.
+  let full = normalize(id)
+  let i = indexOf(s, full)
+  if i < 0:
+    s.ids.add(full)
+    s.values.add(value)
+  else:
+    s.values[i] = value
+  var ns = ""
+  var path = ""
+  splitId(full, ns, path)
+  markDirty(s, ns)
+
+proc namespaceFile(s: CommandStorage; ns: string): string =
+  joinPathW(s.folder, FilePrefix & ns & FileSuffix)
+
+proc loadNamespace(s: CommandStorage; ns, file: string): bool =
+  let (status, bytes) = readFileBytes(file)
+  if status != rsOk:
+    return false
+  let parsed = readGzipCompoundTag(bytes)
+  if not parsed.isOk:
+    return false
+  let (hasData, data) = parsed.value.get("data")
+  if not hasData or data.kind != ntkCompound:
+    return false
+  let (hasContents, contents) = data.compoundVal.get("contents")
+  if not hasContents or contents.kind != ntkCompound:
+    return true
+  for i in 0 ..< contents.compoundVal.names.len:
+    let v = contents.compoundVal.values[i]
+    if v.kind != ntkCompound:
+      continue
+    let full = ns & ":" & contents.compoundVal.names[i]
+    let at = indexOf(s, full)
+    if at < 0:
+      s.ids.add(full)
+      s.values.add(v.compoundVal)
+    else:
+      s.values[at] = v.compoundVal
+  true
+
+proc loadCommandStorage*(folder: string): CommandStorage =
+  ## Every `command_storage_<namespace>.dat` in `folder`; an unreadable file is skipped.
+  result = newCommandStorage(folder)
+  try:
+    for kind, entry in walkDir(path(folder)):
+      if kind != pcFile:
+        continue
+      let full = $entry
+      let cut = lastSlash(full)
+      let base = full[cut + 1 .. ^1]
+      if base.startsWith(FilePrefix) and base.endsWith(FileSuffix) and base.len > FilePrefix.len + FileSuffix.len:
+        let ns = base[FilePrefix.len ..< base.len - FileSuffix.len]
+        discard loadNamespace(result, ns, folder & "/" & base)
+  except ErrorCode:
+    discard
+
+proc saveNamespace(s: CommandStorage; ns: string): bool =
+  var contents = newCompound()
+  for i in 0 ..< s.ids.len:
+    var n = ""
+    var p = ""
+    splitId(s.ids[i], n, p)
+    if n == ns:
+      contents.insert(p, NbtTag(kind: ntkCompound, compoundVal: s.values[i]))
+  var data = newCompound()
+  data.insert("contents", NbtTag(kind: ntkCompound, compoundVal: contents))
+  var root = newCompound()
+  root.insert("data", NbtTag(kind: ntkCompound, compoundVal: data))
+  root.insert("DataVersion", NbtTag(kind: ntkInt, intVal: StorageDataVersion))
+  let bytes = writeGzipCompoundTagToBytes(root)
+  if not bytes.isOk:
+    return false
+  if not createDirAllW(s.folder):
+    return false
+  let file = namespaceFile(s, ns)
+  let tmp = file & ".tmp"
+  if not writeFileBytes(tmp, bytes.value):
+    return false
+  renameReplace(tmp, file)
+
+proc saveCommandStorage*(s: CommandStorage): bool =
+  ## Writes the namespaces changed since the last save. False when one could not be written (it stays dirty).
+  var ok = true
+  var remaining: seq[string] = @[]
+  for ns in s.dirty:
+    if not saveNamespace(s, ns):
+      ok = false
+      remaining.add(ns)
+  s.dirty = remaining
+  ok

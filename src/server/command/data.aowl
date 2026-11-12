@@ -1,12 +1,16 @@
-## The `/data` command.
-## Port of pumpkin/src/command/commands/data.rs
+## The `/data` command: get, merge, modify and remove on entities, blocks and command storage.
+## Port of pumpkin/src/command/commands/data.rs (the newer tree's brigadier command; the pinned tree has `data get entity`)
 ##
-## The pinned tree's command is `data get entity <entity>` alone. The newer tree's storage, block, merge, modify and
-## remove forms need an NBT path argument type and a command storage that this port does not have yet.
-## PARTIAL: pumpkin/src/command/commands/data.rs - only `data get entity`, as the pinned tree has it.
+## DEVIATIONS: `modify ... merge` merges into the compound at the path as vanilla does (upstream replaces it);
+## `data remove entity` writes the whole remaining compound back, as `remove_data`'s default does (`entity.remove_nbt` has no hook).
+## PARTIAL: pumpkin/src/command/commands/data.rs - `data merge|modify|remove entity` go through `CommandEntity.readNbt`, which only some entities implement.
 
-import std/[options, strutils]
-import ../../command/[cmderrors, cmdsource, fallbackdispatch, args]
+import std/[options, strutils, math]
+import ../../command/[cmderrors, cmdsource, cmdtree, argument_builder, argtype, argument_types, cmddispatch,
+  entity_selector, coordinates, nbt_path]
+import ../../util/[identifier, permission]
+import ../../util/math/position
+import ../../command/string_reader
 import ../../codecs/json_value
 import ../../nbt/tag
 import ../../util/text/[textbase, text, color]
@@ -14,9 +18,8 @@ import ../../generated/translation
 import cmdcommon
 
 const
-  Names = ["data"]
-  Description = "Query and modify data of entities and blocks"
-  ArgEntity = "entity"
+  Description = "Queries or modifies NBT data of entities, blocks, and storages."
+  Permission0 = "minecraft:command.data"
 
 proc red(s: string): TextComponent = colorNamed(text(s), ncRed)
 
@@ -145,25 +148,515 @@ proc getI32Result*(tag: NbtTag; res: var int32): bool =
   of ntkCompound: res = int32(tag.compoundVal.len)
   true
 
-proc getEntityDataExecutor(sender: CommandSender; server: nil CommandServer; args: ConsumedArgs): CommandResult =
-  var found: seq[CommandEntity] = @[]
-  if not findEntity(args, ArgEntity, found) or found.len == 0:
-    return missing(ArgEntity)
-  let entity = found[0]
-  var nbt = newCompound()
-  if entity.writeNbt != nil:
-    nbt = entity.writeNbt()
-  let tag = nbtTag(nbt)
-  var value = 0'i32
-  if not getI32Result(tag, value):
-    return cmdFailed(tc(JAVA_COMMANDS_DATA_GET_UNKNOWN))
-  var display = empty()
-  let err = snbtColorfulDisplay(tag, 0, display)
-  if err.len > 0:
-    return cmdFailed(text(err))
-  sendMessage(sender, tc(JAVA_COMMANDS_DATA_ENTITY_QUERY, [entity.getDisplayName(), display]))
-  cmdSuccess(value)
 
-proc initCommandTree*(): CommandTree =
-  then(newCommandTree(Names, Description), then(literal("get"), then(literal("entity"),
-    execute(argument(ArgEntity, newEntityArgumentConsumer()), getEntityDataExecutor))))
+# ---------------- errors ----------------
+
+proc errMergeUnchanged(): CommandErrorType = errorType0(JAVA_COMMANDS_DATA_MERGE_FAILED, JAVA_COMMANDS_DATA_MERGE_FAILED)
+proc errGetNotNumber(): CommandErrorType = errorType1(JAVA_COMMANDS_DATA_GET_INVALID, JAVA_COMMANDS_DATA_GET_INVALID)
+proc errGetNonExistent(): CommandErrorType = errorType1(JAVA_COMMANDS_DATA_GET_UNKNOWN, JAVA_COMMANDS_DATA_GET_UNKNOWN)
+proc errMultipleTags(): CommandErrorType = errorType0(JAVA_COMMANDS_DATA_GET_MULTIPLE, JAVA_COMMANDS_DATA_GET_MULTIPLE)
+proc errExpectedObject(): CommandErrorType = errorType1(JAVA_COMMANDS_DATA_MODIFY_EXPECTED_OBJECT, JAVA_COMMANDS_DATA_MODIFY_EXPECTED_OBJECT)
+proc errExpectedValue(): CommandErrorType = errorType1(JAVA_COMMANDS_DATA_MODIFY_EXPECTED_VALUE, JAVA_COMMANDS_DATA_MODIFY_EXPECTED_VALUE)
+proc errInvalidSubstring(): CommandErrorType = errorType2(JAVA_COMMANDS_DATA_MODIFY_INVALID_SUBSTRING, JAVA_COMMANDS_DATA_MODIFY_INVALID_SUBSTRING)
+proc errBlockInvalid(): CommandErrorType = errorType0(JAVA_COMMANDS_DATA_BLOCK_INVALID, JAVA_COMMANDS_DATA_BLOCK_INVALID)
+proc errEntityInvalid(): CommandErrorType = errorType0(JAVA_COMMANDS_DATA_ENTITY_INVALID, JAVA_COMMANDS_DATA_ENTITY_INVALID)
+
+# ---------------- data accessors ----------------
+
+type
+  TargetKind* = enum
+    tkEntity
+    tkBlock
+    tkStorage
+
+  DataAccessor* = object
+    ## `EntityDataAccessor`, `BlockDataAccessor` and `StorageDataAccessor`.
+    kind*: TargetKind
+    entity*: CommandEntity
+    server*: nil CommandServer
+    world*: nil CommandWorld
+    x*, y*, z*: int32
+    id*: string
+
+proc posText(a: DataAccessor): string = $a.x & ", " & $a.y & ", " & $a.z
+
+proc getData*(a: DataAccessor): CmdResult[NbtCompound] =
+  case a.kind
+  of tkEntity:
+    var nbt = newCompound()
+    if a.entity.writeNbt != nil:
+      nbt = a.entity.writeNbt()
+    cmdOk[NbtCompound](nbt)
+  of tkBlock:
+    var nbt = newCompound()
+    let w = a.world
+    if w == nil:
+      return cmdFail[NbtCompound](createWithoutContext(errBlockInvalid()))
+    let getter = w.getBlockEntityNbt
+    if getter == nil or not getter(a.x, a.y, a.z, nbt):
+      return cmdFail[NbtCompound](createWithoutContext(errBlockInvalid()))
+    cmdOk[NbtCompound](nbt)
+  of tkStorage:
+    let sv = a.server
+    if sv == nil or sv.getCommandStorage == nil:
+      return cmdOk[NbtCompound](newCompound())
+    cmdOk[NbtCompound](sv.getCommandStorage(a.id))
+
+proc setData*(a: DataAccessor; tag: NbtCompound): CmdVoidResult =
+  case a.kind
+  of tkEntity:
+    if a.entity.player != nil:
+      return cmdFailVoid(createWithoutContext(errEntityInvalid()))
+    if a.entity.readNbt != nil:
+      a.entity.readNbt(tag)
+    cmdOkVoid()
+  of tkBlock:
+    let w = a.world
+    if w == nil:
+      return cmdFailVoid(createWithoutContext(errBlockInvalid()))
+    let setter = w.setBlockEntityNbt
+    if setter == nil or not setter(a.x, a.y, a.z, tag):
+      return cmdFailVoid(createWithoutContext(errBlockInvalid()))
+    cmdOkVoid()
+  of tkStorage:
+    let sv = a.server
+    if sv != nil and sv.setCommandStorage != nil:
+      sv.setCommandStorage(a.id, tag)
+    cmdOkVoid()
+
+proc modifiedSuccess*(a: DataAccessor): TextComponent =
+  case a.kind
+  of tkEntity: tc(JAVA_COMMANDS_DATA_ENTITY_MODIFIED, [a.entity.getDisplayName()])
+  of tkBlock: tc(JAVA_COMMANDS_DATA_BLOCK_MODIFIED, [text(posText(a))])
+  of tkStorage: tc(JAVA_COMMANDS_DATA_STORAGE_MODIFIED, [text(a.id)])
+
+proc printSuccess*(a: DataAccessor; data: NbtTag): CmdResult[TextComponent] =
+  var display = empty()
+  let err = snbtColorfulDisplay(data, 0, display)
+  if err.len > 0:
+    return cmdFail[TextComponent](createWithoutContext(errGetNonExistent(), text(err)))
+  case a.kind
+  of tkEntity: cmdOk[TextComponent](tc(JAVA_COMMANDS_DATA_ENTITY_QUERY, [a.entity.getDisplayName(), display]))
+  of tkBlock: cmdOk[TextComponent](tc(JAVA_COMMANDS_DATA_BLOCK_QUERY, [text(posText(a)), display]))
+  of tkStorage: cmdOk[TextComponent](tc(JAVA_COMMANDS_DATA_STORAGE_QUERY, [text(a.id), display]))
+
+proc fixed2(v: float64): string = formatFloat(v, ffDecimal, 2)
+
+proc scaledSuccess*(a: DataAccessor; path: NbtPath; scale: float64; value: int32): TextComponent =
+  case a.kind
+  of tkEntity:
+    tc(JAVA_COMMANDS_DATA_ENTITY_GET, [text(path.original), a.entity.getDisplayName(), text(fixed2(scale)), text($value)])
+  of tkBlock:
+    tc(JAVA_COMMANDS_DATA_BLOCK_GET, [text(path.original), text($a.x), text($a.y), text($a.z), text(fixed2(scale)), text($value)])
+  of tkStorage:
+    tc(JAVA_COMMANDS_DATA_STORAGE_GET, [text(path.original), text(a.id), text(fixed2(scale)), text($value)])
+
+proc accessTarget*(context: CommandContext; kind: TargetKind; prefix: string): CmdResult[DataAccessor] =
+  ## `TargetKind::access`.
+  case kind
+  of tkEntity:
+    let e = getEntity(context, prefix)
+    if not e.isOk:
+      return cmdFail[DataAccessor](e.error)
+    cmdOk[DataAccessor](DataAccessor(kind: tkEntity, entity: e.value))
+  of tkBlock:
+    let pos = getBlockPos(context, prefix)
+    if not pos.isOk:
+      return cmdFail[DataAccessor](pos.error)
+    let p = pos.value.vec
+    let acc = DataAccessor(kind: tkBlock, world: context.source.world, x: p.x, y: p.y, z: p.z)
+    # `BlockDataAccessor::new` fails without a block entity.
+    let probe = getData(acc)
+    if not probe.isOk:
+      return cmdFail[DataAccessor](probe.error)
+    cmdOk[DataAccessor](acc)
+  of tkStorage:
+    let id = getIdentifier(context, prefix)
+    if not id.isOk:
+      return cmdFail[DataAccessor](id.error)
+    cmdOk[DataAccessor](DataAccessor(kind: tkStorage, server: context.source.server, id: $id.value))
+
+proc getSingleTag*(path: NbtPath; a: DataAccessor): CmdResult[NbtTag] =
+  let data = getData(a)
+  if not data.isOk:
+    return cmdFail[NbtTag](data.error)
+  let found = path.get(NbtTag(kind: ntkCompound, compoundVal: data.value))
+  if not found.isOk:
+    return cmdFail[NbtTag](found.error)
+  case found.value.len
+  of 0: cmdFail[NbtTag](createWithoutContext(errGetNonExistent(), text(path.original)))
+  of 1: cmdOk[NbtTag](found.value[0])
+  else: cmdFail[NbtTag](createWithoutContext(errMultipleTags()))
+
+proc getAsText(tag: NbtTag): CmdResult[string] =
+  case tag.kind
+  of ntkString: cmdOk[string](tag.stringVal)
+  of ntkByte: cmdOk[string]($tag.byteVal)
+  of ntkShort: cmdOk[string]($tag.shortVal)
+  of ntkInt: cmdOk[string]($tag.intVal)
+  of ntkLong: cmdOk[string]($tag.longVal)
+  of ntkFloat: cmdOk[string](displayF32(tag.floatVal))
+  of ntkDouble: cmdOk[string](displayF64(tag.doubleVal))
+  else: cmdFail[string](createWithoutContext(errExpectedValue(), text($tag)))
+
+proc codePoints(s: string): seq[string] =
+  result = @[]
+  var i = 0
+  while i < s.len:
+    var n = 1
+    let b = ord(s[i])
+    if b >= 0xF0: n = 4
+    elif b >= 0xE0: n = 3
+    elif b >= 0xC0: n = 2
+    if i + n > s.len: n = s.len - i
+    result.add(s[i ..< i + n])
+    i += n
+
+proc substring*(input: string; start: int32; endV: Option[int32]): CmdResult[string] =
+  let chars = codePoints(input)
+  let len = int32(chars.len)
+  let absStart = if start >= 0: start else: len + start
+  var absEnd = len
+  if endV.isSome:
+    let e = endV.unsafeGet
+    absEnd = if e >= 0: e else: len + e
+  if absStart >= 0 and absEnd <= len and absStart <= absEnd:
+    var res = ""
+    for i in int(absStart) ..< int(absEnd):
+      res.add(chars[i])
+    return cmdOk[string](res)
+  let shownEnd = if endV.isSome: endV.unsafeGet else: len
+  cmdFail[string](createWithoutContext(errInvalidSubstring(), text($start), text($shownEnd)))
+
+proc floorToI32*(v: float64): int32 =
+  ## `v.floor() as i32`: saturating, NaN is 0.
+  if v != v: return 0'i32
+  let f = floor(v)
+  if f >= 2147483647.0: return int32.high
+  if f <= -2147483648.0: return int32.low
+  int32(f)
+
+# ---------------- execution ----------------
+
+proc rootOf(c: NbtCompound): NbtTag = NbtTag(kind: ntkCompound, compoundVal: c)
+
+proc executeGet(context: CommandContext; kind: TargetKind; hasPath, hasScale: bool): CmdResult[int32] =
+  let acc = accessTarget(context, kind, "target")
+  if not acc.isOk:
+    return cmdFail[int32](acc.error)
+  if not hasPath:
+    let data = getData(acc.value)
+    if not data.isOk:
+      return cmdFail[int32](data.error)
+    let shown = printSuccess(acc.value, rootOf(data.value))
+    if not shown.isOk:
+      return cmdFail[int32](shown.error)
+    sendFeedback(context.source, shown.value, false)
+    return cmdOk[int32](int32(data.value.len))
+  let path = getNbtPath(context, "path")
+  if not path.isOk:
+    return cmdFail[int32](path.error)
+  let tag = getSingleTag(path.value, acc.value)
+  if not tag.isOk:
+    return cmdFail[int32](tag.error)
+  if hasScale:
+    let scale = getDouble(context, "scale")
+    if not scale.isOk:
+      return cmdFail[int32](scale.error)
+    var num = 0.0
+    case tag.value.kind
+    of ntkByte: num = float64(tag.value.byteVal)
+    of ntkShort: num = float64(tag.value.shortVal)
+    of ntkInt: num = float64(tag.value.intVal)
+    of ntkLong: num = float64(tag.value.longVal)
+    of ntkFloat: num = float64(tag.value.floatVal)
+    of ntkDouble: num = tag.value.doubleVal
+    else:
+      return cmdFail[int32](createWithoutContext(errGetNotNumber(), text(path.value.original)))
+    let scaled = floorToI32(num * scale.value)
+    sendFeedback(context.source, scaledSuccess(acc.value, path.value, scale.value, scaled), false)
+    return cmdOk[int32](scaled)
+  var res = 0'i32
+  case tag.value.kind
+  of ntkByte: res = int32(tag.value.byteVal)
+  of ntkShort: res = int32(tag.value.shortVal)
+  of ntkInt: res = tag.value.intVal
+  of ntkLong: res = lowI32(tag.value.longVal)
+  of ntkFloat: res = floorToI32(float64(tag.value.floatVal))
+  of ntkDouble: res = floorToI32(tag.value.doubleVal)
+  of ntkByteArray: res = int32(tag.value.byteArrayVal.len)
+  of ntkIntArray: res = int32(tag.value.intArrayVal.len)
+  of ntkLongArray: res = int32(tag.value.longArrayVal.len)
+  of ntkString: res = int32(tag.value.stringVal.len)
+  of ntkList: res = int32(tag.value.listVal.len)
+  of ntkCompound: res = int32(tag.value.compoundVal.len)
+  of ntkEnd:
+    return cmdFail[int32](createWithoutContext(errGetNonExistent(), text(path.value.original)))
+  let shown = printSuccess(acc.value, tag.value)
+  if not shown.isOk:
+    return cmdFail[int32](shown.error)
+  sendFeedback(context.source, shown.value, false)
+  cmdOk[int32](res)
+
+proc executeMerge(context: CommandContext; kind: TargetKind): CmdResult[int32] =
+  let acc = accessTarget(context, kind, "target")
+  if not acc.isOk:
+    return cmdFail[int32](acc.error)
+  let nbt = getNbtTag(context, "nbt")
+  if not nbt.isOk:
+    return cmdFail[int32](nbt.error)
+  if isTooDeep(nbt.value, 0):
+    return cmdFail[int32](createWithoutContext(errorDataTooDeep()))
+  let old = getData(acc.value)
+  if not old.isOk:
+    return cmdFail[int32](old.error)
+  var updated = old.value
+  if nbt.value.kind == ntkCompound:
+    for i in 0 ..< nbt.value.compoundVal.names.len:
+      updated.insert(nbt.value.compoundVal.names[i], nbt.value.compoundVal.values[i])
+  if old.value == updated:
+    return cmdFail[int32](createWithoutContext(errMergeUnchanged()))
+  let done = setData(acc.value, updated)
+  if not done.isOk:
+    return cmdFail[int32](done.error)
+  sendFeedback(context.source, modifiedSuccess(acc.value), true)
+  cmdOk[int32](1'i32)
+
+proc executeRemove(context: CommandContext; kind: TargetKind): CmdResult[int32] =
+  let acc = accessTarget(context, kind, "target")
+  if not acc.isOk:
+    return cmdFail[int32](acc.error)
+  let path = getNbtPath(context, "path")
+  if not path.isOk:
+    return cmdFail[int32](path.error)
+  let old = getData(acc.value)
+  if not old.isOk:
+    return cmdFail[int32](old.error)
+  var root = rootOf(old.value)
+  let count = path.value.remove(root)
+  if count == 0'i32 or root.kind != ntkCompound:
+    return cmdFail[int32](createWithoutContext(errMergeUnchanged()))
+  let done = setData(acc.value, root.compoundVal)
+  if not done.isOk:
+    return cmdFail[int32](done.error)
+  sendFeedback(context.source, modifiedSuccess(acc.value), true)
+  cmdOk[int32](count)
+
+type
+  ModifyMode = enum
+    mmInsert
+    mmPrepend
+    mmAppend
+    mmSet
+    mmMerge
+
+  SourceMode = enum
+    smValue
+    smFrom
+    smString
+
+  ModifySpec = object
+    target: TargetKind
+    mode: ModifyMode
+    source: TargetKind
+    sourceMode: SourceMode
+    hasPath, hasStart, hasEnd: bool
+
+proc resolveSourceTags(context: CommandContext; spec: ModifySpec): CmdResult[seq[NbtTag]] =
+  if spec.sourceMode == smValue:
+    let v = getNbtTag(context, "value")
+    if not v.isOk:
+      return cmdFail[seq[NbtTag]](v.error)
+    return cmdOk[seq[NbtTag]](@[v.value])
+  let acc = accessTarget(context, spec.source, "source")
+  if not acc.isOk:
+    return cmdFail[seq[NbtTag]](acc.error)
+  let data = getData(acc.value)
+  if not data.isOk:
+    return cmdFail[seq[NbtTag]](data.error)
+  var tags: seq[NbtTag] = @[]
+  if spec.hasPath:
+    let sp = getNbtPath(context, "sourcePath")
+    if not sp.isOk:
+      return cmdFail[seq[NbtTag]](sp.error)
+    let got = sp.value.get(rootOf(data.value))
+    if not got.isOk:
+      return cmdFail[seq[NbtTag]](got.error)
+    tags = got.value
+  else:
+    tags = @[rootOf(data.value)]
+  if spec.sourceMode == smFrom:
+    return cmdOk[seq[NbtTag]](tags)
+  var start = 0'i32
+  if spec.hasStart:
+    let s = getInt(context, "start")
+    if not s.isOk:
+      return cmdFail[seq[NbtTag]](s.error)
+    start = s.value
+  var endV = none[int32]()
+  if spec.hasEnd:
+    let e = getInt(context, "end")
+    if not e.isOk:
+      return cmdFail[seq[NbtTag]](e.error)
+    endV = some(e.value)
+  var strings: seq[NbtTag] = @[]
+  for tag in tags:
+    let txt = getAsText(tag)
+    if not txt.isOk:
+      return cmdFail[seq[NbtTag]](txt.error)
+    let sub = substring(txt.value, start, endV)
+    if not sub.isOk:
+      return cmdFail[seq[NbtTag]](sub.error)
+    strings.add(NbtTag(kind: ntkString, stringVal: sub.value))
+  cmdOk[seq[NbtTag]](strings)
+
+proc executeModify(context: CommandContext; spec: ModifySpec): CmdResult[int32] =
+  let acc = accessTarget(context, spec.target, "target")
+  if not acc.isOk:
+    return cmdFail[int32](acc.error)
+  let path = getNbtPath(context, "targetPath")
+  if not path.isOk:
+    return cmdFail[int32](path.error)
+  let data = getData(acc.value)
+  if not data.isOk:
+    return cmdFail[int32](data.error)
+  var root = rootOf(data.value)
+  let sources = resolveSourceTags(context, spec)
+  if not sources.isOk:
+    return cmdFail[int32](sources.error)
+  var changed = 0'i32
+  case spec.mode
+  of mmInsert, mmPrepend, mmAppend:
+    var index = 0'i32
+    if spec.mode == mmInsert:
+      let i = getInt(context, "index")
+      if not i.isOk:
+        return cmdFail[int32](i.error)
+      index = i.value
+    elif spec.mode == mmAppend:
+      index = -1'i32
+    let r = path.value.insert(index, root, sources.value)
+    if not r.isOk:
+      return cmdFail[int32](r.error)
+    changed = r.value
+  of mmSet:
+    let last = if sources.value.len > 0: sources.value[sources.value.len - 1] else: NbtTag(kind: ntkEnd)
+    let r = path.value.set(root, last)
+    if not r.isOk:
+      return cmdFail[int32](r.error)
+    changed = r.value
+  of mmMerge:
+    var combined = newCompound()
+    for tag in sources.value:
+      if isTooDeep(tag, 0):
+        return cmdFail[int32](createWithoutContext(errorDataTooDeep()))
+      if tag.kind != ntkCompound:
+        return cmdFail[int32](createWithoutContext(errExpectedObject(), text($tag)))
+      for i in 0 ..< tag.compoundVal.names.len:
+        combined.insert(tag.compoundVal.names[i], tag.compoundVal.values[i])
+    let r = path.value.set(root, rootOf(combined), true)
+    if not r.isOk:
+      return cmdFail[int32](r.error)
+    changed = r.value
+  if changed == 0'i32:
+    return cmdFail[int32](createWithoutContext(errMergeUnchanged()))
+  if root.kind == ntkCompound:
+    let done = setData(acc.value, root.compoundVal)
+    if not done.isOk:
+      return cmdFail[int32](done.error)
+  sendFeedback(context.source, modifiedSuccess(acc.value), true)
+  cmdOk[int32](changed)
+
+# ---------------- registration ----------------
+
+const
+  AllKinds = [tkEntity, tkBlock, tkStorage]
+
+proc kindName(k: TargetKind): string =
+  case k
+  of tkEntity: "entity"
+  of tkBlock: "block"
+  of tkStorage: "storage"
+
+proc targetArg(kind: TargetKind; name: string): ArgumentBuilder =
+  case kind
+  of tkEntity: argument(name, newEntityArgumentType(eakEntity))
+  of tkBlock: argument(name, newBlockPosArgumentType())
+  of tkStorage: argument(name, newIdentifierArgumentType())
+
+proc getExecutor(kind: TargetKind; hasPath, hasScale: bool): CommandExecutor =
+  result = proc(context: CommandContext): CmdResult[int32] {.closure.} = executeGet(context, kind, hasPath, hasScale)
+
+proc mergeExecutor(kind: TargetKind): CommandExecutor =
+  result = proc(context: CommandContext): CmdResult[int32] {.closure.} = executeMerge(context, kind)
+
+proc removeExecutor(kind: TargetKind): CommandExecutor =
+  result = proc(context: CommandContext): CmdResult[int32] {.closure.} = executeRemove(context, kind)
+
+proc modifyExecutor(spec: ModifySpec): CommandExecutor =
+  result = proc(context: CommandContext): CmdResult[int32] {.closure.} = executeModify(context, spec)
+
+proc modifySources(holder0: ArgumentBuilder; base: ModifySpec): ArgumentBuilder =
+  ## The `value`, `from` and `string` sources under a mode.
+  var holder = holder0
+  var valueSpec = base
+  valueSpec.sourceMode = smValue
+  holder = then(holder, then(literal("value"), executes(argument("value", newNbtTagArgumentType()), modifyExecutor(valueSpec))))
+  # One `from` and one `string` literal for all three source kinds: `then` replaces a child of the same name.
+  var fromNode = literal("from")
+  var stringNode = literal("string")
+  for src in AllKinds:
+    var fromSpec = base
+    fromSpec.source = src
+    fromSpec.sourceMode = smFrom
+    var fromPath = fromSpec
+    fromPath.hasPath = true
+    fromNode = then(fromNode, then(literal(kindName(src)),
+      then(executes(targetArg(src, "source"), modifyExecutor(fromSpec)),
+        executes(argument("sourcePath", newNbtPathArgumentType()), modifyExecutor(fromPath)))))
+    var strSpec = fromSpec
+    strSpec.sourceMode = smString
+    var strPath = strSpec
+    strPath.hasPath = true
+    var strStart = strPath
+    strStart.hasStart = true
+    var strEnd = strStart
+    strEnd.hasEnd = true
+    let endNode = executes(argument("end", newIntegerArgumentType()), modifyExecutor(strEnd))
+    let startNode = then(executes(argument("start", newIntegerArgumentType()), modifyExecutor(strStart)), endNode)
+    let pathNode = then(executes(argument("sourcePath", newNbtPathArgumentType()), modifyExecutor(strPath)), startNode)
+    stringNode = then(stringNode, then(literal(kindName(src)),
+      then(executes(targetArg(src, "source"), modifyExecutor(strSpec)), pathNode)))
+  holder = then(holder, fromNode)
+  holder = then(holder, stringNode)
+  holder
+
+proc modifyModeNode(target: TargetKind; mode: ModifyMode; name: string): ArgumentBuilder =
+  let base = ModifySpec(target: target, mode: mode)
+  if mode == mmInsert:
+    return then(literal("insert"), modifySources(argument("index", newIntegerArgumentType()), base))
+  modifySources(literal(name), base)
+
+proc register*(dispatcher: CommandDispatcher; registry: PermissionRegistry) =
+  registerPermissionOrPanic(registry, newPermission(Permission0, Description, permissionOp(Two)))
+  var mergeNode = literal("merge")
+  var getNode = literal("get")
+  var removeNode = literal("remove")
+  for kind in AllKinds:
+    mergeNode = then(mergeNode, then(literal(kindName(kind)), then(targetArg(kind, "target"),
+      executes(argument("nbt", newNbtCompoundArgumentType()), mergeExecutor(kind)))))
+    let scaleNode = executes(argument("scale", newDoubleArgumentType()), getExecutor(kind, true, true))
+    let pathNode = then(executes(argument("path", newNbtPathArgumentType()), getExecutor(kind, true, false)), scaleNode)
+    getNode = then(getNode, then(literal(kindName(kind)), then(executes(targetArg(kind, "target"), getExecutor(kind, false, false)), pathNode)))
+    removeNode = then(removeNode, then(literal(kindName(kind)), then(targetArg(kind, "target"),
+      executes(argument("path", newNbtPathArgumentType()), removeExecutor(kind)))))
+  var modifyNode = literal("modify")
+  for kind in AllKinds:
+    var targetPath = argument("targetPath", newNbtPathArgumentType())
+    targetPath = then(targetPath, modifyModeNode(kind, mmInsert, "insert"))
+    targetPath = then(targetPath, modifyModeNode(kind, mmPrepend, "prepend"))
+    targetPath = then(targetPath, modifyModeNode(kind, mmAppend, "append"))
+    targetPath = then(targetPath, modifyModeNode(kind, mmSet, "set"))
+    targetPath = then(targetPath, modifyModeNode(kind, mmMerge, "merge"))
+    modifyNode = then(modifyNode, then(literal(kindName(kind)), then(targetArg(kind, "target"), targetPath)))
+  discard register(dispatcher, then(then(then(then(requires(command("data", Description), Permission0), mergeNode), getNode), removeNode), modifyNode))

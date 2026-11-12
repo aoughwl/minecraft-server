@@ -1,0 +1,593 @@
+## The NBT path: parsing, and get, set, insert and remove on an NBT tree.
+## Port of pumpkin-command/src/argument_types/nbt_path.rs (newer tree)
+##
+## Upstream walks `*mut NbtTag` pointers while it creates parents. Here a location is the chain of indices from the
+## root (an index into a compound's `values`, or into a list), resolved again with `locate`; nothing is added to a
+## tree except by appending, so an index stays valid for the rest of the walk.
+
+import std/[options]
+import ../util/text/textbase, ../util/text/text
+import ../generated/translation
+import ../nbt/tag
+import ../protocol/java/client/play/commands
+import cmderrors, cmdtree, argument_types, suggestion, string_reader, snbt
+
+type
+  NbtPathNodeKind* = enum
+    npnAllElements
+    npnCompoundChild
+    npnIndexedElement
+    npnMatchElement
+    npnMatchObject
+    npnMatchRootObject
+
+  NbtPathNode* = object
+    kind*: NbtPathNodeKind
+    name*: string          ## CompoundChild, MatchObject
+    index*: int32          ## IndexedElement
+    pattern*: NbtCompound  ## MatchElement, MatchObject, MatchRootObject
+
+  NbtPath* = object
+    original*: string
+    nodes*: seq[NbtPathNode]
+    nodeToOriginalPosition*: seq[int]
+
+const MaxDepth = 512
+
+proc errorInvalidNode*(): CommandErrorType = errorType0(JAVA_ARGUMENTS_NBTPATH_NODE_INVALID, JAVA_ARGUMENTS_NBTPATH_NODE_INVALID)
+proc errorDataTooDeep*(): CommandErrorType = errorType0(JAVA_ARGUMENTS_NBTPATH_TOO_DEEP, JAVA_ARGUMENTS_NBTPATH_TOO_DEEP)
+proc errorNothingFound*(): CommandErrorType = errorType1(JAVA_ARGUMENTS_NBTPATH_NOTHING_FOUND, JAVA_ARGUMENTS_NBTPATH_NOTHING_FOUND)
+proc errorExpectedList*(): CommandErrorType = errorType1(JAVA_COMMANDS_DATA_MODIFY_EXPECTED_LIST, JAVA_COMMANDS_DATA_MODIFY_EXPECTED_LIST)
+proc errorInvalidIndex*(): CommandErrorType = errorType1(JAVA_COMMANDS_DATA_MODIFY_INVALID_INDEX, JAVA_COMMANDS_DATA_MODIFY_INVALID_INDEX)
+
+proc isTooDeep*(tag: NbtTag; depth: int): bool =
+  ## Whether a tag exceeds the maximum nesting depth (512).
+  if depth >= MaxDepth:
+    return true
+  case tag.kind
+  of ntkCompound:
+    for child in tag.compoundVal.values:
+      if isTooDeep(child, depth + 1):
+        return true
+  of ntkList:
+    for child in tag.listVal:
+      if isTooDeep(child, depth + 1):
+        return true
+  else:
+    discard
+  false
+
+proc compareNbt*(pattern, target: NbtTag): bool =
+  ## Recursively compares whether `target` satisfies the `pattern`.
+  if pattern == target:
+    return true
+  if pattern.kind == ntkCompound and target.kind == ntkCompound:
+    for i in 0 ..< pattern.compoundVal.names.len:
+      let (found, tv) = target.compoundVal.get(pattern.compoundVal.names[i])
+      if not found:
+        return false
+      if not compareNbt(pattern.compoundVal.values[i], tv):
+        return false
+    return true
+  if pattern.kind == ntkList and target.kind == ntkList:
+    if pattern.listVal.len == 0:
+      return target.listVal.len == 0
+    if target.listVal.len < pattern.listVal.len:
+      return false
+    for pe in pattern.listVal:
+      var matched = false
+      for te in target.listVal:
+        if compareNbt(pe, te):
+          matched = true
+          break
+      if not matched:
+        return false
+    return true
+  false
+
+proc compoundTag(c: NbtCompound): NbtTag = NbtTag(kind: ntkCompound, compoundVal: c)
+
+proc allElements*(): NbtPathNode = NbtPathNode(kind: npnAllElements)
+proc compoundChild*(name: string): NbtPathNode = NbtPathNode(kind: npnCompoundChild, name: name)
+proc indexedElement*(index: int32): NbtPathNode = NbtPathNode(kind: npnIndexedElement, index: index)
+proc matchElement*(pattern: NbtCompound): NbtPathNode = NbtPathNode(kind: npnMatchElement, pattern: pattern)
+proc matchObject*(name: string; pattern: NbtCompound): NbtPathNode = NbtPathNode(kind: npnMatchObject, name: name, pattern: pattern)
+proc matchRootObject*(pattern: NbtCompound): NbtPathNode = NbtPathNode(kind: npnMatchRootObject, pattern: pattern)
+
+proc actualIndex(index: int32; size: int): int =
+  if index < 0: size + int(index) else: int(index)
+
+proc getTag*(node: NbtPathNode; parent: NbtTag; output: var seq[NbtTag]) =
+  case node.kind
+  of npnAllElements:
+    case parent.kind
+    of ntkList:
+      for e in parent.listVal: output.add(e)
+    of ntkByteArray:
+      for b in parent.byteArrayVal: output.add(NbtTag(kind: ntkByte, byteVal: b))
+    of ntkIntArray:
+      for b in parent.intArrayVal: output.add(NbtTag(kind: ntkInt, intVal: b))
+    of ntkLongArray:
+      for b in parent.longArrayVal: output.add(NbtTag(kind: ntkLong, longVal: b))
+    else: discard
+  of npnCompoundChild:
+    if parent.kind == ntkCompound:
+      let (found, t) = parent.compoundVal.get(node.name)
+      if found: output.add(t)
+  of npnIndexedElement:
+    case parent.kind
+    of ntkList:
+      let i = actualIndex(node.index, parent.listVal.len)
+      if i >= 0 and i < parent.listVal.len: output.add(parent.listVal[i])
+    of ntkByteArray:
+      let i = actualIndex(node.index, parent.byteArrayVal.len)
+      if i >= 0 and i < parent.byteArrayVal.len: output.add(NbtTag(kind: ntkByte, byteVal: parent.byteArrayVal[i]))
+    of ntkIntArray:
+      let i = actualIndex(node.index, parent.intArrayVal.len)
+      if i >= 0 and i < parent.intArrayVal.len: output.add(NbtTag(kind: ntkInt, intVal: parent.intArrayVal[i]))
+    of ntkLongArray:
+      let i = actualIndex(node.index, parent.longArrayVal.len)
+      if i >= 0 and i < parent.longArrayVal.len: output.add(NbtTag(kind: ntkLong, longVal: parent.longArrayVal[i]))
+    else: discard
+  of npnMatchElement:
+    if parent.kind == ntkList:
+      let pt = compoundTag(node.pattern)
+      for e in parent.listVal:
+        if compareNbt(pt, e): output.add(e)
+  of npnMatchObject:
+    if parent.kind == ntkCompound:
+      let (found, t) = parent.compoundVal.get(node.name)
+      if found and compareNbt(compoundTag(node.pattern), t): output.add(t)
+  of npnMatchRootObject:
+    if parent.kind == ntkCompound and compareNbt(compoundTag(node.pattern), parent):
+      output.add(parent)
+
+proc createPreferredParentTag*(node: NbtPathNode): NbtTag =
+  case node.kind
+  of npnAllElements, npnIndexedElement, npnMatchElement:
+    NbtTag(kind: ntkList, listVal: @[])
+  of npnCompoundChild, npnMatchObject, npnMatchRootObject:
+    NbtTag(kind: ntkCompound, compoundVal: newCompound())
+
+proc valueFor(old, toAdd: NbtTag; merge: bool): NbtTag =
+  ## What a slot holds after a set: `toAdd`, or with `merge` the old compound with `toAdd`'s entries put over it.
+  if merge and old.kind == ntkCompound and toAdd.kind == ntkCompound:
+    var c = old.compoundVal
+    for i in 0 ..< toAdd.compoundVal.names.len:
+      c.insert(toAdd.compoundVal.names[i], toAdd.compoundVal.values[i])
+    return NbtTag(kind: ntkCompound, compoundVal: c)
+  toAdd
+
+proc setTag*(node: NbtPathNode; parent: var NbtTag; toAdd: NbtTag; merge: bool = false): int32 =
+  ## `set_tag`; `toAdd` is the value cloned for every slot (upstream's closure only ever clones one value).
+  ## `merge` is vanilla's `data modify ... merge`: a compound slot keeps its other entries. (DEVIATION: upstream's
+  ## newer tree replaces the slot with the source compound.)
+  case node.kind
+  of npnAllElements:
+    if parent.kind == ntkList:
+      let size = parent.listVal.len
+      if size == 0:
+        parent.listVal.add(toAdd)
+        return 1
+      var changed = 0'i32
+      for i in 0 ..< size:
+        let nv = valueFor(parent.listVal[i], toAdd, merge)
+        if not (parent.listVal[i] == nv):
+          parent.listVal[i] = nv
+          inc changed
+      return changed
+    0'i32
+  of npnCompoundChild:
+    if parent.kind == ntkCompound:
+      let (had, prev) = parent.compoundVal.get(node.name)
+      let nv = if had: valueFor(prev, toAdd, merge) else: toAdd
+      parent.compoundVal.insert(node.name, nv)
+      return (if had and prev == nv: 0'i32 else: 1'i32)
+    0'i32
+  of npnIndexedElement:
+    if parent.kind == ntkList:
+      let i = actualIndex(node.index, parent.listVal.len)
+      if i >= 0 and i < parent.listVal.len:
+        let nv = valueFor(parent.listVal[i], toAdd, merge)
+        if not (parent.listVal[i] == nv):
+          parent.listVal[i] = nv
+          return 1
+    0'i32
+  of npnMatchElement:
+    var changed = 0'i32
+    if parent.kind == ntkList:
+      let pt = compoundTag(node.pattern)
+      if parent.listVal.len == 0:
+        parent.listVal.add(toAdd)
+        changed += 1
+      else:
+        for i in 0 ..< parent.listVal.len:
+          if compareNbt(pt, parent.listVal[i]):
+            let nv = valueFor(parent.listVal[i], toAdd, merge)
+            if not (parent.listVal[i] == nv):
+              parent.listVal[i] = nv
+              changed += 1
+    changed
+  of npnMatchObject:
+    if parent.kind == ntkCompound:
+      let pt = compoundTag(node.pattern)
+      let (found, curr) = parent.compoundVal.get(node.name)
+      if found and compareNbt(pt, curr):
+        let nv = valueFor(curr, toAdd, merge)
+        if not (curr == nv):
+          parent.compoundVal.insert(node.name, nv)
+          return 1
+    0'i32
+  of npnMatchRootObject:
+    0'i32
+
+proc removeTag*(node: NbtPathNode; parent: var NbtTag): int32 =
+  case node.kind
+  of npnAllElements:
+    if parent.kind == ntkList:
+      let size = int32(parent.listVal.len)
+      if size > 0:
+        parent.listVal = @[]
+        return size
+    0'i32
+  of npnCompoundChild:
+    if parent.kind == ntkCompound:
+      let (found, _) = parent.compoundVal.remove(node.name)
+      if found: return 1
+    0'i32
+  of npnIndexedElement:
+    if parent.kind == ntkList:
+      let i = actualIndex(node.index, parent.listVal.len)
+      if i >= 0 and i < parent.listVal.len:
+        parent.listVal.delete(i)
+        return 1
+    0'i32
+  of npnMatchElement:
+    var changed = 0'i32
+    if parent.kind == ntkList:
+      let pt = compoundTag(node.pattern)
+      var i = 0
+      while i < parent.listVal.len:
+        if compareNbt(pt, parent.listVal[i]):
+          parent.listVal.delete(i)
+          changed += 1
+        else:
+          inc i
+    changed
+  of npnMatchObject:
+    if parent.kind == ntkCompound:
+      let (found, curr) = parent.compoundVal.get(node.name)
+      if found and compareNbt(compoundTag(node.pattern), curr):
+        discard parent.compoundVal.remove(node.name)
+        return 1
+    0'i32
+  of npnMatchRootObject:
+    0'i32
+
+proc newNbtPath*(original: string; nodes: seq[NbtPathNode]; positions: seq[int]): NbtPath =
+  NbtPath(original: original, nodes: nodes, nodeToOriginalPosition: positions)
+
+proc `$`*(p: NbtPath): string = p.original
+
+proc notFound(p: NbtPath; nodeIndex: int): CommandSyntaxError =
+  let index = if nodeIndex < p.nodeToOriginalPosition.len: p.nodeToOriginalPosition[nodeIndex] else: p.original.len
+  createWithoutContext(errorNothingFound(), text(p.original[0 ..< index]))
+
+proc get*(p: NbtPath; tag: NbtTag): CmdResult[seq[NbtTag]] =
+  ## Gets matching tags from the given root tag.
+  var current = @[tag]
+  for i in 0 ..< p.nodes.len:
+    var next: seq[NbtTag] = @[]
+    for parent in current:
+      getTag(p.nodes[i], parent, next)
+    if next.len == 0:
+      return cmdFail[seq[NbtTag]](notFound(p, i))
+    current = next
+  cmdOk[seq[NbtTag]](current)
+
+proc countMatching*(p: NbtPath; tag: NbtTag): int =
+  var current = @[tag]
+  for node in p.nodes:
+    var next: seq[NbtTag] = @[]
+    for parent in current:
+      getTag(node, parent, next)
+    if next.len == 0:
+      return 0
+    current = next
+  current.len
+
+proc locate(t: var NbtTag; loc: seq[int]; i: int): var NbtTag =
+  if i >= loc.len:
+    return t
+  if t.kind == ntkCompound:
+    return locate(t.compoundVal.values[loc[i]], loc, i + 1)
+  locate(t.listVal[loc[i]], loc, i + 1)
+
+proc expandNode(parent: var NbtTag; node, nextNode: NbtPathNode; loc: seq[int]; next: var seq[seq[int]]) =
+  ## One parent of one level of `get_or_create_parents`.
+  case node.kind
+  of npnCompoundChild:
+    if parent.kind == ntkCompound:
+      if not parent.compoundVal.containsKey(node.name):
+        parent.compoundVal.insert(node.name, createPreferredParentTag(nextNode))
+      for k in 0 ..< parent.compoundVal.names.len:
+        if parent.compoundVal.names[k] == node.name:
+          var l = loc
+          l.add(k)
+          next.add(l)
+  of npnAllElements:
+    if parent.kind == ntkList:
+      if parent.listVal.len == 0:
+        parent.listVal.add(createPreferredParentTag(nextNode))
+      for k in 0 ..< parent.listVal.len:
+        var l = loc
+        l.add(k)
+        next.add(l)
+  of npnIndexedElement:
+    if parent.kind == ntkList:
+      let ai = actualIndex(node.index, parent.listVal.len)
+      if ai >= 0 and ai < parent.listVal.len:
+        var l = loc
+        l.add(ai)
+        next.add(l)
+  of npnMatchElement:
+    if parent.kind == ntkList:
+      let pt = compoundTag(node.pattern)
+      var found = false
+      for k in 0 ..< parent.listVal.len:
+        if compareNbt(pt, parent.listVal[k]):
+          var l = loc
+          l.add(k)
+          next.add(l)
+          found = true
+      if not found:
+        parent.listVal.add(pt)
+        var l = loc
+        l.add(parent.listVal.len - 1)
+        next.add(l)
+  of npnMatchObject:
+    if parent.kind == ntkCompound:
+      let pt = compoundTag(node.pattern)
+      if not parent.compoundVal.containsKey(node.name):
+        parent.compoundVal.insert(node.name, pt)
+      for k in 0 ..< parent.compoundVal.names.len:
+        if parent.compoundVal.names[k] == node.name and compareNbt(pt, parent.compoundVal.values[k]):
+          var l = loc
+          l.add(k)
+          next.add(l)
+  of npnMatchRootObject:
+    if compareNbt(compoundTag(node.pattern), parent):
+      next.add(loc)
+
+proc getOrCreateParents(p: NbtPath; root: var NbtTag; locs: var seq[seq[int]]): CmdVoidResult =
+  ## Every location the walk of all but the last node reaches, creating what is missing.
+  locs = @[newSeq[int]()]
+  for i in 0 ..< max(p.nodes.len - 1, 0):
+    var next: seq[seq[int]] = @[]
+    for loc in locs:
+      expandNode(locate(root, loc, 0), p.nodes[i], p.nodes[i + 1], loc, next)
+    if next.len == 0:
+      return cmdFailVoid(notFound(p, i))
+    locs = next
+  cmdOkVoid()
+
+proc set*(p: NbtPath; tag: var NbtTag; toAdd: NbtTag; merge: bool = false): CmdResult[int32] =
+  ## Sets the value at this path on the given root tag.
+  if isTooDeep(toAdd, p.nodes.len):
+    return cmdFail[int32](createWithoutContext(errorDataTooDeep()))
+  var locs: seq[seq[int]] = @[]
+  let r = getOrCreateParents(p, tag, locs)
+  if not r.isOk:
+    return cmdFail[int32](r.error)
+  if locs.len == 0 or p.nodes.len == 0:
+    return cmdOk[int32](0'i32)
+  var changed = 0'i32
+  for loc in locs:
+    changed += setTag(p.nodes[p.nodes.len - 1], locate(tag, loc, 0), toAdd, merge)
+  cmdOk[int32](changed)
+
+proc insertInto(list: var seq[NbtTag]; index: int32; toInsert: seq[NbtTag]; modified: var bool): CmdVoidResult =
+  let size = list.len
+  var ai = if index < 0: size + int(index) + 1 else: int(index)
+  for src in toInsert:
+    if ai < 0 or ai > list.len:
+      return cmdFailVoid(createWithoutContext(errorInvalidIndex(), text($ai)))
+    list.add(src)
+    var j = list.len - 1
+    while j > ai:
+      list[j] = list[j - 1]
+      dec j
+    list[ai] = src
+    inc ai
+    modified = true
+  cmdOkVoid()
+
+proc insertOne(parent: var NbtTag; last: NbtPathNode; index: int32; toInsert: seq[NbtTag]; counted: var int32): CmdVoidResult =
+  case last.kind
+  of npnCompoundChild:
+    if parent.kind == ntkCompound:
+      if not parent.compoundVal.containsKey(last.name):
+        parent.compoundVal.insert(last.name, NbtTag(kind: ntkList, listVal: @[]))
+      for k in 0 ..< parent.compoundVal.names.len:
+        if parent.compoundVal.names[k] == last.name:
+          var modified = false
+          if parent.compoundVal.values[k].kind != ntkList:
+            return cmdFailVoid(createWithoutContext(errorExpectedList(), text($parent.compoundVal.values[k])))
+          let r = insertInto(parent.compoundVal.values[k].listVal, index, toInsert, modified)
+          if not r.isOk:
+            return r
+          if modified:
+            counted += 1
+  of npnMatchRootObject:
+    if parent.kind != ntkList:
+      return cmdFailVoid(createWithoutContext(errorExpectedList(), text($parent)))
+    var modified = false
+    let r = insertInto(parent.listVal, index, toInsert, modified)
+    if not r.isOk:
+      return r
+    if modified:
+      counted += 1
+  else:
+    discard
+  cmdOkVoid()
+
+proc insert*(p: NbtPath; index: int32; target: var NbtTag; toInsert: seq[NbtTag]): CmdResult[int32] =
+  ## Inserts elements at the given index into list targets matching this path.
+  for t in toInsert:
+    if isTooDeep(t, p.nodes.len):
+      return cmdFail[int32](createWithoutContext(errorDataTooDeep()))
+  var locs: seq[seq[int]] = @[]
+  let r = getOrCreateParents(p, target, locs)
+  if not r.isOk:
+    return cmdFail[int32](r.error)
+  if p.nodes.len == 0:
+    return cmdOk[int32](0'i32)
+  var modifiedCount = 0'i32
+  for loc in locs:
+    let ir = insertOne(locate(target, loc, 0), p.nodes[p.nodes.len - 1], index, toInsert, modifiedCount)
+    if not ir.isOk:
+      return cmdFail[int32](ir.error)
+  cmdOk[int32](modifiedCount)
+
+proc remove*(p: NbtPath; tag: var NbtTag): int32 =
+  ## Removes tags at this path from the given root tag.
+  var locs: seq[seq[int]] = @[]
+  let r = getOrCreateParents(p, tag, locs)
+  if not r.isOk or p.nodes.len == 0:
+    return 0
+  var total = 0'i32
+  for loc in locs:
+    total += removeTag(p.nodes[p.nodes.len - 1], locate(tag, loc, 0))
+  total
+
+# --- the argument type ---------------------------------------------------------------------------------------------
+
+proc isAllowedInUnquotedName(c: int32): bool =
+  not (c == int32(ord(' ')) or c == int32(ord('"')) or c == int32(ord('\'')) or c == int32(ord('[')) or
+       c == int32(ord(']')) or c == int32(ord('.')) or c == int32(ord('{')) or c == int32(ord('}')))
+
+proc parseCompoundPattern(r: var StringReader): CmdResult[NbtCompound] =
+  let t = parseForCommands(r)
+  if not t.isOk:
+    return cmdFail[NbtCompound](t.error)
+  if t.value.kind != ntkCompound:
+    return cmdFail[NbtCompound](create(errorInvalidNode(), r))
+  cmdOk[NbtCompound](t.value.compoundVal)
+
+proc readObjectNode(r: var StringReader; name: string): CmdResult[NbtPathNode] =
+  if name.len == 0:
+    return cmdFail[NbtPathNode](create(errorInvalidNode(), r))
+  if peekIs(r, '{'):
+    let pat = parseCompoundPattern(r)
+    if not pat.isOk:
+      return cmdFail[NbtPathNode](pat.error)
+    return cmdOk[NbtPathNode](matchObject(name, pat.value))
+  cmdOk[NbtPathNode](compoundChild(name))
+
+proc readUnquotedName(r: var StringReader): CmdResult[string] =
+  let start = cursor(r)
+  while canReadChar(r) and isAllowedInUnquotedName(peek(r)):
+    skip(r)
+  if cursor(r) == start:
+    return cmdFail[string](create(errorInvalidNode(), r))
+  cmdOk[string](r.str[start ..< cursor(r)])
+
+proc parseNode(r: var StringReader; firstNode: bool): CmdResult[NbtPathNode] =
+  if not canReadChar(r):
+    return cmdFail[NbtPathNode](create(errorInvalidNode(), r))
+  let pk = peek(r)
+  if pk == int32(ord('"')) or pk == int32(ord('\'')):
+    let name = readString(r)
+    if not name.isOk:
+      return cmdFail[NbtPathNode](name.error)
+    return readObjectNode(r, name.value)
+  if pk == int32(ord('[')):
+    skip(r)
+    if not canReadChar(r):
+      return cmdFail[NbtPathNode](create(errorInvalidNode(), r))
+    if peekIs(r, '{'):
+      let pat = parseCompoundPattern(r)
+      if not pat.isOk:
+        return cmdFail[NbtPathNode](pat.error)
+      let e = expect(r, ']')
+      if not e.isOk:
+        return cmdFail[NbtPathNode](e.error)
+      return cmdOk[NbtPathNode](matchElement(pat.value))
+    if peekIs(r, ']'):
+      skip(r)
+      return cmdOk[NbtPathNode](allElements())
+    let idx = readInt(r)
+    if not idx.isOk:
+      return cmdFail[NbtPathNode](idx.error)
+    let e = expect(r, ']')
+    if not e.isOk:
+      return cmdFail[NbtPathNode](e.error)
+    return cmdOk[NbtPathNode](indexedElement(idx.value))
+  if pk == int32(ord('{')):
+    if not firstNode:
+      return cmdFail[NbtPathNode](create(errorInvalidNode(), r))
+    let pat = parseCompoundPattern(r)
+    if not pat.isOk:
+      return cmdFail[NbtPathNode](pat.error)
+    return cmdOk[NbtPathNode](matchRootObject(pat.value))
+  let name = readUnquotedName(r)
+  if not name.isOk:
+    return cmdFail[NbtPathNode](name.error)
+  readObjectNode(r, name.value)
+
+proc parseNbtPath*(r: var StringReader): CmdResult[NbtPath] =
+  ## `NbtPathArgumentType::parse`.
+  var nodes: seq[NbtPathNode] = @[]
+  var positions: seq[int] = @[]
+  let start = cursor(r)
+  var first = true
+  while canReadChar(r) and not peekIs(r, ' '):
+    let node = parseNode(r, first)
+    if not node.isOk:
+      return cmdFail[NbtPath](node.error)
+    nodes.add(node.value)
+    positions.add(cursor(r) - start)
+    first = false
+    if canReadChar(r):
+      let nx = peek(r)
+      if nx != int32(ord(' ')) and nx != int32(ord('[')) and nx != int32(ord('{')):
+        let e = expect(r, '.')
+        if not e.isOk:
+          return cmdFail[NbtPath](e.error)
+  if nodes.len == 0:
+    return cmdFail[NbtPath](create(errorInvalidNode(), r))
+  cmdOk[NbtPath](newNbtPath(r.str[start ..< cursor(r)], nodes, positions))
+
+type
+  NbtPathValue* = ref object of ArgValue
+    value*: NbtPath
+
+proc newNbtPathArgumentType*(): AnyArgumentType =
+  ## `NbtPathArgumentType`.
+  AnyArgumentType(clientParser: JavaClientArgumentType(kind: atNbtPath), overrideSuggestion: none[SuggestionProviders](),
+    examples: @["foo", "foo.bar", "foo[0]", "[0]", "[]", "{foo:\"bar\"}"],
+    parseProc: proc(reader: var StringReader): CmdResult[ArgValue] {.closure.} =
+      let p = parseNbtPath(reader)
+      if not p.isOk:
+        return cmdFail[ArgValue](p.error)
+      let boxed: ArgValue = NbtPathValue(value: p.value)
+      cmdOk[ArgValue](boxed))
+
+proc getNbtPath*(context: CommandContext; name: string): CmdResult[NbtPath] =
+  var found = false
+  let v = argumentOf(context, name, found)
+  if not found:
+    return cmdFail[NbtPath](missingArgument(name))
+  if not (v of NbtPathValue):
+    return cmdFail[NbtPath](wrongArgumentType(name))
+  cmdOk[NbtPath](NbtPathValue(v).value)
+
+proc getNbtTag*(context: CommandContext; name: string): CmdResult[NbtTag] =
+  ## `NbtTagArgumentType::get` and `NbtCompoundArgumentType::get`.
+  var found = false
+  let v = argumentOf(context, name, found)
+  if not found:
+    return cmdFail[NbtTag](missingArgument(name))
+  if not (v of NbtValue):
+    return cmdFail[NbtTag](wrongArgumentType(name))
+  cmdOk[NbtTag](NbtValue(v).value)

@@ -1,0 +1,243 @@
+## The score holder and scoreboard operation argument types.
+## Port of pumpkin-core/src/command/argument_types/score_holder.rs (newer tree)
+## Port of pumpkin-core/src/command/argument_types/operation.rs (newer tree)
+##
+## A score holder is a name (an online player, a uuid, or any fake name such as `#temp` or `$x`), a selector, or `*` for
+## every holder the scoreboard already tracks. `getScoreHolders` resolves them to the key a score is kept under and the
+## name feedback shows.
+
+import std/options
+import ../generated/translation
+import ../protocol/java/client/play/commands
+import ../util/uuid
+import ../util/text/[textbase, text]
+import cmderrors, cmdsource, cmdtree, entity_selector, string_reader, suggestion
+
+type
+  ScoreHolderKind* = enum
+    shName
+    shSelector
+    shWildcard
+
+  ScoreHolder* = object
+    kind*: ScoreHolderKind
+    name*: string
+    selector*: EntitySelector
+
+  ScoreHolderValue* = ref object of ArgValue
+    value*: ScoreHolder
+
+  ResolvedScoreHolder* = object
+    name*: string
+    displayName*: TextComponent
+
+  ScoreboardOperation* = enum
+    soAssign
+    soPlus
+    soMinus
+    soMultiply
+    soDivide
+    soModulo
+    soSwap
+    soMin
+    soMax
+
+  OperationValue* = ref object of ArgValue
+    value*: ScoreboardOperation
+
+const OperationSymbols = [("+=", soPlus), ("-=", soMinus), ("*=", soMultiply), ("/=", soDivide), ("%=", soModulo),
+  ("><", soSwap), ("=", soAssign), ("<", soMin), (">", soMax)]
+
+proc noWildcardResults*(): CommandErrorType = errorType0(JAVA_ARGUMENT_SCOREHOLDER_EMPTY, JAVA_ARGUMENT_SCOREHOLDER_EMPTY)
+proc invalidOperationError*(): CommandErrorType = errorType0(JAVA_ARGUMENTS_OPERATION_INVALID, JAVA_ARGUMENTS_OPERATION_INVALID)
+proc divideByZeroError*(): CommandErrorType = errorType0(JAVA_ARGUMENTS_OPERATION_DIV0, JAVA_ARGUMENTS_OPERATION_DIV0)
+
+# ---- operation.rs --------------------------------------------------------------------------------------------------
+
+proc floorDiv32(target, source: int32): int32 =
+  ## Floor division that wraps on `i32::MIN / -1`.
+  if source == -1'i32:
+    return 0'i32 - target
+  let quotient = target div source
+  let remainder = target mod source
+  if (target xor source) < 0'i32 and remainder != 0'i32: quotient - 1'i32 else: quotient
+
+proc floorMod32(target, source: int32): int32 =
+  ## Floor modulo that wraps on `i32::MIN % -1`.
+  if source == -1'i32:
+    return 0'i32
+  let remainder = target mod source
+  if remainder != 0'i32 and (remainder xor source) < 0'i32: remainder + source else: remainder
+
+proc wrapAdd(a, b: int32): int32 = cast[int32](cast[uint32](a) + cast[uint32](b))
+proc wrapSub(a, b: int32): int32 = cast[int32](cast[uint32](a) - cast[uint32](b))
+proc wrapMul(a, b: int32): int32 = cast[int32](cast[uint32](a) * cast[uint32](b))
+
+proc applyOperation*(op: ScoreboardOperation; target, source: int32; res: var int32): CmdVoidResult =
+  ## `ScoreboardOperation::apply`. `Swap` returns the source; the command sets both scores itself.
+  case op
+  of soAssign, soSwap: res = source
+  of soPlus: res = wrapAdd(target, source)
+  of soMinus: res = wrapSub(target, source)
+  of soMultiply: res = wrapMul(target, source)
+  of soDivide:
+    if source == 0'i32:
+      return cmdFailVoid(createWithoutContext(divideByZeroError()))
+    res = floorDiv32(target, source)
+  of soModulo:
+    if source == 0'i32:
+      return cmdFailVoid(createWithoutContext(divideByZeroError()))
+    res = floorMod32(target, source)
+  of soMin: res = min(target, source)
+  of soMax: res = max(target, source)
+  cmdOkVoid()
+
+proc newOperationArgumentType*(): AnyArgumentType =
+  AnyArgumentType(clientParser: JavaClientArgumentType(kind: atOperation), overrideSuggestion: none[SuggestionProviders](),
+    examples: @["=", "+=", "><"],
+    parseProc: proc(reader: var StringReader): CmdResult[ArgValue] {.closure.} =
+      if not canReadChar(reader):
+        return cmdFail[ArgValue](create(invalidOperationError(), reader))
+      let start = cursor(reader)
+      while canReadChar(reader) and not peekIs(reader, ' '):
+        skip(reader)
+      let token = reader.str[start ..< cursor(reader)]
+      for entry in OperationSymbols:
+        if token == entry[0]:
+          let boxed: ArgValue = OperationValue(value: entry[1])
+          return cmdOk[ArgValue](boxed)
+      cmdFail[ArgValue](createWithoutContext(invalidOperationError())),
+    listSuggestionsProc: proc(context: CommandContext; builder: SuggestionsBuilder): Suggestions {.closure.} =
+      var b = builder
+      for entry in OperationSymbols:
+        b = filterAndSuggestOne(b, entry[0])
+      build(b))
+
+proc getOperation*(context: CommandContext; name: string): CmdResult[ScoreboardOperation] =
+  var found = false
+  let v = argumentOf(context, name, found)
+  if not found:
+    return cmdFail[ScoreboardOperation](missingArgument(name))
+  if not (v of OperationValue):
+    return cmdFail[ScoreboardOperation](wrongArgumentType(name))
+  cmdOk[ScoreboardOperation](OperationValue(v).value)
+
+# ---- score_holder.rs -----------------------------------------------------------------------------------------------
+
+proc parseScoreHolder(multiple: bool; reader: var StringReader; allowSelectors: bool): CmdResult[ArgValue] =
+  let start = cursor(reader)
+  if peekIs(reader, '@'):
+    let s = parseAndConsume(reader, allowSelectors)
+    if not s.isOk:
+      return cmdFail[ArgValue](s.error)
+    if not multiple and s.value.maxSelected > 1'i32:
+      return cmdFail[ArgValue](create(notSingleEntityErrorType(), reader))
+    let boxed: ArgValue = ScoreHolderValue(value: ScoreHolder(kind: shSelector, selector: s.value))
+    return cmdOk[ArgValue](boxed)
+  while canReadChar(reader) and not peekIs(reader, ' '):
+    skip(reader)
+  let name = reader.str[start ..< cursor(reader)]
+  if name.len == 0:
+    return cmdFail[ArgValue](create(noEntitiesErrorType(), reader))
+  if name == "*":
+    let boxed: ArgValue = ScoreHolderValue(value: ScoreHolder(kind: shWildcard))
+    return cmdOk[ArgValue](boxed)
+  let boxed: ArgValue = ScoreHolderValue(value: ScoreHolder(kind: shName, name: name))
+  cmdOk[ArgValue](boxed)
+
+proc newScoreHolderArgumentType*(multiple: bool): AnyArgumentType =
+  ## `ScoreHolderArgumentType::{Single, Multiple}`.
+  AnyArgumentType(clientParser: JavaClientArgumentType(kind: atScoreHolder, flags: (if multiple: ScoreHolderFlagAllowMultiple else: 0'u8)),
+    overrideSuggestion: none[SuggestionProviders](),
+    examples: @["detectGen", "#temp", "$x", "*", "@s"],
+    parseProc: proc(reader: var StringReader): CmdResult[ArgValue] {.closure.} = parseScoreHolder(multiple, reader, true),
+    parseWithSourceProc: proc(reader: var StringReader; source: CommandSource): CmdResult[ArgValue] {.closure.} =
+      parseScoreHolder(multiple, reader, hasPermission(source, EntitySelectorPermission)),
+    listSuggestionsProc: listSelectorSuggestions)
+
+proc scoreboardNameOf*(e: CommandEntity): string =
+  ## `get_scoreboard_name`: a player's name, anything else's uuid.
+  if e.player != nil or e.entityTypeId == "minecraft:player": getText(e.getName()) else: $e.uuid
+
+proc entityHolder(e: CommandEntity): ResolvedScoreHolder =
+  ResolvedScoreHolder(name: scoreboardNameOf(e), displayName: e.getDisplayName())
+
+proc namedHolder(name: string): ResolvedScoreHolder =
+  ResolvedScoreHolder(name: name, displayName: text(name))
+
+proc resolveName(source: CommandSource; name: string): seq[ResolvedScoreHolder] =
+  ## Named online players and uuids keep entity feedback; offline names stay literal.
+  if name.len > 0 and name[0] != '#':
+    let server = source.server
+    if server != nil:
+      let (isUuid, id) = parseUuid(name)
+      if isUuid:
+        var found: seq[ResolvedScoreHolder] = @[]
+        if server.getWorlds != nil:
+          let worlds = server.getWorlds()
+          for w in worlds:
+            var entity: nil CommandEntity = nil
+            if w.getEntityByUuid != nil:
+              entity = w.getEntityByUuid(id)
+            if entity != nil:
+              found.add(entityHolder(entity))
+            elif w.getPlayerByUuid != nil:
+              let p = w.getPlayerByUuid(id)
+              if p != nil:
+                found.add(entityHolder(p.entity))
+        if found.len > 0:
+          return found
+      elif server.getPlayerByName != nil:
+        let p = server.getPlayerByName(name)
+        if p != nil:
+          return @[entityHolder(p.entity)]
+  @[namedHolder(name)]
+
+proc holderArg(c: CommandContext; name: string): CmdResult[ScoreHolder] =
+  var found = false
+  let v = argumentOf(c, name, found)
+  if not found:
+    return cmdFail[ScoreHolder](missingArgument(name))
+  if not (v of ScoreHolderValue):
+    return cmdFail[ScoreHolder](wrongArgumentType(name))
+  cmdOk[ScoreHolder](ScoreHolderValue(v).value)
+
+proc getScoreHolders*(context: CommandContext; name: string): CmdResult[seq[ResolvedScoreHolder]] =
+  ## Resolves holders without losing the entity display names feedback uses.
+  let h = holderArg(context, name)
+  if not h.isOk:
+    return cmdFail[seq[ResolvedScoreHolder]](h.error)
+  var holders: seq[ResolvedScoreHolder] = @[]
+  case h.value.kind
+  of shName:
+    holders = resolveName(context.source, h.value.name)
+  of shSelector:
+    let found = findEntities(h.value.selector, context.source)
+    if not found.isOk:
+      return cmdFail[seq[ResolvedScoreHolder]](found.error)
+    for e in found.value:
+      holders.add(entityHolder(e))
+  of shWildcard:
+    let world = context.source.world
+    var names: seq[string] = @[]
+    if world != nil and world.getScoreHolderNames != nil:
+      names = world.getScoreHolderNames()
+    if names.len == 0:
+      return cmdFail[seq[ResolvedScoreHolder]](createWithoutContext(noWildcardResults()))
+    for n in names:
+      holders.add(namedHolder(n))
+  if holders.len == 0:
+    return cmdFail[seq[ResolvedScoreHolder]](createWithoutContext(noEntitiesErrorType()))
+  cmdOk[seq[ResolvedScoreHolder]](holders)
+
+proc getScoreHolder*(context: CommandContext; name: string): CmdResult[ResolvedScoreHolder] =
+  ## One holder; a wildcard is not accepted.
+  let h = holderArg(context, name)
+  if not h.isOk:
+    return cmdFail[ResolvedScoreHolder](h.error)
+  if h.value.kind == shWildcard:
+    return cmdFail[ResolvedScoreHolder](createWithoutContext(noWildcardResults()))
+  let all = getScoreHolders(context, name)
+  if not all.isOk:
+    return cmdFail[ResolvedScoreHolder](all.error)
+  cmdOk[ResolvedScoreHolder](all.value[0])
