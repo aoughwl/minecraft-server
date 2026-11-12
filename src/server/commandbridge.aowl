@@ -6,14 +6,13 @@
 ##
 ## What has no backing yet stays nil, and the command gets the neutral answer cmdsource.aowl names on that field:
 ##   Player: effects (get/add/remove, in src/server/entity's LivingEntity, not linked to a live player yet),
-##           `isAdvancementDone` (no advancement manager), `getIp` (the connection keeps no peer address),
 ##           `heldItemAccepts`/`heldItemCanHold`/`enchantHeld` (no enchantment glue on the live inventory).
 ##   Entity: only players exist in a live world: `remove`, `getCustomName`.
 ##   World:  `teamHasPlayer`, `getScore`, `getTeamNames`, `getTeamOf`, `getObjectiveNames` (no scoreboard on `World`),
 ##           `spawnParticle`, `spawnEntity` (no entity list on `World`), `updateNeighbors`.
 ##   Server: `getTps`/`getMspt` (no sample history), `lookupProfileByName` (Mojang), `reloadDatapacks`, `fireSpawnChange`.
 
-import std/[options, syncio, strutils, math]
+import std/[options, syncio, strutils, math, tables]
 import ../command/[client_suggestions, cmdsource, cmddispatch]
 import ../config/[op, whitelist]
 import ../config/lib as configlib
@@ -33,6 +32,10 @@ import ../protocol/varint
 import ../protocol/java/client/config/config_disconnect
 import ../protocol/java/client/login/login_disconnect
 import ../protocol/java/client/play/disconnect
+import ../protocol/java/client/play/[show_dialog, clear_dialog, update_attributes]
+import "../protocol/java/client/dialog" as dialogmod
+import "entity/attributes" as entityattrs
+import ../generated/entity_type
 import ../util/resource_location
 import ../protocol/java/client/play/[actionbar, clear_title, combat_death, disguised_chat_message, set_experience,
   set_title, set_title_animation, sound_effect, stop_sound, subtitle, transfer]
@@ -44,9 +47,15 @@ import ../world/level
 import ../world/world as worldtraits
 import ../world/worldinfo except Dimension
 import command/[cmdcommon, default_dispatcher]
+import command/advancement as advcmd
+import advancementglue
+import ../data/advancement_data as advdata
+import ../generated/advancement as advgen
 import data/[banned_ip, banned_player, banlist_serializer, datamod, usercache]
 import entity/player as playermod
 import net/java/javamod
+from logging import LineEditor, newLineEditor, feedKey, takeLine, takeShown, renderLine, consolePrint, setActiveEditor, ConsolePrompt
+import net/netbase
 import net/winsock
 import serverbase
 import ../world/chunkdata
@@ -55,6 +64,8 @@ import ../protocol/java/client/play/[chunk_data, set_camera]
 import ../generated/[block_loot, chest_loot]
 import world/loot as lootmod
 import world/[time, weather, worldmod, scoreboard, border, bossbar, custom_bossbar]
+from "block/blockbehaviour" import BlockWorld, BlockEntity, getBlockEntity, getInventory, getBlockAndStateId
+from "block/entities/command_block" import CommandBlockEntity
 
 const DataFolder = "data"
 
@@ -135,6 +146,11 @@ proc buildCommandWorld(server: Server; world: World): CommandWorld =
     previous != enabled
   result.sendCommandFeedback = proc(): bool {.closure.} = rules().sendCommandFeedback
   result.commandBlockOutput = proc(): bool {.closure.} = rules().commandBlockOutput
+  result.spawnEntity = proc(entityType: string; pos: Vector3[float64]): TextComponent {.closure.} =
+    let hook = world.spawnEntityHook
+    if hook != nil:
+      return hook(entityType, pos)
+    text("")
   result.getSpawnPoint = proc(): Vector3[int32] {.closure.} =
     Vector3[int32](x: world.levelInfo.spawnX, y: world.levelInfo.spawnY, z: world.levelInfo.spawnZ)
   result.getPlayers = proc(): seq[CommandPlayer] {.closure.} =
@@ -217,6 +233,21 @@ proc buildCommandWorld(server: Server; world: World): CommandWorld =
     if chunk == nil:
       return world.dimension.minY
     getHeightmap(chunk.heightmap, chmWorldSurface, x, z, world.dimension.minY)
+  result.getBlockContainer = proc(x, y, z: int32): seq[CmdItemSlot] {.closure.} =
+    ## The block entity's inventory at the position, slot by slot; none without a block entity or an inventory.
+    result = @[]
+    let bw = world.blockWorld
+    if bw == nil:
+      return
+    let entity = getBlockEntity(BlockWorld(bw), newBlockPos(x, y, z))
+    if entity.isNone:
+      return
+    let found = getInventory(entity.unsafeGet)
+    if found.isNone:
+      return
+    let container = found.unsafeGet
+    for i in 0 ..< inventory.size(container):
+      result.add(blockContainerSlot(container, i))
   result.isLiquidAt = proc(x, y, z: int32): bool {.closure.} =
     isLiquid(BlockState.fromId(newBlockStateIdUnchecked(uint16(worldmod.getBlockStateId(world, newBlockPos(x, y, z))))))
   result.generateBlockLoot = proc(x, y, z: int32; hasTool: bool; tool: string; found: var bool): seq[CmdItemStack] {.closure.} =
@@ -363,6 +394,9 @@ proc killPlayer(player: Player) =
   ## respawn. Death drops and statistics are in LivingEntity::on_death, src/server/entity, not linked to a live player.
   if player.dead:
     return
+  if playermod.gPlayerKillHook != nil:
+    playermod.gPlayerKillHook(player)
+    return
   player.health = 0.0'f32
   player.dead = true
   playermod.sendHealth(player)
@@ -403,6 +437,10 @@ proc buildCommandEntity(server: Server; player: Player; owner: CommandPlayer): C
   result.damageWithContext = proc(amount: float32; damageType: string; location: Option[Vector3[float64]];
                                   source, cause: nil CommandEntity): bool {.closure.} =
     # The sum `LivingEntity::damage` ends in, without armour and the rest of src/server/entity.
+    if playermod.gPlayerDamageHook != nil:
+      if player.dead:
+        return false
+      return playermod.gPlayerDamageHook(player, amount, damageType)
     if player.dead or player.abilities.invulnerable:
       return false
     player.health = max(0.0'f32, player.health - amount)
@@ -451,12 +489,40 @@ proc enderChestSlot(player: Player; index: int): CmdItemSlot =
       inventory.setStack(inv, index, s)
   result.isEmpty = proc(): bool {.closure.} = inventory.getStack(inv, index).isEmpty()
 
+proc blockContainerSlot(inv: Inventory; index: int): CmdItemSlot =
+  ## One slot of a block entity's inventory, for `getBlockContainer`.
+  result = CmdItemSlot()
+  result.getStack = proc(): CmdItemStack {.closure.} = fromItemStack(inventory.getStack(inv, index))
+  result.setStack = proc(stack: CmdItemStack) {.closure.} =
+    var s = ItemStack()
+    if stack.itemKey.len == 0 or not toItemStack(stack, s):
+      inventory.setStack(inv, index, emptyItemStack())
+    else:
+      inventory.setStack(inv, index, s)
+  result.isEmpty = proc(): bool {.closure.} = inventory.getStack(inv, index).isEmpty()
+
 proc buildCommandPlayer(server: Server; player: Player): CommandPlayer =
   result = CommandPlayer(gameProfile: CmdGameProfile(id: player.gameprofile.id, name: player.gameprofile.name))
   let owner = result
   result.entity = buildCommandEntity(server, player, owner)
   let client = player.client
   result.getPermissionLvl = proc(): PermissionLvl {.closure.} = player.permissionLvl
+  result.getEffectAmplifier = proc(effect: string): int32 {.closure.} =
+    let hooks = playermod.gPlayerEffects
+    if hooks == nil:
+      return -1'i32
+    hooks.amplifier(player, effect)
+  result.addEffect = proc(effect: string; duration: int32; amplifier: uint8; showParticles: bool) {.closure.} =
+    let hooks = playermod.gPlayerEffects
+    if hooks != nil:
+      hooks.add(player, effect, duration, amplifier, showParticles)
+  result.removeEffect = proc(effect: string) {.closure.} =
+    let hooks = playermod.gPlayerEffects
+    if hooks != nil:
+      hooks.remove(player, effect)
+  result.removeAllEffects = proc(): bool {.closure.} =
+    let hooks = playermod.gPlayerEffects
+    hooks != nil and hooks.removeAll(player)
   result.setPermissionLvl = proc(lvl: PermissionLvl) {.closure.} =
     player.permissionLvl = lvl
     sendPermissionLvlUpdate(player)
@@ -484,6 +550,7 @@ proc buildCommandPlayer(server: Server; player: Player): CommandPlayer =
   result.setGameMode = proc(mode: GameMode): bool {.closure.} = playermod.setGamemode(player, mode)
   result.getExperienceLevel = proc(): int32 {.closure.} = player.experienceLevel
   result.kick = proc(reason: TextComponent) {.closure.} = javamod.kick(client, reason)
+  result.getIp = proc(): string {.closure.} = client.peerIp
   result.sendMsgOutgoing = proc(message, sender, target: TextComponent) {.closure.} =
     client.writePacketFor(CDisguisedChatMessage(message: message, chatType: newVarInt(int32(MSG_COMMAND_OUTGOING) + 1'i32),
       senderName: sender, targetName: some(target)))
@@ -590,6 +657,67 @@ proc buildCommandPlayer(server: Server; player: Player): CommandPlayer =
   result.setCameraTarget = proc(entityId: int32) {.closure.} =
     player.cameraTargetId = (if entityId == player.entityId: none[int32]() else: some(entityId))
     player.client.writePacketFor(CSetCamera(cameraId: newVarInt(entityId)))
+  let tracked = player.advancements
+  if tracked != nil:
+    let progress = tracked.advancements
+    advcmd.installAdvancementHooks(result, progress)
+    result.isAdvancementDone = proc(id: string; exists: var bool): bool {.closure.} =
+      var found = advgen.Advancement.fromName(id)
+      if found.isNone:
+        found = advgen.Advancement.fromMinecraftName(id)
+      exists = found.isSome
+      exists and progress.progress.containsKey(found.unsafeGet) and progress.progress.getMutOrStartProgress(found.unsafeGet).isDone()
+  result.showDialog = proc(dialog: NbtTag) {.closure.} =
+    if dialog.kind == ntkCompound:
+      player.client.writePacketFor(CPlayShowDialog(dialog: proto.IdOr[dialogmod.DialogNBT](kind: proto.iokValue,
+        value: dialogmod.fromNbt(dialog.compoundVal))))
+  result.clearDialog = proc() {.closure.} = player.client.writePacketFor(CPlayClearDialog())
+  # `/attribute`: the player is not yet a `LivingEntity` here, so the table of its attribute instances is the one
+  # `LivingEntity::new` would build from the player entity type, kept for this player.
+  var attributes = initTable[uint8, entityattrs.AttributeInstance]()
+  let playerType = EntityType.fromName("player")
+  if playerType.isSome:
+    for entry in playerType.unsafeGet.attributes:
+      attributes[entry.attribute.id] = entityattrs.newAttributeInstance(entry.value)
+  let entityId = player.entityId
+  let attributeOf = proc(id: uint8): entityattrs.AttributeInstance {.closure.} = attributes.getOrDefault(id)
+  result.entity.isLiving = true
+  result.entity.hasAttribute = proc(id: uint8): bool {.closure.} = attributes.hasKey(id)
+  result.entity.getAttributeBase = proc(id: uint8): float64 {.closure.} = attributeOf(id).baseValue
+  result.entity.getAttributeValue = proc(id: uint8): float64 {.closure.} = entityattrs.value(attributeOf(id))
+  result.entity.setAttributeBase = proc(id: uint8; value: float64) {.closure.} =
+    let inst = attributeOf(id)
+    inst.baseValue = value
+    inst.dirty = true
+  result.entity.getAttributeModifier = proc(id: uint8; modifierId: string; amount: var float64): bool {.closure.} =
+    for m in attributeOf(id).modifiers:
+      if m.id == modifierId:
+        amount = m.amount
+        return true
+    false
+  result.entity.addAttributeModifier = proc(id: uint8; modifierId: string; amount: float64; operation: int32): bool {.closure.} =
+    let inst = attributeOf(id)
+    for m in inst.modifiers:
+      if m.id == modifierId:
+        return false
+    inst.modifiers.add(entityattrs.AttrModifier(id: modifierId, amount: amount, operation: entityattrs.ModifierOperation(operation)))
+    inst.dirty = true
+    true
+  result.entity.removeAttributeModifier = proc(id: uint8; modifierId: string): bool {.closure.} =
+    let inst = attributeOf(id)
+    for i in 0 ..< inst.modifiers.len:
+      if inst.modifiers[i].id == modifierId:
+        inst.modifiers.delete(i)
+        inst.dirty = true
+        return true
+    false
+  result.entity.sendAttributeUpdate = proc(id: uint8) {.closure.} =
+    let inst = attributeOf(id)
+    var modifiers: seq[AttributeModifier] = @[]
+    for m in inst.modifiers:
+      modifiers.add(AttributeModifier(id: m.id, amount: m.amount, operation: int8(ord(m.operation))))
+    player.client.writePacketFor(CUpdateAttributes(entityId: newVarInt(entityId),
+      properties: @[update_attributes.Property(id: newVarInt(int32(id)), value: inst.baseValue, modifiers: modifiers)]))
 
 proc forgetCommandPlayer*(player: Player) =
   ## `Player::remove`'s half here: break the cycle between a player and its hooks.
@@ -715,7 +843,7 @@ proc selectPlayerList(server: Server; selector: TargetSelector; sender: CommandS
     result.add(p)
 
 proc playerEntry(id: Uuid; name, source, reason: string): BannedPlayerEntry =
-  BannedPlayerEntry(uuid: id, name: name, created: nowUtcSeconds(), source: source, expires: 0'i64, reason: reason)
+  BannedPlayerEntry(uuid: id, name: name, created: nowUtcSeconds(), source: source, expires: NoExpiry, reason: reason)
 
 proc buildCommandServer(server: Server; registry: PermissionRegistry): CommandServer =
   result = CommandServer(permissionRegistry: registry, opPermissionLevel: server.basicConfig.opPermissionLevel)
@@ -744,6 +872,7 @@ proc buildCommandServer(server: Server; registry: PermissionRegistry): CommandSe
     if w != nil:
       return commandWorldOf(server, w)
     nil
+  result.saveAdvancements = proc(): bool {.closure.} = saveAllAdvancements(server)
   result.broadcastSystemMessage = proc(message: TextComponent) {.closure.} =
     for w in server.worlds:
       w.broadcastSystemMessage(message, false)
@@ -823,7 +952,7 @@ proc buildCommandServer(server: Server; registry: PermissionRegistry): CommandSe
     list
   result.addBannedIp = proc(entry: CmdListEntry) {.closure.} =
     server.data.bannedIpList.bannedIps.add(BannedIpEntry(ip: entry.ip, created: nowUtcSeconds(), source: entry.source,
-      expires: 0'i64, reason: entry.reason))
+      expires: NoExpiry, reason: entry.reason))
     banned_ip.save(server.data.bannedIpList)
   result.removeBannedIp = proc(ip: string): bool {.closure.} =
     var i = 0
@@ -834,6 +963,13 @@ proc buildCommandServer(server: Server; registry: PermissionRegistry): CommandSe
         return true
       inc i
     false
+  result.parseIp = proc(text: string; canonical: var string): bool {.closure.} = parseIpv4(text, canonical)
+  result.getPlayersByIp = proc(ip: string): seq[CommandPlayer] {.closure.} =
+    var found: seq[CommandPlayer] = @[]
+    for p in allPlayers(server):
+      if p.client.peerIp == ip:
+        found.add(server.commandPlayerOf(p))
+    found
   result.getOps = proc(): seq[CmdListEntry] {.closure.} =
     var list: seq[CmdListEntry] = @[]
     for e in server.data.operatorConfig.ops:
@@ -973,8 +1109,7 @@ proc buildCommandServer(server: Server; registry: PermissionRegistry): CommandSe
     statusOf(boxes.bars.updatePlayers(server, location, players))
 
 proc consoleLine(line: string) =
-  echo line
-  stdout.flushFile()
+  consolePrint(line)
 
 proc installCommands*(server: Server) =
   ## `default_dispatcher` and `setup_console`'s half that needs no thread: the server's one dispatcher and its hooks.
@@ -988,6 +1123,34 @@ proc installCommands*(server: Server) =
     let built = buildCommandPlayer(server, player)
     player.commandPlayer = built
     built
+  server.runCommandBlock = proc(world: World; position: BlockPos; command: string) {.closure.} =
+    ## `CommandBlock::execute`'s dispatch half: the entity as a `CommandSender::CommandBlock`, then `handle_command`.
+    let found = BlockWorld(world.blockWorld).getBlockEntity(position)
+    if found.isNone or not (found.unsafeGet of CommandBlockEntity):
+      return
+    let entity = CommandBlockEntity(found.unsafeGet)
+    let blockWorld = BlockWorld(world.blockWorld)
+    let handle = CommandBlockHandle()
+    handle.setLastOutput = proc(text: string) {.closure.} = entity.lastOutput = text
+    handle.setSuccessCount = proc(count: uint32) {.closure.} = entity.successCount = count
+    handle.getPosition = proc(): Vector3[int32] {.closure.} = entity.position.vec
+    handle.getRotationY = proc(): Option[float32] {.closure.} =
+      ## `into_source`'s `horizontal_direction`, from the block's facing.
+      let (blockRef, stateId) = blockWorld.getBlockAndStateId(entity.position)
+      if blockRef.id != blockCommandBlock().id and blockRef.id != blockChainCommandBlock().id and
+          blockRef.id != blockRepeatingCommandBlock().id:
+        return none[float32]()
+      case CommandBlockLikeProperties.fromStateId(stateId, blockRef).facing
+      of Facing.South: some(0.0'f32)
+      of Facing.West: some(90.0'f32)
+      of Facing.North: some(180.0'f32)
+      of Facing.Up, Facing.Down, Facing.East: some(270.0'f32)
+    let commandServer = server.commandServer
+    let dispatcher = server.commandDispatcher
+    if commandServer == nil or dispatcher == nil:
+      return
+    cmddispatch.handleCommand(dispatcher, intoSource(senderCommandBlock(handle, commandWorldOf(server, world)), commandServer),
+      command)
   setConsoleWriter(consoleLine)
 
 proc cGetStdHandle(which: int32): pointer {.stdcall, importc: "GetStdHandle", dynlib: "kernel32".}
@@ -997,9 +1160,25 @@ proc cPeekNamedPipe(handle: pointer; buffer: nil pointer; size: uint32; read: ni
 proc cReadFile(handle, buffer: pointer; size: uint32; read: ptr uint32; overlapped: nil pointer): int32
   {.stdcall, importc: "ReadFile", dynlib: "kernel32".}
 proc cKbhit(): int32 {.cdecl, importc: "_kbhit", dynlib: "ucrtbase".}
-proc cGetche(): int32 {.cdecl, importc: "_getche", dynlib: "ucrtbase".}
+proc cGetch(): int32 {.cdecl, importc: "_getch", dynlib: "ucrtbase".}
 
 var consoleBuffer = ""
+var consoleEditor: nil LineEditor = nil
+var consoleEditorShown = false
+
+proc consoleCandidates(server: Server; line: string): seq[string] =
+  ## `PumpkinCommandCompleter::complete`: every command for an empty line, else the dispatcher's suggestions.
+  result = @[]
+  let dispatcher = server.commandDispatcher
+  let commandServer = server.commandServer
+  if dispatcher == nil or commandServer == nil:
+    return
+  if line.len == 0:
+    for usage in cmddispatch.getAllCommands(dispatcher):
+      result.add(usage.name)
+    return
+  for suggestion in cmddispatch.suggest(dispatcher, line, intoSource(senderConsole(), commandServer)):
+    result.add(suggestion.suggestion)
 
 proc runConsoleCommand*(server: Server; line: string) =
   ## A line typed at the console.
@@ -1047,16 +1226,36 @@ proc pumpConsole*(server: Server) =
       consoleBuffer.add(chunk[i])
       inc i
   elif kind == FileTypeChar:
+    # A real console: `LineEditor` with tab completion (logging.aowl), as upstream's rustyline.
+    if consoleEditor == nil:
+      consoleEditor = newLineEditor()
+    let editor = consoleEditor
+    if editor == nil:
+      return
+    if not consoleEditorShown:
+      consoleEditorShown = true
+      setActiveEditor(editor)
+      stdout.write(renderLine(editor, ConsolePrompt))
+      stdout.flushFile()
+    var touched = false
     while cKbhit() != 0'i32:
-      let c = cGetche()
-      if c == 13'i32:
-        echo ""
+      editor.feedKey(int(cGetch()), proc(line: string): seq[string] {.closure.} = consoleCandidates(server, line))
+      touched = true
+      if editor.submitted:
+        let typed = editor.takeLine()
+        stdout.write("\r" & ConsolePrompt & typed & "\x1b[K\n")
+        consoleBuffer.add(typed)
         consoleBuffer.add('\n')
-      elif c == 8'i32:
-        if consoleBuffer.len > 0:
-          consoleBuffer.setLen(consoleBuffer.len - 1)
-      elif c > 0'i32 and c < 256'i32:
-        consoleBuffer.add(char(c))
+      let listing = editor.takeShown()
+      if listing.len > 0:
+        var row = ""
+        for c in listing:
+          row.add(c)
+          row.add("  ")
+        stdout.write("\r\x1b[K" & row & "\n")
+    if touched:
+      stdout.write(renderLine(editor, ConsolePrompt))
+      stdout.flushFile()
   else:
     return
   takeConsoleLines(server)

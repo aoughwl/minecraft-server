@@ -1,0 +1,258 @@
+## The `/advancement` command.
+## Port of pumpkin/src/command/commands/advancement.rs
+##
+## What a player's progress is lives on `PlayerAdvancement` (src/server/entity/player/advancement.aowl), which this
+## module must not see: `Action::perform` and `Action::perform_criterion` for one player are the hooks
+## `advancementPerform` and `advancementPerformCriterion` of `CommandPlayer`, filled by src/server/commandbridge.aowl.
+## Everything else, the tree walk, the counts and the messages, is here.
+
+import std/options
+import ../../command/[cmderrors, cmdsource, cmdtree, argument_builder, argument_types, entity_selector, cmddispatch,
+  suggestion]
+import ../../command/argtype
+import ../../data/advancement_data
+import ../../generated/translation
+import ../../protocol/java/client/play/commands
+import ../../util/permission
+import ../../util/text/[textbase, text]
+import ../entity/player/advancement as playeradv
+import cmdcommon
+
+const
+  Name = "advancement"
+  Description = "manage advancement of players"
+  Permission0 = "minecraft:command.advancement"
+  ArgTargets = "targets"
+  ArgAdvancement = "advancement"
+  ArgCriterion = "criterion"
+
+type
+  Action* = enum
+    Grant
+    Revoke
+
+  Mode* = enum
+    Only
+    Through
+    From
+    Until
+    Everything
+
+proc performSingleInner(guard: playeradv.PlayerAdvancement; advancement: Advancement; grant: bool): bool =
+  ## `Action::perform_single_inner`.
+  let progress = guard.progress.getMutOrStartProgress(advancement)
+  if grant:
+    if progress.isDone():
+      return false
+    for criterion in progress.getRemainingCriteria():
+      discard guard.award(advancement, criterion)
+    true
+  else:
+    if not progress.isDone():
+      return false
+    for criterion in progress.getCompletedCriteria():
+      discard guard.revoke(advancement, criterion)
+    true
+
+proc installAdvancementHooks*(player: CommandPlayer; guard: playeradv.PlayerAdvancement) =
+  ## Fills `advancementPerform` and `advancementPerformCriterion` from a player's `PlayerAdvancement`.
+  player.advancementPerform = proc(grant: bool; ids: seq[string]; showAdvancement: bool): int32 {.closure.} =
+    # `Action::perform`: with `show_advancement` off, what is pending goes out first and the change goes out quietly.
+    if not showAdvancement:
+      guard.flushDirty(true)
+    var count = 0'i32
+    for id in ids:
+      let found = Advancement.fromMinecraftName(id)
+      if found.isSome and performSingleInner(guard, found.unsafeGet, grant):
+        inc count
+    if not showAdvancement:
+      guard.flushDirty(false)
+    count
+  player.advancementPerformCriterion = proc(grant: bool; id, criterion: string): bool {.closure.} =
+    let found = Advancement.fromMinecraftName(id)
+    if found.isNone:
+      return false
+    if grant: guard.award(found.unsafeGet, criterion) else: guard.revoke(found.unsafeGet, criterion)
+
+proc keyOf(action: Action): string =
+  case action
+  of Grant: "commands.advancement.grant"
+  of Revoke: "commands.advancement.revoke"
+
+proc parents(mode: Mode): bool = mode in {Through, Until, Everything}
+proc children(mode: Mode): bool = mode in {Through, From, Everything}
+
+proc criterionNotFoundError(): CommandErrorType =
+  errorType2(JAVA_COMMANDS_ADVANCEMENT_CRITERIONNOTFOUND, JAVA_COMMANDS_ADVANCEMENT_CRITERIONNOTFOUND)
+
+proc oneToOneError(action: Action): CommandErrorType =
+  case action
+  of Grant: errorType2(JAVA_COMMANDS_ADVANCEMENT_GRANT_ONE_TO_ONE_FAILURE, JAVA_COMMANDS_ADVANCEMENT_GRANT_ONE_TO_ONE_FAILURE)
+  of Revoke: errorType2(JAVA_COMMANDS_ADVANCEMENT_REVOKE_ONE_TO_ONE_FAILURE, JAVA_COMMANDS_ADVANCEMENT_REVOKE_ONE_TO_ONE_FAILURE)
+
+proc oneToManyError(action: Action): CommandErrorType =
+  case action
+  of Grant: errorType2(JAVA_COMMANDS_ADVANCEMENT_GRANT_ONE_TO_MANY_FAILURE, JAVA_COMMANDS_ADVANCEMENT_GRANT_ONE_TO_MANY_FAILURE)
+  of Revoke: errorType2(JAVA_COMMANDS_ADVANCEMENT_REVOKE_ONE_TO_MANY_FAILURE, JAVA_COMMANDS_ADVANCEMENT_REVOKE_ONE_TO_MANY_FAILURE)
+
+proc manyToOneError(action: Action): CommandErrorType =
+  case action
+  of Grant: errorType2(JAVA_COMMANDS_ADVANCEMENT_GRANT_MANY_TO_ONE_FAILURE, JAVA_COMMANDS_ADVANCEMENT_GRANT_MANY_TO_ONE_FAILURE)
+  of Revoke: errorType2(JAVA_COMMANDS_ADVANCEMENT_REVOKE_MANY_TO_ONE_FAILURE, JAVA_COMMANDS_ADVANCEMENT_REVOKE_MANY_TO_ONE_FAILURE)
+
+proc manyToManyError(action: Action): CommandErrorType =
+  case action
+  of Grant: errorType2(JAVA_COMMANDS_ADVANCEMENT_GRANT_MANY_TO_MANY_FAILURE, JAVA_COMMANDS_ADVANCEMENT_GRANT_MANY_TO_MANY_FAILURE)
+  of Revoke: errorType2(JAVA_COMMANDS_ADVANCEMENT_REVOKE_MANY_TO_MANY_FAILURE, JAVA_COMMANDS_ADVANCEMENT_REVOKE_MANY_TO_MANY_FAILURE)
+
+proc criterionToOneError(action: Action): CommandErrorType =
+  case action
+  of Grant: errorType3(JAVA_COMMANDS_ADVANCEMENT_GRANT_CRITERION_TO_ONE_FAILURE, JAVA_COMMANDS_ADVANCEMENT_GRANT_CRITERION_TO_ONE_FAILURE)
+  of Revoke: errorType3(JAVA_COMMANDS_ADVANCEMENT_REVOKE_CRITERION_TO_ONE_FAILURE, JAVA_COMMANDS_ADVANCEMENT_REVOKE_CRITERION_TO_ONE_FAILURE)
+
+proc criterionToManyError(action: Action): CommandErrorType =
+  case action
+  of Grant: errorType3(JAVA_COMMANDS_ADVANCEMENT_GRANT_CRITERION_TO_MANY_FAILURE, JAVA_COMMANDS_ADVANCEMENT_GRANT_CRITERION_TO_MANY_FAILURE)
+  of Revoke: errorType3(JAVA_COMMANDS_ADVANCEMENT_REVOKE_CRITERION_TO_MANY_FAILURE, JAVA_COMMANDS_ADVANCEMENT_REVOKE_CRITERION_TO_MANY_FAILURE)
+
+proc idString(advancement: Advancement): string = advancement.id.namespace & ":" & advancement.id.path
+
+proc addChildren(parent: AdvancementNode; output: var seq[Advancement]) =
+  for child in parent.children:
+    let node = ADVANCEMENT_TREE.nodesVector[child]
+    output.add(node.value)
+    addChildren(node, output)
+
+proc getAdvancements*(target: Advancement; mode: Mode): seq[Advancement] =
+  ## `get_advancements`: the target with its ancestors and/or descendants, ancestors first, as the mode asks.
+  let targetNode = ADVANCEMENT_TREE.getNodeFromId(target.id)
+  if targetNode.isNone:
+    return @[target]
+  result = @[]
+  if mode.parents():
+    var parent = targetNode.unsafeGet.parent
+    while parent.isSome:
+      let current = ADVANCEMENT_TREE.nodesVector[parent.unsafeGet]
+      result.add(current.value)
+      parent = current.parent
+  result.add(target)
+  if mode.children():
+    addChildren(targetNode.unsafeGet, result)
+
+proc perform(context: CommandContext; targets: seq[CommandPlayer]; action: Action; advancements: seq[Advancement];
+             showAdvancement: bool): CmdResult[int32] =
+  var ids: seq[string] = @[]
+  for a in advancements:
+    ids.add(idString(a))
+  var i = 0'i32
+  for player in targets:
+    if player.advancementPerform != nil:
+      i += player.advancementPerform(action == Grant, ids, showAdvancement)
+  if i == 0:
+    if advancements.len == 1:
+      if targets.len == 1:
+        return cmdFail[int32](createWithoutContext(oneToOneError(action), name(advancements[0]), shown(targets[0])))
+      return cmdFail[int32](createWithoutContext(oneToManyError(action), name(advancements[0]), text($targets.len)))
+    if targets.len == 1:
+      return cmdFail[int32](createWithoutContext(manyToOneError(action), text($advancements.len), shown(targets[0])))
+    return cmdFail[int32](createWithoutContext(manyToManyError(action), text($advancements.len), text($targets.len)))
+  let translated =
+    if advancements.len == 1:
+      if targets.len == 1:
+        translate(keyOf(action) & ".one.to.one.success", [name(advancements[0]), shown(targets[0])])
+      else:
+        translate(keyOf(action) & ".one.to.many.success", [name(advancements[0]), text($targets.len)])
+    elif targets.len == 1:
+      translate(keyOf(action) & ".many.to.one.success", [text($advancements.len), shown(targets[0])])
+    else:
+      translate(keyOf(action) & ".many.to.many.success", [text($advancements.len), text($targets.len)])
+  sendFeedback(context.source, translated, true)
+  cmdOk[int32](i)
+
+proc hasCriterion(advancement: Advancement; criterion: string): bool =
+  for c in advancement.criteria:
+    if c == criterion:
+      return true
+  false
+
+proc performCriterion*(context: CommandContext; targets: seq[CommandPlayer]; action: Action; advancement: Advancement;
+                       criterion: string): CmdResult[int32] =
+  if not hasCriterion(advancement, criterion):
+    return cmdFail[int32](createWithoutContext(criterionNotFoundError(), name(advancement), text(criterion)))
+  let id = idString(advancement)
+  var count = 0'i32
+  for player in targets:
+    if player.advancementPerformCriterion != nil and player.advancementPerformCriterion(action == Grant, id, criterion):
+      inc count
+  if count == 0:
+    if targets.len == 1:
+      return cmdFail[int32](createWithoutContext(criterionToOneError(action), text(criterion), name(advancement), shown(targets[0])))
+    return cmdFail[int32](createWithoutContext(criterionToManyError(action), text(criterion), name(advancement), text($targets.len)))
+  let translated =
+    if targets.len == 1:
+      translate(keyOf(action) & ".criterion.to.one.success", [text(criterion), name(advancement), shown(targets[0])])
+    else:
+      translate(keyOf(action) & ".criterion.to.many.success", [text(criterion), name(advancement), text($targets.len)])
+  sendFeedback(context.source, translated, true)
+  cmdOk[int32](count)
+
+proc onlyCriterionExecutor(action: Action): CommandExecutor =
+  ## `OnlyAdvancementCriterionExecutor`.
+  result = proc(context: CommandContext): CmdResult[int32] {.closure.} =
+    let targets = getPlayers(context, ArgTargets)
+    if not targets.isOk:
+      return cmdFail[int32](targets.error)
+    let advancement = getAdvancement(context, ArgAdvancement)
+    if not advancement.isOk:
+      return cmdFail[int32](advancement.error)
+    let criterion = getString(context, ArgCriterion)
+    if not criterion.isOk:
+      return cmdFail[int32](criterion.error)
+    performCriterion(context, targets.value, action, advancement.value, criterion.value)
+
+proc advancementExecutor(action: Action; mode: Mode): CommandExecutor =
+  ## `AdvancementExecutor`: `perform_and_show`.
+  result = proc(context: CommandContext): CmdResult[int32] {.closure.} =
+    let targets = getPlayers(context, ArgTargets)
+    if not targets.isOk:
+      return cmdFail[int32](targets.error)
+    let advancement = getAdvancement(context, ArgAdvancement)
+    if not advancement.isOk:
+      return cmdFail[int32](advancement.error)
+    perform(context, targets.value, action, getAdvancements(advancement.value, mode), true)
+
+proc everyAdvancementExecutor(action: Action): CommandExecutor =
+  ## `EveryAdvancementExecutor`.
+  result = proc(context: CommandContext): CmdResult[int32] {.closure.} =
+    let targets = getPlayers(context, ArgTargets)
+    if not targets.isOk:
+      return cmdFail[int32](targets.error)
+    perform(context, targets.value, action, Advancement.getAdvancementsList(), false)
+
+proc criterionSuggestions(context: CommandContext; builder: SuggestionsBuilder): Suggestions =
+  ## `CriterionSuggestionProvider`: the criteria of the advancement parsed so far.
+  var b = builder
+  let advancement = getAdvancement(context, ArgAdvancement)
+  if advancement.isOk:
+    for c in advancement.value.criteria:
+      b = filterAndSuggestOne(b, c)
+  build(b)
+
+proc buildAction(literalName: string; action: Action): ArgumentBuilder =
+  let advancementArg = proc(): ArgumentBuilder =
+    argument(ArgAdvancement, newResourceKeyArgument(advancementRegistry()))
+  var criterion = executes(argument(ArgCriterion, newStringArgumentType(spGreedyPhrase)), onlyCriterionExecutor(action))
+  criterion = suggests(criterion, criterionSuggestions)
+  let only = then(literal("only"), then(executes(advancementArg(), advancementExecutor(action, Only)), criterion))
+  let fromNode = then(literal("from"), executes(advancementArg(), advancementExecutor(action, From)))
+  let until = then(literal("until"), executes(advancementArg(), advancementExecutor(action, Until)))
+  let through = then(literal("through"), executes(advancementArg(), advancementExecutor(action, Through)))
+  let everything = executes(literal("everything"), everyAdvancementExecutor(action))
+  let targets = then(then(then(then(then(argument(ArgTargets, newEntityArgumentType(eakPlayers)), only), fromNode), until),
+    through), everything)
+  then(literal(literalName), targets)
+
+proc register*(dispatcher: CommandDispatcher; registry: PermissionRegistry) =
+  registerPermissionOrPanic(registry, newPermission(Permission0, Description, permissionOp(Two)))
+  discard register(dispatcher, then(then(requires(command(Name, Description), Permission0),
+    buildAction("grant", Grant)), buildAction("revoke", Revoke)))

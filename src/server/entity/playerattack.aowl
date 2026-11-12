@@ -1,0 +1,147 @@
+## Port of pumpkin/src/entity/player.rs: `attack`, `get_attack_cooldown_progress` and `combat_weapon_durability_cost`.
+## PARTIAL: pumpkin/src/entity/player.rs - `attack` without the `DealtOverkillDamage` advancement (it reaches the advancement
+## manager, which `gPlayerHooks.triggerAdvancement` does not fill yet).
+
+import std/[math, options]
+import ../../data/block_ext
+import "../../data/item_stack/mod"
+import ../../generated/[attributes, damage_type, enchantment, entity_type, sound, sound_category]
+import ../../inventory/player_inventory
+import ../../util/math/boundingbox
+import ../../util/vector3
+import ../item/itembehaviour
+import ../serverbase
+import combat
+import player as playermod
+import entitymod
+import hunger
+
+proc getAttackCooldownProgress*(self: Player; tps, baseTime, attackSpeed: float64): float64 =
+  ## `get_attack_cooldown_progress`
+  let x = float64(self.lastAttackedTicks) + baseTime
+  let progressPerTick = tps / attackSpeed
+  let progress = x / progressPerTick
+  clamp(progress, 0.0'f64, 1.0'f64)
+
+proc combatWeaponDurabilityCost(stack: ItemStack): int32 =
+  ## `combat_weapon_durability_cost`: from the `Weapon` component; an item without one takes no damage in combat.
+  let (has, weapon) = stack.getDataComponent(WeaponImpl)
+  if has: int32(weapon.itemDamagePerAttack) else: 0'i32
+
+proc isUndead(targetType: uint16): bool =
+  targetType == EntityType.ZOMBIE.id or targetType == EntityType.DROWNED.id or targetType == EntityType.HUSK.id or
+    targetType == EntityType.ZOMBIE_VILLAGER.id or targetType == EntityType.ZOMBIFIED_PIGLIN.id or
+    targetType == EntityType.SKELETON.id or targetType == EntityType.BOGGED.id or targetType == EntityType.PARCHED.id or
+    targetType == EntityType.WITHER_SKELETON.id or targetType == EntityType.STRAY.id or
+    targetType == EntityType.PHANTOM.id or targetType == EntityType.WITHER.id or
+    targetType == EntityType.ZOMBIE_HORSE.id or targetType == EntityType.SKELETON_HORSE.id
+
+proc isArthropod(targetType: uint16): bool =
+  targetType == EntityType.SPIDER.id or targetType == EntityType.CAVE_SPIDER.id or
+    targetType == EntityType.SILVERFISH.id or targetType == EntityType.ENDERMITE.id or targetType == EntityType.BEE.id
+
+proc attack*(self: Player; victim: EntityBase) =
+  ## `Player::attack`
+  let world = self.world
+  let server = world.server
+  let victimEntity = victim.entity
+  let selfBase = playerBase(self)
+  let attackerEntity = selfBase.entity
+  let config = server.advancedConfig.pvp
+  let itemStack = self.inventory.heldItem()
+  let baseDamage = mustLiving(selfBase).getAttributeValue(ATTACK_DAMAGE)
+  let baseAttackSpeed = 4.0'f64
+  var damageMultiplier = 1.0'f64
+  var addDamage = 0.0'f64
+  var addSpeed = 0.0'f64
+  var extraEnchDamage = 0.0'f64
+  var knockbackLevel = 0'u32
+  block gather:
+    let (hasModifiers, modifiers) = itemStack.getDataComponent(AttributeModifiersImpl)
+    if hasModifiers:
+      for itemMod in modifiers.attributeModifiers:
+        if itemMod.operation == opAddValue:
+          if itemMod.id == "minecraft:base_attack_damage":
+            addDamage = itemMod.amount
+          elif itemMod.id == "minecraft:base_attack_speed":
+            addSpeed = itemMod.amount
+    let (hasEnchantments, enchantments) = itemStack.getDataComponent(EnchantmentsImpl)
+    if hasEnchantments:
+      for entry in enchantments.enchantment:
+        let level = entry.level
+        let id = entry.enchantment.id
+        if id == Enchantment.SHARPNESS.id:
+          extraEnchDamage += 0.5'f64 * float64(level) + 0.5'f64
+        elif id == Enchantment.SMITE.id:
+          if isUndead(victimEntity.entityType.id):
+            extraEnchDamage += 2.5'f64 * float64(level)
+        elif id == Enchantment.BANE_OF_ARTHROPODS.id:
+          if isArthropod(victimEntity.entityType.id):
+            extraEnchDamage += 2.5'f64 * float64(level)
+        elif id == Enchantment.KNOCKBACK.id:
+          knockbackLevel = uint32(level)
+  let attackSpeed = baseAttackSpeed + addSpeed
+  let attackCooldownProgress = self.getAttackCooldownProgress(float64(server.basicConfig.tps), 0.5'f64, attackSpeed)
+  self.lastAttackedTicks = 0'u32
+  # Only reduce attack damage if in cooldown
+  # TODO upstream: Enchantments are reduced in the same way, just without the square.
+  if attackCooldownProgress < 1.0'f64:
+    damageMultiplier = mulAdd(attackCooldownProgress * attackCooldownProgress, 0.8'f64, 0.2'f64)
+  # Modify the added damage based on the multiplier.
+  var damage = baseDamage + addDamage * damageMultiplier
+  damage += extraEnchDamage * attackCooldownProgress
+  let strength = mustLiving(selfBase).getEffect(StatusEffect.STRENGTH)
+  if strength.isSome:
+    damage += 3.0'f64 * (float64(strength.unsafeGet.amplifier) + 1.0'f64)
+  let weakness = mustLiving(selfBase).getEffect(StatusEffect.WEAKNESS)
+  if weakness.isSome:
+    damage -= 4.0'f64 * (float64(weakness.unsafeGet.amplifier) + 1.0'f64)
+  damage = max(damage, 0.0'f64)
+
+  let pos = victimEntity.pos
+  let attackType = newAttackType(self, float32(attackCooldownProgress))
+  if attackType == atCritical:
+    damage *= 1.5'f64
+  let isMaceSmash = attackType == atMaceSmash
+  if isMaceSmash:
+    damage += 1.5'f64 * float64(self.fallDistance)
+  if not victim.damageWithContext(victim, float32(damage), (if isMaceSmash: MACE_SMASH else: PLAYER_ATTACK),
+      none[Vector3[float64]](), selfBase, selfBase):
+    world.playSound(sdEntityPlayerAttackNodamage, scPlayers, attackerEntity.pos)
+    return
+  # `DealtOverkillDamage` (damage >= 100.0): see the PARTIAL line.
+  let (hasEnchantments, enchantments) = itemStack.getDataComponent(EnchantmentsImpl)
+  if hasEnchantments:
+    for entry in enchantments.enchantment:
+      if entry.enchantment.id == Enchantment.FIRE_ASPECT.id:
+        victim.setOnFireForTicks(uint32(entry.level) * 80'u32)
+  if isMaceSmash:
+    let fallDistance = self.fallDistance
+    self.fallDistance = 0.0'f32
+    world.playSound(if fallDistance > 5.0'f32: sdItemMaceSmashGroundHeavy else: sdItemMaceSmashGround, scPlayers, pos)
+  playerAttackSound(pos, world, attackType)
+  mustLiving(selfBase).lastAttackingId = victimEntity.entityId
+  mustLiving(selfBase).lastAttackTime = attackerEntity.age
+  if victim.living != nil:
+    var knockbackStrength = 1.0'f64 + float64(knockbackLevel)
+    if attackType == atKnockback:
+      knockbackStrength += 1.0'f64
+    elif attackType == atSweeping:
+      spawnSweepParticle(attackerEntity, world, pos)
+      var sweepDamage = 1.0'f32
+      if hasEnchantments:
+        for entry in enchantments.enchantment:
+          if entry.enchantment.id == Enchantment.SWEEPING_EDGE.id:
+            sweepDamage += float32(damage) * (float32(entry.level) / (float32(entry.level) + 1.0'f32))
+      let searchBox = newBoundingBox(Vector3[float64](x: pos.x - 1.0'f64, y: pos.y - 0.5'f64, z: pos.z - 1.0'f64),
+        Vector3[float64](x: pos.x + 1.0'f64, y: pos.y + 0.5'f64, z: pos.z + 1.0'f64))
+      for otherVictim in world.getAllAtBox(searchBox):
+        if otherVictim.entity.entityId != victimEntity.entityId and otherVictim.entity.entityId != attackerEntity.entityId:
+          discard otherVictim.damageWithContext(otherVictim, sweepDamage, PLAYER_ATTACK, none[Vector3[float64]](),
+            selfBase, selfBase)
+    if config.knockback:
+      handleKnockback(attackerEntity, victim, knockbackStrength)
+  discard self.damageHeldItem(combatWeaponDurabilityCost(itemStack))
+  syncToPlayer(selfBase)
+  # Vanilla `Player#attack` ends the successful-hit branch with `causeFoodExhaustion(0.1F)`. Only landed hits exhaust.
+  playermod.addExhaustion(self, 0.1'f32)

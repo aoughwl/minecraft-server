@@ -1,7 +1,8 @@
 ## Port of pumpkin/src/server/mod.rs
 ## PARTIAL: pumpkin/src/server/mod.rs - construction from a save, all three dimensions, `add_player`, `remove_player`, lookups, counts, branding, status, `decrypt`, `digest_secret` and the tick, with the tick-rate manager, recipe manager, key store and `data/`. No plugin manager, command dispatcher (held back by the compiler fix), block or item registries, advancement manager or listing. The types are in serverbase.aowl.
 
-import std/[options, syncio]
+import std/[options, syncio, tables]
+import ../generated/statistic
 import ../generated/translation as tr
 import ../protocol/proto
 import ../util/text/text
@@ -23,7 +24,10 @@ import entity/player as playermod
 import world/worldmod
 import "block/worldhooks"
 import commandbridge
-import ../plugin/pluginmgr
+import advancementglue
+import world/dragon_fight_world
+import ../plugin/[pluginmgr, pluginhooks]
+import net/java/javamod
 
 type
   ServerLoadResult* = object
@@ -80,11 +84,14 @@ proc loadServer*(basicConfig: BasicConfiguration; advancedConfig: AdvancedConfig
     let (seaLevel, minY) = settingsFor(dim)
     let loaded = loadWorld(level, levelInfo, dim, seaLevel, minY, server)
     installBlockHooks(loaded)
+    discard installDragonFight(loaded)
     server.worlds.add(loaded)
   let java = advancedConfig.networking.java
   if java.onlineMode or java.encryption:
     echo "Creating encryption keys..."
     server.keyStore = newKeyStore()
+  installAdvancements(server)
+  installEndPortalHook()
   installCommands(server)
   startPlugins(server)
   ServerLoadResult(ok: true, server: server, error: "")
@@ -118,9 +125,8 @@ proc getStatus*(self: Server): StatusResponse =
   buildStatusResponse(self.advancedConfig.networking.java.motd,
     self.advancedConfig.networking.java.maxPlayers, uint32(self.getPlayerCount()), self.favicon, sample)
 
-proc canNotJoin*(self: Server; profile: GameProfile): Option[TextComponent] =
-  ## `can_not_join` from pumpkin/src/net/mod.rs. The banned-ip half needs the client's address, which `tryAccept` does not
-  ## keep yet: see ../net/winsock.aowl.
+proc canNotJoin*(self: Server; profile: GameProfile; address: string): Option[TextComponent] =
+  ## `can_not_join` from pumpkin/src/net/mod.rs; `address` is the client's IP as text (`JavaClient.peerIp`).
   let banned = self.data.bannedPlayerList.getEntry(profile.id)
   if banned.isSome:
     let entry = banned.unsafeGet
@@ -133,6 +139,15 @@ proc canNotJoin*(self: Server; profile: GameProfile): Option[TextComponent] =
   if self.basicConfig.whiteList:
     if self.data.operatorConfig.getEntry(profile.id).isNone and not self.data.whitelistConfig.isWhitelisted(profile.id):
       return some(translateCross(tr.JAVA_MULTIPLAYER_DISCONNECT_NOT_WHITELISTED, tr.JAVA_MULTIPLAYER_DISCONNECT_NOT_WHITELISTED))
+  let bannedIp = self.data.bannedIpList.getEntry(address)
+  if bannedIp.isSome:
+    let entry = bannedIp.unsafeGet
+    let reason = translateCross(tr.JAVA_MULTIPLAYER_DISCONNECT_BANNED_IP_REASON,
+      tr.JAVA_MULTIPLAYER_DISCONNECT_BANNED_IP_REASON, [text(entry.reason)])
+    if entry.expires != NoExpiry:
+      return some(reason.addChild(translateCross(tr.JAVA_MULTIPLAYER_DISCONNECT_BANNED_IP_EXPIRATION,
+        tr.JAVA_MULTIPLAYER_DISCONNECT_BANNED_IP_EXPIRATION, [text(formatBanDate(entry.expires))])))
+    return some(reason)
   none[TextComponent]()
 
 proc getWorldFromDimension*(self: Server; dimension: Dimension): World =
@@ -159,7 +174,13 @@ proc addPlayer*(self: Server; client: JavaClient; profile: GameProfile; config: 
   let player = newPlayer(client, profile, config, world, self, self.basicConfig.defaultGamemode, entityId)
   if loaded.isSome:
     player.readNbt(loaded.unsafeGet)
+  joinAdvancements(self, player)
   player.screenHandlerSyncHandler.storePlayer(player.asInventoryPlayer())
+  # `PlayerLoginEvent`: a cancel kicks the client with the plugins' message; the player is still added so the disconnect
+  # runs the normal leave path (upstream returns `None` before `add_player`).
+  let (loginCancelled, kickMessage) = gPluginLoginHook(player)
+  if loginCancelled:
+    javamod.kick(client, kickMessage)
   worldmod.addPlayer(world, player)
   firePlayerJoin(player)
   self.data.userCache.upsert(profile.id, profile.name)
@@ -170,7 +191,10 @@ proc removePlayer*(self: Server; player: Player) =
   if player.removed:
     return
   player.removed = true
+  player.incrementCustomStat(csLeaveGame, 1'i32)
   handlePlayerLeave(self, player)
+  saveAdvancementsOnLeave(self, player)
+  gPlayerStats.del(player.entityId)
   firePlayerLeave(player)
   forgetCommandPlayer(player)
   let world = player.world
@@ -196,7 +220,7 @@ proc tickPlayersAndNetwork(self: Server) =
 
 proc tickWorlds(self: Server) =
   ## `tick_worlds`
-  discard self.scheduler.tick(uint64(self.tickCounter))
+  runPluginTasks(self.scheduler.tick(uint64(self.tickCounter)))
   for world in self.worlds:
     worldmod.tick(world, self)
   tickPlayerData(self)
@@ -220,6 +244,7 @@ proc pumpChunkSystems*(self: Server; maxGenerationTasks: int): bool =
 proc shutdown*(self: Server) =
   ## `Server::shutdown`: saves the players, the chunks and the level's data.
   saveAllPlayers(self)
+  discard saveAllAdvancements(self)
   for world in self.worlds:
     worldmod.shutdown(world)
   var info = self.worlds[0].levelInfo

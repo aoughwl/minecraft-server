@@ -1,5 +1,5 @@
 ## Port of pumpkin/src/world/mod.rs
-## PARTIAL: pumpkin/src/world/mod.rs - players, blocks and chunks: broadcasts, `tick`, `tick_environment`, `spawn_java_player`, `respawn_player`, `remove_player`, block get and set, `set_block_breaking`, `break_block`, `flush_block_updates`, active chunks, tick data. Missing, because what they call is a later batch: entities, block entities, block and fluid behaviour (`tick_chunks` computes the ticks and random ticks and has nobody to hand them to, `on_placed` and neighbour updates are the hook `blockHooks` below), sounds, particles, the dragon fight (dragon_fight.rs is not ported), explosions' block side, and the commands packet, an empty tree (src/command has no wire form yet). Ported since: `teleport_world` (below), the portal search and spawning hooks (`gNaturalSpawnHook`, natural_spawner.aowl; world/portal/), and a block's drops (`block::drop_loot`, loot.aowl and lootbridge.aowl through `dropLoot0`). Still missing here: statistics and advancement hooks of the death path, `respawn_player`'s bed and anchor points, `get_heightmap_height`'s world method, `PlayerChangeWorldEvent`. See ../block/block_place.aowl for `place_block`.
+## PARTIAL: pumpkin/src/world/mod.rs - players, blocks and chunks: broadcasts, `tick`, `tick_environment`, `spawn_java_player`, `respawn_player`, `remove_player`, block get and set, `set_block_breaking`, `break_block`, `flush_block_updates`, active chunks, tick data. Missing, because what they call is a later batch: entities, block entities, block and fluid behaviour (`tick_chunks` computes the ticks and random ticks and has nobody to hand them to, `on_placed` and neighbour updates are the hook `blockHooks` below), sounds, particles, the dragon fight (dragon_fight.rs is not ported), explosions' block side, and the commands packet, an empty tree (src/command has no wire form yet). Ported since: the night skip (`should_skip_night`, in `tick_environment`), `set_time_of_day`, `set_raining`, `set_thundering`, `get_players_by_pos`, `teleport_world` (below), the portal search and spawning hooks (`gNaturalSpawnHook`, natural_spawner.aowl; world/portal/), and a block's drops (`block::drop_loot`, loot.aowl and lootbridge.aowl through `dropLoot0`). Still missing here: statistics and advancement hooks of the death path, `respawn_player`'s bed and anchor points, `get_heightmap_height`'s world method, `PlayerChangeWorldEvent`. See ../block/block_place.aowl for `place_block`.
 ##
 ## The types are in ../serverbase.aowl.
 ##
@@ -19,6 +19,7 @@ import ../../protocol/java/client/play/[login, player_spawn_data, ticking_state,
   multi_block_update, block_destroy_stage, worldevent, set_equipment, respawn, entity_metadata, block_event,
   player_chat_message, update_entity_pos, update_entity_pos_rot, update_entity_rot, head_rot, entity_position_sync]
 import ../../protocol/java/client/play/player_info_update except Player
+import ../../protocol/java/client/play/[recipe_book_add, recipe_book_settings]
 import ../../protocol/itemstackserializer
 import ../../command/[client_suggestions, cmdsource]
 import ../../generated/translation as tr
@@ -38,6 +39,7 @@ import ../../world/chunk_system/chunk_system
 import ../../world/poi
 import ../serverbase
 import ../entity/player as playermod
+import ../../plugin/pluginhooks
 import ../net/winsock
 import "../block/blockbehaviour" as blockbehaviour
 import "../block/worldadapter"
@@ -386,6 +388,11 @@ proc finishJoin(self: World; player: Player; server: Server; position: Vector3[f
     if p.gameprofile.id != player.gameprofile.id:
       others.add(PlayerInfoEntry(uuid: p.gameprofile.id, actions: playerActionsFor(p, false)))
   client.writePacketFor(CPlayerInfoUpdate(actions: TabListFlags, players: others))
+  # The display names the others have set (upstream sends them after the five actions).
+  for p in self.players:
+    if p.gameprofile.id != player.gameprofile.id and p.tabListName.isSome:
+      client.writePacketFor(CPlayerInfoUpdate(actions: PlayerInfoUpdateDisplayName, players: @[PlayerInfoEntry(
+        uuid: p.gameprofile.id, actions: @[PlayerAction(kind: paUpdateDisplayName, displayName: p.tabListName)])]))
 
   # Spawn the player for every client.
   self.broadcastPacketExcept(player.gameprofile.id, spawnEntityPacket(player))
@@ -433,6 +440,11 @@ proc finishJoin(self: World; player: Player; server: Server; position: Vector3[f
   # `send_player_equipment`
   self.broadcastToChunkExcept(player.chunkPos, player.gameprofile.id, equipmentPacket(player))
 
+  # `advanced_config.recipe.send_recipes`
+  if server.advancedConfig.recipe.sendRecipes:
+    client.writePacketFor(CRecipeBookSettings.defaultClosed())
+    client.writePacketFor(CRecipeBookAdd(replace: true, dynamicRecipes: server.recipeManager.dynamicRecipes))
+
   let msgComp = translateCross(tr.JAVA_MULTIPLAYER_PLAYER_JOINED, tr.BEDROCK_MULTIPLAYER_PLAYER_JOINED,
     [text(player.gameprofile.name)]).colorNamed(ncYellow)
   self.broadcastSystemMessage(msgComp, false)
@@ -461,6 +473,10 @@ proc finishRespawn(self: World; player: Player; position: Vector3[float64]; yaw,
   self.sendWorldInfo(player, position, yaw, pitch)
   sendCenterChunk(player.client, centerChunk)
   player.requestTeleport(position, yaw, pitch)
+  # The client forgot its entities with the `Respawn` packet.
+  let joinedHook = self.playerJoinedHook
+  if joinedHook != nil:
+    joinedHook(player)
 
 proc continueSpawn*(self: World; player: Player; server: Server) =
   ## Runs the rest of a join or respawn when the chunk under the player has arrived, or the wait has gone on too long.
@@ -488,35 +504,81 @@ proc continueSpawn*(self: World; player: Player; server: Server) =
   else:
     self.finishJoin(player, server, position, pending.yaw, pending.pitch, chunk)
 
+type
+  CalculatedRespawnPoint* = object
+    ## `CalculatedRespawnPoint` in entity/player.rs.
+    position*: Vector3[float64]
+    yaw*: float32
+    pitch*: float32
+    dimension*: Dimension
+
+var gCalculateRespawnHook*: proc(world: World; player: Player): Option[CalculatedRespawnPoint] {.closure.} =
+  proc(world: World; player: Player): Option[CalculatedRespawnPoint] {.closure.} = none[CalculatedRespawnPoint]()
+  ## `Player::calculate_respawn_point`: it reads blocks and the collision of a player-sized box, so entity/respawn.aowl
+  ## (above entitymod) has it and block/worldhooks.aowl sets it.
+var gPlayerRespawnedHook*: proc(world: World; player: Player) {.closure.} =
+  proc(world: World; player: Player) {.closure.} = discard
+  ## `LivingEntity::reset_state` and the breath manager's reset, on the entity half of a player. worldhooks.aowl sets it.
+
 proc respawnPlayer*(self: World; player: Player; alive: bool) =
-  ## `respawn_player`, for this world's spawn: bed and anchor points (`calculate_respawn_point`) and the cross-dimension
-  ## transfer need sleeping and portals, a later batch.
+  ## `respawn_player`: a bed or an anchor (`calculate_respawn_point`), else the world spawn. A respawn point in another
+  ## dimension moves the player to that dimension's world first (upstream's cross-dimension transfer, without the plugin
+  ## `PlayerChangeWorldEvent`); with no world for the dimension it falls back to this world's spawn.
   let lastPos = player.lastPos
   let deathDimension = player.world.dimension.minecraftName
   let deathLocation = newBlockPos(int32(round(lastPos.x)), int32(round(lastPos.y)), int32(round(lastPos.z)))
   let info = self.levelInfo
-  player.client.writePacketFor(newCGameEvent(geNoRespawnBlockAvailable, 0.0'f32))
+  var at = Vector3[float64](x: float64(info.spawnX) + 0.5, y: float64(info.spawnY), z: float64(info.spawnZ) + 0.5)
+  var yaw = info.spawnYaw
+  var pitch = info.spawnPitch
+  var needsTopBlock = true
+  var target = self
+  let calculated = gCalculateRespawnHook(self, player)
+  if calculated.isSome:
+    let wanted = calculated.unsafeGet
+    if wanted.dimension.minecraftName == self.dimension.minecraftName:
+      at = wanted.position
+      yaw = wanted.yaw
+      pitch = wanted.pitch
+      needsTopBlock = false
+    else:
+      for candidate in self.server.worlds:
+        if candidate.dimension.minecraftName == wanted.dimension.minecraftName:
+          target = candidate
+      if target != self:
+        # Detach from the old world before publishing into the new one.
+        self.removePlayer(player, false)
+        player.unloadWatchedChunks(self)
+        player.chunkManager.changeWorld(self.level, target.level)
+        player.world = target
+        target.players.add(player)
+        at = wanted.position
+        yaw = wanted.yaw
+        pitch = wanted.pitch
+        needsTopBlock = false
+  else:
+    player.client.writePacketFor(newCGameEvent(geNoRespawnBlockAvailable, 0.0'f32))
 
   player.client.writePacketFor(CRespawn(playerSpawnInfo: PlayerSpawnData(
-    dimension: self.dimension,
-    hashedSeed: hashSeed(self.level.seed),
+    dimension: target.dimension,
+    hashedSeed: hashSeed(target.level.seed),
     gameMode: uint8(ord(player.gamemode)),
     previousGamemode: int8(ord(player.gamemode)),
     debug: false,
     isFlat: false,
     deathDimensionName: some((deathDimension, deathLocation)),
     portalCooldown: newVarInt(0'i32),
-    sealevel: newVarInt(self.seaLevel)), dataKept: if alive: 1'u8 else: 0'u8))
+    sealevel: newVarInt(target.seaLevel)), dataKept: if alive: 1'u8 else: 0'u8))
 
-  let at = Vector3[float64](x: float64(info.spawnX) + 0.5, y: float64(info.spawnY), z: float64(info.spawnZ) + 0.5)
-  player.client.writePacketFor(CPlayerSpawnPosition(dimensionName: self.dimension.minecraftName,
-    location: newBlockPos(info.spawnX, info.spawnY, info.spawnZ), yaw: info.spawnYaw, pitch: info.spawnPitch))
+  player.client.writePacketFor(CPlayerSpawnPosition(dimensionName: target.dimension.minecraftName,
+    location: newBlockPos(int32(round(at.x)), int32(round(at.y)), int32(round(at.z))), yaw: yaw, pitch: pitch))
 
   # `LivingEntity::reset_state` and what follows it.
   player.health = player.maxHealth
   player.absorption = 0.0'f32
   player.dead = false
   player.fallDistance = 0.0'f32
+  gPlayerRespawnedHook(target, player)
   player.sendPermissionLvlUpdate()
   player.hungerManager = HungerManager(level: 20'u8, saturation: 5.0'f32, exhaustion: 0.0'f32, tickTimer: 0'u32)
   if not info.gameRules.keepInventory:
@@ -525,16 +587,20 @@ proc respawnPlayer*(self: World; player: Player; alive: bool) =
     player.experienceProgress = 0.0'f32
     Inventory(player.inventory).clear()
 
-  self.requestSpawnChunk(player, at, info.spawnYaw, info.spawnPitch, true, true)
+  target.requestSpawnChunk(player, at, yaw, pitch, needsTopBlock, true)
 
-proc teleportWorld*(self: World; player: Player; position: Vector3[float64]; yaw, pitch: Option[float32]) =
+proc teleportWorld*(self: World; player: Player; position0: Vector3[float64]; yaw0, pitch0: Option[float32]) =
   ## `Player::teleport_world`: `self` is the world the player goes to. The removal from the old world, the chunk manager's
   ## change of level and the `Respawn` with all data kept run here; the rest (spawn chunk, world info, the teleport)
   ## is `finishRespawn`, when the chunk under the player has arrived. Upstream's `PlayerChangeWorldEvent` and the
   ## `EnterDimension` advancement trigger are the plugin and advancement managers' (not ported).
   let currentWorld = player.world
-  let yawV = if yaw.isSome: yaw.unsafeGet else: self.levelInfo.spawnYaw
-  let pitchV = if pitch.isSome: pitch.unsafeGet else: self.levelInfo.spawnPitch
+  let yaw1 = if yaw0.isSome: yaw0.unsafeGet else: self.levelInfo.spawnYaw
+  let pitch1 = if pitch0.isSome: pitch0.unsafeGet else: self.levelInfo.spawnPitch
+  # `PlayerChangeWorldEvent`: a cancel leaves the player where it is, the plugins may move the target.
+  let (worldCancelled, position, yawV, pitchV) = gPluginChangeWorldHook(player, currentWorld, self, position0, yaw1, pitch1)
+  if worldCancelled:
+    return
   player.setClientLoaded(false)
   currentWorld.removePlayer(player, false)
   self.players.add(player)
@@ -599,6 +665,50 @@ proc updateActiveChunks*(self: World) =
       active.add(pos)
   self.activeChunks = active
 
+proc getTimeOfDay*(self: World): int64 = self.levelTime.timeOfDay
+
+proc setTimeOfDay*(self: World; time: int64) =
+  ## `set_time_of_day`
+  self.levelTime.setTime(time)
+  self.levelTime.sendTime(self)
+
+proc setRaining*(self: World; raining: bool) =
+  ## `set_raining`
+  if self.weather.raining != raining:
+    var w = self.weather
+    let thunder = w.thundering
+    w.setWeatherParameters(self, 0'i32, 0'i32, raining, thunder)
+    self.weather = w
+
+proc setThundering*(self: World; thundering: bool) =
+  ## `set_thundering`
+  if self.weather.thundering != thundering:
+    var w = self.weather
+    let rain = w.raining
+    w.setWeatherParameters(self, 0'i32, 0'i32, rain, thundering)
+    self.weather = w
+
+proc getPlayersByPos*(self: World; position: BlockPos): seq[Player] =
+  ## `get_players_by_pos`: the players standing in that block.
+  result = @[]
+  for p in self.players:
+    let b = flooredV(p.pos)
+    if b.vec.x == position.vec.x and b.vec.y == position.vec.y and b.vec.z == position.vec.z:
+      result.add(p)
+
+proc shouldSkipNight*(self: World): bool =
+  ## `should_skip_night`: enough players have slept for 100 ticks.
+  let playerCount = self.players.len
+  if playerCount == 0:
+    return false
+  var sleeping = 0
+  for p in self.players:
+    if p.sleepingSince >= 100'i32:
+      inc sleeping
+  let pct = max(0'i64, min(100'i64, self.levelInfo.gameRules.playersSleepingPercentage))
+  let required = max(1, int(ceil(float64(playerCount) * float64(pct) / 100.0'f64)))
+  sleeping >= required
+
 proc tickEnvironment*(self: World) =
   ## `tick_environment`
   let rules = self.levelInfo.gameRules
@@ -618,12 +728,23 @@ proc tickEnvironment*(self: World) =
     if worldAge mod int64(theLevel.autosaveTicks) == 0'i64:
       theLevel.shouldSave = true
 
+  let isNight = self.levelTime.isNight()
+  let timeOfDay = self.levelTime.timeOfDay
+
   var weather0 = self.weather
   weather0.tickWeather(self)
-  self.weather = weather0
 
-  if worldAge mod 20'i64 == 0'i64:
+  if self.shouldSkipNight() and isNight:
+    let time = timeOfDay + 24000'i64
+    self.levelTime.setTime(time - time mod 24000'i64)
     self.levelTime.sendTime(self)
+    for player in self.players:
+      playermod.gWakeUpHook(player)
+    if weather0.weatherCycleEnabled and (weather0.raining or weather0.thundering):
+      weather0.resetWeatherCycle(self)
+  elif worldAge mod 20'i64 == 0'i64:
+    self.levelTime.sendTime(self)
+  self.weather = weather0
 
 var gNaturalSpawnHook*: proc(world: World) {.closure.} = proc(world: World) {.closure.} = discard
 var gPlayerEntityTickHook*: proc(world: World; player: Player; server: Server) {.closure.} =
@@ -689,6 +810,9 @@ proc tick*(self: World; server: Server) =
 
 proc shutdown*(self: World) =
   ## `shutdown`: saves what the chunk system holds.
+  let shutdownHook = self.shutdownHook
+  if shutdownHook != nil:
+    shutdownHook()
   self.saveBlockEntities()
   discard self.portalPoi.saveAll()
   discard shutdown(self.level)

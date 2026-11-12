@@ -1,0 +1,673 @@
+## Port of pumpkin-world/src/generation/feature/features/sculk_patch.rs, sculk/mod.rs, sculk/spreader.rs, sculk/vein.rs and
+## sculk/growth.rs of the newer checkout (../ref/pumpkin), which has the full charge-cursor spreader the pinned tree's
+## sculk_patch.rs only approximates (the pinned tree's `SculkPatchFeature` is a 389-line single-pass loop).
+##
+## `SculkLevel` is the generation cache here: upstream's blanket `impl<T: GenerationCache> SculkLevel for T`, whose
+## `sculk_get` always answers. `ProtoChunkSculkView` and `generate_in_proto_chunk` are not ported: nothing in the pipeline
+## calls them (every feature runs through a `GenerationCache`), and they are the bounds-aware variant of the same code.
+## `MockSculkLevel` (`#[cfg(test)]`) becomes sculktest.aowl's own tiny world.
+
+{.feature: "lenientnils".}
+
+import std/[math, tables]
+import ../../../../generated/tag
+import ../types
+import ../common
+
+let
+  TagSculkReplaceable = blockTag("sculk_replaceable")
+  TagSculkReplaceableWorldGen = blockTag("sculk_replaceable_world_gen")
+  BSculk = blockIdOfName("sculk")
+  BSculkVein = blockIdOfName("sculk_vein")
+  BSculkCatalyst = blockIdOfName("sculk_catalyst")
+  BSculkShrieker = blockIdOfName("sculk_shrieker")
+  BSculkSensor = blockIdOfName("sculk_sensor")
+  BMovingPiston = blockIdOfName("moving_piston")
+  BFire = blockIdOfName("fire")
+
+const
+  MaxCursors* = 32
+  MaxCharge* = 1000'u16
+  MaxCursorDistance = 1024'i32
+  WorldGenRadiusSq = 225'i64
+  GrowthCheckRadius = 4'i32
+  GrowthCheckHeight = 2'i32
+  MaxNearbyGrowths = 2'i32
+
+  NonCornerNeighbours*: array[18, tuple[x, y, z: int32]] = [
+    # Face-adjacent
+    (x: -1'i32, y: 0'i32, z: 0'i32), (x: 1'i32, y: 0'i32, z: 0'i32), (x: 0'i32, y: -1'i32, z: 0'i32),
+    (x: 0'i32, y: 1'i32, z: 0'i32), (x: 0'i32, y: 0'i32, z: -1'i32), (x: 0'i32, y: 0'i32, z: 1'i32),
+    # Edge-adjacent (same Y plane)
+    (x: -1'i32, y: 0'i32, z: -1'i32), (x: -1'i32, y: 0'i32, z: 1'i32),
+    (x: 1'i32, y: 0'i32, z: -1'i32), (x: 1'i32, y: 0'i32, z: 1'i32),
+    # Edge-adjacent (vertical X)
+    (x: -1'i32, y: -1'i32, z: 0'i32), (x: -1'i32, y: 1'i32, z: 0'i32),
+    (x: 1'i32, y: -1'i32, z: 0'i32), (x: 1'i32, y: 1'i32, z: 0'i32),
+    # Edge-adjacent (vertical Z)
+    (x: 0'i32, y: -1'i32, z: -1'i32), (x: 0'i32, y: -1'i32, z: 1'i32),
+    (x: 0'i32, y: 1'i32, z: -1'i32), (x: 0'i32, y: 1'i32, z: 1'i32)]
+    ## The 18 non-corner neighbours of a block, in upstream's order (the shuffle in `valid_movement_position` depends on it).
+
+type
+  SpreadType* = enum
+    stSamePosition
+    stSamePlane
+    stWrapAround
+
+  SpreaderConfig* = object
+    isWorldGeneration*: bool
+    growthSpawnCost*: int32
+    noGrowthRadius*: int32
+    chargeDecayRate*: int32
+    additionalDecayRate*: int32
+    replaceableWorldGen*: bool
+
+  ChargeCursor* = object
+    pos*: BlockPos
+    charge*: uint16
+    updateDelay*: uint8
+    decayDelay*: uint8
+    hasFaces*: bool   ## `faces.is_some()`
+    faces*: uint8     ## One bit per `BlockDirection::to_index`.
+
+  SculkSpreader* = object
+    isWorldGeneration*: bool
+    replaceableTagWorldGen*: bool
+    growthSpawnCost*: int32
+    noGrowthRadius*: int32
+    chargeDecayRate*: int32
+    additionalDecayRate*: int32
+    cursors*: seq[ChargeCursor]
+
+const DefaultSpreadOrder* = [stSamePosition, stSamePlane, stWrapAround]
+
+proc dirName(d: BlockDirection): string =
+  case d
+  of BlockDirection.Up: "up"
+  of BlockDirection.Down: "down"
+  of BlockDirection.North: "north"
+  of BlockDirection.South: "south"
+  of BlockDirection.West: "west"
+  of BlockDirection.East: "east"
+
+proc isSculkBehaviour*(id: int): bool =
+  ## `is_sculk_behaviour`: sculk and sculk veins only.
+  id == BSculk or id == BSculkVein
+
+proc isSculkReplaceable*(id: int): bool =
+  hasTag(uint16(id), TagSculkReplaceable)
+
+proc isSculkReplaceableWorldGen*(id: int): bool =
+  hasTag(uint16(id), TagSculkReplaceableWorldGen)
+
+# --- the level (upstream's blanket `impl SculkLevel for T: GenerationCache`) ---------------------------------------------
+
+proc sculkIsAir(c: FeatureContext, p: BlockPos): bool {.inline.} =
+  isAir(getState(c, p))
+
+proc sculkIsWaterSource(c: FeatureContext, p: BlockPos): bool =
+  let (fluid, fs) = fluidOf(c.chunk, p.vec)
+  fluid.name == "water" and fs.isSource
+
+proc sculkIsWater(c: FeatureContext, p: BlockPos): bool =
+  let (fluid, fs) = fluidOf(c.chunk, p.vec)
+  discard fs
+  fluid.name == "water"
+
+proc sculkIsFaceSturdy(c: FeatureContext, p: BlockPos, face: BlockDirection): bool {.inline.} =
+  sideSolid(getState(c, p), face)
+
+proc sculkIsFullCube(c: FeatureContext, p: BlockPos): bool {.inline.} =
+  isFullCube(getState(c, p))
+
+proc canSpreadFrom*(c: FeatureContext, p: BlockPos): bool =
+  ## `can_spread_from`
+  let state = getState(c, p)
+  let blockId = blockIdOf(state)
+  if isSculkBehaviour(blockId):
+    return true
+  # Only air or an actual water block holding a source qualifies; a waterlogged non-water block does not.
+  if not (sculkIsAir(c, p) or (blockId == BWater and sculkIsWaterSource(c, p))):
+    return false
+  # Position is air or water source: it needs a full-cube neighbour.
+  for dir in AllDirections:
+    if sculkIsFullCube(c, offset(p, dir)):
+      return true
+  false
+
+proc shriekerState*(canSummon: bool): BlockStateId =
+  ## `shrieker_state`
+  withProp(defaultStateOf(BSculkShrieker), "can_summon", boolStr(canSummon))
+
+# --- vein rules (sculk/vein.rs) -------------------------------------------------------------------------------------
+
+proc spreadPos(t: SpreadType, p: BlockPos, spreadDirection, fromFace: BlockDirection): (BlockPos, BlockDirection) =
+  ## `SpreadType::spread_pos`
+  case t
+  of stSamePosition: (p, spreadDirection)
+  of stSamePlane: (offset(p, spreadDirection), fromFace)
+  of stWrapAround: (offset(offset(p, spreadDirection), fromFace), opposite(spreadDirection))
+
+proc veinHasFace*(state: BlockStateId, face: BlockDirection): bool =
+  ## `VeinRules::has_face`
+  if blockIdOf(state) != BSculkVein:
+    return false
+  propValue(state, dirName(face)) == "true"
+
+proc veinHasAnyFace(state: BlockStateId): bool =
+  for dir in AllDirections:
+    if veinHasFace(state, dir):
+      return true
+  false
+
+proc withFace(state: BlockStateId, face: BlockDirection, value: bool): BlockStateId =
+  withProp(state, dirName(face), boolStr(value))
+
+proc withWaterlogged(state: BlockStateId, value: bool): BlockStateId =
+  withProp(state, "waterlogged", boolStr(value))
+
+proc canAttachTo(c: FeatureContext, p: BlockPos, face: BlockDirection): bool =
+  sculkIsFaceSturdy(c, offset(p, face), opposite(face))
+
+proc stateHasWater(c: FeatureContext, state: BlockStateId, p: BlockPos): bool =
+  let id = blockIdOf(state)
+  if id == BWater:
+    sculkIsWater(c, p)
+  elif id == BSculkVein:
+    propValue(state, "waterlogged") == "true"
+  else:
+    false
+
+proc stateIsAirOrWater(c: FeatureContext, state: BlockStateId, p: BlockPos): bool =
+  isAir(state) or stateHasWater(c, state, p)
+
+proc oldStateIsWaterSource(c: FeatureContext, state: BlockStateId, p: BlockPos): bool =
+  let id = blockIdOf(state)
+  if id == BWater:
+    sculkIsWaterSource(c, p)
+  elif id == BSculkVein:
+    propValue(state, "waterlogged") == "true"
+  else:
+    false
+
+proc canSpreadIntoVein(c: FeatureContext, sourcePos, placementPos: BlockPos, placementFace: BlockDirection): bool =
+  ## `VeinRules::can_spread_into`
+  let existing = getState(c, placementPos)
+  let existingId = blockIdOf(existing)
+  let againstPos = offset(placementPos, placementFace)
+  let againstId = getBlockId(c, againstPos)
+  if againstId == BSculk or againstId == BSculkCatalyst or againstId == BMovingPiston:
+    return false
+  let manhattan = abs(placementPos.vec.x - sourcePos.vec.x) + abs(placementPos.vec.y - sourcePos.vec.y) +
+    abs(placementPos.vec.z - sourcePos.vec.z)
+  if manhattan == 2:
+    let neighborPos = offset(sourcePos, opposite(placementFace))
+    if sculkIsFaceSturdy(c, neighborPos, placementFace):
+      return false
+  if existingId == BFire:
+    return false
+  if isLiquid(existing) and not (existingId == BWater and sculkIsWater(c, placementPos)):
+    return false
+  isReplaceable(existing) or existingId == BAir or existingId == BSculkVein or
+    (existingId == BWater and sculkIsWaterSource(c, placementPos))
+
+proc stateForPlacement(c: FeatureContext, placementPos: BlockPos, face: BlockDirection, oldState: BlockStateId): (bool, BlockStateId) =
+  ## `VeinRules::get_state_for_placement`; `old_state` is always `Some` for a generation cache.
+  if not canAttachTo(c, placementPos, face):
+    return (false, 0'u32)
+  if blockIdOf(oldState) == BSculkVein and veinHasFace(oldState, face):
+    return (false, 0'u32)
+  var base = if blockIdOf(oldState) == BSculkVein: oldState else: defaultStateOf(BSculkVein)
+  base = withFace(base, face, true)
+  if oldStateIsWaterSource(c, oldState, placementPos):
+    base = withWaterlogged(base, true)
+  (true, base)
+
+proc spreadFromFace(c: FeatureContext, p: BlockPos, sourceState: BlockStateId, fromFace: BlockDirection,
+                    spreadTypes: openArray[SpreadType]): bool =
+  ## `VeinRules::spread_from_face`
+  let isVein = blockIdOf(sourceState) == BSculkVein
+  var any = false
+  for spreadDir in AllDirections:
+    if toAxis(spreadDir) == toAxis(fromFace):
+      continue
+    if isVein and veinHasFace(sourceState, spreadDir):
+      continue
+    for spreadType in spreadTypes:
+      let (targetPos, targetFace) = spreadPos(spreadType, p, spreadDir, fromFace)
+      if canSpreadIntoVein(c, p, targetPos, targetFace):
+        let oldState = getState(c, targetPos)
+        let (ok, placed) = stateForPlacement(c, targetPos, targetFace, oldState)
+        if ok:
+          setState(c, targetPos, placed)
+          any = true
+          break
+  any
+
+proc spreadWithTypes(c: FeatureContext, p: BlockPos, spreadTypes: openArray[SpreadType]): bool =
+  ## `VeinRules::spread_with_types`
+  let sourceState = getState(c, p)
+  var any = false
+  for face in AllDirections:
+    let canSpread = if blockIdOf(sourceState) == BSculkVein: veinHasFace(sourceState, face) else: true
+    if canSpread and spreadFromFace(c, p, sourceState, face, spreadTypes):
+      any = true
+  any
+
+proc spreadAll*(c: FeatureContext, p: BlockPos): bool =
+  ## `VeinRules::spread_all`
+  spreadWithTypes(c, p, DefaultSpreadOrder)
+
+proc spreadSameSpace(c: FeatureContext, p: BlockPos): bool =
+  spreadWithTypes(c, p, [stSamePosition])
+
+proc onDischarged*(c: FeatureContext, p: BlockPos) =
+  ## `VeinRules::on_discharged`
+  let state = getState(c, p)
+  if blockIdOf(state) != BSculkVein:
+    return
+  var newState = state
+  for dir in AllDirections:
+    if veinHasFace(newState, dir):
+      if getBlockId(c, offset(p, dir)) == BSculk:
+        newState = withFace(newState, dir, false)
+  if not veinHasAnyFace(newState):
+    newState = if sculkIsWater(c, p): SWater else: SAir
+  setState(c, p, newState)
+
+proc hasSubstrateAccess*(c: FeatureContext, state: BlockStateId, p: BlockPos): bool =
+  ## `VeinRules::has_substrate_access`
+  if blockIdOf(state) != BSculkVein:
+    return false
+  for dir in AllDirections:
+    if not veinHasFace(state, dir):
+      continue
+    if isSculkReplaceable(getBlockId(c, offset(p, dir))):
+      return true
+  false
+
+proc regrow(c: FeatureContext, p: BlockPos, faces: openArray[BlockDirection]): bool =
+  ## `VeinRules::regrow`
+  var hasAny = false
+  var newState = defaultStateOf(BSculkVein)
+  for face in faces:
+    if canAttachTo(c, p, face):
+      newState = withFace(newState, face, true)
+      hasAny = true
+  if not hasAny:
+    return false
+  let existing = getState(c, p)
+  if stateHasWater(c, existing, p):
+    newState = withWaterlogged(newState, true)
+  setState(c, p, newState)
+  true
+
+proc attemptSpreadVein(c: FeatureContext, p: BlockPos, state: BlockStateId, hasFaces: bool, facesBits: uint8): bool =
+  ## `VeinRules::attempt_spread_vein`
+  if not hasFaces:
+    return spreadSameSpace(c, p)
+  if facesBits == 0'u8:
+    return spreadAll(c, p)
+  if not stateIsAirOrWater(c, state, p):
+    return false
+  var faces = newSeq[BlockDirection](0)
+  for dir in AllDirections:
+    if (facesBits and (1'u8 shl toIndex(dir))) != 0'u8:
+      faces.add(dir)
+  regrow(c, p, faces)
+
+proc attemptPlaceSculk(c: FeatureContext, p: BlockPos, random: var RandomGenerator, replaceableWorldGen: bool): bool =
+  ## `VeinRules::attempt_place_sculk`
+  let state = getState(c, p)
+  var supportOrder = @AllDirections
+  var i = supportOrder.len - 1
+  while i >= 1:
+    let j = int(nextBoundedI32(random, int32(i + 1)))
+    let a = supportOrder[i]
+    let b = supportOrder[j]
+    supportOrder[i] = b
+    supportOrder[j] = a
+    dec i
+  for support in supportOrder:
+    if not veinHasFace(state, support):
+      continue
+    let supportPos = offset(p, support)
+    let supportId = getBlockId(c, supportPos)
+    let replaceable = if replaceableWorldGen: isSculkReplaceableWorldGen(supportId) else: isSculkReplaceable(supportId)
+    if not replaceable:
+      continue
+    setState(c, supportPos, defaultStateOf(BSculk))
+    discard spreadAll(c, supportPos)
+    let skip = opposite(support)
+    for veinDir in AllDirections:
+      if veinDir == skip:
+        continue
+      let veinPos = offset(supportPos, veinDir)
+      if getBlockId(c, veinPos) == BSculkVein:
+        onDischarged(c, veinPos)
+    return true
+  false
+
+# --- growth rules (sculk/growth.rs) ---------------------------------------------------------------------------------
+
+proc canPlaceGrowth(c: FeatureContext, p: BlockPos): bool =
+  ## `GrowthRules::can_place_growth`
+  let above = p.up()
+  let aboveState = getState(c, above)
+  let aboveId = blockIdOf(aboveState)
+  # The block above must be air, or a water block holding water.
+  if not (isAir(aboveState) or (aboveId == BWater and sculkIsWater(c, above))):
+    return false
+  var growthCount = 0'i32
+  for dx in -GrowthCheckRadius .. GrowthCheckRadius:
+    for dz in -GrowthCheckRadius .. GrowthCheckRadius:
+      for dy in 0'i32 .. GrowthCheckHeight:
+        let id = getBlockId(c, p.add(dx, dy, dz))
+        # Only sculk sensors and shriekers count (exact match: calibrated sensors do not).
+        if id == BSculkSensor or id == BSculkShrieker:
+          inc growthCount
+          if growthCount > MaxNearbyGrowths:
+            return false
+  true
+
+proc randomGrowthState(c: FeatureContext, p: BlockPos, random: var RandomGenerator, isWorldGen: bool): BlockStateId =
+  ## `GrowthRules::random_growth_state`
+  let baseState = if nextBoundedI32(random, 11) == 0: shriekerState(isWorldGen) else: defaultStateOf(BSculkSensor)
+  if sculkIsWater(c, p):
+    return withProp(baseState, "waterlogged", "true")
+  baseState
+
+# --- the spreader (sculk/spreader.rs) -------------------------------------------------------------------------------
+
+proc newCursor*(p: BlockPos, charge: uint16): ChargeCursor =
+  ChargeCursor(pos: p, charge: charge, updateDelay: 0'u8, decayDelay: 1'u8, hasFaces: false, faces: 0'u8)
+
+proc newSpreader(isWorldGeneration, replaceableTagWorldGen: bool, growthSpawnCost, noGrowthRadius, chargeDecayRate,
+                 additionalDecayRate: int32): SculkSpreader =
+  SculkSpreader(isWorldGeneration: isWorldGeneration, replaceableTagWorldGen: replaceableTagWorldGen,
+    growthSpawnCost: growthSpawnCost, noGrowthRadius: noGrowthRadius, chargeDecayRate: chargeDecayRate,
+    additionalDecayRate: additionalDecayRate, cursors: @[])
+
+proc newLevelSpreader*(): SculkSpreader = newSpreader(false, false, 10'i32, 4'i32, 10'i32, 5'i32)
+
+proc newWorldGenSpreader*(): SculkSpreader = newSpreader(true, true, 50'i32, 1'i32, 5'i32, 10'i32)
+
+proc config*(s: SculkSpreader): SpreaderConfig =
+  SpreaderConfig(isWorldGeneration: s.isWorldGeneration, growthSpawnCost: s.growthSpawnCost,
+    noGrowthRadius: s.noGrowthRadius, chargeDecayRate: s.chargeDecayRate,
+    additionalDecayRate: s.additionalDecayRate, replaceableWorldGen: s.replaceableTagWorldGen)
+
+proc addCursor(s: var SculkSpreader, cursor: ChargeCursor) =
+  if s.cursors.len < MaxCursors:
+    s.cursors.add(cursor)
+
+proc addCursors*(s: var SculkSpreader, startPos: BlockPos, charge: int32) =
+  ## `SculkSpreader::add_cursors`
+  var left = charge
+  while left > 0:
+    let current = min(left, int32(MaxCharge))
+    s.addCursor(newCursor(startPos, uint16(current)))
+    left -= current
+
+proc clear*(s: var SculkSpreader) =
+  s.cursors.setLen(0)
+
+proc isCloseToCatalyst(p, originPos: BlockPos, noGrowthRadius: int32): bool =
+  let dx = int64(p.vec.x - originPos.vec.x)
+  let dy = int64(p.vec.y - originPos.vec.y)
+  let dz = int64(p.vec.z - originPos.vec.z)
+  let radius = int64(noGrowthRadius)
+  dx * dx + dy * dy + dz * dz < radius * radius
+
+proc decayPenalty(cfg: SpreaderConfig, p, originPos: BlockPos, charge: int32): int32 =
+  let dx = float64(p.vec.x - originPos.vec.x)
+  let dy = float64(p.vec.y - originPos.vec.y)
+  let dz = float64(p.vec.z - originPos.vec.z)
+  # The distance is computed in double precision, then cast to float before squaring.
+  let distance = sqrt(dx * dx + dy * dy + dz * dz)
+  let diff = float32(distance) - float32(cfg.noGrowthRadius)
+  let outerDistanceSq = diff * diff
+  # `Mth.square(24 - noGrowthRadius)` is an int.
+  let maxReachSq = (24'i32 - cfg.noGrowthRadius) * (24'i32 - cfg.noGrowthRadius)
+  let factor = min(outerDistanceSq / float32(maxReachSq), 1.0'f32)
+  # `(int)(charge * distanceFactor * 0.5F)` truncates toward zero.
+  let penalty = int32(float32(charge) * factor * 0.5'f32)
+  max(penalty, 1'i32)
+
+proc satSub(a: uint16, b: int32): uint16 =
+  ## `u16::saturating_sub` of `b as u16`.
+  let bb = int32(uint16(cast[uint32](b) and 0xFFFF'u32))
+  if int32(a) <= bb: 0'u16 else: uint16(int32(a) - bb)
+
+proc sculkBlockUseCharge(c: FeatureContext, p, originPos: BlockPos, random: var RandomGenerator, cfg: SpreaderConfig,
+                         charge: uint16): uint16 =
+  if charge == 0'u16:
+    return 0'u16
+  # Roll for decay.
+  if nextBoundedI32(random, cfg.chargeDecayRate) != 0:
+    return charge
+  let closeToCatalyst = isCloseToCatalyst(p, originPos, cfg.noGrowthRadius)
+  if not closeToCatalyst and canPlaceGrowth(c, p):
+    let xpPerGrowth = cfg.growthSpawnCost
+    if nextBoundedI32(random, xpPerGrowth) < int32(charge):
+      let growthPos = p.up()
+      let growthState = randomGrowthState(c, growthPos, random, cfg.isWorldGeneration)
+      setState(c, growthPos, growthState)
+    # `Math.max(0, charge - xpPerGrowthSpawn)`
+    return satSub(charge, xpPerGrowth)
+  # No growth: apply additional decay or a small decrement.
+  if nextBoundedI32(random, cfg.additionalDecayRate) != 0:
+    return charge
+  if closeToCatalyst:
+    satSub(charge, 1'i32)
+  else:
+    satSub(charge, decayPenalty(cfg, p, originPos, int32(charge)))
+
+proc attemptUseCharge(cur: ChargeCursor, currentId: int, c: FeatureContext, originPos: BlockPos,
+                      random: var RandomGenerator, cfg: SpreaderConfig, spreadVeins: bool): uint16 =
+  let charge = cur.charge
+  if charge == 0'u16:
+    return 0'u16
+  if currentId == BSculkVein:
+    if spreadVeins and attemptPlaceSculk(c, cur.pos, random, cfg.replaceableWorldGen):
+      return satSub(charge, 1'i32)
+    if nextBoundedI32(random, cfg.chargeDecayRate) == 0:
+      # `Mth.floor(charge * 0.5F)` halves the charge.
+      return charge div 2'u16
+    return charge
+  elif currentId == BSculk:
+    return sculkBlockUseCharge(c, cur.pos, originPos, random, cfg, charge)
+  # Default rule: `decay_delay > 0 ? charge : 0`.
+  if cur.decayDelay > 0'u8: charge else: 0'u16
+
+proc isUnobstructed(c: FeatureContext, fromPos: BlockPos, direction: BlockDirection): bool =
+  let testPos = offset(fromPos, direction)
+  not sculkIsFaceSturdy(c, testPos, opposite(direction))
+
+proc isMovementUnobstructed(c: FeatureContext, fromPos, toPos: BlockPos): bool =
+  let dx = toPos.vec.x - fromPos.vec.x
+  let dy = toPos.vec.y - fromPos.vec.y
+  let dz = toPos.vec.z - fromPos.vec.z
+  # Manhattan distance 1 is always unobstructed.
+  if abs(dx) + abs(dy) + abs(dz) == 1:
+    return true
+  let dirX = if dx < 0: BlockDirection.West else: BlockDirection.East
+  let dirY = if dy < 0: BlockDirection.Down else: BlockDirection.Up
+  let dirZ = if dz < 0: BlockDirection.North else: BlockDirection.South
+  if dx == 0:
+    isUnobstructed(c, fromPos, dirY) or isUnobstructed(c, fromPos, dirZ)
+  elif dy == 0:
+    isUnobstructed(c, fromPos, dirX) or isUnobstructed(c, fromPos, dirZ)
+  else:
+    isUnobstructed(c, fromPos, dirX) or isUnobstructed(c, fromPos, dirY)
+
+proc validMovementPosition(c: FeatureContext, p: BlockPos, random: var RandomGenerator): (bool, BlockPos) =
+  ## `SculkSpreader::valid_movement_position`
+  var found = false
+  var res = p
+  # Shuffle the 18 non-corner neighbours (Fisher-Yates).
+  var order = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17]
+  var i = 17
+  while i >= 1:
+    let j = int(nextBoundedI32(random, int32(i + 1)))
+    let a = order[i]
+    let b = order[j]
+    order[i] = b
+    order[j] = a
+    dec i
+  for idx in order:
+    let o = NonCornerNeighbours[idx]
+    let neighbour = p.add(o.x, o.y, o.z)
+    let state = getState(c, neighbour)
+    if not isSculkBehaviour(blockIdOf(state)):
+      continue
+    if not isMovementUnobstructed(c, p, neighbour):
+      continue
+    # The candidate is overwritten on every valid neighbour and only an early stop on substrate access ends the walk, so
+    # without substrate the LAST valid neighbour wins.
+    found = true
+    res = neighbour
+    if hasSubstrateAccess(c, state, neighbour):
+      break
+  (found, res)
+
+proc availableFaces(state: BlockStateId, id: int): uint8 =
+  if id != BSculkVein:
+    return 0'u8
+  var faces = 0'u8
+  for dir in AllDirections:
+    if veinHasFace(state, dir):
+      faces = faces or (1'u8 shl toIndex(dir))
+  faces
+
+proc updateDecayDelay(current: uint8, isSculk: bool): uint8 =
+  if isSculk: 1'u8
+  elif current > 0'u8: current - 1'u8
+  else: 0'u8
+
+proc update*(cur: var ChargeCursor, c: FeatureContext, originPos: BlockPos, random: var RandomGenerator,
+             cfg: SpreaderConfig, spreadVeins: bool) =
+  ## `ChargeCursor::update`
+  if cur.charge == 0'u16:
+    return
+  if cur.updateDelay > 0'u8:
+    dec cur.updateDelay
+    return
+  var currentState = getState(c, cur.pos)
+  var currentId = blockIdOf(currentState)
+
+  # Attempt vein spreading first. Sculk behaviour blocks use the multiface `spread_all`, every other block switches on
+  # the cursor's facings.
+  if spreadVeins:
+    let spread = if isSculkBehaviour(currentId): spreadAll(c, cur.pos)
+                 else: attemptSpreadVein(c, cur.pos, currentState, cur.hasFaces, cur.faces)
+    # Re-read the state after a successful spread, except for sculk: only sculk never changes state when spread over.
+    if spread and currentId != BSculk:
+      currentState = getState(c, cur.pos)
+      currentId = blockIdOf(currentState)
+
+  cur.charge = attemptUseCharge(cur, currentId, c, originPos, random, cfg, spreadVeins)
+
+  if cur.charge == 0'u16:
+    # On discharge only sculk veins remove faces.
+    if currentId == BSculkVein:
+      onDischarged(c, cur.pos)
+    return
+
+  # Attempt movement.
+  let (moved, newPos) = validMovementPosition(c, cur.pos, random)
+  if moved:
+    if currentId == BSculkVein:
+      onDischarged(c, cur.pos)
+    cur.pos = newPos
+    # World-gen radius limit (XZ only): dx^2 + dz^2 >= 225.
+    if cfg.isWorldGeneration:
+      let dx = int64(cur.pos.vec.x - originPos.vec.x)
+      let dz = int64(cur.pos.vec.z - originPos.vec.z)
+      if dx * dx + dz * dz >= WorldGenRadiusSq:
+        cur.charge = 0'u16
+        return
+    # Update faces from the new position's block.
+    let state = getState(c, cur.pos)
+    let id = blockIdOf(state)
+    if isSculkBehaviour(id):
+      cur.hasFaces = true
+      cur.faces = availableFaces(state, id)
+
+  # The decay delay uses the pre-movement block behaviour: sculk behaviours reset it to 1, others decrement it.
+  cur.decayDelay = updateDecayDelay(cur.decayDelay, isSculkBehaviour(currentId))
+  cur.updateDelay = 1'u8  # spread delay is always a single tick
+
+proc updateCursors*(s: var SculkSpreader, c: FeatureContext, originPos: BlockPos, random: var RandomGenerator,
+                    spreadVeins: bool) =
+  ## `SculkSpreader::update_cursors`
+  if s.cursors.len == 0:
+    return
+  var processed = newSeqOfCap[ChargeCursor](s.cursors.len)
+  # Merge map: position -> index into `processed`.
+  var mergeIndex = initTable[(int32, int32, int32), int]()
+  let cfg = s.config()
+  let drained = s.cursors
+  s.cursors = @[]
+  for k in 0 ..< drained.len:
+    var cursor = drained[k]
+    if abs(int64(cursor.pos.vec.x) - int64(originPos.vec.x)) > int64(MaxCursorDistance) or
+       abs(int64(cursor.pos.vec.y) - int64(originPos.vec.y)) > int64(MaxCursorDistance) or
+       abs(int64(cursor.pos.vec.z) - int64(originPos.vec.z)) > int64(MaxCursorDistance):
+      continue  # unreachable position, discard
+    cursor.update(c, originPos, random, cfg, spreadVeins)
+    if cursor.charge == 0'u16:
+      continue
+    let key = (cursor.pos.vec.x, cursor.pos.vec.y, cursor.pos.vec.z)
+    let existingIdx = mergeIndex.getOrDefault(key, -1)
+    if existingIdx >= 0:
+      let existingCharge = processed[existingIdx].charge
+      # Merge when not world-gen and the combined charge fits within MAX_CHARGE.
+      if not cfg.isWorldGeneration:
+        let combined = uint32(existingCharge) + uint32(cursor.charge)
+        if combined <= uint32(MaxCharge):
+          processed[existingIdx].charge = uint16(combined)
+          processed[existingIdx].updateDelay = min(processed[existingIdx].updateDelay, cursor.updateDelay)
+          continue
+      # Can't merge: keep the new cursor as a separate entry. It is not registered in the merge map unless it carries
+      # less charge than the existing cursor, in which case the merge target is replaced.
+      processed.add(cursor)
+      let newIdx = processed.len - 1
+      if processed[newIdx].charge < existingCharge:
+        mergeIndex[key] = newIdx
+    else:
+      mergeIndex[key] = processed.len
+      processed.add(cursor)
+  s.cursors = processed
+
+# --- SculkPatchFeature (sculk_patch.rs) -----------------------------------------------------------------------------
+
+proc placeExtraRareGrowths(f: ConfiguredFeatureDef, c: FeatureContext, random: var RandomGenerator, p: BlockPos) =
+  ## `SculkPatchFeature::place_extra_rare_growths`: sculk shriekers around the origin (ancient cities).
+  let extraGrowths = get(f.extraRareGrowths, random)
+  for i in 0'i32 ..< extraGrowths:
+    let a = nextBoundedI32(random, 5) - 2
+    let b = nextBoundedI32(random, 5) - 2
+    let candidate = p.add(a, 0, b)
+    if sculkIsAir(c, candidate) and sculkIsFaceSturdy(c, candidate.down(), BlockDirection.Up):
+      setState(c, candidate, shriekerState(true))
+
+proc generateSculkPatch*(f: ConfiguredFeatureDef, c: FeatureContext, random: var RandomGenerator, at: BlockPos): bool =
+  ## `SculkPatchFeature::generate`
+  if not canSpreadFrom(c, at):
+    return false
+  var spreader = newWorldGenSpreader()
+  let totalRounds = f.spreadRounds + f.growthRounds
+  for round in 0'i32 ..< totalRounds:
+    for i in 0'i32 ..< f.chargeCount:
+      spreader.addCursors(at, f.amountPerCharge)
+    for i in 0'i32 ..< f.spreadAttempts:
+      spreader.updateCursors(c, at, random, round < f.spreadRounds)
+    spreader.clear()
+  # Catalyst needs a full cube below it.
+  if nextF32(random) <= f.catalystChance and sculkIsFullCube(c, at.down()):
+    setState(c, at, defaultStateOf(BSculkCatalyst))
+  # Extra-rare growths (shriekers, only for ancient cities).
+  placeExtraRareGrowths(f, c, random, at)
+  true

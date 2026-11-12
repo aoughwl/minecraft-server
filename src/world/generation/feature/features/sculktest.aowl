@@ -1,0 +1,205 @@
+## Tests for features/sculk.aowl. The first two blocks are the newer checkout's own `#[cfg(test)]` cases of sculk/mod.rs (the
+## ones a bare generation cache can answer: it has no fluids, so its water-source cases are not here); the rest are
+## invariants worked from the spreader, vein and growth code: charge splitting, vein faces and discharge, world-gen
+## radius, determinism, the catalyst, and that a patch only starts where `can_spread_from` allows.
+
+{.feature: "lenientnils".}
+
+import std/syncio
+import ../../../../util/worldgen_random as worldgen_random
+import ../../../../generated/placed_feature as placedenum
+import ../../../../util/math/int_provider
+import ../types
+import ../common
+import ../placed_features
+import ../configured_features
+import ../survival
+import sculk
+
+var failures = 0
+
+proc expect(ok: bool, what: string) =
+  if not ok:
+    echo "FAIL ", what
+    inc failures
+
+proc freshChunk(): ProtoChunk =
+  ## A chunk of solid stone: the raw chunk's filler is only its default for reads, so the map is filled by hand.
+  result = newProtoChunkRaw(0'i32, 0'i32, stateOfName("stone"), 0'i64, 384'i32, -64'i32)
+  let stone = stateOfName("stone")
+  for i in 0 ..< result.flatBlockMap.len:
+    result.flatBlockMap[i] = stone
+
+proc context(chunk: ProtoChunk): FeatureContext =
+  let cache = protoChunkAsGenerationCache(chunk)
+  FeatureContext(chunk: cache, blockRegistry: worldgenPortal(), minY: -64'i8, height: 384'u16, worldSeed: 1'i64, seaLevel: 63'i32,
+    accessor: generationCacheAsAccessor(cache), feature: placedenum.PlacedFeature(0))
+
+installFeatureHooks()
+
+let
+  BSculk = blockIdOfName("sculk")
+  BSculkVein = blockIdOfName("sculk_vein")
+  BSculkCatalyst = blockIdOfName("sculk_catalyst")
+  BSculkSensor = blockIdOfName("sculk_sensor")
+  BCalibrated = blockIdOfName("calibrated_sculk_sensor")
+  BShrieker = blockIdOfName("sculk_shrieker")
+
+# sculk_behaviour_implementations
+block:
+  expect(isSculkBehaviour(BSculk) and isSculkBehaviour(BSculkVein), "sculk and vein are behaviour")
+  expect(not isSculkBehaviour(BSculkCatalyst) and not isSculkBehaviour(BSculkSensor) and
+    not isSculkBehaviour(BCalibrated) and not isSculkBehaviour(BShrieker), "nothing else is")
+
+# can_spread_from_rejects_solid_origin, can_spread_from_rejects_sensor_origin, and an air origin with a full-cube neighbour
+block:
+  let chunk = freshChunk()
+  let c = context(chunk)
+  let origin = pos(8'i32, 60'i32, 8'i32)
+  expect(not canSpreadFrom(c, origin), "a stone origin does not spread")
+  setBlockState(chunk, 8'i32, 60'i32, 8'i32, defaultStateOf(BSculkSensor))
+  expect(not canSpreadFrom(c, origin), "a sensor origin does not spread")
+  setBlockState(chunk, 8'i32, 60'i32, 8'i32, SAir)
+  expect(canSpreadFrom(c, origin), "an air origin beside stone spreads")
+  setBlockState(chunk, 8'i32, 60'i32, 8'i32, defaultStateOf(BSculk))
+  expect(canSpreadFrom(c, origin), "a sculk origin spreads")
+  # air with no full cube around it
+  for dx in -1'i32 .. 1'i32:
+    for dy in -1'i32 .. 1'i32:
+      for dz in -1'i32 .. 1'i32:
+        setBlockState(chunk, 8'i32 + dx, 60'i32 + dy, 8'i32 + dz, SAir)
+  expect(not canSpreadFrom(c, origin), "air in open air does not spread")
+
+# add_cursors splits a charge into pieces of at most 1000, and holds at most 32 cursors.
+block:
+  var s = newWorldGenSpreader()
+  s.addCursors(pos(0'i32, 0'i32, 0'i32), 2500'i32)
+  expect(s.cursors.len == 3 and s.cursors[0].charge == 1000'u16 and s.cursors[1].charge == 1000'u16 and
+    s.cursors[2].charge == 500'u16, "2500 charge is 1000 + 1000 + 500")
+  expect(s.cursors[0].decayDelay == 1'u8 and s.cursors[0].updateDelay == 0'u8 and not s.cursors[0].hasFaces, "a new cursor")
+  s.clear()
+  for i in 0 ..< 40:
+    s.addCursors(pos(0'i32, 0'i32, 0'i32), 1'i32)
+  expect(s.cursors.len == MaxCursors, "at most 32 cursors")
+  let cfg = newWorldGenSpreader().config()
+  expect(cfg.isWorldGeneration and cfg.growthSpawnCost == 50'i32 and cfg.noGrowthRadius == 1'i32 and
+    cfg.chargeDecayRate == 5'i32 and cfg.additionalDecayRate == 10'i32 and cfg.replaceableWorldGen, "world-gen spreader constants")
+  let lvl = newLevelSpreader().config()
+  expect(not lvl.isWorldGeneration and lvl.growthSpawnCost == 10'i32 and lvl.noGrowthRadius == 4'i32 and
+    lvl.chargeDecayRate == 10'i32 and lvl.additionalDecayRate == 5'i32 and not lvl.replaceableWorldGen, "level spreader constants")
+
+# Vein faces: has_face, has_substrate_access, on_discharged.
+block:
+  let chunk = freshChunk()
+  let c = context(chunk)
+  let vein = defaultStateOf(BSculkVein)
+  expect(not veinHasFace(vein, BlockDirection.Up), "a default vein has no face")
+  let upVein = withProp(vein, "up", "true")
+  expect(veinHasFace(upVein, BlockDirection.Up) and not veinHasFace(upVein, BlockDirection.Down), "one face")
+  expect(not veinHasFace(stateOfName("stone"), BlockDirection.Up), "stone has no vein face")
+  # A vein on its up face has stone (sculk-replaceable) above.
+  setBlockState(chunk, 8'i32, 60'i32, 8'i32, upVein)
+  expect(hasSubstrateAccess(c, upVein, pos(8'i32, 60'i32, 8'i32)), "a vein against stone has substrate access")
+  expect(not hasSubstrateAccess(c, vein, pos(8'i32, 60'i32, 8'i32)), "a vein with no face has none")
+  # on_discharged: the up face sits against sculk, so the face goes and the empty vein becomes air.
+  setBlockState(chunk, 8'i32, 61'i32, 8'i32, defaultStateOf(BSculk))
+  onDischarged(c, pos(8'i32, 60'i32, 8'i32))
+  expect(isAir(getState(c, pos(8'i32, 60'i32, 8'i32))), "a vein whose only face is on sculk is removed")
+  # with a second face against stone it stays, with just that face
+  setBlockState(chunk, 8'i32, 60'i32, 8'i32, withProp(upVein, "north", "true"))
+  onDischarged(c, pos(8'i32, 60'i32, 8'i32))
+  let left = getState(c, pos(8'i32, 60'i32, 8'i32))
+  expect(blockIdOf(left) == BSculkVein and veinHasFace(left, BlockDirection.North) and
+    not veinHasFace(left, BlockDirection.Up), "the stone-side face stays")
+
+# spread_all from a sculk block in a cave puts veins on the cave's walls.
+block:
+  let chunk = freshChunk()
+  let c = context(chunk)
+  for dx in -2'i32 .. 2'i32:
+    for dz in -2'i32 .. 2'i32:
+      for dy in 0'i32 .. 3'i32:
+        setBlockState(chunk, 8'i32 + dx, 50'i32 + dy, 8'i32 + dz, SAir)
+  setBlockState(chunk, 8'i32, 50'i32, 8'i32, defaultStateOf(BSculk))
+  expect(spreadAll(c, pos(8'i32, 50'i32, 8'i32)), "a sculk block spreads veins")
+  var veins = 0
+  for dx in -2'i32 .. 2'i32:
+    for dz in -2'i32 .. 2'i32:
+      for dy in 0'i32 .. 3'i32:
+        if blockIdOf(getState(c, pos(8'i32 + dx, 50'i32 + dy, 8'i32 + dz))) == BSculkVein:
+          inc veins
+  expect(veins > 0, "veins were placed")
+  # the floor block beside the sculk gets a down face (against the stone below it)
+  let beside = getState(c, pos(9'i32, 50'i32, 8'i32))
+  expect(blockIdOf(beside) == BSculkVein and veinHasFace(beside, BlockDirection.Down), "a floor vein faces down")
+
+# A whole patch: ancient city's numbers (10 charges of 32, 64 attempts, one growth round, no spread round).
+proc caveChunk(): ProtoChunk =
+  let chunk = freshChunk()
+  for dx in -6'i32 .. 6'i32:
+    for dz in -6'i32 .. 6'i32:
+      for dy in 0'i32 .. 4'i32:
+        setBlockState(chunk, 8'i32 + dx, -20'i32 + dy, 8'i32 + dz, SAir)
+  chunk
+
+proc patchDef(catalystChance: float32): ConfiguredFeatureDef =
+  ConfiguredFeatureDef(kind: ConfiguredFeatureKind.SculkPatch, chargeCount: 10'i32, amountPerCharge: 32'i32,
+    spreadAttempts: 64'i32, growthRounds: 1'i32, spreadRounds: 0'i32, extraRareGrowths: intProvider(0'i32),
+    catalystChance: catalystChance)
+
+proc countOf(chunk: ProtoChunk, id: int): int =
+  result = 0
+  for x in 0'i32 ..< 16'i32:
+    for z in 0'i32 ..< 16'i32:
+      for y in -64'i32 ..< 20'i32:
+        if blockIdOf(getBlockState(chunk, vec3[int32](x, y, z))) == id:
+          inc result
+
+block:
+  let chunkA = caveChunk()
+  let a = context(chunkA)
+  var ra = toRandomGenerator(worldgen_random.fromSeed(1234'u64))
+  let origin = pos(8'i32, -20'i32, 8'i32)
+  expect(generateSculkPatch(patchDef(1.0'f32), a, ra, origin), "the patch generates")
+  let sculkA = countOf(chunkA, BSculk)
+  expect(sculkA > 0, "sculk was placed")
+  # chance 1.0 and a full cube under the origin: the catalyst sits at the origin.
+  expect(blockIdOf(getState(a, origin)) == BSculkCatalyst, "a catalyst at the origin")
+  # World generation stops a cursor 15 blocks out in XZ.
+  var tooFar = 0
+  for x in 0'i32 ..< 16'i32:
+    for z in 0'i32 ..< 16'i32:
+      for y in -64'i32 ..< 20'i32:
+        let id = blockIdOf(getBlockState(chunkA, vec3[int32](x, y, z)))
+        if (id == BSculk or id == BSculkVein) and (x - 8) * (x - 8) + (z - 8) * (z - 8) >= 226:
+          inc tooFar
+  expect(tooFar == 0, "sculk stays within the world-gen radius")
+  # Same seed, same result.
+  let chunkB = caveChunk()
+  let b = context(chunkB)
+  var rb = toRandomGenerator(worldgen_random.fromSeed(1234'u64))
+  discard generateSculkPatch(patchDef(1.0'f32), b, rb, origin)
+  expect(countOf(chunkB, BSculk) == sculkA and countOf(chunkB, BSculkVein) == countOf(chunkA, BSculkVein), "deterministic")
+  # Chance 0: no catalyst.
+  let chunkC = caveChunk()
+  let cc = context(chunkC)
+  var rc = toRandomGenerator(worldgen_random.fromSeed(99'u64))
+  discard generateSculkPatch(patchDef(0.0'f32), cc, rc, origin)
+  expect(blockIdOf(getState(cc, origin)) != BSculkCatalyst, "no catalyst at chance 0")
+  # No catalyst without a full cube below the origin.
+  let chunkD = caveChunk()
+  let d = context(chunkD)
+  setBlockState(chunkD, 8'i32, -21'i32, 8'i32, SAir)
+  var rd = toRandomGenerator(worldgen_random.fromSeed(1234'u64))
+  discard generateSculkPatch(patchDef(1.0'f32), d, rd, origin)
+  expect(blockIdOf(getState(d, origin)) != BSculkCatalyst, "no catalyst without a floor")
+  # A patch started in solid stone does nothing.
+  let chunkE = freshChunk()
+  let e = context(chunkE)
+  var re = toRandomGenerator(worldgen_random.fromSeed(1'u64))
+  expect(not generateSculkPatch(patchDef(1.0'f32), e, re, pos(8'i32, 0'i32, 8'i32)), "no patch from solid stone")
+
+if failures > 0:
+  echo failures, " checks failed"
+  quit(1)
+echo "sculktest ok"

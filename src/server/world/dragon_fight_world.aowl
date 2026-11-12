@@ -1,0 +1,143 @@
+## Port of pumpkin/src/world/mod.rs (`dragon_fight` and its tick), over the fight in dragon_fight.aowl.
+##
+## `newWorldFightEnv` answers the fight's questions from a real `World`; `installDragonFight` gives the End world its
+## fight (`Option<Mutex<DragonFight>>`: only the End has one), ticks it from `tickEntitiesHook` as `World::tick` does,
+## and answers `gDragonFightOf`, which the dragon (entity/boss/ender_dragon/dragonbase.aowl) asks.
+##
+## Type-checked against the real `World`, not yet run in a live End: the fight itself is run by dragon_fighttest.aowl
+## over a fake world. Nothing calls `tryRespawn` or `onCrystalDestroyed` (nor does upstream).
+
+{.feature: "untyped".}
+{.feature: "lenientnils".}
+
+import std/[options, tables]
+import ../../data/block_ext
+from ../../data/block_state import asU16
+import ../../generated/[block_properties, entity_type, world_event]
+import ../../world/world as worldtraits
+import ../../util/uuid
+import ../../util/vector2
+import ../../util/vector3
+import ../../util/math/position
+import ../entity/boss/ender_dragon/dragonbase
+import ../entity/decoration/end_crystal
+import ../entity/entitymod
+import ../entity/entitytype
+import ../item/itembehaviour
+import ../serverbase
+import bossbar
+import dragon_fight
+import end_podium
+import "portal/end" as endportal
+import worldmod
+
+export dragon_fight
+
+var gFights* = initTable[string, DragonFightState]()  ## By dimension name: one fight per End world.
+
+proc blockNameOf(b: Block): string =
+  if b == blockBedrock(): "bedrock"
+  elif b == blockEndPortal(): "end_portal"
+  elif b == blockEndStone(): "end_stone"
+  elif b == blockDragonEgg(): "dragon_egg"
+  else: "other"
+
+proc stateOfName(name: string): uint32 =
+  case name
+  of "end_stone": uint32(asU16(blockEndStone().defaultState.id))
+  of "dragon_egg": uint32(asU16(blockDragonEgg().defaultState.id))
+  of "bedrock": uint32(asU16(blockBedrock().defaultState.id))
+  else: uint32(asU16(blockAir().defaultState.id))
+
+proc entitiesOfType(world: World; entityType: EntityType): seq[EntityBase] =
+  result = @[]
+  for e in allEntities(world):
+    if e.entity.entityType == entityType:
+      result.add(e)
+
+proc playerNamed(world: World; id: Uuid): nil Player =
+  for p in world.players:
+    if p.gameprofile.id == id:
+      return p
+  nil
+
+proc newWorldFightEnv*(world: World): FightEnv =
+  result = FightEnv(minY: world.minY)
+  result.entities = proc(kind: FightEntityKind): seq[FightEntity] {.closure.} =
+    var found: seq[FightEntity] = @[]
+    let wanted = if kind == fekDragon: EntityType.ENDER_DRAGON else: EntityType.END_CRYSTAL
+    for e in entitiesOfType(world, wanted):
+      found.add(FightEntity(uuid: e.entity.entityUuid, pos: e.entity.pos))
+    found
+  result.removeEntity = proc(uuid: Uuid) {.closure.} =
+    for e in allEntities(world):
+      if e.entity.entityUuid == uuid:
+        e.entity.remove()
+  result.spawnDragon = proc(uuid: Uuid; pos: Vector3[float64]) {.closure.} =
+    world.spawnEntity(fromType(EntityType.ENDER_DRAGON, pos, world, uuid))
+  result.spawnCrystal = proc(pos: Vector3[float64]) {.closure.} =
+    let crystal = newEndCrystalEntity(newEntity(world, pos, EntityType.END_CRYSTAL))
+    crystal.setShowBottom(true)
+    world.spawnEntity(crystal)
+  result.setDragonOrigin = proc(uuid: Uuid; origin: BlockPos) {.closure.} =
+    for e in entitiesOfType(world, EntityType.ENDER_DRAGON):
+      if e.entity.entityUuid == uuid:
+        EnderDragonEntity(e).setFightOrigin(origin)
+  result.blockName = proc(x, y, z: int32): string {.closure.} = blockNameOf(world.getBlock(newBlockPos(x, y, z)))
+  result.setBlock = proc(x, y, z: int32; name: string) {.closure.} =
+    discard world.setBlockState(newBlockPos(x, y, z), stateOfName(name), BfNotifyAll)
+  result.topBlock = proc(x, z: int32): int32 {.closure.} = world.getTopBlock(Vector2[int32](x: x, y: z))
+  result.placePodium = proc(origin: BlockPos; active: bool) {.closure.} = end_podium.place(world, origin, active)
+  result.gatewayEvent = proc(pos: BlockPos) {.closure.} =
+    world.syncWorldEvent(weAnimationEndGatewaySpawn, pos, 0'i32)
+  result.players = proc(): seq[FightEntity] {.closure.} =
+    var found: seq[FightEntity] = @[]
+    for p in world.players:
+      found.add(FightEntity(uuid: p.gameprofile.id, pos: p.pos))
+    found
+  result.sendBossbar = proc(player: Uuid; bar: Bossbar) {.closure.} =
+    let p = playerNamed(world, player)
+    if p != nil:
+      p.sendBossbar(bar)
+  result.removeBossbar = proc(player: Uuid; bar: Uuid) {.closure.} =
+    let p = playerNamed(world, player)
+    if p != nil:
+      p.removeBossbar(bar)
+  result.updateBossbarHealth = proc(player: Uuid; bar: Uuid; health: float32) {.closure.} =
+    let p = playerNamed(world, player)
+    if p != nil:
+      p.updateBossbarHealth(bar, health)
+
+proc dragonFightHandle(fight: DragonFightState): dragonbase.DragonFight =
+  ## What the dragon asks of `World::dragon_fight`.
+  dragonbase.DragonFight(
+    updateDragon: proc(world: World; health, maxHealth: float32) {.closure.} = fight.updateDragon(health, maxHealth),
+    aliveCrystals: proc(): int32 {.closure.} = int32(fight.aliveCrystals()),
+    hasPreviouslyKilledDragon: proc(): bool {.closure.} = fight.hasPreviouslyKilledDragon(),
+    setDragonKilled: proc(world: World; uuid: Uuid) {.closure.} = fight.setDragonKilled(uuid))
+
+proc installEndPortalHook*() =
+  ## `EndPortal::get_new_portal(&world, location)` after an eye of ender fills a frame (item/items/ender_eye.rs), which
+  ## item/placing_items.aowl calls as `gItemHooks.getNewEndPortal`.
+  gItemHooks.getNewEndPortal = proc(world: World; pos: BlockPos) {.closure.} =
+    if world.blockWorld != nil:
+      endportal.endPortalGetNewPortal(world.blockWorld, pos)
+
+proc installDragonFight*(world: World): nil DragonFightState =
+  ## `dragon_fight` of `World::new`, for the End only, and its tick in `World::tick`. Returns nil for any other dimension.
+  if world.dimension.minecraftName != "minecraft:the_end":
+    return nil
+  let fight = newDragonFight(newWorldFightEnv(world))
+  gFights[world.dimension.minecraftName] = fight
+  let handle = dragonFightHandle(fight)
+  let previousAsk = gDragonFightOf
+  gDragonFightOf = proc(asked: World): nil dragonbase.DragonFight {.closure.} =
+    if asked.dimension.minecraftName == "minecraft:the_end":
+      return handle
+    previousAsk(asked)
+  let previousTick = world.tickEntitiesHook
+  world.tickEntitiesHook = proc(server: Server) {.closure.} =
+    if previousTick != nil:
+      previousTick(server)
+    fight.tick()
+  fight

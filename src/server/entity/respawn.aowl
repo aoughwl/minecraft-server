@@ -1,0 +1,160 @@
+## Port of pumpkin/src/entity/player.rs: `calculate_respawn_point` and what it calls (`find_bed_spawn_position`,
+## `get_bed_spawn_offsets`, `find_anchor_spawn_position`, `find_respawn_pos`). It sits on entitymod for `is_space_empty`;
+## worldmod's `gCalculateRespawnHook` is how `respawnPlayer` reaches it.
+
+import std/[options]
+import ../../data/block_ext
+from ../../data/block_state import newBlockStateIdUnchecked, asU16, isAir, isSolid, BlockState
+import ../../generated/[block_properties, block_enums, tag]
+import ../../util/math/boundingbox
+import ../../util/math/position
+import ../../util/vector3
+import ../../world/world as worldtraits
+import ../serverbase
+import ../world/worldmod
+import entitymod
+
+proc bedSpawnOffsets*(facing: HorizontalFacing): seq[(int32, int32)] =
+  ## `get_bed_spawn_offsets`: a simplified `getAroundBedOffsets`.
+  var fx = 0'i32
+  var fz = 0'i32
+  case facing
+  of HorizontalFacing.North:
+    fz = -1'i32
+  of HorizontalFacing.South:
+    fz = 1'i32
+  of HorizontalFacing.West:
+    fx = -1'i32
+  of HorizontalFacing.East:
+    fx = 1'i32
+  # Clockwise rotation
+  let rx = -fz
+  let rz = fx
+  @[(rx, rz),                     # Right of bed
+    (-rx, -rz),                   # Left of bed
+    (rx - fx, rz - fz),           # Right-back
+    (-rx - fx, -rz - fz),         # Left-back
+    (-fx, -fz),                   # Behind foot
+    (-fx * 2'i32, -fz * 2'i32),   # Further behind
+    (rx + fx, rz + fz),           # Right-front
+    (-rx + fx, -rz + fz),         # Left-front
+    (fx, fz),                     # In front
+    (rx - fx * 2'i32, rz - fz * 2'i32)]  # Far right-back
+
+proc findRespawnPos(world: World; pos: BlockPos): Option[Vector3[float64]] =
+  ## `find_respawn_pos`: `Dismounting.findRespawnPos`'s logic.
+  let state = BlockState.fromId(world.stateIdAt(pos))
+  let belowState = BlockState.fromId(world.stateIdAt(pos.down()))
+  # Check if block at position is invalid for spawn (e.g., inside solid block)
+  let blockHere = Block.fromStateId(world.stateIdAt(pos))
+  if hasTag(asU16(blockHere.id), Block_MINECRAFT_INVALID_SPAWN_INSIDE):
+    return none[Vector3[float64]]()
+  # Check if block above is also invalid
+  let blockAbove = Block.fromStateId(world.stateIdAt(pos.up()))
+  if hasTag(asU16(blockAbove.id), Block_MINECRAFT_INVALID_SPAWN_INSIDE):
+    return none[Vector3[float64]]()
+  # Need solid floor below or at position
+  if not (belowState.isSolid or state.isSolid):
+    return none[Vector3[float64]]()
+  # Position must not be inside a solid block
+  if state.isSolid and not state.isAir:
+    return none[Vector3[float64]]()
+  let x = float64(pos.vec.x) + 0.5'f64
+  let y = float64(pos.vec.y) + 0.1'f64
+  let z = float64(pos.vec.z) + 0.5'f64
+  # Player dimensions: 0.6 wide, 1.8 tall
+  let halfWidth = 0.3'f64
+  let height = 1.8'f64
+  let playerBox = newBoundingBox(Vector3[float64](x: x - halfWidth, y: y, z: z - halfWidth),
+    Vector3[float64](x: x + halfWidth, y: y + height, z: z + halfWidth))
+  # Check if the space is empty (no block collisions)
+  if not world.isSpaceEmpty(playerBox):
+    return none[Vector3[float64]]()
+  some(Vector3[float64](x: x, y: y, z: z))
+
+proc findBedSpawnPosition(world: World; bedPos: BlockPos; facing: HorizontalFacing): Option[Vector3[float64]] =
+  ## `find_bed_spawn_position`
+  for offset in bedSpawnOffsets(facing):
+    let checkPos = newBlockPos(bedPos.vec.x + offset[0], bedPos.vec.y, bedPos.vec.z + offset[1])
+    let found = findRespawnPos(world, checkPos)
+    if found.isSome:
+      return found
+    # Also try one block down (for beds on elevated platforms)
+    let foundDown = findRespawnPos(world, newBlockPos(bedPos.vec.x + offset[0], bedPos.vec.y - 1'i32, bedPos.vec.z + offset[1]))
+    if foundDown.isSome:
+      return foundDown
+  # Try on the bed itself as last resort
+  findRespawnPos(world, bedPos)
+
+proc findAnchorSpawnPosition(world: World; anchorPos: BlockPos): Option[Vector3[float64]] =
+  ## `find_anchor_spawn_position`: vanilla's VALID_HORIZONTAL_SPAWN_OFFSETS.
+  let horizontalOffsets = @[(0'i32, -1'i32), (-1'i32, 0'i32), (0'i32, 1'i32), (1'i32, 0'i32), (-1'i32, -1'i32),
+    (1'i32, -1'i32), (-1'i32, 1'i32), (1'i32, 1'i32)]
+  # Try at same level, then one down, then one up
+  for dy in @[0'i32, -1'i32, 1'i32]:
+    for offset in horizontalOffsets:
+      let found = findRespawnPos(world, newBlockPos(anchorPos.vec.x + offset[0], anchorPos.vec.y + dy,
+        anchorPos.vec.z + offset[1]))
+      if found.isSome:
+        return found
+  # Also try directly above the anchor
+  findRespawnPos(world, anchorPos.up())
+
+proc calculateRespawnPoint*(world: World; player: Player): Option[CalculatedRespawnPoint] =
+  ## `calculate_respawn_point`: none means the caller sends `NoRespawnBlockAvailable` and uses the world spawn. It sends
+  ## nothing itself.
+  if player.respawnPoint.isNone:
+    return none[CalculatedRespawnPoint]()
+  let respawnPoint = player.respawnPoint.unsafeGet
+  let pos = respawnPoint.position
+  # The point is in `respawnPoint.dimension`, whose world holds the block; worldmod follows only this world's.
+  var home: nil World = world
+  if respawnPoint.dimension.minecraftName != world.dimension.minecraftName:
+    home = nil
+    for w in world.server.worlds:
+      if w.dimension.minecraftName == respawnPoint.dimension.minecraftName:
+        home = w
+    if home == nil:
+      return none[CalculatedRespawnPoint]()
+  let target: World = cast[World](home)
+  let stateId = target.stateIdAt(pos)
+  let blockRef = Block.fromStateId(stateId)
+  # If force is set (from /spawnpoint command), validate position is safe
+  if respawnPoint.force:
+    # For forced spawn, check if both the block and block above allow mob spawn
+    let blockState = BlockState.fromId(stateId)
+    let aboveState = BlockState.fromId(target.stateIdAt(pos.up()))
+    # Check if blocks are passable (non-solid or air)
+    let blockSafe = blockState.isAir or not blockState.isSolid
+    let aboveSafe = aboveState.isAir or not aboveState.isSolid
+    if blockSafe and aboveSafe:
+      return some(CalculatedRespawnPoint(
+        position: Vector3[float64](x: float64(pos.vec.x) + 0.5'f64, y: float64(pos.vec.y) + 0.1'f64,
+          z: float64(pos.vec.z) + 0.5'f64),
+        yaw: respawnPoint.yaw, pitch: 0.0'f32, dimension: respawnPoint.dimension))
+    return none[CalculatedRespawnPoint]()
+  # Handle bed respawn
+  if hasTag(asU16(blockRef.id), Block_MINECRAFT_BEDS):
+    let bedProps = WhiteBedLikeProperties.fromStateId(stateId, blockRef)
+    let spawnPos = findBedSpawnPosition(target, pos, bedProps.facing)
+    if spawnPos.isSome:
+      return some(CalculatedRespawnPoint(position: spawnPos.unsafeGet, yaw: respawnPoint.yaw, pitch: 0.0'f32,
+        dimension: respawnPoint.dimension))
+    return none[CalculatedRespawnPoint]()
+  # Handle respawn anchor (Nether)
+  if blockRef == blockRespawnAnchor():
+    var anchorProps = RespawnAnchorLikeProperties.fromStateId(stateId, blockRef)
+    let charges = anchorProps.charges
+    # Anchor needs at least 1 charge to work
+    if charges == 0'u8:
+      return none[CalculatedRespawnPoint]()
+    # Try positions around the anchor
+    let spawnPos = findAnchorSpawnPosition(target, pos)
+    if spawnPos.isSome:
+      # Decrement charges after successful respawn position found
+      anchorProps.charges = charges - 1'u8
+      discard target.setBlockState(pos, uint32(asU16(anchorProps.toStateId(blockRef))), worldtraits.BfNotifyAll)
+      return some(CalculatedRespawnPoint(position: spawnPos.unsafeGet, yaw: respawnPoint.yaw, pitch: 0.0'f32,
+        dimension: respawnPoint.dimension))
+    return none[CalculatedRespawnPoint]()
+  none[CalculatedRespawnPoint]()
