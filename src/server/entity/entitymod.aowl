@@ -37,6 +37,7 @@
 {.feature: "untyped".}
 
 import std/[assertions, math, options, tables, syncio]
+import trackedalias
 import ../../plugin/pluginhooks
 import ../../data/block_ext
 from ../../data/block_state import newBlockStateIdUnchecked, asU16, isAir, isSolid, isFullCube, isSideSolid, BlockState,
@@ -906,12 +907,21 @@ proc newEntity*(world: World; position: Vector3[float64]; entityType: EntityType
   ## `Entity::new`
   fromUuid(randomUuid(), world, position, entityType)
 
+var gMetaTarget*: nil Player = nil
+  ## When set, `sendMetaData` answers to that one player (an entity coming into its view) instead of to everyone who watches.
+
+proc metaWanted*(smEntity: Entity; smPlayer: Player): bool =
+  ## Who `sendMetaData` writes to: the target player alone when one is set, else whoever has the entity in view.
+  if gMetaTarget != nil:
+    return smPlayer == gMetaTarget
+  isWithinViewDistance(smEntity.chunkPos, smPlayer.chunkPos, int32(getViewDistance(smPlayer, smEntity.world.server)))
+
 template sendMetaData*(self: Entity; index: TrackedId; typ: MetaDataType; value: untyped) =
   ## `send_meta_data`, one entry at a time: the only call with more than one is `send_client_information`, in player.aowl.
   let smEntity = self
   let smWorld = smEntity.world
   for smPlayer in smWorld.players:
-    if isWithinViewDistance(smEntity.chunkPos, smPlayer.chunkPos, int32(getViewDistance(smPlayer, smWorld.server))):
+    if metaWanted(smEntity, smPlayer):
       var smBuf = newNetWriter()
       discard newMetadata(index, typ, value).write(smBuf, smPlayer.client.version)
       writeU8(smBuf, 255'u8)
@@ -923,7 +933,7 @@ template sendMetaData2*(self: Entity; index1: TrackedId; typ1: MetaDataType; val
   let smEntity = self
   let smWorld = smEntity.world
   for smPlayer in smWorld.players:
-    if isWithinViewDistance(smEntity.chunkPos, smPlayer.chunkPos, int32(getViewDistance(smPlayer, smWorld.server))):
+    if metaWanted(smEntity, smPlayer):
       var smBuf = newNetWriter()
       discard newMetadata(index1, typ1, value1).write(smBuf, smPlayer.client.version)
       discard newMetadata(index2, typ2, value2).write(smBuf, smPlayer.client.version)
@@ -1449,7 +1459,7 @@ proc tickFrozen*(self: Entity; caller: EntityBase) =
   # Only update and send metadata if the value changed
   if newFrozenTicks != oldFrozenTicks:
     self.frozenTicks = newFrozenTicks
-    self.sendMetaData(TrackedData_TICKS_FROZEN, INTEGER, newVarInt(newFrozenTicks))
+    self.sendMetaData(TD_FROZEN_TICKS, TD_INT, newVarInt(newFrozenTicks))
   # Vanilla parity: full-freeze damage is tick-phase based.
   if canFreeze and newFrozenTicks >= MaxFrozenTicks and self.age mod FreezeDamageInterval == 0'i32:
     discard caller.damage(caller, 1.0'f32, FREEZE)
@@ -2107,7 +2117,7 @@ proc sendEquipmentChanges*(self: LivingEntity; equipment: openArray[(EquipmentSl
     return
   var wire: seq[(int8, ItemStackSerializer)] = @[]
   for item in equipment:
-    wire.add((int8(ord(item[0])), toSerializer(item[1])))
+    wire.add((discriminant(item[0]), toSerializer(item[1])))
   self.entity.world.broadcastPacketExcept(self.entity.entityUuid, CSetEquipment(entityId: newVarInt(self.entityId()),
     equipment: wire))
 
@@ -2166,7 +2176,7 @@ proc setHealth*(self: LivingEntity; health: float32) =
   let clamped = min(max(health, 0.0'f32), maxHealth)
   self.health = clamped
   # tell everyone entities health changed
-  self.entity.sendMetaData(TrackedData_HEALTH_ID, FLOAT, clamped)
+  self.entity.sendMetaData(TD_HEALTH, FLOAT, clamped)
 
 proc heal*(self: LivingEntity; additionalHealth: float32) =
   ## `heal`
@@ -2920,7 +2930,7 @@ proc resetState*(self: LivingEntity) =
   let maxHealth = self.getMaxHealth()
   self.setHealth(maxHealth)
   self.absorption = 0.0'f32
-  self.entity.sendMetaData(TrackedData_HEALTH_ID, FLOAT, maxHealth)
+  self.entity.sendMetaData(TD_HEALTH, FLOAT, maxHealth)
   self.resetEffectsAndAttributes()
   # Give a short grace period of invulnerability after respawn
   self.hurtCooldown = 20'i32
@@ -3417,7 +3427,7 @@ proc newEntityVt*(): EntityVt =
     initDataTracker: proc(self: EntityBase) {.closure.} =
       # If the internal age is negative, it's a baby
       if self.entity.age < 0'i32:
-        self.entity.sendMetaData(TrackedData_BABY_ID, BOOLEAN, true),
+        self.entity.sendMetaData(TD_BABY, BOOLEAN, true),
     setVariantName: proc(self: EntityBase; name: string) {.closure.} = discard,
     teleport: proc(self: EntityBase; position: Vector3[float64]; yaw, pitch: Option[float32]; world: World) {.closure.} =
       self.entity.teleportEntity(position, yaw, pitch, world),
@@ -3809,6 +3819,50 @@ proc broadcastEntitySpawn*(world: World; entity: EntityBase) =
     if isWithinViewDistance(base.chunkPos, player.chunkPos, int32(getViewDistance(player, world.server))):
       player.client.writePacketFor(base.createSpawnPacket())
 
+proc sendEquipmentSnapshot*(world: World; e: EntityBase) =
+  ## What a mob holds and wears, to whoever is its target (or watches it): the client learns it only from a packet.
+  if e.living == nil or e.player != nil:
+    return
+  let living = mustLiving(e)
+  var wire: seq[(int8, ItemStackSerializer)] = @[]
+  for slot in [esMainHand, esOffHand, esFeet, esLegs, esChest, esHead, esBody, esSaddle]:
+    let stack = living.entityEquipment.get(slot)
+    if not stack.isEmpty():
+      wire.add((discriminant(slot), toSerializer(stack)))
+  if wire.len == 0:
+    return
+  for player in world.players:
+    if metaWanted(e.entity, player):
+      player.client.writePacketFor(CSetEquipment(entityId: newVarInt(e.entity.entityId), equipment: wire))
+
+proc sendCommonData*(world: World; e: EntityBase) =
+  ## The entity data every entity has and a spawn packet does not carry: flags, custom name, silent, gravity, pose, and a living
+  ## entity's health. Only what differs from the client's default goes out. Mob-specific entries are `initDataTracker`'s.
+  let ent = e.entity
+  if ent.flags != 0'i8:
+    ent.sendMetaData2(TrackedData_SHARED_FLAGS_ID, BYTE, ent.flags, TrackedData_FLAGS, BYTE, ent.flags)
+  if ent.customName.isSome:
+    ent.sendMetaData(TrackedData_CUSTOM_NAME, OPTIONAL_TEXT_COMPONENT, ent.customName)
+  if ent.customNameVisible:
+    ent.sendMetaData(TrackedData_CUSTOM_NAME_VISIBLE, BOOLEAN, true)
+  if ent.silent:
+    ent.sendMetaData(TrackedData_SILENT, BOOLEAN, true)
+  if ent.noGravity:
+    ent.sendMetaData(TrackedData_NO_GRAVITY, BOOLEAN, true)
+  if ent.pose != epStanding:
+    ent.sendMetaData(TrackedData_POSE, ENTITY_POSE, newVarInt(int32(ord(ent.pose))))
+  if e.living != nil and e.player == nil:
+    ent.sendMetaData(TD_HEALTH, FLOAT, mustLiving(e).health)
+  sendEquipmentSnapshot(world, e)
+
+proc sendEntityDataTo*(world: World; player: Player; e: EntityBase) =
+  ## An entity comes into one player's view (a chunk that loaded, a player who joined): after the spawn packet, the data
+  ## `spawn_entity` sends everyone who watched it come to be.
+  gMetaTarget = player
+  sendCommonData(world, e)
+  e.initDataTracker()
+  gMetaTarget = nil
+
 proc addEntitySilent*(world: World; entity: EntityBase) =
   ## `add_entity_silent`: guards against a duplicate uuid. Natural spawning's `spawn_state` is not ported.
   let store = entitiesOf(world)
@@ -3821,6 +3875,7 @@ proc spawnEntity*(world: World; entity: EntityBase) =
   ## `spawn_entity`
   world.broadcastEntitySpawn(entity)
   entity.initDataTracker()
+  sendCommonData(world, entity)
   world.addEntitySilent(entity)
 
 proc spawnEntityNonSave*(world: World; entity: EntityBase) =
@@ -3843,6 +3898,7 @@ proc sendEntitiesTo*(world: World; player: Player) =
   for e in entitiesOf(world).entities:
     if isWithinViewDistance(e.entity.chunkPos, player.chunkPos, int32(getViewDistance(player, world.server))):
       player.client.writePacketFor(e.entity.createSpawnPacket())
+      sendEntityDataTo(world, player, e)
 
 proc tickEntities*(world: World; server: Server) =
   ## The entity half of `World::tick`. The caller is the gameplay core's `World::tick`.

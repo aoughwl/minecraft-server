@@ -66,9 +66,9 @@ def itemuse_session(m, c, st, w, biomes, ctx, args):
                     v = r.u8()
                     if index == 8:
                         flags.append((eid, v))
-                elif kind == 21:   # pose
+                elif kind == 20:   # pose (774: ENTITY_POSE is 20)
                     poses.append((eid, r.varint()))
-                elif kind in (1, 2, 12, 14, 15):
+                elif kind in (1, 2, 12, 14, 15, 19):
                     r.varint()
                 elif kind == 3:
                     r.f32()
@@ -216,16 +216,20 @@ def itemuse_session(m, c, st, w, biomes, ctx, args):
 
     if wanted('pose'):
         print('--- pose', flush=True)
-        settle(0.5)
-        mark = len(poses)
+        settle(8.0)   # a bot that has only just joined is still falling: no pose change then
+
+        def poses_since(mark):
+            # The decoder of mcbot.py (774 serializer ids) has every entry: pose is index 6, serializer 20.
+            return [(e, v) for (e, i, k, v) in m.META_ALL[mark:] if i == 6 and k == 20]
+        mark = len(m.META_ALL)
         c.send(SB_INPUT, bytes([0x20]))   # sneak bit of the input flags
         settle(0.8)
-        print('  poses %s' % (poses[mark:],))
-        check(any(p == 5 for _, p in poses[mark:]), 'no crouching pose (5) after sneaking')
-        mark = len(poses)
+        print('  poses %s' % (poses_since(mark),))
+        check(any(p == 5 for _, p in poses_since(mark)), 'no crouching pose (5) after sneaking')
+        mark = len(m.META_ALL)
         c.send(SB_INPUT, bytes([0x00]))
-        settle(0.8)
-        check(any(p == 0 for _, p in poses[mark:]), 'no standing pose after standing up')
+        settle(2.0)
+        check(any(p == 0 for _, p in poses_since(mark)), 'no standing pose after standing up')
         print('  pose OK')
     ctx['tap'] = None
     print('itemuse: all scenarios passed', flush=True)

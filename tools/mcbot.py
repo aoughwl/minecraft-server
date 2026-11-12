@@ -643,6 +643,74 @@ def read_commands(r):
 
 
 META_LOG = []   # (entity id, index, kind, value) of every item-stack metadata --world has seen
+META_ALL = []   # (entity id, index, kind, value) of every entry of every set_entity_data packet; value is decoded per kind
+
+# 774's entity data serializer ids (generated/meta_data_type.aowl, v1_21_11): kind -> name. Anything else is a failure: a
+# server that sends a 26.x id (HUMANOID_ARM is 42 there, ARM is 38 here) is writing for the wrong protocol.
+META_KINDS_774 = {
+    0: 'byte', 1: 'int', 2: 'long', 3: 'float', 4: 'string', 5: 'component', 6: 'optional_component', 7: 'item_stack',
+    8: 'boolean', 9: 'rotation', 10: 'block_pos', 11: 'optional_block_pos', 12: 'direction', 13: 'optional_uuid',
+    14: 'block_state', 15: 'optional_block_state', 16: 'particle', 17: 'particle_list', 18: 'villager_data',
+    19: 'optional_int', 20: 'pose', 21: 'cat_variant', 22: 'cow_variant', 23: 'wolf_variant', 24: 'wolf_sound_variant',
+    25: 'frog_variant', 26: 'pig_variant', 27: 'chicken_variant', 28: 'zombie_nautilus_variant', 29: 'optional_global_pos',
+    30: 'painting_variant', 31: 'sniffer_state', 32: 'armadillo_state', 33: 'copper_golem_state', 34: 'oxidation_level',
+    35: 'vector3f', 36: 'quaternion', 37: 'profile', 38: 'arm',
+}
+POSE_NAMES = {0: 'standing', 1: 'fall_flying', 2: 'sleeping', 3: 'swimming', 4: 'spin_attack', 5: 'crouching',
+              6: 'long_jumping', 7: 'dying', 8: 'croaking', 9: 'using_tongue', 10: 'sitting', 11: 'roaring',
+              12: 'sniffing', 13: 'emerging', 14: 'digging', 15: 'sliding', 16: 'shooting', 17: 'inhaling'}
+
+
+class MetaStop(Exception):
+    """An entry this bot cannot size (a particle with data, a profile): the rest of the packet is skipped."""
+
+
+def read_meta_value(r, kind):
+    name = META_KINDS_774.get(kind)
+    check(name is not None, 'metadata type %d is not a 1.21.11 (774) serializer id' % kind)
+    if kind == 0:
+        v = r.u8()
+        return v - 256 if v > 127 else v
+    if kind == 8:
+        return r.u8() != 0
+    if kind == 3:
+        return r.f32()
+    if kind in (1, 2, 12, 14, 15, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 31, 32, 33, 34, 38):
+        return r.varint()        # varint, varlong, direction, block states, optional int, pose, the variant holders, arm
+    if kind == 4:
+        return r.string()
+    if kind == 5:
+        return text_of(skip_network_nbt_bytes(r))[0]
+    if kind == 6:
+        return text_of(skip_network_nbt_bytes(r))[0] if r.boolean() else None
+    if kind == 7:
+        stack = read_slot(r)
+        return stack
+    if kind == 9 or kind == 35:
+        return (r.f32(), r.f32(), r.f32())
+    if kind == 36:
+        return (r.f32(), r.f32(), r.f32(), r.f32())
+    if kind == 10:
+        return r.take(8)
+    if kind == 11:
+        return r.take(8) if r.boolean() else None
+    if kind == 13:
+        return r.take(16) if r.boolean() else None
+    if kind == 18:
+        return (r.varint(), r.varint(), r.varint())    # type, profession, level
+    if kind == 29:
+        if r.boolean():
+            return (r.string(), r.take(8))
+        return None
+    if kind == 30:
+        return r.varint()
+    raise MetaStop('metadata type %d (%s) has data this bot does not size' % (kind, name))
+
+
+def skip_network_nbt_bytes(r):
+    start = r.at
+    skip_network_nbt(r)
+    return r.data[start:r.at]
 
 
 def read_metadata(r):
@@ -652,27 +720,14 @@ def read_metadata(r):
         if index == 0xFF:
             return
         kind = r.varint()
-        # 774's serializer ids (generated/meta_data_type.aowl, v1_21_11). Holder-backed variants are one varint each.
-        check(kind in (0, 1, 2, 3, 6, 7, 8, 10, 11, 12, 14, 15, 18, 19, 20, 21, 22, 23, 25, 26, 27, 30),
-              'metadata type %d: this bot does not read it' % kind)
-        if kind == 0 or kind == 8:
-            r.u8()
-        elif kind == 3:
-            r.f32()
-        elif kind == 6:
-            if r.boolean():
-                skip_network_nbt(r)
-        elif kind == 7:
-            META_LOG.append((entity, index, kind, read_slot(r)))
-        elif kind == 18:
-            r.varint(), r.varint(), r.varint()   # villager data: type, profession, level
-        elif kind == 10:
-            r.take(8)
-        elif kind == 11:
-            if r.boolean():
-                r.take(8)
-        else:
-            r.varint()   # varint, varlong, direction, block states, optional int, pose and the variant holders
+        try:
+            value = read_meta_value(r, kind)
+        except MetaStop:
+            META_ALL.append((entity, index, kind, None))
+            return
+        META_ALL.append((entity, index, kind, value))
+        if kind == 7:
+            META_LOG.append((entity, index, kind, value))
 
 
 # 774's layouts for the rest of the join, as aoughwl.mcnet reads them; each must be consumed exactly.
@@ -938,6 +993,8 @@ class Stages:
     COMMAND_VERIFY_NAMES = ['setblock_persisted', 'fill_persisted', 'give_persisted', 'tp_persisted', 'alive_on_return']
     BLOCKS_NAMES = ['door_placed', 'door_opened', 'door_closed', 'lamp_line_placed', 'lamp_lit', 'lamp_dark', 'sand_fell',
                     'water_flowed']
+    FLUIDS_NAMES = ['fluid_flow_length', 'fluid_falls', 'fluid_infinite_source', 'fluid_obsidian', 'fluid_cobblestone',
+                    'fluid_waterlogged', 'fluid_sponge', 'fluid_bucket_place', 'fluid_bucket_pickup']
     BLOCKS_VERIFY_NAMES = ['blocks_persisted']
     PLAYA_NAMES = ['pa_shift_click', 'pa_drag_split', 'pa_tab_complete', 'pa_chat_sent']
     PLAYA_LISTEN_NAMES = ['pa_chat_heard']
@@ -2108,7 +2165,7 @@ def blocks_session(c, st, w, biomes, ctx, args):
 
     # --- Water, where the server has fluids.
 
-    wx, wz = sx + 6, sz + 1
+    wx, wz = sx + 6, sz + 3   # water seeks a drop within 4 blocks: the stage edges are 5 away here, so it spreads on all four sides
 
     cmd('setblock %d %d %d minecraft:water' % (wx, fy + 1, wz))
 
@@ -2127,6 +2184,10 @@ def blocks_session(c, st, w, biomes, ctx, args):
         check(len(flowed) == 4, 'the water did not flow: %d of 4 neighbours' % len(flowed))
 
     st.hit('water_flowed')
+    if getattr(args, 'fluids', False):
+        import mcbot_fluids
+        mcbot_fluids.run(sys.modules[__name__], st, args, dict(cmd=cmd, wait=wait, settle=settle, name_at=name_at, state_at=state_at,
+                                                               hold=hold, use_on=use_on, c=c, stage=(sx, fy, sz)))
 
 
 
@@ -2843,6 +2904,8 @@ def run(args):
         extra = list(extra) + Stages.PLAYER_VERIFY_NAMES
     if args.blocks:
         extra = list(extra) + Stages.BLOCKS_NAMES
+        if args.fluids:
+            extra = list(extra) + Stages.FLUIDS_NAMES
     if args.blocks_verify:
         extra = list(extra) + Stages.BLOCKS_VERIFY_NAMES
     if args.c2:
@@ -3105,6 +3168,9 @@ def run(args):
             containers_session(c, st, w, biomes, ctx, args)
         elif args.containers_verify:
             containers_verify_session(c, st, w, biomes, ctx, args)
+        if args.meta or args.meta_verify:
+            import mcbot_meta
+            mcbot_meta.meta_session(sys.modules[__name__], c, st, w, biomes, ctx, args, verify=bool(args.meta_verify))
         if args.itemuse:
             import mcbot_itemuse
             mcbot_itemuse.itemuse_session(sys.modules[__name__], c, st, w, biomes, ctx, args)
@@ -3446,6 +3512,7 @@ def main():
     ap.add_argument('--commands-verify', help='a file from --commands --save: check what the commands did is still there')
     ap.add_argument('--world', action='store_true', help='drops, a nether portal and night spawns as an operator; see world_session')
     ap.add_argument('--blocks', action='store_true', help='play with blocks as an operator; see blocks_session')
+    ap.add_argument('--fluids', action='store_true', help='with --blocks: the fluid scenarios of mcbot_fluids.py (flow lengths, falling water, lava and water)')
     ap.add_argument('--blocks-verify', help='a file from --blocks --save: check the door, lamp and sand are still there')
     ap.add_argument('--assets', default=os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '..', 'ref', 'pumpkin-1.21.11', 'assets', 'blocks.json'), help='blocks.json of the pinned upstream, for --blocks')
     ap.add_argument('--playa', choices=['act', 'listen'], help='play packets as an operator: shift-click, drag split, tab completion and chat (act), or hear the actor chat (listen); see mcbot_playa.py')
@@ -3462,6 +3529,8 @@ def main():
     ap.add_argument('--c1-verify', help='a file from --c1 --save: the smelted output is still in the furnace')
     ap.add_argument('--containers', action='store_true', help='open a chest, a barrel and a trapped chest and fill them; see containers_session')
     ap.add_argument('--containers-verify', help='a file from --containers --save: check the stacks are still in the containers')
+    ap.add_argument('--meta', action='store_true', help='entity data at 774 indexes and types: names, babies, health, pose, air; see mcbot_meta.py')
+    ap.add_argument('--meta-verify', action='store_true', help='a second player joins after --meta: the entity data arrives with the join')
     ap.add_argument('--itemuse', action='store_true', help='eat, shoot a bow, raise a shield, pick up experience, crouch; see mcbot_itemuse.py')
     ap.add_argument('--player', action='store_true', help='mob damage, hunger, death and respawn, /fill states, a cow; see player_session')
     ap.add_argument('--player-verify', help='a file from --player --save: the cow must be spawned on joining')
