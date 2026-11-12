@@ -17,6 +17,15 @@ login layouts, not from the server's code, so it is an independent check of it. 
   7. ResourcePackResponse HaveAllPacks -> ResourcePackStack; Completed (the server's join hook); it stays up and keeps
      answering connected pings, then disconnects.
 
+  8. With --play --extended (after the walk and the chat): the join's CraftingData, attributes, commands and abilities; a hotbar
+     selection; a modal form answered (--form, the server started with PUMPKIN_BEDROCK_TEST_FORM); the Java `give` arriving
+     as inventory content; creative mode; a creative pick through an ItemStackRequest; a block placed and broken; a chest
+     opened, filled, closed, opened again and emptied; OpenInventory; a block pick; an emote; a dropped item arriving as an
+     item actor; a cow arriving as an actor and hit with a UseItemOnEntity attack. Lines starting `@console ` ask the driver
+     (tools/runbedrockfull.py) to run a server console command and `@expect ` lines are looked for in the server log.
+  9. With --oidc-key/--oidc-kid/--oidc-issuer the login is an online-mode one (AuthenticationType 0): an OIDC token signed
+     by a key the driver published in a local JWKS.
+
 Exit status 0 only if every step held. `--ping-only` stops after step 1. `--expect-full` wants the server to answer open
 connection request 1 with NoFreeIncomingConnections. Run it against src/server/net/bedrock/bedrockdemo.aowl (see
 tools/runbedrock.py) or a full server with Bedrock enabled; it never uses a fixed port.
@@ -25,6 +34,7 @@ import argparse
 import base64
 import hashlib
 import json
+import math
 import os
 import socket
 import struct
@@ -269,13 +279,14 @@ class Bot:
         self.held = {}
         self.queue = []  # delivered frame payloads
         self.acked_by_server = 0
+        self.scene = None   # fed every game packet that is read (the extended scenario)
 
     # offline
-    def offline(self, data, wait=2.0):
+    def offline(self, data, wait=8.0):
         self.sock.sendto(data, self.addr)
         return self.recv_offline(wait)
 
-    def recv_offline(self, wait=2.0):
+    def recv_offline(self, wait=8.0):
         self.sock.settimeout(wait)
         d, _ = self.sock.recvfrom(4096)
         return d
@@ -426,6 +437,8 @@ class Bot:
             if out:
                 break
         first = self.game_in.pop(0)
+        if self.scene is not None:
+            self.scene.take(first[0], first[1])
         return first
 
 
@@ -462,6 +475,8 @@ def play_phase(bot, args):
            'radius': None, 'texts': [], 'moves': 0, 'other': {}}
     runtime = None
     pos = None
+    if args.extended:
+        bot.scene = Scene(bot, 0)
     sent_radius = False
     initialized = False
     deadline = time.time() + args.play_seconds
@@ -542,6 +557,10 @@ def play_phase(bot, args):
                     got['players_seen'] = got.get('players_seen', 0) + 1
                 else:
                     got['other'][pid] = got['other'].get(pid, 0) + 1
+            if args.extended:
+                extended_phase(bot, args, got, runtime or 0, pos)
+            if args.followups:
+                followups_phase(bot, args, got, runtime or 0, pos)
             quiet = time.time() + 2.0
             while time.time() < quiet:
                 try:
@@ -558,6 +577,483 @@ def play_phase(bot, args):
     return got
 
 
+# --- the follow-ups scenario: effects, weather, title, boss bar, equipment, metadata, death and respawn -----------------------
+# Every packet layout checked here is the HAND-LAID one of src/protocol/bedrock/client/play_extra.aowl (no real client has
+# read them): the bot proves the server writes them as laid out, not that a real Bedrock client accepts them.
+
+def gather(bot, seconds):
+    """Every game packet that arrives in `seconds`, as (id, body)."""
+    out = []
+    end = time.time() + seconds
+    while time.time() < end:
+        try:
+            out.append(bot.next_game(0.3))
+        except Fail:
+            continue
+    return out
+
+
+def expect_packet(packets, what, pred):
+    ok = any(pred(pid, body) for pid, body in packets)
+    print(('  ok  ' if ok else 'FAIL  ') + what, flush=True)
+    if not ok:
+        SOFT_FAILS.append(what)
+    return ok
+
+
+def followups_phase(bot, args, got, runtime, start):
+    x, y, z = int(start[0]) + 2, int(start[1]) + 1, int(start[2])
+    rt = varuint(runtime)
+    # 1. effects: speed 2 for 30 s, then cleared
+    console('effect give %s minecraft:speed 30 1' % args.name.replace(' ', '_'))
+    pk = gather(bot, 2.0)
+    # MobEffect (28): runtime, event 1 add, effect 1 (speed) zigzag 2, amplifier 1 zigzag 2, particles
+    expect_packet(pk, 'MobEffect add for speed', lambda i, b: i == 28 and b.startswith(rt + bytes([1, 2, 2])))
+    console('effect clear %s' % args.name.replace(' ', '_'))
+    pk = gather(bot, 2.0)
+    expect_packet(pk, 'MobEffect remove', lambda i, b: i == 28 and b.startswith(rt + bytes([3, 2])))
+    # 2. weather
+    console('weather rain')
+    pk = gather(bot, 2.0)
+    expect_packet(pk, 'LevelEvent start rain (3001)', lambda i, b: i == 25 and b.startswith(bytes([0xf2, 0x2e])))
+    console('weather clear')
+    pk = gather(bot, 2.0)
+    expect_packet(pk, 'LevelEvent stop rain (3003)', lambda i, b: i == 25 and b.startswith(varuint(zigzag32(3003))))
+    # 3. title and action bar
+    console('title %s title {"text":"Hello"}' % args.name.replace(' ', '_'))
+    pk = gather(bot, 2.0)
+    expect_packet(pk, 'SetTitle (88) with the title text', lambda i, b: i == 88 and b.startswith(bytes([4]) + bstr('Hello')))
+    console('title %s actionbar {"text":"Bar"}' % args.name.replace(' ', '_'))
+    pk = gather(bot, 2.0)
+    expect_packet(pk, 'SetTitle action bar text', lambda i, b: i == 88 and b.startswith(bytes([8]) + bstr('Bar')))
+    # 4. boss bar
+    console('bossbar add bot:bar {"text":"Boss"}')
+    console('bossbar set bot:bar players %s' % args.name.replace(' ', '_'))
+    pk = gather(bot, 2.0)
+    expect_packet(pk, 'BossEvent (74) add', lambda i, b: i == 74)
+    # 5. a zombie in an iron helmet and sword (the Java equipment packet becomes MobEquipment 31 and MobArmorEquipment 32)
+    console('summon minecraft:zombie %d %d %d' % (x, y, z))
+    console('item replace entity @e[type=minecraft:zombie,limit=1] armor.head with minecraft:iron_helmet')
+    console('item replace entity @e[type=minecraft:zombie,limit=1] weapon.mainhand with minecraft:iron_sword')
+    pk = gather(bot, 3.0)
+    expect_packet(pk, 'MobArmorEquipment (32) for the zombie', lambda i, b: i == 32)
+    expect_packet(pk, 'MobEquipment (31) for the zombie', lambda i, b: i == 31)
+    # 6. a baby sheep with a name: SetActorData (39) carries the metadata
+    console("summon minecraft:sheep %d %d %d {Age:-24000,CustomName:'{\"text\":\"Dolly\"}',Color:5}" % (x + 1, y, z))
+    pk = gather(bot, 3.0)
+    expect_packet(pk, 'AddActor (13) or SetActorData (39) for the sheep', lambda i, b: i in (13, 39))
+    expect_packet(pk, 'the sheep name Dolly is in a packet', lambda i, b: i in (13, 39) and b'Dolly' in b)
+    # 7. death and respawn
+    console('kill %s' % args.name.replace(' ', '_'))
+    pk = gather(bot, 3.0)
+    expect_packet(pk, 'SetHealth (42) with health 0', lambda i, b: i == 42 and b == bytes([0]))
+    expect_packet(pk, 'ActorEvent (27) death animation', lambda i, b: i == 27 and b.startswith(rt + bytes([3])))
+    expect_packet(pk, 'UpdateAttributes (29) health 0', lambda i, b: i == 29 and b'minecraft:health' in b)
+    # PlayerAction (36): runtime, action 7 (respawn, zigzag 14), block pos 0 0 0, result pos 0 0 0, face 0
+    bot.send_game(36, rt + varuint(zigzag32(7)) + block_pos(0, 0, 0) + block_pos(0, 0, 0) + varuint(zigzag32(0)))
+    pk = gather(bot, 4.0)
+    expect_packet(pk, 'Respawn (45) searching for spawn', lambda i, b: i == 45 and len(b) == 12 + 1 + len(rt) and b[12] == 0)
+    expect_packet(pk, 'Respawn (45) ready to spawn', lambda i, b: i == 45 and b[12] == 1)
+    expect_packet(pk, 'MovePlayer (19) teleport to the spawn', lambda i, b: i == 19)
+    expect_packet(pk, 'SetHealth (42) back to 20', lambda i, b: i == 42 and b == bytes([40]))
+    # the client confirms (state 2); the server must stay up and answer a chat afterwards
+    bot.send_game(45, struct.pack('<fff', start[0], start[1], start[2]) + bytes([2]) + rt)
+    bot.send_game(9, bytes([0, 1, 1]) + bstr(args.name) + bstr('alive after respawn') + bstr('') + bstr('') + bytes([0]))
+    pk = gather(bot, 2.0)
+    expect_packet(pk, 'chat still answered after the respawn', lambda i, b: i == 9 and b'alive after respawn' in b)
+
+
+# --- the extended scenario: hotbar, inventory, place and break, a chest, forms ---------------------------------------------
+
+def container_names():
+    """The ContainerName ordinals, read from the server source's enum (the wire value is the ordinal)."""
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'src', 'protocol', 'bedrock', 'network_item.aowl')
+    names = {}
+    try:
+        text = open(path, encoding='utf-8').read()
+        block = text.split('ContainerName* = enum')[1].split('FullContainerName*')[0]
+        for i, line in enumerate(l.strip() for l in block.splitlines() if l.strip().startswith('cn')):
+            names[line] = i
+    except OSError:
+        pass
+    return names
+
+
+def varint(v):
+    return varuint(zigzag32(v))
+
+
+def read_varint(buf, pos):
+    v, pos = read_varuint(buf, pos)
+    return unzigzag(v), pos
+
+
+def block_pos(x, y, z):
+    return varint(x) + varint(y) + varint(z)
+
+
+def desc(item_id, count, aux=0, block_rid=0):
+    """A NetworkItemDescriptor as the server reads it (UseItem and MobEquipment)."""
+    if item_id == 0:
+        return varint(0)
+    return varint(item_id) + struct.pack('<H', count) + varuint(aux) + b'\x00' + varint(block_rid) + varuint(0)
+
+
+def read_stack(b, p):
+    """A NetworkItemStackDescriptor as the server writes it: id, count, aux, optional net id, block runtime id, extra data."""
+    item_id = struct.unpack('<h', b[p:p + 2])[0]
+    count = struct.unpack('<H', b[p + 2:p + 4])[0]
+    p += 4
+    aux, p = read_varuint(b, p)
+    has_net = b[p]
+    p += 1
+    if has_net:
+        _, p = read_varuint(b, p)
+        _, p = read_varuint(b, p)
+    rid, p = read_varuint(b, p)
+    n, p = read_varuint(b, p)
+    return (item_id, count), p + n
+
+
+def read_full_name(b, p):
+    name = b[p]
+    p += 1
+    dyn = b[p]
+    p += 1
+    if dyn:
+        p += 4
+    return name, p
+
+
+class Scene:
+    """What the bot has been told so far, kept up to date from the packets that arrive."""
+
+    def __init__(self, bot, runtime):
+        self.bot = bot
+        self.runtime = runtime
+        self.windows = {}      # window id -> {slot: (item id, count)}
+        self.slot_names = {}   # (window, slot) -> container name
+        self.blocks = []       # (x, y, z, runtime id) from UpdateBlock
+        self.opened = []       # (container id, type, (x, y, z))
+        self.closed = []
+        self.responses = []    # (request id, result)
+        self.forms = []        # (id, json)
+        self.texts = []
+        self.counts = {}
+        self.actors = []
+        self.cows = []
+        self.commands = 0
+        self.attributes = 0
+        self.crafting = 0
+        self.gamemode = None
+        self.abilities = 0
+
+    def take(self, pid, body):
+        self.counts[pid] = self.counts.get(pid, 0) + 1
+        try:
+            if pid == 49:
+                window, p = read_varuint(body, 0)
+                n, p = read_varuint(body, p)
+                slots = {}
+                for i in range(n):
+                    st, p = read_stack(body, p)
+                    slots[i] = st
+                self.windows[window] = slots
+            elif pid == 50:
+                window, p = read_varuint(body, 0)
+                slot, p = read_varuint(body, p)
+                if body[p]:
+                    name, p = read_full_name(body, p + 1)
+                    self.slot_names[(window, slot)] = name
+                else:
+                    p += 1
+                if body[p]:
+                    _, p = read_stack(body, p + 1)
+                else:
+                    p += 1
+                st, p = read_stack(body, p)
+                self.windows.setdefault(window, {})[slot] = st
+            elif pid == 21:
+                x, p = read_varint(body, 0)
+                y, p = read_varint(body, p)
+                z, p = read_varint(body, p)
+                rid, p = read_varuint(body, p)
+                self.blocks.append((x, y, z, rid))
+            elif pid == 46:
+                cid, ctype = body[0], body[1]
+                x, p = read_varint(body, 2)
+                y, p = read_varint(body, p)
+                z, p = read_varint(body, p)
+                self.opened.append((cid, ctype, (x, y, z)))
+            elif pid == 47:
+                self.closed.append((body[0], body[1], body[2]))
+            elif pid == 148:
+                n, p = read_varuint(body, 0)
+                for _ in range(n):
+                    result = body[p]
+                    p += 1
+                    rid, p = read_varint(body, p)
+                    self.responses.append((rid, result))
+                    if result == 0:
+                        infos, p = read_varuint(body, p)
+                        for _ in range(infos):
+                            _, p = read_full_name(body, p)
+                            slots, p = read_varuint(body, p)
+                            for _ in range(slots):
+                                p += 3
+                                _, p = read_varint(body, p)
+                                for _ in range(2):
+                                    ln, p = read_varuint(body, p)
+                                    p += ln
+                                _, p = read_varint(body, p)
+            elif pid == 100:
+                fid, p = read_varint(body, 0)
+                ln, p = read_varuint(body, p)
+                self.forms.append((fid, body[p:p + ln].decode()))
+            elif pid == 9:
+                self.texts.append(body)
+            elif pid == 62:
+                self.gamemode = unzigzag(read_varuint(body, 0)[0])
+            elif pid == 76:
+                self.commands += 1
+            elif pid == 29:
+                self.attributes += 1
+            elif pid == 52:
+                self.crafting += 1
+            elif pid == 187:
+                self.abilities += 1
+            elif pid == 13:
+                self.actors.append(pid)
+                _, p = read_varint(body, 0)
+                rid, p = read_varuint(body, p)
+                ln, p = read_varuint(body, p)
+                if body[p:p + ln] == b'minecraft:cow':
+                    self.cows.append(rid)
+            elif pid == 15:
+                self.actors.append(pid)
+        except (IndexError, struct.error) as e:
+            raise Fail('could not parse packet %d (%d bytes): %r' % (pid, len(body), e))
+
+    def pump(self, seconds):
+        end = time.time() + seconds
+        while time.time() < end:
+            try:
+                self.bot.next_game(min(0.3, max(0.05, end - time.time())))
+            except Fail:
+                continue
+
+    def wait_for(self, what, pred, seconds=6.0):
+        end = time.time() + seconds
+        while time.time() < end:
+            if pred():
+                return True
+            self.pump(0.2)
+        raise Fail('timed out waiting for %s (packets seen: %s)' % (what, sorted(self.counts.items())))
+
+
+SOFT_FAILS = []
+
+
+def soft_wait(scene, what, pred, seconds=6.0):
+    """Like wait_for, but a miss is recorded and the scenario goes on (the exit status still says it failed)."""
+    try:
+        scene.wait_for(what, pred, seconds)
+        print('  ok  ' + what, flush=True)
+        return True
+    except Fail as e:
+        print('FAIL  ' + str(e), flush=True)
+        SOFT_FAILS.append(str(e))
+        return False
+
+
+def console(cmd):
+    """Asks the driver to run a server console command (its answer goes to the server log)."""
+    print('@console ' + cmd, flush=True)
+    time.sleep(1.6)
+
+
+def use_item_transaction(action, pos, face, hotbar_slot, item, player_pos, click):
+    body = varint(0) + b'\x00' + b'\x01' + varuint(2) + b'\x01' + b'\x00'
+    body += varuint(action) + b'\x00' + block_pos(*pos) + bytes([face]) + varint(hotbar_slot) + item
+    body += struct.pack('<fff', *player_pos) + struct.pack('<fff', *click) + varuint(0) + b'\x00\x00'
+    return body
+
+
+def extended_phase(bot, args, got, runtime, start):
+    """Runs after the join, the walk and the chat. Every step asserts something the server did, and the driver checks the
+    server's own view (`@console` lines are run by tools/runbedrockfull.py, `@expect` lines are looked for in its log)."""
+    names = container_names()
+    scene = bot.scene
+    scene.runtime = runtime
+    scene.pump(1.5)
+    check(scene.windows.get(0) is not None and len(scene.windows[0]) == 36, 'InventoryContent (49) for window 0 holds 36 slots')
+    check(scene.crafting >= 1, 'CraftingData (52) came with the join (%d)' % scene.crafting)
+    check(scene.attributes >= 1, 'UpdateAttributes (29) came with the join (%d)' % scene.attributes)
+    check(scene.commands >= 1, 'AvailableCommands (76) came with the join (%d)' % scene.commands)
+    check(scene.abilities >= 1, 'UpdateAbilities (187) came with the join (%d)' % scene.abilities)
+    check(120 in scene.windows and len(scene.windows[120]) == 4 and 119 in scene.windows, 'armor (120) and offhand (119) contents')
+
+    # hotbar
+    bot.send_game(31, varuint(runtime) + varint(0) + bytes([5, 5, 0]))
+    scene.pump(0.5)
+    console('data get entity Bot_Steve')
+    print('@expect SelectedItemSlot: 5', flush=True)
+    print('      hotbar slot 5 selected', flush=True)
+
+    # a form, when the server was asked to send one
+    if args.form:
+        scene.wait_for('ModalFormRequest (100)', lambda: scene.forms, 6.0)
+        fid, text = scene.forms[0]
+        check('"modal"' in text, 'form %d is the modal form: %s' % (fid, text[:60]))
+        bot.send_game(101, varint(fid) + b'\x01' + bstr('true'))
+        print('@expect Bedrock form %d answered by Bot_Steve: true' % fid, flush=True)
+        scene.pump(1.0)
+
+    # the server gives the player stone: the inventory comes down as Bedrock inventory content
+    console('give Bot_Steve minecraft:stone 64')
+    scene.pump(1.5)
+    stone = [(i, st) for i, st in scene.windows[0].items() if st[0] != 0 and st[1] == 64]
+    check(stone, 'the Java give shows in the Bedrock inventory (window 0): %s' % scene.windows[0])
+    slot, (item_id, count) = stone[0]
+    print('      stone is item %d in slot %d' % (item_id, slot), flush=True)
+
+    # creative: pick from the creative menu into the hotbar through an ItemStackRequest
+    console('gamemode creative Bot_Steve')
+    scene.pump(0.8)
+    check(scene.gamemode == 1, 'SetPlayerGameType (62) says creative: %r' % scene.gamemode)
+    hot = names.get('cnHotBar', 28)
+    created = names.get('cnCreatedOutput', 59)
+    request_id = -3
+    action_craft = bytes([14]) + varuint(1) + bytes([1])
+    slot_info = lambda name, slot_id: bytes([name, 0, slot_id]) + varint(0)
+    action_take = bytes([0, 16]) + slot_info(created, 50) + slot_info(hot, 8)
+    bot.send_game(147, varuint(1) + varint(request_id) + varuint(2) + action_craft + action_take + varuint(0) + struct.pack('<i', 0))
+    scene.wait_for('ItemStackResponse (148)', lambda: any(r[0] == request_id for r in scene.responses), 4.0)
+    check((request_id, 0) in scene.responses, 'creative pick: ItemStackResponse success for request %d' % request_id)
+    scene.pump(1.0)
+    check(scene.windows[0][8][0] != 0, 'the picked item sits in hotbar slot 8: %r' % (scene.windows[0][8],))
+    console('data get entity Bot_Steve')
+    print('@expect Slot: 8b', flush=True)
+
+    # place a block: the stone, on the block under the feet two blocks along +x
+    feet_y = math.floor(start[1] - 1.62 + 0.001)
+    px, pz = math.floor(start[0] + 2.0) + 3, math.floor(start[2])
+    target = (px, feet_y - 1, pz)
+    console('setblock %d %d %d minecraft:stone' % target)
+    console('setblock %d %d %d minecraft:air' % (px, feet_y, pz))
+    scene.blocks.clear()
+    held = stone[0][0]
+    if held < 9:
+        bot.send_game(31, varuint(runtime) + varint(0) + bytes([held, held, 0]))
+        scene.pump(0.3)
+    use = use_item_transaction(0, target, 1, held if held < 9 else 0, desc(item_id, 64), (start[0] + 2.0, start[1], start[2]), (0.5, 1.0, 0.5))
+    bot.send_game(30, use)
+    soft_wait(scene, 'an UpdateBlock for the placed block', lambda: any((b[0], b[1], b[2]) == (px, feet_y, pz) for b in scene.blocks), 8.0)
+    placed = [b for b in scene.blocks if (b[0], b[1], b[2]) == (px, feet_y, pz)]
+    print('      block updates after the click: %s' % scene.blocks[:4], flush=True)
+    check(placed, 'UpdateBlock (21) for the block placed at %s' % ((px, feet_y, pz),))
+    placed_rid = placed[-1][3] if placed else -1
+
+    # break it: StartBreak in creative is instant
+    scene.blocks.clear()
+    bot.send_game(36, varint(runtime) + varint(0) + block_pos(px, feet_y, pz) + block_pos(px, feet_y, pz) + varint(1))
+    soft_wait(scene, 'an UpdateBlock for the broken block', lambda: any((b[0], b[1], b[2]) == (px, feet_y, pz) for b in scene.blocks), 8.0)
+    broken = [b for b in scene.blocks if (b[0], b[1], b[2]) == (px, feet_y, pz)]
+    check(broken and broken[-1][3] != placed_rid, 'UpdateBlock (21) for the block broken at %s: %s' % ((px, feet_y, pz), broken))
+
+    # a chest: opened with an empty hand, taken from, closed again
+    cx, cy, cz = px, feet_y, pz + 2
+    console('setblock %d %d %d minecraft:chest' % (cx, cy, cz))
+    scene.opened.clear()
+    scene.pump(0.5)
+    bot.send_game(30, use_item_transaction(0, (cx, cy, cz), 1, 8, desc(0, 0), (cx - 1.0, start[1], cz), (0.5, 1.0, 0.5)))
+    scene.wait_for('ContainerOpen (46)', lambda: scene.opened, 6.0)
+    cid, ctype, cpos = scene.opened[0]
+    check(ctype == 0 and cpos == (cx, cy, cz), 'ContainerOpen (46): chest window %d at %s' % (cid, cpos))
+    scene.pump(1.0)
+    chest = scene.windows.get(cid, {})
+    check(len(chest) == 27, 'the chest has 27 slots: %d' % len(chest))
+    level = names.get('cnLevelEntity', 7)
+    picked = scene.windows[0][8]
+    check(picked[0] != 0 and picked[1] >= 2, 'the creative pick in hotbar 8 can be shared: %r' % (picked,))
+    # put 2 of the picked item into chest slot 0, over the container protocol
+    bot.send_game(147, varuint(1) + varint(-4) + varuint(1) + bytes([1, 2]) + slot_info(hot, 8) + slot_info(level, 0)
+                  + varuint(0) + struct.pack('<i', 0))
+    scene.wait_for('ItemStackResponse (148)', lambda: any(r[0] == -4 for r in scene.responses), 4.0)
+    check((-4, 0) in scene.responses, 'placing 2 items into the chest: ItemStackResponse success')
+    # close and open again: the chest keeps them (the contents come from the server's own container)
+    bot.send_game(47, bytes([cid, ctype, 0]))
+    scene.wait_for('ContainerClose echo', lambda: scene.closed, 4.0)
+    scene.closed.clear()
+    scene.opened.clear()
+    bot.send_game(30, use_item_transaction(0, (cx, cy, cz), 1, 8, desc(0, 0), (cx - 1.0, start[1], cz), (0.5, 1.0, 0.5)))
+    scene.wait_for('ContainerOpen (46) again', lambda: scene.opened, 6.0)
+    cid, ctype, cpos = scene.opened[0]
+    scene.pump(1.0)
+    chest = scene.windows.get(cid, {})
+    check(chest.get(0, (0, 0)) == (picked[0], 2), 'the chest kept 2 of the item in slot 0: %r' % (chest.get(0),))
+    # take them back out into hotbar slot 7
+    bot.send_game(147, varuint(1) + varint(-5) + varuint(1) + bytes([0, 2]) + slot_info(level, 0) + slot_info(hot, 7)
+                  + varuint(0) + struct.pack('<i', 0))
+    scene.wait_for('ItemStackResponse (148)', lambda: any(r[0] == -5 for r in scene.responses), 4.0)
+    check((-5, 0) in scene.responses, 'taking the items out of the chest: ItemStackResponse success')
+    console('data get entity Bot_Steve')
+    print('@expect Slot: 7b', flush=True)
+    bot.send_game(47, bytes([cid, ctype, 0]))
+    scene.wait_for('ContainerClose echo', lambda: scene.closed, 4.0)
+    check(scene.closed[0][0] == cid, 'ContainerClose (47) answered for window %d' % cid)
+
+    # the inventory screen: Interaction OpenInventory, then close
+    scene.opened.clear()
+    scene.closed.clear()
+    bot.send_game(33, bytes([6]) + varuint(0) + b'\x00')
+    scene.wait_for('ContainerOpen (46) for the inventory', lambda: scene.opened, 4.0)
+    check(scene.opened[0][:2] == (0, 255), 'OpenInventory answered with ContainerOpen of window 0, type 255: %r' % (scene.opened[0],))
+    bot.send_game(47, bytes([0, 255, 0]))
+    scene.wait_for('ContainerClose echo', lambda: scene.closed, 4.0)
+
+    # block pick: the stone under the player goes to hotbar slot 4 (creative takes it from nothing)
+    scene.counts[48] = 0
+    bot.send_game(34, block_pos(px, feet_y - 1, pz) + b'\x00' + bytes([4]))
+    scene.wait_for('PlayerHotbar (48) after the block pick', lambda: scene.counts.get(48, 0) >= 1, 4.0)
+    scene.pump(0.5)
+    check(scene.windows[0][4][0] != 0, 'the picked block sits in hotbar slot 4: %r' % (scene.windows[0][4],))
+
+    # an emote: the server must keep the connection (nobody else is there to see it)
+    bot.send_game(138, varuint(runtime) + bstr('emote-1') + struct.pack('<I', 5) + bstr('') + bstr('') + bytes([0]))
+    scene.pump(0.5)
+
+    # a legacy world action: dropping one of the stone makes an item entity, which arrives as AddItemActor (15)
+    scene.actors.clear()
+    drop = varint(0) + b'\x00' + b'\x01' + varuint(0) + b'\x01' + b'\x01' + varuint(1)
+    drop += varuint(2) + varuint(0) + varuint(0) + desc(0, 0) + desc(item_id, 1)
+    bot.send_game(30, drop)
+    soft_wait(scene, 'AddItemActor (15) for the dropped stone', lambda: 15 in scene.actors, 6.0)
+
+    # a cow: AddActor (13) with its type, hit with a UseItemOnEntity attack
+    scene.actors.clear()
+    console('summon minecraft:cow %d %d %d' % (px - 6, feet_y, pz))
+    if soft_wait(scene, 'AddActor (13) for the cow', lambda: scene.cows, 6.0):
+        cow = scene.cows[0]
+        print('      cow runtime id %d' % cow, flush=True)
+    else:
+        cow = 0
+    attack = varint(0) + b'\x00' + b'\x01' + varuint(3) + b'\x01' + b'\x00'
+    attack += varuint(cow) + varuint(1) + varint(0) + desc(0, 0) + struct.pack('<fff', 0, 0, 0) + struct.pack('<fff', 0, 0, 0)
+    bot.send_game(30, attack)
+    scene.pump(1.0)
+    console('list')
+    print('@expect There are 1 of a max of 1000 players online: Bot_Steve', flush=True)
+
+    # PlayerAction DropItem
+    bot.send_game(36, varint(runtime) + varint(4) + block_pos(0, 0, 0) + block_pos(0, 0, 0) + varint(0))
+    scene.pump(1.0)
+    got['scene'] = scene
+    if SOFT_FAILS:
+        raise Fail('%d step(s) failed: %s' % (len(SOFT_FAILS), '; '.join(SOFT_FAILS)))
+    return scene
+
+
 def run(args):
     self_test_aes()
     bot = Bot(args.host, args.port, args.name, not args.no_encrypt)
@@ -566,7 +1062,23 @@ def run(args):
 
     # 1. unconnected ping
     ping_time = 0x0102030405
-    d = bot.offline(b'\x01' + struct.pack('>Q', ping_time) + MAGIC + struct.pack('>Q', bot.guid))
+    ping = b'\x01' + struct.pack('>Q', ping_time) + MAGIC + struct.pack('>Q', bot.guid)
+    d = None
+    for attempt in range(6):
+        # a busy server (a Java player joining) can answer late: ask again before giving up
+        try:
+            d = bot.offline(ping, 3.0)
+            break
+        except socket.timeout:
+            continue
+    if d is None:
+        raise Fail('no answer to the unconnected ping')
+    bot.sock.settimeout(0.5)
+    try:
+        while True:
+            bot.sock.recvfrom(4096)     # the late answers to the repeated pings
+    except socket.timeout:
+        pass
     check(d[0] == 0x1C, 'unconnected pong id 0x1c')
     check(struct.unpack('>Q', d[1:9])[0] == ping_time, 'pong echoes the ping time (big-endian)')
     server_guid = struct.unpack('>Q', d[9:17])[0]
@@ -631,7 +1143,17 @@ def run(args):
     payload = b64(json.dumps({'cpk': pub_b64, 'xname': args.name, 'xid': '2535400000000042', 'exp': int(time.time()) + 3600,
                               'iss': 'bot'}, separators=(',', ':')).encode(), True, False)
     token = header + '.' + payload + '.' + b64(ecdsa_sign(key, (header + '.' + payload).encode()), True, False)
-    identity = json.dumps({'AuthenticationType': 2, 'Token': token, 'Certificate': ''}, separators=(',', ':')).encode()
+    auth_type = 2
+    if args.oidc_key:
+        # online mode: an OIDC token signed by the key the driver published in its local JWKS (the Xbox keys cannot be had offline)
+        oidc_header = b64(json.dumps({'alg': 'ES384', 'kid': args.oidc_kid, 'typ': 'JWT'}, separators=(',', ':')).encode(), True, False)
+        oidc_payload = b64(json.dumps({'iss': args.oidc_issuer, 'aud': 'api://auth-minecraft-services/multiplayer', 'cpk': pub_b64,
+                                       'xname': args.name, 'xid': '2535400000000042', 'exp': int(time.time()) + 3600},
+                                      separators=(',', ':')).encode(), True, False)
+        oidc_sig = b64(ecdsa_sign(int(args.oidc_key, 16), (oidc_header + '.' + oidc_payload).encode()), True, False)
+        token = oidc_header + '.' + oidc_payload + '.' + oidc_sig
+        auth_type = 0
+    identity = json.dumps({'AuthenticationType': auth_type, 'Token': token, 'Certificate': ''}, separators=(',', ':')).encode()
     client_data = json.dumps({'ClientRandomId': -1234567890123, 'DeviceOS': 7, 'DeviceId': 'bot-1', 'GameVersion': '1.26.30',
                               'LanguageCode': 'en_US', 'CurrentInputMode': 1, 'DefaultInputMode': 1, 'UIProfile': 0,
                               'ServerAddress': '%s:%d' % (args.host, args.port), 'MaxViewDistance': 8},
@@ -726,6 +1248,12 @@ def main():
     ap.add_argument('--y', type=float, default=None)
     ap.add_argument('--z', type=float, default=None)
     ap.add_argument('--expect-full', action='store_true')
+    ap.add_argument('--oidc-key', default='', help='hex scalar of the key the local JWKS publishes: log in with AuthenticationType 0')
+    ap.add_argument('--oidc-kid', default='')
+    ap.add_argument('--oidc-issuer', default='')
+    ap.add_argument('--extended', action='store_true', help='with --play: hotbar, inventory, place and break, chest, form (see extended_phase)')
+    ap.add_argument('--followups', action='store_true', help='with --play: effects, weather, title, boss bar, equipment, metadata, death and respawn (see followups_phase)')
+    ap.add_argument('--form', action='store_true', help='with --extended: the server was started to send a form (PUMPKIN_BEDROCK_TEST_FORM)')
     args = ap.parse_args()
     try:
         return run(args)

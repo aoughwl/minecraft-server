@@ -1,0 +1,130 @@
+## Port of pumpkin-protocol/src/bedrock/server/inventory_transaction.rs as the NEWER upstream tree (../ref/pumpkin) reads it.
+##
+## WHAT THIS IS AND IS NOT. The server speaks Bedrock protocol 1001 (1.26.30) and refuses any other protocol at the login
+## (bedrocklogin.aowl), so nothing here is reached by a 1001 client. The newer upstream tree is protocol 2225 (1.26.60); its
+## `inventory_transaction.rs` tests hold bytes captured from a REAL client, in two generations:
+##   - `tlV1_26_40`: upstream commit cfef83339 (2026-08-16, "Fix Bedrock use item transactions", 1.26.40). Proven by those
+##     captured bytes: after the transaction type a has-data bool and then the action count; each action has `bool && bool`
+##     guards around the window id and the source flags; items are the i16 form of network_item.aowl's `packetReadV2`.
+##   - `tlLatest`: the same packets re-captured on the 1.26.60 tree (commit 2709e8b7a): no has-type / has-data bools, the
+##     action count follows the type directly, one `bool` guards the window id (an i8) and one the flags, and a use-item
+##     transaction has a hand byte (0 main, 1 off) after the hot bar slot.
+## Neither is proven for 1001. The pinned 1001 layout in inventory_transaction.aowl stays what the server reads: nothing on
+## this machine holds a 1001 capture, and the 1.26.40 update (upstream f2444bcef) rewrote the item and transaction layouts, so
+## the captures say the layout CHANGED after 1001, not that the pinned 1001 one is wrong. The block position is a ZigZag
+## VarInt on each axis in both captures (y 0x80 0x01 is 64, with the player at y 65.6): the same as the 1001 reader.
+## GUESSED (no capture): the use-item-on-entity and release-item payloads, which are read here with the field order of the
+## 1001 reader and the later item form.
+##
+## The known-answer tests (inventory_transaction_v2test.aowl) run the four captured payloads.
+
+import std/options
+import ../../protobase, ../../netcodec, ../../serial, ../../varint
+import ../../../util/math/position
+import ../../../util/vector3
+import ../network_item
+import inventory_transaction
+
+type
+  TransactionLayout* = enum
+    tlV1_26_40
+    tlLatest
+
+proc readActionV2(r: var NetReader; layout: TransactionLayout): ProtoReadResult[InventoryAction] =
+  let sourceType = tryRead(InventoryAction, packetRead(VarUInt, r)).value
+  var windowId = none[int32]()
+  var sourceFlags = none[uint32]()
+  var haveWindow = tryRead(InventoryAction, packetRead(bool, r))
+  if layout == tlV1_26_40 and haveWindow:
+    haveWindow = tryRead(InventoryAction, packetRead(bool, r)) # `bool::read && bool::read`
+  if haveWindow:
+    windowId = some(int32(tryRead(InventoryAction, packetRead(int8, r))))
+  var haveFlags = tryRead(InventoryAction, packetRead(bool, r))
+  if layout == tlV1_26_40 and haveFlags:
+    haveFlags = tryRead(InventoryAction, packetRead(bool, r))
+  if haveFlags:
+    sourceFlags = some(tryRead(InventoryAction, packetRead(VarUInt, r)).value)
+  let slot = tryRead(InventoryAction, packetRead(VarUInt, r)).value
+  let oldItem = tryRead(InventoryAction, packetReadV2(NetworkItemDescriptor, r))
+  let newItem = tryRead(InventoryAction, packetReadV2(NetworkItemDescriptor, r))
+  readOk(InventoryAction(sourceType: sourceType, windowId: windowId, sourceFlags: sourceFlags, inventorySlot: slot,
+    oldItem: oldItem, newItem: newItem))
+
+proc readVec3(r: var NetReader): ProtoReadResult[Vector3[float32]] =
+  packetRead(Vector3[float32], r)
+
+proc packetReadInventoryTransactionV2*(r: var NetReader; layout: TransactionLayout): ProtoReadResult[SInventoryTransaction] =
+  ## Reads a transaction of the later protocols; see the header for what is captured and what is guessed.
+  let legacyRequestId = tryRead(SInventoryTransaction, packetRead(VarInt, r))
+  var legacy: seq[LegacySetItemSlot] = @[]
+  if tryRead(SInventoryTransaction, packetRead(bool, r)):
+    let n = tryRead(SInventoryTransaction, packetRead(VarUInt, r)).value
+    var i = 0'u32
+    while i < n:
+      legacy.add(tryRead(SInventoryTransaction, packetRead(LegacySetItemSlot, r)))
+      i += 1'u32
+  if layout == tlV1_26_40:
+    if not tryRead(SInventoryTransaction, packetRead(bool, r)):
+      return readErr[SInventoryTransaction](messageRead("missing inventory transaction type"))
+  let transactionType = tryRead(SInventoryTransaction, packetRead(VarUInt, r))
+  if layout == tlV1_26_40:
+    if not tryRead(SInventoryTransaction, packetRead(bool, r)):
+      return readErr[SInventoryTransaction](messageRead("missing inventory action data"))
+  let n = tryRead(SInventoryTransaction, packetRead(VarUInt, r)).value
+  if n > 1024'u32:
+    return readErr[SInventoryTransaction](messageRead("inventory actions length exceeds 1024"))
+  var actions: seq[InventoryAction] = @[]
+  var i = 0'u32
+  while i < n:
+    actions.add(tryRead(SInventoryTransaction, readActionV2(r, layout)))
+    i += 1'u32
+  var data: TransactionData
+  case transactionType.value
+  of 0'u32:
+    data = TransactionData(kind: tdNormal, normal: NormalTransactionData())
+  of 1'u32:
+    data = TransactionData(kind: tdMismatch, mismatch: MismatchTransactionData())
+  of 2'u32:
+    let actionType = tryRead(SInventoryTransaction, packetRead(VarInt, r))
+    let triggerType = tryRead(SInventoryTransaction, packetRead(uint8, r))
+    let pos = tryRead(SInventoryTransaction, packetRead(BlockPos, r))
+    let face = tryRead(SInventoryTransaction, packetRead(uint8, r))
+    let hotBar = tryRead(SInventoryTransaction, packetRead(VarInt, r))
+    var hand = 0'u8
+    if layout == tlLatest:
+      hand = tryRead(SInventoryTransaction, packetRead(uint8, r))
+    let item = tryRead(SInventoryTransaction, packetReadV2(NetworkItemDescriptor, r))
+    let playerPos = tryRead(SInventoryTransaction, readVec3(r))
+    let clickPos = tryRead(SInventoryTransaction, readVec3(r))
+    let blockRuntimeId = tryRead(SInventoryTransaction, packetRead(VarUInt, r))
+    let prediction = tryRead(SInventoryTransaction, packetRead(uint8, r))
+    let cooldown = tryRead(SInventoryTransaction, packetRead(uint8, r))
+    data = TransactionData(kind: tdUseItem, useItem: UseItemTransactionData(actionType: newVarUInt(uint32(actionType.value)),
+      triggerType: triggerType, blockPosition: pos, blockFace: int32(face), hotBarSlot: hotBar, itemInHand: item,
+      playerPosition: playerPos, clickPosition: clickPos, blockRuntimeId: blockRuntimeId, clientPrediction: prediction,
+      clientCooldownState: cooldown, hand: hand))
+  of 3'u32:
+    let target = tryRead(SInventoryTransaction, packetRead(VarULong, r))
+    let actionType = tryRead(SInventoryTransaction, packetRead(VarInt, r))
+    let hotBar = tryRead(SInventoryTransaction, packetRead(VarInt, r))
+    if layout == tlLatest:
+      discard tryRead(SInventoryTransaction, packetRead(uint8, r))
+    let item = tryRead(SInventoryTransaction, packetReadV2(NetworkItemDescriptor, r))
+    let playerPos = tryRead(SInventoryTransaction, readVec3(r))
+    let clickPos = tryRead(SInventoryTransaction, readVec3(r))
+    data = TransactionData(kind: tdUseItemOnEntity, useItemOnEntity: UseItemOnEntityTransactionData(
+      targetEntityRuntimeId: target, actionType: newVarUInt(uint32(actionType.value)), hotBarSlot: hotBar, itemInHand: item,
+      playerPosition: playerPos, clickPosition: clickPos))
+  of 4'u32:
+    let actionType = tryRead(SInventoryTransaction, packetRead(VarInt, r))
+    let hotBar = tryRead(SInventoryTransaction, packetRead(VarInt, r))
+    let item = tryRead(SInventoryTransaction, packetReadV2(NetworkItemDescriptor, r))
+    let head = tryRead(SInventoryTransaction, readVec3(r))
+    if layout == tlLatest:
+      discard tryRead(SInventoryTransaction, packetRead(uint8, r))
+    data = TransactionData(kind: tdReleaseItem, releaseItem: ReleaseItemTransactionData(
+      actionType: newVarUInt(uint32(actionType.value)), hotBarSlot: hotBar, itemInHand: item, headPosition: head))
+  else:
+    return readErr[SInventoryTransaction](messageRead("Unknown inventory transaction type: " & $transactionType.value))
+  readOk(SInventoryTransaction(legacyRequestId: legacyRequestId, legacySetItemSlots: legacy, hasValue: actions.len > 0,
+    actions: actions, transactionType: transactionType, transactionData: data))

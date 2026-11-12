@@ -1,0 +1,554 @@
+## Port of pumpkin/src/net/bedrock/play.rs: `handle_inventory_action` (the legacy slot moves and drops, the world and
+## container actions), `handle_item_stack_request` with its `map_bedrock_container_slot`, `record_update`, `get_slot_stack`
+## and `update_slot_stack`, `handle_block_pick_request`, `handle_interaction`, `handle_container_close` and the
+## `CContainerOpen` half of `Player::open_handled_screen` (pumpkin/src/entity/player.rs).
+##
+## This is the part that needs no `Player`: it works on the screen handler and an `InventoryPlayer`, so a test can run it with
+## the inventory test kit. bedrockinvplay.aowl is the rest (block pick, interaction, closing), on a real `Player`.
+## The Java screen handler is the one truth, as for a Java player; what a Bedrock client does to a container is applied to its
+## slots here, and what the server does to them reaches the client through `sendInventory` / `sendOpenContainer`.
+## PARTIAL: pumpkin/src/net/bedrock/play.rs - the item stack ids of `ItemStackResponse` are echoed from the request as upstream does (the server keeps no Bedrock stack id table); the `Create`, `Optional`, `Grindstone`, `Loom`, `BeaconPayment`, `MineBlock` and `LabTableCombine` request actions are the no-ops that upstream has.
+
+{.feature: "untyped".}
+
+import std/[options]
+import ../../../protocol/[protobase, proto, netcodec, serial, varint]
+import ../../../protocol/bedrock/[bedrockmod, network_item]
+import ../../../protocol/bedrock/client/[inventory_content, inventory_slot, item_stack_response, container_open]
+import ../../../protocol/bedrock/server/[inventory_transaction, item_stack_request]
+import ../../../generated/[screen, item_full, bedrock_creative]
+import "../../../data/item_stack/mod"
+import ../../../inventory/[screenhandler, slot, inventory, player_inventory, entity_equipment]
+import ../../../util/math/position
+import ../../logging
+import bedrockclient
+
+const InvTarget = "pumpkin::net::bedrock::play"
+
+type
+  SlotUpdate* = object
+    containerName*: FullContainerName
+    slotId*: uint8
+    count*: uint8
+    stackId*: VarInt
+
+proc plainName(n: ContainerName): FullContainerName =
+  FullContainerName(containerName: n, dynamicId: none[uint32]())
+
+proc sameContainer(a, b: FullContainerName): bool =
+  a.containerName == b.containerName and a.dynamicId == b.dynamicId
+
+# --- the stack mapping --------------------------------------------------------------------------------------------------
+
+proc descriptorToStack*(desc: NetworkItemDescriptor; isCreative: bool): ItemStack =
+  ## `descriptor_to_stack`: the client's item, as a Java stack. In creative the id is an index into the creative entries.
+  if desc.id.value == 0'i32 or desc.stackSize == 0'u16:
+    return emptyItemStack()
+  var mapped: nil JavaToBedrockItemMapping = nil
+  if isCreative:
+    let entries = creativeEntries()
+    let index = int(max(desc.id.value - 1'i32, 0'i32))
+    if index < entries.len:
+      let entry = entries[index]
+      mapped = JavaToBedrockItemMapping.fromBedrock(entry.itemId, entry.itemAuxValue)
+  if mapped == nil:
+    mapped = JavaToBedrockItemMapping.fromBedrock(int16(desc.id.value), desc.auxValue.value)
+  if mapped == nil:
+    warn("Failed to map bedrock item id " & $desc.id.value & " and data " & $desc.auxValue.value & " to Java item", InvTarget)
+    return emptyItemStack()
+  newItemStack(uint8(desc.stackSize), mapped.javaItem)
+
+proc bedrockContainerType*(w: WindowType): uint8 =
+  ## The `bedrock_window_type` of `open_handled_screen`.
+  case w
+  of wtCrafting: 1'u8
+  of wtFurnace: 2'u8
+  of wtEnchantment: 3'u8
+  of wtBrewingStand: 4'u8
+  of wtAnvil: 5'u8
+  of wtHopper: 8'u8
+  of wtBeacon: 13'u8
+  of wtBlastFurnace: 27'u8
+  of wtSmoker: 28'u8
+  of wtStonecutter: 29'u8
+  of wtCartographyTable: 30'u8
+  of wtGrindstone: 26'u8
+  of wtLoom: 24'u8
+  of wtSmithing: 34'u8
+  else: 0'u8
+
+proc isWindow(b: ScreenHandlerBehaviour; w: WindowType): bool =
+  b.windowType.isSome and b.windowType.unsafeGet == w
+
+proc isFurnaceLike(b: ScreenHandlerBehaviour): bool =
+  b.isWindow(wtFurnace) or b.isWindow(wtBlastFurnace) or b.isWindow(wtSmoker)
+
+proc containerCount*(b: ScreenHandlerBehaviour): int =
+  ## The slots of the window that are its own. Upstream's `container_slots` is set only by the GUI builder; a chest, a
+  ## furnace or an anvil leaves it 0, so there everything before the player's 36 slots is the container's.
+  if b.containerSlots > 0:
+    b.containerSlots
+  elif b.windowType.isSome:
+    max(0, b.slots.len - 36)
+  else:
+    0
+
+proc mapContainerSlot*(h: ScreenHandler; name: ContainerName; slotId: uint8): int =
+  ## `map_bedrock_container_slot`: the index in the handler's slots of a Bedrock container slot, -1 for none. (The armor and
+  ## the offhand are checked to be on the player's own screen: upstream maps them to 5-8 and 45 whatever the screen is.)
+  let b = h.getBehaviour()
+  let containerSlots = containerCount(b)
+  let isPlayerScreen = b.windowType.isNone
+  let id = int(slotId)
+  case name
+  of cnHotBar:
+    if isPlayerScreen: 36 + id else: containerSlots + 27 + id
+  of cnInventory, cnCombinedHotBarAndInventory:
+    if id < 9:
+      if isPlayerScreen: 36 + id else: containerSlots + 27 + id
+    elif id < 36:
+      if isPlayerScreen: id else: containerSlots + (id - 9)
+    else: -1
+  of cnArmor:
+    if isPlayerScreen and id < 4: 5 + id else: -1
+  of cnOffhand:
+    if isPlayerScreen and id == 0: 45 else: -1
+  of cnCursor: -1
+  of cnCraftingInput:
+    if isPlayerScreen:
+      if id < 4: 1 + id
+      elif id >= 28 and id < 32: 1 + (id - 28)
+      else: -1
+    elif b.isWindow(wtCrafting):
+      if id < 9: 1 + id
+      elif id >= 32 and id < 41: 1 + (id - 32)
+      else: -1
+    else: -1
+  of cnCraftingOutputPreview, cnCreatedOutput:
+    if isPlayerScreen: 0
+    elif b.windowType.isSome:
+      case b.windowType.unsafeGet
+      of wtCrafting: 0
+      of wtStonecutter: 1
+      of wtAnvil, wtFurnace, wtBlastFurnace, wtSmoker, wtGrindstone, wtMerchant: 2
+      of wtLoom, wtSmithing: 3
+      else: -1
+    else: -1
+  of cnAnvilInput: (if b.isWindow(wtAnvil): 0 else: -1)
+  of cnAnvilMaterial: (if b.isWindow(wtAnvil): 1 else: -1)
+  of cnAnvilResultPreview: (if b.isWindow(wtAnvil): 2 else: -1)
+  of cnBeaconPayment: (if b.isWindow(wtBeacon): 0 else: -1)
+  of cnBrewingStandResult: (if b.isWindow(wtBrewingStand) and id < 3: id else: -1)
+  of cnBrewingStandInput: (if b.isWindow(wtBrewingStand): 3 else: -1)
+  of cnBrewingStandFuel: (if b.isWindow(wtBrewingStand): 4 else: -1)
+  of cnFurnaceIngredient, cnBlastFurnaceIngredient, cnSmokerIngredient: (if b.isFurnaceLike(): 0 else: -1)
+  of cnFurnaceFuel: (if b.isFurnaceLike(): 1 else: -1)
+  of cnFurnaceResult: (if b.isFurnaceLike(): 2 else: -1)
+  of cnEnchantingInput: (if b.isWindow(wtEnchantment): 0 else: -1)
+  of cnEnchantingMaterial: (if b.isWindow(wtEnchantment): 1 else: -1)
+  of cnGrindstoneInput: (if b.isWindow(wtGrindstone): 0 else: -1)
+  of cnGrindstoneAdditional: (if b.isWindow(wtGrindstone): 1 else: -1)
+  of cnGrindstoneResultPreview: (if b.isWindow(wtGrindstone): 2 else: -1)
+  of cnLoomInput: (if b.isWindow(wtLoom): 0 else: -1)
+  of cnLoomDye: (if b.isWindow(wtLoom): 1 else: -1)
+  of cnLoomMaterial: (if b.isWindow(wtLoom): 2 else: -1)
+  of cnLoomResultPreview: (if b.isWindow(wtLoom): 3 else: -1)
+  of cnStonecutterInput: (if b.isWindow(wtStonecutter): 0 else: -1)
+  of cnStonecutterResultPreview: (if b.isWindow(wtStonecutter): 1 else: -1)
+  of cnCartographyInput: (if b.isWindow(wtCartographyTable): 0 else: -1)
+  of cnCartographyAdditional: (if b.isWindow(wtCartographyTable): 1 else: -1)
+  of cnCartographyResultPreview: (if b.isWindow(wtCartographyTable): 2 else: -1)
+  of cnSmithingTableTemplate: (if b.isWindow(wtSmithing): 0 else: -1)
+  of cnSmithingTableInput: (if b.isWindow(wtSmithing): 1 else: -1)
+  of cnSmithingTableMaterial: (if b.isWindow(wtSmithing): 2 else: -1)
+  of cnSmithingTableResultPreview: (if b.isWindow(wtSmithing): 3 else: -1)
+  of cnTradeIngredient1, cnTrade2Ingredient1: (if b.isWindow(wtMerchant): 0 else: -1)
+  of cnTradeIngredient2, cnTrade2Ingredient2: (if b.isWindow(wtMerchant): 1 else: -1)
+  of cnTradeResultPreview, cnTrade2ResultPreview: (if b.isWindow(wtMerchant): 2 else: -1)
+  else:
+    if id < containerSlots: id else: -1
+
+proc bedrockSlotOfContainer*(h: ScreenHandler; index: int): (ContainerName, uint8) =
+  ## The inverse of `mapContainerSlot` for a slot of the container part (what the server tells the client about a window it
+  ## opened): the Bedrock container name and slot.
+  let b = h.getBehaviour()
+  if b.windowType.isNone:
+    return (cnLevelEntity, uint8(index))
+  case b.windowType.unsafeGet
+  of wtCrafting:
+    if index == 0: (cnCreatedOutput, 0'u8) else: (cnCraftingInput, uint8(31 + index))
+  of wtFurnace: (case index
+    of 0: (cnFurnaceIngredient, 0'u8)
+    of 1: (cnFurnaceFuel, 0'u8)
+    else: (cnFurnaceResult, 0'u8))
+  of wtBlastFurnace: (case index
+    of 0: (cnBlastFurnaceIngredient, 0'u8)
+    of 1: (cnFurnaceFuel, 0'u8)
+    else: (cnFurnaceResult, 0'u8))
+  of wtSmoker: (case index
+    of 0: (cnSmokerIngredient, 0'u8)
+    of 1: (cnFurnaceFuel, 0'u8)
+    else: (cnFurnaceResult, 0'u8))
+  of wtAnvil: (case index
+    of 0: (cnAnvilInput, 0'u8)
+    of 1: (cnAnvilMaterial, 0'u8)
+    else: (cnAnvilResultPreview, 0'u8))
+  of wtEnchantment: (if index == 0: (cnEnchantingInput, 0'u8) else: (cnEnchantingMaterial, 0'u8))
+  of wtBrewingStand: (case index
+    of 3: (cnBrewingStandInput, 0'u8)
+    of 4: (cnBrewingStandFuel, 0'u8)
+    else: (cnBrewingStandResult, uint8(index)))
+  of wtBeacon: (cnBeaconPayment, 0'u8)
+  of wtGrindstone: (case index
+    of 0: (cnGrindstoneInput, 0'u8)
+    of 1: (cnGrindstoneAdditional, 0'u8)
+    else: (cnGrindstoneResultPreview, 0'u8))
+  of wtLoom: (case index
+    of 0: (cnLoomInput, 0'u8)
+    of 1: (cnLoomDye, 0'u8)
+    of 2: (cnLoomMaterial, 0'u8)
+    else: (cnLoomResultPreview, 0'u8))
+  of wtStonecutter: (if index == 0: (cnStonecutterInput, 0'u8) else: (cnStonecutterResultPreview, 0'u8))
+  of wtCartographyTable: (case index
+    of 0: (cnCartographyInput, 0'u8)
+    of 1: (cnCartographyAdditional, 0'u8)
+    else: (cnCartographyResultPreview, 0'u8))
+  of wtSmithing: (case index
+    of 0: (cnSmithingTableTemplate, 0'u8)
+    of 1: (cnSmithingTableInput, 0'u8)
+    of 2: (cnSmithingTableMaterial, 0'u8)
+    else: (cnSmithingTableResultPreview, 0'u8))
+  of wtMerchant: (case index
+    of 0: (cnTradeIngredient1, 0'u8)
+    of 1: (cnTradeIngredient2, 0'u8)
+    else: (cnTradeResultPreview, 0'u8))
+  of wtShulkerBox: (cnShulkerBox, uint8(index))
+  else: (cnLevelEntity, uint8(index))
+
+# --- what the client is told ------------------------------------------------------------------------------------------
+
+proc contentPacket(containerId: uint32; name: ContainerName; stacks: seq[ItemStack]): CInventoryContent =
+  var slots: seq[NetworkItemStackDescriptor] = @[]
+  for stack in stacks:
+    slots.add(networkItemStackDescriptorFromItemStack(stack))
+  CInventoryContent(containerId: newVarUInt(containerId), slots: slots, fullContainerName: plainName(name),
+    storageItem: defaultNetworkItemStackDescriptor())
+
+proc sendInventory*(client: BedrockClient; inv: PlayerInventory) =
+  ## The `CInventoryContent` upstream sends after every change: the main inventory (window 0), and here also the armor
+  ## (window 120) and the offhand (window 119) that upstream leaves for the Java-side equipment packets.
+  client.sendGamePacket(CInventoryContentPacketId, contentPacket(0'u32, cnInventory, inv.mainInventory))
+  let eq = inv.entityEquipment
+  client.sendGamePacket(CInventoryContentPacketId, contentPacket(120'u32, cnArmor,
+    @[eq.get(esHead), eq.get(esChest), eq.get(esLegs), eq.get(esFeet)]))
+  client.sendGamePacket(CInventoryContentPacketId, contentPacket(119'u32, cnOffhand, @[eq.get(esOffHand)]))
+
+proc sendCursor*(client: BedrockClient; handler: ScreenHandler) =
+  client.sendGamePacket(CInventoryContentPacketId, contentPacket(59'u32, cnCursor, @[handler.getBehaviour().cursorStack]))
+
+proc sendContainerSlots*(client: BedrockClient; handler: ScreenHandler) =
+  ## The container part of the open window (a window the server opened, or the server changed a slot of it).
+  let b = handler.getBehaviour()
+  if b.windowType.isNone:
+    return
+  for i in 0 ..< min(containerCount(b), b.slots.len):
+    let (name, slotId) = bedrockSlotOfContainer(handler, i)
+    client.sendGamePacket(CInventorySlotPacketId, CInventorySlot(windowId: newVarUInt(uint32(b.syncId)),
+      inventorySlot: newVarUInt(uint32(slotId)), containerName: some(plainName(name)),
+      storage: some(defaultNetworkItemStackDescriptor()),
+      item: networkItemStackDescriptorFromItemStack(b.slots[i].getClonedStack())))
+
+proc sendOpenContainer*(client: BedrockClient; handler: ScreenHandler; inv: PlayerInventory; pos: BlockPos) =
+  ## The `CContainerOpen` of `open_handled_screen`, then the container's slots (a window's contents are also a Java
+  ## `CSetContainerContent` upstream, whose Bedrock twin is the slot packets here).
+  let b = handler.getBehaviour()
+  if b.windowType.isNone:
+    return
+  client.sendGamePacket(CContainerOpenPacketId, CContainerOpen(containerId: b.syncId,
+    containerType: bedrockContainerType(b.windowType.unsafeGet), position: pos, targetEntityId: newVarLong(-1'i64)))
+  client.sendContainerSlots(handler)
+  client.sendInventory(inv)
+
+# --- slot access --------------------------------------------------------------------------------------------------------
+
+proc getSlotStack(h: ScreenHandler; info: ItemStackRequestSlotInfo; created: Option[ItemStack]): ItemStack =
+  ## `get_slot_stack`.
+  let name = info.containerName.containerName
+  if name == cnCreatedOutput and created.isSome:
+    return created.unsafeGet
+  if name == cnCursor:
+    let cursor = h.getBehaviour().cursorStack
+    if cursor.isEmpty() and created.isSome:
+      return created.unsafeGet
+    return cursor
+  let index = mapContainerSlot(h, name, info.slotId)
+  if index >= 0 and index < h.getBehaviour().slots.len:
+    h.getBehaviour().slots[index].getClonedStack()
+  else:
+    emptyItemStack()
+
+proc equipmentOfScreenSlot(slot: int): EquipmentSlot =
+  case slot
+  of 5: esHead
+  of 6: esChest
+  of 7: esLegs
+  else: esFeet
+
+proc updateSlotStack(ip: InventoryPlayer; mainHand: proc(stack: ItemStack) {.closure.}; h: ScreenHandler;
+    info: ItemStackRequestSlotInfo; newStack: ItemStack) =
+  ## `update_slot_stack`.
+  let b = h.getBehaviour()
+  if info.containerName.containerName == cnCursor:
+    b.cursorStack = newStack
+    return
+  let index = mapContainerSlot(h, info.containerName.containerName, info.slotId)
+  if index >= 0 and index < b.slots.len:
+    if b.windowType.isNone:
+      let current = b.slots[index].getClonedStack()
+      if not current.areItemsAndComponentsEqual(newStack):
+        if index >= 5 and index < 9:
+          ip.enqueueEquipmentChange(equipmentOfScreenSlot(index), newStack)
+        elif index >= 36 and index < 45:
+          if int(ip.getInventory().getSelectedSlot()) == index - 36:
+            mainHand(newStack)
+    b.slots[index].setStack(newStack)
+    h.setReceivedStack(index, newStack)
+
+proc recordUpdate(updates: var seq[SlotUpdate]; name: FullContainerName; slotId, count: uint8; stackId: VarInt) =
+  ## `record_update`.
+  let finalStackId = if count == 0'u8: newVarInt(0'i32) else: stackId
+  for i in 0 ..< updates.len:
+    if sameContainer(updates[i].containerName, name) and updates[i].slotId == slotId:
+      updates[i].count = count
+      updates[i].stackId = finalStackId
+      return
+  updates.add(SlotUpdate(containerName: name, slotId: slotId, count: count, stackId: finalStackId))
+
+proc responseOf(updates: seq[SlotUpdate]; status: uint8; requestId: VarInt): ItemStackResponse =
+  var infos: seq[ItemStackResponseContainerInfo] = @[]
+  if status == 0'u8:
+    for update in updates:
+      let slotInfo = ItemStackResponseSlotInfo(slot: update.slotId, hotbarSlot: update.slotId, count: update.count,
+        itemStackId: update.stackId, customName: "", filteredCustomName: "", durabilityCorrection: newVarInt(0'i32))
+      var found = false
+      for i in 0 ..< infos.len:
+        if sameContainer(infos[i].containerName, update.containerName):
+          infos[i].slots.add(slotInfo)
+          found = true
+          break
+      if not found:
+        infos.add(ItemStackResponseContainerInfo(containerName: update.containerName, slots: @[slotInfo]))
+  ItemStackResponse(result: status, requestId: requestId, containerInfos: infos)
+
+# --- handle_inventory_action --------------------------------------------------------------------------------------------
+
+proc mapWindowSlot(windowId: int32; slot: uint32): int =
+  ## `map_bedrock_slot_to_screen_handler`.
+  case windowId
+  of 0'i32:
+    if slot < 9'u32: int(slot) + 36
+    elif slot < 36'u32: int(slot)
+    else: -1
+  of 120'i32:
+    if slot < 4'u32: int(slot) + 5 else: -1
+  of 119'i32:
+    if slot == 0'u32: 45 else: -1
+  else: -1
+
+proc handleInventoryActions*(client: BedrockClient; ip: InventoryPlayer; handler: ScreenHandler;
+    mainHand: proc(stack: ItemStack) {.closure.}; packet: SInventoryTransaction): seq[SlotUpdate] =
+  ## The part of `handle_inventory_action` before the `match packet.transaction_data`: the legacy slots and the actions. The
+  ## updates are what the legacy response is made of.
+  var updates: seq[SlotUpdate] = @[]
+  var inventoryUpdated = false
+  if packet.actions.len == 0 and packet.legacyRequestId.value != 0'i32:
+    for legacySlot in packet.legacySetItemSlots:
+      let mapped = case legacySlot.containerId
+        of 28'u8, 29'u8: 0'i32
+        of 6'u8, 120'u8: 120'i32
+        of 34'u8, 119'u8: 119'i32
+        else: int32(legacySlot.containerId)
+      for slotId in legacySlot.slots:
+        let screenSlot = mapWindowSlot(mapped, uint32(slotId))
+        if screenSlot >= 0:
+          let current = handler.getBehaviour().slots[screenSlot].getClonedStack()
+          if not current.isEmpty():
+            ip.dropItem(current, false)
+            handler.getBehaviour().slots[screenSlot].setStack(emptyItemStack())
+            handler.setReceivedStack(screenSlot, emptyItemStack())
+            recordUpdate(updates, plainName(if legacySlot.containerId == 28'u8: cnHotBar else: cnInventory), slotId, 0'u8,
+              newVarInt(0'i32))
+            inventoryUpdated = true
+    handler.sendContentUpdates()
+  let isCreative = ip.isCreative()
+  for action in packet.actions:
+    let source = inventoryActionSourceFrom(action.sourceType)
+    if source.kind == iasWorld:
+      let oldStack = descriptorToStack(action.oldItem, isCreative)
+      let newStack = descriptorToStack(action.newItem, isCreative)
+      if oldStack.isEmpty() and not newStack.isEmpty():
+        ip.dropItem(newStack, false)
+    elif action.windowId.isSome:
+      let screenSlot = mapWindowSlot(action.windowId.unsafeGet, action.inventorySlot)
+      if screenSlot >= 0:
+        let itemStack = descriptorToStack(action.newItem, isCreative)
+        let isEquipped = handler.getBehaviour().slots[screenSlot].getClonedStack().areEqual(itemStack)
+        if not isEquipped:
+          if screenSlot >= 5 and screenSlot < 9:
+            ip.enqueueEquipmentChange(equipmentOfScreenSlot(screenSlot), itemStack)
+          elif screenSlot >= 36 and screenSlot < 45:
+            if int(ip.getInventory().getSelectedSlot()) == screenSlot - 36:
+              mainHand(itemStack)
+        handler.getBehaviour().slots[screenSlot].setStack(itemStack)
+        handler.setReceivedStack(screenSlot, itemStack)
+        handler.sendContentUpdates()
+        inventoryUpdated = true
+  if inventoryUpdated:
+    client.sendInventory(ip.getInventory())
+  updates
+
+proc sendLegacyResponse*(client: BedrockClient; packet: SInventoryTransaction; updates: seq[SlotUpdate]) =
+  ## The end of `handle_inventory_action`: the `CItemStackResponse` of a legacy request id.
+  if packet.legacyRequestId.value != 0'i32:
+    client.sendGamePacket(CItemStackResponsePacketId, CItemStackResponse(responses: @[
+      responseOf(updates, 0'u8, packet.legacyRequestId)]))
+
+# --- handle_item_stack_request ------------------------------------------------------------------------------------------
+
+proc processItemStackRequests*(ip: InventoryPlayer; handler: ScreenHandler; mainHand: proc(stack: ItemStack) {.closure.};
+    packet: SItemStackRequest): (seq[ItemStackResponse], bool) =
+  ## The body of `handle_item_stack_request`: the requests applied to the handler, and what the client is told; true when
+  ## the player's own inventory was touched, which the caller sends again.
+  var responses: seq[ItemStackResponse] = @[]
+  for request in packet.requests:
+    var created = none[ItemStack]()
+    var updates: seq[SlotUpdate] = @[]
+    var failed = false
+    for action in request.actions:
+      if failed:
+        break
+      case action.kind
+      of isaCraftCreative:
+        let entries = creativeEntries()
+        let index = int(max(int64(action.creativeItemId.value) - 1'i64, 0'i64))
+        if index < entries.len:
+          let entry = entries[index]
+          let mapping = JavaToBedrockItemMapping.fromBedrock(entry.itemId, entry.itemAuxValue)
+          if mapping != nil:
+            # `repetitions` is how many stacks to create: the item's max stack size each.
+            let maxStack = newItemStack(1'u8, mapping.javaItem).getMaxStackSize()
+            let count = uint8(min(int(maxStack) * int(action.repetitions), 255))
+            created = some(newItemStack(count, mapping.javaItem))
+          else:
+            warn("Failed to map bedrock item id " & $entry.itemId & " and data " & $entry.itemAuxValue & " to Java item", InvTarget)
+            failed = true
+        else:
+          warn("Creative item index " & $index & " out of bounds (len: " & $entries.len & ")", InvTarget)
+          failed = true
+      of isaTake, isaPlace, isaPlaceInContainer, isaTakeOutContainer:
+        let source = action.source
+        let destination = action.destination
+        var sourceStack = getSlotStack(handler, source, created)
+        if sourceStack.isEmpty() and created.isNone:
+          failed = true
+        else:
+          let count = min(action.count, sourceStack.itemCount)
+          if count > 0'u8:
+            var destStack = getSlotStack(handler, destination, created)
+            if destStack.isEmpty():
+              destStack = sourceStack.copyWithCount(count)
+            elif destStack.areItemsAndComponentsEqual(sourceStack):
+              destStack.itemCount = uint8(min(int(destStack.itemCount) + int(count), 255))
+            else:
+              failed = true
+            if not failed:
+              sourceStack.decrement(count)
+              if source.containerName.containerName == cnCreatedOutput:
+                if created.isSome:
+                  var stack = created.unsafeGet
+                  stack.decrement(count)
+                  created = if stack.isEmpty(): none[ItemStack]() else: some(stack)
+              elif source.containerName.containerName == cnCursor:
+                if handler.getBehaviour().cursorStack.isEmpty() and created.isSome:
+                  var stack = created.unsafeGet
+                  stack.decrement(count)
+                  created = if stack.isEmpty(): none[ItemStack]() else: some(stack)
+              let sourceAfter = if sourceStack.isEmpty(): emptyItemStack() else: sourceStack
+              updateSlotStack(ip, mainHand, handler, source, sourceAfter)
+              updateSlotStack(ip, mainHand, handler, destination, destStack)
+              recordUpdate(updates, source.containerName, source.slotId, sourceAfter.itemCount, source.stackId)
+              recordUpdate(updates, destination.containerName, destination.slotId, destStack.itemCount, destination.stackId)
+      of isaSwap:
+        let stack1 = getSlotStack(handler, action.slot1, created)
+        let stack2 = getSlotStack(handler, action.slot2, created)
+        updateSlotStack(ip, mainHand, handler, action.slot1, stack2)
+        updateSlotStack(ip, mainHand, handler, action.slot2, stack1)
+        recordUpdate(updates, action.slot1.containerName, action.slot1.slotId, stack2.itemCount, action.slot2.stackId)
+        recordUpdate(updates, action.slot2.containerName, action.slot2.slotId, stack1.itemCount, action.slot1.stackId)
+      of isaDrop:
+        let source = action.source
+        var sourceStack = getSlotStack(handler, source, created)
+        if sourceStack.isEmpty():
+          failed = true
+        else:
+          let count = min(action.count, sourceStack.itemCount)
+          if count > 0'u8:
+            ip.dropItem(sourceStack.copyWithCount(count), false)
+            sourceStack.decrement(count)
+            let sourceAfter = if sourceStack.isEmpty(): emptyItemStack() else: sourceStack
+            updateSlotStack(ip, mainHand, handler, source, sourceAfter)
+            recordUpdate(updates, source.containerName, source.slotId, sourceAfter.itemCount, source.stackId)
+      of isaDestroy, isaConsume:
+        let source = action.source
+        var sourceStack = getSlotStack(handler, source, created)
+        if sourceStack.isEmpty():
+          failed = true
+        else:
+          let count = min(action.count, sourceStack.itemCount)
+          if count > 0'u8:
+            sourceStack.decrement(count)
+            let sourceAfter = if sourceStack.isEmpty(): emptyItemStack() else: sourceStack
+            updateSlotStack(ip, mainHand, handler, source, sourceAfter)
+            recordUpdate(updates, source.containerName, source.slotId, sourceAfter.itemCount, source.stackId)
+      of isaCraftRecipe, isaCraftRecipeAuto:
+        if action.repetitions > 0'u8:
+          handler.updateToClient()
+          let b = handler.getBehaviour()
+          let gridSize = if b.windowType.isNone: 4 else: 9
+          let outputSlot = b.slots[0]
+          let outputStack = outputSlot.getClonedStack()
+          if outputStack.isEmpty():
+            warn("Client tried to craft, but output slot is empty!", InvTarget)
+            failed = true
+          else:
+            var total = outputStack
+            total.itemCount = uint8(min(int(total.itemCount) * int(action.repetitions), 255))
+            created = some(total)
+            for r in 0 ..< int(action.repetitions):
+              outputSlot.onTakeItem(ip, outputStack)
+            # The consumed ingredients are told to the client with the grid.
+            for i in 0 ..< gridSize:
+              let gridStack = b.slots[1 + i].getClonedStack()
+              recordUpdate(updates, plainName(cnCraftingInput), uint8(i), gridStack.itemCount, newVarInt(0'i32))
+      else:
+        discard # Successful no-ops to prevent client-side transaction rollbacks.
+    responses.add(responseOf(updates, if failed: 1'u8 else: 0'u8, request.requestId))
+    # The client's inventory is told again when a request touched it.
+    discard
+  handler.sendContentUpdates()
+  var inventoryUpdated = false
+  for response in responses:
+    if response.result == 0'u8:
+      for info in response.containerInfos:
+        let n = info.containerName.containerName
+        if n == cnInventory or n == cnCombinedHotBarAndInventory or n == cnHotBar:
+          inventoryUpdated = true
+  (responses, inventoryUpdated)
+
+proc handleItemStackRequest*(client: BedrockClient; ip: InventoryPlayer; handler: ScreenHandler;
+    mainHand: proc(stack: ItemStack) {.closure.}; packet: SItemStackRequest) =
+  ## `handle_item_stack_request`.
+  let (responses, inventoryUpdated) = processItemStackRequests(ip, handler, mainHand, packet)
+  client.sendGamePacket(CItemStackResponsePacketId, CItemStackResponse(responses: responses))
+  if inventoryUpdated:
+    client.sendInventory(ip.getInventory())

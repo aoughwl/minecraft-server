@@ -10,12 +10,18 @@ import argparse
 import os
 import re
 import shutil
+import json
 import socket
 import subprocess
 import sys
+import threading
 import time
+from http.server import BaseHTTPRequestHandler, HTTPServer
 
 here = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, here)
+import bedrockbot as bb  # noqa: E402  (its P-384 and ECDSA make the local OIDC key and token)
+
 DEFAULT_WORLD = r'C:\Users\timbuktu\AppData\LocalLow\savannt\UnityHost\mcserver\instances\default\world'
 
 
@@ -27,6 +33,44 @@ def free_port(udp):
         s.close()
         if port > 40000 and port not in (25565, 19132):
             return port
+
+
+def start_oidc_server(port):
+    """A local stand-in for the Xbox discovery document, the OpenID configuration and the JWKS, with a key made here (the
+    Xbox keys cannot be had offline). Returns (server, private scalar, kid, issuer)."""
+    key = int.from_bytes(os.urandom(48), 'big') % bb.N or 1
+    pub = bb.pt_mul(key, bb.G)
+    kid = 'local-test-key'
+    issuer = 'http://127.0.0.1:%d/issuer' % port
+    jwks = {'keys': [{'kty': 'EC', 'crv': 'P-384', 'alg': 'ES384', 'kid': kid,
+                      'x': bb.b64(pub[0].to_bytes(48, 'big'), True, False), 'y': bb.b64(pub[1].to_bytes(48, 'big'), True, False)}]}
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            base = 'http://127.0.0.1:%d' % port
+            if self.path.startswith('/discovery'):
+                body = {'result': {'serviceEnvironments': {'auth': {'prod': {'serviceUri': base + '/svc'}}}}}
+            elif self.path == '/svc/.well-known/openid-configuration':
+                body = {'issuer': issuer, 'jwks_uri': base + '/jwks'}
+            elif self.path == '/jwks':
+                body = jwks
+            else:
+                self.send_response(404)
+                self.end_headers()
+                return
+            data = json.dumps(body).encode()
+            self.send_response(200)
+            self.send_header('Content-Type', 'application/json')
+            self.send_header('Content-Length', str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+
+        def log_message(self, *a):
+            pass
+
+    server = HTTPServer(('127.0.0.1', port), Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    return server, key, kid, issuer
 
 
 def set_key(text, section_pred, key, value):
@@ -64,6 +108,11 @@ def main():
     ap.add_argument('--chat', default='hello from the bedrock bot')
     ap.add_argument('--command', default='')
     ap.add_argument('--seconds', type=float, default=60.0)
+    ap.add_argument('--extended', action='store_true', help='hotbar, inventory, place and break, chest (bedrockbot --extended)')
+    ap.add_argument('--followups', action='store_true', help='effects, weather, title, boss bar, equipment, metadata, death and respawn (bedrockbot --followups)')
+    ap.add_argument('--form', action='store_true', help='the server sends a modal form at join; the bot answers it')
+    ap.add_argument('--online-wrong-key', action='store_true', help='with --online: the bot signs with a key that is not in the JWKS; the login must be refused')
+    ap.add_argument('--online', action='store_true', help='online mode against a local OIDC server and a token signed with a key made here')
     args = ap.parse_args()
     run = os.path.join(args.work, 'run')
     if args.fresh or not os.path.isdir(os.path.join(run, 'world')):
@@ -85,7 +134,16 @@ def main():
     is_bedrock = lambda h: h.endswith('bedrock') and 'networking' in h and 'resource' not in h and 'authentication' not in h
     is_java = lambda h: h.endswith('java') and 'networking' in h and 'resource' not in h
     text = set_key(text, is_bedrock, 'address', '"127.0.0.1:%d"' % udp)
-    text = set_key(text, is_bedrock, 'online_mode', 'false')
+    oidc = None
+    if args.online:
+        oidc_port = free_port(False)
+        oidc = start_oidc_server(oidc_port)
+        text = set_key(text, is_bedrock, 'online_mode', 'true')
+        is_auth = lambda h: h == 'networking.bedrock.authentication'
+        text = set_key(text, is_auth, 'enabled', 'true')
+        text = set_key(text, is_auth, 'url', '"http://127.0.0.1:%d/discovery"' % oidc_port)
+    else:
+        text = set_key(text, is_bedrock, 'online_mode', 'false')
     text = set_key(text, is_bedrock, 'encryption', 'false' if args.no_encrypt else 'true')
     text = set_key(text, is_bedrock, 'enabled', 'true')
     for table in ('networking.query', 'networking.rcon', 'networking.lan_broadcast'):
@@ -96,6 +154,8 @@ def main():
     text = set_key(text, is_java, 'encryption', 'false')
     open(toml, 'w', encoding='utf-8').write(text)
     log = open(os.path.join(run, 'server.log'), 'wb')
+    if args.form:
+        env['PUMPKIN_BEDROCK_TEST_FORM'] = '1'
     proc = subprocess.Popen([args.exe, '--config:cfg', '--world:world', '--port:%d' % tcp, '--max-seconds:%d' % int(args.seconds + 120)],
                             cwd=run, env=env, stdout=log, stderr=subprocess.STDOUT, stdin=subprocess.PIPE)
     print('server pid %d, java tcp %d, bedrock udp %d' % (proc.pid, tcp, udp), flush=True)
@@ -128,18 +188,50 @@ def main():
         if args.command:
             bot += ['--command', args.command]
         bot += ['--hold', '6', '--expect-block']
+        if args.extended:
+            bot.append('--extended')
+        if args.followups:
+            bot.append('--followups')
+        if args.form:
+            bot.append('--form')
+        if oidc is not None:
+            key = oidc[1] if not args.online_wrong_key else (oidc[1] ^ 0x1234567) or 1
+            bot += ['--oidc-key', '%x' % key, '--oidc-kid', oidc[2], '--oidc-issuer', oidc[3]]
         b = subprocess.Popen(bot, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
         lines = []
+        expects = []
+        walked = None
         for line in b.stdout:
             lines.append(line.rstrip())
+            if line.startswith('@console '):
+                proc.stdin.write(line[len('@console '):].rstrip().encode() + bytes([10]))
+                proc.stdin.flush()
+                continue
+            if line.startswith('@expect '):
+                expects.append(line[len('@expect '):].rstrip())
+                continue
+            m = re.search(r'walked from \(([-0-9.]+), ([-0-9.]+), ([-0-9.]+)\)', line)
+            if m:
+                walked = tuple(float(v) for v in m.groups())
             if 'sent chat' in line:
-                # the bot holds for a few seconds: ask the server where its player is, and who is there
+                # the bot holds for a few seconds: change a block next to it (inside its view, whatever the world), ask the
+                # server where its player is, and who is there
                 time.sleep(1.5)
-                proc.stdin.write(b'setblock 9 99 0 minecraft:diamond_block' + bytes([10]) + b'data get entity Bot_Steve' + bytes([10]) + b'list' + bytes([10]))
+                x, y, z = (int(walked[0]) + 1, int(walked[1]) + 3, int(walked[2])) if walked else (9, 99, 0)
+                proc.stdin.write(('setblock %d %d %d minecraft:diamond_block' % (x, y, z)).encode() + bytes([10]) + b'data get entity Bot_Steve' + bytes([10]) + b'list' + bytes([10]))
                 proc.stdin.flush()
         b.wait(timeout=240)
         print(chr(10).join(lines))
         rc = b.returncode
+        if expects:
+            time.sleep(1.0)
+            logtext = open(os.path.join(run, 'server.log'), errors='replace').read()
+            for want in expects:
+                if want in logtext:
+                    print('  ok  server log has: ' + want)
+                else:
+                    print('FAIL  server log lacks: ' + want)
+                    rc = rc or 1
         if java is not None:
             try:
                 java.wait(timeout=90)

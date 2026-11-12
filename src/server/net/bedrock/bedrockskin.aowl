@@ -1,0 +1,238 @@
+## Port of `Player::fetch_skin` (pumpkin/src/entity/player.rs) and the skin half of what a Bedrock client sends at login.
+##
+## What a Bedrock client sees of a Java player is the 64x64 skin its profile's `textures` property points to: fetched once
+## (WinHTTP, a short timeout; a failure is the stock skin, as upstream's `unwrap_or_else(Skin::steve)`), decoded from PNG and
+## kept by uuid. What Bedrock clients see of another Bedrock player is the skin that player's own client sent at login
+## (upstream uses the stock skin for them too).
+## PARTIAL: pumpkin/src/entity/player.rs `fetch_skin` - a PNG is decoded when it is 8 bits per channel and not interlaced
+## (every Mojang skin is); a Java client cannot be shown a Bedrock skin at all, because its player list takes a texture URL
+## that Mojang's domains serve, so a Bedrock player appears to Java clients with the default skin of its uuid.
+import std/[options, tables]
+import ../../../protocol/bedrock/rawdeflate
+import ../../../protocol/bedrock/client/player_list
+import ../../../protocol/bedrock/server/login as slogin
+import ../../../auth/[minijson, winhttp]
+import ../netbase
+import ../authentication
+
+type
+  PngImage* = object
+    ok*: bool
+    width*, height*: int
+    rgba*: seq[byte]
+
+var gJavaSkins = initTable[string, Skin]()
+
+proc be32(d: openArray[byte]; at: int): int =
+  (int(d[at]) shl 24) or (int(d[at + 1]) shl 16) or (int(d[at + 2]) shl 8) or int(d[at + 3])
+
+proc paeth(a, b, c: int): int =
+  let p = a + b - c
+  let pa = abs(p - a)
+  let pb = abs(p - b)
+  let pc = abs(p - c)
+  if pa <= pb and pa <= pc: a elif pb <= pc: b else: c
+
+proc decodePng*(data: openArray[byte]): PngImage =
+  ## 8-bit, non-interlaced PNG (greyscale, RGB, palette, greyscale+alpha, RGBA) to RGBA.
+  let failed = PngImage(ok: false, width: 0, height: 0, rgba: @[])
+  if data.len < 33 or data[0] != 0x89'u8 or data[1] != 0x50'u8 or data[2] != 0x4E'u8 or data[3] != 0x47'u8:
+    return failed
+  var pos = 8
+  var width = 0
+  var height = 0
+  var colorType = 0
+  var bitDepth = 0
+  var interlace = 0
+  var palette: seq[byte] = @[]
+  var trns: seq[byte] = @[]
+  var idat: seq[byte] = @[]
+  while pos + 12 <= data.len:
+    let length = be32(data, pos)
+    var kind = ""
+    for k in 4 ..< 8:
+      kind.add(char(data[pos + k]))
+    let body = pos + 8
+    if length < 0 or body + length + 4 > data.len:
+      return failed
+    if kind == "IHDR":
+      width = be32(data, body)
+      height = be32(data, body + 4)
+      bitDepth = int(data[body + 8])
+      colorType = int(data[body + 9])
+      interlace = int(data[body + 12])
+    elif kind == "PLTE":
+      for i in 0 ..< length:
+        palette.add(data[body + i])
+    elif kind == "tRNS":
+      for i in 0 ..< length:
+        trns.add(data[body + i])
+    elif kind == "IDAT":
+      for i in 0 ..< length:
+        idat.add(data[body + i])
+    elif kind == "IEND":
+      break
+    pos = body + length + 4
+  if width <= 0 or height <= 0 or width > 1024 or height > 1024 or bitDepth != 8 or interlace != 0:
+    return failed
+  var channels = 0
+  case colorType
+  of 0: channels = 1
+  of 2: channels = 3
+  of 3: channels = 1
+  of 4: channels = 2
+  of 6: channels = 4
+  else: channels = 0
+  if channels == 0 or idat.len < 3 or (colorType == 3 and palette.len == 0):
+    return failed
+  # The zlib header is two bytes; the raw inflater ignores what follows the stream's end (the adler trailer).
+  let stride = width * channels
+  let inflated = rawInflate(idat[2 ..< idat.len], height * (stride + 1) + 1)
+  if inflated.data.len < height * (stride + 1):
+    return failed
+  var raw = newSeq[byte](height * stride)
+  for y in 0 ..< height:
+    let filter = int(inflated.data[y * (stride + 1)])
+    if filter > 4:
+      return failed
+    let src = y * (stride + 1) + 1
+    for x in 0 ..< stride:
+      let cur = int(inflated.data[src + x])
+      let left = if x >= channels: int(raw[y * stride + x - channels]) else: 0
+      let up = if y > 0: int(raw[(y - 1) * stride + x]) else: 0
+      let upLeft = if y > 0 and x >= channels: int(raw[(y - 1) * stride + x - channels]) else: 0
+      var value = cur
+      case filter
+      of 1: value = cur + left
+      of 2: value = cur + up
+      of 3: value = cur + (left + up) div 2
+      of 4: value = cur + paeth(left, up, upLeft)
+      else: value = cur
+      raw[y * stride + x] = byte(value and 255)
+  var rgba = newSeq[byte](width * height * 4)
+  for i in 0 ..< width * height:
+    let p = i * channels
+    var r = 0
+    var g = 0
+    var b = 0
+    var a = 255
+    case colorType
+    of 0:
+      r = int(raw[p]); g = r; b = r
+    of 2:
+      r = int(raw[p]); g = int(raw[p + 1]); b = int(raw[p + 2])
+    of 3:
+      let idx = int(raw[p])
+      if idx * 3 + 2 >= palette.len:
+        return failed
+      r = int(palette[idx * 3]); g = int(palette[idx * 3 + 1]); b = int(palette[idx * 3 + 2])
+      if idx < trns.len:
+        a = int(trns[idx])
+    of 4:
+      r = int(raw[p]); g = r; b = r; a = int(raw[p + 1])
+    else:
+      r = int(raw[p]); g = int(raw[p + 1]); b = int(raw[p + 2]); a = int(raw[p + 3])
+    rgba[i * 4] = byte(r)
+    rgba[i * 4 + 1] = byte(g)
+    rgba[i * 4 + 2] = byte(b)
+    rgba[i * 4 + 3] = byte(a)
+  PngImage(ok: true, width: width, height: height, rgba: rgba)
+
+proc skinFromImage*(width, height: int; rgba: seq[byte]): Option[Skin] =
+  ## The tail of `fetch_skin`: a 64x32 skin is padded to 64x64 with transparent pixels; any other size is refused.
+  if width != 64 or (height != 32 and height != 64):
+    return none[Skin]()
+  var pixels = rgba
+  if height == 32:
+    pixels.setLen(64 * 64 * 4)
+  var skin = steve()
+  skin.imageWidth = 64'u32
+  skin.imageHeight = 64'u32
+  skin.skinData = pixels
+  some(skin)
+
+proc textureUrlOf*(properties: seq[PropertyValue]): string =
+  ## `textures.skin.url` of the `textures` property, "" for none.
+  for p in properties:
+    if p.name == "textures":
+      let (ok, bytes) = base64Decode(p.value)
+      if not ok:
+        return ""
+      var text = newString(bytes.len)
+      for i in 0 ..< bytes.len:
+        text[i] = char(bytes[i])
+      let parsed = parseJson(text)
+      if not parsed.ok or parsed.value == nil:
+        return ""
+      let textures = objGet(parsed.value, "textures")
+      let skin = objGet(textures, "SKIN")
+      let url = objGet(skin, "url")
+      if url != nil and url.kind == jkString:
+        return url.strVal
+  ""
+
+proc fetchSkin*(properties: seq[PropertyValue]): Option[Skin] =
+  ## `fetch_skin`: blocking, bounded to two seconds. None when there is no skin to fetch.
+  let url = textureUrlOf(properties)
+  if url.len == 0:
+    return none[Skin]()
+  let res = winHttpGet(url, 2000, 2000)
+  if not res.ok or res.status < 200 or res.status >= 300:
+    return none[Skin]()
+  var bytes = newSeq[byte](res.body.len)
+  for i in 0 ..< res.body.len:
+    bytes[i] = byte(ord(res.body[i]))
+  let image = decodePng(bytes)
+  if not image.ok:
+    return none[Skin]()
+  skinFromImage(image.width, image.height, image.rgba)
+
+proc javaSkinOf*(key: string; properties: seq[PropertyValue]): Skin =
+  ## The skin a Bedrock client is shown for a Java player, fetched once per profile.
+  if gJavaSkins.hasKey(key):
+    return gJavaSkins.getOrDefault(key)
+  let fetched = fetchSkin(properties)
+  let skin = if fetched.isSome: fetched.unsafeGet else: steve()
+  gJavaSkins[key] = skin
+  skin
+
+# --- what a Bedrock client sent ---------------------------------------------------------------------------------------
+
+proc bytesOf64(s: string): seq[byte] =
+  if s.len == 0:
+    return @[]
+  let (ok, bytes) = base64Decode(s)
+  if ok: bytes else: @[]
+
+proc skinFromClientData*(cd: slogin.ClientData): Skin =
+  ## The `Skin` of a Bedrock player's own `ClientData`; the stock skin when the image does not fit its size.
+  var skin = steve()
+  let pixels = bytesOf64(cd.skinData)
+  if cd.skinImageWidth > 0 and cd.skinImageHeight > 0 and
+      pixels.len == int(cd.skinImageWidth) * int(cd.skinImageHeight) * 4:
+    skin.skinId = cd.skinId
+    skin.fullId = cd.skinId
+    skin.imageWidth = uint32(cd.skinImageWidth)
+    skin.imageHeight = uint32(cd.skinImageHeight)
+    skin.skinData = pixels
+    let patch = bytesOf64(cd.skinResourcePatch)
+    if patch.len > 0:
+      skin.resourcePatch = patch
+    skin.geometryData = bytesOf64(cd.skinGeometry)
+    skin.geometryDataEngineVersion = bytesOf64(cd.skinGeometryVersion)
+    skin.animationData = bytesOf64(cd.skinAnimationData)
+    skin.armSize = cd.armSize
+    skin.skinColor = cd.skinColour
+    skin.playFabId = cd.playFabId
+    skin.isPremium = cd.premiumSkin
+    skin.isPersona = cd.personaSkin
+    skin.personaCapeOnClassic = cd.capeOnClassicSkin
+    skin.overrideAppearance = cd.overrideSkin
+    skin.isTrusted = true
+    let cape = bytesOf64(cd.capeData)
+    if cape.len > 0:
+      skin.capeData = cape
+      skin.capeWidth = uint32(cd.capeImageWidth)
+      skin.capeHeight = uint32(cd.capeImageHeight)
+      skin.capeId = cd.capeId
+  skin
