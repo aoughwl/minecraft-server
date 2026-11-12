@@ -62,6 +62,12 @@ def names(group, path, crate, tail):
         return True
     if tail.split('/')[-1] in ('mod.rs', 'lib.rs', 'main.rs'):
         return False
+    # A bare file name ("biome.rs", "loot.rs") exists in several crates, and a comment about
+    # one must not mark the others: it counts only with the crate's own directory in front
+    # of it, or from the crate root. Longer tails ("world/mod.rs") are specific enough.
+    if '/' not in tail:
+        return any(n == tail or n.endswith('/' + crate + '/src/' + tail) or n.endswith(crate + '/src/' + tail)
+                   for n in group)
     return any(n == tail or n.endswith('/' + tail) for n in group)
 
 

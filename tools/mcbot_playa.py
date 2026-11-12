@@ -21,14 +21,11 @@ def playa_session(m, c, st, w, biomes, ctx, args):
     varint, check = m.varint, m.check
     stone = m.STONE_ITEM
     import time
-    t0 = time.time()
-    if args.playa == 'listen':
-        ctx['tap'] = lambda pid, data: print('  [%.1fs] packet 0x%02x (%d bytes)' % (time.time() - t0, pid, len(data)), flush=True) if pid in (0x77, 0x3f, 0x44, 0x45, 0x3e, 0x02) else None
     wait(lambda: w.pos is not None and ctx['chunk_parsed'], 'a position and a chunk', 60.0)
     wait(lambda: w.health is not None, 'health')
     if args.playa == 'listen':
         try:
-            wait(lambda: any(CHAT_TEXT in said for said in w.chat), 'the other bot chatting', 70.0)
+            wait(lambda: any(CHAT_TEXT in said for said in w.chat), 'the other bot chatting', 90.0)
         except m.Fail:
             print('  chat heard: %r; packets by id %r' % (w.chat, sorted(ctx['counts'].items())), flush=True)
             raise
@@ -84,10 +81,6 @@ def playa_session(m, c, st, w, biomes, ctx, args):
     import time
     wait(lambda: True, '', 1.0)
     time.sleep(3.0)  # the listener is slow to read the join flood: the line is sent once it has been in the world a while
-    c.send(m.SB_CHAT_COMMAND, m.string('tp @s PlayHear'))
-    time.sleep(2.0)
-    wait(lambda: True, '', 1.0)
-    print('  DEBUG tp said: %r' % (w.chat[-3:],), flush=True)
     c.send(m.SB_CHAT, m.string(CHAT_TEXT) + struct.pack('>qq', int(time.time() * 1000), 42) + bytes([0]) + varint(0) + bytes([0, 0, 0]) + bytes([0]))
     wait(lambda: any(CHAT_TEXT in said for said in w.chat), 'our chat message back')
     st.hit('pa_chat_sent')

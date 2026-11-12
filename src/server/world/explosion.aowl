@@ -1,5 +1,4 @@
 ## Port of pumpkin/src/world/explosion.rs, and `World::explode` from pumpkin/src/world/mod.rs
-## PARTIAL: pumpkin/src/world/explosion.rs - which blocks go, their removal and the packet. `damage_entities` and `calculate_exposure` need damage (living.rs), `drop_loot` needs item entities, `pumpkin_block.explode` needs block behaviour.
 ##
 ## A fluid's blast resistance is read from the state's being liquid or waterlogged: water's and lava's are both 100.
 
@@ -14,7 +13,13 @@ import ../../protocol/proto
 import ../../world/[chunkdata, world as worldtraits]
 import ../net/winsock
 import ../serverbase
-import worldmod
+import worldmod, lootbridge
+import ../../util/math/boundingbox
+import ../../util/math/position
+import ../../generated/[damage_type, entity_type]
+from ../../data/block_state import BlockState
+import ../entity/[entitymod, raycast]
+import "../block/blockbehaviour"
 
 const FluidBlastResistance = 100.0'f32
 
@@ -68,12 +73,96 @@ proc getBlocksToDestroy*(world: World; pos: Vector3[float64]; power: float32): s
           posZ += dirZ * 0.3
           h -= 0.22500001'f32
 
+proc calculateExposure*(explosionPos: Vector3[float64]; entity: Entity; world: World): float32 =
+  ## `Explosion::calculate_exposure`
+  let bbox = entity.boundingBox
+  let stepX = 1.0 / ((bbox.max.x - bbox.min.x) * 2.0 + 1.0)
+  let stepY = 1.0 / ((bbox.max.y - bbox.min.y) * 2.0 + 1.0)
+  let stepZ = 1.0 / ((bbox.max.z - bbox.min.z) * 2.0 + 1.0)
+  if stepX < 0.0 or stepY < 0.0 or stepZ < 0.0:
+    return 0.0'f32
+  let offsetX = (1.0 - floor(1.0 / stepX) * stepX) / 2.0
+  let offsetZ = (1.0 - floor(1.0 / stepZ) * stepZ) / 2.0
+  var visiblePoints = 0
+  var totalPoints = 0
+  var k = 0.0
+  while k <= 1.0:
+    var l = 0.0
+    while l <= 1.0:
+      var m = 0.0
+      while m <= 1.0:
+        let n = bbox.min.x + (bbox.max.x - bbox.min.x) * k
+        let o = bbox.min.y + (bbox.max.y - bbox.min.y) * l
+        let p = bbox.min.z + (bbox.max.z - bbox.min.z) * m
+        let vec3d = Vector3[float64](x: n + offsetX, y: o, z: p + offsetZ)
+        let hit = raycast(world, vec3d, explosionPos, proc(pos: BlockPos; w: World): bool {.closure.} =
+          let state = BlockState.fromId(newBlockStateIdUnchecked(uint16(w.getBlockStateId(pos))))
+          not state.isAir() and state.collisionShapes.len != 0)
+        if hit.isNone:
+          visiblePoints += 1
+        totalPoints += 1
+        m += stepZ
+      l += stepY
+    k += stepX
+  if totalPoints == 0:
+    return 0.0'f32
+  float32(visiblePoints) / float32(totalPoints)
+
+proc damageEntities*(world: World; pos: Vector3[float64]; power: float32) =
+  ## `Explosion::damage_entities`
+  if power < 1.0e-5'f32:
+    return
+  let radius = float64(power) * 2.0
+  let searchBox = BoundingBox(
+    min: Vector3[float64](x: float64(int32(floor(pos.x - radius - 1.0))), y: float64(int32(floor(pos.y - radius - 1.0))),
+      z: float64(int32(floor(pos.z - radius - 1.0)))),
+    max: Vector3[float64](x: float64(int32(floor(pos.x + radius + 1.0))), y: float64(int32(floor(pos.y + radius + 1.0))),
+      z: float64(int32(floor(pos.z + radius + 1.0)))))
+  let entities = world.getAllAtBox(searchBox)
+  for entityBase in entities:
+    if entityBase.isImmuneToExplosion():
+      continue
+    if entityBase.isSpectator():
+      continue
+    let entity = entityBase.getEntity()
+    let distance = sqrt(entity.pos.squaredDistanceToVec(pos)) / radius
+    if distance > 1.0:
+      continue
+    let exposure = float64(calculateExposure(pos, entity, world))
+    if exposure == 0.0:
+      continue
+    let damageMultiplier = (1.0 - distance) * exposure
+    let damage = float32((damageMultiplier * damageMultiplier + damageMultiplier) / 2.0 * 7.0 * float64(power) + 1.0)
+    entityBase.damage(entityBase, damage, EXPLOSION)
+    let dirPos = if entity.entityType.id == EntityType.TNT.id: entity.pos else: entity.getEyePos()
+    let direction = (dirPos - pos).normalize()
+    # TODO upstream: knockback resistance
+    let knockbackMultiplier = (1.0 - distance) * exposure * (1.0 - 0.0)
+    entity.addVelocity(direction * knockbackMultiplier)
+
 proc explodeBlocks*(world: World; pos: Vector3[float64]; power: float32): int32 =
   ## `Explosion::explode`: answers the removed block count.
   let blocks = getBlocksToDestroy(world, pos, power)
+  var stateIds: seq[uint32] = @[]
   for at in blocks:
+    stateIds.add(world.getBlockStateId(at))
+  damageEntities(world, pos, power)
+  let blockWorld = world.blockWorld
+  if blockWorld == nil:
+    return int32(blocks.len)
+  let registry = blockWorld.blockRegistry
+  for i in 0 ..< blocks.len:
+    let at = blocks[i]
+    let dataId = newBlockStateIdUnchecked(uint16(stateIds[i]))
+    let blockRef = Block.fromStateId(dataId)
     discard world.setBlockState(at, 0'u32, BfNotifyAll)
     world.closeContainerScreensAt(at)
+    let behaviour = registry.getPumpkinBlock(blockRef.id)
+    if behaviour.isNone or behaviour.unsafeGet.shouldDropItemsOnExplosion():
+      blockDropLoot(world, at, dataId, nil, some(power), false)
+    if behaviour.isSome:
+      behaviour.unsafeGet.explode(ExplodeArgs(world: blockWorld, block0: blockRef, position: at))
+  # TODO upstream: fire
   int32(blocks.len)
 
 proc explode*(world: World; position: Vector3[float64]; power: float32) =

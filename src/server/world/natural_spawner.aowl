@@ -1,5 +1,4 @@
 ## Port of pumpkin/src/world/natural_spawner.rs
-## PARTIAL: pumpkin/src/world/natural_spawner.rs - the `GenerationCache` half is not here: `spawn_mobs_for_chunk_generation`, `get_top_non_colliding_pos`, `is_spawn_position_ok_cache` and `adjust_spawn_position_cache` are the spawns of a chunk that is being generated, and need the proto chunk's cache; nothing in the world generation here calls them.
 ##
 ## The state is rebuilt once per tick by `naturalSpawnTick` (upstream builds it in `update_active_chunks` and adjusts it as
 ## entities come and go, which a rebuild per tick makes the same), so `add_entity` and `remove_entity` are not here.
@@ -13,7 +12,7 @@
 
 import std/[math, options, tables, sequtils, syncio]
 import ../../data/block_ext
-from ../../data/block_state import asU16, newBlockStateIdUnchecked, BlockState, isFullCube, isLiquid, isSideSolid
+from ../../data/block_state import asU16, newBlockStateIdUnchecked, BlockState, isFullCube, isLiquid, isSideSolid, isAir
 import ../../generated/[biome, block_properties, entity_type, fluid, tag]
 import ../../util/difficulty
 import ../../util/gamemode
@@ -32,6 +31,9 @@ import ../entity/entitymod
 import ../entity/entitytype
 import ../serverbase
 import worldmod
+import ../../world/world as worldtraits
+import ../../world/generation/protochunkbase
+import ../../nbt/tag as nbttag
 
 const MagicNumber* = 17'i32 * 17'i32
 
@@ -489,5 +491,127 @@ proc naturalSpawnTick*(world: World) =
     i -= 1
   for (pos, chunk) in chunks:
     tickSpawningChunk(world, pos, chunk, spawnList, spawnState)
+
+
+# ---------------------------------------------------------------------------
+# The `GenerationCache` half: the spawns of a chunk that is being generated
+# ---------------------------------------------------------------------------
+
+proc cacheStateAt(cache: GenerationCache; pos: Vector3[int32]): BlockState =
+  let f = cache.getBlockState
+  BlockState.fromId(newBlockStateIdUnchecked(uint16(f(pos))))
+
+proc isSpawnPositionOkCache*(cache: GenerationCache; blockPos: BlockPos; entityType: EntityType): bool =
+  ## `is_spawn_position_ok_cache`. The liquid tags are asked of the block's id, as upstream does.
+  let posVec = blockPos.vec
+  let state = cacheStateAt(cache, posVec)
+  case entityType.spawnRestriction.location
+  of SpawnLocation.InLava:
+    state.isLiquid() and hasTag(asU16(Block.fromStateId(state.id).id), Fluid_MINECRAFT_LAVA)
+  of SpawnLocation.InWater:
+    let aboveState = cacheStateAt(cache, blockPos.up().vec)
+    state.isLiquid() and hasTag(asU16(Block.fromStateId(state.id).id), Fluid_MINECRAFT_WATER) and
+      not aboveState.isFullCube()
+  of SpawnLocation.OnGround:
+    let down = cacheStateAt(cache, blockPos.down().vec)
+    let up = cacheStateAt(cache, blockPos.up().vec)
+    let isValidSpawnBelow = down.isSideSolid(BlockDirection.Up) and down.luminance < 14'u8
+    if isValidSpawnBelow:
+      isValidEmptySpawnBlock(state) and isValidEmptySpawnBlock(up)
+    else:
+      false
+  of SpawnLocation.Unrestricted:
+    true
+
+proc adjustSpawnPositionCache*(cache: GenerationCache; pos: BlockPos; entityType: EntityType): BlockPos =
+  ## `adjust_spawn_position_cache`
+  if entityType.spawnRestriction.location == SpawnLocation.OnGround:
+    let below = pos.down()
+    let state = cacheStateAt(cache, below.vec)
+    if not state.isFullCube() and not state.isLiquid():
+      return below
+  pos
+
+proc getTopNonCollidingPos*(world: World; cache: GenerationCache; entityType: EntityType; x, z: int32): BlockPos =
+  ## `get_top_non_colliding_pos`
+  let topY = cache.getTopY
+  var y = topY(entityType.spawnRestriction.heightmap, x, z)
+  let minY = world.minY
+  if world.dimension.hasCeiling:
+    while true:
+      y -= 1'i32
+      if cacheStateAt(cache, vec3[int32](x, y, z)).isAir() or y <= minY:
+        break
+    while true:
+      y -= 1'i32
+      if not cacheStateAt(cache, vec3[int32](x, y, z)).isAir() or y <= minY:
+        break
+  adjustSpawnPositionCache(cache, BlockPos(vec: vec3[int32](x, y, z)), entityType)
+
+proc spawnMobsForChunkGeneration*(world: World; cache: GenerationCache; biome: Biome; chunkX, chunkZ: int32) =
+  ## `spawn_mobs_for_chunk_generation`
+  let creatures = biome.spawners.creature
+  if creatures.len == 0:
+    return
+  let xo = chunkX shl 4
+  let zo = chunkZ shl 4
+  while randF32() < biome.creatureSpawnProbability:
+    let spawnerData = creatures[int(gSpawnRand.nextBoundedI32(int32(creatures.len)))]
+    let count = spawnerData.minCount + randRange(0'i32, max(1'i32 + spawnerData.maxCount - spawnerData.minCount, 1'i32))
+    let entityType = entityTypeOf(spawnerData.`type`)
+    var x = xo + randRange(0'i32, 16'i32)
+    var z = zo + randRange(0'i32, 16'i32)
+    let startX = x
+    let startZ = z
+    for _ in 0 ..< count:
+      var success = false
+      for _ in 0 ..< 4:
+        if success:
+          break
+        let pos = getTopNonCollidingPos(world, cache, entityType, x, z)
+        if isSpawnPositionOkCache(cache, pos, entityType):
+          let spawnPos = Vector3[float64](x: float64(pos.vec.x) + 0.5, y: float64(pos.vec.y), z: float64(pos.vec.z) + 0.5)
+          let entity = gFromType(entityType, spawnPos, world, newV4()[1])
+          if entity != nil:
+            entity.entity.setRotation(randF32() * 360.0'f32, 0.0'f32)
+            world.spawnEntityNonSave(entity)
+          success = true
+        # Random jitter for the next mob in the group
+        x += randRange(0'i32, 5'i32) - randRange(0'i32, 5'i32)
+        z += randRange(0'i32, 5'i32) - randRange(0'i32, 5'i32)
+        # Keep group within the chunk bounds
+        if x < xo or x >= xo + 16'i32 or z < zo or z >= zo + 16'i32:
+          x = startX
+          z = startZ
+
+proc spawnStructureEntities*(world: World; entities: seq[NbtCompound]) =
+  ## `WorldPortalExt::spawn_structure_entities` (pumpkin/src/world/mod.rs): each compound's `id` makes an entity at the
+  ## origin that reads the compound, which sets its position. Upstream runs it as a task; here the tick that finishes the
+  ## chunk runs it.
+  for nbt in entities:
+    let id = nbt.getString("id")
+    if id.isNone:
+      continue
+    var key = id.unsafeGet
+    if key.len >= 10 and substr(key, 0, 9) == "minecraft:":
+      key = substr(key, 10)
+    let found = EntityType.fromName(key)
+    if found.isNone:
+      echo "Unknown structure entity type: " & id.unsafeGet
+      continue
+    let entity = gFromType(found.unsafeGet, Vector3[float64](x: 0.0, y: 0.0, z: 0.0), world, newV4()[1])
+    if entity == nil:
+      continue
+    entity.readNbt(nbt)
+    world.spawnEntity(entity)
+
+proc worldPortalFor*(world: World; base: WorldPortalExt): WorldPortalExt =
+  ## `Level.world_portal`'s `World` half: `base` (worldgen's `can_place_at`, mirror and rotate) with the mob spawns and
+  ## the structure entities of generation going to this world.
+  result = base
+  result.spawnMobsForChunkGeneration = proc(cache: GenerationCache; biome: Biome; chunkX, chunkZ: int32) {.closure.} =
+    spawnMobsForChunkGeneration(world, cache, biome, chunkX, chunkZ)
+  result.spawnStructureEntities = proc(entities: seq[NbtCompound]) {.closure.} =
+    spawnStructureEntities(world, entities)
 
 gNaturalSpawnHook = proc(world: World) {.closure.} = naturalSpawnTick(world)
