@@ -8,18 +8,26 @@
 ## errors, which trap here where Rust returns an error to the host).
 ## `get-registry-key` answers the table's registry key, which has no namespace (`diamond`), as `registry_key.to_string()` does.
 ## `get-lore` answers an empty list and `set-lore` / `add-lore` do nothing, as upstream (its `LoreImpl` carries no data).
-## PARTIAL: pumpkin/src/plugin/loader/wasm/wasm_host/wit/v0_1/item_stack.rs - `get-components` / `set-component` carry the
-## component as the network-encoded bytes of `pumpkin_protocol::codec::data_component::{serialize, deserialize}`; the
-## protocol module (src/protocol/datacomponent.aowl) works on its own minimal `DataComponentValue`, not the full
-## `DataComponentImpl` the stack holds, so `get-components` answers the ids with empty values and `set-component` is
-## accepted and ignored; the custom-enchantment and attribute-modifier methods of the newer WIT are not in the pinned
-## loader and trap as unimplemented; a dropped item-stack is not freed from the arena.
+## `get-components` / `set-component` carry a component as the network-encoded bytes of
+## `pumpkin_protocol::codec::data_component::{serialize, deserialize}`: the stack's real `DataComponentImpl` is converted with
+## src/inventory/stackbridge.aowl (`componentToWire` / `componentFromWire`) to the protocol module's `DataComponentValue` and
+## through its codec, so a plugin reads and writes the same bytes a client packet carries. A component the codec has no case for
+## (stackbridge's PARTIAL) is left out of `get-components`, and `set-component` of one is ignored, as upstream ignores a
+## component that fails to decode. Custom enchantments (`pumpkin:enchantments` in the custom data, plus the vanilla ones of the
+## `Enchantments` component) and attribute modifiers (`AttributeModifiersImpl`) are the newer tree's.
+## Lore: verified against the pinned tree, `LoreImpl` is a unit struct there (`default_impl!(Lore)`), so `get-lore` answers an
+## empty list and `set-lore` / `add-lore` do nothing, as the pinned loader does. The newer tree gives `LoreImpl` a `lines` field;
+## porting that changes the component's shape, NBT reader and wire codec, which are other files' work.
+## PARTIAL: pumpkin/src/plugin/loader/wasm/wasm_host/wit/v0_1/item_stack.rs - lore as above; a dropped item-stack is not freed from
+## the arena.
 import std/options
 import ../wasm/[canonabi, component]
 import "../../data/item_stack/mod"
 import ../../generated/data_component
 import ../../generated/item_refs
 import ../../nbt/tag
+from ../../generated/attributes import allAttributes
+from ../../inventory/stackbridge import componentToBytes, componentFromBytes
 import witstate
 
 const
@@ -188,6 +196,19 @@ proc enchantmentsOf(s: ItemStack): seq[EnchantmentEntry] =
   if i >= 0 and s.patch[i].present:
     result = s.patch[i].data.enchantments.enchantment
 
+proc findVanilla(id: string): int =
+  ## `find_vanilla_enchantment`: the index in item_refs' table of `minecraft:name` or the bare name, -1 for none.
+  result = -1
+  var i = 0
+  while i < gEnchantments.len:
+    let n = gEnchantments[i].name
+    if n == id or (n.len > 10 and n[10 ..< n.len] == id): result = i
+    inc i
+
+proc getCustomDataCompound(s: ItemStack): Option[NbtCompound] =
+  let i = patchIndex(s, dcCustomData)
+  if i >= 0 and s.patch[i].present: some(s.patch[i].data.customData.data) else: none[NbtCompound]()
+
 proc installItemStack*(r: HostRegistry; st: WitState; ss: StackState) =
   witFn(r, IfStack, "[constructor]item-stack"):
     var key = args[0].s
@@ -243,6 +264,113 @@ proc installItemStack*(r: HostRegistry; st: WitState; ss: StackState) =
       for e in ss.items[rep].patch[i].data.enchantments.enchantment:
         if int(e.enchantment.id) != id: kept.add e
       ss.items[rep].patch[i].data.enchantments.enchantment = kept
+  witFn(r, IfStack, "[method]item-stack.get-custom-enchantments"):
+    let rep = int(args[0].i)
+    if not validStack(ss, rep): return "item-stack: invalid handle"
+    var xs: seq[CVal] = @[]
+    var names: seq[string] = @[]
+    let custom = ss.items[rep].getCustomDataCompound()
+    if custom.isSome:
+      let (has, ench) = custom.unsafeGet.get("pumpkin:enchantments")
+      if has and ench.kind == ntkCompound:
+        var i = 0
+        while i < ench.compoundVal.names.len:
+          let v = ench.compoundVal.values[i]
+          if v.kind == ntkInt:
+            names.add ench.compoundVal.names[i]
+            xs.add vRecord(@[vStr(ench.compoundVal.names[i]), vInt(int64(max(v.intVal, 1'i32)))])
+          inc i
+    for e in enchantmentsOf(ss.items[rep]):
+      if not (e.enchantment.name in names):
+        xs.add vRecord(@[vStr(e.enchantment.name), vInt(int64(max(e.level, 1'i32)))])
+    results.add vList(xs)
+  witFn(r, IfStack, "[method]item-stack.add-custom-enchantment"):
+    let rep = int(args[0].i)
+    if not validStack(ss, rep): return "item-stack: invalid handle"
+    ss.items[rep].setCustomData("pumpkin:enchantments", args[1].s, NbtTag(kind: ntkInt, intVal: int32(args[2].i)))
+    let v = findVanilla(args[1].s)
+    if v >= 0:
+      var kept: seq[EnchantmentEntry] = @[]
+      for e in enchantmentsOf(ss.items[rep]):
+        if int(e.enchantment.id) != v: kept.add e
+      kept.add EnchantmentEntry(enchantment: gEnchantments[v], level: int32(args[2].i))
+      setEnchantments(ss.items[rep], kept)
+  witFn(r, IfStack, "[method]item-stack.remove-custom-enchantment"):
+    let rep = int(args[0].i)
+    if not validStack(ss, rep): return "item-stack: invalid handle"
+    ss.items[rep].removeCustomData("pumpkin:enchantments", args[1].s)
+    let v = findVanilla(args[1].s)
+    let i = patchIndex(ss.items[rep], dcEnchantments)
+    if v >= 0 and i >= 0 and ss.items[rep].patch[i].present:
+      var kept: seq[EnchantmentEntry] = @[]
+      for e in ss.items[rep].patch[i].data.enchantments.enchantment:
+        if int(e.enchantment.id) != v: kept.add e
+      ss.items[rep].patch[i].data.enchantments.enchantment = kept
+  witFn(r, IfStack, "[method]item-stack.get-custom-enchantment-level"):
+    let rep = int(args[0].i)
+    if not validStack(ss, rep): return "item-stack: invalid handle"
+    let c = ss.items[rep].getCustomData("pumpkin:enchantments", args[1].s)
+    if c.isSome and c.unsafeGet.kind == ntkInt:
+      results.add vSome(vInt(int64(max(c.unsafeGet.intVal, 1'i32))))
+      return ""
+    let v = findVanilla(args[1].s)
+    if v >= 0:
+      for e in enchantmentsOf(ss.items[rep]):
+        if int(e.enchantment.id) == v:
+          results.add vSome(vInt(int64(max(e.level, 1'i32))))
+          return ""
+    results.add vNone()
+  witFn(r, IfStack, "[method]item-stack.has-custom-enchantment"):
+    let rep = int(args[0].i)
+    if not validStack(ss, rep): return "item-stack: invalid handle"
+    var has = ss.items[rep].hasCustomData("pumpkin:enchantments", args[1].s)
+    let v = findVanilla(args[1].s)
+    if not has and v >= 0:
+      for e in enchantmentsOf(ss.items[rep]):
+        if int(e.enchantment.id) == v: has = true
+    results.add vBool(has)
+  witFn(r, IfStack, "[method]item-stack.get-attribute-modifiers"):
+    let rep = int(args[0].i)
+    if not validStack(ss, rep): return "item-stack: invalid handle"
+    var xs: seq[CVal] = @[]
+    let i = patchIndex(ss.items[rep], dcAttributeModifiers)
+    if i >= 0 and ss.items[rep].patch[i].present:
+      for m in ss.items[rep].patch[i].data.attributeModifiers.attributeModifiers:
+        xs.add vRecord(@[vInt(int64(m.attribute.id)),
+          vRecord(@[vStr(m.id), vFloat(m.amount), vInt(int64(ord(m.operation)))]), vInt(int64(ord(m.slot)))])
+    results.add vList(xs)
+  witFn(r, IfStack, "[method]item-stack.add-attribute-modifier"):
+    let rep = int(args[0].i)
+    if not validStack(ss, rep): return "item-stack: invalid handle"
+    let all = allAttributes()
+    let attrId = int(args[1].items[0].i)
+    if attrId < 0 or attrId >= all.len: return "item-stack: unknown attribute " & $attrId
+    let mod0 = args[1].items[1]
+    let fresh = Modifier(attribute: all[attrId], id: mod0.items[0].s, amount: mod0.items[1].f,
+      operation: Operation(int(mod0.items[2].i)), slot: AttributeModifierSlot(int(args[1].items[2].i)))
+    var cur: seq[Modifier] = @[]
+    let i = patchIndex(ss.items[rep], dcAttributeModifiers)
+    if i >= 0 and ss.items[rep].patch[i].present:
+      for m in ss.items[rep].patch[i].data.attributeModifiers.attributeModifiers:
+        if not (m.attribute.id == fresh.attribute.id and m.id == fresh.id and m.slot == fresh.slot): cur.add m
+    cur.add fresh
+    let data = toDyn(AttributeModifiersImpl(attributeModifiers: cur))
+    if i >= 0: ss.items[rep].patch[i] = patchSet(data)
+    else: ss.items[rep].patch.add patchSet(data)
+  witFn(r, IfStack, "[method]item-stack.remove-attribute-modifiers"):
+    let rep = int(args[0].i)
+    if not validStack(ss, rep): return "item-stack: invalid handle"
+    let i = patchIndex(ss.items[rep], dcAttributeModifiers)
+    if i >= 0 and ss.items[rep].patch[i].present:
+      var cur: seq[Modifier] = @[]
+      for m in ss.items[rep].patch[i].data.attributeModifiers.attributeModifiers:
+        if int(m.attribute.id) != int(args[1].i): cur.add m
+      if cur.len == 0: removePatchOf(ss.items[rep], dcAttributeModifiers)
+      else: ss.items[rep].patch[i] = patchSet(toDyn(AttributeModifiersImpl(attributeModifiers: cur)))
+  witFn(r, IfStack, "[method]item-stack.clear-attribute-modifiers"):
+    let rep = int(args[0].i)
+    if not validStack(ss, rep): return "item-stack: invalid handle"
+    removePatchOf(ss.items[rep], dcAttributeModifiers)
   witFn(r, IfStack, "[method]item-stack.get-lore"):
     let rep = int(args[0].i)
     if not validStack(ss, rep): return "item-stack: invalid handle"
@@ -296,10 +424,25 @@ proc installItemStack*(r: HostRegistry; st: WitState; ss: StackState) =
     if not validStack(ss, rep): return "item-stack: invalid handle"
     var xs: seq[CVal] = @[]
     for e in ss.items[rep].patch:
-      if e.present: xs.add vRecord(@[vInt(int64(e.id.toId())), vList(@[])])
+      if e.present:
+        var raw: seq[byte] = @[]
+        if componentToBytes(e.id, e.data, raw):
+          var bytes: seq[CVal] = @[]
+          for b in raw: bytes.add vInt(int64(b))
+          xs.add vRecord(@[vInt(int64(e.id.toId())), vList(bytes)])
     results.add vList(xs)
   witFn(r, IfStack, "[method]item-stack.set-component"):
-    if not validStack(ss, int(args[0].i)): return "item-stack: invalid handle"
+    let rep = int(args[0].i)
+    if not validStack(ss, rep): return "item-stack: invalid handle"
+    let (found, id) = tryFromId(uint8(args[1].i))
+    if found:
+      var raw: seq[byte] = @[]
+      for b in args[2].items: raw.add byte(b.i)
+      var impl = toDyn(MaxStackSizeImpl(size: 1'u8))
+      if componentFromBytes(id, raw, impl):
+        let i = patchIndex(ss.items[rep], id)
+        if i >= 0: ss.items[rep].patch[i] = patchSet(impl)
+        else: ss.items[rep].patch.add patchSet(impl)
   witFn(r, IfStack, "[method]item-stack.remove-component"):
     let rep = int(args[0].i)
     if not validStack(ss, rep): return "item-stack: invalid handle"

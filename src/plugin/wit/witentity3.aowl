@@ -1,0 +1,392 @@
+## The third half of the `entity`, `living-entity` and `mob` resources of pumpkin/src/plugin/loader/wasm/wasm_host/wit/v0_1/entity.rs
+## (pumpkin-wasm-host-v0_1/src/{entity,living_entity,mob}.rs of the newer tree for what the pinned host lacks): remaining and
+## maximum air, `set-vehicle`, custom data (an `nbt-tree` per namespace and key), `raycast` and the entity ray traces, living
+## max health, attributes (value, base, modifiers, reset), equipment, and the `mob` resource over `Mob`/`MobEntity`
+## (target, AI switch, navigation, look-at, freeze ticks). `installEntity3` is called by pluginhost.aowl after `installEntity`.
+## `silent` and `has-gravity` are in witentity2.aowl and are real fields of the server's `Entity` (`silent`, `noGravity`).
+## PARTIAL: pumpkin/src/plugin/loader/wasm/wasm_host/wit/v0_1/entity.rs - custom data is kept here per entity id and is not saved
+## with the entity; the `mob` resource lacks `add-ai-goal` and `add-custom-ai-goal` (the builtin goal list and plugin-run goals
+## have no counterpart), `can-reach`, `set-pathfinding-malus` / `get-pathfinding-malus` (the WIT node types are not mapped onto
+## `PathType`), `get-mob-data` / `set-mob-data` and `navigate-to-entity` follows the target's position once; `clear-ai-goals`
+## empties both selectors.
+import std/[options, strutils, tables]
+import ../wasm/[component, canonabi]
+import "../../data/item_stack/mod"
+import ../../generated/attributes
+import ../../inventory/[inventory, player_inventory, entity_equipment, screenhandler]
+import "../../data/data_component_impl/impl_base" as dcbase
+import ../../nbt/tag
+import ../../util/vector3
+import ../../server/serverbase
+import ../../server/entity/entitymod
+import ../../server/entity/attributes as entityattrs
+import ../../server/entity/breath
+import ../../server/entity/player as playermod
+import ../../server/entity/ai/aibase
+import witstate, witserver, witstack, witray
+
+proc gone(): string = "entity is gone"
+
+proc entOf3(rep: int): nil EntityBase =
+  let eb = entityById(rep)
+  if eb != nil and eb.player != nil:
+    syncFromPlayer(eb)
+  eb
+
+var gCustomData: Table[int32, NbtCompound] = initTable[int32, NbtCompound]()   ## namespace -> compound of key -> tag
+
+proc wattr(idx: int; res: var Attribute): bool =
+  ## The attribute of WIT `attribute` case `idx`: the WIT enum and the generated table list the same 40 attributes in the same
+  ## order (ids 0 to 39), checked when this was written.
+  let all = allAttributes()
+  if idx < 0 or idx >= all.len: return false
+  res = all[idx]
+  true
+
+proc typeBase(lv: LivingEntity; a: Attribute): float64 =
+  ## The entity type's own base for `a`, else the attribute's default (`get_attribute_base` asserts on a type without it, which a
+  ## plugin must not be able to trigger).
+  for entry in lv.entity.entityType.attributes:
+    if entry.attribute.id == a.id: return entry.value
+  a.defaultValue
+
+proc baseOf(lv: LivingEntity; a: Attribute): float64 =
+  if lv.attributes.hasKey(a.id): lv.attributes.getOrDefault(a.id).baseValue else: typeBase(lv, a)
+
+proc slotOfWit(i: int): EquipmentSlot =
+  ## WIT `equipment-slot`: main-hand, off-hand, feet, legs, chest, head, body, saddle.
+  case i
+  of 0: esMainHand
+  of 1: esOffHand
+  of 2: esFeet
+  of 3: esLegs
+  of 4: esChest
+  of 5: esHead
+  of 6: esBody
+  else: esSaddle
+
+proc playerSlot(p: Player; slot: EquipmentSlot): int =
+  ## The player inventory slot behind an equipment slot, -1 for the ones a player does not have.
+  case slot
+  of esMainHand: int(p.inventory.getSelectedSlot())
+  of esOffHand: OffHandSlot
+  of esFeet: 36
+  of esLegs: 37
+  of esChest: 38
+  of esHead: 39
+  else: -1
+
+proc lookOf(eb: EntityBase): Vector3[float64] =
+  rotationVector(float64(eb.entity.pitch), float64(eb.entity.yaw))
+
+proc mobOf(eb: nil EntityBase): nil Mob =
+  if eb != nil and eb of Mob: Mob(eb) else: nil
+
+proc installEntity3*(r: HostRegistry; w: WitState; ss: StackState) =
+  # ---- air ----
+  hostFn(r, IfaceEntity, "[method]entity.get-remaining-air"):
+    let eb = entOf3(int(args[0].i))
+    if eb == nil: return gone()
+    if eb.player != nil: results.add vInt(int64(breathOf(mustPlayer(eb)).airSupply))
+    else: results.add vInt(0)
+  hostFn(r, IfaceEntity, "[method]entity.set-remaining-air"):
+    let eb = entOf3(int(args[0].i))
+    if eb == nil: return gone()
+    if eb.player != nil:
+      let b = breathOf(mustPlayer(eb))
+      b.airSupply = int32(args[1].i)
+      b.sendAirSupply(mustPlayer(eb))
+  hostFn(r, IfaceEntity, "[method]entity.get-max-air"):
+    results.add vInt(int64(MaxAir))
+  # ---- vehicle ----
+  hostFn(r, IfaceEntity, "[method]entity.set-vehicle"):
+    let eb = entOf3(int(args[0].i))
+    if eb == nil: return gone()
+    let current = eb.entity.vehicle
+    if current != nil: removePassenger(current.entity, eb.entity.entityId)
+    if args[1].i != 0:
+      let v = entOf3(int(args[1].items[0].i))
+      if v == nil: return gone()
+      addPassenger(v.entity, v, eb)
+  # ---- custom data ----
+  hostFn(r, IfaceEntity, "[method]entity.set-custom-data"):
+    let eb = entOf3(int(args[0].i))
+    if eb == nil: return gone()
+    var err = ""
+    let tag = fromWitNbtTree(args[3], err)
+    if err.len > 0: return err
+    var root = gCustomData.getOrDefault(eb.entity.entityId, newCompound())
+    var ns = newCompound()
+    let (found, old) = root.get(args[1].s)
+    if found and old.kind == ntkCompound: ns = old.compoundVal
+    ns.insert(args[2].s, tag)
+    root.insert(args[1].s, nbtTag(ns))
+    gCustomData[eb.entity.entityId] = root
+  hostFn(r, IfaceEntity, "[method]entity.get-custom-data"):
+    let eb = entOf3(int(args[0].i))
+    if eb == nil: return gone()
+    var root = gCustomData.getOrDefault(eb.entity.entityId, newCompound())
+    let (found, ns) = root.get(args[1].s)
+    if found and ns.kind == ntkCompound:
+      let (f2, tag) = ns.compoundVal.get(args[2].s)
+      if f2:
+        results.add vSome(toWitNbtTree(tag))
+        return ""
+    results.add vNone()
+  hostFn(r, IfaceEntity, "[method]entity.remove-custom-data"):
+    let eb = entOf3(int(args[0].i))
+    if eb == nil: return gone()
+    var root = gCustomData.getOrDefault(eb.entity.entityId, newCompound())
+    let (found, ns) = root.get(args[1].s)
+    if found and ns.kind == ntkCompound:
+      var inner = ns.compoundVal
+      discard inner.remove(args[2].s)
+      root.insert(args[1].s, nbtTag(inner))
+      gCustomData[eb.entity.entityId] = root
+  hostFn(r, IfaceEntity, "[method]entity.has-custom-data"):
+    let eb = entOf3(int(args[0].i))
+    if eb == nil: return gone()
+    var root = gCustomData.getOrDefault(eb.entity.entityId, newCompound())
+    let (found, ns) = root.get(args[1].s)
+    var has = false
+    if found and ns.kind == ntkCompound:
+      let (f2, tag) = ns.compoundVal.get(args[2].s)
+      has = f2
+    results.add vBool(has)
+  # ---- ray tracing ----
+  hostFn(r, IfaceEntity, "[method]entity.raycast"):
+    let eb = entOf3(int(args[0].i))
+    if eb == nil: return gone()
+    let h = traceBlock(eb.entity.world, getEyePos(eb), lookOf(eb), args[1].f, args[2].i != 0)
+    if h.found: results.add vSome(vRecord(@[blockPosVal(h.pos), vInt(int64(faceIndex(h.face)))]))
+    else: results.add vNone()
+  hostFn(r, IfaceEntity, "[method]entity.ray-trace-block"):
+    let eb = entOf3(int(args[0].i))
+    if eb == nil: return gone()
+    let h = traceBlock(eb.entity.world, getEyePos(eb), lookOf(eb), args[1].f, args[2].i != 0)
+    if h.found: results.add vSome(vRecord(@[blockPosVal(h.pos), vInt(int64(faceIndex(h.face))), vPos(h.hit)]))
+    else: results.add vNone()
+  hostFn(r, IfaceEntity, "[method]entity.ray-trace-entity"):
+    let eb = entOf3(int(args[0].i))
+    if eb == nil: return gone()
+    let h = traceEntity(eb.entity.world, eb, getEyePos(eb), lookOf(eb), args[1].f)
+    let he = h.entity
+    if he != nil: results.add vSome(vRecord(@[vInt(int64(he.entity.entityId)), vPos(h.hit), vFloat(h.distance)]))
+    else: results.add vNone()
+  hostFn(r, IfaceEntity, "[method]entity.get-target-entity"):
+    let eb = entOf3(int(args[0].i))
+    if eb == nil: return gone()
+    let h = traceEntity(eb.entity.world, eb, getEyePos(eb), lookOf(eb), args[1].f)
+    let he = h.entity
+    if he != nil: results.add vSome(vInt(int64(he.entity.entityId)))
+    else: results.add vNone()
+  # ---- living: max health, attributes, equipment ----
+  hostFn(r, IfaceEntity, "[method]living-entity.get-max-health"):
+    let eb = entOf3(int(args[0].i))
+    if eb == nil or eb.living == nil: return gone()
+    if eb.player != nil: results.add vFloat(float64(mustPlayer(eb).maxHealth))
+    else: results.add vFloat(float64(mustLiving(eb).getMaxHealth()))
+  hostFn(r, IfaceEntity, "[method]living-entity.set-max-health"):
+    let eb = entOf3(int(args[0].i))
+    if eb == nil or eb.living == nil: return gone()
+    if eb.player != nil:
+      mustPlayer(eb).maxHealth = float32(args[1].f)
+    else:
+      discard mustLiving(eb).updateAttributeInstance(MAX_HEALTH)
+      mustLiving(eb).setAttributeBase(MAX_HEALTH, args[1].f)
+      sendAttributeUpdatesForLiving(mustLiving(eb), [MAX_HEALTH])
+  hostFn(r, IfaceEntity, "[method]living-entity.get-attribute-value"):
+    let eb = entOf3(int(args[0].i))
+    if eb == nil or eb.living == nil: return gone()
+    var a = AIR_DRAG_MODIFIER
+    if not wattr(int(args[1].i), a): return "unknown attribute"
+    results.add vFloat(mustLiving(eb).getAttributeValue(a))
+  hostFn(r, IfaceEntity, "[method]living-entity.get-attribute-base"):
+    let eb = entOf3(int(args[0].i))
+    if eb == nil or eb.living == nil: return gone()
+    var a = AIR_DRAG_MODIFIER
+    if not wattr(int(args[1].i), a): return "unknown attribute"
+    results.add vFloat(baseOf(mustLiving(eb), a))
+  hostFn(r, IfaceEntity, "[method]living-entity.set-attribute-base"):
+    let eb = entOf3(int(args[0].i))
+    if eb == nil or eb.living == nil: return gone()
+    var a = AIR_DRAG_MODIFIER
+    if not wattr(int(args[1].i), a): return "unknown attribute"
+    discard mustLiving(eb).updateAttributeInstance(a)
+    mustLiving(eb).setAttributeBase(a, args[2].f)
+    sendAttributeUpdatesForLiving(mustLiving(eb), [a])
+  hostFn(r, IfaceEntity, "[method]living-entity.add-attribute-modifier"):
+    let eb = entOf3(int(args[0].i))
+    if eb == nil or eb.living == nil: return gone()
+    var a = AIR_DRAG_MODIFIER
+    if not wattr(int(args[1].i), a): return "unknown attribute"
+    let m = args[2]
+    mustLiving(eb).updateAttributeInstance(a).addOrReplaceModifier(
+      entityattrs.AttrModifier(id: m.items[0].s, amount: m.items[1].f, operation: ModifierOperation(int(m.items[2].i))))
+    sendAttributeUpdatesForLiving(mustLiving(eb), [a])
+  hostFn(r, IfaceEntity, "[method]living-entity.remove-attribute-modifier"):
+    let eb = entOf3(int(args[0].i))
+    if eb == nil or eb.living == nil: return gone()
+    var a = AIR_DRAG_MODIFIER
+    if not wattr(int(args[1].i), a): return "unknown attribute"
+    mustLiving(eb).updateAttributeInstance(a).removeModifier(args[2].s)
+    sendAttributeUpdatesForLiving(mustLiving(eb), [a])
+  hostFn(r, IfaceEntity, "[method]living-entity.get-attribute-modifiers"):
+    let eb = entOf3(int(args[0].i))
+    if eb == nil or eb.living == nil: return gone()
+    var a = AIR_DRAG_MODIFIER
+    if not wattr(int(args[1].i), a): return "unknown attribute"
+    var l: seq[CVal] = @[]
+    if mustLiving(eb).attributes.hasKey(a.id):
+      for m in mustLiving(eb).attributes.getOrDefault(a.id).modifiers:
+        l.add vRecord(@[vStr(m.id), vFloat(m.amount), vInt(int64(ord(m.operation)))])
+    results.add vList(l)
+  hostFn(r, IfaceEntity, "[method]living-entity.reset-attribute"):
+    let eb = entOf3(int(args[0].i))
+    if eb == nil or eb.living == nil: return gone()
+    var a = AIR_DRAG_MODIFIER
+    if not wattr(int(args[1].i), a): return "unknown attribute"
+    mustLiving(eb).attributes[a.id] = newAttributeInstance(typeBase(mustLiving(eb), a))
+    sendAttributeUpdatesForLiving(mustLiving(eb), [a])
+  hostFn(r, IfaceEntity, "[method]living-entity.reset-all-attributes"):
+    let eb = entOf3(int(args[0].i))
+    if eb == nil or eb.living == nil: return gone()
+    var all: seq[Attribute] = @[]
+    let everything = allAttributes()
+    for a in everything:
+      if mustLiving(eb).attributes.hasKey(a.id): all.add a
+    for a in all: mustLiving(eb).attributes[a.id] = newAttributeInstance(typeBase(mustLiving(eb), a))
+    sendAttributeUpdatesForLiving(mustLiving(eb), all)
+  hostFn(r, IfaceEntity, "[method]living-entity.get-equipment"):
+    let eb = entOf3(int(args[0].i))
+    if eb == nil or eb.living == nil: return gone()
+    let slot = slotOfWit(int(args[1].i))
+    var s = emptyItemStack()
+    if eb.player != nil:
+      let ps = playerSlot(mustPlayer(eb), slot)
+      if ps >= 0: s = inventory.getStack(Inventory(mustPlayer(eb).inventory), ps)
+    else:
+      s = mustLiving(eb).entityEquipment.get(slot)
+    if s.isEmpty(): results.add vNone()
+    else: results.add vSome(vInt(int64(addStack(ss, s))))
+  hostFn(r, IfaceEntity, "[method]living-entity.set-equipment"):
+    let eb = entOf3(int(args[0].i))
+    if eb == nil or eb.living == nil: return gone()
+    let slot = slotOfWit(int(args[1].i))
+    var s = emptyItemStack()
+    if args[2].i != 0 and validStack(ss, int(args[2].items[0].i)): s = ss.items[int(args[2].items[0].i)]
+    if eb.player != nil:
+      let p = mustPlayer(eb)
+      let ps = playerSlot(p, slot)
+      if ps >= 0:
+        inventory.setStack(Inventory(p.inventory), ps, s)
+        p.currentScreenHandler.sendContentUpdates()
+        p.sendEquipmentChanges([(slot, s)])
+    else:
+      discard mustLiving(eb).entityEquipment.put(slot, s)
+      mustLiving(eb).sendEquipmentChanges([(slot, s)])
+  hostFn(r, IfaceEntity, "[method]living-entity.clear-equipment"):
+    let eb = entOf3(int(args[0].i))
+    if eb == nil or eb.living == nil: return gone()
+    let slots = [esMainHand, esOffHand, esFeet, esLegs, esChest, esHead]
+    if eb.player != nil:
+      let p = mustPlayer(eb)
+      for slot in slots:
+        let ps = playerSlot(p, slot)
+        if ps >= 0: inventory.setStack(Inventory(p.inventory), ps, emptyItemStack())
+        p.sendEquipmentChanges([(slot, emptyItemStack())])
+      p.currentScreenHandler.sendContentUpdates()
+    else:
+      for slot in slots:
+        discard mustLiving(eb).entityEquipment.put(slot, emptyItemStack())
+        mustLiving(eb).sendEquipmentChanges([(slot, emptyItemStack())])
+  hostFn(r, IfaceEntity, "[method]living-entity.as-mob"):
+    let eb = entOf3(int(args[0].i))
+    if eb == nil: return gone()
+    if mobOf(eb) != nil: results.add vSome(vInt(args[0].i)) else: results.add vNone()
+  hostFn(r, IfaceEntity, "[method]entity.as-mob"):
+    let eb = entOf3(int(args[0].i))
+    if eb == nil: return gone()
+    if mobOf(eb) != nil: results.add vSome(vInt(args[0].i)) else: results.add vNone()
+  hostFn(r, IfaceEntity, "[method]entity.is-mob"):
+    let eb = entOf3(int(args[0].i))
+    if eb == nil: return gone()
+    results.add vBool(mobOf(eb) != nil)
+  hostFn(r, IfaceEntity, "[method]living-entity.is-mob"):
+    let eb = entOf3(int(args[0].i))
+    if eb == nil: return gone()
+    results.add vBool(mobOf(eb) != nil)
+  # ---- mob ----
+  hostFn(r, IfaceEntity, "[method]mob.as-entity"):
+    results.add vInt(args[0].i)
+  hostFn(r, IfaceEntity, "[method]mob.as-living"):
+    results.add vInt(args[0].i)
+  hostFn(r, IfaceEntity, "[method]mob.clear-ai-goals"):
+    let m = mobOf(entOf3(int(args[0].i)))
+    if m == nil: return gone()
+    m.mobEntity.goalsSelector = newGoalSelector()
+    m.mobEntity.targetSelector = newGoalSelector()
+  hostFn(r, IfaceEntity, "[method]mob.set-ai-disabled"):
+    let m = mobOf(entOf3(int(args[0].i)))
+    if m == nil: return gone()
+    m.mobEntity.setNoAi(args[1].i != 0)
+  hostFn(r, IfaceEntity, "[method]mob.is-ai-disabled"):
+    let m = mobOf(entOf3(int(args[0].i)))
+    if m == nil: return gone()
+    results.add vBool(m.mobEntity.isNoAi())
+  hostFn(r, IfaceEntity, "[method]mob.set-target"):
+    let m = mobOf(entOf3(int(args[0].i)))
+    if m == nil: return gone()
+    if args[1].i != 0: m.mobEntity.target = entOf3(int(args[1].items[0].i))
+    else: m.mobEntity.target = nil
+  hostFn(r, IfaceEntity, "[method]mob.get-target"):
+    let m = mobOf(entOf3(int(args[0].i)))
+    if m == nil: return gone()
+    let tg = m.mobEntity.target
+    if tg != nil: results.add vSome(vInt(int64(tg.entity.entityId)))
+    else: results.add vNone()
+  hostFn(r, IfaceEntity, "[method]mob.navigate-to-pos"):
+    let m = mobOf(entOf3(int(args[0].i)))
+    if m == nil: return gone()
+    m.mobEntity.navigator.setProgress(newNavigatorGoal(m.entity.pos, posOf(args[1]), args[2].f))
+    results.add vBool(true)
+  hostFn(r, IfaceEntity, "[method]mob.navigate-to-entity"):
+    let m = mobOf(entOf3(int(args[0].i)))
+    let t = entOf3(int(args[1].i))
+    if m == nil or t == nil: return gone()
+    m.mobEntity.navigator.setProgress(newNavigatorGoal(m.entity.pos, t.entity.pos, args[2].f))
+    results.add vBool(true)
+  hostFn(r, IfaceEntity, "[method]mob.stop-navigation"):
+    let m = mobOf(entOf3(int(args[0].i)))
+    if m == nil: return gone()
+    m.mobEntity.navigator.stop()
+  hostFn(r, IfaceEntity, "[method]mob.is-navigating"):
+    let m = mobOf(entOf3(int(args[0].i)))
+    if m == nil: return gone()
+    results.add vBool(not m.mobEntity.navigator.isIdle())
+  hostFn(r, IfaceEntity, "[method]mob.has-reached-destination"):
+    let m = mobOf(entOf3(int(args[0].i)))
+    if m == nil: return gone()
+    results.add vBool(m.mobEntity.navigator.isIdle())
+  hostFn(r, IfaceEntity, "[method]mob.set-navigation-speed"):
+    let m = mobOf(entOf3(int(args[0].i)))
+    if m == nil: return gone()
+    m.mobEntity.navigator.setSpeed(args[1].f)
+  hostFn(r, IfaceEntity, "[method]mob.look-at"):
+    let m = mobOf(entOf3(int(args[0].i)))
+    if m == nil: return gone()
+    let p = posOf(args[1])
+    m.mobEntity.lookControl.lookAt(m, p.x, p.y, p.z)
+  hostFn(r, IfaceEntity, "[method]mob.look-at-entity"):
+    let m = mobOf(entOf3(int(args[0].i)))
+    let t = entOf3(int(args[1].i))
+    if m == nil or t == nil: return gone()
+    m.mobEntity.lookControl.lookAtEntity(m, t)
+  hostFn(r, IfaceEntity, "[method]mob.set-freeze-ticks"):
+    let m = mobOf(entOf3(int(args[0].i)))
+    if m == nil: return gone()
+    m.entity.frozenTicks = int32(args[1].i)
+  hostFn(r, IfaceEntity, "[method]mob.get-freeze-ticks"):
+    let m = mobOf(entOf3(int(args[0].i)))
+    if m == nil: return gone()
+    results.add vInt(int64(m.entity.frozenTicks))

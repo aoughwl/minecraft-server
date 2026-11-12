@@ -1,0 +1,271 @@
+## The events of `PlayerEvKind` (witeventsplayer2.aowl) through a real plugin: a component assembled by hand registers (blocking)
+## for player-drop-item-event and player-permission-check-event; its `handle-event` cancels a drop of one item (count == 1, read from the event) and answers every
+## permission check with true. The test raises both through `playerEvent` against a `Player` and reads what came back, and
+## an event nobody registered for. `--write <file>` writes the component (for `mcbot.py --wasm-plugin2`).
+import std/[syncio, assertions, options, os]
+import ../wasm/[wasmvm, canonabi, component]
+import ../pluginhost
+import ../pluginhooks
+import witstate, witserver, witeventsplayer2
+import ../../server/serverbase
+import ../../util/math/position
+import ../../util/text/text
+import ../../util/vector3
+
+proc leb(n: int): string =
+  result = ""
+  var x = n
+  while true:
+    let b = x and 0x7F
+    x = x shr 7
+    if x == 0:
+      result.add char(b)
+      break
+    result.add char(b or 0x80)
+
+proc sl(n: int): string =
+  result = ""
+  var x = n
+  while true:
+    let b = x and 0x7F
+    x = x shr 7
+    if x == 0 and (b and 0x40) == 0:
+      result.add char(b)
+      break
+    result.add char(b or 0x80)
+
+proc nm(s: string): string = leb(s.len) & s
+proc sec(id: int; body: string): string =
+  result = ""
+  result.add char(id)
+  result.add leb(body.len)
+  result.add body
+proc bs(xs: openArray[int]): string =
+  result = ""
+  for x in xs: result.add char(x)
+proc vec(items: openArray[string]): string =
+  result = leb(items.len)
+  for it in items: result.add it
+proc names(xs: openArray[string]): string =
+  result = leb(xs.len)
+  for x in xs: result.add nm(x)
+const hdr = "\0asm\x01\0\0\0"
+
+# core signatures of the three lowered host functions: text.text(ptr, len) -> handle,
+# player.send-system-message(self, text, overlay), context.register-event(self, id, type, priority, blocking)
+const hostParams = [2, 3, 5]
+const hostResults = [1, 0, 0]
+
+proc coreType(np, nr: int): string =
+  result = bs([0x60, np])
+  for i in 0 ..< np: result.add char(0x7f)
+  result.add char(nr)
+  if nr == 1: result.add char(0x7f)
+
+proc shimModule(): string =
+  var types: seq[string] = @[]
+  var funcs: seq[string] = @[]
+  var codes: seq[string] = @[]
+  var exps: seq[string] = @[]
+  for i in 0 ..< 3:
+    types.add coreType(hostParams[i], hostResults[i])
+    funcs.add bs([i])
+    var body = bs([0x00])
+    for k in 0 ..< hostParams[i]: body.add bs([0x20, k])
+    body.add bs([0x41, i, 0x11, i, 0x00, 0x0b])
+    codes.add leb(body.len) & body
+    exps.add nm($i) & bs([0, i])
+  exps.add nm("$imports") & bs([1, 0])
+  result = hdr & sec(1, vec(types)) & sec(3, vec(funcs)) & sec(4, vec([bs([0x70, 0, 3])])) &
+    sec(7, vec(exps)) & sec(10, vec(codes))
+
+proc fixupModule(): string =
+  var types: seq[string] = @[]
+  var imps: seq[string] = @[]
+  for i in 0 ..< 3:
+    types.add coreType(hostParams[i], hostResults[i])
+    imps.add nm("") & nm($i) & bs([0, i])
+  imps.add nm("") & nm("$imports") & bs([1, 0x70, 0, 3])
+  result = hdr & sec(1, vec(types)) & sec(2, vec(imps)) &
+    sec(9, vec([bs([0, 0x41, 0, 0x0b, 3, 0, 1, 2])]))
+
+proc mainModule(): string =
+  let t0 = coreType(2, 1)       # text.text
+  let t1 = coreType(3, 0)       # player.send-system-message
+  let t2 = coreType(5, 0)       # context.register-event
+  let t3 = bs([0x60, 4, 0x7f, 0x7f, 0x7f, 0x7f, 1, 0x7f])   # cabi_realloc
+  let t4 = coreType(1, 1)       # on_load
+  let t5 = coreType(8, 1)       # handle_event: event-id, server, case, 5 flat payload slots
+  let reallocBody = bs([0x01, 0x01, 0x7f,
+    0x23,0x00,0x20,0x02,0x6a,0x41,0x01,0x6b,0x41,0x00,0x20,0x02,0x6b,0x71,0x21,0x04,
+    0x20,0x04,0x20,0x03,0x6a,0x24,0x00, 0x20,0x04,0x0b])
+  proc ic(n: int): string = bs([0x41]) & sl(n)           # i32.const n
+  proc lg(i: int): string = bs([0x20, i])                 # local.get i
+  proc cl(i: int): string = bs([0x10, i])                 # call i
+  proc st(addr0: int; v: string): string = ic(addr0) & v & bs([0x36, 2, 0])   # i32.store [addr0] = v
+  proc st8(addr0: int; v: string): string = ic(addr0) & v & bs([0x3a, 0, 0])  # i32.store8
+  # on_load(ctx): register for drop-item (event type 0, handler 3) and permission-check (type 1, handler 4), both blocking
+  let onLoad = bs([0x00]) &
+    lg(0) & ic(3) & ic(0) & ic(2) & ic(1) & cl(2) &
+    lg(0) & ic(4) & ic(1) & ic(2) & ic(1) & cl(2) &
+    st(256, ic(0)) & ic(256) & bs([0x0b])
+  # handle_event(id, server, case, p0..p4): case 0 is {player, item-name (ptr, len), count u8, cancelled}: it comes back with
+  # cancelled = (count == 1); case 1 is {player, permission (ptr, len), permission-result}: it comes back with the result true.
+  let handleEvent = bs([0x00]) &
+    lg(2) & bs([0x45, 0x04, 0x40]) &
+    st(320, ic(0)) & st(324, lg(3)) & st(328, lg(4)) & st(332, lg(5)) & st8(336, lg(6)) & st8(337, lg(6) & ic(1) & bs([0x46])) &
+    bs([0x05]) &
+    st(320, ic(1)) & st(324, lg(3)) & st(328, lg(4)) & st(332, lg(5)) & st8(336, ic(1)) &
+    bs([0x0b]) & ic(320) & bs([0x0b])
+  result = hdr &
+    sec(1, vec([t0, t1, t2, t3, t4, t5])) &
+    sec(2, vec([nm("host") & nm("0") & bs([0, 0]), nm("host") & nm("1") & bs([0, 1]), nm("host") & nm("2") & bs([0, 2])])) &
+    sec(3, vec([bs([3]), bs([4]), bs([5])])) &
+    sec(5, vec([bs([0, 1])])) &
+    sec(6, vec([bs([0x7f, 1, 0x41, 0x80, 0x08, 0x0b])])) &
+    sec(7, vec([nm("memory") & bs([2, 0]), nm("cabi_realloc") & bs([0, 3]), nm("on_load") & bs([0, 4]),
+                nm("handle_event") & bs([0, 5])])) &
+    sec(10, vec([leb(reallocBody.len) & reallocBody, leb(onLoad.len) & onLoad, leb(handleEvent.len) & handleEvent]))
+
+proc buildPlugin(): string =
+  let ver = "@0.1.0"
+  let tText = bs([0x42]) & vec([
+    bs([0x04, 0x00]) & nm("text-component") & bs([0x03, 0x01]),
+    bs([0x01, 0x69, 0]),
+    bs([0x01, 0x40, 1]) & nm("plain") & bs([0x73, 0, 1]),
+    bs([0x04, 0x00]) & nm("[static]text-component.text") & bs([0x01, 2])])
+  let tPlayer = bs([0x42]) & vec([
+    bs([0x02, 0x03, 0x02, 1, 1]),
+    bs([0x04, 0x00]) & nm("player") & bs([0x03, 0x01]),
+    bs([0x01, 0x68, 1]),
+    bs([0x01, 0x69, 0]),
+    bs([0x01, 0x40, 3]) & nm("self") & bs([2]) & nm("text") & bs([3]) & nm("overlay") & bs([0x7f, 1, 0]),
+    bs([0x04, 0x00]) & nm("[method]player.send-system-message") & bs([0x01, 4])])
+  let tServer = bs([0x42]) & vec([bs([0x04, 0x00]) & nm("server") & bs([0x03, 0x01])])
+  # event instance type: own<player> is type 2, the records are 4 (drop) and 5, 6 (permission, 6 unused), then the enums and
+  # the variant, laid out as in pluginhostplayertest
+  let tEvent = bs([0x42]) & vec([
+    bs([0x02, 0x03, 0x02, 1, 3]),
+    bs([0x02, 0x03, 0x02, 1, 1]),
+    bs([0x01, 0x69, 0]),
+    bs([0x01, 0x69, 1]),
+    bs([0x01, 0x72, 4]) & nm("player") & bs([2]) & nm("item-name") & bs([0x73]) & nm("count") & bs([0x7d]) & nm("cancelled") & bs([0x7f]),
+    bs([0x01, 0x72, 3]) & nm("player") & bs([2]) & nm("permission") & bs([0x73]) & nm("permission-result") & bs([0x7f]),
+    bs([0x01, 0x72, 3]) & nm("player") & bs([2]) & nm("permission") & bs([0x73]) & nm("permission-result") & bs([0x7f]),
+    bs([0x01, 0x6d]) & names(["player-drop-item-event", "player-permission-check-event"]),
+    bs([0x01, 0x6d]) & names(["highest", "high", "normal", "low", "lowest"]),
+    bs([0x01, 0x71, 2]) & nm("player-drop-item-event") & bs([1, 4, 0]) & nm("player-permission-check-event") & bs([1, 5, 0]),
+    bs([0x04, 0x00]) & nm("event-type") & bs([0x03, 0x00, 7]),
+    bs([0x04, 0x00]) & nm("event-priority") & bs([0x03, 0x00, 8]),
+    bs([0x04, 0x00]) & nm("event") & bs([0x03, 0x00, 9])])
+  let tContext = bs([0x42]) & vec([
+    bs([0x02, 0x03, 0x02, 1, 7]),
+    bs([0x02, 0x03, 0x02, 1, 8]),
+    bs([0x04, 0x00]) & nm("context") & bs([0x03, 0x01]),
+    bs([0x01, 0x68, 2]),
+    bs([0x01, 0x40, 5]) & nm("self") & bs([3]) & nm("handler-id") & bs([0x79]) & nm("event-type") & bs([0]) &
+      nm("event-priority") & bs([1]) & nm("blocking") & bs([0x7f, 1, 0]),
+    bs([0x04, 0x00]) & nm("[method]context.register-event") & bs([0x01, 4])])
+  let opts = vec([bs([0x03, 0]), bs([0x04, 0])])
+  result = "\0asm\x0d\0\x01\0" &
+    sec(7, vec([tText])) &                                                                   # t0
+    sec(10, vec([bs([0x00]) & nm("pumpkin:plugin/text" & ver) & bs([0x05, 0])])) &           # instance 0
+    sec(6, vec([bs([0x03, 0x00, 0]) & nm("text-component"),                                   # t1
+                bs([0x01, 0x00, 0]) & nm("[static]text-component.text")])) &                  # func 0
+    sec(7, vec([tPlayer])) &                                                                 # t2
+    sec(10, vec([bs([0x00]) & nm("pumpkin:plugin/player" & ver) & bs([0x05, 2])])) &         # instance 1
+    sec(6, vec([bs([0x03, 0x00, 1]) & nm("player"),                                           # t3
+                bs([0x01, 0x00, 1]) & nm("[method]player.send-system-message")])) &           # func 1
+    sec(7, vec([tServer])) &                                                                 # t4
+    sec(10, vec([bs([0x00]) & nm("pumpkin:plugin/server" & ver) & bs([0x05, 4])])) &         # instance 2
+    sec(6, vec([bs([0x03, 0x00, 2]) & nm("server")])) &                                       # t5
+    sec(7, vec([tEvent])) &                                                                  # t6
+    sec(10, vec([bs([0x00]) & nm("pumpkin:plugin/event" & ver) & bs([0x05, 6])])) &          # instance 3
+    sec(6, vec([bs([0x03, 0x00, 3]) & nm("event-type"),                                       # t7
+                bs([0x03, 0x00, 3]) & nm("event-priority"),                                   # t8
+                bs([0x03, 0x00, 3]) & nm("event")])) &                                        # t9
+    sec(7, vec([tContext])) &                                                                # t10
+    sec(10, vec([bs([0x00]) & nm("pumpkin:plugin/context" & ver) & bs([0x05, 10])])) &       # instance 4
+    sec(6, vec([bs([0x03, 0x00, 4]) & nm("context"),                                          # t11
+                bs([0x01, 0x00, 4]) & nm("[method]context.register-event")])) &               # func 2
+    sec(7, vec([bs([0x69, 11]),                                                              # t12 own<context>
+                bs([0x68, 5]),                                                               # t13 borrow<server>
+                bs([0x6a, 0x00, 0x01, 0x73]),                                                # t14 result<_, string>
+                bs([0x40, 1]) & nm("context") & bs([12, 0, 14]),                             # t15 on-load
+                bs([0x40, 3]) & nm("event-id") & bs([0x79]) & nm("server") & bs([13]) & nm("event") & bs([9]) & bs([0, 9])])) &   # t16 handle-event
+    sec(1, shimModule()) & sec(1, mainModule()) & sec(1, fixupModule()) &
+    sec(2, vec([bs([0x00, 0]) & vec([]),
+                bs([0x00, 1]) & vec([nm("host") & bs([0x12, 0])])])) &
+    sec(6, vec([bs([0x00, 0x02, 0x01, 1]) & nm("memory"),
+                bs([0x00, 0x00, 0x01, 1]) & nm("cabi_realloc"),
+                bs([0x00, 0x00, 0x01, 1]) & nm("on_load"),
+                bs([0x00, 0x00, 0x01, 1]) & nm("handle_event"),
+                bs([0x00, 0x01, 0x01, 0]) & nm("$imports")])) &
+    sec(8, vec([bs([0x01, 0x00, 0]) & opts, bs([0x01, 0x00, 1]) & opts, bs([0x01, 0x00, 2]) & opts,
+                bs([0x00, 0x00, 1]) & opts & bs([15]),
+                bs([0x00, 0x00, 2]) & opts & bs([16])])) &
+    sec(2, vec([bs([0x01]) & vec([nm("0") & bs([0x00, 3]), nm("1") & bs([0x00, 4]), nm("2") & bs([0x00, 5]),
+                                  nm("$imports") & bs([0x01, 0])]),
+                bs([0x00, 2]) & vec([nm("") & bs([0x12, 2])])])) &
+    sec(11, vec([bs([0x00]) & nm("on-load") & bs([0x01, 3, 0]),
+                 bs([0x00]) & nm("handle-event") & bs([0x01, 4, 0])]))
+
+var lines: seq[string] = @[]
+
+proc ck(ok: bool; msg: string) =
+  if not ok:
+    echo "FAILED ", msg
+    for l in lines: echo "  line: ", l
+    quit 1
+
+proc main() =
+  if paramCount() >= 2 and paramStr(1) == "--write":
+    try:
+      writeFile(paramStr(2), buildPlugin())
+    except:
+      echo "write failed"
+    echo "wrote ", paramStr(2)
+    return
+  let player = Player(entityId: 5'i32)
+  let world = World(players: @[player])
+  gLink.server = Server(worlds: @[world])
+  let host = newPluginHost("plugins/data")
+  host.logLine = proc (line: string) {.closure.} =
+    if not (line.len > 8 and line[0 ..< 8] == "Plugin '"): lines.add line
+  let err = loadPlugin(host, "demo2", buildPlugin())
+  if err.len > 0:
+    echo "load failed: ", err
+    quit 1
+  ck(host.activeCount() == 1, "the plugin loaded")
+  ck(host.plugins[0].eventRegs.len == 2, "two event registrations")
+  ck(host.plugins[0].eventRegs[0].eventName == "player-drop-item-event", "first is the drop event")
+  ck(host.plugins[0].eventRegs[1].eventName == "player-permission-check-event", "second is the permission check")
+  var drop = newPlayerEv(pekDropItem)
+  drop.text = "diamond"
+  drop.n = 1
+  let (cancelled, _) = playerEvent(host, player, drop)
+  ck(cancelled, "the plugin cancelled the drop of one item")
+  drop.n = 3
+  let (cancelled3, _) = playerEvent(host, player, drop)
+  ck(not cancelled3, "and let the drop of three through")
+  var perm = newPlayerEv(pekPermissionCheck)
+  perm.text = "some.node"
+  perm.flag = false
+  let (c2, granted) = playerEvent(host, player, perm)
+  ck(not c2 and granted, "the plugin answered the permission check with true")
+  perm.flag = true
+  let (c3, still) = playerEvent(host, player, perm)
+  ck(not c3 and still, "and keeps a granted check granted")
+  # an event nobody registered for runs nothing and changes nothing
+  var bed = newPlayerEv(pekBedLeave)
+  bed.pos = newBlockPos(1'i32, 2'i32, 3'i32)
+  bed.flag = true
+  let (c4, f4) = playerEvent(host, player, bed)
+  ck(not c4 and f4, "an unregistered event passes")
+  var closeEv = newPlayerEv(pekInventoryClose)
+  closeEv.n = -1
+  let (c5, _) = playerEvent(host, player, closeEv)
+  ck(not c5, "inventory-close passes (no handler)")
+  echo "witeventsplayer2test ok"
+
+main()

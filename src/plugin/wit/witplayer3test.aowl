@@ -1,0 +1,303 @@
+## The third batch of player and entity host functions (witplayer3, witentity3, witray and the silent / no-gravity fields of
+## the server's `Entity`) called through the registry with lifted `CVal` arguments, against a real `Server`, `World` and
+## `Player` whose client has no socket: the inventory it holds and the packets it wrote are read back.
+import std/[assertions, options, syncio, cmdline, tables]
+import ../../generated/packet
+import ../../generated/item_full
+import ../../protocol/java/packet_decoder
+import ../../protocol/[proto, varint]
+import ../../util/uuid
+import ../../command/cmdsource
+import ../../util/vector3
+import ../../util/text/text
+import ../../util/math/position
+import ../../world/[chunkdata, playerdata, worldfs, worldinfo]
+import ../../server/data/datamod
+import ../../server/entity/player
+import ../../server/entity/entitymod
+import ../../server/recipe
+import ../../server/scheduler
+import ../../server/serverbase
+import ../../server/tick_rate_manager
+import ../../server/world/worldmod
+import ../../server/net/winsock
+import ../../server/net/java/javamod
+import ../../server/net/netbase
+import ../../inventory/[inventory, player_inventory, screenhandler]
+import "../../data/item_stack/mod"
+import ../wasm/[wasmvm, canonabi, component]
+import ../pluginhooks
+import witstate, witserver, witstack, witgui, witplayer, witentity, witplayer3, witentity3, witplayer2
+
+proc scratch(): string =
+  result = parentDirW(paramStr(0)) & "/witplayer3_scratch"
+  discard createDirAllW(result)
+
+proc newTestServer(): Server =
+  let adv = defaultAdvancedConfiguration()
+  let basic = defaultBasicConfiguration()
+  result = Server(basicConfig: basic, advancedConfig: adv, worlds: @[], dimensions: @[OVERWORLD],
+    tickCounter: 100'i64, nextEntityId: 1'i32, tickRateManager: newServerTickRateManager(20.0'f32), keyStore: nil,
+    recipeManager: newRecipeManager(), scheduler: newTaskScheduler(), data: ServerData(),
+    playerDataStorage: newPlayerDataStorage(scratch() & "/playerdata", true), levelFolder: scratch(),
+    playerIdleTimeout: 0'i32, mojangPublicKeys: @[], stopRequested: false, stopAtMs: 0'i64)
+  let theLevel = fromRootFolder(adv.world, scratch(), 1'i64, OVERWORLD)
+  result.worlds.add(loadWorld(theLevel, defaultLevelData(1'u64), OVERWORLD, 63'i32, -64'i32, result))
+
+proc newTestPlayer(server: Server): Player =
+  let client = newJavaClient(InvalidSocket, 1'u64)
+  client.connectionState = csPlay
+  client.version = jmvV1_21_11
+  client.peerIp = "10.1.2.3"
+  client.serverAddress = "play.example.org"
+  let profile = GameProfile(id: offlineUuid("Tester"), name: "Tester", properties: @[], profileActions: @[])
+  result = newPlayer(client, profile, defaultPlayerConfig(), server.worlds[0], server, Survival, 1'i32)
+  worldmod.addPlayer(server.worlds[0], result)
+  result.setClientLoaded(true)
+
+proc packetIds(client: JavaClient): seq[int32] =
+  var decoder = newTCPNetworkDecoder()
+  decoder.feed(client.networkWriter.flush())
+  result = @[]
+  while decoder.packetReady():
+    let res = decoder.getRawPacket()
+    assert res.isOk
+    result.add(res.value.id)
+
+proc has(ids: seq[int32]; id: int32): bool =
+  for i in ids:
+    if i == id: return true
+  false
+
+var failures = 0
+
+proc ck(ok: bool; msg: string) =
+  if not ok:
+    echo "FAILED ", msg
+    inc failures
+
+proc call(r: HostRegistry; ci: CompInst; iface, fname: string; args: seq[CVal]; results: var seq[CVal]): string =
+  let key = iface & "#" & fname
+  var i = 0
+  while i < r.keys.len:
+    if r.keys[i] == key:
+      return r.fns[i].fn(ci, args, results)
+    inc i
+  result = "no host function " & key
+
+proc c(r: HostRegistry; ci: CompInst; iface, fname: string; args: seq[CVal]): seq[CVal] =
+  var res: seq[CVal] = @[]
+  let e = call(r, ci, iface, fname, args, res)
+  if e.len > 0:
+    echo "FAILED call ", fname, ": ", e
+    inc failures
+  res
+
+const
+  P = "pumpkin:plugin/player"
+  I = "pumpkin:plugin/inventory"
+  E = "pumpkin:plugin/world"
+
+proc diamondStack(n: uint8): ItemStack =
+  let it = Item.fromRegistryKey("diamond")
+  if it == nil:
+    echo "FAILED no diamond item"
+    quit 1
+  newItemStack(n, it)
+
+proc main() =
+  let server = newTestServer()
+  let p = newTestPlayer(server)
+  gLink.server = server
+  let r = newHostRegistry()
+  let st = newWitState()
+  let stacks = newStackState()
+  let guis = newGuiState()
+  installPlayer(r, st)
+  installPlayer3(r, st, stacks, guis)
+  installEntity(r, st)
+  installEntity3(r, st, stacks)
+  let ci = newCompInst(newWasmVm(), r, 3)
+  let me = vInt(int64(p.entityId))
+  discard packetIds(p.client)
+
+  # ---- inventory slots through item-stack handles
+  let h1 = addStack(stacks, diamondStack(5'u8))
+  discard c(r, ci, P, "[method]player.set-inventory-item", @[me, vInt(3), vSome(vInt(int64(h1)))])
+  ck(inventory.getStack(Inventory(p.inventory), 3).itemCount == 5'u8, "slot 3 holds 5 diamonds")
+  ck(packetIds(p.client).len >= 1, "a hotbar slot is sent to the client")
+  var res = c(r, ci, P, "[method]player.get-inventory-item", @[me, vInt(3)])
+  ck(res.len == 1 and res[0].i == 1, "get-inventory-item answers some")
+  ck(stacks.items[int(res[0].items[0].i)].itemCount == 5'u8, "and the handle is a copy with count 5")
+  res = c(r, ci, P, "[method]player.get-inventory-item", @[me, vInt(4)])
+  ck(res[0].i == 0, "an empty slot answers none")
+  # the selected slot is the main hand
+  p.inventory.setSelectedSlot(3'u8)
+  res = c(r, ci, P, "[method]player.get-item-in-hand", @[me, vInt(1)])
+  ck(res[0].i == 1, "right hand is slot 3")
+  let h2 = addStack(stacks, diamondStack(1'u8))
+  discard c(r, ci, P, "[method]player.set-item-in-hand", @[me, vInt(0), vSome(vInt(int64(h2)))])
+  ck(inventory.getStack(Inventory(p.inventory), OffHandSlot).itemCount == 1'u8, "left hand is the off hand slot")
+  # armor through player-inventory (rep is the entity id)
+  discard c(r, ci, I, "[method]player-inventory.set-helmet", @[me, vSome(vInt(int64(h2)))])
+  ck(inventory.getStack(Inventory(p.inventory), 39).itemCount == 1'u8, "helmet is slot 39")
+  res = c(r, ci, I, "[method]player-inventory.get-helmet", @[me])
+  ck(res[0].i == 1, "get-helmet some")
+  discard c(r, ci, I, "[method]player-inventory.clear-armor", @[me])
+  ck(inventory.getStack(Inventory(p.inventory), 39).isEmpty(), "clear-armor")
+  # the inventory resource: rep = entity id * 4 + 1
+  let inv = vInt(int64(p.entityId) * 4 + 1)
+  res = c(r, ci, I, "[method]inventory.get-size", @[inv])
+  ck(res[0].i == 36, "main inventory has 36 slots")
+  res = c(r, ci, I, "[method]inventory.count-item", @[inv, vStr("minecraft:diamond")])
+  ck(res[0].i == 5, "diamonds counted in the main inventory (the off hand is not part of it), got " & $res[0].i)
+  res = c(r, ci, I, "[method]inventory.contains-item", @[inv, vStr("diamond")])
+  ck(res[0].i == 1, "contains diamond")
+  res = c(r, ci, I, "[method]inventory.is-empty", @[inv])
+  ck(res[0].i == 0, "main inventory is not empty")
+  res = c(r, ci, I, "[method]inventory.remove-item", @[inv, vInt(3)])
+  ck(res[0].i == 1 and inventory.getStack(Inventory(p.inventory), 3).isEmpty(), "remove-item takes the stack out")
+  # ender chest
+  let h3 = addStack(stacks, diamondStack(9'u8))
+  discard c(r, ci, P, "[method]player.set-ender-chest-item", @[me, vInt(2), vSome(vInt(int64(h3)))])
+  res = c(r, ci, P, "[method]player.get-ender-chest-item", @[me, vInt(2)])
+  ck(res[0].i == 1 and stacks.items[int(res[0].items[0].i)].itemCount == 9'u8, "ender chest slot 2 holds 9")
+  res = c(r, ci, P, "[method]player.get-ender-chest", @[me])
+  let ender = res[0]
+  res = c(r, ci, I, "[method]inventory.get-size", @[ender])
+  ck(res[0].i == 27, "ender chest has 27 slots")
+  discard c(r, ci, P, "[method]player.clear-ender-chest", @[me])
+  res = c(r, ci, P, "[method]player.get-ender-chest-item", @[me, vInt(2)])
+  ck(res[0].i == 0, "clear-ender-chest")
+
+  # ---- display name
+  discard c(r, ci, P, "[method]player.set-display-name", @[me, vInt(int64(newTextRep(st, text("Boss"))))])
+  res = c(r, ci, P, "[method]player.get-display-name", @[me])
+  ck(getText(textAt(st, int(res[0].i))) == "Boss", "display name is read back")
+
+  # ---- packets
+  discard packetIds(p.client)
+  discard c(r, ci, P, "[method]player.delete-message-by-id", @[me, vInt(7)])
+  discard c(r, ci, P, "[method]player.open-book", @[me, vInt(1)])
+  discard c(r, ci, P, "[method]java-player.send-custom-payload", @[me, vStr("test:chan"), vList(@[vInt(1), vInt(2), vInt(3)])])
+  discard c(r, ci, P, "[method]java-player.send-game-event", @[me, vInt(3), vFloat(1.0)])
+  discard c(r, ci, P, "[method]java-player.clear-resource-packs", @[me])
+  discard c(r, ci, P, "[method]java-player.send-resource-pack", @[me, vRecord(@[vRecord(@[vInt(1), vInt(2)]), vStr("http://x/y.zip"),
+    vStr("0123456789012345678901234567890123456789"), vBool(false), vNone()])])
+  discard c(r, ci, P, "[method]player.play-custom-sound", @[me, vStr("mypack:boom"), vInt(0), vFloat(1.0), vFloat(1.0)])
+  let ids = packetIds(p.client)
+  ck(ids.has(CB_PLAY_DELETE_CHAT.toId(jmvV1_21_11)), "delete-chat packet")
+  ck(ids.has(CB_PLAY_OPEN_BOOK.toId(jmvV1_21_11)), "open-book packet")
+  ck(ids.has(CB_PLAY_CUSTOM_PAYLOAD.toId(jmvV1_21_11)), "custom payload packet")
+  ck(ids.has(CB_PLAY_GAME_EVENT.toId(jmvV1_21_11)), "game event packet")
+  ck(ids.has(CB_PLAY_RESOURCE_PACK_POP.toId(jmvV1_21_11)), "resource pack pop packet")
+  ck(ids.has(CB_PLAY_RESOURCE_PACK_PUSH.toId(jmvV1_21_11)), "resource pack push packet")
+  ck(ids.has(CB_PLAY_SOUND.toId(jmvV1_21_11)), "a sound that is not in the registry is sent as an inline sound event")
+  res = c(r, ci, P, "[method]java-player.get-server-address", @[me])
+  ck(res[0].s == "play.example.org", "server address")
+  res = c(r, ci, P, "[method]java-player.get-settings", @[me])
+  ck(res[0].items.len == 8 and res[0].items[0].s == p.config.locale, "java-player settings record")
+
+  # ---- gui
+  let g = addGui(guis, 2, text("Menu"))
+  discard packetIds(p.client)
+  discard c(r, ci, P, "[method]player.open-gui", @[me, vInt(int64(g))])
+  ck(packetIds(p.client).has(CB_PLAY_OPEN_SCREEN.toId(jmvV1_21_11)), "open-gui sends the open-screen packet")
+  ck(p.currentScreenHandler != ScreenHandler(p.playerScreenHandler), "the plugin screen handler is current")
+  p.onHandledScreenClosed()
+  ck(p.currentScreenHandler == ScreenHandler(p.playerScreenHandler), "closing returns to the player's handler")
+
+  # ---- status effects (speed is case 0)
+  res = c(r, ci, P, "[method]player.has-effect", @[me, vInt(0)])
+  ck(res[0].i == 0, "no speed yet")
+  discard c(r, ci, P, "[method]player.add-effect", @[me, vRecord(@[vInt(0), vInt(200), vInt(1), vBool(false), vBool(true), vBool(true)])])
+  res = c(r, ci, P, "[method]player.has-effect", @[me, vInt(0)])
+  ck(res[0].i == 1, "speed added")
+  res = c(r, ci, P, "[method]player.get-effect", @[me, vInt(0)])
+  ck(res[0].i == 1 and res[0].items[0].items[1].i == 200 and res[0].items[0].items[2].i == 1, "get-effect has duration 200 and amplifier 1")
+  res = c(r, ci, P, "[method]player.get-active-effects", @[me])
+  ck(res[0].items.len == 1, "one active effect")
+  discard c(r, ci, P, "[method]player.remove-effect", @[me, vInt(0)])
+  res = c(r, ci, P, "[method]player.has-effect", @[me, vInt(0)])
+  ck(res[0].i == 0, "speed removed")
+  discard c(r, ci, P, "[method]player.add-effect", @[me, vRecord(@[vInt(2), vInt(100), vInt(0), vBool(false), vBool(true), vBool(true)])])
+  discard c(r, ci, P, "[method]player.clear-effects", @[me])
+  res = c(r, ci, P, "[method]player.get-active-effects", @[me])
+  ck(res[0].items.len == 0, "clear-effects")
+
+  # ---- advancements: this player has none loaded, so the answers are the empty ones
+  res = c(r, ci, P, "[method]player.has-advancement", @[me, vStr("minecraft:story/root")])
+  ck(res[0].i == 0, "has-advancement without advancements")
+  res = c(r, ci, P, "[method]player.get-completed-advancements", @[me])
+  ck(res[0].items.len == 0, "no completed advancements")
+
+  # ---- ray tracing in an empty world: nothing is hit
+  res = c(r, ci, P, "[method]player.ray-trace-block", @[me, vFloat(20.0), vBool(false)])
+  ck(res[0].i == 0, "empty world: no block")
+  res = c(r, ci, P, "[method]player.get-target-entity", @[me, vFloat(20.0)])
+  ck(res[0].i == 0, "empty world: no entity")
+
+  # ---- entity: air, silent, gravity (real fields), custom data, attributes, equipment
+  res = c(r, ci, E, "[method]entity.get-max-air", @[me])
+  ck(res[0].i == 300, "max air")
+  discard c(r, ci, E, "[method]entity.set-remaining-air", @[me, vInt(120)])
+  res = c(r, ci, E, "[method]entity.get-remaining-air", @[me])
+  ck(res[0].i == 120, "air is read back")
+  let eb = entityById(int(p.entityId))
+  ck(eb != nil, "player entity found")
+  discard c(r, ci, E, "[method]entity.set-silent", @[me, vBool(true)])
+  ck(eb != nil and eb.entity.silent, "set-silent writes the entity's field")
+  res = c(r, ci, E, "[method]entity.is-silent", @[me])
+  ck(res[0].i == 1, "is-silent")
+  discard c(r, ci, E, "[method]entity.set-has-gravity", @[me, vBool(false)])
+  ck(eb != nil and eb.entity.noGravity, "set-has-gravity false writes noGravity")
+  ck(eb != nil and eb.getGravity() == 0.0, "an entity without gravity has gravity 0")
+  discard c(r, ci, E, "[method]entity.set-has-gravity", @[me, vBool(true)])
+  ck(eb != nil and eb.getGravity() != 0.0, "and gravity is back")
+  # custom data: nbt-tree { tags: [string "v"], root: 0 }, TagString is case 7
+  let tree = vRecord(@[vInt(0), vList(@[vVariant(7, vStr("hello"))])])
+  discard c(r, ci, E, "[method]entity.set-custom-data", @[me, vStr("ns"), vStr("k"), tree])
+  res = c(r, ci, E, "[method]entity.has-custom-data", @[me, vStr("ns"), vStr("k")])
+  ck(res[0].i == 1, "has-custom-data")
+  res = c(r, ci, E, "[method]entity.get-custom-data", @[me, vStr("ns"), vStr("k")])
+  ck(res[0].i == 1 and res[0].items[0].items[1].items[0].items[0].s == "hello", "custom data round trip")
+  discard c(r, ci, E, "[method]entity.remove-custom-data", @[me, vStr("ns"), vStr("k")])
+  res = c(r, ci, E, "[method]entity.has-custom-data", @[me, vStr("ns"), vStr("k")])
+  ck(res[0].i == 0, "remove-custom-data")
+  # attributes: max-health is case 23 in the WIT enum
+  res = c(r, ci, E, "[method]living-entity.get-attribute-base", @[me, vInt(23)])
+  ck(res[0].f == 20.0, "max-health base is 20, got " & $res[0].f)
+  discard c(r, ci, E, "[method]living-entity.set-attribute-base", @[me, vInt(23), vFloat(30.0)])
+  res = c(r, ci, E, "[method]living-entity.get-attribute-value", @[me, vInt(23)])
+  ck(res[0].f == 30.0, "base 30 gives value 30")
+  discard c(r, ci, E, "[method]living-entity.add-attribute-modifier", @[me, vInt(23), vRecord(@[vStr("t:m"), vFloat(10.0), vInt(0)])])
+  res = c(r, ci, E, "[method]living-entity.get-attribute-value", @[me, vInt(23)])
+  ck(res[0].f == 40.0, "an add modifier of 10 gives 40")
+  res = c(r, ci, E, "[method]living-entity.get-attribute-modifiers", @[me, vInt(23)])
+  ck(res[0].items.len == 1 and res[0].items[0].items[0].s == "t:m", "modifier listed")
+  discard c(r, ci, E, "[method]living-entity.remove-attribute-modifier", @[me, vInt(23), vStr("t:m")])
+  discard c(r, ci, E, "[method]living-entity.reset-attribute", @[me, vInt(23)])
+  res = c(r, ci, E, "[method]living-entity.get-attribute-value", @[me, vInt(23)])
+  ck(res[0].f == 20.0, "reset-attribute restores 20")
+  # equipment: head is case 5
+  let h4 = addStack(stacks, diamondStack(1'u8))
+  discard c(r, ci, E, "[method]living-entity.set-equipment", @[me, vInt(5), vSome(vInt(int64(h4)))])
+  ck(inventory.getStack(Inventory(p.inventory), 39).itemCount == 1'u8, "set-equipment head is inventory slot 39")
+  res = c(r, ci, E, "[method]living-entity.get-equipment", @[me, vInt(5)])
+  ck(res[0].i == 1, "get-equipment head")
+  discard c(r, ci, E, "[method]living-entity.clear-equipment", @[me])
+  ck(inventory.getStack(Inventory(p.inventory), 39).isEmpty(), "clear-equipment")
+  res = c(r, ci, P, "[method]player.as-bedrock", @[me])
+  ck(res[0].i == 0, "a Java client has no bedrock view")
+  gPluginBedrockSessionHook = proc (pl: Player): bool {.closure.} = true
+  res = c(r, ci, P, "[method]player.as-bedrock", @[me])
+  ck(res[0].i == 1, "a Bedrock session has one")
+  res = c(r, ci, E, "[method]entity.is-mob", @[me])
+  ck(res[0].i == 0, "a player is not a mob")
+
+  if failures > 0:
+    echo "witplayer3test: ", failures, " failures"
+    quit 1
+  echo "witplayer3test ok"
+
+main()

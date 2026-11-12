@@ -14,25 +14,28 @@
 ## block-entity, boss-bar, scoreboard, gui, forms, recipe, text, server, scheduler, ...; 90+ of the 98 WIT files in
 ## the newer tree's v0.1; text, scheduler, boss-bar, world, server, uuid, i18n, item-stack, block-entity, scoreboard, gui, recipe, forms and WASI are now in wit/, see their headers) is a host function that the plugin may import but that traps when called with
 ## "unimplemented host function <iface>#<fn>": the import is accepted so the plugin still loads.
-## PARTIAL: pumpkin/src/plugin/loader/wasm/wasm_host/mod.rs - WASI p2 is wit/witwasi.aowl (stdio, environment by permission, clocks, random; no filesystem, sockets or http); no signature verification, no fuel or memory limits, no marketplace metadata.
+## PARTIAL: pumpkin/src/plugin/loader/wasm/wasm_host/mod.rs - WASI p2 is wit/witwasi.aowl (stdio, environment by permission, clocks, random, the `data` preopen; no sockets or http); signature verification only warns (no market key fetch), no fuel or memory limits, no marketplace metadata.
 
 ## PARTIAL: pumpkin/src/plugin/loader/wasm/mod.rs - `WasmPluginLoader`'s load path is `preparePlugin` + `startPlugin` here (`loadPlugin` runs both); the loader object, the directory scan, unload by name and `can_load` (the `.wasm` extension) are pluginserver.aowl / managercore.aowl
-## PARTIAL: pumpkin/src/plugin/loader/wasm/wasm_host/mod.rs - instantiate, `init-plugin`, metadata and `on-load`; WASI is wit/witwasi.aowl; no signature check, no store limits, one wasm API version (v0.1) only, no v0.2 host
+## PARTIAL: pumpkin/src/plugin/loader/wasm/wasm_host/mod.rs - instantiate, `init-plugin`, metadata and `on-load`; WASI is wit/witwasi.aowl; signature check warns only, no store limits, one wasm API version (v0.1) only, no v0.2 host
 ## PARTIAL: pumpkin/src/plugin/loader/wasm/wasm_host/state.rs - the host state is `PluginHost` plus per-plugin `PluginEntry`; the WASI context is witwasi.aowl's `WasiHost`, no resource limiter, no permission checks on host calls
 ## PARTIAL: pumpkin/src/plugin/loader/wasm/wasm_host/logging.rs - `logging.log` only (to the host's log line writer); `log-tracing` is not decoded
 ## PARTIAL: pumpkin/src/plugin/loader/wasm/wasm_host/wit/v0_1/mod.rs - the registry of interfaces (installInterfaces) holds logging, context and command; the other 40+ interfaces are absent
 ## PARTIAL: pumpkin/src/plugin/loader/wasm/wasm_host/wit/v0_1/context.rs - register-event, register-command, register-permission (accepts, registers nothing), get-data-folder; get-server and get-marketplace-metadata missing
-## PARTIAL: pumpkin/src/plugin/loader/wasm/wasm_host/wit/v0_1/commands/mod.rs - command, command-node (literal, argument as simple/bool/message consumers), consumed-args.get-value for simple and bool, command-sender send-message and get-name; the other ~40 argument types and the rest of command-sender are missing
+## PARTIAL: pumpkin/src/plugin/loader/wasm/wasm_host/wit/v0_1/commands/mod.rs - command, command-node (literal; argument of bool, float, double, integer, long with bounds, string, players, entities, entity, block-pos, rotation, block-state, block-predicate, item, item-predicate, component, particle, gamemode, difficulty, time, resource-location, mob-effect, entity-anchor, item-slot, message; every other argument type reads one word as `simple`), consumed-args.get-value for every `arg` case, every command-sender method (a command block sender answers `dummy`); `suggest-with-handler-id` and `require-with-handler-id` are kept but never asked of the plugin
 ## PARTIAL: pumpkin/src/plugin/loader/wasm/wasm_host/wit/v0_1/commands/executor.rs - runs `handle-command` and maps the `command-error` variant; suggestions (`handle-command-suggestion`) are not wired
 ## PARTIAL: pumpkin/src/plugin/loader/wasm/wasm_host/wit/v0_1/events/mod.rs - `fireEvent` builds any event variant case from its own declared type, by field name, and hands each handler's returned fields to the next and back to the caller (`EventOutcome.fieldVals`); the player events are produced by wit/witeventsplayer.aowl (see its PARTIAL), no other event family; priorities order nothing (as upstream: blocking handlers first, then non-blocking)
 import std/[options, syncio, strutils]
 import wasm/[wasmvm, canonabi, component]
 import ../command/[fallbackdispatch, cmdsource, args]
-import ../util/text/[textbase, text]
+import ../util/text/[textbase, text, color]
+import ../util/vector3
+import ../util/permission
 import wit/[witstate, witall]
 import api/eventsmod
 import ../server/scheduler
-import wit/[witplayer, witentity]
+import wit/[witplayer, witplayer3, witentity, witentity3]
+import signature
 
 const
   IfaceLogging = "pumpkin:plugin/logging"
@@ -67,9 +70,18 @@ type
   CmdNode = object
     isArgument: bool
     name: string
-    argType: string
+    argType: string          ## the `argument-type` case name (`integer`, `players`, `string`, ...)
     children: seq[int]
     handler: int
+    suggestHandler: int      ## `suggest-with-handler-id` (kept; suggestions are not asked of the plugin yet)
+    requireHandler: int      ## `require-with-handler-id` (kept; requirements are not asked of the plugin yet)
+    hasMin: bool
+    hasMax: bool
+    minV: float64
+    maxV: float64
+    minI: int64
+    maxI: int64
+    strKind: int             ## string-type: 0 single-word, 1 quotable, 2 greedy
 
   CmdBuilder = object
     names: seq[string]
@@ -149,10 +161,39 @@ proc stringsOf(v: CVal): seq[string] =
 
 # ---- command construction --------------------------------------------------------------------
 
-proc consumerFor(argType: string): ArgumentConsumer =
-  case argType
+proc consumerFor(n: CmdNode): ArgumentConsumer =
+  ## The fallback dispatcher's consumer for a plugin argument type (`commands/mod.rs`'s `argument_type_to_consumer`). The types
+  ## whose consumer this server lacks read one word (`simple`).
+  case n.argType
   of "bool": newBoolArgConsumer()
   of "message": newMsgArgConsumer()
+  of "float":
+    newBoundedF32(n.name, (if n.hasMin: some(float32(n.minV)) else: none[float32]()), (if n.hasMax: some(float32(n.maxV)) else: none[float32]()))
+  of "double":
+    newBoundedF64(n.name, (if n.hasMin: some(n.minV) else: none[float64]()), (if n.hasMax: some(n.maxV) else: none[float64]()))
+  of "integer":
+    newBoundedI32(n.name, (if n.hasMin: some(int32(n.minI)) else: none[int32]()), (if n.hasMax: some(int32(n.maxI)) else: none[int32]()))
+  of "long":
+    newBoundedI64(n.name, (if n.hasMin: some(n.minI) else: none[int64]()), (if n.hasMax: some(n.maxI) else: none[int64]()))
+  of "string": (if n.strKind == 2: newMsgArgConsumer() else: newSimpleArgConsumer())
+  of "players": newPlayersArgumentConsumer()
+  of "entities": newEntitiesArgumentConsumer()
+  of "entity": newEntityArgumentConsumer()
+  of "block-pos": newBlockPosArgumentConsumer()
+  of "rotation": newRotationArgumentConsumer()
+  of "block-state": newBlockArgumentConsumer()
+  of "block-predicate": newBlockPredicateArgumentConsumer()
+  of "item": newItemArgumentConsumer()
+  of "item-predicate": newItemPredicateArgumentConsumer()
+  of "component": newTextComponentArgConsumer()
+  of "particle": newParticleArgumentConsumer()
+  of "gamemode": newGamemodeArgumentConsumer()
+  of "difficulty": newDifficultyArgumentConsumer()
+  of "time": newTimeArgumentConsumer()
+  of "resource-location": newResourceLocationArgumentConsumer()
+  of "mob-effect": newEffectTypeArgumentConsumer()
+  of "entity-anchor": newEntityAnchorArgumentConsumer()
+  of "item-slot": newSlotArgumentConsumer()
   else: newSimpleArgConsumer()
 
 proc execFor(h: PluginHost; pluginId, handlerId: int): FallbackExecutor =
@@ -181,7 +222,7 @@ proc execFor(h: PluginHost; pluginId, handlerId: int): FallbackExecutor =
     cmdFailed(text("The plugin command failed."))
 
 proc buildNode(h: PluginHost; pluginId, idx: int): NonLeafNodeBuilder =
-  if h.nodes[idx].isArgument: result = argument(h.nodes[idx].name, consumerFor(h.nodes[idx].argType))
+  if h.nodes[idx].isArgument: result = argument(h.nodes[idx].name, consumerFor(h.nodes[idx]))
   else: result = literal(h.nodes[idx].name)
   var i = 0
   while i < h.nodes[idx].children.len:
@@ -278,15 +319,33 @@ proc installInterfaces*(h: PluginHost) =
     h.cmds[int(args[0].i)].handler = int(args[1].i)
     result = "")
   r.defineHostFn(IfaceCommand, "[static]command-node.literal", proc (ci: CompInst; args: seq[CVal]; results: var seq[CVal]): string {.closure.} =
-    h.nodes.add CmdNode(isArgument: false, name: args[0].s, argType: "", children: @[], handler: -1)
+    h.nodes.add CmdNode(isArgument: false, name: args[0].s, argType: "", children: @[], handler: -1, suggestHandler: -1, requireHandler: -1)
     results.add vInt(int64(h.nodes.len - 1))
     result = "")
   r.defineHostFn(IfaceCommand, "[static]command-node.argument", proc (ci: CompInst; args: seq[CVal]; results: var seq[CVal]): string {.closure.} =
     let at = paramType(ci, 1)
     let cname = (if int(args[1].i) < at.names.len: at.names[int(args[1].i)] else: "string")
-    var kind = cname
-    if cname == "string" and args[1].items.len > 0 and args[1].items[0].i == 2: kind = "message"   # string-type greedy
-    h.nodes.add CmdNode(isArgument: true, name: args[0].s, argType: kind, children: @[], handler: -1)
+    var node = CmdNode(isArgument: true, name: args[0].s, argType: cname, children: @[], handler: -1, suggestHandler: -1, requireHandler: -1)
+    if args[1].items.len > 0:
+      let pl = args[1].items[0]
+      case cname
+      of "float", "double":
+        if pl.items[0].i != 0:
+          node.hasMin = true
+          node.minV = pl.items[0].items[0].f
+        if pl.items[1].i != 0:
+          node.hasMax = true
+          node.maxV = pl.items[1].items[0].f
+      of "integer", "long":
+        if pl.items[0].i != 0:
+          node.hasMin = true
+          node.minI = pl.items[0].items[0].i
+        if pl.items[1].i != 0:
+          node.hasMax = true
+          node.maxI = pl.items[1].items[0].i
+      of "string": node.strKind = int(pl.i)
+      else: discard
+    h.nodes.add node
     results.add vInt(int64(h.nodes.len - 1))
     result = "")
   r.defineHostFn(IfaceCommand, "[method]command-node.then", proc (ci: CompInst; args: seq[CVal]; results: var seq[CVal]): string {.closure.} =
@@ -295,31 +354,154 @@ proc installInterfaces*(h: PluginHost) =
   r.defineHostFn(IfaceCommand, "[method]command-node.execute-with-handler-id", proc (ci: CompInst; args: seq[CVal]; results: var seq[CVal]): string {.closure.} =
     h.nodes[int(args[0].i)].handler = int(args[1].i)
     result = "")
+  r.defineHostFn(IfaceCommand, "[method]command-node.suggest-with-handler-id", proc (ci: CompInst; args: seq[CVal]; results: var seq[CVal]): string {.closure.} =
+    h.nodes[int(args[0].i)].suggestHandler = int(args[1].i)
+    result = "")
+  r.defineHostFn(IfaceCommand, "[method]command-node.require-with-handler-id", proc (ci: CompInst; args: seq[CVal]; results: var seq[CVal]): string {.closure.} =
+    h.nodes[int(args[0].i)].requireHandler = int(args[1].i)
+    result = "")
+  # ---- command-sender
   r.defineHostFn(IfaceCommand, "[method]command-sender.send-message", proc (ci: CompInst; args: seq[CVal]; results: var seq[CVal]): string {.closure.} =
-    let rep = int(args[0].i)
-    let ti = int(args[1].i)
-    sendMessage(h.senders[rep], textAt(h.ws, ti))
+    sendMessage(h.senders[int(args[0].i)], textAt(h.ws, int(args[1].i)))
+    result = "")
+  r.defineHostFn(IfaceCommand, "[method]command-sender.send-system-message", proc (ci: CompInst; args: seq[CVal]; results: var seq[CVal]): string {.closure.} =
+    sendMessage(h.senders[int(args[0].i)], textAt(h.ws, int(args[1].i)))
+    result = "")
+  r.defineHostFn(IfaceCommand, "[method]command-sender.send-error", proc (ci: CompInst; args: seq[CVal]; results: var seq[CVal]): string {.closure.} =
+    # `send_error`: the message in red
+    let m = textAt(h.ws, int(args[1].i))
+    sendMessage(h.senders[int(args[0].i)], m.colorNamed(ncRed))
     result = "")
   r.defineHostFn(IfaceCommand, "[method]command-sender.get-name", proc (ci: CompInst; args: seq[CVal]; results: var seq[CVal]): string {.closure.} =
     results.add vStr(displayText(h.senders[int(args[0].i)]))
     result = "")
+  r.defineHostFn(IfaceCommand, "[method]command-sender.set-success-count", proc (ci: CompInst; args: seq[CVal]; results: var seq[CVal]): string {.closure.} =
+    setSuccessCount(h.senders[int(args[0].i)], uint32(max(0'i64, args[1].i)))
+    result = "")
+  r.defineHostFn(IfaceCommand, "[method]command-sender.is-player", proc (ci: CompInst; args: seq[CVal]; results: var seq[CVal]): string {.closure.} =
+    results.add vBool(isPlayer(h.senders[int(args[0].i)]))
+    result = "")
+  r.defineHostFn(IfaceCommand, "[method]command-sender.is-console", proc (ci: CompInst; args: seq[CVal]; results: var seq[CVal]): string {.closure.} =
+    results.add vBool(isConsole(h.senders[int(args[0].i)]))
+    result = "")
+  r.defineHostFn(IfaceCommand, "[method]command-sender.get-command-sender-type", proc (ci: CompInst; args: seq[CVal]; results: var seq[CVal]): string {.closure.} =
+    # command-sender-type { rcon, console, player(player), command-block(tuple<..>), dummy }; a command block answers `dummy`
+    # (the block-entity and world handles of its payload are not made here)
+    let snd = h.senders[int(args[0].i)]
+    case snd.kind
+    of cskRcon: results.add vVariant(0)
+    of cskConsole: results.add vVariant(1)
+    of cskPlayer: results.add vVariant(2, vInt(int64(snd.player.entity.entityId)))
+    of cskCommandBlock, cskDummy: results.add vVariant(4)
+    result = "")
+  r.defineHostFn(IfaceCommand, "[method]command-sender.as-player", proc (ci: CompInst; args: seq[CVal]; results: var seq[CVal]): string {.closure.} =
+    let snd = h.senders[int(args[0].i)]
+    if snd.kind == cskPlayer: results.add vSome(vInt(int64(snd.player.entity.entityId)))
+    else: results.add vNone()
+    result = "")
+  r.defineHostFn(IfaceCommand, "[method]command-sender.permission-level", proc (ci: CompInst; args: seq[CVal]; results: var seq[CVal]): string {.closure.} =
+    results.add vInt(int64(ord(permissionLvl(h.senders[int(args[0].i)]))))
+    result = "")
+  r.defineHostFn(IfaceCommand, "[method]command-sender.has-permission-level", proc (ci: CompInst; args: seq[CVal]; results: var seq[CVal]): string {.closure.} =
+    results.add vBool(hasPermissionLvl(h.senders[int(args[0].i)], PermissionLvl(int(args[1].i))))
+    result = "")
+  r.defineHostFn(IfaceCommand, "[method]command-sender.has-permission", proc (ci: CompInst; args: seq[CVal]; results: var seq[CVal]): string {.closure.} =
+    results.add vBool(hasPermission(h.senders[int(args[0].i)], nil, args[2].s))
+    result = "")
+  r.defineHostFn(IfaceCommand, "[method]command-sender.position", proc (ci: CompInst; args: seq[CVal]; results: var seq[CVal]): string {.closure.} =
+    var pos = Vector3[float64](x: 0.0, y: 0.0, z: 0.0)
+    if position(h.senders[int(args[0].i)], pos): results.add vSome(vRecord(@[vFloat(pos.x), vFloat(pos.y), vFloat(pos.z)]))
+    else: results.add vNone()
+    result = "")
+  r.defineHostFn(IfaceCommand, "[method]command-sender.world", proc (ci: CompInst; args: seq[CVal]; results: var seq[CVal]): string {.closure.} =
+    # the world handle is the index in server.worlds; found through the sender's player when it has one
+    let snd = h.senders[int(args[0].i)]
+    if snd.kind == cskPlayer and h.ws.hooks.playerWorld != nil:
+      let w = h.ws.hooks.playerWorld(int(snd.player.entity.entityId))
+      if w >= 0:
+        results.add vSome(vInt(int64(w)))
+        return ""
+    results.add vNone()
+    result = "")
+  r.defineHostFn(IfaceCommand, "[method]command-sender.should-receive-feedback", proc (ci: CompInst; args: seq[CVal]; results: var seq[CVal]): string {.closure.} =
+    results.add vBool(shouldReceiveFeedback(h.senders[int(args[0].i)]))
+    result = "")
+  r.defineHostFn(IfaceCommand, "[method]command-sender.should-broadcast-console-to-ops", proc (ci: CompInst; args: seq[CVal]; results: var seq[CVal]): string {.closure.} =
+    results.add vBool(shouldBroadcastConsoleToOps(h.senders[int(args[0].i)]))
+    result = "")
+  r.defineHostFn(IfaceCommand, "[method]command-sender.should-track-output", proc (ci: CompInst; args: seq[CVal]; results: var seq[CVal]): string {.closure.} =
+    results.add vBool(shouldTrackOutput(h.senders[int(args[0].i)]))
+    result = "")
+  # ---- consumed-args
   r.defineHostFn(IfaceCommand, "[method]consumed-args.get-value", proc (ci: CompInst; args: seq[CVal]; results: var seq[CVal]): string {.closure.} =
     let rt = resultType0(ci)
-    var found = ""
-    var i = 0
     let rep = int(args[0].i)
-    var isBool = false
-    var bval = false
+    var idx = -1
+    var i = 0
     while i < h.argStore[rep].len:
-      if h.argStore[rep][i].name == args[1].s:
-        found = h.argStore[rep][i].arg.str
-        if h.argStore[rep][i].arg.kind == akBool:
-          isBool = true
-          bval = h.argStore[rep][i].arg.boolean
+      if h.argStore[rep][i].name == args[1].s: idx = i
       inc i
-    if isBool: results.add vVariant(max(0, caseIndex(rt, "bool")), vBool(bval))
-    else: results.add vVariant(max(0, caseIndex(rt, "simple")), vStr(found))
+    if idx < 0: return "consumed-args: no argument called " & args[1].s
+    results.add argValue(h, rt, h.argStore[rep][idx].arg)
     result = "")
+
+proc numberVal(n: Number): CVal =
+  case n.kind
+  of nkF64: vVariant(0, vFloat(n.f64))
+  of nkF32: vVariant(1, vFloat(float64(n.f32)))
+  of nkI32: vVariant(2, vInt(int64(n.i32)))
+  of nkI64: vVariant(3, vInt(n.i64))
+
+proc enumPayload(rt: CmType; caseName: string; value: string): CVal =
+  ## A variant case whose payload is an enum spelled by `value`.
+  let ci0 = caseIndex(rt, caseName)
+  let pt = rt.types[max(ci0, 0)]
+  vVariant(max(ci0, 0), vInt(int64(max(0, caseIndex(pt, value.toLowerAscii().replace("_", "-"))))))
+
+proc strCaseOf(rt: CmType; name, v: string): CVal = vVariant(max(0, caseIndex(rt, name)), vStr(v))
+
+proc argValue(h: PluginHost; rt: CmType; a: Arg): CVal =
+  ## An `Arg` of the dispatcher as the WIT `arg` variant (`ArgImpl` of commands/mod.rs). The entity arguments answer their
+  ## players (the WIT `arg` has no entity case); `pos3d` / `pos2d` take the coordinates as parsed.
+  case a.kind
+  of akBool: vVariant(max(0, caseIndex(rt, "bool")), vBool(a.boolean))
+  of akMsg: strCaseOf(rt, "msg", a.str)
+  of akItem: strCaseOf(rt, "item", a.str)
+  of akItemPredicate: strCaseOf(rt, "item-predicate", a.str)
+  of akResourceLocation: strCaseOf(rt, "resource-location", a.str)
+  of akBlock: strCaseOf(rt, "block", a.str)
+  of akBlockPredicate: strCaseOf(rt, "block-predicate", a.str)
+  of akParticle: strCaseOf(rt, "particle", a.str)
+  of akDamageType: strCaseOf(rt, "damage-type", a.str)
+  of akEffect: strCaseOf(rt, "effect", a.str)
+  of akEnchantment: strCaseOf(rt, "enchantment", a.str)
+  of akAdvancement: strCaseOf(rt, "advancement", a.str)
+  of akTime: vVariant(max(0, caseIndex(rt, "time")), vInt(int64(a.time)))
+  of akNum:
+    if a.numInBounds:
+      vVariant(max(0, caseIndex(rt, "num")), vVariant(0, numberVal(a.num)))
+    else:
+      vVariant(max(0, caseIndex(rt, "num")), vVariant(1, vVariant((if a.numOverflowLow: 0 else: 1), vRecord(@[numberVal(a.num), numberVal(a.numBound)]))))
+  of akBlockPos:
+    vVariant(max(0, caseIndex(rt, "block-pos")), vRecord(@[vInt(int64(a.blockPos.x)), vInt(int64(a.blockPos.y)), vInt(int64(a.blockPos.z))]))
+  of akPos3D: vVariant(max(0, caseIndex(rt, "pos3d")), vRecord(@[vFloat(a.pos3D.x), vFloat(a.pos3D.y), vFloat(a.pos3D.z)]))
+  of akPos2D: vVariant(max(0, caseIndex(rt, "pos2d")), vRecord(@[vFloat(a.pos2D.x), vFloat(a.pos2D.y)]))
+  of akRotation:
+    vVariant(max(0, caseIndex(rt, "rotation")), vRecord(@[vFloat(float64(a.yaw)), vBool(a.yawRelative), vFloat(float64(a.pitch)), vBool(a.pitchRelative)]))
+  of akGameMode: vVariant(max(0, caseIndex(rt, "gamemode")), vInt(int64(ord(a.gameMode))))
+  of akDifficulty: vVariant(max(0, caseIndex(rt, "difficulty")), vInt(int64(ord(a.difficulty))))
+  of akPlayers, akEntities, akEntity:
+    var ids: seq[CVal] = @[]
+    for p in a.players: ids.add vInt(int64(p.entity.entityId))
+    for e in a.entities:
+      if e.player != nil: ids.add vInt(int64(e.entityId))
+    vVariant(max(0, caseIndex(rt, "players")), vList(ids))
+  of akTextComponent: vVariant(max(0, caseIndex(rt, "text-component")), vInt(int64(newTextRep(h.ws, a.textComponent))))
+  of akBossbarColor: enumPayload(rt, "bossbar-color", a.str)
+  of akBossbarStyle: enumPayload(rt, "bossbar-style", a.str)
+  of akSoundCategory: enumPayload(rt, "sound-category", a.str)
+  of akEntityAnchor: vVariant(max(0, caseIndex(rt, "entity-anchor")), vInt(int64(ord(a.anchor))))
+  else: strCaseOf(rt, "simple", a.str)
 
 proc newPluginHost*(dataRoot: string): PluginHost =
   result = PluginHost(reg: newHostRegistry(), plugins: @[], nodes: @[], cmds: @[], senders: @[], argStore: @[],
@@ -333,8 +515,12 @@ proc newPluginHost*(dataRoot: string): PluginHost =
         (if isErr: "stderr: " else: "stdout: ") & line)
   result.ext.wasi.permissions = proc (pluginId: int): seq[string] {.closure.} =
     if pluginId >= 0 and pluginId < hh.plugins.len: hh.plugins[pluginId].permissions else: @[]
+  result.ext.wasi.fs.dataFolder = proc (pluginId: int): string {.closure.} =
+    if pluginId >= 0 and pluginId < hh.plugins.len: hh.plugins[pluginId].dataFolder else: ""
   installPlayer(result.reg, result.ws)
+  installPlayer3(result.reg, result.ws, result.ext.stacks, result.ext.guis)
   installEntity(result.reg, result.ws)
+  installEntity3(result.reg, result.ws, result.ext.stacks)
   installInterfaces(result)
 
 # ---- loading ---------------------------------------------------------------------------------
@@ -374,6 +560,8 @@ proc preparePlugin*(h: PluginHost; path: string; bytes: string; idOut: var int):
                        dependencies: @[], ci: ci, onLoad: -1, onUnload: -1, handleEvent: -1, handleCommand: -1,
                        eventRegs: @[], dataFolder: h.dataRoot & "/" & path, active: false)
   h.plugins.add pe
+  # `verify_wasm_plugin`: warns about an unsigned plugin or a failed signature, never refuses to load
+  verifyWasmPlugin(bytes, path, "", proc (line: string) {.closure.} = say(h, line))
   if not instantiateComponent(ci, bytes): return "load failed: " & ci.err
   pe.onLoad = findExportFunc(ci, "on-load")
   pe.onUnload = findExportFunc(ci, "on-unload")

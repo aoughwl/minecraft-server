@@ -1,0 +1,747 @@
+## Port of the rest of pumpkin/src/plugin/loader/wasm/wasm_host/wit/v0_1/world.rs (and, for what the pinned loader lacks, the
+## newer tree's crates/pumpkin-wasm-host-v0_1/src/world.rs): the `world-border` and `chunk` resources, the `block-state` /
+## `block` records (get-block-state, get-block, set-block, the free functions `resolve-block-state`, `block-state-to-info`,
+## `get-block-by-id` ... `get-block-state-by-id`), sky and block light, get-biome, get-scoreboard, strike-lightning, the
+## ray-trace functions, get-block-entity (typed through witblockentity.aowl's `newBlockEntityRep`), get-block-entity-nbt /
+## set-block-entity-nbt, set-chunk-generator and the namespaced custom data of a world and a chunk.
+## A world-border handle's rep is the world's index (like `world` and `scoreboard`); a chunk handle's rep is a slot of
+## `WorldExt.chunks` naming (world, chunk x, chunk z), and a chunk that has been unloaded traps with "Chunk unloaded".
+## Ids are 26.2's as in the rest of the server: `block-state.id` is the global palette id, `block-state.block-name` and
+## `block.name` are the bare registry name as upstream's `block.name` is.
+## PARTIAL: pumpkin/src/plugin/loader/wasm/wasm_host/wit/v0_1/world.rs - `strike-lightning` sends the bolt entity and the thunder
+## sound to the world's players (this server has no `LightningBoltEntity`: no fire, no damage, no `LightningStrikeEvent`);
+## `ray-trace-block` approximates the clip (outline boxes through `raycast`, hit point from the box entry, fluids are
+## skipped unless `include-fluids`, which then also stops on liquids); `set-chunk-generator` is accepted and logged, a plugin
+## chunk generator is not run (it needs the `chunk-buffer` resource and the generation hook of the level); custom data of worlds,
+## chunks and block entities lives in memory only (not saved with the level), and a block entity's custom data keeps nothing across
+## a reload of its chunk; `get-chunk` answers only chunks that are loaded.
+import std/[options, tables, math, syncio]
+import ../wasm/[canonabi, component]
+import ../../util/vector3
+import ../../util/uuid
+import ../../util/math/boundingbox
+import ../../util/math/position
+import "../../data/block_ext" as bx
+import ../../data/block_state
+import "../../data/block_direction" as dbd
+import ../../generated/biome as biomedata
+import ../../generated/entity_type
+import ../../generated/sound
+import ../../generated/sound_category
+import ../../world/[chunkdata, lightingruntime, level]
+import ../../nbt/[tag, nbtdoc, deserializer]
+import ../../protocol/proto
+import ../../protocol/java/client/play/spawn_entity
+import ../../server/serverbase
+import ../../server/world/worldmod
+import ../../server/entity/entitymod
+import ../../server/entity/raycast
+import "../../server/block/blockbehaviour" as bb
+import witstate, witserver, witstack, witblockentity
+
+const IfWorld = "pumpkin:plugin/world"
+
+type
+  ChunkRef = object
+    world: int
+    x: int
+    z: int
+
+  WorldExt* = ref object
+    chunks: seq[ChunkRef]
+    custom: Table[string, NbtCompound]
+    be*: BlockEntityState
+
+proc newWorldExt*(be: BlockEntityState): WorldExt =
+  WorldExt(chunks: @[], custom: initTable[string, NbtCompound](), be: be)
+
+# ---- custom data (the same namespace/key layout as ItemStack's) ---------------------------------------------------
+
+proc installCustomData(r: HostRegistry; we: WorldExt; view: string; keyOf: proc (rep: int): string {.closure.}) =
+  ## The four custom-data methods of `view` (`world`, `chunk`); `keyOf` names the compound of a handle.
+  witFn(r, IfWorld, "[method]" & view & ".set-custom-data"):
+    var err = ""
+    let tag = fromWitNbtTree(args[3], err)
+    if err.len > 0: return err
+    let key = keyOf(int(args[0].i))
+    var c = we.custom.getOrDefault(key, newCompound())
+    cdSet(c, args[1].s, args[2].s, tag)
+    we.custom[key] = c
+  witFn(r, IfWorld, "[method]" & view & ".get-custom-data"):
+    let c = we.custom.getOrDefault(keyOf(int(args[0].i)), newCompound())
+    let v = cdGet(c, args[1].s, args[2].s)
+    if v.isNone: results.add vNone()
+    else: results.add vSome(toWitNbtTree(v.unsafeGet))
+  witFn(r, IfWorld, "[method]" & view & ".remove-custom-data"):
+    let key = keyOf(int(args[0].i))
+    var c = we.custom.getOrDefault(key, newCompound())
+    cdRemove(c, args[1].s, args[2].s)
+    we.custom[key] = c
+  witFn(r, IfWorld, "[method]" & view & ".has-custom-data"):
+    let c = we.custom.getOrDefault(keyOf(int(args[0].i)), newCompound())
+    results.add vBool(cdGet(c, args[1].s, args[2].s).isSome)
+
+# ---- block records --------------------------------------------------------------------------------------------------
+
+proc vBlockPosRec(x, y, z: int): CVal = vRecord(@[vInt(int64(x)), vInt(int64(y)), vInt(int64(z))])
+
+proc boxVal(b: ShapeBox): CVal =
+  vRecord(@[vRecord(@[vFloat(b.minX), vFloat(b.minY), vFloat(b.minZ)]), vRecord(@[vFloat(b.maxX), vFloat(b.maxY), vFloat(b.maxZ)])])
+
+proc propsVal(props: seq[(string, string)]): CVal =
+  var xs: seq[CVal] = @[]
+  for p in props: xs.add vRecord(@[vStr(p[0]), vStr(p[1])])
+  vList(xs)
+
+proc propsOfState(b: bx.Block; stateId: uint16): seq[(string, string)] =
+  let (has, p) = bx.properties(b, newBlockStateIdUnchecked(stateId))
+  if has: bx.toProps(p) else: newSeq[(string, string)]()
+
+proc blockStateVal*(stateId: uint16): CVal =
+  ## `to_wit_block_state`.
+  let id = newBlockStateIdUnchecked(stateId)
+  let state = bx.BlockState.fromId(id)
+  let b = bx.Block.fromStateId(id)
+  var coll: seq[CVal] = @[]
+  for s in bx.getBlockCollisionShapes(state): coll.add boxVal(s)
+  var outl: seq[CVal] = @[]
+  for s in bx.getBlockOutlineShapes(state): outl.add boxVal(s)
+  vRecord(@[vInt(int64(asU16(state.id))), vInt(int64(asU16(b.id))), vStr(b.name), vInt(int64(state.luminance)),
+    vInt(int64(state.opacity)), vFloat(float64(state.hardness)), vBool(state.isAir), vBool(state.isLiquid), vBool(state.isSolid),
+    vBool(state.isFullCube), vInt(int64(ord(state.pistonBehavior))), vBool(state.hasRandomTicks), vBool(state.burnable),
+    vBool(state.toolRequired), vBool(state.sidedTransparency), vBool(state.replaceable), vBool(state.isSolidBlock),
+    vInt(int64(state.blockEntityType)), vInt(int64(ord(state.instrument))), vList(coll), vList(outl),
+    vBool(state.isSideSolid(dbd.BlockDirection.Down)), vBool(state.isSideSolid(dbd.BlockDirection.Up)),
+    vBool(state.isSideSolid(dbd.BlockDirection.North)), vBool(state.isSideSolid(dbd.BlockDirection.South)),
+    vBool(state.isSideSolid(dbd.BlockDirection.West)), vBool(state.isSideSolid(dbd.BlockDirection.East)),
+    vBool(state.isCenterSolid(dbd.BlockDirection.Down)), vBool(state.isCenterSolid(dbd.BlockDirection.Up)),
+    vInt(int64(b.mapColor)), propsVal(propsOfState(b, stateId))])
+
+proc blockVal*(b: bx.Block): CVal =
+  ## `to_wit_block`.
+  var ids: seq[CVal] = @[]
+  for s in b.states: ids.add vInt(int64(asU16(s.id)))
+  var flam = vNone()
+  if b.hasFlammable: flam = vSome(vRecord(@[vInt(int64(b.flammable.spreadChance)), vInt(int64(b.flammable.burnChance))]))
+  vRecord(@[vInt(int64(asU16(b.id))), vStr(b.name), vFloat(float64(b.hardness)), vFloat(float64(b.blastResistance)),
+    vInt(int64(b.mapColor)), vFloat(float64(b.slipperiness)), vFloat(float64(b.velocityMultiplier)),
+    vFloat(float64(b.jumpVelocityMultiplier)), vInt(int64(b.itemId)), vInt(int64(asU16(b.defaultState.id))), vList(ids),
+    vBool(b.isSolid), vBool(b.isAir), vBool(b.hasFlammable), flam])
+
+proc resolveState(b: bx.Block; props: seq[(string, string)]; state: var int): bool =
+  ## `Block::from_properties` then `to_state_id`, with upstream's panics (caught there) answered false.
+  state = int(asU16(b.defaultState.id))
+  if props.len == 0: return true
+  let (has, _) = bx.properties(b, b.defaultState.id)
+  if not has: return false
+  var target = propsOfState(b, asU16(b.defaultState.id))
+  # the values each property can take, from the block's own states
+  var values: seq[seq[string]] = @[]
+  for t in target: values.add newSeq[string]()
+  for s in b.states:
+    let sp = propsOfState(b, asU16(s.id))
+    var j = 0
+    while j < sp.len:
+      if not (sp[j][1] in values[j]): values[j].add sp[j][1]
+      inc j
+  for p in props:
+    var j = 0
+    while j < target.len:
+      if target[j][0] == p[0]:
+        if p[1] in values[j]:
+          target[j][1] = p[1]
+        elif values[j][0] == "true":
+          target[j][1] = values[j][1]
+        elif values[j][0].len > 0 and values[j][0][0] >= '0' and values[j][0][0] <= '9':
+          target[j][1] = values[j][0]
+        else:
+          return false
+      inc j
+  for s in b.states:
+    let sp = propsOfState(b, asU16(s.id))
+    var same = sp.len == target.len
+    var j = 0
+    while same and j < sp.len:
+      if sp[j][1] != target[j][1]: same = false
+      inc j
+    if same:
+      state = int(asU16(s.id))
+      return true
+  false
+
+proc badState(id: int): bool = id < 0 or id >= int(bx.STATE_COUNT)
+proc badBlock(id: int): bool = id < 0 or id >= int(bx.BLOCK_COUNT)
+
+# ---- helpers on the server ------------------------------------------------------------------------------------------
+
+proc bpos(v: CVal): BlockPos = newBlockPos(int32(v.items[0].i), int32(v.items[1].i), int32(v.items[2].i))
+
+proc biomeVal(ci: CompInst; wd: World; pos: BlockPos): CVal =
+  let id = level.getRoughBiome(wd.level, pos)
+  var b = biomedata.Biome.fromId(uint8(id))
+  if b == nil: b = biomedata.Biome.fromName("the_void")
+  var name = "the_void"
+  if b != nil: name = b.registryId
+  vInt(int64(enumIndex(resultTy(ci), name)))
+
+proc rayBoxEntry(fromPos, toPos: Vector3[float64]; lo, hi: Vector3[float64]; t: var float64): bool =
+  ## Slab test of the segment `fromPos`..`toPos` against a box; `t` in 0..1 is where it enters.
+  var tmin = 0.0
+  var tmax = 1.0
+  for axis in 0 .. 2:
+    let d = (if axis == 0: toPos.x - fromPos.x elif axis == 1: toPos.y - fromPos.y else: toPos.z - fromPos.z)
+    let f = (if axis == 0: fromPos.x elif axis == 1: fromPos.y else: fromPos.z)
+    let mn = (if axis == 0: lo.x elif axis == 1: lo.y else: lo.z)
+    let mx = (if axis == 0: hi.x elif axis == 1: hi.y else: hi.z)
+    if abs(d) < 1e-12:
+      if f < mn or f > mx: return false
+    else:
+      var t1 = (mn - f) / d
+      var t2 = (mx - f) / d
+      if t1 > t2:
+        let tmp = t1
+        t1 = t2
+        t2 = tmp
+      if t1 > tmin: tmin = t1
+      if t2 < tmax: tmax = t2
+      if tmax < tmin: return false
+  t = tmin
+  true
+
+proc entityBox(wd: World; id: int; box: var BoundingBox): bool =
+  let p = playerById(id)
+  if p != nil:
+    box = BoundingBox(min: Vector3[float64](x: p.pos.x - 0.3, y: p.pos.y, z: p.pos.z - 0.3),
+                      max: Vector3[float64](x: p.pos.x + 0.3, y: p.pos.y + 1.8, z: p.pos.z + 0.3))
+    return true
+  let e = entityById(id)
+  if e == nil: return false
+  box = e.entity.boundingBox
+  true
+
+type EntityHit = object
+  id: int
+  t: float64
+  pos: Vector3[float64]
+  dist: float64
+
+proc entityHits(wd: World; s, e: Vector3[float64]): seq[EntityHit] =
+  ## `World::ray_trace_entities`: every entity (players too) whose box the segment crosses, nearest first.
+  result = @[]
+  if s == e: return
+  let minX = min(s.x, e.x) - 1.0
+  let maxX = max(s.x, e.x) + 1.0
+  let minY = min(s.y, e.y) - 1.0
+  let maxY = max(s.y, e.y) + 1.0
+  let minZ = min(s.z, e.z) - 1.0
+  let maxZ = max(s.z, e.z) + 1.0
+  var ids: seq[int] = @[]
+  for ent in allEntities(wd): ids.add int(ent.entity.entityId)
+  for p in wd.players: ids.add int(p.entityId)
+  for id in ids:
+    var box = BoundingBox()
+    if not entityBox(wd, id, box): continue
+    if box.max.x < minX or box.min.x > maxX or box.max.y < minY or box.min.y > maxY or box.max.z < minZ or box.min.z > maxZ: continue
+    var t = 0.0
+    if rayBoxEntry(s, e, box.min, box.max, t):
+      let hp = Vector3[float64](x: s.x + (e.x - s.x) * t, y: s.y + (e.y - s.y) * t, z: s.z + (e.z - s.z) * t)
+      let dx = hp.x - s.x
+      let dy = hp.y - s.y
+      let dz = hp.z - s.z
+      result.add EntityHit(id: id, t: t, pos: hp, dist: sqrt(dx * dx + dy * dy + dz * dz))
+  # insertion sort by t
+  var i = 1
+  while i < result.len:
+    var j = i
+    while j > 0 and result[j - 1].t > result[j].t:
+      let hi = result[j]
+      let lo = result[j - 1]
+      result[j - 1] = hi
+      result[j] = lo
+      dec j
+    inc i
+
+proc hitAnyBlock(p: BlockPos; w: World): bool {.closure.} =
+  not bx.BlockState.fromId(bx.newBlockStateIdOrAir(uint16(w.getBlockStateId(p)))).isAir
+
+proc hitDryBlock(p: BlockPos; w: World): bool {.closure.} =
+  let state = bx.BlockState.fromId(bx.newBlockStateIdOrAir(uint16(w.getBlockStateId(p))))
+  not state.isAir and not state.isLiquid
+
+proc hitVal(h: EntityHit): CVal = vRecord(@[vInt(int64(h.id)), vPos(h.pos), vFloat(h.dist)])
+
+proc beCase(ci: CompInst; kind: string): int =
+  ## The case of `block-entity-type` called `kind`: `option<block-entity-type>` is the result type.
+  let t = resultTy(ci)
+  let variant = (if t.types.len > 0: t.types[0] else: t)
+  caseIndex(variant, kind)
+
+proc chunkOf(we: WorldExt; rep: int): ChunkData =
+  ## The chunk behind a handle, nil when it has been unloaded.
+  if rep < 0 or rep >= we.chunks.len: return nil
+  let wd = worldAt(we.chunks[rep].world)
+  if wd == nil: return nil
+  wd.level.loadedChunks.getOrDefault(chunkKey(int32(we.chunks[rep].x), int32(we.chunks[rep].z)), nil)
+
+proc chunkStateAt(c: ChunkData; pos: CVal): uint32 =
+  ## `section.get_block_absolute_y(x, y, z).unwrap_or(AIR)`: x and z are chunk-relative.
+  let x = int(pos.items[0].i)
+  let z = int(pos.items[2].i)
+  if x < 0 or x > 15 or z < 0 or z > 15: return 0'u32
+  let (ok, id) = getBlockAbsoluteY(c.section, x, int32(pos.items[1].i), z)
+  if ok: uint32(id) else: 0'u32
+
+proc chunkSetState(we: WorldExt; rep: int; c: ChunkData; pos: CVal; state: uint32) =
+  ## chunk `set_block_state`: write, mark dirty and queue the client update when the state changed.
+  let x = int(pos.items[0].i)
+  let z = int(pos.items[2].i)
+  let y = int32(pos.items[1].i)
+  if x < 0 or x > 15 or z < 0 or z > 15: return
+  let replaced = setBlockAbsoluteY(c, x, y, z, state)
+  if replaced != state:
+    c.dirty = true
+    let wd = worldAt(we.chunks[rep].world)
+    if wd != nil:
+      wd.registerBlockChange(newBlockPos(c.x * 16'i32 + int32(x), y, c.z * 16'i32 + int32(z)), state)
+
+proc chunkLight(c: ChunkData; sky: bool; x, y, z: int): uint8 =
+  let idx = (y - int(c.section.minY)) div 16
+  if x < 0 or x > 15 or z < 0 or z > 15 or y < int(c.section.minY) or idx < 0: return 0'u8
+  if sky:
+    if idx >= c.lightEngine.skyLight.len: return 0'u8
+    c.lightEngine.skyLight[idx].get(x, (y - int(c.section.minY)) mod 16, z)
+  else:
+    if idx >= c.lightEngine.blockLight.len: return 0'u8
+    c.lightEngine.blockLight[idx].get(x, (y - int(c.section.minY)) mod 16, z)
+
+# ---- the interface --------------------------------------------------------------------------------------------------
+
+proc installWorld2*(r: HostRegistry; st: WitState; we: WorldExt) =
+  # ---- free functions
+  witFn(r, IfWorld, "resolve-block-state"):
+    let b = bx.Block.fromName(args[0].s)
+    if b == nil:
+      results.add vNone()
+      return ""
+    var props: seq[(string, string)] = @[]
+    for p in args[1].items: props.add (p.items[0].s, p.items[1].s)
+    var state = 0
+    if resolveState(b, props, state): results.add vSome(vInt(int64(state)))
+    else: results.add vNone()
+  witFn(r, IfWorld, "block-state-to-info"):
+    let sid = bx.newBlockStateIdOrAir(uint16(args[0].i))
+    let b = bx.Block.fromStateId(sid)
+    results.add vSome(vRecord(@[vStr("minecraft:" & b.name), propsVal(propsOfState(b, asU16(sid)))]))
+  witFn(r, IfWorld, "get-block-by-id"):
+    if badBlock(int(args[0].i)): results.add vNone()
+    else: results.add vSome(blockVal(bx.Block.fromId(bx.newBlockIdUnchecked(uint16(args[0].i)))))
+  witFn(r, IfWorld, "get-block-by-name"):
+    let b = bx.Block.fromName(args[0].s)
+    if b == nil: results.add vNone()
+    else: results.add vSome(blockVal(b))
+  witFn(r, IfWorld, "get-all-blocks"):
+    var xs: seq[CVal] = @[]
+    for b in bx.gBlocks: xs.add blockVal(b)
+    results.add vList(xs)
+  witFn(r, IfWorld, "get-all-block-names"):
+    var xs: seq[CVal] = @[]
+    for b in bx.gBlocks: xs.add vStr(b.name)
+    results.add vList(xs)
+  witFn(r, IfWorld, "get-block-count"):
+    results.add vInt(int64(bx.BLOCK_COUNT))
+  witFn(r, IfWorld, "get-block-state-count"):
+    results.add vInt(int64(bx.STATE_COUNT))
+  witFn(r, IfWorld, "get-states-for-block"):
+    let id = uint16(args[0].items[0].i)
+    var xs: seq[CVal] = @[]
+    for s in bx.Block.fromId(bx.newBlockIdOrAir(id)).states: xs.add blockStateVal(asU16(s.id))
+    results.add vList(xs)
+  witFn(r, IfWorld, "get-states-for-block-id"):
+    var xs: seq[CVal] = @[]
+    if not badBlock(int(args[0].i)):
+      for s in bx.Block.fromId(bx.newBlockIdUnchecked(uint16(args[0].i))).states: xs.add blockStateVal(asU16(s.id))
+    results.add vList(xs)
+  witFn(r, IfWorld, "get-state-ids-for-block-id"):
+    var xs: seq[CVal] = @[]
+    if not badBlock(int(args[0].i)):
+      for s in bx.Block.fromId(bx.newBlockIdUnchecked(uint16(args[0].i))).states: xs.add vInt(int64(asU16(s.id)))
+    results.add vList(xs)
+  witFn(r, IfWorld, "get-block-properties"):
+    let sid = bx.newBlockStateIdOrAir(uint16(args[0].i))
+    results.add propsVal(propsOfState(bx.Block.fromStateId(sid), asU16(sid)))
+  witFn(r, IfWorld, "get-block-from-state-id"):
+    if badState(int(args[0].i)): results.add vNone()
+    else: results.add vSome(blockVal(bx.Block.fromStateId(bx.newBlockStateIdUnchecked(uint16(args[0].i)))))
+  witFn(r, IfWorld, "get-block-from-state"):
+    results.add blockVal(bx.Block.fromStateId(bx.newBlockStateIdOrAir(uint16(args[0].items[0].i))))
+  witFn(r, IfWorld, "get-default-state-from-block"):
+    let b = bx.Block.fromId(bx.newBlockIdOrAir(uint16(args[0].items[0].i)))
+    results.add blockStateVal(asU16(b.defaultState.id))
+  witFn(r, IfWorld, "get-default-state-from-block-id"):
+    if badBlock(int(args[0].i)): results.add vNone()
+    else: results.add vSome(blockStateVal(asU16(bx.Block.fromId(bx.newBlockIdUnchecked(uint16(args[0].i))).defaultState.id)))
+  witFn(r, IfWorld, "get-block-state-by-id"):
+    if badState(int(args[0].i)): results.add vNone()
+    else: results.add vSome(blockStateVal(uint16(args[0].i)))
+  # ---- world
+  witFn(r, IfWorld, "[method]world.get-border"):
+    if worldAt(int(args[0].i)) == nil: return "world: invalid handle"
+    results.add vInt(args[0].i)
+  witFn(r, IfWorld, "[method]world.get-world-border"):
+    if worldAt(int(args[0].i)) == nil: return "world: invalid handle"
+    results.add vInt(args[0].i)
+  witFn(r, IfWorld, "[method]world.get-chunk"):
+    let wd = worldAt(int(args[0].i))
+    if wd == nil: return "world: invalid handle"
+    let cx = int32(args[1].i)
+    let cz = int32(args[2].i)
+    if not wd.level.loadedChunks.hasKey(chunkKey(cx, cz)):
+      results.add vNone()
+    else:
+      we.chunks.add ChunkRef(world: int(args[0].i), x: int(cx), z: int(cz))
+      results.add vSome(vInt(int64(we.chunks.len - 1)))
+  witFn(r, IfWorld, "[method]world.get-block-state"):
+    let wd = worldAt(int(args[0].i))
+    if wd == nil: return "world: invalid handle"
+    results.add blockStateVal(asU16(bx.newBlockStateIdOrAir(uint16(wd.getBlockStateId(bpos(args[1]))))))
+  witFn(r, IfWorld, "[method]world.get-block"):
+    let wd = worldAt(int(args[0].i))
+    if wd == nil: return "world: invalid handle"
+    results.add blockVal(bx.Block.fromStateId(bx.newBlockStateIdOrAir(uint16(wd.getBlockStateId(bpos(args[1]))))))
+  witFn(r, IfWorld, "[method]world.set-block"):
+    if worldAt(int(args[0].i)) == nil: return "world: invalid handle"
+    let p = args[1]
+    let b = bx.Block.fromId(bx.newBlockIdOrAir(uint16(args[2].items[0].i)))
+    discard st.hooks.setBlockState(int(args[0].i), int(p.items[0].i), int(p.items[1].i), int(p.items[2].i),
+      int(asU16(b.defaultState.id)), int(args[3].i))
+  witFn(r, IfWorld, "[method]world.get-scoreboard"):
+    if worldAt(int(args[0].i)) == nil: return "world: invalid handle"
+    results.add vInt(args[0].i)
+  witFn(r, IfWorld, "[method]world.get-sky-light"):
+    let wd = worldAt(int(args[0].i))
+    if wd == nil: return "world: invalid handle"
+    results.add vInt(int64(getSkyLightLevel(wd.level.lightAccess, bpos(args[1]))))
+  witFn(r, IfWorld, "[method]world.set-sky-light"):
+    let wd = worldAt(int(args[0].i))
+    if wd == nil: return "world: invalid handle"
+    setSkyLightLevel(wd.level.lightAccess, bpos(args[1]), uint8(args[2].i))
+  witFn(r, IfWorld, "[method]world.get-block-light"):
+    let wd = worldAt(int(args[0].i))
+    if wd == nil: return "world: invalid handle"
+    let (has, v) = getBlockLightLevel(wd.level.lightAccess, bpos(args[1]))
+    results.add vInt(if has: int64(v) else: 0'i64)
+  witFn(r, IfWorld, "[method]world.set-block-light"):
+    let wd = worldAt(int(args[0].i))
+    if wd == nil: return "world: invalid handle"
+    setBlockLightLevel(wd.level.lightAccess, bpos(args[1]), uint8(args[2].i))
+  witFn(r, IfWorld, "[method]world.get-biome"):
+    let wd = worldAt(int(args[0].i))
+    if wd == nil: return "world: invalid handle"
+    results.add biomeVal(ci, wd, bpos(args[1]))
+  witFn(r, IfWorld, "[method]world.strike-lightning"):
+    let wd = worldAt(int(args[0].i))
+    if wd == nil: return "world: invalid handle"
+    let pos = posOf(args[1])
+    let srv = gLink.server
+    if srv == nil: return "Server not available"
+    let (known, bolt) = entityTypeByName("lightning_bolt")
+    if known:
+      let eid = srv.nextEntityId
+      srv.nextEntityId = eid + 1'i32
+      let (made, uuid) = newV4()
+      for p in wd.players:
+        p.client.writePacketFor(newCSpawnEntity(newVarInt(eid), uuid, newVarInt(int32(bolt.id)), pos, 0.0'f32, 0.0'f32, 0.0'f32,
+          newVarInt(0'i32), Vector3[float64](x: 0.0, y: 0.0, z: 0.0)))
+    wd.playSoundRaw(uint16(ord(sdEntityLightningBoltThunder)), scWeather, pos, 10000.0'f32, 0.8'f32)
+    wd.playSoundRaw(uint16(ord(sdEntityLightningBoltImpact)), scWeather, pos, 2.0'f32, 0.5'f32)
+  witFn(r, IfWorld, "[method]world.ray-trace-blocks"):
+    let wd = worldAt(int(args[0].i))
+    if wd == nil: return "world: invalid handle"
+    let hit = raycast(wd, posOf(args[1]), posOf(args[2]), hitAnyBlock)
+    if hit.isNone: results.add vNone()
+    else:
+      let p = hit.unsafeGet[0]
+      results.add vSome(vRecord(@[vFloat(float64(p.x)), vFloat(float64(p.y)), vFloat(float64(p.z))]))
+  witFn(r, IfWorld, "[method]world.ray-trace-block"):
+    let wd = worldAt(int(args[0].i))
+    if wd == nil: return "world: invalid handle"
+    let s = posOf(args[1])
+    let e = posOf(args[2])
+    let fluids = args[3].i != 0
+    let hit = (if fluids: raycast(wd, s, e, hitAnyBlock) else: raycast(wd, s, e, hitDryBlock))
+    if hit.isNone:
+      results.add vNone()
+      return ""
+    let p = hit.unsafeGet[0]
+    let face = hit.unsafeGet[1]
+    var t = 0.0
+    var found = false
+    let state = bx.BlockState.fromId(bx.newBlockStateIdOrAir(uint16(wd.getBlockStateId(p))))
+    for sh in bx.getBlockOutlineShapes(state):
+      var tt = 0.0
+      if rayBoxEntry(s, e, Vector3[float64](x: float64(p.x) + sh.minX, y: float64(p.y) + sh.minY, z: float64(p.z) + sh.minZ),
+          Vector3[float64](x: float64(p.x) + sh.maxX, y: float64(p.y) + sh.maxY, z: float64(p.z) + sh.maxZ), tt):
+        if not found or tt < t:
+          t = tt
+          found = true
+    if not found:
+      var tt = 0.0
+      if rayBoxEntry(s, e, Vector3[float64](x: float64(p.x), y: float64(p.y), z: float64(p.z)),
+          Vector3[float64](x: float64(p.x) + 1.0, y: float64(p.y) + 1.0, z: float64(p.z) + 1.0), tt):
+        t = tt
+    let hp = Vector3[float64](x: s.x + (e.x - s.x) * t, y: s.y + (e.y - s.y) * t, z: s.z + (e.z - s.z) * t)
+    results.add vSome(vRecord(@[vBlockPosRec(int(p.x), int(p.y), int(p.z)), vInt(int64(ord(face))), vPos(hp)]))
+  witFn(r, IfWorld, "[method]world.ray-trace-entity"):
+    let wd = worldAt(int(args[0].i))
+    if wd == nil: return "world: invalid handle"
+    let hits = entityHits(wd, posOf(args[1]), posOf(args[2]))
+    if hits.len == 0: results.add vNone()
+    else: results.add vSome(hitVal(hits[0]))
+  witFn(r, IfWorld, "[method]world.ray-trace-entities"):
+    let wd = worldAt(int(args[0].i))
+    if wd == nil: return "world: invalid handle"
+    var xs: seq[CVal] = @[]
+    for h in entityHits(wd, posOf(args[1]), posOf(args[2])): xs.add hitVal(h)
+    results.add vList(xs)
+  witFn(r, IfWorld, "[method]world.get-block-entity"):
+    let wd = worldAt(int(args[0].i))
+    if wd == nil: return "world: invalid handle"
+    let p = bpos(args[1])
+    let kind = (if we.be.hooks.kind != nil: we.be.hooks.kind(int(args[0].i), int(p.x), int(p.y), int(p.z)) else: "")
+    if kind.len == 0 or beCase(ci, kind) < 0:
+      results.add vNone()
+    else:
+      let rep = newBlockEntityRep(we.be, int(args[0].i), int(p.x), int(p.y), int(p.z))
+      results.add vSome(vVariant(beCase(ci, kind), vInt(int64(rep))))
+  witFn(r, IfWorld, "[method]world.get-block-entity-nbt"):
+    let wd = worldAt(int(args[0].i))
+    if wd == nil: return "world: invalid handle"
+    let be = bb.getBlockEntity(BlockWorld(wd.blockWorld), bpos(args[1]))
+    if be.isNone:
+      results.add vNone()
+    else:
+      var nbt = newCompound()
+      bb.writeNbt(be.unsafeGet, nbt)
+      let bytes = writeUnnamed(toNbtDoc(nbt))
+      var xs: seq[CVal] = @[]
+      for b in bytes: xs.add vInt(int64(b))
+      results.add vSome(vList(xs))
+  witFn(r, IfWorld, "[method]world.set-block-entity-nbt"):
+    let wd = worldAt(int(args[0].i))
+    if wd == nil: return "world: invalid handle"
+    var bytes: seq[byte] = @[]
+    for b in args[2].items: bytes.add byte(b.i)
+    var rd = newNbtReader(nrmJava, bytes)
+    let doc = readUnnamed(rd)
+    if not doc.isOk:
+      return "Invalid NBT"
+    var nbt = doc.value.rootTag
+    let p = args[1]
+    nbt.putInt("x", int32(p.items[0].i))
+    nbt.putInt("y", int32(p.items[1].i))
+    nbt.putInt("z", int32(p.items[2].i))
+    wd.addBlockEntityNbt(bpos(p), nbt)
+    results.add vVariant(0)
+  witFn(r, IfWorld, "[method]world.set-chunk-generator"):
+    if worldAt(int(args[0].i)) == nil: return "world: invalid handle"
+    echo "[plugin] set-chunk-generator(", args[1].i, ") is not supported by this server: the generator is ignored"
+  installCustomData(r, we, "world", proc (rep: int): string {.closure.} = "w" & $rep)
+  # ---- world-border
+  witFn(r, IfWorld, "[method]world-border.get-center-x"):
+    let wd = worldAt(int(args[0].i))
+    if wd == nil: return "world-border: invalid handle"
+    results.add vFloat(wd.worldborder.centerX)
+  witFn(r, IfWorld, "[method]world-border.get-center-z"):
+    let wd = worldAt(int(args[0].i))
+    if wd == nil: return "world-border: invalid handle"
+    results.add vFloat(wd.worldborder.centerZ)
+  witFn(r, IfWorld, "[method]world-border.get-center"):
+    let wd = worldAt(int(args[0].i))
+    if wd == nil: return "world-border: invalid handle"
+    results.add vRecord(@[vFloat(wd.worldborder.centerX), vFloat(0.0), vFloat(wd.worldborder.centerZ)])
+  witFn(r, IfWorld, "[method]world-border.set-center"):
+    let wd = worldAt(int(args[0].i))
+    if wd == nil: return "world-border: invalid handle"
+    var wb = wd.worldborder
+    wb.setCenter(wd, args[1].f, args[2].f)
+    wd.worldborder = wb
+  witFn(r, IfWorld, "[method]world-border.get-diameter"):
+    let wd = worldAt(int(args[0].i))
+    if wd == nil: return "world-border: invalid handle"
+    results.add vFloat(wd.worldborder.newDiameter)
+  witFn(r, IfWorld, "[method]world-border.get-size"):
+    let wd = worldAt(int(args[0].i))
+    if wd == nil: return "world-border: invalid handle"
+    results.add vFloat(wd.worldborder.newDiameter)
+  witFn(r, IfWorld, "[method]world-border.set-diameter"):
+    let wd = worldAt(int(args[0].i))
+    if wd == nil: return "world-border: invalid handle"
+    let hasSpeed = args[2].i != 0
+    var wb = wd.worldborder
+    wb.setDiameter(wd, args[1].f, hasSpeed, (if hasSpeed: args[2].items[0].i else: 0'i64))
+    wd.worldborder = wb
+  witFn(r, IfWorld, "[method]world-border.set-size"):
+    let wd = worldAt(int(args[0].i))
+    if wd == nil: return "world-border: invalid handle"
+    var wb = wd.worldborder
+    wb.setDiameter(wd, args[1].f, false, 0'i64)
+    wd.worldborder = wb
+  witFn(r, IfWorld, "[method]world-border.set-size-transition"):
+    let wd = worldAt(int(args[0].i))
+    if wd == nil: return "world-border: invalid handle"
+    let secs = cast[uint64](args[2].i)
+    let millis = if secs > 9_000_000_000_000_000'u64: 9_000_000_000_000_000'i64 else: int64(secs) * 1000'i64
+    var wb = wd.worldborder
+    wb.setDiameter(wd, args[1].f, true, millis)
+    wd.worldborder = wb
+  witFn(r, IfWorld, "[method]world-border.get-target-diameter"):
+    let wd = worldAt(int(args[0].i))
+    if wd == nil: return "world-border: invalid handle"
+    results.add vFloat(wd.worldborder.newDiameter)
+  witFn(r, IfWorld, "[method]world-border.get-target-speed"):
+    let wd = worldAt(int(args[0].i))
+    if wd == nil: return "world-border: invalid handle"
+    results.add vInt(wd.worldborder.speed)
+  witFn(r, IfWorld, "[method]world-border.get-warning-distance"):
+    let wd = worldAt(int(args[0].i))
+    if wd == nil: return "world-border: invalid handle"
+    results.add vInt(int64(wd.worldborder.warningBlocks))
+  witFn(r, IfWorld, "[method]world-border.set-warning-distance"):
+    let wd = worldAt(int(args[0].i))
+    if wd == nil: return "world-border: invalid handle"
+    var wb = wd.worldborder
+    wb.setWarningDistance(wd, int32(args[1].i))
+    wd.worldborder = wb
+  witFn(r, IfWorld, "[method]world-border.get-warning-delay"):
+    let wd = worldAt(int(args[0].i))
+    if wd == nil: return "world-border: invalid handle"
+    results.add vInt(int64(wd.worldborder.warningTime))
+  witFn(r, IfWorld, "[method]world-border.set-warning-delay"):
+    let wd = worldAt(int(args[0].i))
+    if wd == nil: return "world-border: invalid handle"
+    var wb = wd.worldborder
+    wb.setWarningDelay(wd, int32(args[1].i))
+    wd.worldborder = wb
+  witFn(r, IfWorld, "[method]world-border.get-warning-time"):
+    let wd = worldAt(int(args[0].i))
+    if wd == nil: return "world-border: invalid handle"
+    results.add vInt(int64(wd.worldborder.warningTime))
+  witFn(r, IfWorld, "[method]world-border.set-warning-time"):
+    let wd = worldAt(int(args[0].i))
+    if wd == nil: return "world-border: invalid handle"
+    var wb = wd.worldborder
+    wb.setWarningDelay(wd, int32(args[1].i))
+    wd.worldborder = wb
+  witFn(r, IfWorld, "[method]world-border.get-damage-buffer"):
+    let wd = worldAt(int(args[0].i))
+    if wd == nil: return "world-border: invalid handle"
+    results.add vFloat(float64(wd.worldborder.buffer))
+  witFn(r, IfWorld, "[method]world-border.set-damage-buffer"):
+    let wd = worldAt(int(args[0].i))
+    if wd == nil: return "world-border: invalid handle"
+    wd.worldborder.buffer = float32(args[1].f)
+  witFn(r, IfWorld, "[method]world-border.get-damage-amount"):
+    let wd = worldAt(int(args[0].i))
+    if wd == nil: return "world-border: invalid handle"
+    results.add vFloat(float64(wd.worldborder.damagePerBlock))
+  witFn(r, IfWorld, "[method]world-border.set-damage-amount"):
+    let wd = worldAt(int(args[0].i))
+    if wd == nil: return "world-border: invalid handle"
+    wd.worldborder.damagePerBlock = float32(args[1].f)
+  witFn(r, IfWorld, "[method]world-border.contains"):
+    let wd = worldAt(int(args[0].i))
+    if wd == nil: return "world-border: invalid handle"
+    results.add vBool(wd.worldborder.contains(args[1].f, args[2].f))
+  witFn(r, IfWorld, "[method]world-border.contains-pos"):
+    let wd = worldAt(int(args[0].i))
+    if wd == nil: return "world-border: invalid handle"
+    results.add vBool(wd.worldborder.contains(args[1].items[0].f, args[1].items[2].f))
+  witFn(r, IfWorld, "[method]world-border.reset"):
+    let wd = worldAt(int(args[0].i))
+    if wd == nil: return "world-border: invalid handle"
+    var wb = wd.worldborder
+    wb.reset(wd)
+    wd.worldborder = wb
+  # ---- chunk
+  witFn(r, IfWorld, "[method]chunk.get-x"):
+    let c = chunkOf(we, int(args[0].i))
+    if c == nil: return "Chunk unloaded"
+    results.add vInt(int64(c.x))
+  witFn(r, IfWorld, "[method]chunk.get-z"):
+    let c = chunkOf(we, int(args[0].i))
+    if c == nil: return "Chunk unloaded"
+    results.add vInt(int64(c.z))
+  witFn(r, IfWorld, "[method]chunk.get-block-state-id"):
+    let c = chunkOf(we, int(args[0].i))
+    if c == nil: return "Chunk unloaded"
+    results.add vInt(int64(chunkStateAt(c, args[1])))
+  witFn(r, IfWorld, "[method]chunk.get-block-state"):
+    let c = chunkOf(we, int(args[0].i))
+    if c == nil: return "Chunk unloaded"
+    results.add blockStateVal(asU16(bx.newBlockStateIdOrAir(uint16(chunkStateAt(c, args[1])))))
+  witFn(r, IfWorld, "[method]chunk.get-block"):
+    let c = chunkOf(we, int(args[0].i))
+    if c == nil: return "Chunk unloaded"
+    results.add blockVal(bx.Block.fromStateId(bx.newBlockStateIdOrAir(uint16(chunkStateAt(c, args[1])))))
+  witFn(r, IfWorld, "[method]chunk.set-block-state"):
+    let rc = int(args[0].i)
+    let c = chunkOf(we, rc)
+    if c == nil: return "Chunk unloaded"
+    if badState(int(args[2].i)): return "Invalid BlockStateId"
+    chunkSetState(we, rc, c, args[1], uint32(args[2].i))
+  witFn(r, IfWorld, "[method]chunk.set-block"):
+    let rc = int(args[0].i)
+    let c = chunkOf(we, rc)
+    if c == nil: return "Chunk unloaded"
+    let b = bx.Block.fromId(bx.newBlockIdOrAir(uint16(args[2].items[0].i)))
+    chunkSetState(we, rc, c, args[1], uint32(asU16(b.defaultState.id)))
+  witFn(r, IfWorld, "[method]chunk.set-block-by-id"):
+    let rc = int(args[0].i)
+    let c = chunkOf(we, rc)
+    if c == nil: return "Chunk unloaded"
+    if badBlock(int(args[2].i)): return "Invalid BlockId"
+    let b = bx.Block.fromId(bx.newBlockIdUnchecked(uint16(args[2].i)))
+    chunkSetState(we, rc, c, args[1], uint32(asU16(b.defaultState.id)))
+  witFn(r, IfWorld, "[method]chunk.get-biome"):
+    let c = chunkOf(we, int(args[0].i))
+    if c == nil: return "Chunk unloaded"
+    let p = args[1]
+    var id = 0
+    if p.items[0].i >= 0 and p.items[0].i < 16 and p.items[2].i >= 0 and p.items[2].i < 16:
+      let (ok, v) = getRoughBiomeAbsoluteY(c.section, int(p.items[0].i), int32(p.items[1].i), int(p.items[2].i))
+      if ok: id = int(v)
+    var b = biomedata.Biome.fromId(uint8(id))
+    if b == nil: b = biomedata.Biome.fromName("the_void")
+    var nm = "the_void"
+    if b != nil: nm = b.registryId
+    results.add vInt(int64(enumIndex(resultTy(ci), nm)))
+  witFn(r, IfWorld, "[method]chunk.get-block-entity"):
+    let rc = int(args[0].i)
+    let c = chunkOf(we, rc)
+    if c == nil: return "Chunk unloaded"
+    let p = args[1]
+    let ax = int(c.x) * 16 + int(p.items[0].i)
+    let az = int(c.z) * 16 + int(p.items[2].i)
+    let kind = (if we.be.hooks.kind != nil: we.be.hooks.kind(we.chunks[rc].world, ax, int(p.items[1].i), az) else: "")
+    if kind.len == 0 or beCase(ci, kind) < 0:
+      results.add vNone()
+    else:
+      let rep = newBlockEntityRep(we.be, we.chunks[rc].world, ax, int(p.items[1].i), az)
+      results.add vSome(vVariant(beCase(ci, kind), vInt(int64(rep))))
+  witFn(r, IfWorld, "[method]chunk.get-top-block-y"):
+    let c = chunkOf(we, int(args[0].i))
+    if c == nil: return "Chunk unloaded"
+    results.add vInt(int64(getHeightmap(c.heightmap, chmWorldSurface, int32(args[1].i), int32(args[2].i), c.section.minY)))
+  witFn(r, IfWorld, "[method]chunk.get-sky-light"):
+    let c = chunkOf(we, int(args[0].i))
+    if c == nil: return "Chunk unloaded"
+    let p = args[1]
+    results.add vInt(int64(chunkLight(c, true, int(p.items[0].i), int(p.items[1].i), int(p.items[2].i))))
+  witFn(r, IfWorld, "[method]chunk.get-block-light"):
+    let c = chunkOf(we, int(args[0].i))
+    if c == nil: return "Chunk unloaded"
+    let p = args[1]
+    results.add vInt(int64(chunkLight(c, false, int(p.items[0].i), int(p.items[1].i), int(p.items[2].i))))
+  installCustomData(r, we, "chunk", proc (rep: int): string {.closure.} =
+    if rep >= 0 and rep < we.chunks.len: "c" & $we.chunks[rep].world & ":" & $we.chunks[rep].x & ":" & $we.chunks[rep].z
+    else: "c?")

@@ -1,0 +1,539 @@
+## Port of the rest of pumpkin/src/plugin/loader/wasm/wasm_host/wit/v0_1/server.rs (the newer tree's
+## crates/pumpkin-wasm-host-v0_1/src/{server,enchantment,advancement,datapack}.rs for what the pinned loader lacks): the
+## `op-manager`, `ban-manager`, `whitelist-manager`, `enchantment-manager` and `datapack-manager` resources, and the
+## `server` methods create-world, unload-world, delete-message-by-signature / -by-id, get-recipe-manager, get-op-manager,
+## get-ban-manager, get-whitelist-manager, get-advancement, get-all-advancement-ids, get-enchantment-manager,
+## get-enchantment, get-all-enchantment-ids and get-datapack-manager. The managers have no state of their own: a handle's
+## rep is ignored and every call goes to `server.data` (ops.json, banned-players.json, banned-ips.json, whitelist.json),
+## which the commands edit too. create-world, unload-world and save-all are servermod's, through the globals of
+## pluginhooks.aowl (`WitHooks.createWorld`, `unloadWorld`, `saveAll`). The enchantment registry is `SrvState.enchantments`.
+## PARTIAL: pumpkin/src/plugin/loader/wasm/wasm_host/wit/v0_1/server.rs - the datapack manager: this server loads no
+## datapacks, so the listings are empty, `get-pack` answers none, enable/disable/reload/execute-function answer an error
+## string; `create-world` fires no `WorldInitEvent`; sys-info is not gated by the plugin's `sys.info` permissions.
+import std/[options, strutils, syncio]
+import ../wasm/[canonabi, component]
+import ../../util/uuid
+import ../../util/text/text
+import ../../config/[op, whitelist]
+import ../../protocol/java/client/play/delete_chat
+import ../../server/serverbase
+import ../../server/data/[banned_ip, banned_player, banlist_serializer]
+import ../../server/crash
+import ../../generated/advancement as advdata
+import ../../generated/enchantment as enchdata
+import witstate, witserver
+
+const
+  IfServer = "pumpkin:plugin/server"
+  SrvDataFolder = "data"
+
+type
+  CustomEnch* = object
+    id*: string
+    description*: int       ## text arena rep
+    maxLevel*: int
+    anvilCost*: int
+    supportedItems*: string
+    weight*: int
+    slots*: seq[int]        ## attribute-modifier-slot ordinals
+    exclusiveSet*: seq[string]
+
+  SrvState* = ref object
+    enchantments*: seq[CustomEnch]
+
+proc newSrvState*(): SrvState = SrvState(enchantments: @[])
+
+# ---- helpers -------------------------------------------------------------------------------------------------------
+
+proc uuidOf(v: CVal): Uuid = Uuid(hi: cast[uint64](v.items[0].i), lo: cast[uint64](v.items[1].i))
+proc uuidVal(u: Uuid): CVal = vRecord(@[u64Val(u.hi), u64Val(u.lo)])
+
+proc strOrNone(has: bool; s: string): CVal =
+  if has: vSome(vStr(s)) else: vNone()
+
+proc daysFromCivil(y0, m, d: int64): int64 =
+  let y = if m <= 2'i64: y0 - 1'i64 else: y0
+  let era = (if y >= 0'i64: y else: y - 399'i64) div 400'i64
+  let yoe = y - era * 400'i64
+  let doy = (153'i64 * (m + (if m > 2'i64: -3'i64 else: 9'i64)) + 2'i64) div 5'i64 + d - 1'i64
+  let doe = yoe * 365'i64 + yoe div 4'i64 - yoe div 100'i64 + doy
+  era * 146097'i64 + doe - 719468'i64
+
+proc digitsAt(s: string; at, n: int; v: var int64): bool =
+  if at + n > s.len: return false
+  v = 0
+  var i = 0
+  while i < n:
+    let c = s[at + i]
+    if c < '0' or c > '9': return false
+    v = v * 10 + int64(ord(c) - ord('0'))
+    inc i
+  true
+
+proc parseTimestamp*(s: string; seconds: var int64): bool =
+  ## RFC 3339 (`2026-11-12T10:00:00Z`, `...+01:00`, optional fraction) or `2026-11-12 10:00:00+00:00`: epoch seconds.
+  var y = 0'i64
+  var mo = 0'i64
+  var d = 0'i64
+  var h = 0'i64
+  var mi = 0'i64
+  var sec = 0'i64
+  if s.len < 20: return false
+  if not digitsAt(s, 0, 4, y) or s[4] != '-' or not digitsAt(s, 5, 2, mo) or s[7] != '-' or not digitsAt(s, 8, 2, d): return false
+  if s[10] != 'T' and s[10] != 't' and s[10] != ' ': return false
+  if not digitsAt(s, 11, 2, h) or s[13] != ':' or not digitsAt(s, 14, 2, mi) or s[16] != ':' or not digitsAt(s, 17, 2, sec): return false
+  var i = 19
+  if i < s.len and s[i] == '.':
+    inc i
+    while i < s.len and s[i] >= '0' and s[i] <= '9': inc i
+  var offset = 0'i64
+  if i >= s.len: return false
+  if s[i] == 'Z' or s[i] == 'z':
+    inc i
+  elif s[i] == '+' or s[i] == '-':
+    var oh = 0'i64
+    var om = 0'i64
+    if not digitsAt(s, i + 1, 2, oh) or i + 3 >= s.len or s[i + 3] != ':' or not digitsAt(s, i + 4, 2, om): return false
+    offset = (oh * 3600'i64 + om * 60'i64) * (if s[i] == '-': -1'i64 else: 1'i64)
+    i += 6
+  else:
+    return false
+  if i != s.len: return false
+  seconds = daysFromCivil(y, mo, d) * 86400'i64 + h * 3600'i64 + mi * 60'i64 + sec - offset
+  true
+
+proc parseBanExpiry*(hasExpires: bool; expires: string; hasDuration: bool; duration: uint64): int64 =
+  ## `parse_ban_expiry` (wit/v0_1/player.rs of the newer tree): the duration wins; "forever" or "" and anything that does
+  ## not parse is no expiry. Epoch seconds, `NoExpiry` for none.
+  if hasDuration:
+    let secs = if duration > 9_000_000_000_000'u64: 9_000_000_000_000'i64 else: int64(duration)
+    return nowUtcSeconds() + secs
+  if hasExpires:
+    if expires.len == 0 or expires.toLowerAscii() == "forever": return NoExpiry
+    var t = 0'i64
+    if parseTimestamp(expires, t): return t
+  NoExpiry
+
+proc dateOrNone(expires: int64): CVal =
+  if expires == NoExpiry: vNone() else: vSome(vStr(formatBanDate(expires)))
+
+proc opEntryVal(o: Op): CVal =
+  vRecord(@[uuidVal(o.uuid), vStr(o.name), vInt(int64(ord(o.level))), vBool(o.bypassesPlayerLimit)])
+
+proc playerBanVal(e: BannedPlayerEntry): CVal =
+  vRecord(@[uuidVal(e.uuid), vStr(e.name), vStr(formatBanDate(e.created)), vStr(e.source), dateOrNone(e.expires), vStr(e.reason)])
+
+proc ipBanVal(e: BannedIpEntry): CVal =
+  vRecord(@[vStr(e.ip), vStr(formatBanDate(e.created)), vStr(e.source), dateOrNone(e.expires), vStr(e.reason)])
+
+proc optionSome(v: CVal): bool = v.i != 0
+
+proc customEnchVal(e: CustomEnch): CVal =
+  var slots: seq[CVal] = @[]
+  for s in e.slots: slots.add vInt(int64(s))
+  var ex: seq[CVal] = @[]
+  for s in e.exclusiveSet: ex.add vStr(s)
+  vRecord(@[vStr(e.id), vInt(int64(e.description)), vInt(int64(e.maxLevel)), vInt(int64(e.anvilCost)), vStr(e.supportedItems),
+            vInt(int64(e.weight)), vList(slots), vList(ex)])
+
+proc findVanillaEnchantment*(id: string): int =
+  ## `find_vanilla_enchantment`: the table index by `minecraft:name` or the bare name; -1 for none.
+  result = -1
+  var i = 0
+  while i < enchdata.gEnchantments.len:
+    let n = enchdata.gEnchantments[i].name
+    if n == id or (n.len > 10 and n[10 ..< n.len] == id and id.find(':') < 0): result = i
+    inc i
+
+proc vanillaEnchVal(st: WitState; idx: int): CVal =
+  let e = enchdata.gEnchantments[idx]
+  var slots: seq[CVal] = @[]
+  for s in e.slots: slots.add vInt(int64(ord(s)))
+  var ex: seq[CVal] = @[]
+  if e.exclusiveSet.isSome: ex.add vStr(e.exclusiveSet.unsafeGet)
+  let rep = newTextRep(st, translate(e.description))
+  vRecord(@[vStr(e.name), vInt(int64(rep)), vInt(int64(max(e.maxLevel, 1'i32))), vInt(int64(e.anvilCost)), vStr(e.supportedItems),
+            vInt(int64(max(e.weight, 1'i32))), vList(slots), vList(ex)])
+
+proc findAdvancement(id: string): Option[advdata.Advancement] =
+  result = advdata.Advancement.fromName(id)
+  if result.isNone: result = advdata.Advancement.fromMinecraftName(id)
+
+proc advancementInfoVal(st: WitState; a: advdata.Advancement): CVal =
+  var display = vNone()
+  if a.display.isSome:
+    let d = a.display.unsafeGet
+    let title = newTextRep(st, translate(d.title))
+    let desc = newTextRep(st, translate(d.description))
+    var bg = vNone()
+    if d.backgroundTexture.isSome: bg = vSome(vStr(d.backgroundTexture.unsafeGet))
+    display = vSome(vRecord(@[vInt(int64(title)), vInt(int64(desc)), vInt(int64(ord(d.frameType))), vBool(d.showToast),
+      vBool(d.hidden), vBool(d.announceToChat), bg, vFloat(float64(d.x)), vFloat(float64(d.y))]))
+  var crit: seq[CVal] = @[]
+  for c in a.criteria: crit.add vStr(c)
+  var parent = vNone()
+  if a.parent.isSome: parent = vSome(vStr($a.parent.unsafeGet))
+  vRecord(@[vStr($a.id), parent, vList(crit), display])
+
+proc allPlayersOf(srv: Server): seq[Player] =
+  result = @[]
+  for w in srv.worlds:
+    for p in w.players: result.add p
+
+proc kickWith(p: Player; reason: TextComponent) =
+  let cp = p.commandPlayer
+  if cp != nil and cp.kick != nil: cp.kick(reason)
+
+# ---- the interfaces ------------------------------------------------------------------------------------------------
+
+proc installServer2*(r: HostRegistry; st: WitState; ss: SrvState) =
+  witFn(r, IfServer, "[method]server.create-world"):
+    if st.hooks.createWorld == nil: return "Server not available"
+    let idx = st.hooks.createWorld(args[1].s, int(args[2].i))
+    if idx < 0: return "Server not available"
+    results.add vInt(int64(idx))
+  witFn(r, IfServer, "[method]server.unload-world"):
+    var err = "Server not available"
+    if st.hooks.unloadWorld != nil: err = st.hooks.unloadWorld(args[1].s)
+    if err.len == 0: results.add vVariant(0)
+    else: results.add vVariant(1, vStr(err))
+  witFn(r, IfServer, "[method]server.delete-message-by-signature"):
+    let srv = gLink.server
+    if srv == nil: return "Server not available"
+    var sig: seq[byte] = @[]
+    for b in args[1].items: sig.add byte(b.i)
+    for p in allPlayersOf(srv): p.client.writePacketFor(cDeleteChatFromSignature(sig))
+  witFn(r, IfServer, "[method]server.delete-message-by-id"):
+    let srv = gLink.server
+    if srv == nil: return "Server not available"
+    for p in allPlayersOf(srv): p.client.writePacketFor(cDeleteChatFromCacheId(int32(args[1].i)))
+  witFn(r, IfServer, "[method]server.get-recipe-manager"):
+    results.add vInt(0)
+  witFn(r, IfServer, "[method]server.get-op-manager"):
+    results.add vInt(0)
+  witFn(r, IfServer, "[method]server.get-ban-manager"):
+    results.add vInt(0)
+  witFn(r, IfServer, "[method]server.get-whitelist-manager"):
+    results.add vInt(0)
+  witFn(r, IfServer, "[method]server.get-enchantment-manager"):
+    results.add vInt(0)
+  witFn(r, IfServer, "[method]server.get-datapack-manager"):
+    results.add vInt(0)
+  witFn(r, IfServer, "[method]server.get-advancement"):
+    let a = findAdvancement(args[1].s)
+    if a.isNone: results.add vNone()
+    else: results.add vSome(advancementInfoVal(st, a.unsafeGet))
+  witFn(r, IfServer, "[method]server.get-all-advancement-ids"):
+    var ids: seq[CVal] = @[]
+    for i in advdata.Advancement.getIdentifierList(): ids.add vStr($i)
+    results.add vList(ids)
+  witFn(r, IfServer, "[method]server.get-enchantment"):
+    var found = -1
+    var i = 0
+    while i < ss.enchantments.len:
+      if ss.enchantments[i].id == args[1].s: found = i
+      inc i
+    if found >= 0:
+      results.add vSome(customEnchVal(ss.enchantments[found]))
+    else:
+      let v = findVanillaEnchantment(args[1].s)
+      if v >= 0: results.add vSome(vanillaEnchVal(st, v))
+      else: results.add vNone()
+  witFn(r, IfServer, "[method]server.get-all-enchantment-ids"):
+    var ids: seq[CVal] = @[]
+    for e in ss.enchantments: ids.add vStr(e.id)
+    for e in enchdata.gEnchantments: ids.add vStr(e.name)
+    results.add vList(ids)
+  # ---- enchantment-manager
+  witFn(r, IfServer, "[method]enchantment-manager.register-enchantment"):
+    let v = args[1]
+    for e in ss.enchantments:
+      if e.id == v.items[0].s:
+        results.add vVariant(1, vStr("Enchantment '" & e.id & "' is already registered"))
+        return ""
+    var slots: seq[int] = @[]
+    for s in v.items[6].items: slots.add int(s.i)
+    var ex: seq[string] = @[]
+    for s in v.items[7].items: ex.add s.s
+    ss.enchantments.add CustomEnch(id: v.items[0].s, description: int(v.items[1].i), maxLevel: int(v.items[2].i),
+      anvilCost: int(v.items[3].i), supportedItems: v.items[4].s, weight: int(v.items[5].i), slots: slots, exclusiveSet: ex)
+    results.add vVariant(0)
+  witFn(r, IfServer, "[method]enchantment-manager.get-enchantment"):
+    var found = -1
+    var i = 0
+    while i < ss.enchantments.len:
+      if ss.enchantments[i].id == args[1].s: found = i
+      inc i
+    if found >= 0:
+      results.add vSome(customEnchVal(ss.enchantments[found]))
+    else:
+      let v = findVanillaEnchantment(args[1].s)
+      if v >= 0: results.add vSome(vanillaEnchVal(st, v))
+      else: results.add vNone()
+  witFn(r, IfServer, "[method]enchantment-manager.has-enchantment"):
+    var has = findVanillaEnchantment(args[1].s) >= 0
+    for e in ss.enchantments:
+      if e.id == args[1].s: has = true
+    results.add vBool(has)
+  witFn(r, IfServer, "[method]enchantment-manager.get-all-enchantment-ids"):
+    var ids: seq[CVal] = @[]
+    for e in ss.enchantments: ids.add vStr(e.id)
+    for e in enchdata.gEnchantments: ids.add vStr(e.name)
+    results.add vList(ids)
+  # ---- op-manager
+  witFn(r, IfServer, "[method]op-manager.is-op"):
+    let srv = gLink.server
+    if srv == nil: return "Server not available"
+    results.add vBool(srv.data.operatorConfig.getEntry(uuidOf(args[1])).isSome)
+  witFn(r, IfServer, "[method]op-manager.get-op"):
+    let srv = gLink.server
+    if srv == nil: return "Server not available"
+    let o = srv.data.operatorConfig.getEntry(uuidOf(args[1]))
+    if o.isNone: results.add vNone()
+    else: results.add vSome(opEntryVal(o.unsafeGet))
+  witFn(r, IfServer, "[method]op-manager.get-permission-level"):
+    let srv = gLink.server
+    if srv == nil: return "Server not available"
+    let o = srv.data.operatorConfig.getEntry(uuidOf(args[1]))
+    results.add vInt(if o.isNone: 0'i64 else: int64(ord(o.unsafeGet.level)))
+  witFn(r, IfServer, "[method]op-manager.list-ops"):
+    let srv = gLink.server
+    if srv == nil: return "Server not available"
+    var xs: seq[CVal] = @[]
+    for o in srv.data.operatorConfig.ops: xs.add opEntryVal(o)
+    results.add vList(xs)
+  witFn(r, IfServer, "[method]op-manager.op-player"):
+    let srv = gLink.server
+    if srv == nil: return "Server not available"
+    let id = uuidOf(args[2])
+    let level = PermissionLvl(int(args[3].i))
+    var i = 0
+    var done = false
+    while i < srv.data.operatorConfig.ops.len:
+      if srv.data.operatorConfig.ops[i].uuid == id:
+        srv.data.operatorConfig.ops[i].level = level
+        srv.data.operatorConfig.ops[i].name = args[1].s
+        srv.data.operatorConfig.ops[i].bypassesPlayerLimit = args[4].i != 0
+        done = true
+      inc i
+    if not done:
+      srv.data.operatorConfig.ops.add newOp(id, args[1].s, level, args[4].i != 0)
+    discard saveOperatorConfig(srv.data.operatorConfig, SrvDataFolder)
+    for p in allPlayersOf(srv):
+      if p.gameprofile.id == id:
+        let cp = p.commandPlayer
+        if cp != nil and cp.setPermissionLvl != nil: cp.setPermissionLvl(level)
+  witFn(r, IfServer, "[method]op-manager.deop-player"):
+    let srv = gLink.server
+    if srv == nil: return "Server not available"
+    let id = uuidOf(args[1])
+    var removed = false
+    var i = 0
+    while i < srv.data.operatorConfig.ops.len and not removed:
+      if srv.data.operatorConfig.ops[i].uuid == id:
+        srv.data.operatorConfig.ops.delete(i)
+        removed = true
+      else:
+        inc i
+    if removed:
+      discard saveOperatorConfig(srv.data.operatorConfig, SrvDataFolder)
+      for p in allPlayersOf(srv):
+        if p.gameprofile.id == id:
+          let cp = p.commandPlayer
+          if cp != nil and cp.setPermissionLvl != nil: cp.setPermissionLvl(PermissionLvl.Zero)
+    results.add vBool(removed)
+  # ---- ban-manager
+  witFn(r, IfServer, "[method]ban-manager.is-player-banned"):
+    let srv = gLink.server
+    if srv == nil: return "Server not available"
+    results.add vBool(srv.data.bannedPlayerList.getEntry(uuidOf(args[1])).isSome)
+  witFn(r, IfServer, "[method]ban-manager.get-player-ban"):
+    let srv = gLink.server
+    if srv == nil: return "Server not available"
+    let e = srv.data.bannedPlayerList.getEntry(uuidOf(args[1]))
+    if e.isNone: results.add vNone()
+    else: results.add vSome(playerBanVal(e.unsafeGet))
+  witFn(r, IfServer, "[method]ban-manager.unban-player"):
+    let srv = gLink.server
+    if srv == nil: return "Server not available"
+    let id = uuidOf(args[1])
+    var removed = false
+    var i = 0
+    while i < srv.data.bannedPlayerList.bannedPlayers.len and not removed:
+      if srv.data.bannedPlayerList.bannedPlayers[i].uuid == id:
+        srv.data.bannedPlayerList.bannedPlayers.delete(i)
+        removed = true
+      else:
+        inc i
+    if removed: banned_player.save(srv.data.bannedPlayerList)
+    results.add vBool(removed)
+  witFn(r, IfServer, "[method]ban-manager.list-player-bans"):
+    let srv = gLink.server
+    if srv == nil: return "Server not available"
+    var xs: seq[CVal] = @[]
+    for e in srv.data.bannedPlayerList.bannedPlayers: xs.add playerBanVal(e)
+    results.add vList(xs)
+  witFn(r, IfServer, "[method]ban-manager.ban-player"):
+    let srv = gLink.server
+    if srv == nil: return "Server not available"
+    let id = uuidOf(args[2])
+    let o = args[3]
+    var reason = "Banned by plugin."
+    if optionSome(o.items[0]): reason = getText(textAt(st, int(o.items[0].items[0].i)))
+    var source = "Plugin"
+    if optionSome(o.items[1]): source = o.items[1].items[0].s
+    var expStr = ""
+    var duration = 0'u64
+    let hasExp = optionSome(o.items[2])
+    let hasDur = optionSome(o.items[3])
+    if hasExp: expStr = o.items[2].items[0].s
+    if hasDur: duration = cast[uint64](o.items[3].items[0].i)
+    let expires = parseBanExpiry(hasExp, expStr, hasDur, duration)
+    var done = false
+    var i = 0
+    while i < srv.data.bannedPlayerList.bannedPlayers.len:
+      if srv.data.bannedPlayerList.bannedPlayers[i].uuid == id:
+        srv.data.bannedPlayerList.bannedPlayers[i].name = args[1].s
+        srv.data.bannedPlayerList.bannedPlayers[i].source = source
+        srv.data.bannedPlayerList.bannedPlayers[i].expires = expires
+        srv.data.bannedPlayerList.bannedPlayers[i].reason = reason
+        done = true
+      inc i
+    if not done:
+      srv.data.bannedPlayerList.bannedPlayers.add BannedPlayerEntry(uuid: id, name: args[1].s, created: nowUtcSeconds(),
+        source: source, expires: expires, reason: reason)
+    banned_player.save(srv.data.bannedPlayerList)
+    if o.items[4].i != 0:
+      for p in allPlayersOf(srv):
+        if p.gameprofile.id == id: kickWith(p, text(reason))
+    if o.items[5].i != 0:
+      echo "Banned player " & args[1].s & ": " & reason
+  witFn(r, IfServer, "[method]ban-manager.is-ip-banned"):
+    let srv = gLink.server
+    if srv == nil: return "Server not available"
+    results.add vBool(srv.data.bannedIpList.getEntry(args[1].s).isSome)
+  witFn(r, IfServer, "[method]ban-manager.get-ip-ban"):
+    let srv = gLink.server
+    if srv == nil: return "Server not available"
+    let e = srv.data.bannedIpList.getEntry(args[1].s)
+    if e.isNone: results.add vNone()
+    else: results.add vSome(ipBanVal(e.unsafeGet))
+  witFn(r, IfServer, "[method]ban-manager.unban-ip"):
+    let srv = gLink.server
+    if srv == nil: return "Server not available"
+    var removed = false
+    var i = 0
+    while i < srv.data.bannedIpList.bannedIps.len and not removed:
+      if srv.data.bannedIpList.bannedIps[i].ip == args[1].s:
+        srv.data.bannedIpList.bannedIps.delete(i)
+        removed = true
+      else:
+        inc i
+    if removed: banned_ip.save(srv.data.bannedIpList)
+    results.add vBool(removed)
+  witFn(r, IfServer, "[method]ban-manager.list-ip-bans"):
+    let srv = gLink.server
+    if srv == nil: return "Server not available"
+    var xs: seq[CVal] = @[]
+    for e in srv.data.bannedIpList.bannedIps: xs.add ipBanVal(e)
+    results.add vList(xs)
+  witFn(r, IfServer, "[method]ban-manager.ban-ip"):
+    let srv = gLink.server
+    if srv == nil: return "Server not available"
+    let ip = args[1].s
+    let o = args[2]
+    var reason = "Banned by plugin."
+    if optionSome(o.items[0]): reason = getText(textAt(st, int(o.items[0].items[0].i)))
+    var source = "Plugin"
+    if optionSome(o.items[1]): source = o.items[1].items[0].s
+    var expStr = ""
+    var duration = 0'u64
+    let hasExp = optionSome(o.items[2])
+    let hasDur = optionSome(o.items[3])
+    if hasExp: expStr = o.items[2].items[0].s
+    if hasDur: duration = cast[uint64](o.items[3].items[0].i)
+    let expires = parseBanExpiry(hasExp, expStr, hasDur, duration)
+    var done = false
+    var i = 0
+    while i < srv.data.bannedIpList.bannedIps.len:
+      if srv.data.bannedIpList.bannedIps[i].ip == ip:
+        srv.data.bannedIpList.bannedIps[i].source = source
+        srv.data.bannedIpList.bannedIps[i].expires = expires
+        srv.data.bannedIpList.bannedIps[i].reason = reason
+        done = true
+      inc i
+    if not done:
+      srv.data.bannedIpList.bannedIps.add BannedIpEntry(ip: ip, created: nowUtcSeconds(), source: source, expires: expires,
+        reason: reason)
+    banned_ip.save(srv.data.bannedIpList)
+    if o.items[4].i != 0:
+      for p in allPlayersOf(srv):
+        if p.client.peerIp == ip: kickWith(p, text(reason))
+    if o.items[5].i != 0:
+      echo "Banned IP " & ip & ": " & reason
+  # ---- whitelist-manager
+  witFn(r, IfServer, "[method]whitelist-manager.is-enabled"):
+    let srv = gLink.server
+    if srv == nil: return "Server not available"
+    results.add vBool(srv.basicConfig.whiteList)
+  witFn(r, IfServer, "[method]whitelist-manager.set-enabled"):
+    let srv = gLink.server
+    if srv == nil: return "Server not available"
+    srv.basicConfig.whiteList = args[1].i != 0
+    if args[1].i != 0 and srv.basicConfig.enforceWhitelist:
+      for p in allPlayersOf(srv):
+        if not srv.data.whitelistConfig.isWhitelisted(p.gameprofile.id):
+          kickWith(p, translate("multiplayer.disconnect.not_whitelisted"))
+  witFn(r, IfServer, "[method]whitelist-manager.is-whitelisted"):
+    let srv = gLink.server
+    if srv == nil: return "Server not available"
+    results.add vBool(srv.data.whitelistConfig.isWhitelisted(uuidOf(args[1])))
+  witFn(r, IfServer, "[method]whitelist-manager.add-player"):
+    let srv = gLink.server
+    if srv == nil: return "Server not available"
+    let id = uuidOf(args[2])
+    if srv.data.whitelistConfig.isWhitelisted(id):
+      results.add vBool(false)
+    else:
+      srv.data.whitelistConfig.whitelist.add newWhitelistEntry(id, args[1].s)
+      discard saveWhitelistConfig(srv.data.whitelistConfig, SrvDataFolder)
+      results.add vBool(true)
+  witFn(r, IfServer, "[method]whitelist-manager.remove-player"):
+    let srv = gLink.server
+    if srv == nil: return "Server not available"
+    let id = uuidOf(args[1])
+    var removed = false
+    var i = 0
+    while i < srv.data.whitelistConfig.whitelist.len and not removed:
+      if srv.data.whitelistConfig.whitelist[i].uuid == id:
+        srv.data.whitelistConfig.whitelist.delete(i)
+        removed = true
+      else:
+        inc i
+    if removed: discard saveWhitelistConfig(srv.data.whitelistConfig, SrvDataFolder)
+    results.add vBool(removed)
+  witFn(r, IfServer, "[method]whitelist-manager.list-entries"):
+    let srv = gLink.server
+    if srv == nil: return "Server not available"
+    var xs: seq[CVal] = @[]
+    for e in srv.data.whitelistConfig.whitelist: xs.add vRecord(@[uuidVal(e.uuid), vStr(e.name)])
+    results.add vList(xs)
+  # ---- datapack-manager (PARTIAL: no datapacks are loaded)
+  witFn(r, IfServer, "[method]datapack-manager.list-all-packs"):
+    results.add vList(@[])
+  witFn(r, IfServer, "[method]datapack-manager.list-enabled-packs"):
+    results.add vList(@[])
+  witFn(r, IfServer, "[method]datapack-manager.list-available-packs"):
+    results.add vList(@[])
+  witFn(r, IfServer, "[method]datapack-manager.get-pack"):
+    results.add vNone()
+  witFn(r, IfServer, "[method]datapack-manager.is-enabled"):
+    results.add vBool(false)
+  witFn(r, IfServer, "[method]datapack-manager.enable-pack"):
+    results.add vVariant(1, vStr("Datapack '" & args[1].s & "' not found"))
+  witFn(r, IfServer, "[method]datapack-manager.disable-pack"):
+    results.add vVariant(1, vStr("Datapack '" & args[1].s & "' is not enabled"))
+  witFn(r, IfServer, "[method]datapack-manager.reload"):
+    results.add vVariant(1, vStr("Datapacks are not supported by this server"))
+  witFn(r, IfServer, "[method]datapack-manager.execute-function"):
+    results.add vVariant(1, vStr("Function '" & args[1].s & "' not found"))

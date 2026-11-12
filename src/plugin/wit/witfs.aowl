@@ -1,0 +1,435 @@
+## wasi:filesystem for the plugin host: the `data` preopen of `WasiCtxBuilder::preopened_dir(context.get_data_folder(),
+## "data", ReadWrite | ReadOnly)` in pumpkin-wasm-host/src/runtime.rs `on_load`, and the descriptor / directory-entry-stream
+## interface a wasm32-wasip2 `std::fs` call reaches. The WIT is wasi:filesystem 0.2 (in neither upstream tree; wasmtime-wasi
+## carries it), so the signatures are written from the specification.
+## The preopen exists only with `fs.read.data` or `fs.write.data`; it is read-write only with `fs.write.data`. A path may
+## not be absolute or contain `..` (cap-std's sandbox answers `not-permitted`). Symbolic links are never followed or made.
+## PARTIAL: wasmtime_wasi p2 filesystem - file contents are read and written whole (`readFile` / `writeFile`), so a write
+## stream costs a read-modify-write of the file; no metadata-hash, is-same-object, link-at, symlink, readlink, set-times,
+## lock, or per-descriptor flags beyond read / write; stat carries type, link count 1 and size but no timestamps; rename of a
+## directory is not supported (aowlmony's std has no rename: files move by copy then remove).
+import std/[syncio, os, dirs, paths]
+import ../wasm/[canonabi, component]
+import witstate
+
+const
+  FsStreamBase* = 16        ## stream reps below this are the stdio streams of witwasi.aowl
+  IfPreopens = "wasi:filesystem/preopens"
+  IfFsTypes = "wasi:filesystem/types"
+  # error-code enum order of wasi:filesystem 0.2
+  EcAccess = 0
+  EcExist = 7
+  EcInvalid = 12
+  EcIo = 13
+  EcIsDirectory = 14
+  EcNoEntry = 20
+  EcNotDirectory = 24
+  EcNotEmpty = 25
+  EcNotPermitted = 31
+  EcReadOnly = 33
+  # descriptor-type enum order
+  TyDirectory = 3
+  TyRegularFile = 6
+
+type
+  FsDesc = object
+    path: string        ## host path of the descriptor
+    isDir: bool
+    writable: bool
+    plugin: int
+
+  FsStream = object
+    path: string
+    offset: int64
+    isInput: bool
+    append: bool
+
+  FsDirStream = object
+    entries: seq[(int, string)]   ## (descriptor-type, name)
+    pos: int
+
+  FsState* = ref object
+    permissions*: proc (pluginId: int): seq[string] {.closure.}
+    dataFolder*: proc (pluginId: int): string {.closure.}
+    descs: seq[FsDesc]
+    streams: seq[FsStream]
+    dirs: seq[FsDirStream]
+    preopen: seq[(int, int)]      ## (plugin, descriptor rep)
+
+proc newFsState*(): FsState = FsState(descs: @[], streams: @[], dirs: @[], preopen: @[])
+
+proc okUnit(): CVal = vVariant(0)
+proc okVal(v: CVal): CVal = vVariant(0, v)
+proc errCode(c: int): CVal = vVariant(1, vInt(int64(c)))
+
+proc has(perms: seq[string]; p: string): bool =
+  for x in perms:
+    if x == p: return true
+  false
+
+proc isDirPath(p: string): bool = dirExists(p)
+
+proc fileSize(p: string; size: var int64): bool =
+  if not fileExists(p): return false
+  try:
+    size = getFileSize(p)
+    result = true
+  except ErrorCode:
+    result = false
+
+proc readAll(p: string; data: var string): bool =
+  try:
+    data = readFile(p)
+    result = true
+  except ErrorCode:
+    result = false
+
+proc writeAll(p: string; data: string): bool =
+  try:
+    writeFile(p, data)
+    result = true
+  except ErrorCode:
+    result = false
+
+proc safeRelative(rel: string): bool =
+  ## no absolute path, no drive, no `..`
+  if rel.len > 0 and (rel[0] == '/' or rel[0] == '\\'): return false
+  var part = ""
+  var i = 0
+  while i <= rel.len:
+    if i == rel.len or rel[i] == '/' or rel[i] == '\\':
+      if part == "..": return false
+      for c in part:
+        if c == ':': return false
+      part = ""
+    else:
+      part.add rel[i]
+    inc i
+  true
+
+proc joinPath(base, rel: string): string =
+  if rel.len == 0 or rel == ".": return base
+  var r = rel
+  while r.len > 0 and r[r.len - 1] == '/': r.setLen(r.len - 1)
+  if r.len > 2 and r[0] == '.' and r[1] == '/': r = r[2 ..< r.len]
+  base & "/" & r
+
+proc newDesc(fs: FsState; d: FsDesc): int =
+  fs.descs.add d
+  fs.descs.len - 1
+
+proc validDesc(fs: FsState; rep: int): bool = rep >= 0 and rep < fs.descs.len
+
+# ---- stream access used by witwasi.aowl ------------------------------------------------------------
+
+proc isFsStream*(fs: FsState; rep: int): bool = rep >= FsStreamBase and rep - FsStreamBase < fs.streams.len
+
+proc fsStreamRead*(fs: FsState; rep: int; len: int64; data: var string): bool =
+  ## true: `data` holds up to `len` bytes; false: end of stream (`stream-error::closed`)
+  let s = rep - FsStreamBase
+  var all = ""
+  if not fs.streams[s].isInput or not readAll(fs.streams[s].path, all): return false
+  let off = int(fs.streams[s].offset)
+  if off >= all.len: return false
+  var n = all.len - off
+  if int64(n) > len: n = int(len)
+  data = all[off ..< off + n]
+  fs.streams[s].offset += int64(n)
+  true
+
+proc fsStreamSkip*(fs: FsState; rep: int; len: int64; skipped: var int64): bool =
+  var d = ""
+  if not fsStreamRead(fs, rep, len, d): return false
+  skipped = int64(d.len)
+  true
+
+proc fsStreamWrite*(fs: FsState; rep: int; data: string): string =
+  ## "" or a trap reason
+  let s = rep - FsStreamBase
+  if fs.streams[s].isInput: return "wasi:io/streams: write on an input stream"
+  var all = ""
+  discard readAll(fs.streams[s].path, all)
+  var off = int(fs.streams[s].offset)
+  if fs.streams[s].append: off = all.len
+  while all.len < off: all.add '\0'
+  if off + data.len >= all.len:
+    all = all[0 ..< off] & data
+  else:
+    all = all[0 ..< off] & data & all[off + data.len ..< all.len]
+  if not writeAll(fs.streams[s].path, all): return "wasi:filesystem: write failed"
+  fs.streams[s].offset = int64(off + data.len)
+  ""
+
+# ---- the interface ---------------------------------------------------------------------------------
+
+proc statOf(p: string; isDir: bool): CVal =
+  var size = 0'i64
+  if not isDir: discard fileSize(p, size)
+  vRecord(@[vInt(int64(if isDir: TyDirectory else: TyRegularFile)), vInt(1), vInt(size), vNone(), vNone(), vNone()])
+
+proc exists(p: string; isDir: var bool): bool =
+  if isDirPath(p):
+    isDir = true
+    return true
+  isDir = false
+  var size = 0'i64
+  fileSize(p, size)
+
+proc installFs*(r: HostRegistry; fs: FsState) =
+  witFn(r, IfPreopens, "get-directories"):
+    var items: seq[CVal] = @[]
+    var perms: seq[string] = @[]
+    if fs.permissions != nil: perms = fs.permissions(ci.user)
+    let mayWrite = has(perms, "fs.write.data")
+    if (mayWrite or has(perms, "fs.read.data")) and fs.dataFolder != nil:
+      var rep = -1
+      for pr in fs.preopen:
+        if pr[0] == ci.user: rep = pr[1]
+      if rep < 0:
+        let folder = fs.dataFolder(ci.user)
+        try:
+          createDir(path(folder))
+        except ErrorCode:
+          discard
+        rep = newDesc(fs, FsDesc(path: folder, isDir: true, writable: mayWrite, plugin: ci.user))
+        fs.preopen.add((ci.user, rep))
+      else:
+        fs.descs[rep].writable = mayWrite   # permissions may have changed since the plugin was last loaded
+      items.add vRecord(@[vInt(int64(rep)), vStr("data")])
+    results.add vList(items)
+
+  witFn(r, IfFsTypes, "[method]descriptor.get-type"):
+    let d = int(args[0].i)
+    if not validDesc(fs, d): return "wasi:filesystem: bad descriptor"
+    results.add okVal(vInt(int64(if fs.descs[d].isDir: TyDirectory else: TyRegularFile)))
+  witFn(r, IfFsTypes, "[method]descriptor.get-flags"):
+    let d = int(args[0].i)
+    if not validDesc(fs, d): return "wasi:filesystem: bad descriptor"
+    results.add okVal(vInt(if fs.descs[d].writable: 3 else: 1))
+  witFn(r, IfFsTypes, "[method]descriptor.stat"):
+    let d = int(args[0].i)
+    if not validDesc(fs, d): return "wasi:filesystem: bad descriptor"
+    results.add okVal(statOf(fs.descs[d].path, fs.descs[d].isDir))
+  witFn(r, IfFsTypes, "[method]descriptor.stat-at"):
+    let d = int(args[0].i)
+    if not validDesc(fs, d): return "wasi:filesystem: bad descriptor"
+    let rel = args[2].s
+    if not safeRelative(rel):
+      results.add errCode(EcNotPermitted)
+      return ""
+    let p = joinPath(fs.descs[d].path, rel)
+    var isDir = false
+    if not exists(p, isDir):
+      results.add errCode(EcNoEntry)
+      return ""
+    results.add okVal(statOf(p, isDir))
+  witFn(r, IfFsTypes, "[method]descriptor.sync"):
+    results.add okUnit()
+  witFn(r, IfFsTypes, "[method]descriptor.sync-data"):
+    results.add okUnit()
+  witFn(r, IfFsTypes, "[method]descriptor.advise"):
+    results.add okUnit()
+  witFn(r, IfFsTypes, "[method]descriptor.set-size"):
+    let d = int(args[0].i)
+    if not validDesc(fs, d): return "wasi:filesystem: bad descriptor"
+    if not fs.descs[d].writable:
+      results.add errCode(EcReadOnly)
+      return ""
+    if fs.descs[d].isDir:
+      results.add errCode(EcIsDirectory)
+      return ""
+    var all = ""
+    discard readAll(fs.descs[d].path, all)
+    let n = int(args[1].i)
+    if n < all.len: all = all[0 ..< n]
+    else:
+      while all.len < n: all.add '\0'
+    results.add (if writeAll(fs.descs[d].path, all): okUnit() else: errCode(EcIo))
+
+  witFn(r, IfFsTypes, "[method]descriptor.open-at"):
+    let d = int(args[0].i)
+    if not validDesc(fs, d): return "wasi:filesystem: bad descriptor"
+    let rel = args[2].s
+    let openFlags = int(args[3].i)
+    let descFlags = int(args[4].i)
+    let create = (openFlags and 1) != 0
+    let wantDir = (openFlags and 2) != 0
+    let excl = (openFlags and 4) != 0
+    let trunc = (openFlags and 8) != 0
+    let wantWrite = (descFlags and 2) != 0
+    if not fs.descs[d].isDir:
+      results.add errCode(EcNotDirectory)
+      return ""
+    if not safeRelative(rel):
+      results.add errCode(EcNotPermitted)
+      return ""
+    if (create or trunc or wantWrite) and not fs.descs[d].writable:
+      results.add errCode(EcReadOnly)
+      return ""
+    let p = joinPath(fs.descs[d].path, rel)
+    var isDir = false
+    let there = exists(p, isDir)
+    if there and excl and create:
+      results.add errCode(EcExist)
+      return ""
+    if not there:
+      if not create:
+        results.add errCode(EcNoEntry)
+        return ""
+      if wantDir or not writeAll(p, ""):
+        results.add errCode(if wantDir: EcInvalid else: EcNoEntry)
+        return ""
+    elif wantDir and not isDir:
+      results.add errCode(EcNotDirectory)
+      return ""
+    elif isDir and (wantWrite or trunc):
+      results.add errCode(EcIsDirectory)
+      return ""
+    elif trunc and not isDir:
+      if not writeAll(p, ""):
+        results.add errCode(EcIo)
+        return ""
+    let isD = there and isDir
+    let rep = newDesc(fs, FsDesc(path: p, isDir: isD, writable: fs.descs[d].writable, plugin: fs.descs[d].plugin))
+    results.add okVal(vInt(int64(rep)))
+
+  witFn(r, IfFsTypes, "[method]descriptor.read-via-stream"):
+    let d = int(args[0].i)
+    if not validDesc(fs, d): return "wasi:filesystem: bad descriptor"
+    if fs.descs[d].isDir:
+      results.add errCode(EcIsDirectory)
+      return ""
+    fs.streams.add FsStream(path: fs.descs[d].path, offset: args[1].i, isInput: true)
+    results.add okVal(vInt(int64(FsStreamBase + fs.streams.len - 1)))
+  witFn(r, IfFsTypes, "[method]descriptor.write-via-stream"):
+    let d = int(args[0].i)
+    if not validDesc(fs, d): return "wasi:filesystem: bad descriptor"
+    if fs.descs[d].isDir:
+      results.add errCode(EcIsDirectory)
+      return ""
+    if not fs.descs[d].writable:
+      results.add errCode(EcReadOnly)
+      return ""
+    fs.streams.add FsStream(path: fs.descs[d].path, offset: args[1].i, isInput: false)
+    results.add okVal(vInt(int64(FsStreamBase + fs.streams.len - 1)))
+  witFn(r, IfFsTypes, "[method]descriptor.append-via-stream"):
+    let d = int(args[0].i)
+    if not validDesc(fs, d): return "wasi:filesystem: bad descriptor"
+    if fs.descs[d].isDir:
+      results.add errCode(EcIsDirectory)
+      return ""
+    if not fs.descs[d].writable:
+      results.add errCode(EcReadOnly)
+      return ""
+    fs.streams.add FsStream(path: fs.descs[d].path, offset: 0, isInput: false, append: true)
+    results.add okVal(vInt(int64(FsStreamBase + fs.streams.len - 1)))
+
+  witFn(r, IfFsTypes, "[method]descriptor.read-directory"):
+    let d = int(args[0].i)
+    if not validDesc(fs, d): return "wasi:filesystem: bad descriptor"
+    if not fs.descs[d].isDir:
+      results.add errCode(EcNotDirectory)
+      return ""
+    var ents: seq[(int, string)] = @[]
+    try:
+      for kind, entry in walkDir(path(fs.descs[d].path), relative = true):
+        let ty = (if kind == pcDir: TyDirectory else: TyRegularFile)
+        ents.add((ty, $entry))
+    except ErrorCode:
+      results.add errCode(EcIo)
+      return ""
+    fs.dirs.add FsDirStream(entries: ents, pos: 0)
+    results.add okVal(vInt(int64(fs.dirs.len - 1)))
+  witFn(r, IfFsTypes, "[method]directory-entry-stream.read-directory-entry"):
+    let s = int(args[0].i)
+    if s < 0 or s >= fs.dirs.len: return "wasi:filesystem: bad directory-entry-stream"
+    if fs.dirs[s].pos >= fs.dirs[s].entries.len:
+      results.add okVal(vNone())
+      return ""
+    let e = fs.dirs[s].entries[fs.dirs[s].pos]
+    inc fs.dirs[s].pos
+    results.add okVal(vSome(vRecord(@[vInt(int64(e[0])), vStr(e[1])])))
+
+  witFn(r, IfFsTypes, "[method]descriptor.create-directory-at"):
+    let d = int(args[0].i)
+    if not validDesc(fs, d): return "wasi:filesystem: bad descriptor"
+    let rel = args[1].s
+    if not safeRelative(rel):
+      results.add errCode(EcNotPermitted)
+      return ""
+    if not fs.descs[d].writable:
+      results.add errCode(EcReadOnly)
+      return ""
+    let p = joinPath(fs.descs[d].path, rel)
+    var isDir = false
+    if exists(p, isDir):
+      results.add errCode(EcExist)
+      return ""
+    let st = tryCreateFinalDir(path(p))
+    results.add (if st == Success: okUnit() else: errCode(EcNoEntry))
+  witFn(r, IfFsTypes, "[method]descriptor.remove-directory-at"):
+    let d = int(args[0].i)
+    if not validDesc(fs, d): return "wasi:filesystem: bad descriptor"
+    let rel = args[1].s
+    if not safeRelative(rel) or rel.len == 0 or rel == ".":
+      results.add errCode(EcNotPermitted)
+      return ""
+    if not fs.descs[d].writable:
+      results.add errCode(EcReadOnly)
+      return ""
+    let p = joinPath(fs.descs[d].path, rel)
+    var isDir = false
+    if not exists(p, isDir):
+      results.add errCode(EcNoEntry)
+      return ""
+    if not isDir:
+      results.add errCode(EcNotDirectory)
+      return ""
+    let st = tryRemoveFinalDir(path(p))
+    results.add (if st == Success: okUnit() else: errCode(EcNotEmpty))
+  witFn(r, IfFsTypes, "[method]descriptor.unlink-file-at"):
+    let d = int(args[0].i)
+    if not validDesc(fs, d): return "wasi:filesystem: bad descriptor"
+    let rel = args[1].s
+    if not safeRelative(rel) or rel.len == 0 or rel == ".":
+      results.add errCode(EcNotPermitted)
+      return ""
+    if not fs.descs[d].writable:
+      results.add errCode(EcReadOnly)
+      return ""
+    let p = joinPath(fs.descs[d].path, rel)
+    var isDir = false
+    if not exists(p, isDir):
+      results.add errCode(EcNoEntry)
+      return ""
+    if isDir:
+      results.add errCode(EcIsDirectory)
+      return ""
+    let st = tryRemoveFile(path(p))
+    results.add (if st == Success: okUnit() else: errCode(EcAccess))
+  witFn(r, IfFsTypes, "[method]descriptor.rename-at"):
+    let d = int(args[0].i)
+    let nd = int(args[2].i)
+    if not validDesc(fs, d) or not validDesc(fs, nd): return "wasi:filesystem: bad descriptor"
+    let oldRel = args[1].s
+    let newRel = args[3].s
+    if not safeRelative(oldRel) or not safeRelative(newRel):
+      results.add errCode(EcNotPermitted)
+      return ""
+    if not fs.descs[d].writable or not fs.descs[nd].writable:
+      results.add errCode(EcReadOnly)
+      return ""
+    let src = joinPath(fs.descs[d].path, oldRel)
+    let dst = joinPath(fs.descs[nd].path, newRel)
+    var isDir = false
+    if not exists(src, isDir):
+      results.add errCode(EcNoEntry)
+      return ""
+    if isDir:
+      results.add errCode(EcInvalid)
+      return ""
+    var data = ""
+    if not readAll(src, data) or not writeAll(dst, data):
+      results.add errCode(EcIo)
+      return ""
+    results.add (if src == dst or tryRemoveFile(path(src)) == Success: okUnit() else: errCode(EcIo))

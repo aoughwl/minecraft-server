@@ -1,0 +1,730 @@
+## The third half of the `player` and `java-player` resources of pumpkin/src/plugin/loader/wasm/wasm_host/wit/v0_1/player.rs
+## (pumpkin-wasm-host-v0_1/src/{player,inventory,advancement,status_effect}.rs of the newer tree for the methods the pinned
+## host lacks): inventory, ender chest and hand items through `item-stack` handles, the `inventory` and `player-inventory`
+## resources, `open-gui`, `open-book`, `set-display-name`, `delete-message-*`, status effects, advancements, ray tracing and
+## projectiles, and the `java-player` methods that have a packet or a field behind them. `installPlayer3` is called by
+## pluginhost.aowl after `installPlayer` (it needs the item-stack and gui state of the `WitExt`).
+##
+## An `item-stack` handle here owns a copy (`ItemStack` is a value in aowlmony; upstream's handle shares the `Arc` of the
+## inventory slot): a plugin that changes a stack it got from `get-inventory-item` writes it back with
+## `set-inventory-item`.
+##
+## A handle's rep: `player-inventory` is the player's entity id; `inventory` is `entityId * 4 + 1` for the main inventory
+## (36 slots) and `+ 2` for the ender chest (27).
+## PARTIAL: pumpkin/src/plugin/loader/wasm/wasm_host/wit/v0_1/player.rs - not done here: `java-player.send-packet` and
+## `show-dialog` (the generated packet and dialog variants are not lowered; `clear-dialog` is), `get-scoreboard` answers the
+## world's scoreboard handle, `launch-projectile` for arrow, splash-potion and trident answers none, the `bedrock-player` resource
+## except `open-form` and `reset-scoreboard` (`as-bedrock` answers none for a Java client).
+import std/[options, strutils, tables]
+import ../wasm/[component, canonabi]
+import "../../data/item_stack/mod"
+import ../../generated/[effect, potion, entity_type]
+import "../../generated/advancement" as advgen
+import ../../inventory/[inventory, player_inventory, screenhandler, genericcontainer]
+import ../../generated/translation
+import ../../protocol/varint
+import ../../protocol/java/client/play/[open_book, delete_chat, resource_pack, game_event]
+import ../../protocol/java/client/play/entity_status as entitystatuspkt
+import ../../util/uuid
+import ../../command/cmdsource
+import ../../util/vector3
+import ../../util/text/text
+import ../../util/math/position
+import ../../server/serverbase
+import ../../server/net/netbase
+import ../../server/net/java/javamod
+import ../../server/entity/entitymod
+import ../../server/entity/player as playermod
+import ../../server/entity/playerextras
+import ../../server/entity/player/advancement as advmod
+import ../../server/entity/player/advancement/trigger
+import ../../server/entity/projectile/[thrown, thrown_items]
+import ../../server/world/worldmod
+import ../../util/javaversion
+import ../pluginhooks
+import witstate, witserver, witstack, witgui, witray, witplayer2, witforms
+
+const
+  IfInventory = "pumpkin:plugin/inventory"
+  MainSize = 36
+  EnderSize = 27
+  ThrowSpeed = 1.5'f32
+  EffectNames = ["speed", "slowness", "haste", "mining-fatigue", "strength", "instant-health", "instant-damage",
+    "jump-boost", "nausea", "regeneration", "resistance", "fire-resistance", "water-breathing", "invisibility",
+    "blindness", "night-vision", "hunger", "weakness", "poison", "wither", "health-boost", "absorption", "saturation",
+    "glowing", "levitation", "luck", "unluck", "slow-falling", "conduit-power", "dolphins-grace", "bad-omen",
+    "hero-of-the-village", "darkness", "trial-omen", "raid-omen", "wind-charged", "weaving", "oozing", "infested"]
+
+proc gone3(): string = "player is gone"
+
+proc bareKey(k: string): string =
+  if k.startsWith("minecraft:"): k[10 ..< k.len] else: k
+
+proc stackOpt(ss: StackState; s: ItemStack): CVal =
+  if s.isEmpty(): vNone() else: vSome(vInt(int64(addStack(ss, s))))
+
+proc stackIn(ss: StackState; v: CVal): ItemStack =
+  ## An `option<item-stack>` argument as a stack (empty for none or a bad handle).
+  if v.i == 0 or not validStack(ss, int(v.items[0].i)): emptyItemStack() else: ss.items[int(v.items[0].i)]
+
+proc cpOf3(p: Player): nil CommandPlayer =
+  result = p.commandPlayer
+  if result == nil:
+    let srv = gLink.server
+    if srv != nil and srv.commandPlayerOf != nil:
+      result = srv.commandPlayerOf(p)
+
+proc effectOfWit(idx: int; res: var StatusEffect): bool =
+  if idx < 0 or idx >= EffectNames.len: return false
+  let e = StatusEffect.fromMinecraftName("minecraft:" & EffectNames[idx].replace("-", "_"))
+  if e.isNone: return false
+  res = e.unsafeGet
+  true
+
+proc witOfEffect(e: StatusEffect): int =
+  let n = bareKey(e.minecraftName).replace("_", "-")
+  result = -1
+  var i = 0
+  while i < EffectNames.len:
+    if EffectNames[i] == n: result = i
+    inc i
+
+proc effectVal(e: Effect): CVal =
+  vRecord(@[vInt(int64(max(0, witOfEffect(e.effectType)))), vInt(int64(e.duration)), vInt(int64(e.amplifier)),
+            vBool(e.ambient), vBool(e.showParticles), vBool(e.showIcon)])
+
+proc slotOf(p: Player; slot: int): ItemStack = inventory.getStack(Inventory(p.inventory), slot)
+
+proc putSlot(p: Player; slot: int; s: ItemStack) =
+  ## `set_stack` and the client sync: the hand slots by `sync_hand_slot`, the others by the player screen's content update.
+  inventory.setStack(Inventory(p.inventory), slot, s)
+  if slot == OffHandSlot or (slot >= 0 and slot < 9): p.syncHandSlot(slot, s)
+  else: p.currentScreenHandler.sendContentUpdates()
+
+proc handSlot(p: Player; hand: int): int =
+  ## WIT `hand`: left is the off hand, right the selected slot.
+  if hand == 0: OffHandSlot else: int(p.inventory.getSelectedSlot())
+
+proc invOf(rep: int): nil Player = playerById(rep div 4)
+proc invKind(rep: int): int = rep mod 4
+
+proc invSize(kind: int): int =
+  if kind == 2: EnderSize else: MainSize
+
+proc invGet(p: Player; kind, slot: int): ItemStack =
+  if slot < 0 or slot >= invSize(kind): return emptyItemStack()
+  if kind == 2: inventory.getStack(Inventory(p.enderChestInventory), slot) else: slotOf(p, slot)
+
+proc invPut(p: Player; kind, slot: int; s: ItemStack) =
+  if slot < 0 or slot >= invSize(kind): return
+  if kind == 2: inventory.setStack(Inventory(p.enderChestInventory), slot, s) else: putSlot(p, slot, s)
+
+proc eyeLook(p: Player): (Vector3[float64], Vector3[float64]) =
+  (getEyePos(playerBase(p)), rotationVector(float64(p.pitch), float64(p.yaw)))
+
+proc advOf(id: string): Option[advgen.Advancement] =
+  result = advgen.Advancement.fromName(id)
+  if result.isNone: result = advgen.Advancement.fromMinecraftName(id)
+
+proc versionName(v: JavaMinecraftVersion): string =
+  ## `jmvV1_21_11` -> `v-1-21-11`
+  let s = $v
+  if s.len > 4 and s.startsWith("jmvV"): "v-" & s[4 ..< s.len].replace("_", "-") else: "unknown"
+
+const EntityStatusCodes = [
+    ("armadillopeek", 64),
+    ("armorstandwobble", 32),
+    ("bodybreak", 65),
+    ("cancelshakewetness", 56),
+    ("chestbreak", 50),
+    ("death", 3),
+    ("dolphinlookingfortreasure", 38),
+    ("drownparticles", 67),
+    ("eatgrass", 10),
+    ("endram", 59),
+    ("feetbreak", 52),
+    ("fireworksexplode", 17),
+    ("fishingrodreelin", 31),
+    ("foxeat", 45),
+    ("fulldebuginfo", 23),
+    ("guardianattacksound", 21),
+    ("headbreak", 49),
+    ("honeyjump", 54),
+    ("honeyslide", 53),
+    ("inlovehearts", 18),
+    ("jump", 1),
+    ("kinetichit", 2),
+    ("legsbreak", 51),
+    ("lovehearts", 12),
+    ("mainhandbreak", 47),
+    ("offerflower", 11),
+    ("offhandbreak", 48),
+    ("permissionleveladmins", 27),
+    ("permissionlevelall", 24),
+    ("permissionlevelgamemasters", 26),
+    ("permissionlevelmoderators", 25),
+    ("permissionlevelowners", 28),
+    ("poof", 60),
+    ("protectedfromdeath", 35),
+    ("ravagerroared", 69),
+    ("ravagerstunned", 39),
+    ("reduceddebuginfo", 22),
+    ("saddlebreak", 68),
+    ("shake", 66),
+    ("shakewetness", 8),
+    ("silverfishmergeanim", 20),
+    ("snifferdiggingsound", 63),
+    ("soniccharge", 62),
+    ("squidanimsynch", 19),
+    ("startattacking", 4),
+    ("startram", 58),
+    ("stopattacking", 5),
+    ("stopofferflower", 34),
+    ("swaphands", 55),
+    ("tamingfailed", 6),
+    ("tamingsucceeded", 7),
+    ("teleport", 46),
+    ("tendrilsshiver", 61),
+    ("tntprime", 70),
+    ("trustingfailed", 40),
+    ("trustingsucceeded", 41),
+    ("useitemcomplete", 9),
+    ("villagerangry", 13),
+    ("villagerhappy", 14),
+    ("villagersweat", 42),
+    ("witchhatmagic", 15),
+    ("zombieconverting", 16)]
+
+proc statusCode(idx: int; t: CmType): int =
+  ## The wire byte of the WIT `entity-status` case `idx`: the generated table has the same names in camelCase (the enum has
+  ## holes, so it is a table of its values here).
+  let want = t.names[idx].replace("-", "")
+  result = 0
+  for e in EntityStatusCodes:
+    if e[0] == want: result = e[1]
+
+proc uuidOf(v: CVal): Uuid = Uuid(hi: cast[uint64](v.items[0].i), lo: cast[uint64](v.items[1].i))
+
+proc installPlayer3*(r: HostRegistry; w: WitState; ss: StackState; gs: GuiState) =
+  # ---- names and chat ----
+  hostFn(r, IfacePlayer, "[method]player.set-display-name"):
+    let p = playerById(int(args[0].i))
+    if p == nil: return gone3()
+    gDisplayNames[p.entityId] = textAt(w, int(args[1].i))
+  hostFn(r, IfacePlayer, "[method]player.delete-message-by-signature"):
+    let p = playerById(int(args[0].i))
+    if p == nil: return gone3()
+    var sig: seq[byte] = @[]
+    for b in args[1].items: sig.add byte(b.i)
+    p.client.writePacketFor(cDeleteChatFromSignature(sig))
+  hostFn(r, IfacePlayer, "[method]player.delete-message-by-id"):
+    let p = playerById(int(args[0].i))
+    if p == nil: return gone3()
+    p.client.writePacketFor(cDeleteChatFromCacheId(int32(args[1].i)))
+  hostFn(r, IfacePlayer, "[method]player.open-book"):
+    let p = playerById(int(args[0].i))
+    if p == nil: return gone3()
+    p.client.writePacketFor(COpenBook(hand: (if args[1].i == 1: 0'i32 else: 1'i32)))
+  hostFn(r, IfacePlayer, "[method]player.teleport-world"):
+    let p = playerById(int(args[0].i))
+    if p == nil: return gone3()
+    let target = worldAt(int(args[1].i))
+    var yaw = p.yaw
+    var pitch = p.pitch
+    if args[3].i != 0: yaw = float32(args[3].items[0].f)
+    if args[4].i != 0: pitch = float32(args[4].items[0].f)
+    if target != nil and target != p.world:
+      worldmod.teleportWorld(target, p, posOf(args[2]), some(yaw), some(pitch))
+    else:
+      playermod.requestTeleport(p, posOf(args[2]), yaw, pitch)
+  # ---- gui ----
+  hostFn(r, IfacePlayer, "[method]player.open-gui"):
+    let p = playerById(int(args[0].i))
+    if p == nil: return gone3()
+    let rep = int(args[1].i)
+    if not validGui(gs, rep): return "invalid gui resource handle"
+    let gui = gs.guis[rep]
+    p.incrementScreenHandlerSyncId()
+    let h = newPluginScreenHandler(p.screenHandlerSyncId, gui.windowType, gui.inventory, gui.allowGrabItems,
+                                   gui.allowPutItems)
+    discard p.openHandledScreenDirect(ScreenHandler(h), gui.title)
+  # ---- items ----
+  hostFn(r, IfacePlayer, "[method]player.get-item-in-hand"):
+    let p = playerById(int(args[0].i))
+    if p == nil: return gone3()
+    results.add stackOpt(ss, slotOf(p, handSlot(p, int(args[1].i))))
+  hostFn(r, IfacePlayer, "[method]player.set-item-in-hand"):
+    let p = playerById(int(args[0].i))
+    if p == nil: return gone3()
+    putSlot(p, handSlot(p, int(args[1].i)), stackIn(ss, args[2]))
+  hostFn(r, IfacePlayer, "[method]player.get-inventory-item"):
+    let p = playerById(int(args[0].i))
+    if p == nil: return gone3()
+    results.add stackOpt(ss, invGet(p, 1, int(args[1].i)))
+  hostFn(r, IfacePlayer, "[method]player.set-inventory-item"):
+    let p = playerById(int(args[0].i))
+    if p == nil: return gone3()
+    invPut(p, 1, int(args[1].i), stackIn(ss, args[2]))
+  hostFn(r, IfacePlayer, "[method]player.get-ender-chest-item"):
+    let p = playerById(int(args[0].i))
+    if p == nil: return gone3()
+    results.add stackOpt(ss, invGet(p, 2, int(args[1].i)))
+  hostFn(r, IfacePlayer, "[method]player.set-ender-chest-item"):
+    let p = playerById(int(args[0].i))
+    if p == nil: return gone3()
+    invPut(p, 2, int(args[1].i), stackIn(ss, args[2]))
+  hostFn(r, IfacePlayer, "[method]player.clear-ender-chest"):
+    let p = playerById(int(args[0].i))
+    if p == nil: return gone3()
+    inventory.clear(Inventory(p.enderChestInventory))
+  hostFn(r, IfacePlayer, "[method]player.get-inventory"):
+    results.add vInt(args[0].i)
+  hostFn(r, IfacePlayer, "[method]player.get-ender-chest"):
+    results.add vInt(args[0].i * 4 + 2)
+  hostFn(r, IfacePlayer, "[method]player.open-ender-chest"):
+    let p = playerById(int(args[0].i))
+    if p == nil: return gone3()
+    # `EnderChestScreenFactory`
+    p.incrementScreenHandlerSyncId()
+    let h = createGeneric9x3(p.screenHandlerSyncId, p.inventory, Inventory(p.enderChestInventory))
+    discard p.openHandledScreenDirect(ScreenHandler(h), translateCross(JAVA_CONTAINER_ENDERCHEST, BEDROCK_CONTAINER_ENDERCHEST))
+  # ---- the inventory resources ----
+  hostFn(r, IfInventory, "[method]player-inventory.as-inventory"):
+    results.add vInt(args[0].i * 4 + 1)
+  hostFn(r, IfInventory, "[method]player-inventory.get-item-in-hand"):
+    let p = playerById(int(args[0].i))
+    if p == nil: return gone3()
+    results.add stackOpt(ss, slotOf(p, handSlot(p, int(args[1].i))))
+  hostFn(r, IfInventory, "[method]player-inventory.set-item-in-hand"):
+    let p = playerById(int(args[0].i))
+    if p == nil: return gone3()
+    putSlot(p, handSlot(p, int(args[1].i)), stackIn(ss, args[2]))
+  hostFn(r, IfInventory, "[method]player-inventory.get-selected-slot"):
+    let p = playerById(int(args[0].i))
+    if p == nil: return gone3()
+    results.add vInt(int64(p.inventory.getSelectedSlot()))
+  hostFn(r, IfInventory, "[method]player-inventory.set-selected-slot"):
+    let p = playerById(int(args[0].i))
+    if p == nil: return gone3()
+    if args[1].i >= 0 and args[1].i < 9: p.inventory.setSelectedSlot(uint8(args[1].i))
+  # armor and off hand: helmet 39, chestplate 38, leggings 37, boots 36, off hand 40
+  hostFn(r, IfInventory, "[method]player-inventory.get-helmet"):
+    let p = playerById(int(args[0].i))
+    if p == nil: return gone3()
+    results.add stackOpt(ss, slotOf(p, 39))
+  hostFn(r, IfInventory, "[method]player-inventory.set-helmet"):
+    let p = playerById(int(args[0].i))
+    if p == nil: return gone3()
+    putSlot(p, 39, stackIn(ss, args[1]))
+  hostFn(r, IfInventory, "[method]player-inventory.get-chestplate"):
+    let p = playerById(int(args[0].i))
+    if p == nil: return gone3()
+    results.add stackOpt(ss, slotOf(p, 38))
+  hostFn(r, IfInventory, "[method]player-inventory.set-chestplate"):
+    let p = playerById(int(args[0].i))
+    if p == nil: return gone3()
+    putSlot(p, 38, stackIn(ss, args[1]))
+  hostFn(r, IfInventory, "[method]player-inventory.get-leggings"):
+    let p = playerById(int(args[0].i))
+    if p == nil: return gone3()
+    results.add stackOpt(ss, slotOf(p, 37))
+  hostFn(r, IfInventory, "[method]player-inventory.set-leggings"):
+    let p = playerById(int(args[0].i))
+    if p == nil: return gone3()
+    putSlot(p, 37, stackIn(ss, args[1]))
+  hostFn(r, IfInventory, "[method]player-inventory.get-boots"):
+    let p = playerById(int(args[0].i))
+    if p == nil: return gone3()
+    results.add stackOpt(ss, slotOf(p, 36))
+  hostFn(r, IfInventory, "[method]player-inventory.set-boots"):
+    let p = playerById(int(args[0].i))
+    if p == nil: return gone3()
+    putSlot(p, 36, stackIn(ss, args[1]))
+  hostFn(r, IfInventory, "[method]player-inventory.get-off-hand"):
+    let p = playerById(int(args[0].i))
+    if p == nil: return gone3()
+    results.add stackOpt(ss, slotOf(p, 40))
+  hostFn(r, IfInventory, "[method]player-inventory.set-off-hand"):
+    let p = playerById(int(args[0].i))
+    if p == nil: return gone3()
+    putSlot(p, 40, stackIn(ss, args[1]))
+  hostFn(r, IfInventory, "[method]player-inventory.clear-armor"):
+    let p = playerById(int(args[0].i))
+    if p == nil: return gone3()
+    for sl in [39, 38, 37, 36]: putSlot(p, sl, emptyItemStack())
+  hostFn(r, IfInventory, "[method]player-inventory.clear-main"):
+    let p = playerById(int(args[0].i))
+    if p == nil: return gone3()
+    for sl in 0 ..< MainSize: putSlot(p, sl, emptyItemStack())
+  hostFn(r, IfInventory, "[method]player-inventory.clear-all"):
+    let p = playerById(int(args[0].i))
+    if p == nil: return gone3()
+    for sl in 0 ..< MainSize: putSlot(p, sl, emptyItemStack())
+    for sl in [39, 38, 37, 36, 40]: putSlot(p, sl, emptyItemStack())
+  hostFn(r, IfInventory, "[method]inventory.get-size"):
+    results.add vInt(int64(invSize(invKind(int(args[0].i)))))
+  hostFn(r, IfInventory, "[method]inventory.is-empty"):
+    let rep = int(args[0].i)
+    let p = invOf(rep)
+    if p == nil: return gone3()
+    var empty = true
+    for sl in 0 ..< invSize(invKind(rep)):
+      if not invGet(p, invKind(rep), sl).isEmpty(): empty = false
+    results.add vBool(empty)
+  hostFn(r, IfInventory, "[method]inventory.get-item"):
+    let rep = int(args[0].i)
+    let p = invOf(rep)
+    if p == nil: return gone3()
+    results.add stackOpt(ss, invGet(p, invKind(rep), int(args[1].i)))
+  hostFn(r, IfInventory, "[method]inventory.set-item"):
+    let rep = int(args[0].i)
+    let p = invOf(rep)
+    if p == nil: return gone3()
+    invPut(p, invKind(rep), int(args[1].i), stackIn(ss, args[2]))
+  hostFn(r, IfInventory, "[method]inventory.remove-item"):
+    let rep = int(args[0].i)
+    let p = invOf(rep)
+    if p == nil: return gone3()
+    let old = invGet(p, invKind(rep), int(args[1].i))
+    invPut(p, invKind(rep), int(args[1].i), emptyItemStack())
+    results.add stackOpt(ss, old)
+  hostFn(r, IfInventory, "[method]inventory.clear"):
+    let rep = int(args[0].i)
+    let p = invOf(rep)
+    if p == nil: return gone3()
+    for sl in 0 ..< invSize(invKind(rep)): invPut(p, invKind(rep), sl, emptyItemStack())
+  hostFn(r, IfInventory, "[method]inventory.get-all-items"):
+    let rep = int(args[0].i)
+    let p = invOf(rep)
+    if p == nil: return gone3()
+    var l: seq[CVal] = @[]
+    for sl in 0 ..< invSize(invKind(rep)): l.add stackOpt(ss, invGet(p, invKind(rep), sl))
+    results.add vList(l)
+  hostFn(r, IfInventory, "[method]inventory.set-all-items"):
+    let rep = int(args[0].i)
+    let p = invOf(rep)
+    if p == nil: return gone3()
+    var sl = 0
+    while sl < args[1].items.len and sl < invSize(invKind(rep)):
+      invPut(p, invKind(rep), sl, stackIn(ss, args[1].items[sl]))
+      inc sl
+  hostFn(r, IfInventory, "[method]inventory.count-item"):
+    let rep = int(args[0].i)
+    let p = invOf(rep)
+    if p == nil: return gone3()
+    var total = 0
+    for sl in 0 ..< invSize(invKind(rep)):
+      let s = invGet(p, invKind(rep), sl)
+      if not s.isEmpty() and bareKey(s.item.registryKey) == bareKey(args[1].s): total += int(s.itemCount)
+    results.add vInt(int64(total))
+  hostFn(r, IfInventory, "[method]inventory.contains-item"):
+    let rep = int(args[0].i)
+    let p = invOf(rep)
+    if p == nil: return gone3()
+    var found = false
+    for sl in 0 ..< invSize(invKind(rep)):
+      let s = invGet(p, invKind(rep), sl)
+      if not s.isEmpty() and bareKey(s.item.registryKey) == bareKey(args[1].s): found = true
+    results.add vBool(found)
+  # ---- status effects ----
+  hostFn(r, IfacePlayer, "[method]player.add-effect"):
+    let p = playerById(int(args[0].i))
+    if p == nil: return gone3()
+    var et = gStatusEffects[0]
+    if not effectOfWit(int(args[1].items[0].i), et): return "unknown status effect"
+    let eb = entityById(int(p.entityId))
+    if eb == nil or eb.living == nil: return gone3()
+    mustLiving(eb).addEffect(Effect(effectType: et, duration: int32(args[1].items[1].i), amplifier: uint8(args[1].items[2].i),
+      ambient: args[1].items[3].i != 0, showParticles: args[1].items[4].i != 0, showIcon: args[1].items[5].i != 0, blend: false))
+  hostFn(r, IfacePlayer, "[method]player.remove-effect"):
+    let p = playerById(int(args[0].i))
+    if p == nil: return gone3()
+    var et = gStatusEffects[0]
+    if not effectOfWit(int(args[1].i), et): return "unknown status effect"
+    let eb = entityById(int(p.entityId))
+    if eb == nil or eb.living == nil: return gone3()
+    discard mustLiving(eb).removeEffect(et)
+  hostFn(r, IfacePlayer, "[method]player.clear-effects"):
+    let p = playerById(int(args[0].i))
+    if p == nil: return gone3()
+    let eb = entityById(int(p.entityId))
+    if eb == nil or eb.living == nil: return gone3()
+    var kinds: seq[StatusEffect] = @[]
+    for e in mustLiving(eb).activeEffects: kinds.add e.effectType
+    for k in kinds: discard mustLiving(eb).removeEffect(k)
+  hostFn(r, IfacePlayer, "[method]player.has-effect"):
+    let p = playerById(int(args[0].i))
+    if p == nil: return gone3()
+    var et = gStatusEffects[0]
+    if not effectOfWit(int(args[1].i), et): return "unknown status effect"
+    let eb = entityById(int(p.entityId))
+    if eb == nil or eb.living == nil: return gone3()
+    results.add vBool(mustLiving(eb).hasEffect(et))
+  hostFn(r, IfacePlayer, "[method]player.get-effect"):
+    let p = playerById(int(args[0].i))
+    if p == nil: return gone3()
+    var et = gStatusEffects[0]
+    if not effectOfWit(int(args[1].i), et): return "unknown status effect"
+    let eb = entityById(int(p.entityId))
+    if eb == nil or eb.living == nil: return gone3()
+    let e = mustLiving(eb).getEffect(et)
+    if e.isSome: results.add vSome(effectVal(e.unsafeGet)) else: results.add vNone()
+  hostFn(r, IfacePlayer, "[method]player.get-active-effects"):
+    let p = playerById(int(args[0].i))
+    if p == nil: return gone3()
+    let eb = entityById(int(p.entityId))
+    if eb == nil or eb.living == nil: return gone3()
+    var l: seq[CVal] = @[]
+    for e in mustLiving(eb).activeEffects: l.add effectVal(e)
+    results.add vList(l)
+  # ---- advancements ----
+  hostFn(r, IfacePlayer, "[method]player.has-advancement"):
+    let p = playerById(int(args[0].i))
+    if p == nil: return gone3()
+    let adv = advOf(args[1].s)
+    let ta = p.advancements
+    var yes = false
+    if ta != nil:
+      if adv.isSome: yes = ta.hasAdvancement(adv.unsafeGet)
+    results.add vBool(yes)
+  hostFn(r, IfacePlayer, "[method]player.get-advancement-progress"):
+    let p = playerById(int(args[0].i))
+    if p == nil: return gone3()
+    let adv = advOf(args[1].s)
+    let ta = p.advancements
+    var answer = vNone()
+    if ta != nil:
+      if adv.isSome:
+        let pa = ta.advancements
+        let pr = pa.progress.getMutOrStartProgress(adv.unsafeGet)
+        var done: seq[CVal] = @[]
+        var left: seq[CVal] = @[]
+        for c in pr.getCompletedCriteria(): done.add vStr(c)
+        for c in pr.getRemainingCriteria(): left.add vStr(c)
+        answer = vSome(vRecord(@[vStr($adv.unsafeGet), vBool(pr.isDone()), vList(done), vList(left)]))
+    results.add answer
+  hostFn(r, IfacePlayer, "[method]player.award-advancement-criterion"):
+    let p = playerById(int(args[0].i))
+    if p == nil: return gone3()
+    let adv = advOf(args[1].s)
+    let ta = p.advancements
+    var yes = false
+    if ta != nil:
+      if adv.isSome: yes = ta.advancements.award(adv.unsafeGet, args[2].s)
+    results.add vBool(yes)
+  hostFn(r, IfacePlayer, "[method]player.revoke-advancement-criterion"):
+    let p = playerById(int(args[0].i))
+    if p == nil: return gone3()
+    let adv = advOf(args[1].s)
+    let ta = p.advancements
+    var yes = false
+    if ta != nil:
+      if adv.isSome: yes = ta.advancements.revoke(adv.unsafeGet, args[2].s)
+    results.add vBool(yes)
+  hostFn(r, IfacePlayer, "[method]player.award-advancement"):
+    let p = playerById(int(args[0].i))
+    if p == nil: return gone3()
+    let adv = advOf(args[1].s)
+    let ta = p.advancements
+    var any = false
+    if ta != nil:
+      if adv.isSome:
+        let pa = ta.advancements
+        for c in pa.progress.getMutOrStartProgress(adv.unsafeGet).getRemainingCriteria():
+          if pa.award(adv.unsafeGet, c): any = true
+    results.add vBool(any)
+  hostFn(r, IfacePlayer, "[method]player.revoke-advancement"):
+    let p = playerById(int(args[0].i))
+    if p == nil: return gone3()
+    let adv = advOf(args[1].s)
+    let ta = p.advancements
+    var any = false
+    if ta != nil:
+      if adv.isSome:
+        let pa = ta.advancements
+        for c in pa.progress.getMutOrStartProgress(adv.unsafeGet).getCompletedCriteria():
+          if pa.revoke(adv.unsafeGet, c): any = true
+    results.add vBool(any)
+  hostFn(r, IfacePlayer, "[method]player.get-completed-advancements"):
+    let p = playerById(int(args[0].i))
+    if p == nil: return gone3()
+    let ta = p.advancements
+    var l: seq[CVal] = @[]
+    if ta != nil:
+      let pa = ta.advancements
+      var i = 0
+      while i < pa.progress.keys.len:
+        if pa.progress.values[i].isDone(): l.add vStr($pa.progress.keys[i])
+        inc i
+    results.add vList(l)
+  hostFn(r, IfacePlayer, "[method]player.get-selected-advancement-tab"):
+    let p = playerById(int(args[0].i))
+    if p == nil: return gone3()
+    let ta = p.advancements
+    var answer = vNone()
+    if ta != nil:
+      let pa = ta.advancements
+      if pa.lastSelectedTab.isSome: answer = vSome(vStr($pa.lastSelectedTab.unsafeGet))
+    results.add answer
+  hostFn(r, IfacePlayer, "[method]player.set-selected-advancement-tab"):
+    let p = playerById(int(args[0].i))
+    if p == nil: return gone3()
+    let ta = p.advancements
+    if ta != nil:
+      let pa = ta.advancements
+      if args[1].i != 0: pa.setSelectedTab(advOf(args[1].items[0].s))
+      else: pa.setSelectedTab(none[advgen.Advancement]())
+  # ---- ray tracing and projectiles ----
+  hostFn(r, IfacePlayer, "[method]player.ray-trace-block"):
+    let p = playerById(int(args[0].i))
+    if p == nil: return gone3()
+    let (eye, look) = eyeLook(p)
+    let h = traceBlock(p.world, eye, look, args[1].f, args[2].i != 0)
+    if h.found: results.add vSome(vRecord(@[blockPosVal(h.pos), vInt(int64(faceIndex(h.face))), vPos(h.hit)]))
+    else: results.add vNone()
+  hostFn(r, IfacePlayer, "[method]player.get-target-block-exact"):
+    let p = playerById(int(args[0].i))
+    if p == nil: return gone3()
+    let (eye, look) = eyeLook(p)
+    let h = traceBlock(p.world, eye, look, args[1].f, args[2].i != 0)
+    if h.found: results.add vSome(vRecord(@[blockPosVal(h.pos), vInt(int64(faceIndex(h.face))), vPos(h.hit)]))
+    else: results.add vNone()
+  hostFn(r, IfacePlayer, "[method]player.get-target-block"):
+    let p = playerById(int(args[0].i))
+    if p == nil: return gone3()
+    let (eye, look) = eyeLook(p)
+    let h = traceBlock(p.world, eye, look, float64(args[1].i), false)
+    if h.found:
+      results.add vSome(vPos(Vector3[float64](x: float64(h.pos.vec.x), y: float64(h.pos.vec.y), z: float64(h.pos.vec.z))))
+    else: results.add vNone()
+  hostFn(r, IfacePlayer, "[method]player.ray-trace-entity"):
+    let p = playerById(int(args[0].i))
+    if p == nil: return gone3()
+    let (eye, look) = eyeLook(p)
+    let h = traceEntity(p.world, playerBase(p), eye, look, args[1].f)
+    let he = h.entity
+    if he != nil: results.add vSome(vRecord(@[vInt(int64(he.entity.entityId)), vPos(h.hit), vFloat(h.distance)]))
+    else: results.add vNone()
+  hostFn(r, IfacePlayer, "[method]player.get-target-entity"):
+    let p = playerById(int(args[0].i))
+    if p == nil: return gone3()
+    let (eye, look) = eyeLook(p)
+    let h = traceEntity(p.world, playerBase(p), eye, look, args[1].f)
+    let he = h.entity
+    if he != nil: results.add vSome(vInt(int64(he.entity.entityId)))
+    else: results.add vNone()
+  hostFn(r, IfacePlayer, "[method]player.launch-projectile"):
+    let p = playerById(int(args[0].i))
+    if p == nil: return gone3()
+    let shooter = playerBase(p).entity
+    let world = p.world
+    var spawned: nil EntityBase = nil
+    # projectile-type: arrow, snowball, egg, ender-pearl, splash-potion, fireball, small-fireball, trident, wind-charge
+    case int(args[1].i)
+    of 1:
+      let sb = newSnowballShot(newEntity(world, p.pos, EntityType.SNOWBALL), shooter)
+      sb.setVelocityFrom(shooter, p.pitch, p.yaw, 0.0'f32, ThrowSpeed, 1.0'f32)
+      spawned = projectileBase(sb)
+    of 2:
+      let egg = newEggShot(newEntity(world, p.pos, EntityType.EGG), shooter)
+      egg.setVelocityFrom(shooter, p.pitch, p.yaw, 0.0'f32, ThrowSpeed, 1.0'f32)
+      spawned = projectileBase(egg)
+    of 3:
+      let pearl = newEnderPearlShot(newEntity(world, p.pos, EntityType.ENDER_PEARL), shooter)
+      pearl.setVelocityFrom(shooter, p.pitch, p.yaw, 0.0'f32, ThrowSpeed, 1.0'f32)
+      spawned = projectileBase(pearl)
+    of 5:
+      let fb = newFireballShot(newEntity(world, p.pos, EntityType.FIREBALL), shooter)
+      fb.setVelocityFrom(shooter, p.pitch, p.yaw, 0.0'f32, ThrowSpeed, 1.0'f32)
+      spawned = projectileBase(fb)
+    of 6:
+      let fb = newSmallFireballShot(newEntity(world, p.pos, EntityType.SMALL_FIREBALL), shooter)
+      fb.setVelocityFrom(shooter, p.pitch, p.yaw, 0.0'f32, ThrowSpeed, 1.0'f32)
+      spawned = projectileBase(fb)
+    of 8:
+      let wc = newWindChargeShot(newEntity(world, p.pos, EntityType.WIND_CHARGE), shooter)
+      wc.setVelocityFrom(shooter, p.pitch, p.yaw, 0.0'f32, ThrowSpeed, 1.0'f32)
+      spawned = projectileBase(wc)
+    else: discard
+    if spawned == nil:
+      results.add vNone()
+    else:
+      spawnEntity(world, spawned)
+      results.add vSome(vInt(int64(spawned.entity.entityId)))
+  # ---- bedrock-player (a Bedrock client is a `Player` with a ghost Java client; its session is bedrockplay.aowl's) ----
+  hostFn(r, IfacePlayer, "[method]player.as-bedrock"):
+    let p = playerById(int(args[0].i))
+    if p == nil: return gone3()
+    # `gPluginBedrockSessionHook` answers whether the player is on Bedrock
+    if gPluginBedrockSessionHook(p): results.add vSome(vInt(args[0].i))
+    else: results.add vNone()
+  hostFn(r, IfacePlayer, "[method]bedrock-player.open-form"):
+    # `send_form`: the form as the JSON of witforms.aowl, the id the response event (`bedrock-form-response-event`) carries.
+    let p = playerById(int(args[0].i))
+    if p == nil: return gone3()
+    results.add vInt(int64(gPluginBedrockFormHook(p, serializeForm(w, args[1]))))
+  hostFn(r, IfacePlayer, "[method]bedrock-player.reset-scoreboard"):
+    let p = playerById(int(args[0].i))
+    if p == nil: return gone3()
+  # ---- java-player ----
+  hostFn(r, IfacePlayer, "[method]java-player.get-version"):
+    let p = playerById(int(args[0].i))
+    if p == nil: return gone3()
+    results.add vInt(int64(enumIndex(resultTy(ci), versionName(p.client.version))))
+  hostFn(r, IfacePlayer, "[method]java-player.get-brand"):
+    let p = playerById(int(args[0].i))
+    if p == nil: return gone3()
+    results.add vStr(if p.client.brand.isSome: p.client.brand.unsafeGet else: "")
+  hostFn(r, IfacePlayer, "[method]java-player.get-server-address"):
+    let p = playerById(int(args[0].i))
+    if p == nil: return gone3()
+    results.add vStr(p.client.serverAddress)
+  hostFn(r, IfacePlayer, "[method]java-player.get-settings"):
+    let p = playerById(int(args[0].i))
+    if p == nil: return gone3()
+    let c = p.config
+    results.add vRecord(@[vStr(c.locale), vInt(int64(c.viewDistance)), vInt(int64(ord(c.chatMode))), vBool(c.chatColors),
+      vInt(int64(c.skinParts and 0x7F'u8)), vInt(int64(ord(c.mainHand))), vBool(c.textFiltering), vBool(c.serverListing)])
+  hostFn(r, IfacePlayer, "[method]java-player.send-custom-payload"):
+    let p = playerById(int(args[0].i))
+    if p == nil: return gone3()
+    var data: seq[byte] = @[]
+    for b in args[2].items: data.add byte(b.i)
+    p.sendCustomPayload(args[1].s, data)
+  hostFn(r, IfacePlayer, "[method]java-player.send-game-event"):
+    let p = playerById(int(args[0].i))
+    if p == nil: return gone3()
+    p.client.writePacketFor(CGameEvent(event: uint8(args[1].i), value: float32(args[2].f)))
+  hostFn(r, IfacePlayer, "[method]java-player.send-entity-status"):
+    let p = playerById(int(args[0].i))
+    if p == nil: return gone3()
+    p.client.writePacketFor(CEntityStatus(entityId: int32(args[1].i), entityStatus: int8(statusCode(int(args[2].i), paramTy(ci, 2)))))
+  hostFn(r, IfacePlayer, "[method]java-player.send-resource-pack"):
+    let p = playerById(int(args[0].i))
+    if p == nil: return gone3()
+    # java-resource-pack { id: uuid, url, hash, forced, prompt: option<text-component> }
+    let rp = args[1]
+    var prompt = none[TextComponent]()
+    if rp.items[4].i != 0: prompt = some(textAt(w, int(rp.items[4].items[0].i)))
+    p.client.writePacketFor(CPlayResourcePackPush(uuid: uuidOf(rp.items[0]), url: rp.items[1].s, hash: rp.items[2].s,
+      forced: rp.items[3].i != 0, promptMessage: prompt))
+  hostFn(r, IfacePlayer, "[method]java-player.remove-resource-pack"):
+    let p = playerById(int(args[0].i))
+    if p == nil: return gone3()
+    p.client.writePacketFor(CPlayResourcePackPop(uuid: some(uuidOf(args[1]))))
+  hostFn(r, IfacePlayer, "[method]java-player.clear-resource-packs"):
+    let p = playerById(int(args[0].i))
+    if p == nil: return gone3()
+    p.client.writePacketFor(CPlayResourcePackPop(uuid: none[Uuid]()))
+  hostFn(r, IfacePlayer, "[method]java-player.clear-dialog"):
+    let p = playerById(int(args[0].i))
+    if p == nil: return gone3()
+    let cp = cpOf3(p)
+    if cp != nil and cp.clearDialog != nil: cp.clearDialog()
+  hostFn(r, IfacePlayer, "[method]java-player.reset-scoreboard"):
+    let p = playerById(int(args[0].i))
+    if p == nil: return gone3()
+  hostFn(r, IfacePlayer, "[method]java-player.get-scoreboard"):
+    let p = playerById(int(args[0].i))
+    if p == nil: return gone3()
+    results.add vInt(int64(worldRep(p.world)))

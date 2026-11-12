@@ -139,3 +139,43 @@ loader in a scratch folder, handler order, the context), `wit/witasm` (hand asse
 registry), `wit/witexttest` (item-stack, gui, recipe, scoreboard, block-entity and forms through the registry),
 `src/server/command/plugintest` (`/plugin`). Over the wire: `python tools/mcbot.py --plugmgr --op` (tools/mcbot_plugmgr.py)
 loads, unloads and reloads plugins on a running server.
+
+## Signatures and the filesystem (phase 4)
+
+    src/plugin/ed25519.aowl            Ed25519 (RFC 8032) over the jwt package's BigInt and SHA-512: public key, sign, verify
+    src/plugin/ed25519test.aowl        SHA-512 known answers and RFC 8032 section 7.1 tests 1 and 2 (public key, signature, verify,
+                                       tampered message / signature / key rejected); about one second per scalar multiplication
+    src/plugin/signature.aowl          now verifies for real; `KeyManager`, `injectPumpkinSections` (serde field order) sign
+    src/plugin/wit/witfs.aowl          wasi:filesystem: the `data` preopen (`fs.read.data` / `fs.write.data`), descriptors, open-at,
+                                       read / write / append streams, stat, directories, mkdir, rmdir, unlink, rename (files)
+
+`pluginhost.preparePlugin` calls `verifyWasmPlugin` as `WasmPluginLoader::load` does: an unsigned plugin or a failed signature
+logs a warning, loading goes on. `witwasitest` runs the filesystem through the registry against a scratch folder.
+
+## Player and entity host interfaces, part A (phase 5)
+
+    src/plugin/wit/witplayer3.aowl       player: set-display-name (plugin-side), delete-message-by-id / -by-signature (CDeleteChat), open-book
+                                         (COpenBook), teleport-world, open-gui (PluginScreenHandler through openHandledScreenDirect), item in hand,
+                                         inventory / ender chest slots through item-stack handles, the `inventory` and `player-inventory`
+                                         resources, open-ender-chest, status effects (add, remove, clear, has, get, list), advancements (award,
+                                         revoke, progress, completed, selected tab), ray-trace-block / -entity, get-target-*, launch-projectile
+                                         (snowball, egg, ender pearl, fireball, small fireball, wind charge), bedrock-player open-form (witforms JSON, `sendBedrockForm`; the answer arrives as
+                                         bedrock-form-response-event), java-player get-version / brand /
+                                         server-address / settings, send-custom-payload, send-game-event, send-entity-status, resource packs, clear-dialog
+    src/plugin/wit/witentity3.aowl       entity: air, set-vehicle, custom data (plugin-side), raycast and ray traces; living-entity: max health,
+                                         attributes, equipment; the `mob` resource (target, AI switch, navigation, look-at, freeze ticks)
+    src/plugin/wit/witray.aowl           the ray tracing both use (World::raycast for blocks, bounding boxes for entities)
+    src/plugin/wit/witeventsplayer2.aowl the events of `PlayerEvKind` (pluginhooks.aowl) converted to the WIT event variant and fired
+    src/protocol/java/client/play/{open_book,delete_chat,resource_pack}.aowl   the packets those need
+
+`silent` and `has-gravity` are real fields of the server's `Entity` (`silent`, `noGravity`): `Entity.playSound` stays quiet, `getGravity` answers 0, a thrown
+projectile skips its gravity, and the Silent / NoGravity metadata is sent. `item-stack` handles that come out of an inventory own a copy.
+The server calls one hook for the new events, `gPluginPlayerEventHook(player, PlayerEv)`: swing arm and use item (the raycast for the
+interact action is the host's), interact entity, custom payload (dispatch.aowl), client information (main hand), inventory click (play.aowl) and
+close (player.aowl), block break (worldmod.breakBlock, with the should-drop flag read back), drop (player.aowl), pickup (itementity.aowl), sign update,
+bed enter and leave (block/worldhooks.aowl), item consume (entitymod.aowl) and permission check (the `hasPermission` of each CommandPlayer is wrapped by pluginmgr.aowl). The existing
+`gPluginBlockPlaceHook` is filled now.
+
+Tests: `wit/witplayer3test` (every function above through the registry against a real Server and Player, packets read back),
+`wit/witeventsplayer2test` (a hand-assembled plugin cancels a one-item drop and answers permission checks). Over the wire:
+`python tools/mcbot.py --wasm-plugin2 --op` with the plugin written by `witeventsplayer2test --write`.

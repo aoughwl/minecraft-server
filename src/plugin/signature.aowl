@@ -1,14 +1,15 @@
 ## Port of pumpkin/src/plugin/loader/wasm/wasm_host/signature.rs: the `pumpkin.metadata` and `wasm_signature` custom
 ## sections a marketplace plugin carries, their parsing, and the verification flow of `verify_pumpkin_wasm` /
 ## `verify_wasm_plugin` up to the signature check itself.
-## PARTIAL: pumpkin/src/plugin/loader/wasm/wasm_host/signature.rs - no Ed25519 and no SHA-512 exist in this tree, so the
-## final `verifying_key.verify(payload, signature)` goes through `ed25519Verifier`, a hook that is unset by default (`hasEd25519Verifier`): a
-## signed plugin then reports `isValid = false` with "Ed25519 verification is not available", never a false "valid".
-## Not ported: `KeyManager` and `inject_pumpkin_sections` (signing; needs Ed25519 signing and a JSON writer with serde's
-## field order), `fetch_market_public_key` (network; `verifyWasmPlugin` takes the key as an argument, empty as upstream's
-## `unwrap_or_default`). The public key of the envelope is what verification uses when there is an envelope, as upstream.
+## `ed25519.aowl` supplies Ed25519 and SHA-512 (RFC 8032 vectors in ed25519test.aowl); `KeyManager` and
+## `injectPumpkinSections` sign with it, with serde_json's field order for the two JSON sections.
+## PARTIAL: pumpkin/src/plugin/loader/wasm/wasm_host/signature.rs - `fetch_market_public_key` (network; `verifyWasmPlugin`
+## takes the key as an argument, empty as upstream's `unwrap_or_default`, and there is no market key cache). Ed25519 here
+## is variable time (about a second per verification), and `inject_pumpkin_sections` re-parses nothing but the sections
+## `stripPumpkinSections` finds. Verification failure text is dalek's `signature error`.
 import std/options
 import ../codecs/json_value
+import ed25519
 
 const
   WasmSignatureSection* = "wasm_signature"
@@ -43,8 +44,8 @@ type
     publicKeyHex*: string
 
 var ed25519Verifier*: proc (publicKey, message, signature: string): bool {.closure.}
-  ## `ed25519_dalek::VerifyingKey::verify`: raw 32-byte key, message, raw 64-byte signature.
-var hasEd25519Verifier* = false   ## set it with `ed25519Verifier`; false: verification is not available
+  ## Test override of `ed25519_dalek::VerifyingKey::verify`: raw 32-byte key, message, raw 64-byte signature.
+var hasEd25519Verifier* = false   ## true: use `ed25519Verifier` instead of ed25519.aowl's `ed25519Verify`
 
 # ---- byte helpers ----------------------------------------------------------------------------
 
@@ -200,6 +201,80 @@ proc parseEnvelope*(raw: string; env: var WasmSignatureEnvelope): bool =
   env = e
   true
 
+# ---- signing ------------------------------------------------------------------------------------
+
+type
+  KeyManager* = object
+    seed*: string   ## the 32-byte secret
+
+proc hexEncode*(s: string): string =
+  result = ""
+  const digits = "0123456789abcdef"
+  for c in s:
+    result.add digits[ord(c) shr 4]
+    result.add digits[ord(c) and 15]
+
+proc newKeyManager*(secretHex: string): KeyManager =
+  ## `KeyManager::new`: a secret that is not 32 hex-decoded bytes leaves the all-zero seed, as upstream.
+  var ok = false
+  let d = hexDecode(secretHex, ok)
+  if ok and d.len == 32: KeyManager(seed: d)
+  else: KeyManager(seed: newString(32))
+
+proc publicKeyHex*(k: KeyManager): string = hexEncode(ed25519PublicKey(k.seed))
+proc sign*(k: KeyManager; data: string): string = ed25519Sign(k.seed, data)
+
+proc toJson*(m: PumpkinMetadata): string =
+  ## `serde_json::to_vec(meta)`: fields in declaration order, `license_key` as null when absent.
+  # json_value objects keep keys sorted, so write the text by hand to keep serde's order
+  result = "{\"marketplace_url\":"
+  result.addEscaped(m.marketplaceUrl)
+  result.add ",\"plugin_id\":" & $m.pluginId & ",\"plugin_name\":"
+  result.addEscaped(m.pluginName)
+  result.add ",\"version\":"
+  result.addEscaped(m.version)
+  result.add ",\"dev_id\":" & $m.devId & ",\"dev_name\":"
+  result.addEscaped(m.devName)
+  result.add ",\"is_paid\":" & (if m.isPaid: "true" else: "false") & ",\"user_id\":" & $m.userId & ",\"license_key\":"
+  if m.licenseKey.isSome: result.addEscaped(m.licenseKey.get())
+  else: result.add "null"
+  result.add ",\"issued_at\":"
+  result.addEscaped(m.issuedAt)
+  result.add "}"
+
+proc toJson*(e: WasmSignatureEnvelope): string =
+  result = "{\"version\":" & $int(e.version) & ",\"algorithm\":"
+  result.addEscaped(e.algorithm)
+  result.add ",\"public_key_hex\":"
+  result.addEscaped(e.publicKeyHex)
+  result.add ",\"signature_hex\":"
+  result.addEscaped(e.signatureHex)
+  result.add "}"
+
+proc encodeLeb128(n: int): string =
+  result = ""
+  var x = n
+  while true:
+    let b = x and 0x7F
+    x = x shr 7
+    if x == 0:
+      result.add char(b)
+      break
+    result.add char(b or 0x80)
+
+proc customSection(name, data: string): string =
+  ## `wasm_encoder::CustomSection::encode`: id 0, size, name length, name, data.
+  let body = encodeLeb128(name.len) & name & data
+  "\0" & encodeLeb128(body.len) & body
+
+proc injectPumpkinSections*(wasm: string; meta: PumpkinMetadata; km: KeyManager): string =
+  ## `inject_pumpkin_sections`: strip, sign `clean || metadata json`, append `pumpkin.metadata` and `wasm_signature`.
+  let clean = stripPumpkinSections(wasm)
+  let metaJson = toJson(meta)
+  let raw = km.sign(clean & metaJson)
+  let env = WasmSignatureEnvelope(version: 1'u8, algorithm: "Ed25519", publicKeyHex: km.publicKeyHex(), signatureHex: hexEncode(raw))
+  result = clean & customSection(PumpkinMetadataSection, metaJson) & customSection(WasmSignatureSection, toJson(env))
+
 # ---- verification --------------------------------------------------------------------------------
 
 proc fail(pub: string; signed: bool; err: string; meta: Option[PumpkinMetadata] = none[PumpkinMetadata]();
@@ -270,10 +345,9 @@ proc verifyPumpkinWasm*(wasm: string; publicKeyHex: string): VerificationResult 
     return fail(targetPub, true, "Invalid Ed25519 public key: expected 32 bytes", some(meta), envOpt)
   if rawSig.len != 64:
     return fail(targetPub, true, "Invalid signature bytes: expected 64 bytes", some(meta), envOpt)
-  if not hasEd25519Verifier:
-    return fail(targetPub, true, "Ed25519 verification is not available", some(meta), envOpt)
-  if not ed25519Verifier(pubBytes, payload, rawSig):
-    return fail(targetPub, true, "Signature verification failed", some(meta), envOpt)
+  let good = (if hasEd25519Verifier: ed25519Verifier(pubBytes, payload, rawSig) else: ed25519Verify(pubBytes, payload, rawSig))
+  if not good:
+    return fail(targetPub, true, "Signature verification failed: signature error", some(meta), envOpt)
   VerificationResult(isValid: true, isSigned: true, error: none[string](), metadata: some(meta), signatureEnvelope: envOpt,
                      publicKeyHex: targetPub)
 

@@ -1,7 +1,7 @@
 ## WASI preview 2 for the plugin host: the part of `wasmtime_wasi::p2::add_to_linker_async` a Rust `std` plugin built for
 ## wasm32-wasip2 imports at start-up and from `println!`, `std::time` and `rand`: wasi:cli (environment, exit, stdin,
 ## stdout, stderr, terminal-*), wasi:io (error, poll, streams), wasi:clocks (monotonic-clock, wall-clock) and
-## wasi:random (random, insecure, insecure-seed), plus the empty wasi:filesystem/preopens.
+## wasi:random (random, insecure, insecure-seed), plus wasi:filesystem (witfs.aowl).
 ## Port of the configuration in pumpkin/src/plugin/loader/wasm/wasm_host/mod.rs (`WasiCtxBuilder`: `inherit_stdout`,
 ## `inherit_stderr`, environment only through the `sys.env` / `sys.env.<KEY>` permissions, a `data` preopen) and of
 ## `setup_linker` (`add_to_linker_async`). The interface list and signatures are the WASI 0.2 WIT, which is not in either
@@ -11,15 +11,14 @@
 ## server's log. `monotonic-clock` is the process monotonic clock plus a skew: a `pollable.block` on a clock deadline does
 ## not sleep the server thread, it moves the skew forward so the deadline has passed (a plugin that sleeps sees the time
 ## pass, the tick loop is not held).
-## PARTIAL: wasmtime_wasi p2 - wasi:filesystem has no preopened directory (the `data` preopen is not provided, so
-## `get-directories` is empty and `descriptor` methods trap as unimplemented host functions); wasi:sockets, wasi:http and
-## `wasi:cli/terminal-*` queries (always "not a terminal") are not provided; stdin is always closed; `exit` traps the
-## plugin call with "wasi exit <code>"; a dropped stream or pollable frees nothing (the tables only grow by one pollable
-## per clock subscription).
+## wasi:filesystem is wit/witfs.aowl (the `data` preopen by `fs.read.data` / `fs.write.data`; see its PARTIAL line).
+## PARTIAL: wasmtime_wasi p2 - wasi:sockets, wasi:http and `wasi:cli/terminal-*` queries (always "not a terminal") are not
+## provided; stdin is always closed; `exit` traps the plugin call with "wasi exit <code>"; a dropped stream or pollable frees
+## nothing (the tables only grow by one pollable per clock subscription).
 import std/[times, monotimes, envvars]
 import ../wasm/[canonabi, component]
 import ../../plugin_api/permissions
-import witstate
+import witstate, witfs
 
 const
   IfEnv = "wasi:cli/environment"
@@ -49,6 +48,7 @@ type
   WasiHost* = ref object
     log*: proc (pluginId: int; isErr: bool; line: string) {.closure.}   ## one complete line of a plugin's stdout / stderr
     permissions*: proc (pluginId: int): seq[string] {.closure.}
+    fs*: FsState                         ## the `data` preopen (witfs.aowl); set `fs.dataFolder` to enable it
     lastExit*: int                       ## the code of the last `wasi:cli/exit` call (-1 before any)
     outBuf: seq[string]                  ## partial lines, 2 per plugin: [id * 2] stdout, [id * 2 + 1] stderr
     polls: seq[int64]                    ## monotonic deadline in ns of each pollable; rep 0 is always ready
@@ -56,7 +56,7 @@ type
     clockFn*: proc (): int64 {.closure.} ## test hook: replaces the monotonic clock source (ns)
 
 proc newWasiHost*(): WasiHost =
-  WasiHost(lastExit: -1, outBuf: @[], polls: @[0'i64], skew: 0)
+  WasiHost(lastExit: -1, outBuf: @[], polls: @[0'i64], skew: 0, fs: newFsState())
 
 proc rawMono(w: WasiHost): int64 =
   if w.clockFn != nil: w.clockFn() else: ticks(getMonoTime())
@@ -127,6 +127,7 @@ proc allowedEnv(w: WasiHost; pluginId: int): seq[(string, string)] =
     if ok: result.add (kv.key, kv.value)
 
 proc streamWrite(w: WasiHost; ci: CompInst; rep: int; data: string): string =
+  if isFsStream(w.fs, rep): return fsStreamWrite(w.fs, rep, data)
   if rep == StdoutRep: writeBytes(w, ci.user, false, data)
   elif rep == StderrRep: writeBytes(w, ci.user, true, data)
   else: return "wasi:io/streams: write on an input stream"
@@ -231,13 +232,27 @@ proc installWasi*(r: HostRegistry; st: WitState; w: WasiHost) =
   witFn(r, IfStreams, "[method]output-stream.subscribe"):
     results.add vInt(0)
   witFn(r, IfStreams, "[method]input-stream.read"):
-    results.add closedErr(ci)
+    var data = ""
+    if isFsStream(w.fs, int(args[0].i)) and fsStreamRead(w.fs, int(args[0].i), args[1].i, data):
+      var items: seq[CVal] = @[]
+      for ch in data: items.add vInt(int64(ord(ch)))
+      results.add okVal(vList(items))
+    else: results.add closedErr(ci)
   witFn(r, IfStreams, "[method]input-stream.blocking-read"):
-    results.add closedErr(ci)
+    var data = ""
+    if isFsStream(w.fs, int(args[0].i)) and fsStreamRead(w.fs, int(args[0].i), args[1].i, data):
+      var items: seq[CVal] = @[]
+      for ch in data: items.add vInt(int64(ord(ch)))
+      results.add okVal(vList(items))
+    else: results.add closedErr(ci)
   witFn(r, IfStreams, "[method]input-stream.skip"):
-    results.add closedErr(ci)
+    var n = 0'i64
+    if isFsStream(w.fs, int(args[0].i)) and fsStreamSkip(w.fs, int(args[0].i), args[1].i, n): results.add okVal(vInt(n))
+    else: results.add closedErr(ci)
   witFn(r, IfStreams, "[method]input-stream.blocking-skip"):
-    results.add closedErr(ci)
+    var n = 0'i64
+    if isFsStream(w.fs, int(args[0].i)) and fsStreamSkip(w.fs, int(args[0].i), args[1].i, n): results.add okVal(vInt(n))
+    else: results.add closedErr(ci)
   witFn(r, IfStreams, "[method]input-stream.subscribe"):
     results.add vInt(0)
   # ---- wasi:io/poll
@@ -287,7 +302,9 @@ proc installWasi*(r: HostRegistry; st: WitState; w: WasiHost) =
   witFn(r, IfSeed, "insecure-seed"):
     results.add vRecord(@[vInt(cast[int64](next64(st))), vInt(cast[int64](next64(st)))])
   # ---- wasi:filesystem
-  witFn(r, IfPreopens, "get-directories"):
-    results.add vList(@[])
+  if w.fs.permissions == nil:
+    w.fs.permissions = proc (pluginId: int): seq[string] {.closure.} =
+      if w.permissions != nil: w.permissions(pluginId) else: @[]
+  installFs(r, w.fs)
   witFn(r, IfFsTypes, "filesystem-error-code"):
     results.add vNone()
