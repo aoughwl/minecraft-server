@@ -352,6 +352,85 @@ def partsb_session(m, c, st, w, biomes, ctx, args):
         st.hit('pig_followed_carrot')
         ctx['tap'] = old_tap
 
+    # --- Gameplay fidelity gaps: selectors with namespaced ids, /damage on mobs, /execute into the fallback dispatcher,
+    # score tests and stores, and tab completion of an enum argument.
+    if wanted('gaps'):
+        def said_since(at, fragment):
+            return any(fragment in t for t in w.chat[at:])
+        def expect_say(line, fragment, what, seconds=8.0):
+            at = len(w.chat)
+            cmd(line)
+            try:
+                wait(lambda: said_since(at, fragment), what, seconds)
+            except m.Fail:
+                print('  chat said: %r' % (w.chat[at:],), flush=True)
+                raise
+            print('  ok: %s' % what, flush=True)
+        def expect_silent(line, fragment, what):
+            at = len(w.chat)
+            cmd(line)
+            settle(1.2)
+            check(not said_since(at, fragment), what)
+            print('  ok: %s' % what, flush=True)
+        mark = len(spawned)
+        cmd('summon minecraft:pig %d %d %d' % (sx + 6, fy + 1, sz + 5))
+        cmd('summon minecraft:zombie %d %d %d' % (sx + 8, fy + 1, sz + 5))
+        wait(lambda: len(spawned) >= mark + 2, 'the pig and the zombie', 10.0)
+        pig_id = spawned[mark][0]
+        # (1) selectors
+        expect_say('execute if entity @e[type=minecraft:pig] run tellraw @a {"text":"GAP_SEL1"}', 'GAP_SEL1', 'type=minecraft:pig finds the pig')
+        expect_say('execute if entity @e[type=!minecraft:pig,type=minecraft:zombie] run tellraw @a {"text":"GAP_SEL2"}', 'GAP_SEL2', 'type=!pig with a zombie')
+        expect_say('execute if entity @e[type=#minecraft:undead] run tellraw @a {"text":"GAP_SEL3"}', 'GAP_SEL3', 'type=#minecraft:undead finds the zombie')
+        expect_silent('execute if entity @e[type=minecraft:cow,distance=..3] run tellraw @a {"text":"GAP_SEL4"}', 'GAP_SEL4', 'no cow, no hit')
+        # (2) /damage on a mob, with and without a source
+        d0 = len(damages)
+        cmd('damage @e[type=minecraft:pig,limit=1] 2 minecraft:generic')
+        wait(lambda: pig_id in damages[d0:], 'a damage event for the pig', 8.0)
+        print('  ok: /damage hurt the pig', flush=True)
+        settle(1.5)   # past the pig's hurt-time, or the second hit is absorbed
+        d1 = len(damages)
+        at_d = len(w.chat)
+        cmd('damage @e[type=minecraft:pig,limit=1] 3 minecraft:player_attack by @s')
+        try:
+            wait(lambda: pig_id in damages[d1:], 'a damage event for the pig, by @s', 8.0)
+        except m.Fail:
+            print('  chat said: %r' % (w.chat[at_d:],), flush=True)
+            raise
+        print('  ok: /damage by a source hurt the pig', flush=True)
+        # (3) execute reaches the fallback dispatcher with the source in force
+        expect_say('execute in minecraft:the_nether run tellraw @a {"text":"GAP_IN"}', 'GAP_IN', 'execute in <dim> run say')
+        mark2 = len(spawned)
+        cmd('execute positioned %d %d %d run summon minecraft:chicken ~ ~ ~' % (sx + 3, fy + 1, sz + 3))
+        wait(lambda: len(spawned) > mark2, 'the chicken from execute positioned', 8.0)
+        ch = spawned[mark2]
+        print('  chicken at %.2f %.2f %.2f, wanted %d %d %d' % (ch[2], ch[3], ch[4], sx + 3, fy + 1, sz + 3), flush=True)
+        check(abs(ch[2] - (sx + 3)) < 1.0 and abs(ch[4] - (sz + 3)) < 1.0, 'positioned moved the summon')
+        mark3 = len(spawned)
+        cmd('execute as @e[type=minecraft:pig,limit=1] at @s run summon minecraft:chicken ~ ~ ~')
+        wait(lambda: len(spawned) > mark3, 'the chicken from execute as/at the pig', 8.0)
+        pg = [e for e in spawned[:mark] + spawned[mark:mark + 1]][-1]
+        print('  chicken at %.2f %.2f %.2f; the pig was spawned at %.2f %.2f' % (spawned[mark3][2], spawned[mark3][3], spawned[mark3][4], pg[2], pg[4]), flush=True)
+        check(abs(spawned[mark3][2] - pg[2]) < 6.0 and abs(spawned[mark3][4] - pg[4]) < 6.0, 'as/at moved to the pig')
+        # scores: `store result` puts tellraw's value (one player told) in the score, and `if score` reads it back
+        at_sc = len(w.chat)
+        cmd('scoreboard objectives add gapt dummy')
+        settle(0.6)
+        cmd('execute store result score @s gapt run tellraw @a {"text":"GAP_ST"}')
+        settle(1.0)
+        print('  chat so far: %r' % (w.chat[at_sc:],), flush=True)
+        expect_say('execute if score @s gapt matches 1 run tellraw @a {"text":"GAP_SC1"}', 'GAP_SC1', 'store result, then if score matches 1')
+        expect_silent('execute if score @s gapt matches 7.. run tellraw @a {"text":"GAP_SC2"}', 'GAP_SC2', 'if score matches, outside')
+        expect_say('execute if score @s gapt = @s gapt run tellraw @a {"text":"GAP_SC3"}', 'GAP_SC3', 'if score = itself')
+        expect_silent('execute unless score @s gapt >= @s gapt run tellraw @a {"text":"GAP_SC4"}', 'GAP_SC4', 'unless score >= itself')
+        expect_say('execute if blocks %d %d %d %d %d %d %d %d %d all run tellraw @a {"text":"GAP_BL"}' % ((sx, fy, sz, sx + 1, fy, sz, sx, fy, sz)), 'GAP_BL', 'if blocks of an area with itself')
+        # (5) tab completion of an enum argument
+        c.send(m.SB_COMMAND_SUGGESTION, m.varint(41) + m.string('/gamemode s'))
+        wait(lambda: any(s[0] == 41 for s in w.suggestions), 'suggestions for /gamemode s', 8.0)
+        found = [s for s in w.suggestions if s[0] == 41][0]
+        print('  /gamemode s suggests: %s' % (found[4],), flush=True)
+        check('survival' in found[4] and 'spectator' in found[4], 'survival and spectator among them')
+        st.hit('gaps_done')
+
     # --- A control for the dragon's hit: a cow, hit by the bot.
     if wanted('cow'):
         mark = len(spawned)

@@ -958,7 +958,7 @@ class Stages:
                     'bed': ['bed_slept', 'night_skipped', 'bed_woken_by_skip', 'bed_woken_by_command'],
                     'villager': ['villager_summoned', 'villager_window_opened', 'villager_offers_sent', 'villager_result_shown',
                                  'villager_traded'],
-                    'dragon': ['dragon_spawned', 'dragon_damaged'], 'cow': [], 'pig': ['pig_followed_carrot']}
+                    'dragon': ['dragon_spawned', 'dragon_damaged'], 'cow': [], 'pig': ['pig_followed_carrot'], 'gaps': ['gaps_done']}
     WATCH_NAMES = ['other_appeared', 'other_moved', 'other_swung', 'other_block_change', 'other_chat', 'other_left']
 
     def __init__(self, extra=()):
