@@ -1,0 +1,218 @@
+## The plugin manager of the server: `managercore.aowl`'s `PluginManager` over the WebAssembly loader and the real `Server`.
+## Port of the server-facing half of pumpkin/src/plugin/mod.rs and of pumpkin/src/plugin/loader/wasm/mod.rs
+## (`WasmPluginLoader`: `load`, `can_load` (the `.wasm` extension), `unload`, `can_unload`) and of
+## pumpkin/src/plugin/api/context.rs's server calls (`register_command`'s dispatcher registration and the commands packet
+## sent again to everyone, `unregister_command`, `register_permission` in the server's permission registry).
+## What this adds over the load at start-up: `/plugin list|load|unload|reload|hotreload` (src/server/command/plugin.aowl) work
+## on the running server, a plugin loaded or unloaded at run time registers and drops its commands, tasks and event
+## handlers, and `tickPlugins` polls the plugin folder while hot reload is on.
+## PARTIAL: pumpkin/src/plugin/mod.rs - hot reload polls the SHA-256 of every `plugins/*.wasm` once every 40 ticks (a new file
+## is loaded, a changed one reloaded, a removed one unloaded) instead of a file watcher with a debounce; the permission
+## prompt is the cache file (see managercore.aowl).
+import std/[syncio, strutils, dirs, paths, options]
+import pluginhost
+import managercore
+import cache
+import pluginwire2
+import api/[apimod, context]
+import loader/loadermod
+import wasm/canonabi
+import ../command/[fallbackdispatch, cmdsource, client_suggestions]
+import ../server/serverbase
+import ../server/command/plugin as plugincmd
+import "../server/plugin/native" as nativeplugin
+import ../util/permission
+import ../util/text/text
+
+export managercore.PluginManager
+
+const
+  HotReloadEvery = 40
+  PluginsFolder = "plugins"
+
+var gManager: nil PluginManager = nil
+var gHotReload = false
+var gTickCount = 0
+var gServer: nil Server = nil
+var gKnown: seq[string] = @[]        ## path of every plugin file the poll has seen
+var gKnownHash: seq[string] = @[]
+
+proc readWasm(file: string): string =
+  try:
+    result = readFile(file)
+  except:
+    result = ""
+
+proc metadataOf(pe: PluginEntry): apimod.PluginMetadata =
+  apimod.PluginMetadata(name: pe.name, version: pe.version, authors: pe.authors, description: pe.description,
+                 dependencies: pe.dependencies, permissions: pe.permissions)
+
+proc wasmLoader(host: PluginHost): PluginLoader =
+  PluginLoader(
+    canLoadImpl: proc (path: string): bool {.closure.} = path.toLowerAscii.endsWith(".wasm"),
+    canUnloadImpl: proc (): bool {.closure.} = true,
+    unloadImpl: proc (loaderData: int): string {.closure.} =
+      if loaderData >= 0 and loaderData < host.plugins.len and host.plugins[loaderData].active:
+        return unloadPlugin(host, loaderData)
+      "",
+    loadImpl: proc (path: string): LoadResult {.closure.} =
+      let bytes = readWasm(path)
+      if bytes.len == 0: return loadErr(nativeplugin.libraryLoad("cannot read " & path))
+      var id = -1
+      let err = preparePlugin(host, path, bytes, id)
+      if err.len > 0:
+        discardPlugin(host, id)
+        return loadErr(nativeplugin.initializationFailed(err))
+      let inst = Plugin(
+        onLoad: proc (ctx: PluginContext): string {.closure.} = startPlugin(host, id),
+        onUnload: proc (ctx: PluginContext): string {.closure.} = unloadPlugin(host, id))
+      loadOk(LoadedPlugin(instance: inst, metadata: metadataOf(host.plugins[id]), loaderData: id)))
+
+proc reloadCommandsForEveryone(server: Server) =
+  ## `Context::reload_commands_for_everyone`: the commands packet again, for every player of every world.
+  let d = server.commandDispatcher
+  if d == nil: return
+  for w in server.worlds:
+    for p in w.players:
+      p.client.writePacketFor(buildCCommands(senderPlayer(server.commandPlayerOf(p)), server.commandServer, d))
+
+proc resolvePath(arg: string): string =
+  ## A plugin given by file name: as typed, else inside `plugins/`, with `.wasm` added when it has no extension.
+  var candidates = @[arg, "plugins/" & arg, arg & ".wasm", "plugins/" & arg & ".wasm"]
+  result = arg
+  for c in candidates:
+    if readWasm(c).len > 0:
+      return c
+
+proc pathOfPlugin(m: PluginManager; name: string): string =
+  result = ""
+  for p in m.plugins:
+    if p.metadata.name == name: result = p.path
+
+proc managerError(r: ManagerResult): string = (if r.ok: "" else: r.message)
+
+proc slashed(p: string): string =
+  result = ""
+  for c in p:
+    if ord(c) == 92: result.add '/'
+    else: result.add c
+
+proc scanPluginFiles(): seq[string] =
+  result = @[]
+  try:
+    for kind, entry in walkDir(path(PluginsFolder)):
+      if kind == pcFile and ($entry).toLowerAscii.endsWith(".wasm"): result.add slashed($entry)
+  except ErrorCode:
+    discard
+
+proc syncKnown() =
+  gKnown = @[]
+  gKnownHash = @[]
+  let files = scanPluginFiles()
+  for f in files:
+    gKnown.add f
+    gKnownHash.add calculateHash(f)
+
+proc commandOps(m: PluginManager): PluginCommandOps =
+  PluginCommandOps(
+    isActive: proc (name: string): bool {.closure.} = m.isPluginActive(name),
+    load: proc (path: string): string {.closure.} = managerError(m.tryLoadPlugin(resolvePath(path))),
+    unload: proc (name: string): string {.closure.} = managerError(m.unloadPlugin(name)),
+    reload: proc (name: string): string {.closure.} =
+      let path = pathOfPlugin(m, name)
+      if path.len == 0: return "Plugin not found: " & name
+      let e = managerError(m.unloadPlugin(name))
+      if e.len > 0: return e
+      managerError(m.tryLoadPlugin(path)),
+    setHotReload: proc (enabled: bool): string {.closure.} =
+      gHotReload = enabled
+      if enabled: syncKnown()
+      "")
+
+proc startPluginManager*(host: PluginHost; server: Server) =
+  ## Called by `startPlugins` once the wiring of the host to the server is done: builds the manager, adds the wasm loader,
+  ## registers `/plugin`, loads `plugins/`, and tells `/plugins` where the active plugins are.
+  gServer = server
+  let cs0 = server.commandServer
+  let registry: nil PermissionRegistry = (if cs0 != nil: cs0.permissionRegistry else: nil)
+  let hooks = ContextHooks(
+    registerTree: host.registerTree,
+    unregisterCommand: proc (name: string) {.closure.} =
+      let d = server.commandDispatcher
+      if d != nil: unregister(d.fallbackDispatcher, name),
+    reloadCommands: proc () {.closure.} = reloadCommandsForEveryone(server),
+    playerByName: proc (name: string): int {.closure.} =
+      result = -1
+      for w in server.worlds:
+        for p in w.players:
+          if p.gameprofile.name == name: result = int(p.entityId),
+    log: proc (line: string) {.closure.} = echo line)
+  host.unregisterName = hooks.unregisterCommand
+  host.reloadCommands = hooks.reloadCommands
+  host.registerPermission = proc (node, description: string; defaultKind, level: int; childNodes: seq[string];
+                                  childValues: seq[bool]): string {.closure.} =
+    let reg = registry
+    if reg == nil: return ""
+    var p = newPermission(node, description, (if defaultKind == 0: permissionDeny() elif defaultKind == 1: permissionAllow()
+                                              else: permissionOp(PermissionLvl(max(0, min(4, level))))))
+    var i = 0
+    while i < childNodes.len:
+      p.addChild(childNodes[i], childValues[i])
+      inc i
+    let (ok, err) = registerPermission(reg, p)
+    if ok: "" else: err
+  let mgr = newPluginManager(hooks, registry, "plugins/data")
+  gManager = mgr
+  mgr.log = proc (line: string) {.closure.} = echo line
+  mgr.addLoader(wasmLoader(host))
+  let d = server.commandDispatcher
+  if d != nil:
+    register(d.fallbackDispatcher, plugincmd.initCommandTree(commandOps(mgr)), "pumpkin:command.plugins")
+  let cs = server.commandServer
+  if cs != nil:
+    cs.activePlugins = proc(): seq[cmdsource.PluginMetadata] {.closure.} =
+      result = @[]
+      for m in mgr.activePlugins(): result.add cmdMetadata(m)
+  let r = mgr.loadPlugins()
+  if not r.ok: echo r.message
+  syncKnown()
+
+proc tickPlugins*() =
+  ## The hot reload poll, once every `HotReloadEvery` ticks while `/plugin hotreload enable` is on.
+  let mgr = gManager
+  if not gHotReload or mgr == nil: return
+  inc gTickCount
+  if gTickCount mod HotReloadEvery != 0: return
+  let files = scanPluginFiles()
+  for f in files:
+    let h = calculateHash(f)
+    let k = gKnown.find(f)
+    if k < 0:
+      gKnown.add f
+      gKnownHash.add h
+      let r = mgr.tryLoadPlugin(f)
+      echo (if r.ok: "Hot reload: loaded " & f else: "Hot reload: " & r.message)
+    elif gKnownHash[k] != h:
+      gKnownHash[k] = h
+      var name = ""
+      for p in mgr.plugins:
+        if p.path == f: name = p.metadata.name
+      if name.len > 0:
+        discard mgr.unloadPlugin(name)
+      let r = mgr.tryLoadPlugin(f)
+      echo (if r.ok: "Hot reload: reloaded " & f else: "Hot reload: " & r.message)
+  var i = 0
+  while i < gKnown.len:
+    if gKnown[i] notin files:
+      for p in mgr.plugins:
+        if p.path == gKnown[i]:
+          discard mgr.unloadPlugin(p.metadata.name)
+          echo "Hot reload: unloaded " & gKnown[i]
+      gKnown.delete(i)
+      gKnownHash.delete(i)
+    else:
+      inc i
+
+proc unloadAllOnShutdown*() =
+  let mgr = gManager
+  if mgr != nil: mgr.unloadAllPlugins()

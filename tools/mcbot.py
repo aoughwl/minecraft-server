@@ -653,7 +653,7 @@ def read_metadata(r):
             return
         kind = r.varint()
         # 774's serializer ids (generated/meta_data_type.aowl, v1_21_11). Holder-backed variants are one varint each.
-        check(kind in (0, 1, 2, 3, 6, 7, 8, 10, 11, 12, 14, 15, 19, 20, 21, 22, 23, 25, 26, 27, 30),
+        check(kind in (0, 1, 2, 3, 6, 7, 8, 10, 11, 12, 14, 15, 18, 19, 20, 21, 22, 23, 25, 26, 27, 30),
               'metadata type %d: this bot does not read it' % kind)
         if kind == 0 or kind == 8:
             r.u8()
@@ -664,6 +664,8 @@ def read_metadata(r):
                 skip_network_nbt(r)
         elif kind == 7:
             META_LOG.append((entity, index, kind, read_slot(r)))
+        elif kind == 18:
+            r.varint(), r.varint(), r.varint()   # villager data: type, profession, level
         elif kind == 10:
             r.take(8)
         elif kind == 11:
@@ -940,6 +942,8 @@ class Stages:
     PLAYA_NAMES = ['pa_shift_click', 'pa_drag_split', 'pa_tab_complete', 'pa_chat_sent']
     PLAYA_LISTEN_NAMES = ['pa_chat_heard']
     PLUGIN_NAMES = ['plugin_welcome', 'plugin_chat_passes', 'plugin_chat_cancelled']
+    PLUGMGR_NAMES = ['plugmgr_tree', 'plugmgr_chat_before', 'plugmgr_list', 'plugmgr_load_error', 'plugmgr_loaded', 'plugmgr_already_loaded',
+                     'plugmgr_chat_cancelled', 'plugmgr_unloaded', 'plugmgr_chat_after_unload', 'plugmgr_reloaded']
     C2_NAMES = ['sign_placed', 'sign_text_set', 'bed_placed', 'bed_slept', 'piston_pushed']
     C2_VERIFY_NAMES = ['sign_persisted', 'bed_persisted', 'piston_persisted']
     CONTAINERS_NAMES = ['container_placed', 'container_opened', 'container_filled', 'window_opens', 'item_replace_block']
@@ -952,8 +956,9 @@ class Stages:
     PLAYER_VERIFY_NAMES = ['entity_after_join']
     PARTSB_NAMES = {'pearl': ['pearl_cooldown_sent', 'pearl_blocked', 'pearl_again'],
                     'bed': ['bed_slept', 'night_skipped', 'bed_woken_by_skip', 'bed_woken_by_command'],
-                    'villager': ['villager_summoned', 'villager_window_opened', 'villager_offers_sent'],
-                    'dragon': ['dragon_spawned', 'dragon_damaged']}
+                    'villager': ['villager_summoned', 'villager_window_opened', 'villager_offers_sent', 'villager_result_shown',
+                                 'villager_traded'],
+                    'dragon': ['dragon_spawned', 'dragon_damaged'], 'cow': []}
     WATCH_NAMES = ['other_appeared', 'other_moved', 'other_swung', 'other_block_change', 'other_chat', 'other_left']
 
     def __init__(self, extra=()):
@@ -2761,6 +2766,8 @@ def run(args):
         extra = list(extra) + Stages.C2_NAMES
     if args.wasm_plugin:
         extra = list(extra) + Stages.PLUGIN_NAMES
+    if args.plugmgr:
+        extra = list(extra) + Stages.PLUGMGR_NAMES
     if args.playa:
         extra = list(extra) + (Stages.PLAYA_LISTEN_NAMES if args.playa == 'listen' else Stages.PLAYA_NAMES)
     if args.c2_verify:
@@ -2979,6 +2986,9 @@ def run(args):
         if args.wasm_plugin:
             import mcbot_plugin
             mcbot_plugin.plugin_session(sys.modules[__name__], c, st, w, biomes, ctx, args)
+        if args.plugmgr:
+            import mcbot_plugmgr
+            mcbot_plugmgr.plugmgr_session(sys.modules[__name__], c, st, w, biomes, ctx, args)
         if args.c2 or args.c2_verify:
             import mcbot_c2
             if args.c2:
@@ -3326,6 +3336,7 @@ def main():
     ap.add_argument('--assets', default=os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '..', 'ref', 'pumpkin-1.21.11', 'assets', 'blocks.json'), help='blocks.json of the pinned upstream, for --blocks')
     ap.add_argument('--playa', choices=['act', 'listen'], help='play packets as an operator: shift-click, drag split, tab completion and chat (act), or hear the actor chat (listen); see mcbot_playa.py')
     ap.add_argument('--wasm-plugin', action='store_true', help='a wasm plugin welcomes the player and cancels chat starting with x; see mcbot_plugin.py')
+    ap.add_argument('--plugmgr', action='store_true', help='the plugin manager at run time: /plugin list, load, unload, reload; see mcbot_plugmgr.py')
     ap.add_argument('--c2', action='store_true', help='a sign with text, a bed slept in and a piston push; see mcbot_c2.py')
     ap.add_argument('--c2-verify', help='a file from --c2 --save: the sign, bed and piston are still there')
     ap.add_argument('--last', action='store_true', help='command blocks, a cauldron, a flower pot and a dragon egg; see mcbot_last.py')

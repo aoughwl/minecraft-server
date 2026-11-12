@@ -1,0 +1,188 @@
+## Tests of witwasi.aowl. Part one runs a component assembled by hand (witasm.aowl) in the shape a wasm32-wasip2 plugin has:
+## its `on-load` calls wasi:cli/stdout, wasi:io/streams, wasi:clocks/monotonic-clock, wasi:io/poll, wasi:random/random and
+## wasi:cli/environment through the linker and the canonical ABI, and traps (so the load fails) when a result is not what
+## WASI says. Part two calls the host functions through the registry for what the component does not reach: exit, closed
+## stdin, the environment permission, poll ordering, the wall clock, random bytes.
+##   witwasitest                  runs both
+##   witwasitest --write FILE     writes the component (for the over-the-wire run: it prints a line to the server log)
+import std/[syncio, os]
+import ../wasm/[wasmvm, canonabi, component]
+import witstate, witall, witasm
+
+var failures = 0
+var lines: seq[string] = @[]
+
+proc ck(ok: bool; msg: string) =
+  if not ok:
+    echo "FAILED ", msg
+    inc failures
+
+proc buildWasiPlugin(): string =
+  let ifaces = @[
+    AsmIface(name: "wasi:cli/stdout@0.2.0",
+      decls: @[bs([0x01, 0x40, 0, 0x00, 0x79])],
+      funcs: @[AsmFn(name: "get-stdout", typeIdx: 0, params: "", res: "i")]),
+    AsmIface(name: "wasi:io/streams@0.2.0",
+      decls: @[bs([0x01, 0x6a, 0x00, 0x01, 0x79]),
+               bs([0x01, 0x70, 0x7d]),
+               bs([0x01, 0x40, 2]) & nm("self") & bs([0x79]) & nm("contents") & bs([1]) & bs([0x00, 0])],
+      funcs: @[AsmFn(name: "[method]output-stream.blocking-write-and-flush", typeIdx: 2, params: "iiii", res: "")]),
+    AsmIface(name: "wasi:clocks/monotonic-clock@0.2.0",
+      decls: @[bs([0x01, 0x40, 0, 0x00, 0x78]),
+               bs([0x01, 0x40, 1]) & nm("when") & bs([0x78]) & bs([0x00, 0x79])],
+      funcs: @[AsmFn(name: "now", typeIdx: 0, params: "", res: "l"),
+               AsmFn(name: "subscribe-duration", typeIdx: 1, params: "l", res: "i")]),
+    AsmIface(name: "wasi:io/poll@0.2.0",
+      decls: @[bs([0x01, 0x40, 1]) & nm("self") & bs([0x79]) & bs([0x01, 0])],
+      funcs: @[AsmFn(name: "[method]pollable.block", typeIdx: 0, params: "i", res: "")]),
+    AsmIface(name: "wasi:random/random@0.2.0",
+      decls: @[bs([0x01, 0x40, 0, 0x00, 0x78])],
+      funcs: @[AsmFn(name: "get-random-u64", typeIdx: 0, params: "", res: "l")]),
+    AsmIface(name: "wasi:cli/environment@0.2.0",
+      decls: @[bs([0x01, 0x6f, 2, 0x73, 0x73]), bs([0x01, 0x70, 0]), bs([0x01, 0x40, 0, 0x00, 1])],
+      funcs: @[AsmFn(name: "get-environment", typeIdx: 2, params: "i", res: "")])]
+  # function indices: 0 get-stdout, 1 write, 2 now, 3 subscribe-duration, 4 block, 5 random, 6 get-environment
+  let body =
+    cl(0) & lset(1) &                                           # stdout = get-stdout()
+    lget(1) & ic(64) & ic(11) & ic(RetArea) & cl(1) &           # blocking-write-and-flush(stdout, "hello wasi\n")
+    ic(RetArea) & i32load8u(0) & expectI32(0) &                 # result::ok
+    ic(256) & cl(2) & i64store(0) &                             # t0 = now()
+    lc(5000000) & cl(3) & lset(2) &                             # p = subscribe-duration(5 ms)
+    lget(2) & cl(4) &                                           # p.block()
+    cl(2) & ic(256) & i64load(0) & i64sub() & lc(5000000) & i64geU() & trapUnless() &   # now() - t0 >= 5 ms
+    cl(5) & dropv() &                                           # get-random-u64()
+    ic(RetArea + 16) & cl(6) &                                  # get-environment(): empty without the permission
+    ic(RetArea + 20) & i32load(0) & expectI32(0) &
+    lget(1) & ic(80) & ic(4) & ic(RetArea) & cl(1) &            # "tail", no newline: flushed when the plugin goes
+    ic(0)
+  buildComponent(ifaces, 2, body, @[AsmData(addr0: 64, bytes: "hello wasi\n"), AsmData(addr0: 80, bytes: "tail")])
+
+proc call(r: HostRegistry; ci: CompInst; iface, fname: string; args: seq[CVal]; results: var seq[CVal]): string =
+  let key = iface & "#" & fname
+  var i = 0
+  while i < r.keys.len:
+    if r.keys[i] == key:
+      return r.fns[i].fn(ci, args, results)
+    inc i
+  result = "no host function " & key
+
+proc c(r: HostRegistry; ci: CompInst; iface, fname: string; args: seq[CVal]): seq[CVal] =
+  var res: seq[CVal] = @[]
+  let e = call(r, ci, iface, fname, args, res)
+  if e.len > 0:
+    echo "FAILED call ", fname, ": ", e
+    inc failures
+  res
+
+proc main() =
+  if paramCount() >= 2 and paramStr(1) == "--write":
+    try:
+      writeFile(paramStr(2), buildWasiPlugin())
+    except:
+      echo "write failed"
+      quit 1
+    echo "wrote ", paramStr(2)
+    return
+  # ---- the component
+  let r = newHostRegistry()
+  let st = newWitState()
+  let ext = installWitInterfaces(r, st)
+  var perms: seq[string] = @[]
+  ext.wasi.log = proc (pluginId: int; isErr: bool; line: string) {.closure.} =
+    lines.add "[wasidemo] " & (if isErr: "stderr: " else: "stdout: ") & line
+  ext.wasi.permissions = proc (pluginId: int): seq[string] {.closure.} = perms
+  var clock = 1_000_000_000'i64
+  ext.wasi.clockFn = proc (): int64 {.closure.} = clock
+  let ci = newCompInst(newWasmVm(), r, 0)
+  ck(instantiateComponent(ci, buildWasiPlugin()), "instantiate the wasi component: " & ci.err)
+  let onLoad = findExportFunc(ci, "on-load")
+  ck(onLoad >= 0, "on-load is exported")
+  var res: seq[CVal] = @[]
+  let err = callExport(ci, onLoad, @[vInt(0)], res)
+  ck(err.len == 0, "on-load runs against WASI: " & err)
+  ck(res.len == 1 and res[0].i == 0, "on-load returned ok")
+  ck("[wasidemo] stdout: hello wasi" in lines, "stdout line reached the log")
+  ck("[wasidemo] stdout: tail" notin lines, "partial line still buffered")
+  flushPlugin(ext.wasi, 0)
+  ck("[wasidemo] stdout: tail" in lines, "partial line flushed when the plugin goes")
+
+  # ---- host functions
+  let w = ext.wasi
+  res = c(r, ci, "wasi:cli/stdout", "get-stdout", @[])
+  ck(res[0].i == 1, "stdout rep")
+  res = c(r, ci, "wasi:cli/stderr", "get-stderr", @[])
+  ck(res[0].i == 2, "stderr rep")
+  lines = @[]
+  var bytes: seq[CVal] = @[]
+  for ch in "err one\nerr two\r\npartial":
+    bytes.add vInt(int64(ord(ch)))
+  res = c(r, ci, "wasi:io/streams", "[method]output-stream.write", @[vInt(2), vList(bytes)])
+  ck(res[0].i == 0, "write ok")
+  ck(lines == @["[wasidemo] stderr: err one", "[wasidemo] stderr: err two"], "stderr lines: " & $lines.len)
+  res = c(r, ci, "wasi:io/streams", "[method]output-stream.check-write", @[vInt(1)])
+  ck(res[0].i == 0 and res[0].items[0].i == 65536, "check-write")
+  var out0: seq[CVal] = @[]
+  ck(call(r, ci, "wasi:io/streams", "[method]output-stream.write", @[vInt(0), vList(bytes)], out0).len > 0, "write on stdin traps")
+  res = c(r, ci, "wasi:io/streams", "[method]input-stream.read", @[vInt(0), vInt(10)])
+  ck(res[0].i == 1 and res[0].items[0].i == 1, "stdin read: err(closed)")
+  # exit
+  var e2 = call(r, ci, "wasi:cli/exit", "exit", @[vVariant(1)], out0)
+  ck(e2 == "wasi exit 1" and w.lastExit == 1, "exit(err) traps: " & e2)
+  e2 = call(r, ci, "wasi:cli/exit", "exit", @[vVariant(0)], out0)
+  ck(e2 == "wasi exit 0" and w.lastExit == 0, "exit(ok) traps: " & e2)
+  # environment is empty without a permission and filtered with one
+  perms = @[]
+  res = c(r, ci, "wasi:cli/environment", "get-environment", @[])
+  ck(res[0].items.len == 0, "no environment without sys.env")
+  perms = @["sys.env"]
+  res = c(r, ci, "wasi:cli/environment", "get-environment", @[])
+  ck(res[0].items.len > 0, "sys.env inherits the environment")
+  perms = @["sys.env.PATH"]
+  res = c(r, ci, "wasi:cli/environment", "get-environment", @[])
+  ck(res[0].items.len == 1 and res[0].items[0].items[0].s == "PATH", "sys.env.PATH is one variable")
+  res = c(r, ci, "wasi:cli/environment", "get-arguments", @[])
+  ck(res[0].items.len == 0, "no arguments")
+  res = c(r, ci, "wasi:cli/environment", "initial-cwd", @[])
+  ck(res[0].i == 0, "no cwd")
+  res = c(r, ci, "wasi:cli/terminal-stdout", "get-terminal-stdout", @[])
+  ck(res[0].i == 0, "stdout is not a terminal")
+  # clocks and polling
+  clock = 5_000'i64
+  res = c(r, ci, "wasi:clocks/monotonic-clock", "now", @[])
+  let n0 = res[0].i
+  ck(n0 == w.monoNow(), "now is the clock")
+  res = c(r, ci, "wasi:clocks/monotonic-clock", "subscribe-duration", @[vInt(1000)])
+  let pa = res[0].i
+  res = c(r, ci, "wasi:clocks/monotonic-clock", "subscribe-instant", @[vInt(n0 + 400)])
+  let pb = res[0].i
+  res = c(r, ci, "wasi:io/poll", "[method]pollable.ready", @[vInt(pa)])
+  ck(res[0].i == 0, "1000 ns not elapsed yet")
+  res = c(r, ci, "wasi:io/poll", "poll", @[vList(@[vInt(pa), vInt(pb)])])
+  ck(res[0].items.len == 1 and res[0].items[0].i == 1, "poll wakes for the earlier deadline (index 1)")
+  res = c(r, ci, "wasi:io/poll", "[method]pollable.ready", @[vInt(pb)])
+  ck(res[0].i == 1, "ready after the poll moved the clock")
+  res = c(r, ci, "wasi:io/poll", "[method]pollable.block", @[vInt(pa)])
+  res = c(r, ci, "wasi:io/poll", "[method]pollable.ready", @[vInt(pa)])
+  ck(res[0].i == 1, "block moves the clock to the deadline")
+  ck(call(r, ci, "wasi:io/poll", "poll", @[vList(@[])], out0).len > 0, "poll of nothing traps")
+  res = c(r, ci, "wasi:io/poll", "[method]pollable.ready", @[vInt(0)])
+  ck(res[0].i == 1, "pollable 0 is always ready")
+  res = c(r, ci, "wasi:clocks/wall-clock", "now", @[])
+  ck(res[0].items[0].i > 1_700_000_000 and res[0].items[1].i < 1_000_000_000, "wall clock is a recent date")
+  # random
+  res = c(r, ci, "wasi:random/random", "get-random-bytes", @[vInt(13)])
+  ck(res[0].items.len == 13, "13 random bytes")
+  res = c(r, ci, "wasi:random/insecure", "get-random-bytes", @[vInt(0)])
+  ck(res[0].items.len == 0, "0 random bytes")
+  ck(call(r, ci, "wasi:random/random", "get-random-bytes", @[vInt(100_000_000)], out0).len > 0, "huge request traps")
+  var a = c(r, ci, "wasi:random/random", "get-random-u64", @[])
+  var b = c(r, ci, "wasi:random/random", "get-random-u64", @[])
+  ck(a[0].i != b[0].i, "random u64 differs")
+  res = c(r, ci, "wasi:random/insecure-seed", "insecure-seed", @[])
+  ck(res[0].items.len == 2, "insecure-seed is a pair")
+  res = c(r, ci, "wasi:filesystem/preopens", "get-directories", @[])
+  ck(res[0].items.len == 0, "no preopened directories")
+  if failures > 0: quit 1
+  echo "witwasitest ok"
+
+main()

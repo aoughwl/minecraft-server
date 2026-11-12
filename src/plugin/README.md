@@ -76,6 +76,22 @@ death by chaining `gPlayerRespawnedHook` and `gPlayerHooks.handleKilled`). `plug
 plugin that sends a text component to a joining player and cancels chat; `python tools/mcbot.py --wasm-plugin` does the same
 over the wire (tools/mcbot_plugin.py). What each file leaves out is its PARTIAL line.
 
+Second batch (witplayer2, witentity2, and more in witworld and witsrv): about 90 more `player` methods (tab list, cameras,
+sounds, particles, block change, knockback, links, ban, stats, cooldowns, abilities, ip, skin, ...), the entity box/
+passenger/nearby methods, the world's spawn location, game rules, sound, particle, entities and explosions (through the
+new `WitHooks.createExplosion`), and `server` command execution, tab-list header/footer and links. `witplayer2test` runs
+them through the registry against a real `Server` and `Player` and reads the packets back. State the server has no field
+for (permission overrides, movement lock, freeze ticks, hidden players, per-player time/weather) is kept in witplayer2
+and only the plugin sees it.
+
+Events fired from the server, beyond the first batch: login (servermod `addPlayer`, a cancel kicks the client), teleport
+(`requestTeleport`), change-world (`teleportWorld`), gamemode-change (`setGamemode`), exp-change (chained on
+`gPlayerHooks.addExperiencePoints`), item-held, toggle-sneak/sprint/flight and interact (right-click-block), through the new
+closures of pluginhooks.aowl. Dispatch is upstream's (`PluginManager::fire`): blocking handlers first in registration
+order, each seeing the previous one's edits and able to cancel; non-blocking handlers then run on the result and their
+reply is dropped; the WIT `priority` is stored and orders nothing, and a cancelled event still reaches every handler.
+`pluginhostplayertest` checks this (`--write FILE login` writes the plugin so that it cancels logins).
+
 Server hooks (small, in other agents' files): `src/server/servermod.aowl` imports `../plugin/pluginmgr`, calls
 `startPlugins(server)` after `installCommands`, `firePlayerJoin(player)` after `worldmod.addPlayer` in `addPlayer`, and
 `firePlayerLeave(player)` after `handlePlayerLeave` in `removePlayer`.
@@ -85,3 +101,41 @@ block-entity, scoreboard, gui, forms, recipe, the managers behind `server`, the 
 a Rust std plugin imports, is not provided; nested components and guest-defined resources; v0.2 host; signature and
 permission enforcement; pumpkin-plugin-api (the guest SDK), pumpkin-macros, pumpkin-api-macros and the wit generators in
 pumpkin-codegen are untouched (they need rustc and the WIT-to-aowlmony generator described in src/plugin_api/README.md).
+
+## Manager, WASI and the later interfaces (phase 3)
+
+    src/plugin/wit/witwasi.aowl        WASI preview 2: wasi:cli (environment, exit, stdin, stdout, stderr, terminal-*), wasi:io
+                                       (error, poll, streams), wasi:clocks (monotonic, wall), wasi:random (random, insecure,
+                                       insecure-seed), the empty wasi:filesystem/preopens. stdout and stderr are line buffered
+                                       into the server log as `[plugin] stdout: ...`; the environment only through the
+                                       `sys.env` / `sys.env.<KEY>` permissions; `pollable.block` moves a clock skew, it never
+                                       sleeps the tick thread
+    src/plugin/wit/witstack.aowl       item-stack over the real `ItemStack` (enchantments, custom name, custom data as an
+                                       `nbt-tree` flat table with upstream's bounds and cycle errors)
+    src/plugin/wit/witblockentity.aowl block-entity and the command-block, sign, jukebox, chest and mob-spawner views, through
+                                       `BlockEntityHooks` (pluginwire2.aowl runs them against the worlds' real block entities)
+    src/plugin/wit/witscoreboard.aowl  scoreboard (objectives, scores, teams, display slots) through `ScoreboardHooks`
+    src/plugin/wit/witgui.aowl         gui, backed by api/gui.aowl (`PluginGui`, `PluginInventory`, `PluginScreenHandler`)
+    src/plugin/wit/witrecipe.aowl      recipe-manager: shaped, shapeless and cooking recipes into `server.recipeManager`
+    src/plugin/wit/witforms.aowl       the JSON of a Bedrock form from the `form` variant (`serializeForm`; the interface itself
+                                       has no host function)
+    src/plugin/wit/witall.aowl         `installWitInterfaces` returns the `WitExt` that owns the state and hooks of the above
+    src/plugin/api/apimod.aowl         PluginMetadata, PluginState        (plugin/api/mod.rs)
+    src/plugin/api/eventsmod.aowl      EventPriority, Cancellable, HandlerMap: `fire`'s blocking-then-non-blocking order
+    src/plugin/api/context.aowl        Context: data folder, register / unregister command (namespaced permission, plugin as
+                                       the tree's source, commands packet again), register_permission, services, `Plugin`
+    src/plugin/api/gui.aowl            PluginGui, PluginInventory, PluginScreenHandler            (plugin/api/gui.rs)
+    src/plugin/loader/loadermod.aowl   PluginLoader (load, can_load, unload, can_unload) and LoaderError   (loader/mod.rs)
+    src/plugin/cache.aowl              the permission cache file and the SHA-256 of a plugin file     (plugin/cache.rs)
+    src/plugin/managercore.aowl        PluginManager without the server: load_plugins, dependency order, permission cache,
+                                       try_load_plugin, unload_plugin, states                          (plugin/mod.rs)
+    src/plugin/pluginserver.aowl       the manager over the wasm loader and the real Server; `/plugin`; the hot reload poll
+    src/plugin/pluginwire2.aowl        fills the hooks of block entities, scoreboard and recipes from the Server
+    src/server/command/plugin.aowl     `/plugin list|load|unload|reload|hotreload`                (commands/plugin.rs)
+
+Tests: `managercoretest` (topological_sort's upstream test, SHA-256 known answers, cache round trip, the manager over a fake
+loader in a scratch folder, handler order, the context), `wit/witasm` (hand assembler of component test fixtures),
+`wit/witwasitest` (a hand-built wasip2-shaped component run through the linker, then every WASI function through the
+registry), `wit/witexttest` (item-stack, gui, recipe, scoreboard, block-entity and forms through the registry),
+`src/server/command/plugintest` (`/plugin`). Over the wire: `python tools/mcbot.py --plugmgr --op` (tools/mcbot_plugmgr.py)
+loads, unloads and reloads plugins on a running server.

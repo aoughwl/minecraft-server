@@ -1,0 +1,218 @@
+## Connects the interfaces of wit/witblockentity, witscoreboard and witrecipe to the real `Server`: fills their hooks
+## (`BlockEntityHooks`, `ScoreboardHooks`, `RecipeHooks`) with closures over the worlds' block entities, a scoreboard per
+## world and `server.recipeManager`. The same job as pluginwire.aowl for the first half of the interfaces; a separate file so
+## that the two halves can change without touching one another. `wireExt` is called by `startPlugins` (pluginmgr.aowl).
+## A world handle is the index in `server.worlds`, a block entity is found by position through `getBlockEntity` of the
+## world's `BlockWorld`, as `World::get_block_entity` does.
+## PARTIAL: pumpkin/src/plugin/loader/wasm/wasm_host/wit/v0_1/scoreboard.rs - `World` holds no scoreboard in this tree, so
+## the scoreboard plugins reach is one `Scoreboard` per world kept here, not the one the /scoreboard command edits.
+## PARTIAL: pumpkin/src/plugin/loader/wasm/wasm_host/wit/v0_1/block_entity.rs - sign text written by a plugin is not sent to
+## the clients until the chunk is resent (upstream does not send it either, the block entity is only marked through the
+## sign's own `update`); hanging signs are not given the sign view.
+import std/[options, tables]
+import ../server/serverbase
+import ../server/world/worldmod
+import ../server/world/scoreboard
+import ../server/recipe
+import "../server/block/blockbehaviour"
+import "../server/block/entities/sign" as signbe
+import "../server/block/entities/command_block" as cmdbe
+import "../server/block/entities/jukebox" as jukebe
+import "../server/block/entities/mob_spawner" as spawnbe
+import "../server/block/entities/chest_like_block_entity" as chestbe
+import ../generated/block_properties
+import ../generated/scoreboard_slot
+import ../protocol/java/client/play/[display_objective, update_objectives, update_score]
+import ../protocol/proto
+import ../util/math/position
+import ../util/text/text
+import ../util/text/color
+import wit/[witstate, witall, witblockentity, witscoreboard]
+
+var gBoards: seq[Scoreboard] = @[]         ## one per world index
+
+proc board(w: int): int =
+  while gBoards.len <= w: gBoards.add newScoreboard()
+  w
+
+proc worldAt(server: Server; i: int): nil World =
+  if i >= 0 and i < server.worlds.len: return server.worlds[i]
+  nil
+
+proc entityAt(server: Server; w, x, y, z: int): Option[BlockEntity] =
+  let wd = worldAt(server, w)
+  if wd == nil: return none[BlockEntity]()
+  getBlockEntity(BlockWorld(wd.blockWorld), newBlockPos(int32(x), int32(y), int32(z)))
+
+proc numberFormatOf(f: NumFmt): Option[NumberFormat] =
+  case f.kind
+  of 1: some(NumberFormat(kind: nfBlank))
+  of 2: some(NumberFormat(kind: nfFixed, fixedText: f.fixed))
+  else: none[NumberFormat]()
+
+proc teamOf(t: SbTeam): Team =
+  var options = 0'i8
+  if t.friendlyFire: options = options or 0x01'i8
+  if t.seeFriendlyInvisibles: options = options or 0x02'i8
+  Team(name: t.name, displayName: t.displayName, options: options, nametagVisibility: NameTagVisibility(t.nametagVisibility),
+       collisionRule: CollisionRule(t.collisionRule), color: NamedColor(t.color), playerPrefix: t.prefix, playerSuffix: t.suffix,
+       players: t.players)
+
+proc wireExt*(ext: WitExt; server: Server) =
+  # ---- recipes
+  ext.recipes.hooks.addRecipe = proc (recipe: DynamicRecipe) {.closure.} =
+    server.recipeManager.addRecipe(recipe)
+  # ---- block entities
+  let be = ext.blockEntities.hooks
+  be.info = proc (w, x, y, z: int; res: var BeInfo): bool {.closure.} =
+    let e = entityAt(server, w, x, y, z)
+    if e.isNone: return false
+    let loc = e.unsafeGet.resourceLocation()
+    let short = loc.substr(loc.find(':') + 1)
+    var typeId = 0
+    for i in 0 ..< BLOCK_ENTITY_TYPES.len:
+      if BLOCK_ENTITY_TYPES[i] == short: typeId = i
+    res = BeInfo(resourceLocation: loc, id: typeId, dirty: e.unsafeGet.isDirty())
+    true
+  be.clearDirty = proc (w, x, y, z: int) {.closure.} =
+    let e = entityAt(server, w, x, y, z)
+    if e.isSome: e.unsafeGet.clearDirty()
+  be.command = proc (w, x, y, z: int; res: var BeCommand): bool {.closure.} =
+    let e = entityAt(server, w, x, y, z)
+    if e.isNone or not (e.unsafeGet of cmdbe.CommandBlockEntity): return false
+    let c = cmdbe.CommandBlockEntity(e.unsafeGet)
+    res = BeCommand(lastOutput: c.lastOutput, command: c.command, trackOutput: c.trackOutput, successCount: int(c.successCount),
+                    auto: c.auto, conditionMet: c.conditionMet, powered: c.powered)
+    true
+  be.sign = proc (w, x, y, z: int; res: var BeSign): bool {.closure.} =
+    let e = entityAt(server, w, x, y, z)
+    if e.isNone or not (e.unsafeGet of signbe.SignBlockEntity): return false
+    let s = signbe.SignBlockEntity(e.unsafeGet)
+    res = BeSign(front: SignFace(messages: @[s.frontText.messages[0], s.frontText.messages[1], s.frontText.messages[2], s.frontText.messages[3]],
+                                 color: int(s.frontText.color), glowing: s.frontText.hasGlowingText),
+                 back: SignFace(messages: @[s.backText.messages[0], s.backText.messages[1], s.backText.messages[2], s.backText.messages[3]],
+                                color: int(s.backText.color), glowing: s.backText.hasGlowingText),
+                 waxed: s.isWaxed)
+    true
+  be.setSignFace = proc (w, x, y, z: int; front: bool; face: SignFace): bool {.closure.} =
+    let e = entityAt(server, w, x, y, z)
+    if e.isNone or not (e.unsafeGet of signbe.SignBlockEntity): return false
+    let s = signbe.SignBlockEntity(e.unsafeGet)
+    let t = (if front: s.frontText else: s.backText)
+    t.hasGlowingText = face.glowing
+    t.color = int8(face.color)
+    for i in 0 ..< 4: t.messages[i] = face.messages[i]
+    true
+  be.setSignWaxed = proc (w, x, y, z: int; waxed: bool): bool {.closure.} =
+    let e = entityAt(server, w, x, y, z)
+    if e.isNone or not (e.unsafeGet of signbe.SignBlockEntity): return false
+    signbe.SignBlockEntity(e.unsafeGet).isWaxed = waxed
+    true
+  be.jukeboxPlaying = proc (w, x, y, z: int; playing: var bool): bool {.closure.} =
+    let e = entityAt(server, w, x, y, z)
+    if e.isNone or not (e.unsafeGet of jukebe.JukeboxBlockEntity): return false
+    playing = jukebe.JukeboxBlockEntity(e.unsafeGet).isPlaying()
+    true
+  be.jukeboxStop = proc (w, x, y, z: int): bool {.closure.} =
+    let e = entityAt(server, w, x, y, z)
+    if e.isNone or not (e.unsafeGet of jukebe.JukeboxBlockEntity): return false
+    jukebe.JukeboxBlockEntity(e.unsafeGet).stopPlaying()
+    true
+  be.jukeboxStart = proc (w, x, y, z: int; lengthInTicks: uint64): bool {.closure.} =
+    let e = entityAt(server, w, x, y, z)
+    if e.isNone or not (e.unsafeGet of jukebe.JukeboxBlockEntity): return false
+    jukebe.JukeboxBlockEntity(e.unsafeGet).startPlaying(lengthInTicks)
+    true
+  be.viewerCount = proc (w, x, y, z: int; count: var int): bool {.closure.} =
+    let e = entityAt(server, w, x, y, z)
+    if e.isNone or not (e.unsafeGet of chestbe.ChestLikeBlockEntity): return false
+    count = int(chestbe.ChestLikeBlockEntity(e.unsafeGet).getViewerCount())
+    true
+  be.spawner = proc (w, x, y, z: int; res: var BeSpawner): bool {.closure.} =
+    let e = entityAt(server, w, x, y, z)
+    if e.isNone or not (e.unsafeGet of spawnbe.MobSpawnerBlockEntity): return false
+    let s = spawnbe.MobSpawnerBlockEntity(e.unsafeGet)
+    res = BeSpawner(spawnCount: int(s.spawnCount), spawnRange: int(s.spawnRange), delay: int(s.delay))
+    true
+  # ---- scoreboard
+  let sb = ext.scoreboard.hooks
+  sb.addObjective = proc (w: int; name: string; title: TextComponent; renderType: int; fmt: NumFmt) {.closure.} =
+    let wd = worldAt(server, w)
+    if wd == nil: return
+    let b = board(w)
+    gBoards[b].addObjective(wd, ScoreboardObjective(name: name, displayName: title, renderType: RenderType(renderType),
+                                                    numberFormat: numberFormatOf(fmt), criterion: "dummy"))
+  sb.updateObjective = proc (w: int; name: string; title: TextComponent; renderType: int; fmt: NumFmt) {.closure.} =
+    let wd = worldAt(server, w)
+    if wd == nil: return
+    let b = board(w)
+    for i in 0 ..< gBoards[b].objectives.len:
+      if gBoards[b].objectives[i].name == name:
+        gBoards[b].objectives[i].displayName = title
+        gBoards[b].objectives[i].renderType = RenderType(renderType)
+        gBoards[b].objectives[i].numberFormat = numberFormatOf(fmt)
+        wd.broadcastPacketAll(newCUpdateObjectives(name, mUpdate, title, RenderType(renderType), numberFormatOf(fmt)))
+  sb.removeObjective = proc (w: int; name: string) {.closure.} =
+    let wd = worldAt(server, w)
+    if wd != nil: gBoards[board(w)].removeObjective(wd, name)
+  sb.setDisplaySlot = proc (w: int; slot: int; objective: string) {.closure.} =
+    let wd = worldAt(server, w)
+    if wd != nil and slot >= 0 and slot <= ord(high(ScoreboardDisplaySlot)):
+      wd.broadcastPacketAll(newCDisplayObjective(ScoreboardDisplaySlot(slot), objective))
+  sb.clearDisplaySlot = proc (w: int; slot: int) {.closure.} =
+    let wd = worldAt(server, w)
+    if wd != nil and slot >= 0 and slot <= ord(high(ScoreboardDisplaySlot)):
+      wd.broadcastPacketAll(newCDisplayObjective(ScoreboardDisplaySlot(slot), ""))
+  sb.updateScore = proc (w: int; entity, objective: string; value: int; fmt: NumFmt) {.closure.} =
+    let wd = worldAt(server, w)
+    if wd != nil:
+      gBoards[board(w)].updateScore(wd, newScoreboardScore(entity, objective, newVarInt(int32(value)), none[TextComponent](),
+                                                           numberFormatOf(fmt)))
+  sb.getScore = proc (w: int; entity, objective: string; value: var int): bool {.closure.} =
+    let b = board(w)
+    for s in gBoards[b].scores:
+      if s.entityName == entity and s.objectiveName == objective:
+        value = int(s.value.value)
+        return true
+    false
+  sb.removeScore = proc (w: int; entity, objective: string) {.closure.} =
+    let wd = worldAt(server, w)
+    if wd != nil: gBoards[board(w)].removeScore(wd, entity, objective)
+  sb.resetEntityScores = proc (w: int; entity: string) {.closure.} =
+    let wd = worldAt(server, w)
+    if wd == nil: return
+    let b = board(w)
+    var names: seq[string] = @[]
+    for s in gBoards[b].scores:
+      if s.entityName == entity: names.add s.objectiveName
+    for n in names: gBoards[b].removeScore(wd, entity, n)
+  sb.createTeam = proc (w: int; team: SbTeam) {.closure.} =
+    let wd = worldAt(server, w)
+    if wd != nil: gBoards[board(w)].addTeam(wd, teamOf(team))
+  sb.updateTeam = proc (w: int; team: SbTeam) {.closure.} =
+    let wd = worldAt(server, w)
+    if wd != nil: gBoards[board(w)].updateTeam(wd, teamOf(team))
+  sb.removeTeam = proc (w: int; name: string) {.closure.} =
+    let wd = worldAt(server, w)
+    if wd != nil: gBoards[board(w)].removeTeam(wd, name)
+  sb.addPlayerToTeam = proc (w: int; team, player: string) {.closure.} =
+    let wd = worldAt(server, w)
+    if wd != nil: gBoards[board(w)].addPlayerToTeam(wd, team, player)
+  sb.removePlayerFromTeam = proc (w: int; team, player: string) {.closure.} =
+    let wd = worldAt(server, w)
+    if wd != nil: gBoards[board(w)].removePlayerFromTeam(wd, team, player)
+  sb.clearTeamPlayers = proc (w: int; team: string) {.closure.} =
+    let wd = worldAt(server, w)
+    if wd == nil: return
+    let b = board(w)
+    var players: seq[string] = @[]
+    for t in gBoards[b].teams:
+      if t.name == team: players = t.players
+    for p in players: gBoards[b].removePlayerFromTeam(wd, team, p)
+  sb.teams = proc (w: int): seq[SbTeam] {.closure.} =
+    result = @[]
+    for t in gBoards[board(w)].teams:
+      result.add SbTeam(name: t.name, displayName: t.displayName, friendlyFire: (t.options and 0x01'i8) != 0,
+                        seeFriendlyInvisibles: (t.options and 0x02'i8) != 0, nametagVisibility: ord(t.nametagVisibility),
+                        collisionRule: ord(t.collisionRule), color: ord(t.color), prefix: t.playerPrefix, suffix: t.playerSuffix,
+                        players: t.players)
