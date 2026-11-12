@@ -390,8 +390,10 @@ def partsb_session(m, c, st, w, biomes, ctx, args):
         settle(0.5)
         mark = len(spawned)
         cmd('summon minecraft:ender_dragon ~ ~12 ~')
-        wait(lambda: len(spawned) > mark, 'the dragon to be added', 15.0)
-        dragon = spawned[mark]
+        def above():
+            return [e for e in spawned[mark:] if abs(e[3] - (w.pos[1] + 12.0)) < 1.0 and abs(e[2] - w.pos[0]) < 1.0]
+        wait(lambda: above(), 'the dragon to be added', 15.0)
+        dragon = above()[0]
         print('  dragon: entity %d type %d at %.1f %.1f %.1f' % dragon, flush=True)
         st.hit('dragon_spawned')
         # No selector reaches a mob (the command world lists players only), so the bot goes to the dragon and hits it.
