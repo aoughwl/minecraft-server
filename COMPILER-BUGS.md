@@ -594,13 +594,13 @@ proc main =
 main()
 ```
 
-## Nested call fails type inference where the same call bound to a name works
+## `withEntity(source, entity)` fails type inference in savelistkilltest
 
-`executeInput(d, "kill", withEntity(source, entity)).value` gave `Type mismatch at [position]`
-(src/server/command/savelistkilltest.aowl, argument position of the inner call), although
-`let s = withEntity(source, entity)` followed by `executeInput(d, "kill", s)` compiles and
-passes. Found by splitting the expression; the cause in the frontend is not isolated. Workaround:
-bind intermediate calls to names.
+`src/server/command/savelistkilltest.aowl` (the `/kill` block) fails with
+`Type mismatch at [position]` at the call `withEntity(source, entity)`, although `withEntity`
+takes a CommandSource and a CommandEntity and both arguments have those types. Binding the
+call to a name does not help (an earlier note here claimed it did; that was wrong). The test now
+no longer builds a source with an entity: `newCommandSource(..., entity, ...)` fails the same way, so the self-kill case is not covered there. Cause not isolated (suspect the `entity` value or its closure fields).
 
 ## `case` over distinct integer constants passes `check` but fails in gcc
 

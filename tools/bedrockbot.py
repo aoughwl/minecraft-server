@@ -470,16 +470,20 @@ def play_phase(bot, args):
     tick = 0
     while time.time() < deadline:
         try:
-            pid, body = bot.next_game(2.0)
+            pid, body = bot.next_game(0.5 if initialized else 2.0)
         except Fail:
-            if initialized:
-                break
-            continue
-        if pid == 11:
+            if initialized and time.time() >= next_move and not sent_chat:
+                pid, body = None, b''   # nothing is coming: go on with the script
+            else:
+                continue
+        if pid is None:
+            pass
+        elif pid == 11:
             got['start'] = True
             _, p = read_varuint(body, 0)                       # unique id (zigzag VarLong)
             runtime, p = read_varuint(body, p)
-            pos = struct.unpack('<fff', body[p + 1:p + 13]) if False else None
+            _, p = read_varuint(body, p)                       # gamemode (zigzag VarInt)
+            pos = struct.unpack('<fff', body[p:p + 12])
             print('      StartGame: runtime id %d (%d bytes)' % (runtime, len(body)))
             if not sent_radius:
                 sent_radius = True
@@ -510,15 +514,34 @@ def play_phase(bot, args):
             got['other'][pid] = got['other'].get(pid, 0) + 1
         if initialized and time.time() >= next_move and not sent_chat:
             # walk 2 blocks along +x over 10 inputs, then speak
+            got['start_pos'] = pos
             for i in range(10):
                 tick += 1
-                bot.send_game(144, auth_input((0.5 + 0.2 * (i + 1) + (args.x or 0), (args.y or 100.0) + 1.62, 0.5 + (args.z or 0)), 0.0, 0.0, tick, (0.2, 0.0, 0.0)))
+                # StartGame's position is the eye position, which is what PlayerAuthInput carries
+                bot.send_game(144, auth_input((pos[0] + 0.2 * (i + 1), pos[1], pos[2]), 0.0, 0.0, tick, (0.2, 0.0, 0.0)))
                 time.sleep(0.05)
+            got['end_pos'] = (pos[0] + 2.0, pos[1], pos[2])
+            print('      walked from (%.2f, %.2f, %.2f) to (%.2f, %.2f, %.2f)' % (pos + got['end_pos']), flush=True)
             msg = args.chat
             bot.send_game(9, bytes([0, 1, 1]) + bstr(args.name) + bstr(msg) + bstr('') + bstr('') + bytes([0]))
             if args.command:
                 bot.send_game(77, bstr(args.command) + bstr('player') + b'\x00' * 16 + bstr('1') + struct.pack('<q', -1) + bytes([0]) + bstr('1'))
             sent_chat = True
+            print('      sent chat', flush=True)
+            hold_end = time.time() + args.hold
+            while time.time() < hold_end:
+                try:
+                    pid, body = bot.next_game(0.3)
+                except Fail:
+                    continue
+                if pid == 9:
+                    got['texts'].append(body)
+                elif pid == 58:
+                    got['chunks'] += 1
+                elif pid == 12:
+                    got['players_seen'] = got.get('players_seen', 0) + 1
+                else:
+                    got['other'][pid] = got['other'].get(pid, 0) + 1
             quiet = time.time() + 2.0
             while time.time() < quiet:
                 try:
@@ -658,6 +681,10 @@ def run(args):
         check(got['chunks'] >= 9, 'LevelChunk (58) packets received: %d' % got['chunks'])
         check(got['publisher'] >= 1, 'NetworkChunkPublisherUpdate (121) received')
         check(got['spawn'], 'PlayStatus PlayerSpawn received')
+        if args.expect_block:
+            check(got['other'].get(21, 0) >= 1, 'UpdateBlock (21) arrived for the block the console changed: %d' % got['other'].get(21, 0))
+        if got.get('players_seen') or got['other'].get(12):
+            print('      AddPlayer (12) for other players: %d' % (got.get('players_seen', 0) + got['other'].get(12, 0)))
         said = [t for t in got['texts'] if args.chat.encode() in t]
         check(said, 'the chat message came back as a Text packet (%d texts)' % len(got['texts']))
         if args.command:
@@ -693,6 +720,8 @@ def main():
     ap.add_argument('--radius', type=int, default=4)
     ap.add_argument('--chat', default='hello from the bedrock bot')
     ap.add_argument('--command', default='')
+    ap.add_argument('--expect-block', action='store_true', help='with --play: an UpdateBlock (21) must arrive while holding (a driver changes a block)')
+    ap.add_argument('--hold', type=float, default=0.0, help='with --play: stay this long after the chat (a driver can ask the server things)')
     ap.add_argument('--x', type=float, default=None)
     ap.add_argument('--y', type=float, default=None)
     ap.add_argument('--z', type=float, default=None)

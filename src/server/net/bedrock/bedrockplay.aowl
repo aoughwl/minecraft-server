@@ -3,7 +3,7 @@
 ## (pumpkin/src/world/mod.rs, pumpkin/src/server/mod.rs).
 ## PARTIAL: pumpkin/src/net/bedrock/play.rs - done: request chunk radius, set local player initialized, player auth input (movement, rotation, sprint/sneak/fly toggles, block actions: break and abort), animate (swing), text (chat), command request, modal form response and its event, interaction (ignored as upstream), container close, mob equipment (hotbar), use-item-on-block (place) and a held item that the client names, request ability. NOT done: `handle_inventory_action`'s legacy slot moves and drops and the use-item-on-entity / release-item transactions, `handle_item_stack_request` (the Bedrock container protocol: creative picks, crafting, chest and furnace screens), `handle_block_pick_request`, `handle_emote`, `handle_interaction`'s mouse-over/container opening, `handle_player_action` beyond break/abort/drop. A Bedrock player's inventory therefore cannot be changed from the Bedrock side yet beyond the hotbar slot and placing what the client holds.
 ## PARTIAL: pumpkin/src/net/bedrock/mod.rs - `enqueue_spawn_packet` (spawning a non-player entity for a Bedrock client) maps a Java entity to `CAddActor` with the Java registry name as the Bedrock identifier and no metadata; the plugin events `PacketReceivedEvent`, `ChunkSend` and `fire_packet_sent_no_obj` are not fired.
-## PARTIAL: pumpkin/src/world/mod.rs `spawn_bedrock_player` - no `CCraftingData` (recipes), no `CUpdateAttributes`, no `CPlayerList` skin for a Java player seen from Bedrock (a stock Steve skin is made up), no per-player metadata flags; the inventory is sent as the main inventory contents only.
+## PARTIAL: pumpkin/src/world/mod.rs `spawn_bedrock_player` - no `CCraftingData` (recipes), no `CUpdateAttributes`, no `CPlayerList` skin for a Java player seen from Bedrock (the stock Steve skin (`steve()`) is used), no per-player metadata flags; the inventory is sent as the main inventory contents only.
 ##
 ## HOW THE BEDROCK PLAYER LIVES IN THE WORLD. Upstream's `Player` holds a `ClientPlatform` that is Java or Bedrock. Here
 ## `Player.client` is a `JavaClient`, and everything that is Java (the tab list, spawning for the others, chat, the
@@ -22,13 +22,14 @@
 {.feature: "untyped".}
 
 import std/[options, tables, syncio, math]
-import ../../../protocol/[protobase, proto, netcodec, serial, varint, lpvector3d]
+import ../../../protocol/[protobase, proto, netcodec, serial, varint, lpvector3d, uuid]
 import ../../../protocol/bedrock/[bedrockmod, packet_decoder, network_item]
 import ../../../protocol/bedrock/client/[start_game, item_registry, creative_content, chunk_radius_update,
   network_chunk_publisher_update, play_status, set_time, set_spawn_position, add_player, remove_actor, move_player,
-  update_block, set_actor_data, update_abilities, level_chunk, inventory_content, add_actor, player_list, set_health,
-  modal_form_request, gamerules_changed, set_difficulty]
+  update_block, set_actor_data, update_abilities, level_chunk, inventory_content, add_actor, player_list,
+  modal_form_request, gamerules_changed, set_difficulty, common]
 import ../../../protocol/bedrock/client/disconnect_player as cdisc
+import ../../../protocol/bedrock/client/set_health as bset_health
 import ../../../protocol/bedrock/server/[player_auth_input, text, command_request, request_chunk_radius,
   set_local_player_as_initialized, modal_form_response, player_action, inventory_transaction, mob_equipment,
   container_close, animate, request_ability, client_cache_status]
@@ -36,11 +37,14 @@ import ../../../protocol/java/client/play/[system_chat_message, block_update, mu
   remove_entities, update_entity_pos, update_entity_pos_rot, entity_position_sync, player_position, disconnect,
   set_time as jset_time, teleport_entity, head_rot, chunk_batch_end, set_health as jset_health]
 import ../../../protocol/java/server/play/[player_position_rotation, player_action as jplayer_action, use_item_on,
-  set_held_item]
+  set_held_item, chat_command]
 import ../../../protocol/java/server/play/[confirm_teleport, chunk_batch]
 import ../../../generated/[entity_type, block_properties, item_full]
 import ../../../data/block_state
-import ../../../data/item_stack/mod as itemstackmod
+import "../../../data/item_stack/mod"
+import ../../../inventory/player_inventory
+import ../../../generated/bedrock_creative
+import ../winsock
 import ../../../util/math/position
 import ../../../util/vector3
 import ../../../util/vector2
@@ -52,6 +56,8 @@ import ../../../world/chunkdata
 import ../../../command/cmddispatch
 import ../../../command/cmdsource
 import ../../../plugin/api/events/player/bedrock_form_response
+import ../../../auth/winhttp
+import ../../../util/jwtmod
 import ../../logging
 import ../../serverbase
 import ../../servermod
@@ -91,7 +97,7 @@ type
     gone: bool
 
 var gSessions: seq[BedrockSession] = @[]
-var gServer: Server = nil
+var gServer: nil Server = nil
 
 type
   JavaIds = object
@@ -108,17 +114,17 @@ proc javaIds(): JavaIds =
       multiBlock: CMultiBlockUpdate.toId(v), spawnEntity: CSpawnEntity.toId(v), removeEntities: CRemoveEntities.toId(v),
       posUpdate: CUpdateEntityPos.toId(v), posRotUpdate: CUpdateEntityPosRot.toId(v), posSync: CEntityPositionSync.toId(v),
       playerPosition: CPlayerPosition.toId(v), disconnect: CPlayDisconnect.toId(v), setTime: CUpdateTime.toId(v),
-      teleport: CTeleportEntity.toId(v), headRot: CHeadRot.toId(v), batchEnd: CChunkBatchEnd.toId(v), health: CSetHealth.toId(v))
+      teleport: CTeleportEntity.toId(v), headRot: CHeadRot.toId(v), batchEnd: CChunkBatchEnd.toId(v), health: jset_health.CSetHealth.toId(v))
     gIdsReady = true
   gIds
 
-proc findSession(client: BedrockClient): BedrockSession =
+proc findSession(client: BedrockClient): nil BedrockSession =
   for s in gSessions:
     if s.client == client:
       return s
   nil
 
-proc sessionOfPlayer*(player: Player): BedrockSession =
+proc sessionOfPlayer*(player: Player): nil BedrockSession =
   ## The Bedrock session of a player, nil for a Java player.
   for s in gSessions:
     if s.player == player:
@@ -134,29 +140,14 @@ proc blockPosOf(v: int64): BlockPos = fromI64(v)
 proc sendText(s: BedrockSession; text: string) =
   s.client.sendGamePacket(STextPacketId, SText.systemMessage(text))
 
-proc defaultSkin(): Skin =
-  ## A made-up 64x64 solid skin: Java players have no Bedrock skin to show (`bedrock_skin` upstream). Unverified against a real client.
-  var data = newSeq[byte](64 * 64 * 4)
-  for i in 0 ..< 64 * 64:
-    data[i * 4] = 0x8B'u8
-    data[i * 4 + 1] = 0x6B'u8
-    data[i * 4 + 2] = 0x4A'u8
-    data[i * 4 + 3] = 0xFF'u8
-  var patch: seq[byte] = @[]
-  for c in "{\"geometry\":{\"default\":\"geometry.humanoid.custom\"}}":
-    patch.add(byte(c))
-  Skin(skinId: "Standard_Custom", playFabId: "", resourcePatch: patch, imageWidth: 64'u32, imageHeight: 64'u32, skinData: data,
-    animations: @[], capeWidth: 0'u32, capeHeight: 0'u32, capeData: @[], geometryData: @[], animationData: @[],
-    geometryDataEngineVersion: @[], capeId: "", fullId: "Standard_Custom", armSize: "wide", skinColor: "#0",
-    personaPieces: @[], pieceTintColors: @[], isPremium: false, isPersona: false, personaCapeOnClassic: false,
-    isPrimaryUser: false, overrideAppearance: false, isTrusted: true)
-
 proc spawnPlayerFor(s: BedrockSession; id: int32; uuid: Uuid; pos: Vector3[float64]; yaw, pitch: float32; name: string) =
   ## `bedrock_player_list` then `bedrock_add_player` for one player, as `spawn_bedrock_player` sends them to a Bedrock client.
   let entry = PlayerListEntry(uuid: uuid, entityUniqueId: newVarLong(int64(id)), username: name, xuid: "",
-    platformChatId: "", buildPlatform: 0'i32, skin: defaultSkin(), isTeacher: false, isHost: false, isSubClient: false,
+    platformChatId: "", buildPlatform: 0'i32, skin: steve(), isTeacher: false, isHost: false, isSubClient: false,
     playerColor: [0'u8, 0'u8, 0'u8, 0'u8])
-  s.client.sendGamePacket(CPlayerListPacketId, CPlayerList(action: CPlayerListActionAdd, entries: @[entry]))
+  var listBody = newNetWriter()
+  if packetWrite(CPlayerList(action: CPlayerListActionAdd, entries: @[entry]), listBody).isOk:
+    s.client.sendGameBody(CPlayerListPacketId, listBody.buf)
   var metadata = newEntityMetadata()
   let add = newCAddPlayer(uuid, name, newVarULong(uint64(id)), "",
     Vector3[float32](x: float32(pos.x), y: float32(pos.y + EyeHeight), z: float32(pos.z)),
@@ -165,7 +156,9 @@ proc spawnPlayerFor(s: BedrockSession; id: int32; uuid: Uuid; pos: Vector3[float
     AbilityData(entityUniqueId: int64(id), playerPermissions: 0'u8, commandPermissions: 0'u8, layers: @[AbilityLayer(
       serializedLayer: 0'u16, abilitiesSet: 0'u32, abilityValue: 0'u32, flySpeed: 0.05'f32, verticalFlySpeed: 0.05'f32,
       walkSpeed: 0.1'f32)]), @[], "", 0'i32)
-  s.client.sendGamePacket(CAddPlayerPacketId, add)
+  var body = newNetWriter()
+  if packetWrite(add, body).isOk:
+    s.client.sendGameBody(CAddPlayerPacketId, body.buf)
 
 proc moveTo(s: BedrockSession; id: int32; k: KnownEntity) =
   if k.isPlayer:
@@ -178,7 +171,8 @@ proc angleDegrees(b: uint8): float32 = float32(b) * 360.0'f32 / 256.0'f32
 proc translateJava(s: BedrockSession; data: seq[byte]) =
   ## One Java packet the stand-in was given (id then body), as the Bedrock packet that says the same. Anything not named
   ## here is dropped: it is what a Java client alone needs (login, chunks, inventory windows, the tab list, keep alive).
-  if s.gone:
+  if s.gone or not s.started:
+    # Nothing is said to a client that has not been given StartGame; the join sends it all again as the world.
     return
   var r = newNetReader(data)
   let idr = getVarInt(r)
@@ -234,6 +228,8 @@ proc translateJava(s: BedrockSession; data: seq[byte]) =
     let pos = Vector3[float64](x: x.value, y: y.value, z: z.value)
     let entityId = eid.value.value
     if uint16(typ.value.value) == playerType.id:
+      info("Bedrock: spawning player entity " & $entityId & " for Bedrock client " & s.player.gameprofile.name, PlayTarget)
+    if uint16(typ.value.value) == playerType.id:
       let name = block:
         var found = ""
         for p in s.world.players:
@@ -258,7 +254,9 @@ proc translateJava(s: BedrockSession; data: seq[byte]) =
           yaw: angleDegrees(yaw.value), headYaw: angleDegrees(headYaw.value), bodyYaw: angleDegrees(yaw.value), attributes: @[],
           metadata: newEntityMetadata(), syncedProperties: PropertySyncData(intProperties: @[], floatProperties: @[]),
           links: @[])
-        s.client.sendGamePacket(CAddActorPacketId, add)
+        var body = newNetWriter()
+        if packetWrite(add, body).isOk:
+          s.client.sendGameBody(CAddActorPacketId, body.buf)
   elif id == ids.removeEntities:
     let count = getVarInt(r)
     if count.isOk:
@@ -276,7 +274,7 @@ proc translateJava(s: BedrockSession; data: seq[byte]) =
     let dz = getI16Be(r)
     if not (eid.isOk and dx.isOk and dy.isOk and dz.isOk) or not s.known.hasKey(eid.value.value):
       return
-    var k = s.known[eid.value.value]
+    var k = s.known.getOrDefault(eid.value.value)
     k.pos = Vector3[float64](x: k.pos.x + float64(dx.value) / 4096.0, y: k.pos.y + float64(dy.value) / 4096.0,
       z: k.pos.z + float64(dz.value) / 4096.0)
     if id == ids.posRotUpdate:
@@ -299,7 +297,7 @@ proc translateJava(s: BedrockSession; data: seq[byte]) =
     let pitch = getF32Be(r)
     if not (eid.isOk and x.isOk and y.isOk and z.isOk and yaw.isOk and pitch.isOk) or not s.known.hasKey(eid.value.value):
       return
-    var k = s.known[eid.value.value]
+    var k = s.known.getOrDefault(eid.value.value)
     k.pos = Vector3[float64](x: x.value, y: y.value, z: z.value)
     k.yaw = yaw.value
     k.pitch = pitch.value
@@ -311,12 +309,12 @@ proc translateJava(s: BedrockSession; data: seq[byte]) =
   elif id == ids.health:
     let health = getF32Be(r)
     if health.isOk:
-      s.client.sendGamePacket(CSetHealthPacketId, CSetHealth(health: newVarInt(int32(health.value))))
+      s.client.sendGamePacket(CSetHealthPacketId, bset_health.CSetHealth(health: newVarInt(int32(health.value))))
   elif id == ids.headRot:
     let eid = getVarInt(r)
     let yaw = getU8(r)
     if eid.isOk and yaw.isOk and s.known.hasKey(eid.value.value):
-      var k = s.known[eid.value.value]
+      var k = s.known.getOrDefault(eid.value.value)
       k.headYaw = angleDegrees(yaw.value)
       s.known[eid.value.value] = k
       s.moveTo(eid.value.value, k)
@@ -397,7 +395,7 @@ proc levelSettings(s: BedrockSession): LevelSettings =
     educationProductId: "", rainLevel: world.weather.rainLevel, lightningLevel: world.weather.thunderLevel,
     hasConfirmedPlatformLockedContent: false, wasMultiplayerIntended: true, wasLanBroadcastingIntended: true,
     xboxLiveBroadcastSetting: gpsPublic, platformBroadcastSetting: gpsPublic, commandsEnabled: info.allowCommands,
-    isTexturePacksRequired: false, ruleData: GameRules(), experiments: Experiments(namesSize: 0'u32, experimentsEverToggled: false),
+    isTexturePacksRequired: false, ruleData: GameRules(listSize: newVarUInt(0'u32)), experiments: Experiments(namesSize: 0'u32, experimentsEverToggled: false),
     bonusChest: false, hasStartWithMapEnabled: false,
     permissionLevel: newVarInt(2'i32), # TODO upstream: Bedrock permission levels are different
     serverSimulationDistance: int32(bedrock.simulationDistance), hasLockedBehaviorPack: false, hasLockedResourcePack: false,
@@ -436,7 +434,8 @@ proc sendWorld(s: BedrockSession) =
         of bivNone: 2'i32), componentData: b.definitionComponents))
   s.client.sendGamePacket(CItemRegistryPacketId, CItemRegistry(items: items))
   var groups: seq[Group] = @[]
-  for g in creativeGroups():
+  let creativeGroupList = creativeGroups()
+  for g in creativeGroupList:
     let category = case g.category
       of 1: ccConstruction
       of 2: ccNature
@@ -451,7 +450,8 @@ proc sendWorld(s: BedrockSession) =
     groups.add(Group(creativeCategory: category, name: g.name, iconItem: icon))
   var entries: seq[Entry] = @[]
   var n = 0'u32
-  for e in creativeEntries():
+  let creativeEntryList = creativeEntries()
+  for e in creativeEntryList:
     n += 1'u32
     var item = defaultNetworkItemDescriptor()
     item = NetworkItemDescriptor(id: newVarInt(int32(e.itemId)), stackSize: 1'u16, auxValue: newVarUInt(e.itemAuxValue),
@@ -459,6 +459,12 @@ proc sendWorld(s: BedrockSession) =
     entries.add(Entry(id: newVarUInt(n), item: item, groupIndex: newVarUInt(e.groupIndex)))
   s.client.sendGamePacket(CCreativeContentPacketId, CCreativeContent(groups: groups, entries: entries))
   s.client.sendGamePacket(CSetTimePacketId, newCSetTime(int32(world.levelTime.timeOfDay mod 24000'i64)))
+  var slots: seq[NetworkItemStackDescriptor] = @[]
+  for stack in player.inventory.mainInventory:
+    slots.add(networkItemStackDescriptorFromItemStack(stack))
+  s.client.sendGamePacket(CInventoryContentPacketId, CInventoryContent(containerId: newVarUInt(0'u32), slots: slots,
+    fullContainerName: FullContainerName(containerName: cnInventory, dynamicId: none[uint32]()),
+    storageItem: defaultNetworkItemStackDescriptor()))
   s.started = true
 
 proc onResourcePacksCompleted(ctx: BedrockContext; client: BedrockClient): bool =
@@ -541,7 +547,7 @@ proc handleBlockAction(s: BedrockSession; pos: BlockPos; actionType: PlayerActio
   ## `handle_player_action`, whose digging arms are Java's `handle_player_action` with the status renumbered.
   let (known, status) = javaStatusOf(actionType)
   if known and s.player.hasClientLoaded():
-    s.ghost.handlePlayerAction(s.player, SPlayerAction(status: newVarInt(status), position: pos, face: uint8(face), sequence: newVarInt(0'i32)),
+    s.ghost.handlePlayerAction(s.player, jplayer_action.SPlayerAction(status: newVarInt(status), position: pos, face: uint8(face), sequence: newVarInt(0'i32)),
       s.server)
 
 proc handleAuthInput(s: BedrockSession; packet: SPlayerAuthInput) =
@@ -599,7 +605,7 @@ proc handleUseItemTransaction(s: BedrockSession; data: UseItemTransactionData) =
     if mapped != nil:
       let held = player.inventory.heldItem()
       if held.isEmpty() or held.item.id != mapped.javaItem.id:
-        player.inventory.setSelectedStack(newItemStack(int32(desc.stackSize), mapped.javaItem))
+        player.inventory.setHeldItem(newItemStack(uint8(desc.stackSize), mapped.javaItem))
   let face = case data.blockFace
     of 0: 0'i32
     of 2: 2'i32
@@ -657,7 +663,7 @@ proc onPlayPacket(client: BedrockClient; packet: RawPacket) =
     let p = packetRead(SMobEquipment, r)
     if p.isOk: s.handleMobEquipment(p.value)
   of SPlayerActionPacketId:
-    let p = packetRead(SPlayerAction, r)
+    let p = packetRead(player_action.SPlayerAction, r)
     if p.isOk: s.handleBlockAction(p.value.blockPos, p.value.action, p.value.face.value)
   of SAnimatePacketId:
     let p = packetRead(SAnimate, r)
@@ -688,6 +694,26 @@ proc sendBedrockForm*(player: Player; formData: string): uint32 =
   let id = s.client.nextFormId
   s.client.sendGamePacket(CModalFormRequestPacketId, CModalFormRequest(formId: newVarInt(int32(id)), formData: formData))
   id
+
+proc fetchBedrockOidc*(ctx: BedrockContext) =
+  ## `Server::new`'s fetch of the Xbox OIDC discovery document and its JWKS for `bedrock_oidc_keys`, which the online-mode login
+  ## verifies the client's token against. One blocking pass at startup, as upstream awaits it; a failure is logged and the keys
+  ## stay unset, so a full login is refused with "OIDC keys not initialized" until the server is restarted. (A Bedrock server
+  ## that stays up for days would want a refresh: upstream does not do one either.)
+  if not ctx.config.onlineMode or not ctx.config.authentication.enabled:
+    return
+  let httpGet = proc(url: string; connectMs, readMs: uint32): (bool, string) {.closure.} =
+    let res = winHttpGet(url, int(connectMs), int(readMs))
+    (res.ok and res.status >= 200 and res.status < 300, res.body)
+  let fetched = fetchOidcJwks(httpGet, ctx.config.authentication.url, ctx.config.authentication.connectTimeout,
+    ctx.config.authentication.readTimeout)
+  if fetched.isOk:
+    let (issuer, jwks) = fetched.value
+    ctx.oidcIssuer = issuer
+    ctx.oidcJwks = some(jwks)
+    info("Bedrock: fetched the Xbox OIDC keys", PlayTarget)
+  else:
+    error("Bedrock: could not fetch the Xbox OIDC keys: " & fetched.error.detail, PlayTarget)
 
 # --- the loop ----------------------------------------------------------------------------------------------------------
 

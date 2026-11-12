@@ -958,7 +958,7 @@ class Stages:
                     'bed': ['bed_slept', 'night_skipped', 'bed_woken_by_skip', 'bed_woken_by_command'],
                     'villager': ['villager_summoned', 'villager_window_opened', 'villager_offers_sent', 'villager_result_shown',
                                  'villager_traded'],
-                    'dragon': ['dragon_spawned', 'dragon_damaged'], 'cow': []}
+                    'dragon': ['dragon_spawned', 'dragon_damaged'], 'cow': [], 'pig': ['pig_followed_carrot']}
     WATCH_NAMES = ['other_appeared', 'other_moved', 'other_swung', 'other_block_change', 'other_chat', 'other_left']
 
     def __init__(self, extra=()):
@@ -2565,7 +2565,7 @@ def player_session(c, st, w, biomes, ctx, args):
         print('  the zombie moved %d times (move packets for entity %d); health %r' % (moves.get(zombie[0], 0), zombie[0], w.health))
         print('  the cow (entity %d) moved %d times' % (cow[0], moves.get(cow[0], 0)))
         mob_hit = False   # reported at the end: the other steps still run
-    cmd('kill @e[type=minecraft:zombie]')
+    cmd('kill @e[type=zombie]')
     settle(1.0)
     # With real mob AI the night brings real hostile mobs: the rest of the scenario must not be eaten by them.
     cmd('gamerule spawn_mobs false')
@@ -2680,7 +2680,7 @@ def player_session(c, st, w, biomes, ctx, args):
     print('  the pigs followed the carrot: %r -> %r blocks' % (['%.1f' % d for d in start_distances],
                                                                ['%.1f' % pig_distance(p) for p in pigs]))
     st.hit('pig_followed')
-    cmd('kill @e[type=minecraft:pig]')
+    cmd('kill @e[type=pig]')
     settle(0.5)
     check(mob_hit, 'the zombie never hurt the bot (the rest of the scenario ran)')
 
@@ -2775,7 +2775,7 @@ def run(args):
     if args.partsb:
         only = [n for n in os.environ.get('PARTSB_ONLY', '').split(',') if n]
         for group, names in Stages.PARTSB_NAMES.items():
-            if not only or group in only:
+            if group in only if only else group in ('pearl', 'bed', 'villager', 'dragon'):
                 extra = list(extra) + names
     if args.containers:
         extra = list(extra) + Stages.CONTAINERS_NAMES

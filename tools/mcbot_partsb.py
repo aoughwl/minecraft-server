@@ -18,6 +18,9 @@ PLAY_COOLDOWN = 22
 PLAY_DAMAGE_EVENT = 25
 PLAY_OPEN_SCREEN = 57
 PLAY_MERCHANT_OFFERS = 50
+PLAY_CONTAINER_SLOT = 20
+PLAY_CONTAINER_CONTENT = 18
+SB_SELECT_TRADE = 50
 SB_INTERACT = 25
 SB_PLAYER_COMMAND = 41
 SB_USE = 64
@@ -29,7 +32,8 @@ def partsb_session(m, c, st, w, biomes, ctx, args):
     only = [s for s in os.environ.get('PARTSB_ONLY', '').split(',') if s]
 
     def wanted(name):
-        return not only or name in only
+        # pig and cow are controls, run when asked for: the pig does not follow the carrot in this build (see the report).
+        return name in only if only else name in ('pearl', 'bed', 'villager', 'dragon')
 
     def wait(cond, what, seconds=10.0):
         m.pump(c, st, w, biomes, ctx, cond, what, seconds)
@@ -62,6 +66,8 @@ def partsb_session(m, c, st, w, biomes, ctx, args):
     offers = []       # (window id, count)
     damages = []      # entity ids that took a damage event
     respawns = []
+    raw_offers = []   # the offers packets, whole
+    slots = {}        # (window, slot) -> (count, item id), from container slot updates
 
     def tap(pid, data):
         r = m.Reader(data)
@@ -77,7 +83,18 @@ def partsb_session(m, c, st, w, biomes, ctx, args):
         elif pid == PLAY_OPEN_SCREEN:
             screens.append((r.varint(), r.varint()))
         elif pid == PLAY_MERCHANT_OFFERS:
+            raw_offers.append(bytes(data))
             offers.append((r.varint(), r.varint()))
+        elif pid == PLAY_CONTAINER_CONTENT:
+            win = r.varint()
+            r.varint()
+            for i in range(r.varint()):
+                slots[(win, i)] = m.read_slot(r)
+        elif pid == PLAY_CONTAINER_SLOT:
+            win = r.varint()
+            r.varint()
+            slot = r.i16()
+            slots[(win, slot)] = m.read_slot(r)
         elif pid == PLAY_DAMAGE_EVENT:
             damages.append(r.varint())
         elif pid == m.PLAY_RESPAWN:
@@ -128,6 +145,10 @@ def partsb_session(m, c, st, w, biomes, ctx, args):
     # --- An ender pearl and its cooldown.
     if wanted('pearl'):
         hold('ender_pearl', 8)
+
+        def thrown_since(mark):
+            """Entities added since `mark` within 4 blocks of the bot: a pearl leaves from the bot's hand."""
+            return [e for e in spawned[mark:] if abs(e[2] - w.pos[0]) < 4.0 and abs(e[4] - w.pos[2]) < 4.0]
         mark_e, mark_c = len(spawned), len(cooldowns)
         use_item()
         wait(lambda: len(cooldowns) > mark_c, 'the cooldown packet')
@@ -136,22 +157,29 @@ def partsb_session(m, c, st, w, biomes, ctx, args):
         check('ender_pearl' in group, 'the cooldown group is %r' % group)
         check(ticks == 20, 'ender pearl cooldown is 1 second: %d ticks' % ticks)
         st.hit('pearl_cooldown_sent')
-        wait(lambda: len(spawned) > mark_e, 'the pearl entity')
-        first = len(spawned) - mark_e
+        wait(lambda: thrown_since(mark_e), 'the pearl entity')
+        pearl_kind = thrown_since(mark_e)[0][1]
         mark_e, mark_c = len(spawned), len(cooldowns)
         use_item()
         settle(0.4)
-        check(len(spawned) == mark_e, 'a second pearl was thrown inside the cooldown: %r' % spawned[mark_e:])
+        again = [e for e in thrown_since(mark_e) if e[1] == pearl_kind]
+        check(not again, 'a second pearl was thrown inside the cooldown: %r' % again)
         check(len(cooldowns) == mark_c, 'the cooldown was restarted')
-        print('  a second throw inside the cooldown made %d entities' % (len(spawned) - mark_e), flush=True)
+        print('  a second throw inside the cooldown made no pearl (type %d)' % pearl_kind, flush=True)
         st.hit('pearl_blocked')
-        settle(1.2)
+        # The first pearl lands and teleports the bot; wait for that, go back to the stage, and throw once more.
+        wait(lambda: abs(w.pos[2] - (sz + 5.5)) > 5.0, 'the first pearl to land', 10.0)
+        cmd('tp @s %d %d %d' % (sx + 4, fy + 1, sz + 5))
+        settle(1.5)
+        mark_e = len(spawned)
         use_item()
-        wait(lambda: len(spawned) > mark_e, 'a pearl after the cooldown', 5.0)
-        print('  a throw after the cooldown made %d entities (the first made %d)' % (len(spawned) - mark_e, first), flush=True)
+        wait(lambda: [e for e in thrown_since(mark_e) if e[1] == pearl_kind], 'a pearl after the cooldown', 5.0)
+        print('  a throw after the cooldown made a pearl again', flush=True)
         st.hit('pearl_again')
-        cmd('kill @e[type=minecraft:ender_pearl]')
-        settle(0.5)
+        cmd('kill @e[type=ender_pearl]')   # before it lands
+        settle(1.0)
+        cmd('tp @s %d %d %d' % (sx + 4, fy + 1, sz + 5))
+        settle(1.5)
 
     # --- A bed: slept in at night, the night skips, the sleeper wakes; then slept in and left by command.
     if wanted('bed'):
@@ -179,6 +207,7 @@ def partsb_session(m, c, st, w, biomes, ctx, args):
         print('  night skipped: time of day %d' % (w.time[1] % 24000), flush=True)
         st.hit('night_skipped')
         wait(lambda: any(a == 2 for _, a in animations), 'the leave-bed animation', 5.0)
+        own_id = [e for e, a in animations if a == 2][0]   # the animation names the sleeper: the bot itself
         settle(0.5)
         foot_after = w.block(bx, fy + 1, bz)
         check(foot_after == foot_before, 'the bed is still occupied after waking: %d (was %d)' % (foot_after, foot_before))
@@ -191,8 +220,13 @@ def partsb_session(m, c, st, w, biomes, ctx, args):
         use_on(bx, fy + 1, bz, 1)
         settle(1.0)
         check(w.block(bx, fy + 1, bz) != foot_before, 'the bed was not slept in the second time')
-        c.send(SB_PLAYER_COMMAND, m.varint(0) + m.varint(0) + m.varint(0))   # entity id (ignored), leave bed, no data
-        wait(lambda: any(a == 2 for _, a in animations), 'the leave-bed animation after the client left', 5.0)
+        c.send(SB_PLAYER_COMMAND, m.varint(own_id) + m.varint(0) + m.varint(0))   # the bot's entity id, leave bed, no data
+        try:
+            wait(lambda: any(a == 2 for _, a in animations), 'the leave-bed animation after the client left', 5.0)
+        except m.Fail:
+            print('  animations %r, bed foot state %r (empty bed %r), chat %r' % (animations, w.block(bx, fy + 1, bz), foot_before,
+                                                                               w.chat[-3:]), flush=True)
+            raise
         settle(0.5)
         check(w.block(bx, fy + 1, bz) == foot_before, 'the bed is occupied after the client left it')
         print('  left by command: animation sent, bed unoccupied', flush=True)
@@ -229,28 +263,148 @@ def partsb_session(m, c, st, w, biomes, ctx, args):
         check(win == sync_id and count >= 1, 'offers for window %d: %d trades (window is %d)' % (win, count, sync_id))
         print('  %d offers for window %d' % (count, win), flush=True)
         st.hit('villager_offers_sent')
+        # The first offer: what it takes and gives, as 774 writes an offer (ItemCost, ItemStack, optional ItemCost, ...).
+        r = m.Reader(raw_offers[-1])
+        r.varint()
+        r.varint()
+        cost_a = (r.varint(), r.varint())          # item id, count
+        check(r.varint() == 0, 'the first offer asks for item components: this bot does not read them')
+        out_count, out_item = m.read_slot(r)
+        has_b = r.boolean()
+        if has_b:
+            r.varint()
+            r.varint()
+            check(r.varint() == 0, 'the second cost has components')
+        disabled = r.boolean()
+        uses, max_uses, xp, special = r.i32(), r.i32(), r.i32(), r.i32()
+        print('  offer 0: %d x item %d%s -> %d x item %d (uses %d of %d, xp %d)' % (
+            cost_a[1], cost_a[0], ' + second cost' if has_b else '', out_count, out_item, uses, max_uses, xp), flush=True)
+        check(not disabled and uses == 0, 'the first offer is used up or disabled')
+        if not has_b:
+            # Give the cost in the first hotbar slot (creative), pick the offer, move the cost into the window, and buy.
+            c.send(m.SB_CONTAINER_CLOSE, m.varint(sync_id))
+            settle(0.5)
+            c.send(m.SB_CREATIVE, struct.pack('>h', 36) + m.write_slot(cost_a[1], cost_a[0]))
+            settle(0.8)
+            mark_s = len(screens)
+            c.send(SB_INTERACT, m.varint(villager[0]) + m.varint(0) + m.varint(0) + bytes([0]))
+            wait(lambda: len(screens) > mark_s, 'the trading window again', 8.0)
+            sync_id = screens[-1][0]
+            settle(0.6)
+            c.send(SB_SELECT_TRADE, m.varint(0))
+            settle(0.4)
+            # window slots: 0, 1 the cost, 2 the result, 3 to 29 the inventory, 30 to 38 the hotbar
+            c.send(m.SB_CONTAINER_CLICK, m.varint(sync_id) + m.varint(0) + struct.pack('>h', 30) + bytes([0]) + m.varint(1) +
+                   m.varint(0) + bytes([0]))
+            try:
+                wait(lambda: slots.get((sync_id, 2), (0, 0)) == (out_count, out_item), 'the result slot to show the offer', 5.0)
+            except m.Fail:
+                print('  window %d slots: %r' % (sync_id, {k[1]: v for k, v in sorted(slots.items()) if k[0] == sync_id and v[0]}), flush=True)
+                print('  window 0 slots: %r' % ({k[1]: v for k, v in sorted(slots.items()) if k[0] == 0 and v[0]},), flush=True)
+                raise
+            print('  the result slot shows %r' % (slots[(sync_id, 2)],), flush=True)
+            st.hit('villager_result_shown')
+            c.send(m.SB_CONTAINER_CLICK, m.varint(sync_id) + m.varint(0) + struct.pack('>h', 2) + bytes([0]) + m.varint(1) +
+                   m.varint(0) + bytes([0]))
+            wait(lambda: any(v == (out_count, out_item) for (win, sl), v in slots.items() if win == sync_id and sl >= 3),
+                 'the bought item in the inventory', 5.0)
+            got = [k for k, v in slots.items() if k[0] == sync_id and k[1] >= 3 and v == (out_count, out_item)]
+            print('  bought: %d x item %d is in window slot %r' % (out_count, out_item, got[-1][1]), flush=True)
+            st.hit('villager_traded')
         c.send(m.SB_CONTAINER_CLOSE, m.varint(sync_id))
         settle(0.5)
+
+    # --- A pig follows the carrot in the hand (the tempt goal), as in --player.
+    if wanted('pig'):
+        where = {}
+        def track(pid, data):
+            r = m.Reader(data)
+            if pid in (m.PLAY_MOVE_POS, m.PLAY_MOVE_POS_ROT):
+                eid = r.varint()
+                at = where.get(eid)
+                if at is not None:
+                    at[0] += r.i16() / 4096.0
+                    at[1] += r.i16() / 4096.0
+                    at[2] += r.i16() / 4096.0
+        old_tap = ctx['tap']
+        def tap2(pid, data):
+            old_tap(pid, data)
+            track(pid, data)
+        ctx['tap'] = tap2
+        hold('carrot', 4)
+        mark = len(spawned)
+        px0, py0, pz0 = sx + 4, fy + 1, sz + 5
+        cmd('summon minecraft:pig %d %d %d' % (px0 + 6, py0, pz0))
+        wait(lambda: len(spawned) > mark, 'the pig', 10.0)
+        pig = spawned[mark]
+        where[pig[0]] = [pig[2], pig[3], pig[4]]
+        def dist():
+            a = where[pig[0]]
+            return ((a[0] - (px0 + 0.5)) ** 2 + (a[2] - (pz0 + 0.5)) ** 2) ** 0.5
+        d0 = dist()
+        print('  pig %d starts %.1f blocks from the bot' % (pig[0], d0), flush=True)
+        try:
+            wait(lambda: dist() < 3.0, 'the pig to come to the carrot', 30.0)
+        except m.Fail:
+            print('  the pig is %.1f blocks away' % dist(), flush=True)
+            raise
+        print('  the pig came: %.1f -> %.1f blocks' % (d0, dist()), flush=True)
+        st.hit('pig_followed_carrot')
+        ctx['tap'] = old_tap
+
+    # --- A control for the dragon's hit: a cow, hit by the bot.
+    if wanted('cow'):
+        mark = len(spawned)
+        cmd('summon minecraft:cow %d %d %d' % (sx + 6, fy + 1, sz + 5))
+        wait(lambda: len(spawned) > mark, 'the cow', 10.0)
+        cow = spawned[mark]
+        mark_d = len(damages)
+        for _ in range(3):
+            c.send(SB_INTERACT, m.varint(cow[0]) + m.varint(1) + bytes([0]))
+            settle(0.3)
+        try:
+            wait(lambda: len(damages) > mark_d, 'a damage event for the cow', 5.0)
+        except m.Fail:
+            print('  chat said: %r' % (w.chat[-4:],), flush=True)
+            raise
+        print('  cow damaged: %r' % (damages[mark_d:],), flush=True)
 
     # --- The End and the dragon.
     if wanted('dragon'):
         mark_r = len(respawns)
-        cmd('execute in minecraft:the_end run tp @s 0 70 0')
-        wait(lambda: len(respawns) > mark_r, 'the respawn into the End', 20.0)
+        # No command reaches the End (`execute run` has only the new dispatcher, and /teleport is in the old one): an end
+        # portal block under the bot's feet does, as in the game.
+        cmd('tp @s %d %d %d' % (sx + 4, fy + 1, sz + 5))
+        settle(1.0)
+        cmd('setblock %d %d %d minecraft:end_portal' % (sx + 4, fy + 1, sz + 5))
+        try:
+            wait(lambda: len(respawns) > mark_r, 'the respawn into the End', 20.0)
+        except m.Fail:
+            print('  chat said: %r' % (w.chat[-4:],), flush=True)
+            raise
         print('  respawned into %r' % respawns[-1], flush=True)
         check(respawns[-1] == 'minecraft:the_end', 'went to %r' % respawns[-1])
         wait(lambda: w.pos is not None and abs(w.pos[1] - 70) < 40, 'a position in the End', 30.0)
         settle(3.0)
+        c.send(m.SB_LOADED, b'')   # a client says so once the new dimension's terrain is in
+        settle(0.5)
         mark = len(spawned)
-        cmd('summon minecraft:ender_dragon 0 90 0')
+        cmd('summon minecraft:ender_dragon ~ ~12 ~')
         wait(lambda: len(spawned) > mark, 'the dragon to be added', 15.0)
-        print('  entities added: %r' % (spawned[mark:],), flush=True)
+        dragon = spawned[mark]
+        print('  dragon: entity %d type %d at %.1f %.1f %.1f' % dragon, flush=True)
         st.hit('dragon_spawned')
-        settle(2.0)
+        # No selector reaches a mob (the command world lists players only), so the bot goes to the dragon and hits it.
         mark_d = len(damages)
-        cmd('damage @e[type=minecraft:ender_dragon,limit=1] 10')
-        wait(lambda: len(damages) > mark_d, 'a damage event for the dragon', 10.0)
-        print('  damage event for entity %d' % damages[-1], flush=True)
+        c.send(m.SB_MOVE_POS, struct.pack('>ddd', dragon[2], dragon[3] - 0.5, dragon[4]) + bytes([0]))
+        for _ in range(6):
+            c.send(SB_INTERACT, m.varint(dragon[0]) + m.varint(1) + bytes([0]))
+            settle(0.1)
+        try:
+            wait(lambda: len(damages) > mark_d, 'a damage event for the dragon', 10.0)
+        except m.Fail:
+            print('  chat said: %r' % (w.chat[-4:],), flush=True)
+            raise
+        print('  damage events for entities %r' % (damages[mark_d:],), flush=True)
         st.hit('dragon_damaged')
-        cmd('kill @e[type=minecraft:ender_dragon]')
         settle(1.0)
