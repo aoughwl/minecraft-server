@@ -1,0 +1,517 @@
+## The second half of the `player` and `java-player` resources of pumpkin/src/plugin/loader/wasm/wasm_host/wit/v0_1/player.rs
+## (pumpkin-wasm-host-v0_1/src/player.rs in the newer tree for the methods the pinned host lacks): the methods that
+## write a packet or keep a little state of their own. witplayer.aowl calls `installPlayerMore` at the end of
+## `installPlayer`. See that file's PARTIAL line for what is still not provided.
+##
+## State the server has no field for (permission overrides, cooldowns, movement lock, freeze ticks, hidden players,
+## per-player time and weather) is kept here, per entity id; a plugin sees it back, the rest of the server does not
+## read it (see the PARTIAL line).
+import std/[options, tables, syncio, strutils, math]
+import ../wasm/[component, canonabi]
+import ../../command/cmdsource
+import ../../protocol/proto
+import ../../protocol/varint
+import ../../protocol/java/client/play/[tab_list, hurt_animation, block_update, open_sign_editor, server_links,
+  item_cooldown, player_spawn_position, entity_velocity, set_camera]
+import ../../protocol/java/client/play/particle as particlepkt
+import ../../generated/sound as soundtable
+import ../../generated/particle as particletable
+import ../../generated/statistic
+import ../../generated/damage_type
+import ../../util/math/position
+import ../../util/vector3
+import ../../util/text/text
+import ../../server/serverbase
+import ../../server/net/netbase
+import ../../server/net/java/javamod
+import ../../server/entity/entitymod
+import ../../server/entity/player as playermod
+import ../../server/entity/player/statistics
+import ../../server/world/worldmod
+import witstate, witserver
+
+proc gone(): string = "player is gone"
+
+type
+  Cooldown = object
+    expires: int64
+    total: int64
+
+var
+  gPermOverrides*: Table[int32, Table[string, bool]] = initTable[int32, Table[string, bool]]()
+  gCooldowns: Table[string, Cooldown] = initTable[string, Cooldown]()
+  gMovementLocked*: Table[int32, bool] = initTable[int32, bool]()
+  gFreezeTicks*: Table[int32, int32] = initTable[int32, int32]()
+  gHidden: Table[string, bool] = initTable[string, bool]()
+  gPlayerTime*: Table[int32, (uint64, bool)] = initTable[int32, (uint64, bool)]()
+  gPlayerWeather*: Table[int32, int] = initTable[int32, int]()
+  gCompass*: Table[int32, Vector3[float64]] = initTable[int32, Vector3[float64]]()
+
+proc cpOf2(p: Player): nil CommandPlayer =
+  result = p.commandPlayer
+  if result == nil:
+    let srv = gLink.server
+    if srv != nil and srv.commandPlayerOf != nil:
+      result = srv.commandPlayerOf(p)
+
+proc nowTick(): int64 =
+  let srv = gLink.server
+  if srv == nil: 0'i64 else: srv.tickCounter
+
+proc cdKey(p: Player; group: string): string = $p.entityId & "/" & group
+
+proc blockPosOf(v: CVal): BlockPos =
+  newBlockPos(int32(v.items[0].i), int32(v.items[1].i), int32(v.items[2].i))
+
+proc optF32(v: CVal; fallback: float32): float32 =
+  if v.i != 0: float32(v.items[0].f) else: fallback
+
+proc soundName(idx: int): string =
+  ## The registry name of a WIT `sound` case: the WIT enum and the generated `Sound` list are the same registry in the
+  ## same order.
+  if idx < 0 or idx > ord(high(Sound)): return ""
+  soundtable.toName(Sound(idx))
+
+proc categoryName(idx: int): string =
+  case idx
+  of 0: "master"
+  of 1: "music"
+  of 2: "records"
+  of 3: "weather"
+  of 4: "blocks"
+  of 5: "hostile"
+  of 6: "neutral"
+  of 7: "players"
+  of 8: "ambient"
+  of 9: "voice"
+  else: "ui"
+
+proc seedOf(w: WitState): float64 = float64(w.next64() shr 11)
+
+proc kickBanned(p: Player; ip: bool) =
+  let cp = cpOf2(p)
+  if cp != nil and cp.kick != nil:
+    cp.kick(translate(if ip: "multiplayer.disconnect.ip_banned" else: "multiplayer.disconnect.banned"))
+
+proc banReason(v: CVal; w: WitState): string =
+  ## `ban-player-options.reason` as plain text; the default is the operator ban's.
+  if v.i != 0: getText(textAt(w, int(v.items[0].i))) else: "Banned by an operator."
+
+proc installPlayerMore*(r: HostRegistry; w: WitState) =
+  # ---- permissions: per-player overrides kept here ----
+  hostFn(r, IfacePlayer, "[method]player.set-permission"):
+    let p = playerById(int(args[0].i))
+    if p == nil: return gone()
+    var t = gPermOverrides.getOrDefault(p.entityId)
+    t[args[1].s] = args[2].i != 0
+    gPermOverrides[p.entityId] = t
+  hostFn(r, IfacePlayer, "[method]player.unset-permission"):
+    let p = playerById(int(args[0].i))
+    if p == nil: return gone()
+    var t = gPermOverrides.getOrDefault(p.entityId)
+    t.del(args[1].s)
+    gPermOverrides[p.entityId] = t
+  hostFn(r, IfacePlayer, "[method]player.has-permission-set"):
+    let p = playerById(int(args[0].i))
+    if p == nil: return gone()
+    let t = gPermOverrides.getOrDefault(p.entityId)
+    if t.hasKey(args[1].s): results.add vSome(vBool(t[args[1].s]))
+    else: results.add vNone()
+  # ---- tab list ----
+  hostFn(r, IfacePlayer, "[method]player.set-tab-list-name"):
+    let p = playerById(int(args[0].i))
+    if p == nil: return gone()
+    if args[1].i != 0: playermod.setTabListName(p, some(textAt(w, int(args[1].items[0].i))))
+    else: playermod.setTabListName(p, none[TextComponent]())
+  hostFn(r, IfacePlayer, "[method]player.get-tab-list-name"):
+    let p = playerById(int(args[0].i))
+    if p == nil: return gone()
+    if p.tabListName.isSome: results.add vSome(vInt(int64(newTextRep(w, p.tabListName.unsafeGet))))
+    else: results.add vNone()
+  hostFn(r, IfacePlayer, "[method]player.set-tab-list-header-footer"):
+    let p = playerById(int(args[0].i))
+    if p == nil: return gone()
+    p.client.writePacketFor(CTabList(header: textAt(w, int(args[1].i)), footer: textAt(w, int(args[2].i))))
+  hostFn(r, IfacePlayer, "[method]player.set-tab-list-order"):
+    let p = playerById(int(args[0].i))
+    if p == nil: return gone()
+    playermod.setTabListOrder(p, int32(args[1].i))
+  hostFn(r, IfacePlayer, "[method]player.set-tab-list-latency"):
+    let p = playerById(int(args[0].i))
+    if p == nil: return gone()
+    playermod.setTabListLatency(p, int32(args[1].i))
+  hostFn(r, IfacePlayer, "[method]player.set-tab-list-ping"):
+    let p = playerById(int(args[0].i))
+    if p == nil: return gone()
+    playermod.setTabListLatency(p, int32(args[1].i))
+  hostFn(r, IfacePlayer, "[method]player.set-tab-list-listed"):
+    let p = playerById(int(args[0].i))
+    if p == nil: return gone()
+    playermod.setTabListListed(p, args[1].i != 0)
+  # ---- camera ----
+  hostFn(r, IfacePlayer, "[method]player.set-camera"):
+    let p = playerById(int(args[0].i))
+    if p == nil: return gone()
+    let cp = cpOf2(p)
+    if cp != nil and cp.setCameraTarget != nil:
+      cp.setCameraTarget(if args[1].i != 0: int32(args[1].items[0].i) else: p.entityId)
+  hostFn(r, IfacePlayer, "[method]player.set-camera-entity-id"):
+    let p = playerById(int(args[0].i))
+    if p == nil: return gone()
+    let cp = cpOf2(p)
+    if cp != nil and cp.setCameraTarget != nil: cp.setCameraTarget(int32(args[1].i))
+  hostFn(r, IfacePlayer, "[method]player.get-camera-entity-id"):
+    let p = playerById(int(args[0].i))
+    if p == nil: return gone()
+    results.add vInt(if p.cameraTargetId.isSome: int64(p.cameraTargetId.unsafeGet) else: int64(p.entityId))
+  hostFn(r, IfacePlayer, "[method]player.reset-camera"):
+    let p = playerById(int(args[0].i))
+    if p == nil: return gone()
+    let cp = cpOf2(p)
+    if cp != nil and cp.setCameraTarget != nil: cp.setCameraTarget(p.entityId)
+  # ---- sound ----
+  hostFn(r, IfacePlayer, "[method]player.play-sound"):
+    let p = playerById(int(args[0].i))
+    if p == nil: return gone()
+    let cp = cpOf2(p)
+    let n = soundName(int(args[1].i))
+    if n.len == 0: return "unknown sound"
+    if cp != nil and cp.playSound != nil:
+      cp.playSound(n, categoryName(int(args[2].i)), p.pos, float32(args[3].f), float32(args[4].f), seedOf(w))
+  hostFn(r, IfacePlayer, "[method]player.play-sound-at"):
+    let p = playerById(int(args[0].i))
+    if p == nil: return gone()
+    let cp = cpOf2(p)
+    let n = soundName(int(args[2].i))
+    if n.len == 0: return "unknown sound"
+    if cp != nil and cp.playSound != nil:
+      cp.playSound(n, categoryName(int(args[3].i)), posOf(args[1]), float32(args[4].f), float32(args[5].f), seedOf(w))
+  hostFn(r, IfacePlayer, "[method]player.play-custom-sound"):
+    let p = playerById(int(args[0].i))
+    if p == nil: return gone()
+    let cp = cpOf2(p)
+    if cp != nil and cp.playSound != nil:
+      cp.playSound(args[1].s, categoryName(int(args[2].i)), p.pos, float32(args[3].f), float32(args[4].f), seedOf(w))
+  hostFn(r, IfacePlayer, "[method]player.play-custom-sound-at"):
+    let p = playerById(int(args[0].i))
+    if p == nil: return gone()
+    let cp = cpOf2(p)
+    if cp != nil and cp.playSound != nil:
+      cp.playSound(args[2].s, categoryName(int(args[3].i)), posOf(args[1]), float32(args[4].f), float32(args[5].f), seedOf(w))
+  hostFn(r, IfacePlayer, "[method]player.stop-sound"):
+    let p = playerById(int(args[0].i))
+    if p == nil: return gone()
+    let cp = cpOf2(p)
+    var snd = none[string]()
+    var cat = none[string]()
+    if args[1].i != 0: snd = some(soundName(int(args[1].items[0].i)))
+    if args[2].i != 0: cat = some(categoryName(int(args[2].items[0].i)))
+    if cp != nil and cp.stopSound != nil: cp.stopSound(snd, cat)
+  hostFn(r, IfacePlayer, "[method]player.stop-custom-sound"):
+    let p = playerById(int(args[0].i))
+    if p == nil: return gone()
+    let cp = cpOf2(p)
+    var snd = none[string]()
+    var cat = none[string]()
+    if args[1].i != 0: snd = some(args[1].items[0].s)
+    if args[2].i != 0: cat = some(categoryName(int(args[2].items[0].i)))
+    if cp != nil and cp.stopSound != nil: cp.stopSound(snd, cat)
+  # ---- particles, block changes, animations ----
+  hostFn(r, IfacePlayer, "[method]player.spawn-particles"):
+    let p = playerById(int(args[0].i))
+    if p == nil: return gone()
+    let (ok, part) = particleFromId(uint16(args[1].i))
+    if not ok: return "unknown particle"
+    let pos = posOf(args[2])
+    let off = posOf(args[4])
+    p.client.writePacketFor(particlepkt.CParticle(forceSpawn: false, important: false, position: pos,
+      offset: Vector3[float32](x: float32(off.x), y: float32(off.y), z: float32(off.z)),
+      maxSpeed: float32(args[5].f), particleCount: int32(args[3].i),
+      particleId: newVarInt(int32(particleToId(part))), data: @[]))
+  hostFn(r, IfacePlayer, "[method]player.send-block-change"):
+    let p = playerById(int(args[0].i))
+    if p == nil: return gone()
+    let state = if w.hooks.defaultStateOfBlock != nil: w.hooks.defaultStateOfBlock(int(args[2].i)) else: -1
+    if state < 0: return "invalid block id"
+    p.client.writePacketFor(CBlockUpdate(location: blockPosOf(args[1]), stateId: newVarInt(int32(state))))
+  hostFn(r, IfacePlayer, "[method]player.reset-block-change"):
+    let p = playerById(int(args[0].i))
+    if p == nil: return gone()
+    let bp = blockPosOf(args[1])
+    let st = if w.hooks.getBlockState != nil: w.hooks.getBlockState(worldRep(p.world), int(bp.x), int(bp.y), int(bp.z)) else: 0
+    p.client.writePacketFor(CBlockUpdate(location: bp, stateId: newVarInt(int32(st))))
+  hostFn(r, IfacePlayer, "[method]player.send-hurt-animation"):
+    let p = playerById(int(args[0].i))
+    if p == nil: return gone()
+    p.client.writePacketFor(CHurtAnimation(entityId: newVarInt(p.entityId), yaw: float32(args[1].f)))
+  hostFn(r, IfacePlayer, "[method]player.open-sign-editor"):
+    let p = playerById(int(args[0].i))
+    if p == nil: return gone()
+    p.client.writePacketFor(COpenSignEditor(location: blockPosOf(args[1]), isFrontText: args[2].i != 0))
+  # ---- motion ----
+  hostFn(r, IfacePlayer, "[method]player.set-velocity"):
+    let p = playerById(int(args[0].i))
+    if p == nil: return gone()
+    let v = posOf(args[1])
+    p.velocity = v
+    p.client.writePacketFor(newCEntityVelocity(newVarInt(p.entityId), v))
+  hostFn(r, IfacePlayer, "[method]player.apply-knockback"):
+    let p = playerById(int(args[0].i))
+    if p == nil: return gone()
+    let b = playerBase(p)
+    applyKnockback(b.entity, args[1].f, args[2].f, args[3].f)
+  hostFn(r, IfacePlayer, "[method]player.set-movement-locked"):
+    let p = playerById(int(args[0].i))
+    if p == nil: return gone()
+    gMovementLocked[p.entityId] = args[1].i != 0
+  hostFn(r, IfacePlayer, "[method]player.is-movement-locked"):
+    let p = playerById(int(args[0].i))
+    if p == nil: return gone()
+    results.add vBool(gMovementLocked.getOrDefault(p.entityId))
+  hostFn(r, IfacePlayer, "[method]player.set-freeze-ticks"):
+    let p = playerById(int(args[0].i))
+    if p == nil: return gone()
+    gFreezeTicks[p.entityId] = int32(args[1].i)
+  hostFn(r, IfacePlayer, "[method]player.get-freeze-ticks"):
+    let p = playerById(int(args[0].i))
+    if p == nil: return gone()
+    results.add vInt(int64(gFreezeTicks.getOrDefault(p.entityId)))
+  # ---- server links ----
+  hostFn(r, IfacePlayer, "[method]player.set-server-links"):
+    let p = playerById(int(args[0].i))
+    if p == nil: return gone()
+    var links: seq[Link] = @[]
+    for l in args[1].items:
+      let lab = l.items[0]
+      if lab.i == 0:
+        links.add newLink(Label(kind: lkBuiltIn, builtIn: LinkType(int(lab.items[0].i))), l.items[1].s)
+      else:
+        links.add newLink(Label(kind: lkTextComponent, textComponent: textAt(w, int(lab.items[0].i))), l.items[1].s)
+    p.client.writePacketFor(CPlayServerLinks(links: links))
+  # ---- respawn, bans ----
+  hostFn(r, IfacePlayer, "[method]player.respawn"):
+    let p = playerById(int(args[0].i))
+    if p == nil: return gone()
+    worldmod.respawnPlayer(p.world, p, true)
+  hostFn(r, IfacePlayer, "[method]player.ban"):
+    let p = playerById(int(args[0].i))
+    if p == nil: return gone()
+    let srv = gLink.server
+    if srv != nil and srv.commandServer != nil and srv.commandServer.addBannedPlayer != nil:
+      var src = "Plugin"
+      if args[1].items[1].i != 0: src = args[1].items[1].items[0].s
+      srv.commandServer.addBannedPlayer(CmdListEntry(id: p.gameprofile.id, name: p.gameprofile.name, source: src,
+        reason: banReason(args[1].items[0], w)))
+    kickBanned(p, false)
+  hostFn(r, IfacePlayer, "[method]player.ban-ip"):
+    let p = playerById(int(args[0].i))
+    if p == nil: return gone()
+    let srv = gLink.server
+    if srv != nil and srv.commandServer != nil and srv.commandServer.addBannedIp != nil:
+      var src = "Plugin"
+      if args[1].items[1].i != 0: src = args[1].items[1].items[0].s
+      srv.commandServer.addBannedIp(CmdListEntry(ip: p.client.peerIp, source: src, reason: banReason(args[1].items[0], w)))
+    kickBanned(p, true)
+  # ---- damage ----
+  hostFn(r, IfacePlayer, "[method]player.damage"):
+    let p = playerById(int(args[0].i))
+    if p == nil: return gone()
+    let nm = enumName(paramTy(ci, 2), int(args[2].i)).replace("-", "_")
+    let (ok, dt) = damageTypeFromName(nm)
+    if not ok: return "unknown damage type " & nm
+    let b = playerBase(p)
+    discard damage(b, b, float32(args[1].f), dt)
+  # ---- statistics ----
+  hostFn(r, IfacePlayer, "[method]player.get-statistic"):
+    let p = playerById(int(args[0].i))
+    if p == nil: return gone()
+    let s = playermod.gPlayerStats.getOrDefault(p.entityId)
+    results.add vInt(int64(s.get(StatisticCategory(int(args[1].i)), int32(args[2].i))))
+  hostFn(r, IfacePlayer, "[method]player.set-statistic"):
+    let p = playerById(int(args[0].i))
+    if p == nil: return gone()
+    playermod.setStat(p, StatisticCategory(int(args[1].i)), int32(args[2].i), int32(args[3].i))
+  hostFn(r, IfacePlayer, "[method]player.increment-statistic"):
+    let p = playerById(int(args[0].i))
+    if p == nil: return gone()
+    playermod.incrementStat(p, StatisticCategory(int(args[1].i)), int32(args[2].i), int32(args[3].i))
+  hostFn(r, IfacePlayer, "[method]player.get-custom-statistic"):
+    let p = playerById(int(args[0].i))
+    if p == nil: return gone()
+    let s = playermod.gPlayerStats.getOrDefault(p.entityId)
+    results.add vInt(int64(s.get(scCustom, int32(args[1].i))))
+  hostFn(r, IfacePlayer, "[method]player.set-custom-statistic"):
+    let p = playerById(int(args[0].i))
+    if p == nil: return gone()
+    playermod.setStat(p, scCustom, int32(args[1].i), int32(args[2].i))
+  hostFn(r, IfacePlayer, "[method]player.increment-custom-statistic"):
+    let p = playerById(int(args[0].i))
+    if p == nil: return gone()
+    playermod.incrementStat(p, scCustom, int32(args[1].i), int32(args[2].i))
+  hostFn(r, IfacePlayer, "[method]player.send-stats"):
+    let p = playerById(int(args[0].i))
+    if p == nil: return gone()
+    playermod.sendStats(p)
+  # ---- cooldowns ----
+  hostFn(r, IfacePlayer, "[method]player.start-cooldown"):
+    let p = playerById(int(args[0].i))
+    if p == nil: return gone()
+    let ticks = int64(args[2].i)
+    gCooldowns[cdKey(p, args[1].s)] = Cooldown(expires: nowTick() + ticks, total: ticks)
+    p.client.writePacketFor(CItemCooldown(group: args[1].s, cooldown: newVarInt(int32(ticks))))
+  hostFn(r, IfacePlayer, "[method]player.get-cooldown"):
+    let p = playerById(int(args[0].i))
+    if p == nil: return gone()
+    let c = gCooldowns.getOrDefault(cdKey(p, args[1].s))
+    let left = c.expires - nowTick()
+    results.add vFloat(if c.total > 0 and left > 0: float64(float32(left) / float32(c.total)) else: 0.0)
+  hostFn(r, IfacePlayer, "[method]player.is-on-cooldown"):
+    let p = playerById(int(args[0].i))
+    if p == nil: return gone()
+    let c = gCooldowns.getOrDefault(cdKey(p, args[1].s))
+    results.add vBool(c.total > 0 and c.expires > nowTick())
+  hostFn(r, IfacePlayer, "[method]player.set-item-cooldown"):
+    let p = playerById(int(args[0].i))
+    if p == nil: return gone()
+    let ticks = int64(args[2].i)
+    gCooldowns[cdKey(p, args[1].s)] = Cooldown(expires: nowTick() + ticks, total: ticks)
+    p.client.writePacketFor(CItemCooldown(group: args[1].s, cooldown: newVarInt(int32(ticks))))
+  hostFn(r, IfacePlayer, "[method]player.get-item-cooldown"):
+    let p = playerById(int(args[0].i))
+    if p == nil: return gone()
+    let c = gCooldowns.getOrDefault(cdKey(p, args[1].s))
+    let left = c.expires - nowTick()
+    if c.total > 0 and left > 0: results.add vSome(vInt(left))
+    else: results.add vNone()
+  hostFn(r, IfacePlayer, "[method]player.has-item-cooldown"):
+    let p = playerById(int(args[0].i))
+    if p == nil: return gone()
+    let c = gCooldowns.getOrDefault(cdKey(p, args[1].s))
+    results.add vBool(c.total > 0 and c.expires > nowTick())
+  # ---- abilities, ip, skin ----
+  hostFn(r, IfacePlayer, "[method]player.get-abilities"):
+    let p = playerById(int(args[0].i))
+    if p == nil: return gone()
+    let a = p.abilities
+    results.add vRecord(@[vBool(a.invulnerable), vBool(a.flying), vBool(a.allowFlying), vBool(a.creative),
+      vBool(a.allowModifyWorld), vFloat(float64(a.flySpeed)), vFloat(float64(a.walkSpeed))])
+  hostFn(r, IfacePlayer, "[method]player.set-abilities"):
+    let p = playerById(int(args[0].i))
+    if p == nil: return gone()
+    let a = args[1].items
+    p.abilities.invulnerable = a[0].i != 0
+    p.abilities.flying = a[1].i != 0
+    p.abilities.allowFlying = a[2].i != 0
+    p.abilities.creative = a[3].i != 0
+    p.abilities.allowModifyWorld = a[4].i != 0
+    p.abilities.flySpeed = float32(a[5].f)
+    p.abilities.walkSpeed = float32(a[6].f)
+    playermod.sendAbilitiesUpdate(p)
+  hostFn(r, IfacePlayer, "[method]player.get-ip"):
+    let p = playerById(int(args[0].i))
+    if p == nil: return gone()
+    results.add vStr(p.client.peerIp)
+  hostFn(r, IfacePlayer, "[method]player.get-skin"):
+    let p = playerById(int(args[0].i))
+    if p == nil: return gone()
+    var found = false
+    for prop in p.gameprofile.properties:
+      if prop.name == "textures" and not found:
+        found = true
+        results.add vSome(vRecord(@[vStr(prop.value),
+          (if prop.signature.len > 0: vSome(vStr(prop.signature)) else: vNone())]))
+    if not found: results.add vNone()
+  hostFn(r, IfacePlayer, "[method]player.set-skin"):
+    let p = playerById(int(args[0].i))
+    if p == nil: return gone()
+    var props: seq[PropertyValue] = @[]
+    for prop in p.gameprofile.properties:
+      if prop.name != "textures": props.add prop
+    props.add PropertyValue(name: "textures", value: args[1].items[0].s,
+      signature: (if args[1].items[1].i != 0: args[1].items[1].items[0].s else: ""))
+    p.gameprofile.properties = props
+  hostFn(r, IfacePlayer, "[method]player.get-skin-parts"):
+    let p = playerById(int(args[0].i))
+    if p == nil: return gone()
+    results.add vInt(int64(p.config.skinParts and 0x7F'u8))
+  hostFn(r, IfacePlayer, "[method]player.set-skin-parts"):
+    let p = playerById(int(args[0].i))
+    if p == nil: return gone()
+    p.config.skinParts = uint8(args[1].i and 0x7F)
+  # ---- time, weather, compass, respawn location ----
+  hostFn(r, IfacePlayer, "[method]player.set-player-time"):
+    let p = playerById(int(args[0].i))
+    if p == nil: return gone()
+    gPlayerTime[p.entityId] = (cast[uint64](args[1].i), args[2].i != 0)
+  hostFn(r, IfacePlayer, "[method]player.reset-player-time"):
+    let p = playerById(int(args[0].i))
+    if p == nil: return gone()
+    gPlayerTime.del(p.entityId)
+  hostFn(r, IfacePlayer, "[method]player.get-player-time"):
+    let p = playerById(int(args[0].i))
+    if p == nil: return gone()
+    if gPlayerTime.hasKey(p.entityId): results.add vSome(vInt(cast[int64](gPlayerTime[p.entityId][0])))
+    else: results.add vNone()
+  hostFn(r, IfacePlayer, "[method]player.is-player-time-relative"):
+    let p = playerById(int(args[0].i))
+    if p == nil: return gone()
+    results.add vBool(gPlayerTime.hasKey(p.entityId) and gPlayerTime[p.entityId][1])
+  hostFn(r, IfacePlayer, "[method]player.set-player-weather"):
+    let p = playerById(int(args[0].i))
+    if p == nil: return gone()
+    gPlayerWeather[p.entityId] = int(args[1].i)
+  hostFn(r, IfacePlayer, "[method]player.reset-player-weather"):
+    let p = playerById(int(args[0].i))
+    if p == nil: return gone()
+    gPlayerWeather.del(p.entityId)
+  hostFn(r, IfacePlayer, "[method]player.get-player-weather"):
+    let p = playerById(int(args[0].i))
+    if p == nil: return gone()
+    if gPlayerWeather.hasKey(p.entityId): results.add vSome(vInt(int64(gPlayerWeather[p.entityId])))
+    else: results.add vNone()
+  hostFn(r, IfacePlayer, "[method]player.set-compass-target"):
+    let p = playerById(int(args[0].i))
+    if p == nil: return gone()
+    let v = posOf(args[1])
+    gCompass[p.entityId] = v
+    p.client.writePacketFor(CPlayerSpawnPosition(dimensionName: p.world.dimension.minecraftName,
+      location: newBlockPos(int32(floor(v.x)), int32(floor(v.y)), int32(floor(v.z))), yaw: 0.0'f32, pitch: 0.0'f32))
+  hostFn(r, IfacePlayer, "[method]player.get-compass-target"):
+    let p = playerById(int(args[0].i))
+    if p == nil: return gone()
+    results.add vPos(gCompass.getOrDefault(p.entityId, p.pos))
+  hostFn(r, IfacePlayer, "[method]player.set-respawn-location"):
+    let p = playerById(int(args[0].i))
+    if p == nil: return gone()
+    let v = posOf(args[1])
+    p.respawnPoint = some(RespawnPoint(dimension: p.world.dimension,
+      position: newBlockPos(int32(floor(v.x)), int32(floor(v.y)), int32(floor(v.z))), yaw: p.yaw, force: true))
+  hostFn(r, IfacePlayer, "[method]player.get-respawn-location"):
+    let p = playerById(int(args[0].i))
+    if p == nil: return gone()
+    if p.respawnPoint.isSome:
+      let bp = p.respawnPoint.unsafeGet.position
+      results.add vSome(vPos(Vector3[float64](x: float64(bp.x), y: float64(bp.y), z: float64(bp.z))))
+    else: results.add vNone()
+  # ---- visibility ----
+  hostFn(r, IfacePlayer, "[method]player.hide-player"):
+    let p = playerById(int(args[0].i))
+    if p == nil: return gone()
+    gHidden[$p.entityId & ">" & $int(args[1].i)] = true
+  hostFn(r, IfacePlayer, "[method]player.show-player"):
+    let p = playerById(int(args[0].i))
+    if p == nil: return gone()
+    gHidden.del($p.entityId & ">" & $int(args[1].i))
+  hostFn(r, IfacePlayer, "[method]player.can-see"):
+    let p = playerById(int(args[0].i))
+    if p == nil: return gone()
+    results.add vBool(not gHidden.hasKey($p.entityId & ">" & $int(args[1].i)))
+  hostFn(r, IfacePlayer, "[method]player.can-see-player"):
+    let p = playerById(int(args[0].i))
+    if p == nil: return gone()
+    results.add vBool(not gHidden.hasKey($p.entityId & ">" & $int(args[1].i)))
+  # ---- misc ----
+  hostFn(r, IfacePlayer, "[method]player.set-experience-progress"):
+    let p = playerById(int(args[0].i))
+    if p == nil: return gone()
+    p.experienceProgress = float32(args[1].f)

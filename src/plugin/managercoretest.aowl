@@ -1,0 +1,198 @@
+## Tests of managercore.aowl, cache.aowl, api/eventsmod.aowl and api/context.aowl with a fake loader (no WebAssembly, no server).
+## Upstream's `topological_sort` test is ported as it is; the rest drives `load_plugins` over a scratch folder, dependency
+## order, the permission cache (SHA-256 known answer), unload, a failing `on_load`, and the context's namespacing.
+import std/[syncio, dirs, paths, strutils, options]
+import "../server/plugin/native" as nativeplugin
+import api/[apimod, context, eventsmod]
+import loader/loadermod
+import ../command/fallbackdispatch
+import ../util/permission
+import cache, managercore
+
+var failures = 0
+
+proc ck(ok: bool; msg: string) =
+  if not ok:
+    echo "FAILED ", msg
+    inc failures
+
+var events: seq[string] = @[]
+var unloaded: seq[string] = @[]
+var registered: seq[string] = @[]
+
+proc wr(path, text: string) =
+  try:
+    writeFile(path, text)
+  except:
+    echo "write failed ", path
+
+proc rd(path: string): string =
+  try:
+    result = readFile(path)
+  except:
+    result = ""
+
+proc show(xs: seq[string]): string =
+  result = "["
+  for x in xs: result.add x & ";"
+  result.add "]"
+
+proc baseName(p: string): string =
+  var a = 0
+  var i = 0
+  while i < p.len:
+    if p[i] == '/': a = i + 1
+    inc i
+  var b = p.len
+  i = a
+  while i < p.len:
+    if p[i] == '.' and b == p.len: b = i
+    inc i
+  p[a ..< b]
+
+proc fakeLoader(): PluginLoader =
+  ## A file `name` containing "dep1,dep2|perm1,perm2|fail" is a plugin called `name`.
+  PluginLoader(
+    canLoadImpl: proc (path: string): bool {.closure.} = path.endsWith(".fake"),
+    canUnloadImpl: proc (): bool {.closure.} = true,
+    unloadImpl: proc (loaderData: int): string {.closure.} =
+      unloaded.add $loaderData
+      "",
+    loadImpl: proc (path: string): LoadResult {.closure.} =
+      let text = rd(path)
+      let parts = text.split('|')
+      var meta = PluginMetadata(name: baseName(path), version: "1.0", authors: @["a"], description: "d",
+                                dependencies: @[], permissions: @[])
+      if parts.len > 0 and parts[0].len > 0: meta.dependencies = parts[0].split(',')
+      if parts.len > 1 and parts[1].len > 0: meta.permissions = parts[1].split(',')
+      let failLoad = parts.len > 2 and parts[2] == "fail"
+      let nm = meta.name
+      let inst = Plugin(
+        onLoad: proc (ctx: PluginContext): string {.closure.} =
+          events.add "load " & nm
+          if failLoad: "boom" else: "",
+        onUnload: proc (ctx: PluginContext): string {.closure.} =
+          events.add "unload " & nm
+          "")
+      loadOk(LoadedPlugin(instance: inst, metadata: meta, loaderData: events.len + 100)))
+
+proc main() =
+  # ---- topological_sort, the upstream test
+  var sorted: seq[string] = @[]
+  var e = topologicalSort(@["A", "B", "C"], @[@["B"], @["C"], @[]], sorted)
+  ck(e == "" and sorted == @["C", "B", "A"], "chain sort " & show(sorted))
+  e = topologicalSort(@["A", "B", "C", "D"], @[@["B", "C"], @["D"], @["D"], @[]], sorted)
+  ck(e == "" and sorted.len == 4 and sorted[0] == "D" and sorted[3] == "A" and
+     ((sorted[1] == "B" and sorted[2] == "C") or (sorted[1] == "C" and sorted[2] == "B")), "diamond sort " & show(sorted))
+  e = topologicalSort(@["A", "B"], @[@["B"], @["A"]], sorted)
+  ck(e == "Circular dependency detected involving plugin: A", "circular: " & e)
+  e = topologicalSort(@["A"], @[@["B"]], sorted)
+  ck(e == "Plugin A depends on missing plugin: B", "missing: " & e)
+
+  # ---- cache: SHA-256 known answers (FIPS 180-4 vectors) and the JSON round trip
+  ck(calculateHashForBytes("abc") == "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad", "sha256 abc")
+  ck(calculateHashForBytes("") == "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855", "sha256 empty")
+  var pc = PermissionCache(hashes: @[], entries: @[])
+  put(pc, "h1", PermissionCacheEntry(permissionsRequested: @["fs.read.data", "sys.env"], approved: true))
+  put(pc, "h2", PermissionCacheEntry(permissionsRequested: @[], approved: false))
+  let txt = toJsonText(pc)
+  let back = parseCache(txt)
+  ck(back.hashes == @["h1", "h2"] and back.entries[0].approved and back.entries[0].permissionsRequested == @["fs.read.data", "sys.env"] and
+     not back.entries[1].approved and back.entries[1].permissionsRequested.len == 0, "cache round trip " & txt)
+  ck(txt.contains("\"permissions_requested\": []"), "cache pretty form")
+  ck(parseCache("not json").hashes.len == 0, "bad json is an empty cache")
+
+  # ---- manager over a scratch folder
+  let dir = "managercoretest_tmp"
+  try:
+    removeDir(path(dir))
+  except:
+    discard
+  try:
+    createDir(path(dir))
+  except:
+    echo "mkdir failed"
+  wr(dir & "/a.fake", "b||")           # a depends on b
+  wr(dir & "/b.fake", "||")
+  wr(dir & "/c.fake", "|sys.env|")     # asks for a permission nobody approved
+  wr(dir & "/d.fake", "||fail")        # on_load fails
+  wr(dir & "/e.fake.deactivated", "||")
+  wr(dir & "/readme.txt", "no loader")
+  let hooks = ContextHooks()
+  let m = newPluginManager(hooks, newPermissionRegistry(), dir & "/data")
+  m.dir = dir
+  var lines: seq[string] = @[]
+  m.log = proc (line: string) {.closure.} = lines.add line
+  m.addLoader(fakeLoader())
+  let r = m.loadPlugins()
+  ck(r.ok, "load_plugins " & r.message)
+  ck(events.len >= 2 and events[0] == "load b" and events[1] == "load a", "dependency first: " & show(events))
+  ck(m.isPluginActive("a") and m.isPluginActive("b"), "a and b active")
+  ck(not m.isPluginLoaded("c"), "c denied (permission not approved)")
+  ck(not m.isPluginLoaded("d") and m.getFailedPlugins().len == 1 and m.getFailedPlugins()[0][0] == "d" and
+     m.getFailedPlugins()[0][1] == "Initialization failed: boom", "d failed: " & $m.getFailedPlugins().len)
+  ck("unload d" in events, "failed plugin gets on_unload")
+  ck(not m.isPluginLoaded("e"), ".deactivated skipped")
+  ck(m.activePlugins().len == 2, "two active plugins")
+  # the cache file now holds c's request, unapproved
+  var pc2 = cache.load(dir & "/permission_cache.json")
+  ck(pc2.hashes.len == 4 or pc2.hashes.len == 3, "cache saved " & $pc2.hashes.len)
+  let hc = calculateHash(dir & "/c.fake")
+  ck(indexOf(pc2, hc) >= 0 and not pc2.entries[indexOf(pc2, hc)].approved, "c recorded as denied")
+  # approve c in the cache and load it by path
+  put(pc2, hc, PermissionCacheEntry(permissionsRequested: @["sys.env"], approved: true))
+  ck(cache.save(pc2, dir & "/permission_cache.json"), "cache save")
+  let r2 = m.tryLoadPlugin(dir & "/c.fake")
+  ck(r2.ok and m.isPluginActive("c"), "c loads once approved: " & r2.message)
+  # a missing file
+  let r3 = m.tryLoadPlugin(dir & "/nothing.txt")
+  ck(not r3.ok and r3.message == "Plugin not found: " & dir & "/nothing.txt", "no loader: " & r3.message)
+  # unload
+  let r4 = m.unloadPlugin("a")
+  ck(r4.ok and not m.isPluginLoaded("a") and "unload a" in events, "unload a")
+  let r5 = m.unloadPlugin("a")
+  ck(not r5.ok and r5.message == "Plugin not found: a", "unload twice: " & r5.message)
+  m.unloadAllPlugins()
+  ck(m.activePlugins().len == 0 and "unload b" in events and "unload c" in events, "unload all")
+
+  # ---- event handler ordering: blocking first, registration order inside each group
+  let hm = newHandlerMap()
+  hm.register(HandlerReg(pluginId: 0, handlerId: 1, eventName: "player-join-event", priority: epLowest, blocking: false))
+  hm.register(HandlerReg(pluginId: 1, handlerId: 2, eventName: "player-join-event", priority: epHighest, blocking: true))
+  hm.register(HandlerReg(pluginId: 2, handlerId: 3, eventName: "player-chat-event", priority: epNormal, blocking: true))
+  hm.register(HandlerReg(pluginId: 0, handlerId: 4, eventName: "player-join-event", priority: epHigh, blocking: true))
+  let hs = hm.handlersFor("player-join-event")
+  ck(hs.len == 3 and hs[0].handlerId == 2 and hs[1].handlerId == 4 and hs[2].handlerId == 1, "handler order")
+  hm.unregisterPlugin(0)
+  ck(hm.count() == 2, "unregister plugin")
+  ck(priorityOf(0) == epHighest and priorityOf(2) == epNormal and priorityOf(4) == epLowest, "priority enum order")
+
+  # ---- context: namespacing
+  let ch = ContextHooks()
+  ch.registerTree = proc (tree: CommandTree; permission: string) {.closure.} =
+    registered.add tree.names[0] & "=" & permission & " source=" & tree.source.get()
+  ch.reloadCommands = proc () {.closure.} = registered.add "reload"
+  let reg = newPermissionRegistry()
+  let ctx = newPluginContext(PluginMetadata(name: "demo"), 7, ch, hm, reg, dir & "/data")
+  ctx.registerCommand(newCommandTree(["hello"], "says hi"), "command.hello")
+  ctx.registerCommand(newCommandTree(["bye"], "says bye"), "other:command.bye")
+  ck(registered == @["hello=demo:command.hello source=demo", "reload", "bye=other:command.bye source=demo", "reload"], "register_command: " & show(registered))
+  ck(ctx.registerPermission(newPermission("other:x", "d", permissionAllow())).contains("must use the plugin's namespace (demo)"), "permission namespace")
+  ck(ctx.registerPermission(newPermission("demo:x", "d", permissionAllow())) == "", "permission ok")
+  ck(ctx.registerPermission(newPermission("demo:x", "d", permissionAllow())).contains("already registered"), "permission twice")
+  ctx.registerEvent("player-join-event", 9, epNormal, true)
+  ck(hm.handlersFor("player-join-event")[hm.handlersFor("player-join-event").len - 1].handlerId == 9, "register_event goes to the map")
+  ck(ctx.getDataFolder() == dir & "/data/demo", "data folder")
+  wr(dir & "/data/demo/x.txt", "x")
+  ck(rd(dir & "/data/demo/x.txt") == "x", "data folder created")
+  let svc = RootRef()
+  ctx.registerService("s", svc)
+  ck(ctx.getService("s") == svc and ctx.getService("t") == nil, "services")
+  try:
+    removeDir(path(dir))
+  except:
+    discard
+  if failures > 0: quit 1
+  echo "managercoretest ok"
+
+main()

@@ -1,0 +1,293 @@
+## WASI preview 2 for the plugin host: the part of `wasmtime_wasi::p2::add_to_linker_async` a Rust `std` plugin built for
+## wasm32-wasip2 imports at start-up and from `println!`, `std::time` and `rand`: wasi:cli (environment, exit, stdin,
+## stdout, stderr, terminal-*), wasi:io (error, poll, streams), wasi:clocks (monotonic-clock, wall-clock) and
+## wasi:random (random, insecure, insecure-seed), plus the empty wasi:filesystem/preopens.
+## Port of the configuration in pumpkin/src/plugin/loader/wasm/wasm_host/mod.rs (`WasiCtxBuilder`: `inherit_stdout`,
+## `inherit_stderr`, environment only through the `sys.env` / `sys.env.<KEY>` permissions, a `data` preopen) and of
+## `setup_linker` (`add_to_linker_async`). The interface list and signatures are the WASI 0.2 WIT, which is not in either
+## upstream tree (wasmtime-wasi carries it), so they are written from the specification.
+##
+## stdout and stderr are line buffered per plugin and handed to `WasiHost.log`, which pluginhost.aowl points at the
+## server's log. `monotonic-clock` is the process monotonic clock plus a skew: a `pollable.block` on a clock deadline does
+## not sleep the server thread, it moves the skew forward so the deadline has passed (a plugin that sleeps sees the time
+## pass, the tick loop is not held).
+## PARTIAL: wasmtime_wasi p2 - wasi:filesystem has no preopened directory (the `data` preopen is not provided, so
+## `get-directories` is empty and `descriptor` methods trap as unimplemented host functions); wasi:sockets, wasi:http and
+## `wasi:cli/terminal-*` queries (always "not a terminal") are not provided; stdin is always closed; `exit` traps the
+## plugin call with "wasi exit <code>"; a dropped stream or pollable frees nothing (the tables only grow by one pollable
+## per clock subscription).
+import std/[times, monotimes, envvars]
+import ../wasm/[canonabi, component]
+import ../../plugin_api/permissions
+import witstate
+
+const
+  IfEnv = "wasi:cli/environment"
+  IfExit = "wasi:cli/exit"
+  IfStdin = "wasi:cli/stdin"
+  IfStdout = "wasi:cli/stdout"
+  IfStderr = "wasi:cli/stderr"
+  IfTermStdin = "wasi:cli/terminal-stdin"
+  IfTermStdout = "wasi:cli/terminal-stdout"
+  IfTermStderr = "wasi:cli/terminal-stderr"
+  IfIoError = "wasi:io/error"
+  IfPoll = "wasi:io/poll"
+  IfStreams = "wasi:io/streams"
+  IfMono = "wasi:clocks/monotonic-clock"
+  IfWall = "wasi:clocks/wall-clock"
+  IfRandom = "wasi:random/random"
+  IfInsecure = "wasi:random/insecure"
+  IfSeed = "wasi:random/insecure-seed"
+  IfPreopens = "wasi:filesystem/preopens"
+  IfFsTypes = "wasi:filesystem/types"
+  StdinRep = 0
+  StdoutRep = 1
+  StderrRep = 2
+  CheckWriteLimit = 65536'u64
+
+type
+  WasiHost* = ref object
+    log*: proc (pluginId: int; isErr: bool; line: string) {.closure.}   ## one complete line of a plugin's stdout / stderr
+    permissions*: proc (pluginId: int): seq[string] {.closure.}
+    lastExit*: int                       ## the code of the last `wasi:cli/exit` call (-1 before any)
+    outBuf: seq[string]                  ## partial lines, 2 per plugin: [id * 2] stdout, [id * 2 + 1] stderr
+    polls: seq[int64]                    ## monotonic deadline in ns of each pollable; rep 0 is always ready
+    skew: int64
+    clockFn*: proc (): int64 {.closure.} ## test hook: replaces the monotonic clock source (ns)
+
+proc newWasiHost*(): WasiHost =
+  WasiHost(lastExit: -1, outBuf: @[], polls: @[0'i64], skew: 0)
+
+proc rawMono(w: WasiHost): int64 =
+  if w.clockFn != nil: w.clockFn() else: ticks(getMonoTime())
+
+proc monoNow*(w: WasiHost): int64 = rawMono(w) + w.skew
+
+proc bufSlot(w: WasiHost; pluginId: int; isErr: bool): int =
+  let s = pluginId * 2 + (if isErr: 1 else: 0)
+  while w.outBuf.len <= s: w.outBuf.add ""
+  s
+
+proc emit(w: WasiHost; pluginId: int; isErr: bool; line: string) =
+  if w.log != nil: w.log(pluginId, isErr, line)
+
+proc writeBytes*(w: WasiHost; pluginId: int; isErr: bool; data: string) =
+  ## Line buffering of `inherit_stdout` / `inherit_stderr`: complete lines go to the log, the tail waits for its newline.
+  let s = bufSlot(w, pluginId, isErr)
+  var cur = w.outBuf[s]
+  for c in data:
+    if c == '\n':
+      if cur.len > 0 and cur[cur.len - 1] == '\r': cur.setLen(cur.len - 1)
+      emit(w, pluginId, isErr, cur)
+      cur = ""
+    else:
+      cur.add c
+  w.outBuf[s] = cur
+
+proc flushPlugin*(w: WasiHost; pluginId: int) =
+  ## Hands a partial last line to the log (a plugin unload or an exit).
+  for e in [false, true]:
+    let s = bufSlot(w, pluginId, e)
+    if w.outBuf[s].len > 0:
+      emit(w, pluginId, e, w.outBuf[s])
+      w.outBuf[s] = ""
+
+proc bytesOf(v: CVal): string =
+  result = ""
+  for it in v.items: result.add char(it.i and 0xFF)
+
+proc resultT(ci: CompInst): CmType =
+  ci.sigs[ci.funcs[ci.curFn].sig].results[0]
+
+proc closedErr(ci: CompInst): CVal =
+  ## `err(stream-error::closed)`: the case is found by name in the function's own declared type.
+  let rt = resultT(ci)
+  var idx = 1
+  if rt.kind == ckResult and rt.types.len > 1 and rt.types[1].kind == ckVariant:
+    let k = caseIndex(rt.types[1], "closed")
+    if k >= 0: idx = k
+  vVariant(1, vVariant(idx))
+
+proc okUnit(): CVal = vVariant(0)
+proc okVal(v: CVal): CVal = vVariant(0, v)
+
+proc allowedEnv(w: WasiHost; pluginId: int): seq[(string, string)] =
+  ## `sys.env` inherits everything, `sys.env.<KEY>` one variable (wasm_host/mod.rs `on_load`).
+  result = @[]
+  if w.permissions == nil: return
+  let perms = w.permissions(pluginId)
+  var all = false
+  for p in perms:
+    if p == SysEnv: all = true
+  for kv in envPairs():
+    var ok = all
+    if not ok:
+      for p in perms:
+        if p == SysEnvPrefix & kv.key: ok = true
+    if ok: result.add (kv.key, kv.value)
+
+proc streamWrite(w: WasiHost; ci: CompInst; rep: int; data: string): string =
+  if rep == StdoutRep: writeBytes(w, ci.user, false, data)
+  elif rep == StderrRep: writeBytes(w, ci.user, true, data)
+  else: return "wasi:io/streams: write on an input stream"
+  ""
+
+proc earliestDeadline(w: WasiHost; reps: seq[int]): int64 =
+  result = 0
+  var first = true
+  for r in reps:
+    if r >= 0 and r < w.polls.len:
+      if first or w.polls[r] < result:
+        result = w.polls[r]
+        first = false
+
+proc zeros(n: int): string =
+  if n > 0 and n < 1048576: newString(n) else: ""
+
+proc randomBytes(st: WitState; n: int): CVal =
+  var items: seq[CVal] = @[]
+  var left = n
+  while left > 0:
+    var x = next64(st)
+    var k = 0
+    while k < 8 and left > 0:
+      items.add vInt(int64(x and 0xFF'u64))
+      x = x shr 8
+      dec left
+      inc k
+  vList(items)
+
+proc installRandom(r: HostRegistry; st: WitState; iface: string) =
+  witFn(r, iface, "get-random-bytes"):
+    if args[0].i < 0 or args[0].i > 1048576: return "wasi:random: request too large"
+    results.add randomBytes(st, int(args[0].i))
+  witFn(r, iface, "get-random-u64"):
+    results.add vInt(cast[int64](next64(st)))
+
+proc installWasi*(r: HostRegistry; st: WitState; w: WasiHost) =
+  # ---- wasi:cli
+  witFn(r, IfEnv, "get-environment"):
+    var items: seq[CVal] = @[]
+    let env = allowedEnv(w, ci.user)
+    var ei = 0
+    while ei < env.len:
+      items.add vRecord(@[vStr(env[ei][0]), vStr(env[ei][1])])
+      inc ei
+    results.add vList(items)
+  witFn(r, IfEnv, "get-arguments"):
+    results.add vList(@[])
+  witFn(r, IfEnv, "initial-cwd"):
+    results.add vNone()
+  witFn(r, IfExit, "exit"):
+    flushPlugin(w, ci.user)
+    w.lastExit = (if args[0].i == 0: 0 else: 1)
+    return "wasi exit " & $w.lastExit
+  witFn(r, IfExit, "exit-with-code"):
+    flushPlugin(w, ci.user)
+    w.lastExit = int(args[0].i)
+    return "wasi exit " & $w.lastExit
+  witFn(r, IfStdin, "get-stdin"):
+    results.add vInt(StdinRep)
+  witFn(r, IfStdout, "get-stdout"):
+    results.add vInt(StdoutRep)
+  witFn(r, IfStderr, "get-stderr"):
+    results.add vInt(StderrRep)
+  witFn(r, IfTermStdin, "get-terminal-stdin"):
+    results.add vNone()
+  witFn(r, IfTermStdout, "get-terminal-stdout"):
+    results.add vNone()
+  witFn(r, IfTermStderr, "get-terminal-stderr"):
+    results.add vNone()
+  # ---- wasi:io/error
+  witFn(r, IfIoError, "[method]error.to-debug-string"):
+    results.add vStr("stream error")
+  # ---- wasi:io/streams
+  witFn(r, IfStreams, "[method]output-stream.check-write"):
+    results.add okVal(vInt(int64(CheckWriteLimit)))
+  witFn(r, IfStreams, "[method]output-stream.write"):
+    let e = streamWrite(w, ci, int(args[0].i), bytesOf(args[1]))
+    if e.len > 0: return e
+    results.add okUnit()
+  witFn(r, IfStreams, "[method]output-stream.blocking-write-and-flush"):
+    let e = streamWrite(w, ci, int(args[0].i), bytesOf(args[1]))
+    if e.len > 0: return e
+    results.add okUnit()
+  witFn(r, IfStreams, "[method]output-stream.flush"):
+    results.add okUnit()
+  witFn(r, IfStreams, "[method]output-stream.blocking-flush"):
+    results.add okUnit()
+  witFn(r, IfStreams, "[method]output-stream.write-zeroes"):
+    let e = streamWrite(w, ci, int(args[0].i), zeros(int(args[1].i)))
+    if e.len > 0: return e
+    results.add okUnit()
+  witFn(r, IfStreams, "[method]output-stream.blocking-write-zeroes-and-flush"):
+    let e = streamWrite(w, ci, int(args[0].i), zeros(int(args[1].i)))
+    if e.len > 0: return e
+    results.add okUnit()
+  witFn(r, IfStreams, "[method]output-stream.splice"):
+    results.add closedErr(ci)
+  witFn(r, IfStreams, "[method]output-stream.blocking-splice"):
+    results.add closedErr(ci)
+  witFn(r, IfStreams, "[method]output-stream.subscribe"):
+    results.add vInt(0)
+  witFn(r, IfStreams, "[method]input-stream.read"):
+    results.add closedErr(ci)
+  witFn(r, IfStreams, "[method]input-stream.blocking-read"):
+    results.add closedErr(ci)
+  witFn(r, IfStreams, "[method]input-stream.skip"):
+    results.add closedErr(ci)
+  witFn(r, IfStreams, "[method]input-stream.blocking-skip"):
+    results.add closedErr(ci)
+  witFn(r, IfStreams, "[method]input-stream.subscribe"):
+    results.add vInt(0)
+  # ---- wasi:io/poll
+  witFn(r, IfPoll, "[method]pollable.ready"):
+    let p = int(args[0].i)
+    results.add vBool(p >= 0 and p < w.polls.len and w.polls[p] <= monoNow(w))
+  witFn(r, IfPoll, "[method]pollable.block"):
+    let p = int(args[0].i)
+    if p < 0 or p >= w.polls.len: return "wasi:io/poll: invalid pollable"
+    let now = monoNow(w)
+    if w.polls[p] > now: w.skew += w.polls[p] - now
+  witFn(r, IfPoll, "poll"):
+    var reps: seq[int] = @[]
+    for it in args[0].items: reps.add int(it.i)
+    if reps.len == 0: return "wasi:io/poll: poll of an empty list"
+    for rp in reps:
+      if rp < 0 or rp >= w.polls.len: return "wasi:io/poll: invalid pollable"
+    let now = monoNow(w)
+    let first = earliestDeadline(w, reps)
+    if first > now: w.skew += first - now
+    let t = monoNow(w)
+    var ready: seq[CVal] = @[]
+    var i = 0
+    while i < reps.len:
+      if w.polls[reps[i]] <= t: ready.add vInt(int64(i))
+      inc i
+    results.add vList(ready)
+  # ---- wasi:clocks
+  witFn(r, IfMono, "now"):
+    results.add vInt(monoNow(w))
+  witFn(r, IfMono, "resolution"):
+    results.add vInt(1)
+  witFn(r, IfMono, "subscribe-instant"):
+    w.polls.add args[0].i
+    results.add vInt(int64(w.polls.len - 1))
+  witFn(r, IfMono, "subscribe-duration"):
+    w.polls.add monoNow(w) + args[0].i
+    results.add vInt(int64(w.polls.len - 1))
+  witFn(r, IfWall, "now"):
+    let t = getTime()
+    results.add vRecord(@[vInt(toUnix(t)), vInt(int64(nanosecond(t)))])
+  witFn(r, IfWall, "resolution"):
+    results.add vRecord(@[vInt(0), vInt(1)])
+  # ---- wasi:random
+  installRandom(r, st, IfRandom)
+  installRandom(r, st, IfInsecure)
+  witFn(r, IfSeed, "insecure-seed"):
+    results.add vRecord(@[vInt(cast[int64](next64(st))), vInt(cast[int64](next64(st)))])
+  # ---- wasi:filesystem
+  witFn(r, IfPreopens, "get-directories"):
+    results.add vList(@[])
+  witFn(r, IfFsTypes, "filesystem-error-code"):
+    results.add vNone()

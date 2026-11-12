@@ -1,0 +1,183 @@
+## The player events and their conversion to the WIT `event` variant, and their dispatch. Port of
+## pumpkin/src/plugin/loader/wasm/wasm_host/wit/v0_1/events/player.rs (`ToFromWasmEvent` for PlayerJoinEvent,
+## PlayerLeaveEvent, PlayerChatEvent, PlayerCommandSendEvent, PlayerMoveEvent, PlayerRespawnEvent and the death event:
+## `to_wasm_event` is the field list given to `fireEvent`, `from_wasm_event` is reading the fields back from the
+## `EventOutcome`) over `fireEvent` of pluginhost.aowl, which is `PluginManager::fire` and `WasmPlugin::handle_event`.
+##
+## Player and world fields are reps (witserver.aowl); text fields are arena slots of the host's `WitState`.
+## PARTIAL: pumpkin/src/plugin/loader/wasm/wasm_host/wit/v0_1/events/player.rs - events converted and fired: join, leave,
+## chat, command-send, move, respawn, death, login, teleport, change-world, gamemode-change, exp-change, item-held,
+## toggle-sneak/sprint/flight, interact (right-click-block only). Not converted (no call site or no WIT value to
+## lower): interact left-click and air, interact-entity, fish, egg-throw, inventory click/close (item stacks), custom
+## payload, permission-check, bedrock-form-response, changed main hand, custom click action, and the ~170 other
+## player/world events of the WIT. Dispatch is upstream's (pluginhost.aowl `fireEvent`): blocking handlers first in
+## registration order, they may cancel and edit; non-blocking ones see the result and their reply is dropped; the WIT
+## `priority` orders nothing and a cancelled event still reaches every handler, both as upstream.
+import std/[options]
+import ../wasm/canonabi
+import ../../util/gamemode
+import ../../util/math/position
+import ../../util/vector3
+import ../../util/text/text
+import ../../server/serverbase
+import ../pluginhost
+import witstate, witserver
+
+type
+  PlayerEventResult* = object
+    cancelled*: bool
+    message*: string          ## chat message / command / death text after the plugins
+    text*: TextComponent      ## join, leave and death messages after the plugins
+    pos*: Vector3[float64]    ## move destination after the plugins
+    value*: int               ## game mode, exp amount after the plugins
+    yaw*, pitch*: float32     ## change-world
+
+proc playerRep(p: Player): CVal = vInt(int64(p.entityId))
+
+proc strOf(o: EventOutcome; name: string; fallback: string): string =
+  result = fallback
+  var i = 0
+  while i < o.fieldNames.len:
+    if o.fieldNames[i] == name: result = o.fieldVals[i].s
+    inc i
+
+proc valOf(o: EventOutcome; name: string): CVal =
+  result = vInt(0)
+  var i = 0
+  while i < o.fieldNames.len:
+    if o.fieldNames[i] == name: result = o.fieldVals[i]
+    inc i
+
+proc messageEvent(h: PluginHost; eventName, field: string; player: Player; message: TextComponent): PlayerEventResult =
+  ## join, leave: `{ player, <field>: text-component, cancelled }`.
+  let rep = newTextRep(h.ws, message)
+  let o = fireEvent(h, eventName, @["player", field, "cancelled"], @[playerRep(player), vInt(int64(rep)), vBool(false)])
+  result = PlayerEventResult(cancelled: o.cancelled, message: "", text: textAt(h.ws, int(valOf(o, field).i)),
+                             pos: Vector3[float64](x: 0.0, y: 0.0, z: 0.0))
+
+proc playerJoinEvent*(h: PluginHost; player: Player; joinMessage: TextComponent): PlayerEventResult =
+  ## `PlayerJoinEvent`
+  messageEvent(h, "player-join-event", "join-message", player, joinMessage)
+
+proc playerLeaveEvent*(h: PluginHost; player: Player; leaveMessage: TextComponent): PlayerEventResult =
+  ## `PlayerLeaveEvent`
+  messageEvent(h, "player-leave-event", "leave-message", player, leaveMessage)
+
+proc playerChatEvent*(h: PluginHost; player: Player; message: string; recipients: seq[Player]): PlayerEventResult =
+  ## `PlayerChatEvent`: the recipients are the players of the sender's world.
+  var rl: seq[CVal] = @[]
+  for p in recipients: rl.add playerRep(p)
+  let o = fireEvent(h, "player-chat-event", @["player", "message", "recipients", "signature", "cancelled"],
+    @[playerRep(player), vStr(message), vList(rl), vNone(), vBool(false)])
+  result = PlayerEventResult(cancelled: o.cancelled, message: strOf(o, "message", message), text: text(""),
+                             pos: Vector3[float64](x: 0.0, y: 0.0, z: 0.0))
+
+proc playerCommandSendEvent*(h: PluginHost; player: Player; command: string): PlayerEventResult =
+  ## `PlayerCommandSendEvent`
+  let o = fireEvent(h, "player-command-send-event", @["player", "command", "cancelled"],
+    @[playerRep(player), vStr(command), vBool(false)])
+  result = PlayerEventResult(cancelled: o.cancelled, message: strOf(o, "command", command), text: text(""),
+                             pos: Vector3[float64](x: 0.0, y: 0.0, z: 0.0))
+
+proc playerMoveEvent*(h: PluginHost; player: Player; fromPos, toPos: Vector3[float64]): PlayerEventResult =
+  ## `PlayerMoveEvent`
+  let o = fireEvent(h, "player-move-event", @["player", "from-position", "to-position", "cancelled"],
+    @[playerRep(player), vPos(fromPos), vPos(toPos), vBool(false)])
+  result = PlayerEventResult(cancelled: o.cancelled, message: "", text: text(""), pos: toPos)
+  let v = valOf(o, "to-position")
+  if v.items.len == 3: result.pos = posOf(v)
+
+proc playerRespawnEvent*(h: PluginHost; player: Player; previousWorld, world: int; pos: Vector3[float64];
+                         yaw, pitch: float32; alive: bool) =
+  ## `PlayerRespawnEvent` (not cancellable, and its fields are read back by nobody upstream).
+  discard fireEvent(h, "player-respawn-event", @["player", "previous-world", "respawned-world", "position", "yaw", "pitch", "alive"],
+    @[playerRep(player), vInt(int64(previousWorld)), vInt(int64(world)), vPos(pos), vFloat(float64(yaw)),
+      vFloat(float64(pitch)), vBool(alive)])
+
+proc playerDeathEvent*(h: PluginHost; player: Player; deathMessage: TextComponent): PlayerEventResult =
+  ## The death event: `{ player, death-message, dropped-exp, keep-inventory, cancelled }`. The server has no cancel
+  ## path for a death, so `cancelled` is reported but the caller only takes the message.
+  let rep = newTextRep(h.ws, deathMessage)
+  let o = fireEvent(h, "player-death-event", @["player", "death-message", "dropped-exp", "keep-inventory", "cancelled"],
+    @[playerRep(player), vInt(int64(rep)), vInt(0), vBool(false), vBool(false)])
+  result = PlayerEventResult(cancelled: o.cancelled, message: "", text: textAt(h.ws, int(valOf(o, "death-message").i)),
+                             pos: Vector3[float64](x: 0.0, y: 0.0, z: 0.0))
+
+proc blank(): PlayerEventResult =
+  PlayerEventResult(cancelled: false, message: "", text: text(""), pos: Vector3[float64](x: 0.0, y: 0.0, z: 0.0),
+                    value: 0, yaw: 0.0'f32, pitch: 0.0'f32)
+
+proc playerLoginEvent*(h: PluginHost; player: Player; kickMessage: TextComponent): PlayerEventResult =
+  ## `PlayerLoginEvent`: `{ player, kick-message, cancelled }`.
+  messageEvent(h, "player-login-event", "kick-message", player, kickMessage)
+
+proc playerToggleEvent*(h: PluginHost; player: Player; kind: int; value: bool): PlayerEventResult =
+  ## `PlayerToggleSneakEvent` (kind 0), `PlayerToggleSprintEvent` (1), `PlayerToggleFlightEvent` (2): `{ player, is-<x>, cancelled }`.
+  var ev = "player-toggle-flight-event"
+  var field = "is-flying"
+  if kind == 0:
+    ev = "player-toggle-sneak-event"
+    field = "is-sneaking"
+  elif kind == 1:
+    ev = "player-toggle-sprint-event"
+    field = "is-sprinting"
+  let o = fireEvent(h, ev, @["player", field, "cancelled"], @[playerRep(player), vBool(value), vBool(false)])
+  result = blank()
+  result.cancelled = o.cancelled
+  result.value = int(valOf(o, field).i)
+
+proc playerGamemodeChangeEvent*(h: PluginHost; player: Player; previous, next: GameMode): PlayerEventResult =
+  ## `PlayerGamemodeChangeEvent`: `{ player, previous-gamemode, new-gamemode, cancelled }`; the new mode is read back.
+  let o = fireEvent(h, "player-gamemode-change-event", @["player", "previous-gamemode", "new-gamemode", "cancelled"],
+    @[playerRep(player), vInt(int64(ord(previous))), vInt(int64(ord(next))), vBool(false)])
+  result = blank()
+  result.cancelled = o.cancelled
+  result.value = int(valOf(o, "new-gamemode").i)
+
+proc playerItemHeldEvent*(h: PluginHost; player: Player; previous, next: int): PlayerEventResult =
+  ## `PlayerItemHeldEvent`: `{ player, previous-slot, new-slot, cancelled }`.
+  let o = fireEvent(h, "player-item-held-event", @["player", "previous-slot", "new-slot", "cancelled"],
+    @[playerRep(player), vInt(int64(previous)), vInt(int64(next)), vBool(false)])
+  result = blank()
+  result.cancelled = o.cancelled
+
+proc playerTeleportEvent*(h: PluginHost; player: Player; fromPos, toPos: Vector3[float64]): PlayerEventResult =
+  ## `PlayerTeleportEvent`: `{ player, from-position, to-position, cancelled }`; the destination is read back.
+  let o = fireEvent(h, "player-teleport-event", @["player", "from-position", "to-position", "cancelled"],
+    @[playerRep(player), vPos(fromPos), vPos(toPos), vBool(false)])
+  result = blank()
+  result.cancelled = o.cancelled
+  result.pos = toPos
+  let v = valOf(o, "to-position")
+  if v.items.len == 3: result.pos = posOf(v)
+
+proc playerChangeWorldEvent*(h: PluginHost; player: Player; previousWorld, newWorld: int; pos: Vector3[float64];
+                             yaw, pitch: float32): PlayerEventResult =
+  ## `PlayerChangeWorldEvent`: `{ player, previous-world, new-world, position, yaw, pitch, cancelled }`.
+  let o = fireEvent(h, "player-change-world-event", @["player", "previous-world", "new-world", "position", "yaw", "pitch", "cancelled"],
+    @[playerRep(player), vInt(int64(previousWorld)), vInt(int64(newWorld)), vPos(pos), vFloat(float64(yaw)),
+      vFloat(float64(pitch)), vBool(false)])
+  result = blank()
+  result.cancelled = o.cancelled
+  result.pos = pos
+  let v = valOf(o, "position")
+  if v.items.len == 3: result.pos = posOf(v)
+  result.yaw = float32(valOf(o, "yaw").f)
+  result.pitch = float32(valOf(o, "pitch").f)
+
+proc playerExpChangeEvent*(h: PluginHost; player: Player; amount: int): PlayerEventResult =
+  ## `PlayerExpChangeEvent`: `{ player, amount }` (not cancellable); the amount is read back.
+  let o = fireEvent(h, "player-exp-change-event", @["player", "amount"], @[playerRep(player), vInt(int64(amount))])
+  result = blank()
+  result.value = int(valOf(o, "amount").i)
+
+proc playerInteractEvent*(h: PluginHost; player: Player; action: int; clicked: Option[BlockPos]; blockName: string): PlayerEventResult =
+  ## `PlayerInteractEvent`: `{ player, action, clicked-pos: option<block-pos>, block, cancelled }`.
+  var cp = vNone()
+  if clicked.isSome:
+    let b = clicked.unsafeGet
+    cp = vSome(vRecord(@[vInt(int64(b.x)), vInt(int64(b.y)), vInt(int64(b.z))]))
+  let o = fireEvent(h, "player-interact-event", @["player", "action", "clicked-pos", "block", "cancelled"],
+    @[playerRep(player), vInt(int64(action)), cp, vStr(blockName), vBool(false)])
+  result = blank()
+  result.cancelled = o.cancelled

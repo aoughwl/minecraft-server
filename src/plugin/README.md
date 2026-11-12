@@ -48,20 +48,40 @@ notice.
     src/plugin/pluginmgr.aowl         the server's plugin manager: scans plugins/*.wasm, registers plugin commands in the
                                       fallback dispatcher, fires player join/leave
 
+    src/plugin/wit/                   host interfaces, one file each, registered by witall.aowl (installWitInterfaces):
+                                      wittext (text-component), witscheduler, witbossbar, witworld (world resource),
+                                      witsrv (server resource), wituuid, witi18n; witstate.aowl holds their shared
+                                      state (text arena, boss bars, the `WitHooks` closures into the server)
+    src/plugin/pluginwire.aowl        fills `WitHooks` from the real Server (worlds, players, blocks, boss bar packets)
+    src/plugin/signature.aowl         pumpkin.metadata / wasm_signature sections and the verification flow (no Ed25519 yet)
+
 Tests (each is a `*test.aowl`, run with `python tools/run_tests.py plugin`):
 
     wasmvmtest        hand-assembled core module: host import called from wasm, wasm export called from host, memory both ways, a trap
     canonabitest      layout and flat/memory known answers, variant joining, strings, lists, handles, >16 param spill
     componenttest     hand-built component in wit-component's shape (shim + fixup modules, canon lower/lift): host to guest and guest to host calls with strings
+    wit/witifacetest  every interface above called through the registry with lifted CVal arguments, against fakes
+    wit/witcomptest   a hand-built component importing scheduler, world, text, boss-bar and server: on-load schedules
+                      a task, handle-task sets a block and shows a boss bar (`--write FILE X Y Z STATE NAME DELAY`
+                      writes it for the over-the-wire run with `mcbot.py --plugin`)
+    signaturetest     custom-section scanning, strip, metadata/envelope parsing, verifier payload, error branches
     pluginhosttest    a hand-built plugin against v0.1-shaped interfaces: logs on load, registers command `hello` and a join
                       handler; the test runs the command through the dispatcher and fires a join event
+
+Player interfaces (wit/witplayer, witentity, witeventsplayer, with witserver for the rep lookups): the `player`,
+`java-player` (kick only), `entity` and `living-entity` resources are backed by the real server (`Player`,
+`EntityBase`, `CommandPlayer`); the player events join, leave, chat, command-send, move, respawn and death are fired
+from the server (chat, command and move through the closures of pluginhooks.aowl that play.aowl calls; respawn and
+death by chaining `gPlayerRespawnedHook` and `gPlayerHooks.handleKilled`). `pluginhostplayertest` runs a hand-built
+plugin that sends a text component to a joining player and cancels chat; `python tools/mcbot.py --wasm-plugin` does the same
+over the wire (tools/mcbot_plugin.py). What each file leaves out is its PARTIAL line.
 
 Server hooks (small, in other agents' files): `src/server/servermod.aowl` imports `../plugin/pluginmgr`, calls
 `startPlugins(server)` after `installCommands`, `firePlayerJoin(player)` after `worldmod.addPlayer` in `addPlayer`, and
 `firePlayerLeave(player)` after `handlePlayerLeave` in `removePlayer`.
 
-Not done (also PARTIAL lines in the sources): the other ~40 host interfaces (player, world, entity, item-stack, text,
-scheduler, server, boss-bar, scoreboard, gui, forms, recipe, ...) trap with "unimplemented host function"; WASI p2, which
+Not done (also PARTIAL lines in the sources): the other host interfaces (player and entity are the other half's; item-stack,
+block-entity, scoreboard, gui, forms, recipe, the managers behind `server`, the chunk and world-border resources, ...) trap with "unimplemented host function"; WASI p2, which
 a Rust std plugin imports, is not provided; nested components and guest-defined resources; v0.2 host; signature and
 permission enforcement; pumpkin-plugin-api (the guest SDK), pumpkin-macros, pumpkin-api-macros and the wit generators in
 pumpkin-codegen are untouched (they need rustc and the WIT-to-aowlmony generator described in src/plugin_api/README.md).

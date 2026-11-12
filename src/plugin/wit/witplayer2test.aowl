@@ -1,0 +1,250 @@
+## The second batch of player, entity, world and server host functions (witplayer2, witentity2, witworld, witsrv) called
+## through the registry with lifted `CVal` arguments, against a real `Server`, `World` and `Player` whose client has no
+## socket: the packets a function writes are read back from the client's writer. Also the event dispatch order of
+## pluginhost.aowl (`fireEvent`) is covered by pluginhostplayertest.aowl and witcomptest.aowl.
+import std/[assertions, options, syncio, cmdline, tables]
+import ../../generated/packet
+import ../../protocol/java/packet_decoder
+import ../../protocol/[proto, varint]
+import ../../util/uuid
+import ../../util/vector3
+import ../../util/text/text
+import ../../util/math/position
+import ../../world/[chunkdata, playerdata, worldfs, worldinfo]
+import ../../server/data/datamod
+import ../../server/entity/player
+import ../../server/entity/entitymod
+import ../../server/recipe
+import ../../server/scheduler
+import ../../server/serverbase
+import ../../server/tick_rate_manager
+import ../../server/world/worldmod
+import ../../server/net/winsock
+import ../../server/net/java/javamod
+import ../../server/net/netbase
+import ../../generated/game_rules
+import ../wasm/[wasmvm, canonabi, component]
+import witstate, witserver, witall, witplayer2
+
+proc scratch(): string =
+  result = parentDirW(paramStr(0)) & "/witplayer2_scratch"
+  discard createDirAllW(result)
+
+proc newTestServer(): Server =
+  let adv = defaultAdvancedConfiguration()
+  let basic = defaultBasicConfiguration()
+  result = Server(basicConfig: basic, advancedConfig: adv, worlds: @[], dimensions: @[OVERWORLD],
+    tickCounter: 100'i64, nextEntityId: 1'i32, tickRateManager: newServerTickRateManager(20.0'f32), keyStore: nil,
+    recipeManager: newRecipeManager(), scheduler: newTaskScheduler(), data: ServerData(),
+    playerDataStorage: newPlayerDataStorage(scratch() & "/playerdata", true), levelFolder: scratch(),
+    playerIdleTimeout: 0'i32, mojangPublicKeys: @[], stopRequested: false, stopAtMs: 0'i64)
+  let theLevel = fromRootFolder(adv.world, scratch(), 1'i64, OVERWORLD)
+  result.worlds.add(loadWorld(theLevel, defaultLevelData(1'u64), OVERWORLD, 63'i32, -64'i32, result))
+
+proc newTestPlayer(server: Server): Player =
+  let client = newJavaClient(InvalidSocket, 1'u64)
+  client.connectionState = csPlay
+  client.version = jmvV1_21_11
+  client.peerIp = "10.1.2.3"
+  let profile = GameProfile(id: offlineUuid("Tester"), name: "Tester", properties: @[], profileActions: @[])
+  result = newPlayer(client, profile, defaultPlayerConfig(), server.worlds[0], server, Survival, 1'i32)
+  worldmod.addPlayer(server.worlds[0], result)
+  result.setClientLoaded(true)
+
+proc packetIds(client: JavaClient): seq[int32] =
+  var decoder = newTCPNetworkDecoder()
+  decoder.feed(client.networkWriter.flush())
+  result = @[]
+  while decoder.packetReady():
+    let res = decoder.getRawPacket()
+    assert res.isOk
+    result.add(res.value.id)
+
+var failures = 0
+
+proc ck(ok: bool; msg: string) =
+  if not ok:
+    echo "FAILED ", msg
+    inc failures
+
+proc call(r: HostRegistry; ci: CompInst; iface, fname: string; args: seq[CVal]; results: var seq[CVal]): string =
+  let key = iface & "#" & fname
+  var i = 0
+  while i < r.keys.len:
+    if r.keys[i] == key:
+      return r.fns[i].fn(ci, args, results)
+    inc i
+  result = "no host function " & key
+
+proc c(r: HostRegistry; ci: CompInst; iface, fname: string; args: seq[CVal]): seq[CVal] =
+  var res: seq[CVal] = @[]
+  let e = call(r, ci, iface, fname, args, res)
+  if e.len > 0:
+    echo "FAILED call ", fname, ": ", e
+    inc failures
+  res
+
+proc pos3(x, y, z: float64): CVal = vRecord(@[vFloat(x), vFloat(y), vFloat(z)])
+
+const
+  P = "pumpkin:plugin/player"
+  V = "pumpkin:plugin/server"
+  W = "pumpkin:plugin/world"
+
+proc main() =
+  let server = newTestServer()
+  let p = newTestPlayer(server)
+  gLink.server = server
+  let r = newHostRegistry()
+  let st = newWitState()
+  installWitInterfaces(r, st)
+  let ci = newCompInst(newWasmVm(), r, 3)
+  let me = vInt(int64(p.entityId))
+  discard packetIds(p.client)
+
+  # ---- permissions kept plugin-side
+  discard c(r, ci, P, "[method]player.set-permission", @[me, vStr("a.b"), vBool(true)])
+  var res = c(r, ci, P, "[method]player.has-permission-set", @[me, vStr("a.b")])
+  ck(res.len == 1 and res[0].i == 1 and res[0].items[0].i == 1, "has-permission-set some true")
+  res = c(r, ci, P, "[method]player.has-permission-set", @[me, vStr("x.y")])
+  ck(res[0].i == 0, "has-permission-set none")
+  discard c(r, ci, P, "[method]player.unset-permission", @[me, vStr("a.b")])
+  res = c(r, ci, P, "[method]player.has-permission-set", @[me, vStr("a.b")])
+  ck(res[0].i == 0, "unset-permission")
+
+  # ---- statistics
+  discard c(r, ci, P, "[method]player.increment-statistic", @[me, vInt(0), vInt(5), vInt(3)])
+  discard c(r, ci, P, "[method]player.increment-statistic", @[me, vInt(0), vInt(5), vInt(4)])
+  res = c(r, ci, P, "[method]player.get-statistic", @[me, vInt(0), vInt(5)])
+  ck(res[0].i == 7, "statistic 3 + 4")
+  discard c(r, ci, P, "[method]player.set-custom-statistic", @[me, vInt(1), vInt(99)])
+  discard c(r, ci, P, "[method]player.increment-custom-statistic", @[me, vInt(1), vInt(1)])
+  res = c(r, ci, P, "[method]player.get-custom-statistic", @[me, vInt(1)])
+  ck(res[0].i == 100, "custom statistic play-time")
+  discard packetIds(p.client)
+  discard c(r, ci, P, "[method]player.send-stats", @[me])
+  ck(packetIds(p.client) == @[CB_PLAY_AWARD_STATS.toId(jmvV1_21_11)], "send-stats packet id")
+
+  # ---- abilities round trip
+  discard c(r, ci, P, "[method]player.set-abilities", @[me, vRecord(@[vBool(true), vBool(false), vBool(true), vBool(false),
+    vBool(true), vFloat(0.25), vFloat(0.5)])])
+  res = c(r, ci, P, "[method]player.get-abilities", @[me])
+  ck(res[0].items[0].i == 1 and res[0].items[2].i == 1 and res[0].items[5].f == 0.25 and res[0].items[6].f == 0.5, "abilities")
+  ck(packetIds(p.client) == @[CB_PLAY_PLAYER_ABILITIES.toId(jmvV1_21_11)], "set-abilities packet")
+
+  # ---- ip, skin
+  res = c(r, ci, P, "[method]player.get-ip", @[me])
+  ck(res[0].s == "10.1.2.3", "ip")
+  res = c(r, ci, P, "[method]player.get-skin", @[me])
+  ck(res[0].i == 0, "no skin")
+  discard c(r, ci, P, "[method]player.set-skin", @[me, vRecord(@[vStr("tex"), vSome(vStr("sig"))])])
+  res = c(r, ci, P, "[method]player.get-skin", @[me])
+  ck(res[0].i == 1 and res[0].items[0].items[0].s == "tex" and res[0].items[0].items[1].items[0].s == "sig", "skin")
+  discard c(r, ci, P, "[method]player.set-skin-parts", @[me, vInt(0x41)])
+  res = c(r, ci, P, "[method]player.get-skin-parts", @[me])
+  ck(res[0].i == 0x41, "skin parts")
+
+  # ---- packets: ids written
+  discard packetIds(p.client)
+  discard c(r, ci, P, "[method]player.send-hurt-animation", @[me, vFloat(90.0)])
+  ck(packetIds(p.client) == @[CB_PLAY_HURT_ANIMATION.toId(jmvV1_21_11)], "hurt animation")
+  discard c(r, ci, P, "[method]player.open-sign-editor", @[me, vRecord(@[vInt(1), vInt(64), vInt(2)]), vBool(true)])
+  ck(packetIds(p.client) == @[CB_PLAY_OPEN_SIGN_EDITOR.toId(jmvV1_21_11)], "sign editor")
+  discard c(r, ci, P, "[method]player.set-velocity", @[me, pos3(0.0, 0.5, 0.0)])
+  ck(packetIds(p.client) == @[CB_PLAY_SET_ENTITY_MOTION.toId(jmvV1_21_11)] and p.velocity.y == 0.5, "set-velocity")
+  discard c(r, ci, P, "[method]player.set-compass-target", @[me, pos3(10.5, 70.0, -3.5)])
+  ck(packetIds(p.client) == @[CB_PLAY_SET_DEFAULT_SPAWN_POSITION.toId(jmvV1_21_11)], "compass")
+  res = c(r, ci, P, "[method]player.get-compass-target", @[me])
+  ck(res[0].items[0].f == 10.5, "compass read back")
+  discard c(r, ci, P, "[method]player.send-block-change", @[me, vRecord(@[vInt(1), vInt(64), vInt(2)]), vInt(1)])
+  ck(packetIds(p.client) == @[CB_PLAY_BLOCK_UPDATE.toId(jmvV1_21_11)], "block change")
+  discard c(r, ci, P, "[method]player.spawn-particles", @[me, vInt(3), pos3(0.0, 64.0, 0.0), vInt(5), pos3(0.1, 0.1, 0.1), vFloat(0.0)])
+  ck(packetIds(p.client) == @[CB_PLAY_LEVEL_PARTICLES.toId(jmvV1_21_11)], "particles")
+  discard c(r, ci, P, "[method]player.play-sound", @[me, vInt(0), vInt(0), vFloat(1.0), vFloat(1.0)])
+  ck(packetIds(p.client) == @[CB_PLAY_SOUND.toId(jmvV1_21_11)], "play-sound")
+  discard c(r, ci, P, "[method]player.stop-sound", @[me, vNone(), vSome(vInt(1))])
+  ck(packetIds(p.client) == @[CB_PLAY_STOP_SOUND.toId(jmvV1_21_11)], "stop-sound")
+  discard c(r, ci, P, "[method]player.set-camera-entity-id", @[me, vInt(77)])
+  ck(packetIds(p.client) == @[CB_PLAY_SET_CAMERA.toId(jmvV1_21_11)] and p.cameraTargetId.isSome, "camera")
+  res = c(r, ci, P, "[method]player.get-camera-entity-id", @[me])
+  ck(res[0].i == 77, "camera id")
+  discard c(r, ci, P, "[method]player.reset-camera", @[me])
+  ck(p.cameraTargetId.isNone, "camera reset")
+  discard packetIds(p.client)
+  discard c(r, ci, P, "[method]player.set-server-links", @[me, vList(@[
+    vRecord(@[vVariant(0, vInt(6)), vStr("https://example.org")]),
+    vRecord(@[vVariant(1, vInt(int64(newTextRep(st, text("Custom"))))), vStr("https://example.org/x")])])])
+  ck(packetIds(p.client) == @[CB_PLAY_SERVER_LINKS.toId(jmvV1_21_11)], "server links")
+  discard c(r, ci, P, "[method]player.set-tab-list-header-footer", @[me, vInt(int64(newTextRep(st, text("H")))),
+    vInt(int64(newTextRep(st, text("F"))))])
+  ck(packetIds(p.client) == @[CB_PLAY_TAB_LIST.toId(jmvV1_21_11)], "tab list header footer")
+  discard c(r, ci, P, "[method]player.set-tab-list-order", @[me, vInt(4)])
+  ck(p.tabListOrder == 4, "tab list order")
+  discard c(r, ci, P, "[method]player.set-tab-list-name", @[me, vSome(vInt(int64(newTextRep(st, text("Nick")))))])
+  res = c(r, ci, P, "[method]player.get-tab-list-name", @[me])
+  ck(res[0].i == 1 and getText(textAt(st, int(res[0].items[0].i))) == "Nick", "tab list name")
+
+  # ---- cooldowns follow the server tick
+  discard packetIds(p.client)
+  discard c(r, ci, P, "[method]player.start-cooldown", @[me, vStr("minecraft:ender_pearl"), vInt(20)])
+  ck(packetIds(p.client) == @[CB_PLAY_COOLDOWN.toId(jmvV1_21_11)], "cooldown packet")
+  res = c(r, ci, P, "[method]player.is-on-cooldown", @[me, vStr("minecraft:ender_pearl")])
+  ck(res[0].i == 1, "on cooldown")
+  res = c(r, ci, P, "[method]player.get-cooldown", @[me, vStr("minecraft:ender_pearl")])
+  ck(res[0].f == 1.0, "cooldown fraction 1.0")
+  server.tickCounter = 110'i64
+  res = c(r, ci, P, "[method]player.get-cooldown", @[me, vStr("minecraft:ender_pearl")])
+  ck(res[0].f == 0.5, "cooldown fraction 0.5")
+  server.tickCounter = 120'i64
+  res = c(r, ci, P, "[method]player.is-on-cooldown", @[me, vStr("minecraft:ender_pearl")])
+  ck(res[0].i == 0, "cooldown over")
+
+  # ---- ban lists
+  var banned: seq[string] = @[]
+  server.commandServer = CommandServer(addBannedPlayer: proc (e: CmdListEntry) {.closure.} = banned.add(e.name & ":" & e.reason & ":" & e.source),
+    addBannedIp: proc (e: CmdListEntry) {.closure.} = banned.add(e.ip & ":" & e.reason))
+  discard c(r, ci, P, "[method]player.ban", @[me, vRecord(@[vSome(vInt(int64(newTextRep(st, text("grief"))))), vSome(vStr("Op")),
+    vNone(), vNone()])])
+  ck(banned.len == 1 and banned[0] == "Tester:grief:Op", "ban entry " & (if banned.len > 0: banned[0] else: ""))
+  discard c(r, ci, P, "[method]player.ban-ip", @[me, vRecord(@[vNone(), vNone(), vNone(), vNone()])])
+  ck(banned.len == 2 and banned[1] == "10.1.2.3:Banned by an operator.", "ban-ip entry")
+
+  # ---- server
+  server.basicConfig.whiteList = true
+  res = c(r, ci, V, "[method]server.has-whitelist", @[vInt(0)])
+  ck(res[0].i == 1, "has-whitelist")
+  res = c(r, ci, V, "[method]server.get-sys-info", @[vInt(0)])
+  ck(res[0].items.len == 6 and res[0].items[0].i == 0, "sys-info")
+  discard packetIds(p.client)
+  discard c(r, ci, V, "[method]server.broadcast-tab-list-header-footer", @[vInt(0), vInt(int64(newTextRep(st, text("H")))),
+    vInt(int64(newTextRep(st, text("F"))))])
+  ck(packetIds(p.client) == @[CB_PLAY_TAB_LIST.toId(jmvV1_21_11)], "broadcast tab list")
+  discard c(r, ci, V, "[method]server.set-server-links", @[vInt(0), vList(@[vRecord(@[vVariant(0, vInt(0)), vStr("https://a.b")])])])
+  ck(packetIds(p.client) == @[CB_PLAY_SERVER_LINKS.toId(jmvV1_21_11)], "broadcast server links")
+
+  # ---- world
+  res = c(r, ci, W, "[method]world.get-spawn-location", @[vInt(0)])
+  ck(res[0].items.len == 3 and res[0].items[0].items.len == 3, "spawn location shape")
+  res = c(r, ci, W, "[method]world.get-game-rule", @[vInt(0), vInt(int64(ord(grKeepInventory)))])
+  ck(res[0].i == 1 and res[0].items[0].i == 0, "keep-inventory default false")
+  discard c(r, ci, W, "[method]world.set-game-rule", @[vInt(0), vInt(int64(ord(grKeepInventory))), vVariant(1, vBool(true))])
+  ck(server.worlds[0].levelInfo.gameRules.keepInventory, "set bool game rule")
+  discard c(r, ci, W, "[method]world.set-game-rule", @[vInt(0), vInt(int64(ord(grRandomTickSpeed))), vVariant(0, vInt(9))])
+  res = c(r, ci, W, "[method]world.get-game-rule", @[vInt(0), vInt(int64(ord(grRandomTickSpeed)))])
+  ck(res[0].i == 0 and res[0].items[0].i == 9, "int game rule")
+  discard packetIds(p.client)
+  discard c(r, ci, W, "[method]world.spawn-particle", @[vInt(0), vInt(3), pos3(0.0, 64.0, 0.0), pos3(0.0, 0.0, 0.0), vFloat(0.0), vInt(2)])
+  ck(packetIds(p.client) == @[CB_PLAY_LEVEL_PARTICLES.toId(jmvV1_21_11)], "world particle")
+  discard c(r, ci, W, "[method]world.play-sound", @[vInt(0), vInt(0), vInt(0), pos3(0.0, 64.0, 0.0), vFloat(1.0), vFloat(1.0)])
+  res = c(r, ci, W, "[method]world.get-entities", @[vInt(0)])
+  var found = false
+  for e in res[0].items:
+    if e.i == int64(p.entityId): found = true
+  ck(found, "get-entities lists the player")
+
+  if failures > 0:
+    echo failures, " failure(s)"
+    quit(1)
+  echo "witplayer2test ok"
+
+main()

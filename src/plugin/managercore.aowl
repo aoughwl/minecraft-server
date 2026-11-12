@@ -1,0 +1,383 @@
+## Port of pumpkin/src/plugin/mod.rs: `PluginManager` without the server. It owns the loaders and the loaded plugins and does
+## what the module does: `load_plugins` (scan `plugins/`, skip directories and `.deactivated` files, load each file with
+## the first loader that `can_load` it, sort by dependencies, ask for permissions through the cache, run `on_load` in that
+## order), `try_load_plugin`, `unload_plugin` (the plugin's `on_unload`, then the loader's `unload`), `unload_all_plugins`,
+## `is_plugin_active`, `is_plugin_loaded`, `active_plugins`, `loaded_plugins`, `get_plugin_state`, `get_failed_plugins`,
+## `all_plugins_loaded`, `add_loader` (which retries the files nobody could load), the plugin states, and
+## `topological_sort` with its upstream test (managercoretest.aowl). The server side (the context hooks, the wasm loader, the
+## fallback dispatcher) is wired in pluginmgr.aowl.
+## Async becomes plain calls: `spawn_plugin_initialization` runs the plugin's `on_load` at once and `try_load_plugin`
+## returns after it, which is what awaiting its task does upstream.
+## Permission policy: a plugin that asks for no permission is allowed; one that does is allowed when the cache has an
+## approving entry for the hash of its file and the same list, or when the `askPermission` hook says yes. There is no
+## console prompt (the tick thread must not block on stdin), so without the hook an unknown request is denied and the
+## log says how to approve it (`approved: true` in plugins/permission_cache.json).
+## PARTIAL: pumpkin/src/plugin/mod.rs - hot reload (`start_watcher`, `stop_watcher`, `retry_unloaded_files` on file
+## events) is `/plugin reload` and a poll of the folder's files by the caller, not a file watcher; services are the
+## context's; `wait_for_plugin` / `wait_for_all_plugins` need no waiting (loading is synchronous); no console prompt.
+import std/[syncio, strutils, dirs, paths]
+import "../server/plugin/native" as nativeplugin
+import api/[apimod, context, eventsmod]
+import loader/loadermod
+import cache
+import ../util/permission
+
+const
+  PluginDir* = "plugins"
+
+type
+  ManagerErrorKind* = enum
+    meServerNotInitialized
+    mePluginNotFound
+    meLoaderError
+    meIoError
+    meDependencyError
+
+  ManagerResult* = object
+    ## `Result<_, ManagerError>`: `ok` or the error with its Display text.
+    ok*: bool
+    kind*: ManagerErrorKind
+    message*: string
+
+  PreparedPlugin = object
+    path: string
+    loader: PluginLoader
+    loaded: LoadedPlugin
+
+  LoadedSlot* = ref object
+    metadata*: PluginMetadata
+    instance*: nil Plugin
+    loader*: PluginLoader
+    loaderData*: int
+    isActive*: bool
+    context*: PluginContext
+    path*: string
+
+  PluginManager* = ref object
+    plugins*: seq[LoadedSlot]
+    loaders*: seq[PluginLoader]
+    handlers*: HandlerMap
+    hooks*: ContextHooks
+    registry*: PermissionRegistry
+    dataRoot*: string
+    dir*: string                        ## the folder `load_plugins` scans (`plugins`)
+    stateNames: seq[string]
+    states: seq[PluginState]
+    unloadedFiles: seq[string]
+    askPermission*: proc (metadata: PluginMetadata): bool {.closure.}
+    log*: proc (line: string) {.closure.}
+    onUnloaded*: proc (name: string; loaderData: int) {.closure.}       ## the host drops what it kept for the plugin
+
+proc managerOk*(): ManagerResult = ManagerResult(ok: true)
+
+proc managerErr*(kind: ManagerErrorKind; message: string): ManagerResult =
+  ## The `Display` of each `ManagerError` variant.
+  var m = message
+  case kind
+  of meServerNotInitialized: m = "Server not initialized"
+  of mePluginNotFound: m = "Plugin not found: " & message
+  of meLoaderError: m = "Loader error: " & message
+  of meIoError: m = "IO error: " & message
+  of meDependencyError: m = "Dependency error: " & message
+  ManagerResult(ok: false, kind: kind, message: m)
+
+proc newPluginManager*(hooks: ContextHooks; registry: PermissionRegistry; dataRoot: string): PluginManager =
+  PluginManager(plugins: @[], loaders: @[], handlers: newHandlerMap(), hooks: hooks, registry: registry, dataRoot: dataRoot,
+                dir: PluginDir, stateNames: @[], states: @[], unloadedFiles: @[])
+
+proc say(m: PluginManager; line: string) =
+  if m.log != nil: m.log(line)
+  else: echo line
+
+# ---- states ------------------------------------------------------------------------------------
+
+proc joinWith(xs: seq[string]; sep: string): string =
+  result = ""
+  var i = 0
+  while i < xs.len:
+    if i > 0: result.add sep
+    result.add xs[i]
+    inc i
+
+proc setState(m: PluginManager; name: string; state: PluginState) =
+  var i = 0
+  while i < m.stateNames.len:
+    if m.stateNames[i] == name:
+      m.states[i] = state
+      return
+    inc i
+  m.stateNames.add name
+  m.states.add state
+
+proc clearState(m: PluginManager; name: string) =
+  var names: seq[string] = @[]
+  var states: seq[PluginState] = @[]
+  var i = 0
+  while i < m.stateNames.len:
+    if m.stateNames[i] != name:
+      names.add m.stateNames[i]
+      states.add m.states[i]
+    inc i
+  m.stateNames = names
+  m.states = states
+
+proc getPluginState*(m: PluginManager; name: string; state: var PluginState): bool =
+  var i = 0
+  while i < m.stateNames.len:
+    if m.stateNames[i] == name:
+      state = m.states[i]
+      return true
+    inc i
+  false
+
+proc getFailedPlugins*(m: PluginManager): seq[(string, string)] =
+  result = @[]
+  var i = 0
+  while i < m.stateNames.len:
+    if m.states[i].kind == psFailed: result.add (m.stateNames[i], m.states[i].error)
+    inc i
+
+proc getLoadingPlugins*(m: PluginManager): seq[string] =
+  result = @[]
+  var i = 0
+  while i < m.stateNames.len:
+    if m.states[i].kind == psLoading: result.add m.stateNames[i]
+    inc i
+
+proc allPluginsLoaded*(m: PluginManager): bool = m.getLoadingPlugins().len == 0
+
+# ---- queries -----------------------------------------------------------------------------------
+
+proc isPluginActive*(m: PluginManager; name: string): bool =
+  for p in m.plugins:
+    if p.metadata.name == name and p.isActive and p.instance != nil: return true
+  false
+
+proc isPluginLoaded*(m: PluginManager; name: string): bool =
+  for p in m.plugins:
+    if p.metadata.name == name: return true
+  false
+
+proc activePlugins*(m: PluginManager): seq[PluginMetadata] =
+  result = @[]
+  for p in m.plugins:
+    if p.isActive and p.instance != nil: result.add p.metadata
+
+proc loadedPlugins*(m: PluginManager): seq[PluginMetadata] =
+  result = @[]
+  for p in m.plugins: result.add p.metadata
+
+# ---- dependency order --------------------------------------------------------------------------
+
+proc visit(name: string; names: seq[string]; deps: seq[seq[string]]; visited: var seq[string]; currentPath: var seq[string];
+           sorted: var seq[string]; err: var string) =
+  if err.len > 0: return
+  if name in currentPath:
+    err = "Circular dependency detected involving plugin: " & name
+    return
+  if name notin visited:
+    currentPath.add name
+    let idx = names.find(name)
+    if idx >= 0:
+      for dep in deps[idx]:
+        if err.len > 0: return
+        if dep notin names:
+          err = "Plugin " & name & " depends on missing plugin: " & dep
+          return
+        visit(dep, names, deps, visited, currentPath, sorted, err)
+    if err.len > 0: return
+    var kept: seq[string] = @[]
+    for c in currentPath:
+      if c != name: kept.add c
+    currentPath = kept
+    visited.add name
+    sorted.add name
+
+proc topologicalSort*(names: seq[string]; deps: seq[seq[string]]; sorted: var seq[string]): string =
+  ## `PluginManager::topological_sort`: "" or the error. Every dependency before the plugin that needs it.
+  sorted = @[]
+  var visited: seq[string] = @[]
+  var currentPath: seq[string] = @[]
+  var err = ""
+  for n in names:
+    visit(n, names, deps, visited, currentPath, sorted, err)
+    if err.len > 0: return err
+  ""
+
+# ---- loading ----------------------------------------------------------------------------------
+
+proc checkPermissionsCached(m: PluginManager; path: string; metadata: PluginMetadata; cache: var PermissionCache;
+                            cachePath: string): bool =
+  let hash = calculateHash(path)
+  let i = indexOf(cache, hash)
+  if i >= 0 and cache.entries[i].permissionsRequested == metadata.permissions:
+    say(m, "Found cached permission decision for plugin \"" & metadata.name & "\" (approved: " &
+        (if cache.entries[i].approved: "true" else: "false") & ")")
+    return cache.entries[i].approved
+  var allowed = true
+  if metadata.permissions.len > 0:
+    if m.askPermission != nil: allowed = m.askPermission(metadata)
+    else:
+      allowed = false
+      say(m, "Plugin \"" & metadata.name & "\" requests permissions (" & joinWith(metadata.permissions, ", ") &
+          ") that nobody approved; set \"approved\": true for its entry in " & cachePath & " to allow it")
+  put(cache, hash, PermissionCacheEntry(permissionsRequested: metadata.permissions, approved: allowed))
+  discard save(cache, cachePath)
+  allowed
+
+proc initialize(m: PluginManager; loaded: LoadedPlugin; loader: PluginLoader; path: string): ManagerResult =
+  ## `spawn_plugin_initialization`, awaited: the slot exists while `on_load` runs; a failure unloads the plugin again
+  ## (`on_unload`, the loader's `unload`) and records `Failed`.
+  let name = loaded.metadata.name
+  setState(m, name, PluginState(kind: psLoading, error: ""))
+  let ctx = newPluginContext(loaded.metadata, loaded.loaderData, m.hooks, m.handlers, m.registry, m.dataRoot)
+  let slot = LoadedSlot(metadata: loaded.metadata, instance: nil, loader: loader, loaderData: loaded.loaderData,
+                        isActive: false, context: ctx, path: path)
+  m.plugins.add slot
+  var err = ""
+  if loaded.instance != nil and loaded.instance.onLoad != nil:
+    err = loaded.instance.onLoad(ctx)
+  if err.len == 0:
+    slot.instance = loaded.instance
+    slot.isActive = true
+    setState(m, name, PluginState(kind: psLoaded, error: ""))
+    say(m, "Loaded " & name & " (" & loaded.metadata.version & ")")
+    if loaded.metadata.permissions.len > 0:
+      say(m, "Plugin \"" & name & "\" uses the following permissions: [" & joinWith(loaded.metadata.permissions, ", ") & "]")
+    return managerOk()
+  let msg = "Initialization failed: " & err
+  if loaded.instance != nil and loaded.instance.onUnload != nil:
+    discard loaded.instance.onUnload(ctx)
+  var kept: seq[LoadedSlot] = @[]
+  for p in m.plugins:
+    if p != slot: kept.add p
+  m.plugins = kept
+  discard loader.unload(loaded.loaderData)
+  if m.onUnloaded != nil: m.onUnloaded(name, loaded.loaderData)
+  setState(m, name, PluginState(kind: psFailed, error: msg))
+  say(m, "Failed to initialize plugin " & name & ": " & msg)
+  managerErr(meLoaderError, "Plugin initialization failed: " & msg)
+
+proc firstLoaderFor(m: PluginManager; path: string): nil PluginLoader =
+  result = nil
+  for l in m.loaders:
+    if result == nil and l.canLoad(path): result = l
+
+proc startLoadingPlugin*(m: PluginManager; path: string): ManagerResult =
+  ## `start_loading_plugin` + the await of `try_load_plugin`.
+  let loader = firstLoaderFor(m, path)
+  if loader == nil:
+    if path notin m.unloadedFiles: m.unloadedFiles.add path
+    return managerErr(mePluginNotFound, path)
+  let res = loader.load(path)
+  if not res.isOk: return managerErr(meLoaderError, res.error.msg)
+  let cachePath = m.dir & "/permission_cache.json"
+  var pcache = cache.load(cachePath)
+  if not checkPermissionsCached(m, path, res.loaded.metadata, pcache, cachePath):
+    say(m, "Permission denied for plugin \"" & res.loaded.metadata.name & "\", skipping loading.")
+    discard loader.unload(res.loaded.loaderData)
+    if m.onUnloaded != nil: m.onUnloaded(res.loaded.metadata.name, res.loaded.loaderData)
+    return managerErr(meLoaderError, "Runtime error: Permission denied")
+  initialize(m, res.loaded, loader, path)
+
+proc tryLoadPlugin*(m: PluginManager; path: string): ManagerResult = startLoadingPlugin(m, path)
+
+proc loadPlugins*(m: PluginManager): ManagerResult =
+  ## `load_plugins`: every file of `plugins/` a loader accepts, dependencies first.
+  let dir = m.dir
+  var files: seq[string] = @[]
+  try:
+    for kind, entry in walkDir(path(dir)):
+      if kind == pcFile and not ($entry).toLowerAscii.endsWith(".deactivated"):
+        files.add $entry
+  except ErrorCode:
+    try:
+      createDir(path(dir))
+    except:
+      discard
+    return managerOk()
+  let cachePath = dir & "/permission_cache.json"
+  var pcache = cache.load(cachePath)
+  var prepared: seq[PreparedPlugin] = @[]
+  for f in files:
+    let loader = firstLoaderFor(m, f)
+    if loader == nil:
+      if f notin m.unloadedFiles: m.unloadedFiles.add f
+    else:
+      let res = loader.load(f)
+      if res.isOk: prepared.add PreparedPlugin(path: f, loader: loader, loaded: res.loaded)
+      else: say(m, "Failed to load plugin from " & f & ": " & res.error.msg)
+  var names: seq[string] = @[]
+  var deps: seq[seq[string]] = @[]
+  for p in prepared:
+    names.add p.loaded.metadata.name
+    deps.add p.loaded.metadata.dependencies
+  var sorted: seq[string] = @[]
+  let sortErr = topologicalSort(names, deps, sorted)
+  if sortErr.len > 0: return managerErr(meDependencyError, sortErr)
+  for name in sorted:
+    var idx = -1
+    var i = 0
+    while i < prepared.len:
+      if prepared[i].loaded.metadata.name == name: idx = i
+      inc i
+    if idx >= 0:
+      let path = prepared[idx].path
+      let loader = prepared[idx].loader
+      let loaded = prepared[idx].loaded
+      if not checkPermissionsCached(m, path, loaded.metadata, pcache, cachePath):
+        say(m, "Permission denied for plugin \"" & loaded.metadata.name & "\", skipping loading.")
+        discard loader.unload(loaded.loaderData)
+        if m.onUnloaded != nil: m.onUnloaded(loaded.metadata.name, loaded.loaderData)
+      else:
+        let r = initialize(m, loaded, loader, path)
+        if not r.ok: say(m, r.message)
+  managerOk()
+
+proc addLoader*(m: PluginManager; loader: PluginLoader) =
+  ## `add_loader`: the new loader gets the files nobody could load.
+  m.loaders.add loader
+  var left: seq[string] = @[]
+  for f in m.unloadedFiles:
+    if loader.canLoad(f):
+      let r = startLoadingPlugin(m, f)
+      if not r.ok: say(m, r.message)
+    else:
+      left.add f
+  m.unloadedFiles = left
+
+proc unloadPlugin*(m: PluginManager; name: string): ManagerResult =
+  ## `unload_plugin`: out of the list first, `on_unload`, then the loader's `unload` (or, if it cannot unload, the plugin
+  ## stays in the list, inactive).
+  var index = -1
+  var i = 0
+  while i < m.plugins.len:
+    if m.plugins[i].metadata.name == name and index < 0: index = i
+    inc i
+  if index < 0: return managerErr(mePluginNotFound, name)
+  let slot = m.plugins[index]
+  m.plugins.delete(index)
+  let inst = slot.instance
+  if inst != nil and inst.onUnload != nil:
+    let e = inst.onUnload(slot.context)
+    if e.len > 0: say(m, "[" & name & "] on_unload failed: " & e)
+  slot.instance = nil
+  if slot.loader.canUnload():
+    let e = slot.loader.unload(slot.loaderData)
+    if e.len > 0:
+      clearState(m, name)
+      return managerErr(meLoaderError, e)
+  else:
+    slot.isActive = false
+    m.plugins.add slot
+  if m.onUnloaded != nil: m.onUnloaded(name, slot.loaderData)
+  clearState(m, name)
+  managerOk()
+
+proc unloadAllPlugins*(m: PluginManager) =
+  var names: seq[string] = @[]
+  for p in m.plugins:
+    if p.isActive: names.add p.metadata.name
+  for n in names:
+    let r = unloadPlugin(m, n)
+    if not r.ok: say(m, "Failed to unload plugin " & n & ": " & r.message)

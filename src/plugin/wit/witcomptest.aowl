@@ -1,0 +1,307 @@
+## End to end through the linker: a component assembled by hand (wit-component's shim + fixup shape) imports the
+## scheduler, world, text, boss-bar and server interfaces, as a Rust plugin built from the v0.1 WIT would, and
+## exports `on-load` and `handle-task`. `on-load` schedules a task (20 ticks); `handle-task` sets a block, makes a
+## boss bar, finds the player "Bot" and shows it, all through canonical-ABI lowering of real core wasm calls.
+##
+## Handles of resources (`world`, `boss-bar`, `text-component`, `player`, `server`) are declared as plain u32 in the
+## hand-assembled types: the host reads the same flat i32 either way, and handle tables are covered by canonabitest.
+##
+##   witcomptest                    runs the scenario against recording fakes
+##   witcomptest --write FILE       writes the plugin component (for the over-the-wire run)
+##   witcomptest --write FILE X Y Z STATE NAME DELAY   same, with the block position, block state id, player name
+##                                  and task delay in ticks to use
+import std/[syncio, assertions, os, strutils]
+import ../wasm/[wasmvm, canonabi, component]
+import ../../server/scheduler
+import ../../util/text/text
+import ../pluginhost
+import witstate
+
+proc leb(n: int): string =
+  result = ""
+  var x = n
+  while true:
+    let b = x and 0x7F
+    x = x shr 7
+    if x == 0:
+      result.add char(b)
+      break
+    result.add char(b or 0x80)
+
+proc sl(n: int): string =
+  result = ""
+  var x = n
+  while true:
+    let b = x and 0x7F
+    x = x shr 7
+    if (x == 0 and (b and 0x40) == 0) or (x == -1 and (b and 0x40) != 0):
+      result.add char(b)
+      break
+    result.add char(b or 0x80)
+
+proc nm(s: string): string = leb(s.len) & s
+proc sec(id: int; body: string): string =
+  result = ""
+  result.add char(id)
+  result.add leb(body.len)
+  result.add body
+proc bs(xs: openArray[int]): string =
+  result = ""
+  for x in xs: result.add char(x)
+proc vec(items: openArray[string]): string =
+  result = leb(items.len)
+  for it in items: result.add it
+const hdr = "\0asm\x01\0\0\0"
+
+# ---- the imported functions: interface, name, core parameter codes (i = i32, l = i64, f = f32), result code ----
+type Imp = object
+  iface: string
+  fname: string
+  params: string          ## core flat parameter types
+  res: string             ## "" or one code
+  ctypes: string          ## component-level parameter types as bytes (pairs of name and valtype), see below
+  cres: string            ## component-level result: "" (none) or a valtype string
+  nparams: int
+
+proc coreCode(c: char): string =
+  case c
+  of 'i': bs([0x7f])
+  of 'l': bs([0x7e])
+  else: bs([0x7d])
+
+proc coreType(params, res: string): string =
+  result = bs([0x60]) & leb(params.len)
+  for c in params: result.add coreCode(c)
+  result.add leb(res.len)
+  for c in res: result.add coreCode(c)
+
+proc buildPlugin(bx, by, bz, bstate: int; playerName: string; delay: int = 20): string =
+  # instance-type bodies. Type declarations inside an instance type are indexed from 0 within it.
+  # scheduler: schedule-delayed-task(handler-id: u32, delay-ticks: u64) -> u32
+  let sched = bs([0x42]) & vec([
+    bs([0x01, 0x40, 2]) & nm("handler-id") & bs([0x79]) & nm("delay-ticks") & bs([0x78]) & bs([0x00, 0x79]),
+    bs([0x04, 0x00]) & nm("schedule-delayed-task") & bs([0x01, 0])])
+  # world: set-block-state(self: u32, pos: block-pos, state: u16, flags: u32)
+  let world = bs([0x42]) & vec([
+    bs([0x01, 0x72, 3]) & nm("x") & bs([0x7a]) & nm("y") & bs([0x7a]) & nm("z") & bs([0x7a]),
+    bs([0x01, 0x40, 4]) & nm("self") & bs([0x79]) & nm("pos") & bs([0]) & nm("state") & bs([0x7b]) & nm("flags") & bs([0x79]) & bs([0x01, 0]),
+    bs([0x04, 0x00]) & nm("[method]world.set-block-state") & bs([0x01, 1])])
+  # text: [static]text-component.text(plain: string) -> u32
+  let txt = bs([0x42]) & vec([
+    bs([0x01, 0x40, 1]) & nm("plain") & bs([0x73]) & bs([0x00, 0x79]),
+    bs([0x04, 0x00]) & nm("[static]text-component.text") & bs([0x01, 0])])
+  # boss-bar: constructor(title, color, division) -> u32; add-player(self, player); set-health(self, health: f32)
+  let bar = bs([0x42]) & vec([
+    bs([0x01, 0x40, 3]) & nm("title") & bs([0x79]) & nm("color") & bs([0x79]) & nm("division") & bs([0x79]) & bs([0x00, 0x79]),
+    bs([0x01, 0x40, 2]) & nm("self") & bs([0x79]) & nm("player") & bs([0x79]) & bs([0x01, 0]),
+    bs([0x01, 0x40, 2]) & nm("self") & bs([0x79]) & nm("health") & bs([0x76]) & bs([0x01, 0]),
+    bs([0x04, 0x00]) & nm("[constructor]boss-bar") & bs([0x01, 0]),
+    bs([0x04, 0x00]) & nm("[method]boss-bar.add-player") & bs([0x01, 1]),
+    bs([0x04, 0x00]) & nm("[method]boss-bar.set-health") & bs([0x01, 2])])
+  # server: get-player-by-name(self: u32, name: string) -> option<u32>
+  let srv = bs([0x42]) & vec([
+    bs([0x01, 0x6b, 0x79]),
+    bs([0x01, 0x40, 2]) & nm("self") & bs([0x79]) & nm("name") & bs([0x73]) & bs([0x00, 0]),
+    bs([0x04, 0x00]) & nm("[method]server.get-player-by-name") & bs([0x01, 1])])
+  let insts = [sched, world, txt, bar, srv]
+  let inames = ["scheduler", "world", "text", "boss-bar", "server"]
+  # imported functions in core-index order: (instance, name, core params, core result)
+  let fn_inst = [0, 1, 2, 3, 3, 3, 4]
+  let fn_name = ["schedule-delayed-task", "[method]world.set-block-state", "[static]text-component.text",
+                 "[constructor]boss-bar", "[method]boss-bar.add-player", "[method]boss-bar.set-health",
+                 "[method]server.get-player-by-name"]
+  let fn_params = ["il", "iiiiii", "ii", "iii", "ii", "if", "iiii"]
+  let fn_res = ["i", "", "i", "i", "", "", ""]
+  let N = 7
+  # --- core shim: N functions that call_indirect through table slot i; exports "0".."N-1" and the table
+  var stypes: seq[string] = @[]
+  var sfuncs: seq[string] = @[]
+  var scodes: seq[string] = @[]
+  var sexps: seq[string] = @[]
+  var i = 0
+  while i < N:
+    stypes.add coreType(fn_params[i], fn_res[i])
+    sfuncs.add leb(i)
+    var body = bs([0x00])
+    var k = 0
+    while k < fn_params[i].len:
+      body.add bs([0x20, k])
+      inc k
+    body.add bs([0x41, i, 0x11]) & leb(i) & bs([0x00, 0x0b])
+    scodes.add leb(body.len) & body
+    sexps.add nm($i) & bs([0, i])
+    inc i
+  sexps.add nm("$imports") & bs([1, 0])
+  let shim = hdr & sec(1, vec(stypes)) & sec(3, vec(sfuncs)) & sec(4, vec([bs([0x70, 0, N])])) &
+    sec(7, vec(sexps)) & sec(10, vec(scodes))
+  # --- core fixup: imports the N functions and the table, fills the table
+  var ftypes: seq[string] = @[]
+  var fimps: seq[string] = @[]
+  var felems = bs([0, 0x41, 0, 0x0b]) & leb(N)
+  i = 0
+  while i < N:
+    ftypes.add coreType(fn_params[i], fn_res[i])
+    fimps.add nm("") & nm($i) & bs([0]) & leb(i)
+    felems.add leb(i)
+    inc i
+  fimps.add nm("") & nm("$imports") & bs([1, 0x70, 0]) & leb(N)
+  let fixup = hdr & sec(1, vec(ftypes)) & sec(2, vec(fimps)) & sec(9, vec([felems]))
+  # --- main module
+  # type indices: 0..N-1 = imports, N = cabi_realloc, N+1 = on_load (i32)->i32, N+2 = handle_task (i32,i32)
+  var mtypes: seq[string] = @[]
+  i = 0
+  while i < N:
+    mtypes.add coreType(fn_params[i], fn_res[i])
+    inc i
+  mtypes.add bs([0x60, 4, 0x7f, 0x7f, 0x7f, 0x7f, 1, 0x7f])
+  mtypes.add coreType("i", "i")
+  mtypes.add coreType("ii", "")
+  var mimps: seq[string] = @[]
+  i = 0
+  while i < N:
+    mimps.add nm("host") & nm($i) & bs([0]) & leb(i)
+    inc i
+  # function indices: imports 0..N-1, then cabi_realloc N, on_load N+1, handle_task N+2
+  let reallocBody = bs([0x01, 0x01, 0x7f,
+    0x23,0x00,0x20,0x02,0x6a,0x41,0x01,0x6b,0x41,0x00,0x20,0x02,0x6b,0x71,0x21,0x04,
+    0x20,0x04,0x20,0x03,0x6a,0x24,0x00, 0x20,0x04,0x0b])
+  proc ic(n: int): string = bs([0x41]) & sl(n)
+  proc cl(n: int): string = bs([0x10]) & leb(n)
+  # layout of linear memory: 64 "Hello from a plugin", 128 player name, 192 return area (8 bytes)
+  let title = "Hello from a plugin"
+  let onLoad = bs([0x00]) & ic(1) & bs([0x42]) & sl(delay) & cl(0) & bs([0x1a]) & ic(0) & bs([0x0b])
+  # handle_task(handler, server): set the block, make the bar, find the player, show it, set its health
+  let task = bs([0x01, 0x01, 0x7f]) &            # one i32 local: the bar handle (local 2)
+    ic(0) & ic(bx) & ic(by) & ic(bz) & ic(bstate) & ic(3) & cl(1) &                       # set-block-state(0, x, y, z, state, 3)
+    ic(64) & ic(title.len) & cl(2) &                                                       # text(...) -> title handle
+    ic(2) & ic(1) & cl(3) & bs([0x21, 2]) &                                                # bar = boss-bar(title, color 2 (red), division 1)
+    ic(0) & ic(128) & ic(playerName.len) & ic(192) & cl(6) &                               # get-player-by-name(0, name, retptr)
+    ic(192) & bs([0x2d, 0, 0]) &                                                           # i32.load8_u [192]: option tag
+    bs([0x04, 0x40]) &                                                                     # if (tag)
+      bs([0x20, 2]) & ic(192 + 4) & bs([0x28, 2, 0]) & cl(4) &                             #   add-player(bar, load [196])
+      bs([0x20, 2]) & bs([0x43, 0, 0, 0, 0x3f]) & cl(5) &                                  #   set-health(bar, 0.5f)
+    bs([0x0b]) & bs([0x0b])
+  proc seg(addr0: int; data: string): string = bs([0x00]) & ic(addr0) & bs([0x0b]) & leb(data.len) & data
+  let main = hdr & sec(1, vec(mtypes)) & sec(2, vec(mimps)) &
+    sec(3, vec([leb(N), leb(N + 1), leb(N + 2)])) &
+    sec(5, vec([bs([0, 1])])) &
+    sec(6, vec([bs([0x7f, 1, 0x41, 0x80, 0x08, 0x0b])])) &
+    sec(7, vec([nm("memory") & bs([2, 0]), nm("cabi_realloc") & bs([0]) & leb(N), nm("on_load") & bs([0]) & leb(N + 1),
+                nm("handle_task") & bs([0]) & leb(N + 2)])) &
+    sec(10, vec([leb(reallocBody.len) & reallocBody, leb(onLoad.len) & onLoad, leb(task.len) & task])) &
+    sec(11, vec([seg(64, title), seg(128, playerName)]))
+  # --- the component
+  let ver = "@0.1.0"
+  var impSec: seq[string] = @[]
+  var aliasFuncs: seq[string] = @[]
+  i = 0
+  while i < insts.len:
+    impSec.add bs([0x00]) & nm("pumpkin:plugin/" & inames[i] & ver) & bs([0x05, i])
+    inc i
+  i = 0
+  while i < N:
+    aliasFuncs.add bs([0x01, 0x00, fn_inst[i]]) & nm(fn_name[i])
+    inc i
+  let opts = vec([bs([0x03, 0]), bs([0x04, 0])])
+  var lowers: seq[string] = @[]
+  i = 0
+  while i < N:
+    lowers.add bs([0x01, 0x00, i]) & opts
+    inc i
+  # component types after the 5 instance types: 5 = on-load func, 6 = handle-task func
+  let ftOnLoad = bs([0x40, 1]) & nm("context") & bs([0x79]) & bs([0x00, 0x79])
+  let ftTask = bs([0x40, 2]) & nm("handler-id") & bs([0x79]) & nm("server") & bs([0x79]) & bs([0x01, 0])
+  var canon = lowers
+  canon.add bs([0x00, 0x00, 1]) & opts & bs([5])
+  canon.add bs([0x00, 0x00, 2]) & opts & bs([6])
+  # core funcs: 0 realloc, 1 on_load, 2 handle_task (aliased), then the N lowers at 3..3+N-1
+  var coreExports: seq[string] = @[]
+  i = 0
+  while i < N:
+    coreExports.add nm($i) & bs([0x00]) & leb(3 + i)
+    inc i
+  coreExports.add nm("$imports") & bs([0x01, 0])
+  result = "\0asm\x0d\0\x01\0" &
+    sec(7, vec(insts)) &
+    sec(10, vec(impSec)) &
+    sec(6, vec(aliasFuncs)) &
+    sec(7, vec([ftOnLoad, ftTask])) &
+    sec(1, shim) & sec(1, main) & sec(1, fixup) &
+    sec(2, vec([bs([0x00, 0]) & vec([]),
+                bs([0x00, 1]) & vec([nm("host") & bs([0x12, 0])])])) &
+    sec(6, vec([bs([0x00, 0x02, 0x01, 1]) & nm("memory"),
+                bs([0x00, 0x00, 0x01, 1]) & nm("cabi_realloc"),
+                bs([0x00, 0x00, 0x01, 1]) & nm("on_load"),
+                bs([0x00, 0x00, 0x01, 1]) & nm("handle_task"),
+                bs([0x00, 0x01, 0x01, 0]) & nm("$imports")])) &
+    sec(8, vec(canon)) &
+    sec(2, vec([bs([0x01]) & vec(coreExports), bs([0x00, 2]) & vec([nm("") & bs([0x12, 2])])])) &
+    sec(11, vec([bs([0x00]) & nm("on-load") & bs([0x01, N, 0]), bs([0x00]) & nm("handle-task") & bs([0x01, N + 1, 0])]))
+
+var lines: seq[string] = @[]
+var failures = 0
+var blockWrites: seq[string] = @[]
+var barLog: seq[string] = @[]
+var tick = 100'u64
+
+proc ck(ok: bool; msg: string) =
+  if not ok:
+    echo "FAILED ", msg
+    for l in lines: echo "  line: ", l
+    inc failures
+
+proc main() =
+  var bx = 8
+  var by = 100
+  var bz = 8
+  var bstate = 1
+  var pname = "Bot"
+  var delay = 20
+  if paramCount() >= 2 and paramStr(1) == "--write":
+    try:
+      if paramCount() >= 8:
+        delay = parseInt(paramStr(8))
+      if paramCount() >= 7:
+        bx = parseInt(paramStr(3))
+        by = parseInt(paramStr(4))
+        bz = parseInt(paramStr(5))
+        bstate = parseInt(paramStr(6))
+        pname = paramStr(7)
+      writeFile(paramStr(2), buildPlugin(bx, by, bz, bstate, pname, delay))
+    except:
+      echo "write failed"
+    echo "wrote ", paramStr(2)
+    return
+  let host = newPluginHost("plugins/data")
+  host.logLine = proc (line: string) {.closure.} = lines.add line
+  let hk = host.ws.hooks
+  hk.tickCount = proc (): uint64 {.closure.} = tick
+  hk.playerIds = proc (): seq[int] {.closure.} = @[7]
+  hk.playerByName = proc (n: string): int {.closure.} = (if n == "Bot": 7 else: -1)
+  hk.worldCount = proc (): int {.closure.} = 1
+  hk.setBlockState = proc (w, x, y, z, state, flags: int): int {.closure.} =
+    blockWrites.add $w & ":" & $x & "," & $y & "," & $z & "=" & $state & "/" & $flags
+    result = 0
+  hk.barOp = proc (op: BarOp; p: int; bar: WBar) {.closure.} =
+    barLog.add $ord(op) & ":" & $p & ":" & $bar.health & ":" & $bar.color & ":" & $bar.division & ":" & getText(bar.title)
+  let err = loadPlugin(host, "witdemo", buildPlugin(bx, by, bz, bstate, pname))
+  ck(err.len == 0, "load: " & err)
+  if err.len > 0:
+    quit 1
+  ck(host.activeCount() == 1, "plugin active")
+  var due = host.ws.sched.tick(110'u64)
+  ck(due.len == 0, "task not due at 110")
+  due = host.ws.sched.tick(120'u64)
+  ck(due.len == 1 and due[0].handlerId == 1'u32 and due[0].pluginId == 0, "task due at tick 120 (delay 20 from 100)")
+  if due.len == 1:
+    let e = runTask(host, due[0].pluginId, int(due[0].handlerId))
+    ck(e.len == 0, "handle-task: " & e)
+  ck(blockWrites.len == 1 and blockWrites[0] == "0:" & $bx & "," & $by & "," & $bz & "=" & $bstate & "/3", "block write " & $blockWrites.len)
+  ck(barLog.len == 2, "bar ops " & $barLog.len)
+  if barLog.len == 2:
+    ck(barLog[0] == "0:7:0.0:2:1:Hello from a plugin", "bar add: " & barLog[0])
+    ck(barLog[1] == "3:7:0.5:2:1:Hello from a plugin", "bar health: " & barLog[1])
+  if failures > 0: quit 1
+  echo "witcomptest ok"
+
+main()

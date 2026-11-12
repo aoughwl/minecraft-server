@@ -1,0 +1,306 @@
+## Port of pumpkin/src/plugin/loader/wasm/wasm_host/wit/v0_1/item_stack.rs: the `item-stack` resource. A handle's rep is a
+## slot of `StackState.items` (the Rust `ItemStackResource` holds an `Arc<Mutex<ItemStack>>`; here the arena owns the
+## stack and the other interfaces that take or give an `item-stack` (gui, recipe, block-entity, the player's inventory)
+## go through `addStack` / `stackAt`). Backed by the real `ItemStack` of src/data/item_stack/mod.aowl, its enchantments,
+## custom name and custom data.
+## `nbt-tree` is the flat tag table of common.wit: tag 0 of `tags` is not necessarily the root, `root` names it, lists and
+## compounds refer to their children by index (`push_wit_nbt_tag` / `from_wit_nbt_tree`, with the same bounds and cycle
+## errors, which trap here where Rust returns an error to the host).
+## `get-lore` answers an empty list and `set-lore` / `add-lore` do nothing, as upstream (its `LoreImpl` carries no data).
+## PARTIAL: pumpkin/src/plugin/loader/wasm/wasm_host/wit/v0_1/item_stack.rs - `get-components` / `set-component` carry the
+## component as the network-encoded bytes of `pumpkin_protocol::codec::data_component::{serialize, deserialize}`; the
+## protocol module (src/protocol/datacomponent.aowl) works on its own minimal `DataComponentValue`, not the full
+## `DataComponentImpl` the stack holds, so `get-components` answers the ids with empty values and `set-component` is
+## accepted and ignored; the custom-enchantment and attribute-modifier methods of the newer WIT are not in the pinned
+## loader and trap as unimplemented; a dropped item-stack is not freed from the arena.
+import std/options
+import ../wasm/[canonabi, component]
+import "../../data/item_stack/mod"
+import ../../generated/data_component
+import ../../generated/item_refs
+import ../../nbt/tag
+import witstate
+
+const
+  IfStack* = "pumpkin:plugin/item-stack"
+  TagByte = 0
+  TagShort = 1
+  TagInt = 2
+  TagLong = 3
+  TagFloat = 4
+  TagDouble = 5
+  TagByteArray = 6
+  TagString = 7
+  TagList = 8
+  TagCompound = 9
+  TagIntArray = 10
+  TagLongArray = 11
+  MaxNbtDepth = 512
+
+type
+  StackState* = ref object
+    items*: seq[ItemStack]
+
+proc newStackState*(): StackState = StackState(items: @[])
+
+proc addStack*(s: StackState; stack: ItemStack): int =
+  ## A new handle rep for `stack` (`PluginHostState::add_item_stack`).
+  s.items.add stack
+  s.items.len - 1
+
+proc validStack*(s: StackState; rep: int): bool = rep >= 0 and rep < s.items.len
+
+# ---- nbt-tree <-> NbtTag ---------------------------------------------------------------------------------
+
+proc pushTag(tag: NbtTag; tags: var seq[CVal]): int =
+  ## `push_wit_nbt_tag`: reserves the slot first so a parent precedes its children.
+  let index = tags.len
+  tags.add vVariant(TagByte, vInt(0))
+  var v: CVal
+  case tag.kind
+  of ntkEnd: v = vVariant(TagCompound, vList(@[]))
+  of ntkByte: v = vVariant(TagByte, vInt(int64(tag.byteVal)))
+  of ntkShort: v = vVariant(TagShort, vInt(int64(tag.shortVal)))
+  of ntkInt: v = vVariant(TagInt, vInt(int64(tag.intVal)))
+  of ntkLong: v = vVariant(TagLong, vInt(tag.longVal))
+  of ntkFloat: v = vVariant(TagFloat, vFloat(float64(tag.floatVal)))
+  of ntkDouble: v = vVariant(TagDouble, vFloat(tag.doubleVal))
+  of ntkByteArray:
+    var xs: seq[CVal] = @[]
+    for b in tag.byteArrayVal: xs.add vInt(int64(b))
+    v = vVariant(TagByteArray, vList(xs))
+  of ntkString: v = vVariant(TagString, vStr(tag.stringVal))
+  of ntkList:
+    var xs: seq[CVal] = @[]
+    for child in tag.listVal: xs.add vInt(int64(pushTag(child, tags)))
+    v = vVariant(TagList, vList(xs))
+  of ntkCompound:
+    var xs: seq[CVal] = @[]
+    var i = 0
+    while i < tag.compoundVal.names.len:
+      xs.add vRecord(@[vStr(tag.compoundVal.names[i]), vInt(int64(pushTag(tag.compoundVal.values[i], tags)))])
+      inc i
+    v = vVariant(TagCompound, vList(xs))
+  of ntkIntArray:
+    var xs: seq[CVal] = @[]
+    for b in tag.intArrayVal: xs.add vInt(int64(b))
+    v = vVariant(TagIntArray, vList(xs))
+  of ntkLongArray:
+    var xs: seq[CVal] = @[]
+    for b in tag.longArrayVal: xs.add vInt(b)
+    v = vVariant(TagLongArray, vList(xs))
+  tags[index] = v
+  index
+
+proc toWitNbtTree*(tag: NbtTag): CVal =
+  var tags: seq[CVal] = @[]
+  let root = pushTag(tag, tags)
+  vRecord(@[vInt(int64(root)), vList(tags)])
+
+proc readTag(index: int; tags: seq[CVal]; visiting: var seq[int]; err: var string): NbtTag =
+  result = NbtTag(kind: ntkEnd)
+  if index < 0 or index >= tags.len:
+    err = "NBT tag index " & $index & " is out of bounds"
+    return
+  if index in visiting:
+    err = "NBT tag tree contains a cycle at index " & $index
+    return
+  if visiting.len > MaxNbtDepth:
+    err = "NBT tag tree is too deep"
+    return
+  visiting.add index
+  let t = tags[index]
+  let payload = (if t.items.len > 0: t.items[0] else: vInt(0))
+  case int(t.i)
+  of TagByte: result = NbtTag(kind: ntkByte, byteVal: int8(payload.i))
+  of TagShort: result = NbtTag(kind: ntkShort, shortVal: int16(payload.i))
+  of TagInt: result = NbtTag(kind: ntkInt, intVal: int32(payload.i))
+  of TagLong: result = NbtTag(kind: ntkLong, longVal: payload.i)
+  of TagFloat: result = NbtTag(kind: ntkFloat, floatVal: float32(payload.f))
+  of TagDouble: result = NbtTag(kind: ntkDouble, doubleVal: payload.f)
+  of TagByteArray:
+    var xs: seq[int8] = @[]
+    for b in payload.items: xs.add int8(b.i)
+    result = NbtTag(kind: ntkByteArray, byteArrayVal: xs)
+  of TagString: result = NbtTag(kind: ntkString, stringVal: payload.s)
+  of TagList:
+    var xs: seq[NbtTag] = @[]
+    for c in payload.items:
+      if err.len > 0: break
+      xs.add readTag(int(c.i), tags, visiting, err)
+    result = NbtTag(kind: ntkList, listVal: xs)
+  of TagCompound:
+    var comp = newCompound()
+    for e in payload.items:
+      if err.len > 0: break
+      let child = readTag(int(e.items[1].i), tags, visiting, err)
+      if err.len == 0: comp.insert(e.items[0].s, child)
+    result = NbtTag(kind: ntkCompound, compoundVal: comp)
+  of TagIntArray:
+    var xs: seq[int32] = @[]
+    for b in payload.items: xs.add int32(b.i)
+    result = NbtTag(kind: ntkIntArray, intArrayVal: xs)
+  of TagLongArray:
+    var xs: seq[int64] = @[]
+    for b in payload.items: xs.add b.i
+    result = NbtTag(kind: ntkLongArray, longArrayVal: xs)
+  else:
+    err = "unknown NBT tag case " & $t.i
+  visiting.setLen(visiting.len - 1)
+
+proc fromWitNbtTree*(tree: CVal; err: var string): NbtTag =
+  ## `from_wit_nbt_tree`; `err` is set on a bad index or a cycle.
+  var visiting: seq[int] = @[]
+  err = ""
+  readTag(int(tree.items[0].i), tree.items[1].items, visiting, err)
+
+# ---- patch helpers ---------------------------------------------------------------------------------------
+
+proc patchIndex(s: ItemStack; id: DataComponent): int =
+  result = -1
+  var i = 0
+  while i < s.patch.len:
+    if s.patch[i].id == id: result = i
+    inc i
+
+proc removePatchOf(s: var ItemStack; id: DataComponent) =
+  var kept: seq[PatchEntry] = @[]
+  for e in s.patch:
+    if e.id != id: kept.add e
+  s.patch = kept
+
+proc enchantmentName(id: int): string =
+  if id >= 0 and id < gEnchantments.len: gEnchantments[id].name else: ""
+
+proc setEnchantments(s: var ItemStack; entries: seq[EnchantmentEntry]) =
+  let i = patchIndex(s, dcEnchantments)
+  let data = toDyn(EnchantmentsImpl(enchantment: entries))
+  if i >= 0:
+    s.patch[i] = patchSet(data)
+  else:
+    s.patch.add patchSet(data)
+
+proc enchantmentsOf(s: ItemStack): seq[EnchantmentEntry] =
+  ## Only the patch is searched (`stack.patch.iter().find(Enchantments)`).
+  result = @[]
+  let i = patchIndex(s, dcEnchantments)
+  if i >= 0 and s.patch[i].present:
+    result = s.patch[i].data.enchantments.enchantment
+
+proc installItemStack*(r: HostRegistry; st: WitState; ss: StackState) =
+  witFn(r, IfStack, "[constructor]item-stack"):
+    var key = args[0].s
+    if key.len > 10 and key[0 ..< 10] == "minecraft:": key = key[10 ..< key.len]
+    var it = Item.fromRegistryKey(key)
+    if it == nil: it = ITEM_AIR
+    results.add vInt(int64(addStack(ss, newItemStack(uint8(args[1].i), it))))
+  witFn(r, IfStack, "[method]item-stack.get-registry-key"):
+    let rep = int(args[0].i)
+    if not validStack(ss, rep): return "item-stack: invalid handle"
+    results.add vStr(ss.items[rep].item.registryKey)
+  witFn(r, IfStack, "[method]item-stack.get-count"):
+    let rep = int(args[0].i)
+    if not validStack(ss, rep): return "item-stack: invalid handle"
+    results.add vInt(int64(ss.items[rep].itemCount))
+  witFn(r, IfStack, "[method]item-stack.set-count"):
+    let rep = int(args[0].i)
+    if not validStack(ss, rep): return "item-stack: invalid handle"
+    ss.items[rep].itemCount = uint8(args[1].i)
+  witFn(r, IfStack, "[method]item-stack.get-max-count"):
+    let rep = int(args[0].i)
+    if not validStack(ss, rep): return "item-stack: invalid handle"
+    # the item's own MaxStackSize component, else 64 (the patch is not consulted)
+    var m = 64
+    for c in ss.items[rep].item.components:
+      if c.kind == dcMaxStackSize: m = int(c.maxStackSize.size)
+    results.add vInt(int64(m))
+  witFn(r, IfStack, "[method]item-stack.get-enchantments"):
+    let rep = int(args[0].i)
+    if not validStack(ss, rep): return "item-stack: invalid handle"
+    var xs: seq[CVal] = @[]
+    for e in enchantmentsOf(ss.items[rep]):
+      xs.add vRecord(@[vInt(int64(e.enchantment.id)), vInt(int64(e.level))])
+    results.add vList(xs)
+  witFn(r, IfStack, "[method]item-stack.add-enchantment"):
+    let rep = int(args[0].i)
+    if not validStack(ss, rep): return "item-stack: invalid handle"
+    let id = int(args[1].i)
+    if id < 0 or id >= gEnchantments.len: return "item-stack: unknown enchantment " & $id
+    var cur = enchantmentsOf(ss.items[rep])
+    var kept: seq[EnchantmentEntry] = @[]
+    for e in cur:
+      if int(e.enchantment.id) != id: kept.add e
+    kept.add EnchantmentEntry(enchantment: gEnchantments[id], level: int32(args[2].i))
+    setEnchantments(ss.items[rep], kept)
+  witFn(r, IfStack, "[method]item-stack.remove-enchantment"):
+    let rep = int(args[0].i)
+    if not validStack(ss, rep): return "item-stack: invalid handle"
+    let id = int(args[1].i)
+    let i = patchIndex(ss.items[rep], dcEnchantments)
+    if i >= 0 and ss.items[rep].patch[i].present:
+      var kept: seq[EnchantmentEntry] = @[]
+      for e in ss.items[rep].patch[i].data.enchantments.enchantment:
+        if int(e.enchantment.id) != id: kept.add e
+      ss.items[rep].patch[i].data.enchantments.enchantment = kept
+  witFn(r, IfStack, "[method]item-stack.get-lore"):
+    let rep = int(args[0].i)
+    if not validStack(ss, rep): return "item-stack: invalid handle"
+    results.add vList(@[])
+  witFn(r, IfStack, "[method]item-stack.set-lore"):
+    if not validStack(ss, int(args[0].i)): return "item-stack: invalid handle"
+  witFn(r, IfStack, "[method]item-stack.add-lore"):
+    if not validStack(ss, int(args[0].i)): return "item-stack: invalid handle"
+  witFn(r, IfStack, "[method]item-stack.get-custom-name"):
+    let rep = int(args[0].i)
+    if not validStack(ss, rep): return "item-stack: invalid handle"
+    let i = patchIndex(ss.items[rep], dcCustomName)
+    if i >= 0 and ss.items[rep].patch[i].present:
+      results.add vSome(vInt(int64(newTextRep(st, ss.items[rep].patch[i].data.customName.name))))
+    else:
+      results.add vNone()
+  witFn(r, IfStack, "[method]item-stack.set-custom-name"):
+    let rep = int(args[0].i)
+    if not validStack(ss, rep): return "item-stack: invalid handle"
+    if args[1].i != 0:
+      let name = textAt(st, int(args[1].items[0].i))
+      let data = toDyn(CustomNameImpl(name: name))
+      let i = patchIndex(ss.items[rep], dcCustomName)
+      if i >= 0: ss.items[rep].patch[i] = patchSet(data)
+      else: ss.items[rep].patch.add patchSet(data)
+    else:
+      removePatchOf(ss.items[rep], dcCustomName)
+  witFn(r, IfStack, "[method]item-stack.set-custom-data"):
+    let rep = int(args[0].i)
+    if not validStack(ss, rep): return "item-stack: invalid handle"
+    var err = ""
+    let tag = fromWitNbtTree(args[3], err)
+    if err.len > 0: return err
+    ss.items[rep].setCustomData(args[1].s, args[2].s, tag)
+  witFn(r, IfStack, "[method]item-stack.get-custom-data"):
+    let rep = int(args[0].i)
+    if not validStack(ss, rep): return "item-stack: invalid handle"
+    let v = ss.items[rep].getCustomData(args[1].s, args[2].s)
+    if v.isSome: results.add vSome(toWitNbtTree(v.unsafeGet))
+    else: results.add vNone()
+  witFn(r, IfStack, "[method]item-stack.remove-custom-data"):
+    let rep = int(args[0].i)
+    if not validStack(ss, rep): return "item-stack: invalid handle"
+    ss.items[rep].removeCustomData(args[1].s, args[2].s)
+  witFn(r, IfStack, "[method]item-stack.has-custom-data"):
+    let rep = int(args[0].i)
+    if not validStack(ss, rep): return "item-stack: invalid handle"
+    results.add vBool(ss.items[rep].hasCustomData(args[1].s, args[2].s))
+  witFn(r, IfStack, "[method]item-stack.get-components"):
+    let rep = int(args[0].i)
+    if not validStack(ss, rep): return "item-stack: invalid handle"
+    var xs: seq[CVal] = @[]
+    for e in ss.items[rep].patch:
+      if e.present: xs.add vRecord(@[vInt(int64(e.id.toId())), vList(@[])])
+    results.add vList(xs)
+  witFn(r, IfStack, "[method]item-stack.set-component"):
+    if not validStack(ss, int(args[0].i)): return "item-stack: invalid handle"
+  witFn(r, IfStack, "[method]item-stack.remove-component"):
+    let rep = int(args[0].i)
+    if not validStack(ss, rep): return "item-stack: invalid handle"
+    let (found, id) = tryFromId(uint8(args[1].i))
+    if found: removePatchOf(ss.items[rep], id)

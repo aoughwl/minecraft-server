@@ -1,0 +1,236 @@
+## Test support: assembles a component by hand, in the shape wit-component produces (shim module + fixup module +
+## main module, `canon lower` of every import, `canon lift` of `on-load`), from a description of the imported
+## interfaces and the bytes of the `on_load` body. Generalises the one-off builder of witcomptest.aowl so that a test
+## can call any host function from real core wasm through the linker and the canonical ABI.
+##
+## There is no rustc here, so this is the only way to make a plugin component. The types of an instance are given as
+## raw component type declarations; handles of resources are declared as plain `u32` (the host reads the same flat
+## i32; handle tables are covered by canonabitest).
+##
+## Memory layout the test code may use: [0, 64) scratch, [64, 3072) data segments, [3072, 4096) return areas
+## (`RetArea`), the heap for `cabi_realloc` starts at 8192.
+import std/syncio
+
+const
+  RetArea* = 3072
+  HeapStart* = 8192
+
+type
+  AsmFn* = object
+    name*: string
+    typeIdx*: int         ## index of the function type among the instance's own type declarations
+    params*: string       ## core flat parameter codes: i = i32, l = i64, f = f32, d = f64
+    res*: string          ## "" or one code
+
+  AsmIface* = object
+    name*: string         ## with version, e.g. "wasi:cli/environment@0.2.0"
+    decls*: seq[string]   ## raw type declarations of the instance type (each starts with its tag byte)
+    funcs*: seq[AsmFn]
+
+  AsmData* = object
+    addr0*: int
+    bytes*: string
+
+proc leb*(n: int): string =
+  result = ""
+  var x = n
+  while true:
+    let b = x and 0x7F
+    x = x shr 7
+    if x == 0:
+      result.add char(b)
+      break
+    result.add char(b or 0x80)
+
+proc sl*(n: int): string =
+  result = ""
+  var x = n
+  while true:
+    let b = x and 0x7F
+    x = x shr 7
+    if (x == 0 and (b and 0x40) == 0) or (x == -1 and (b and 0x40) != 0):
+      result.add char(b)
+      break
+    result.add char(b or 0x80)
+
+proc nm*(s: string): string = leb(s.len) & s
+proc sec*(id: int; body: string): string =
+  result = ""
+  result.add char(id)
+  result.add leb(body.len)
+  result.add body
+proc bs*(xs: openArray[int]): string =
+  result = ""
+  for x in xs: result.add char(x)
+proc vec*(items: openArray[string]): string =
+  result = leb(items.len)
+  for it in items: result.add it
+
+const hdr = "\0asm\x01\0\0\0"
+
+proc coreCode(c: char): string =
+  case c
+  of 'i': bs([0x7f])
+  of 'l': bs([0x7e])
+  of 'd': bs([0x7c])
+  else: bs([0x7d])
+
+proc coreType(params, res: string): string =
+  result = bs([0x60]) & leb(params.len)
+  for c in params: result.add coreCode(c)
+  result.add leb(res.len)
+  for c in res: result.add coreCode(c)
+
+# ---- code helpers ----------------------------------------------------------------------------------------------
+proc ic*(n: int): string = bs([0x41]) & sl(n)                  ## i32.const
+proc lc*(n: int): string = bs([0x42]) & sl(n)                  ## i64.const
+proc cl*(n: int): string = bs([0x10]) & leb(n)                 ## call
+proc lget*(n: int): string = bs([0x20, n])
+proc lset*(n: int): string = bs([0x21, n])
+proc dropv*(): string = bs([0x1a])
+proc i32load*(offset: int): string = bs([0x28, 2]) & leb(offset)
+proc i32load8u*(offset: int): string = bs([0x2d, 0]) & leb(offset)
+proc i64load*(offset: int): string = bs([0x29, 3]) & leb(offset)
+proc i32store*(offset: int): string = bs([0x36, 2]) & leb(offset)
+proc i32eq*(): string = bs([0x46])
+proc i64eq*(): string = bs([0x51])
+proc trapUnless*(): string = bs([0x45, 0x04, 0x40, 0x00, 0x0b])   ## `i32.eqz; if; unreachable; end`: traps when the stack top is 0
+proc expectI32*(v: int): string = ic(v) & i32eq() & trapUnless()   ## stack top must equal v, else trap
+proc expectI64*(v: int): string = lc(v) & i64eq() & trapUnless()
+proc ifTrue*(body: string): string = bs([0x04, 0x40]) & body & bs([0x0b])
+
+proc buildComponent*(ifaces: seq[AsmIface]; onLoadLocals: int; onLoadBody: string; data: seq[AsmData]): string =
+  ## `onLoadBody` is core code with the function indices of the imports `0 ..< N` (in the order of `ifaces`, then
+  ## `funcs`) and leaves one i32 on the stack: 0 for `ok`. `onLoadLocals` extra i32 locals follow the parameter.
+  var N = 0
+  for f in ifaces: N += f.funcs.len
+  var fnInst: seq[int] = @[]
+  var fnName: seq[string] = @[]
+  var fnParams: seq[string] = @[]
+  var fnRes: seq[string] = @[]
+  var fnType: seq[int] = @[]
+  var k = 0
+  while k < ifaces.len:
+    var j = 0
+    while j < ifaces[k].funcs.len:
+      fnInst.add k
+      fnName.add ifaces[k].funcs[j].name
+      fnParams.add ifaces[k].funcs[j].params
+      fnRes.add ifaces[k].funcs[j].res
+      fnType.add ifaces[k].funcs[j].typeIdx
+      inc j
+    inc k
+  # instance types
+  var insts: seq[string] = @[]
+  k = 0
+  while k < ifaces.len:
+    var decls = ifaces[k].decls
+    for fn in ifaces[k].funcs:
+      decls.add bs([0x04, 0x00]) & nm(fn.name) & bs([0x01]) & leb(fn.typeIdx)
+    insts.add bs([0x42]) & vec(decls)
+    inc k
+  # core shim
+  var stypes: seq[string] = @[]
+  var sfuncs: seq[string] = @[]
+  var scodes: seq[string] = @[]
+  var sexps: seq[string] = @[]
+  var i = 0
+  while i < N:
+    stypes.add coreType(fnParams[i], fnRes[i])
+    sfuncs.add leb(i)
+    var body = bs([0x00])
+    var q = 0
+    while q < fnParams[i].len:
+      body.add bs([0x20, q])
+      inc q
+    body.add ic(i) & bs([0x11]) & leb(i) & bs([0x00, 0x0b])
+    scodes.add leb(body.len) & body
+    sexps.add nm($i) & bs([0, i])
+    inc i
+  sexps.add nm("$imports") & bs([1, 0])
+  let shim = hdr & sec(1, vec(stypes)) & sec(3, vec(sfuncs)) & sec(4, vec([bs([0x70, 0]) & leb(N)])) &
+    sec(7, vec(sexps)) & sec(10, vec(scodes))
+  # core fixup
+  var ftypes: seq[string] = @[]
+  var fimps: seq[string] = @[]
+  var felems = bs([0, 0x41, 0, 0x0b]) & leb(N)
+  i = 0
+  while i < N:
+    ftypes.add coreType(fnParams[i], fnRes[i])
+    fimps.add nm("") & nm($i) & bs([0]) & leb(i)
+    felems.add leb(i)
+    inc i
+  fimps.add nm("") & nm("$imports") & bs([1, 0x70, 0]) & leb(N)
+  let fixup = hdr & sec(1, vec(ftypes)) & sec(2, vec(fimps)) & sec(9, vec([felems]))
+  # main module
+  var mtypes: seq[string] = @[]
+  i = 0
+  while i < N:
+    mtypes.add coreType(fnParams[i], fnRes[i])
+    inc i
+  mtypes.add bs([0x60, 4, 0x7f, 0x7f, 0x7f, 0x7f, 1, 0x7f])
+  mtypes.add coreType("i", "i")
+  var mimps: seq[string] = @[]
+  i = 0
+  while i < N:
+    mimps.add nm("host") & nm($i) & bs([0]) & leb(i)
+    inc i
+  let reallocBody = bs([0x01, 0x01, 0x7f,
+    0x23,0x00,0x20,0x02,0x6a,0x41,0x01,0x6b,0x41,0x00,0x20,0x02,0x6b,0x71,0x21,0x04,
+    0x20,0x04,0x20,0x03,0x6a,0x24,0x00, 0x20,0x04,0x0b])
+  var onLoad = ""
+  if onLoadLocals > 0: onLoad = bs([0x01, onLoadLocals, 0x7f])
+  else: onLoad = bs([0x00])
+  onLoad.add onLoadBody
+  onLoad.add bs([0x0b])
+  var segs: seq[string] = @[]
+  for d in data:
+    segs.add bs([0x00]) & ic(d.addr0) & bs([0x0b]) & leb(d.bytes.len) & d.bytes
+  let main = hdr & sec(1, vec(mtypes)) & sec(2, vec(mimps)) &
+    sec(3, vec([leb(N), leb(N + 1)])) &
+    sec(5, vec([bs([0, 1])])) &
+    sec(6, vec([bs([0x7f, 1, 0x41]) & sl(HeapStart) & bs([0x0b])])) &
+    sec(7, vec([nm("memory") & bs([2, 0]), nm("cabi_realloc") & bs([0]) & leb(N), nm("on_load") & bs([0]) & leb(N + 1)])) &
+    sec(10, vec([leb(reallocBody.len) & reallocBody, leb(onLoad.len) & onLoad])) &
+    sec(11, vec(segs))
+  # the component
+  var impSec: seq[string] = @[]
+  var aliasFuncs: seq[string] = @[]
+  k = 0
+  while k < ifaces.len:
+    impSec.add bs([0x00]) & nm(ifaces[k].name) & bs([0x05]) & leb(k)
+    inc k
+  i = 0
+  while i < N:
+    aliasFuncs.add bs([0x01, 0x00]) & leb(fnInst[i]) & nm(fnName[i])
+    inc i
+  let opts = vec([bs([0x03, 0]), bs([0x04, 0])])
+  var lowers: seq[string] = @[]
+  i = 0
+  while i < N:
+    lowers.add bs([0x01, 0x00]) & leb(i) & opts
+    inc i
+  let ftOnLoad = bs([0x40, 1]) & nm("context") & bs([0x79]) & bs([0x00, 0x79])
+  var canon = lowers
+  canon.add bs([0x00, 0x00, 1]) & opts & leb(ifaces.len)     # canon lift core func 1 (on_load) with the type after the instance types
+  var coreExports: seq[string] = @[]
+  i = 0
+  while i < N:
+    coreExports.add nm($i) & bs([0x00]) & leb(2 + i)
+    inc i
+  coreExports.add nm("$imports") & bs([0x01, 0])
+  result = "\0asm\x0d\0\x01\0" &
+    sec(7, vec(insts)) &
+    sec(10, vec(impSec)) &
+    sec(6, vec(aliasFuncs)) &
+    sec(7, vec([ftOnLoad])) &
+    sec(1, shim) & sec(1, main) & sec(1, fixup) &
+    sec(2, vec([bs([0x00, 0]) & vec([]),
+                bs([0x00, 1]) & vec([nm("host") & bs([0x12, 0])])])) &
+    sec(6, vec([bs([0x00, 0x02, 0x01, 1]) & nm("memory"),
+                bs([0x00, 0x00, 0x01, 1]) & nm("cabi_realloc"),
+                bs([0x00, 0x00, 0x01, 1]) & nm("on_load"),
+                bs([0x00, 0x01, 0x01, 0]) & nm("$imports")])) &
+    sec(8, vec(canon)) &
+    sec(2, vec([bs([0x01]) & vec(coreExports), bs([0x00, 2]) & vec([nm("") & bs([0x12, 2])])])) &
+    sec(11, vec([bs([0x00]) & nm("on-load") & bs([0x01]) & leb(N + 0) & bs([0])]))

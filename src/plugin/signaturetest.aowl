@@ -1,0 +1,102 @@
+## signature.aowl against hand-assembled wasm binaries: custom-section scanning, stripping, metadata and envelope
+## parsing, the payload handed to the verifier (clean module bytes followed by the metadata JSON) and every error branch.
+import std/[syncio, options]
+import signature
+
+var failures = 0
+
+proc ck(ok: bool; msg: string) =
+  if not ok:
+    echo "FAILED ", msg
+    inc failures
+
+proc leb(n: int): string =
+  result = ""
+  var x = n
+  while true:
+    let b = x and 0x7F
+    x = x shr 7
+    if x == 0:
+      result.add char(b)
+      break
+    result.add char(b or 0x80)
+
+proc custom(name, data: string): string =
+  let body = leb(name.len) & name & data
+  result = "\0" & leb(body.len) & body
+
+const
+  hdr = "\0asm\x01\0\0\0"
+  typeSec = "\x01\x04\x01\x60\x00\x00"
+  meta = "{\"marketplace_url\":\"https://m\",\"plugin_id\":5,\"plugin_name\":\"demo\",\"version\":\"1.0\",\"dev_id\":2,\"dev_name\":\"dev\",\"is_paid\":false,\"user_id\":9,\"license_key\":null,\"issued_at\":\"2026-01-01\"}"
+
+proc zeros(n: int): string =
+  result = ""
+  for i in 0 ..< n: result.add '0'
+
+proc envelope(): string =
+  "{\"version\":1,\"algorithm\":\"Ed25519\",\"public_key_hex\":\"" & zeros(64) & "\",\"signature_hex\":\"" & zeros(128) & "\"}"
+
+var seenMessage = ""
+var seenKey = ""
+var seenSig = ""
+
+proc main() =
+  let clean = hdr & typeSec
+  let signed = clean & custom("pumpkin.metadata", meta) & custom("wasm_signature", envelope())
+  # strip
+  ck(stripPumpkinSections(signed) == clean, "strip removes both sections")
+  ck(stripPumpkinSections(clean) == clean, "strip leaves an unsigned module")
+  let keepOther = clean & custom("name", "xyz") & custom("pumpkin.metadata", meta)
+  ck(stripPumpkinSections(keepOther) == clean & custom("name", "xyz"), "strip keeps other custom sections")
+  # unsigned
+  var r = verifyPumpkinWasm(clean, "")
+  ck(not r.isSigned and not r.isValid and r.error.isSome and r.error.get().len > 20, "unsigned")
+  # signed, no verifier
+  hasEd25519Verifier = false
+  r = verifyPumpkinWasm(signed, "")
+  ck(r.isSigned and not r.isValid, "signed, no verifier is not valid")
+  ck(r.error.isSome and r.error.get() == "Ed25519 verification is not available", "signed, no verifier error")
+  ck(r.metadata.isSome and r.metadata.get().pluginName == "demo" and r.metadata.get().pluginId == 5'i64 and
+     r.metadata.get().userId == 9'i64 and not r.metadata.get().isPaid and r.metadata.get().licenseKey.isNone, "metadata parsed")
+  ck(r.signatureEnvelope.isSome and r.signatureEnvelope.get().algorithm == "Ed25519" and r.signatureEnvelope.get().version == 1'u8, "envelope parsed")
+  ck(r.publicKeyHex == zeros(64), "the envelope's key is the one used")
+  # signed, verifier sees clean || metadata
+  hasEd25519Verifier = true
+  ed25519Verifier = proc (publicKey, message, signature: string): bool {.closure.} =
+    seenKey = publicKey
+    seenMessage = message
+    seenSig = signature
+    true
+  r = verifyPumpkinWasm(signed, "ff")
+  ck(r.isValid and r.isSigned and r.error.isNone, "valid with a verifier that accepts")
+  ck(seenMessage == clean & meta, "verifier message is clean module followed by metadata")
+  ck(seenKey.len == 32 and seenSig.len == 64, "raw key and signature lengths")
+  ed25519Verifier = proc (publicKey, message, signature: string): bool {.closure.} = false
+  r = verifyPumpkinWasm(signed, "")
+  ck(not r.isValid and r.isSigned and r.error.get() == "Signature verification failed", "rejected")
+  # bad metadata
+  let badMeta = clean & custom("pumpkin.metadata", "{\"plugin_id\":1}") & custom("wasm_signature", envelope())
+  r = verifyPumpkinWasm(badMeta, "")
+  ck(r.isSigned and not r.isValid and r.error.get() == "Failed to parse pumpkin metadata: missing field `marketplace_url`", "bad metadata: " & r.error.get())
+  # bad envelope hex: parse as envelope succeeds, hex fails
+  let badHex = clean & custom("pumpkin.metadata", meta) & custom("wasm_signature",
+    "{\"version\":1,\"algorithm\":\"Ed25519\",\"public_key_hex\":\"" & zeros(64) & "\",\"signature_hex\":\"zz\"}")
+  r = verifyPumpkinWasm(badHex, "")
+  ck(r.error.get() == "Invalid signature hex inside signature envelope.", "bad signature hex")
+  # no envelope: a raw signature and the given key
+  let rawSig = clean & custom("pumpkin.metadata", meta) & custom("wasm_signature", zeros(64))
+  r = verifyPumpkinWasm(rawSig, zeros(63) & "g")
+  ck(r.error.get() == "Invalid public key hex format.", "bad key hex")
+  r = verifyPumpkinWasm(rawSig, zeros(64))
+  ck(r.signatureEnvelope.isNone and r.error.get() == "Signature verification failed", "raw signature path: " & r.error.get())
+  var warned: seq[string] = @[]
+  verifyWasmPlugin(clean, "a.wasm", "", proc (line: string) {.closure.} = warned.add line)
+  ck(warned.len == 1 and warned[0] == "Plugin 'a.wasm' is unsigned. Unsigned plugins may come from untrusted sources.", "unsigned warning")
+  hasEd25519Verifier = false
+  verifyWasmPlugin(signed, "b.wasm", "", proc (line: string) {.closure.} = warned.add line)
+  ck(warned.len == 2 and warned[1] == "Plugin 'b.wasm' signature verification failed: Ed25519 verification is not available", "failed warning")
+  if failures > 0: quit 1
+  echo "signaturetest ok"
+
+main()

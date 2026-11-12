@@ -1,0 +1,171 @@
+## Connects the plugin host interfaces under wit/ (text, scheduler, boss-bar, world, server, uuid, i18n) to the real
+## `Server`: fills `WitState.hooks` (wit/witstate.aowl) with closures over the server's worlds, players, scheduler and
+## boss-bar packets, and runs the plugin tasks that fall due. The glue is what upstream spells as `PluginHostState`
+## holding `Arc<Server>` (state.rs) and each `wit/v0_1/*.rs` reaching through it.
+##
+## WIT `block-flags` bit i is `BlockFlags` bit i (`BfNotifyNeighbors` .. `BfSkipBlockAddedCallback`, same order), so the
+## flags go through unchanged. A world handle is the index in `server.worlds`, a player handle the entity id.
+## PARTIAL: pumpkin/src/plugin/loader/wasm/wasm_host/state.rs - world names are the dimension name (`minecraft:overworld`);
+## `get-motion-blocking-height` answers the top block; `set-raining`/`set-thundering` restart the weather timers;
+## `save-all` answers an error (servermod saves, and servermod sits above this module); `get-mspt`/`get-tps` are the tick-time sample.
+import ../server/serverbase
+import ../server/scheduler
+import ../server/world/worldmod
+import ../server/world/bossbar
+import ../server/ticktimes
+import ../generated/blockdata
+import ../util/uuid
+import ../util/text/text
+import ../util/math/position
+import ../util/vector2
+import wit/witstate
+
+var gBars: seq[Bossbar] = @[]       ## the server's bar (uuid) behind each `WBar.n`
+
+proc worldAt(server: Server; i: int): nil World =
+  if i >= 0 and i < server.worlds.len: return server.worlds[i]
+  nil
+
+proc playerOf(server: Server; id: int): nil Player =
+  for w in server.worlds:
+    for p in w.players:
+      if int(p.entityId) == id: return p
+  nil
+
+proc bareName(name: string): string =
+  ## `minecraft:stone` -> `stone`: the generated tables hold bare names.
+  if name.len > 10 and name[0 ..< 10] == "minecraft:": name[10 ..< name.len] else: name
+
+proc barFor(wb: WBar): Bossbar =
+  while gBars.len <= wb.n:
+    gBars.add newBossbar(wb.title)
+  gBars[wb.n].title = wb.title
+  gBars[wb.n].health = wb.health
+  gBars[wb.n].color = BossbarColor(wb.color)
+  gBars[wb.n].division = BossbarDivisions(wb.division)
+  gBars[wb.n].flags = uint8(wb.flags)
+  result = gBars[wb.n]
+
+proc wireWit*(ws: WitState; server: Server) =
+  ## Called by `startPlugins` once the server exists.
+  let hk = ws.hooks
+  ws.sched = server.scheduler
+  hk.tickCount = proc (): uint64 {.closure.} = uint64(server.tickCounter)
+  hk.playerIds = proc (): seq[int] {.closure.} =
+    result = @[]
+    for w in server.worlds:
+      for p in w.players: result.add int(p.entityId)
+  hk.playerWorld = proc (playerId: int): int {.closure.} =
+    result = -1
+    var i = 0
+    while i < server.worlds.len:
+      for p in server.worlds[i].players:
+        if int(p.entityId) == playerId: result = i
+      inc i
+  hk.playerByName = proc (name: string): int {.closure.} =
+    result = -1
+    for w in server.worlds:
+      for p in w.players:
+        if p.gameprofile.name == name: result = int(p.entityId)
+  hk.playerByUuid = proc (high, low: uint64): int {.closure.} =
+    result = -1
+    for w in server.worlds:
+      for p in w.players:
+        if p.gameprofile.id.hi == high and p.gameprofile.id.lo == low: result = int(p.entityId)
+  hk.playerUuid = proc (playerId: int; high, low: var uint64) {.closure.} =
+    let p = playerOf(server, playerId)
+    if p != nil:
+      high = p.gameprofile.id.hi
+      low = p.gameprofile.id.lo
+  hk.playerName = proc (playerId: int): string {.closure.} =
+    let p = playerOf(server, playerId)
+    if p != nil: p.gameprofile.name else: ""
+  hk.worldCount = proc (): int {.closure.} = server.worlds.len
+  hk.worldName = proc (w: int): string {.closure.} =
+    let wd = worldAt(server, w)
+    if wd != nil: wd.dimension.minecraftName else: ""
+  hk.worldDimension = proc (w: int): string {.closure.} =
+    let wd = worldAt(server, w)
+    if wd != nil: wd.dimension.minecraftName else: ""
+  hk.getBlockState = proc (w, x, y, z: int): int {.closure.} =
+    let wd = worldAt(server, w)
+    if wd == nil: return 0
+    int(wd.getBlockStateId(newBlockPos(int32(x), int32(y), int32(z))))
+  hk.setBlockState = proc (w, x, y, z, state, witFlags: int): int {.closure.} =
+    let wd = worldAt(server, w)
+    if wd == nil: return 0
+    int(wd.setBlockState(newBlockPos(int32(x), int32(y), int32(z)), uint32(state), uint32(witFlags)))
+  hk.blockStateByName = proc (name: string): int {.closure.} =
+    let (found, b) = blockByName(bareName(name))
+    if found: b.defaultStateId else: -1
+  hk.blockIdOfState = proc (state: int): int {.closure.} =
+    let (found, b) = blockByName(bareName(dataBlockOf(uint32(state)).name))
+    if found: b.id else: 0
+  hk.defaultStateOfBlock = proc (blockId: int): int {.closure.} =
+    let (found, b) = blockById(blockId)
+    if found: b.defaultStateId else: -1
+  hk.minY = proc (w: int): int {.closure.} =
+    let wd = worldAt(server, w)
+    if wd != nil: int(wd.minY) else: 0
+  hk.seaLevel = proc (w: int): int {.closure.} =
+    let wd = worldAt(server, w)
+    if wd != nil: int(wd.seaLevel) else: 0
+  hk.topBlockY = proc (w, x, z: int): int {.closure.} =
+    let wd = worldAt(server, w)
+    if wd == nil: return 0
+    int(wd.getTopBlock(Vector2[int32](x: int32(x), y: int32(z))))
+  hk.timeOfDay = proc (w: int): uint64 {.closure.} =
+    let wd = worldAt(server, w)
+    if wd != nil: uint64(wd.levelTime.timeOfDay) else: 0'u64
+  hk.setTimeOfDay = proc (w: int; time: uint64) {.closure.} =
+    let wd = worldAt(server, w)
+    if wd != nil:
+      wd.levelTime.setTime(int64(time))
+      wd.levelTime.sendTime(wd)
+  hk.worldAge = proc (w: int): uint64 {.closure.} =
+    let wd = worldAt(server, w)
+    if wd != nil: uint64(wd.levelTime.worldAge) else: 0'u64
+  hk.raining = proc (w: int): bool {.closure.} =
+    let wd = worldAt(server, w)
+    wd != nil and wd.weather.raining
+  hk.setRaining = proc (w: int; v: bool) {.closure.} =
+    let wd = worldAt(server, w)
+    if wd != nil:
+      var wth = wd.weather
+      wth.setWeatherParameters(wd, 0'i32, (if v: 6000'i32 else: 0'i32), v, wd.weather.thundering)
+      wd.weather = wth
+  hk.thundering = proc (w: int): bool {.closure.} =
+    let wd = worldAt(server, w)
+    wd != nil and wd.weather.thundering
+  hk.setThundering = proc (w: int; v: bool) {.closure.} =
+    let wd = worldAt(server, w)
+    if wd != nil:
+      var wth = wd.weather
+      wth.setWeatherParameters(wd, 0'i32, (if wd.weather.raining: 6000'i32 else: 0'i32), wd.weather.raining, v)
+      wd.weather = wth
+  hk.broadcastWorld = proc (w: int; message: TextComponent; overlay: bool) {.closure.} =
+    let wd = worldAt(server, w)
+    if wd != nil: wd.broadcastSystemMessage(message, overlay)
+  hk.broadcast = proc (message: TextComponent) {.closure.} =
+    for wd in server.worlds: wd.broadcastSystemMessage(message, false)
+  hk.barOp = proc (op: BarOp; playerId: int; bar: WBar) {.closure.} =
+    let p = playerOf(server, playerId)
+    if p == nil: return
+    let b = barFor(bar)
+    case op
+    of boAdd: p.sendBossbar(b)
+    of boRemove: p.removeBossbar(b.uuid)
+    of boTitle: p.updateBossbarTitle(b.uuid, b.title)
+    of boHealth: p.updateBossbarHealth(b.uuid, b.health)
+    of boStyle: p.updateBossbarStyle(b.uuid, b.color, b.division)
+    of boFlags: p.updateBossbarFlags(b.uuid, b.flags)
+  hk.serverInfo = proc (): ServerInfo {.closure.} =
+    ServerInfo(maxPlayers: int(server.advancedConfig.networking.java.maxPlayers), motd: server.advancedConfig.networking.java.motd,
+      hardcore: server.basicConfig.hardcore, onlineMode: server.advancedConfig.networking.java.onlineMode,
+      viewDistance: int(server.advancedConfig.networking.java.viewDistance),
+      simulationDistance: int(server.advancedConfig.networking.java.simulationDistance),
+      allowNether: server.basicConfig.allowNether, allowEnd: server.basicConfig.allowEnd,
+      defaultGameMode: ord(server.basicConfig.defaultGamemode), difficulty: ord(server.basicConfig.defaultDifficulty),
+      tps: getTps(), mspt: getMspt())
+  hk.saveAll = proc (): string {.closure.} =
+    "save-all is not available to plugins yet"

@@ -1,0 +1,287 @@
+## Port of pumpkin/src/plugin/loader/wasm/wasm_host/signature.rs: the `pumpkin.metadata` and `wasm_signature` custom
+## sections a marketplace plugin carries, their parsing, and the verification flow of `verify_pumpkin_wasm` /
+## `verify_wasm_plugin` up to the signature check itself.
+## PARTIAL: pumpkin/src/plugin/loader/wasm/wasm_host/signature.rs - no Ed25519 and no SHA-512 exist in this tree, so the
+## final `verifying_key.verify(payload, signature)` goes through `ed25519Verifier`, a hook that is unset by default (`hasEd25519Verifier`): a
+## signed plugin then reports `isValid = false` with "Ed25519 verification is not available", never a false "valid".
+## Not ported: `KeyManager` and `inject_pumpkin_sections` (signing; needs Ed25519 signing and a JSON writer with serde's
+## field order), `fetch_market_public_key` (network; `verifyWasmPlugin` takes the key as an argument, empty as upstream's
+## `unwrap_or_default`). The public key of the envelope is what verification uses when there is an envelope, as upstream.
+import std/options
+import ../codecs/json_value
+
+const
+  WasmSignatureSection* = "wasm_signature"
+  PumpkinMetadataSection* = "pumpkin.metadata"
+  PumpkinMarketPublicKeyUrl* = "https://market.pumpkinmc.org/api/v1/rest/public-key"
+
+type
+  PumpkinMetadata* = object
+    marketplaceUrl*: string
+    pluginId*: int64
+    pluginName*: string
+    version*: string
+    devId*: int64
+    devName*: string
+    isPaid*: bool
+    userId*: int64
+    licenseKey*: Option[string]
+    issuedAt*: string
+
+  WasmSignatureEnvelope* = object
+    version*: uint8
+    algorithm*: string
+    publicKeyHex*: string
+    signatureHex*: string
+
+  VerificationResult* = object
+    isValid*: bool
+    isSigned*: bool
+    error*: Option[string]
+    metadata*: Option[PumpkinMetadata]
+    signatureEnvelope*: Option[WasmSignatureEnvelope]
+    publicKeyHex*: string
+
+var ed25519Verifier*: proc (publicKey, message, signature: string): bool {.closure.}
+  ## `ed25519_dalek::VerifyingKey::verify`: raw 32-byte key, message, raw 64-byte signature.
+var hasEd25519Verifier* = false   ## set it with `ed25519Verifier`; false: verification is not available
+
+# ---- byte helpers ----------------------------------------------------------------------------
+
+proc readLeb128(bytes: string; start: int; value: var uint64; used: var int): bool =
+  ## `read_leb128`: an unsigned LEB128 of at most 64 bits starting at `start`.
+  value = 0'u64
+  var shift = 0
+  var i = start
+  while i < bytes.len:
+    if shift >= 64: return false
+    let b = uint64(ord(bytes[i]))
+    value = value or ((b and 0x7f'u64) shl uint64(shift))
+    if (b and 0x80'u64) == 0'u64:
+      used = i - start + 1
+      return true
+    shift += 7
+    inc i
+  false
+
+proc hexVal(c: char): int =
+  if c >= '0' and c <= '9': int(c) - int('0')
+  elif c >= 'a' and c <= 'f': int(c) - int('a') + 10
+  elif c >= 'A' and c <= 'F': int(c) - int('A') + 10
+  else: -1
+
+proc hexDecode*(s: string; ok: var bool): string =
+  ## `hex::decode`
+  result = ""
+  ok = false
+  if s.len mod 2 != 0: return
+  var i = 0
+  while i < s.len:
+    let a = hexVal(s[i])
+    let b = hexVal(s[i + 1])
+    if a < 0 or b < 0: return
+    result.add char(a * 16 + b)
+    i += 2
+  ok = true
+
+# ---- wasm sections -----------------------------------------------------------------------------
+
+type
+  Section = object
+    id: int
+    start: int          ## offset of the id byte
+    payload: int        ## offset of the first payload byte
+    stop: int           ## end offset
+    name: string        ## custom sections only
+    dataStart: int      ## custom sections: offset of the data after the name
+
+proc scanSections(wasm: string; sections: var seq[Section]): int =
+  ## `Parser::parse_all`: the sections up to the first one that does not parse. Returns the end of the version header
+  ## (8), or 0 when there is no header.
+  sections = @[]
+  if wasm.len < 8 or wasm[0] != '\0' or wasm[1] != 'a' or wasm[2] != 's' or wasm[3] != 'm': return 0
+  var pos = 8
+  while pos < wasm.len:
+    let id = ord(wasm[pos])
+    var size = 0'u64
+    var used = 0
+    if not readLeb128(wasm, pos + 1, size, used): break
+    let payload = pos + 1 + used
+    if size > uint64(wasm.len - payload): break
+    let stop = payload + int(size)
+    var sec = Section(id: id, start: pos, payload: payload, stop: stop, name: "", dataStart: stop)
+    if id == 0:
+      var nlen = 0'u64
+      var nused = 0
+      if not readLeb128(wasm, payload, nlen, nused): break
+      if nlen > uint64(stop - payload - nused): break
+      sec.name = wasm[payload + nused ..< payload + nused + int(nlen)]
+      sec.dataStart = payload + nused + int(nlen)
+    sections.add sec
+    pos = stop
+  result = 8
+
+proc stripPumpkinSections*(wasm: string): string =
+  ## `strip_pumpkin_sections`: the binary up to the end of the last section that is not a pumpkin metadata or signature
+  ## custom section (what follows is dropped, as upstream does).
+  var secs: seq[Section] = @[]
+  let header = scanSections(wasm, secs)
+  var lastValidEnd = wasm.len
+  if header > 0: lastValidEnd = header
+  for s in secs:
+    if s.id == 0 and (s.name == PumpkinMetadataSection or s.name == WasmSignatureSection or s.name == "pumpkin.signature"):
+      discard
+    else:
+      lastValidEnd = s.stop
+  result = wasm[0 ..< lastValidEnd]
+
+# ---- JSON ---------------------------------------------------------------------------------------
+
+proc strField(v: JsonValue; key: string; outv: var string): bool =
+  let (found, f) = v.get(key)
+  if not found or f.kind != jvString: return false
+  outv = f.strVal
+  true
+
+proc intField(v: JsonValue; key: string; outv: var int64): bool =
+  let (found, f) = v.get(key)
+  if not found: return false
+  if f.kind == jvInt:
+    outv = f.intVal
+    return true
+  if f.kind == jvUInt:
+    outv = int64(f.uintVal)
+    return true
+  false
+
+proc parseMetadata*(raw: string; meta: var PumpkinMetadata; err: var string): bool =
+  ## `serde_json::from_slice::<PumpkinMetadata>`
+  let parsed = parseJsonValue(raw)
+  if not parsed.ok or parsed.value.kind != jvObject:
+    err = (if parsed.error.len > 0: parsed.error else: "invalid type: expected a map")
+    return false
+  let v = parsed.value
+  meta = PumpkinMetadata(licenseKey: none[string]())
+  var ok = true
+  var missing = ""
+  if not strField(v, "marketplace_url", meta.marketplaceUrl): ok = false; missing = "marketplace_url"
+  elif not intField(v, "plugin_id", meta.pluginId): ok = false; missing = "plugin_id"
+  elif not strField(v, "plugin_name", meta.pluginName): ok = false; missing = "plugin_name"
+  elif not strField(v, "version", meta.version): ok = false; missing = "version"
+  elif not intField(v, "dev_id", meta.devId): ok = false; missing = "dev_id"
+  elif not strField(v, "dev_name", meta.devName): ok = false; missing = "dev_name"
+  elif not intField(v, "user_id", meta.userId): ok = false; missing = "user_id"
+  elif not strField(v, "issued_at", meta.issuedAt): ok = false; missing = "issued_at"
+  if ok:
+    let (hp, paid) = v.get("is_paid")
+    if hp and paid.kind == jvBool: meta.isPaid = paid.boolVal
+    else:
+      ok = false
+      missing = "is_paid"
+  if not ok:
+    err = "missing field `" & missing & "`"
+    return false
+  let (hl, lic) = v.get("license_key")
+  if hl and lic.kind == jvString: meta.licenseKey = some(lic.strVal)
+  true
+
+proc parseEnvelope*(raw: string; env: var WasmSignatureEnvelope): bool =
+  ## `serde_json::from_slice::<WasmSignatureEnvelope>`, `Ok` or not.
+  let parsed = parseJsonValue(raw)
+  if not parsed.ok or parsed.value.kind != jvObject: return false
+  let v = parsed.value
+  var version = 0'i64
+  var e = WasmSignatureEnvelope()
+  if not intField(v, "version", version) or version < 0 or version > 255: return false
+  e.version = uint8(version)
+  if not strField(v, "algorithm", e.algorithm): return false
+  if not strField(v, "public_key_hex", e.publicKeyHex): return false
+  if not strField(v, "signature_hex", e.signatureHex): return false
+  env = e
+  true
+
+# ---- verification --------------------------------------------------------------------------------
+
+proc fail(pub: string; signed: bool; err: string; meta: Option[PumpkinMetadata] = none[PumpkinMetadata]();
+          env: Option[WasmSignatureEnvelope] = none[WasmSignatureEnvelope]()): VerificationResult =
+  VerificationResult(isValid: false, isSigned: signed, error: some(err), metadata: meta, signatureEnvelope: env, publicKeyHex: pub)
+
+proc verifyPumpkinWasm*(wasm: string; publicKeyHex: string): VerificationResult =
+  ## `verify_pumpkin_wasm`
+  let clean = stripPumpkinSections(wasm)
+  var metaRaw = none[string]()
+  var sigRaw = none[string]()
+  var secs: seq[Section] = @[]
+  discard scanSections(wasm, secs)
+  for s in secs:
+    if s.id == 0:
+      if s.name == PumpkinMetadataSection: metaRaw = some(wasm[s.dataStart ..< s.stop])
+      elif s.name == WasmSignatureSection or s.name == "pumpkin.signature": sigRaw = some(wasm[s.dataStart ..< s.stop])
+  if metaRaw.isNone or sigRaw.isNone:
+    if clean.len < wasm.len:
+      let trailing = wasm[clean.len ..< wasm.len]
+      var cursor = 0
+      while cursor < trailing.len:
+        if trailing[cursor] == '\0': inc cursor
+        var sectionLen = 0'u64
+        var lenBytes = 0
+        if readLeb128(trailing, cursor, sectionLen, lenBytes):
+          cursor += lenBytes
+          let sectionEnd = cursor + int(sectionLen)
+          if sectionEnd <= trailing.len:
+            let data = trailing[cursor ..< sectionEnd]
+            var nameLen = 0'u64
+            var nameLenBytes = 0
+            if readLeb128(data, 0, nameLen, nameLenBytes):
+              let nameStart = nameLenBytes
+              let nameEnd = nameStart + int(nameLen)
+              if nameEnd <= data.len:
+                let name = data[nameStart ..< nameEnd]
+                let payloadData = data[nameEnd ..< data.len]
+                if name == PumpkinMetadataSection: metaRaw = some(payloadData)
+                elif name == WasmSignatureSection or name == "pumpkin.signature": sigRaw = some(payloadData)
+          cursor = sectionEnd
+          continue
+        break
+  if metaRaw.isNone or sigRaw.isNone:
+    return fail(publicKeyHex, false, "WASM does not contain Pumpkin Market metadata or standard wasm_signature custom sections.")
+  let metaBytes = metaRaw.get()
+  let sigBytes = sigRaw.get()
+  var meta = PumpkinMetadata()
+  var perr = ""
+  if not parseMetadata(metaBytes, meta, perr):
+    return fail(publicKeyHex, true, "Failed to parse pumpkin metadata: " & perr)
+  var env = WasmSignatureEnvelope()
+  let hasEnv = parseEnvelope(sigBytes, env)
+  var rawSig = sigBytes
+  if hasEnv:
+    var ok = false
+    rawSig = hexDecode(env.signatureHex, ok)
+    if not ok:
+      return fail(publicKeyHex, true, "Invalid signature hex inside signature envelope.", some(meta))
+  let envOpt = (if hasEnv: some(env) else: none[WasmSignatureEnvelope]())
+  let payload = clean & metaBytes
+  let targetPub = (if hasEnv: env.publicKeyHex else: publicKeyHex)
+  var okKey = false
+  let pubBytes = hexDecode(targetPub, okKey)
+  if not okKey:
+    return fail(targetPub, true, "Invalid public key hex format.", some(meta), envOpt)
+  if pubBytes.len != 32:
+    return fail(targetPub, true, "Invalid Ed25519 public key: expected 32 bytes", some(meta), envOpt)
+  if rawSig.len != 64:
+    return fail(targetPub, true, "Invalid signature bytes: expected 64 bytes", some(meta), envOpt)
+  if not hasEd25519Verifier:
+    return fail(targetPub, true, "Ed25519 verification is not available", some(meta), envOpt)
+  if not ed25519Verifier(pubBytes, payload, rawSig):
+    return fail(targetPub, true, "Signature verification failed", some(meta), envOpt)
+  VerificationResult(isValid: true, isSigned: true, error: none[string](), metadata: some(meta), signatureEnvelope: envOpt,
+                     publicKeyHex: targetPub)
+
+proc verifyWasmPlugin*(wasm: string; pathStr: string; publicKeyHex: string; warn: proc (line: string) {.closure.}) =
+  ## `verify_wasm_plugin`: warns about an unsigned plugin or a failed verification, never refuses to load.
+  let r = verifyPumpkinWasm(wasm, publicKeyHex)
+  if warn == nil: return
+  if not r.isSigned:
+    warn("Plugin '" & pathStr & "' is unsigned. Unsigned plugins may come from untrusted sources.")
+  elif not r.isValid:
+    warn("Plugin '" & pathStr & "' signature verification failed: " & (if r.error.isSome: r.error.get() else: "Unknown error"))

@@ -12,7 +12,7 @@
 ## consumed-args get-value; command-sender send-message/get-name/is-player/is-console) and the events dispatch
 ## (`handle-event` with player join/leave) are provided. Every other interface (player, world, entity, item-stack,
 ## block-entity, boss-bar, scoreboard, gui, forms, recipe, text, server, scheduler, ...; 90+ of the 98 WIT files in
-## the newer tree's v0.1) is a host function that the plugin may import but that traps when called with
+## the newer tree's v0.1; text, scheduler, boss-bar, world, server, uuid and i18n are now in wit/, see their headers) is a host function that the plugin may import but that traps when called with
 ## "unimplemented host function <iface>#<fn>": the import is accepted so the plugin still loads.
 ## PARTIAL: pumpkin/src/plugin/loader/wasm/wasm_host/mod.rs - WASI p2 (wasi:cli, wasi:io, wasi:clocks, wasi:random,
 ## wasi:filesystem, wasi:http, which Rust std plugins import) is not provided, so a plugin built for wasm32-wasip2 loads
@@ -26,11 +26,13 @@
 ## PARTIAL: pumpkin/src/plugin/loader/wasm/wasm_host/wit/v0_1/context.rs - register-event, register-command, register-permission (accepts, registers nothing), get-data-folder; get-server and get-marketplace-metadata missing
 ## PARTIAL: pumpkin/src/plugin/loader/wasm/wasm_host/wit/v0_1/commands/mod.rs - command, command-node (literal, argument as simple/bool/message consumers), consumed-args.get-value for simple and bool, command-sender send-message and get-name; the other ~40 argument types and the rest of command-sender are missing
 ## PARTIAL: pumpkin/src/plugin/loader/wasm/wasm_host/wit/v0_1/commands/executor.rs - runs `handle-command` and maps the `command-error` variant; suggestions (`handle-command-suggestion`) are not wired
-## PARTIAL: pumpkin/src/plugin/loader/wasm/wasm_host/wit/v0_1/events/mod.rs - `fireEvent` builds any event variant case from its own declared type, by field name; only the player join and leave payloads are produced by the server, and the returned event is read for `cancelled` only
+## PARTIAL: pumpkin/src/plugin/loader/wasm/wasm_host/wit/v0_1/events/mod.rs - `fireEvent` builds any event variant case from its own declared type, by field name, and hands each handler's returned fields to the next and back to the caller (`EventOutcome.fieldVals`); the player events are produced by wit/witeventsplayer.aowl (see its PARTIAL), no other event family; priorities order nothing
 import std/[options, syncio]
 import wasm/[wasmvm, canonabi, component]
 import ../command/[fallbackdispatch, cmdsource, args]
 import ../util/text/[textbase, text]
+import wit/[witstate, witall]
+import wit/[witplayer, witentity]
 
 const
   IfaceLogging = "pumpkin:plugin/logging"
@@ -82,6 +84,8 @@ type
   EventOutcome* = object
     cancelled*: bool
     handled*: int            ## handlers that ran
+    fieldNames*: seq[string] ## the fields the caller gave ...
+    fieldVals*: seq[CVal]    ## ... as the last handler left them (a chat message a plugin rewrote, a join message)
 
   PluginHost* = ref object
     reg*: HostRegistry
@@ -95,6 +99,7 @@ type
     registerTree*: proc (tree: CommandTree; permission: string) {.closure.}
     logLine*: proc (line: string) {.closure.}
     dataRoot*: string
+    ws*: WitState                  ## state of the interfaces under wit/ (text arena, boss bars, hooks into the server)
 
 proc say(h: PluginHost; line: string) =
   if h.logLine != nil: h.logLine(line)
@@ -255,7 +260,7 @@ proc installInterfaces*(h: PluginHost) =
   r.defineHostFn(IfaceCommand, "[method]command-sender.send-message", proc (ci: CompInst; args: seq[CVal]; results: var seq[CVal]): string {.closure.} =
     let rep = int(args[0].i)
     let ti = int(args[1].i)
-    sendMessage(h.senders[rep], text(if ti >= 0 and ti < h.texts.len: h.texts[ti] else: ""))
+    sendMessage(h.senders[rep], textAt(h.ws, ti))
     result = "")
   r.defineHostFn(IfaceCommand, "[method]command-sender.get-name", proc (ci: CompInst; args: seq[CVal]; results: var seq[CVal]): string {.closure.} =
     results.add vStr(displayText(h.senders[int(args[0].i)]))
@@ -280,7 +285,13 @@ proc installInterfaces*(h: PluginHost) =
 
 proc newPluginHost*(dataRoot: string): PluginHost =
   result = PluginHost(reg: newHostRegistry(), plugins: @[], nodes: @[], cmds: @[], senders: @[], argStore: @[],
-                      texts: @[], pending: @[], dataRoot: dataRoot)
+                      texts: @[], pending: @[], dataRoot: dataRoot, ws: newWitState())
+  let hh = result
+  result.ws.legacyText = proc (rep: int): string {.closure.} =
+    if rep >= 0 and rep < hh.texts.len: hh.texts[rep] else: ""
+  installWitInterfaces(result.reg, result.ws)
+  installPlayer(result.reg, result.ws)
+  installEntity(result.reg, result.ws)
   installInterfaces(result)
 
 # ---- loading ---------------------------------------------------------------------------------
@@ -344,46 +355,75 @@ proc unloadPlugin*(h: PluginHost; id: int): string =
 # ---- events ----------------------------------------------------------------------------------
 
 proc fireEvent*(h: PluginHost; eventName: string; fieldNames: seq[string]; fieldVals: seq[CVal]): EventOutcome =
-  ## Offers `eventName` to every active plugin that registered for it, in registration order. The event value is built
-  ## from each plugin's own `event` variant type: the case named `eventName`, its record filled by field name (the
-  ## ones given, defaults for the rest). Upstream: `WasmPlugin::handle_event` and `PluginManager::fire`.
-  result = EventOutcome(cancelled: false, handled: 0)
-  var p = 0
-  while p < h.plugins.len:
-    let pe = h.plugins[p]
-    if pe.active and pe.handleEvent >= 0:
-      var r = 0
-      while r < pe.eventRegs.len:
-        if pe.eventRegs[r].eventName == eventName:
-          let sig = funcSig(pe.ci, pe.handleEvent)
-          let evT = sig.params[2]
-          let ci0 = caseIndex(evT, eventName)
-          if ci0 >= 0:
-            let payloadT = evT.types[ci0]
-            var rec = vRecord(@[])
-            var f = 0
-            while f < payloadT.types.len:
-              var v = defaultVal(payloadT.types[f])
-              var k = 0
-              while k < fieldNames.len:
-                if payloadT.names[f] == fieldNames[k]: v = fieldVals[k]
-                inc k
-              rec.items.add v
-              inc f
-            var res: seq[CVal] = @[]
-            let e = callExport(pe.ci, pe.handleEvent, @[vInt(int64(pe.eventRegs[r].handlerId)), vInt(0), vVariant(ci0, rec)], res)
-            if e.len > 0:
-              say(h, "[" & pe.name & "] event handler failed: " & e)
-            else:
-              inc result.handled
-              if res.len > 0 and res[0].items.len > 0:
-                var found = false
-                let c = fieldOf(payloadT, res[0].items[0], "cancelled", found)
-                if found and c.i != 0: result.cancelled = true
-        inc r
-    inc p
+  ## Offers `eventName` to every active plugin that registered for it. The event value is built from each plugin's own
+  ## `event` variant type: the case named `eventName`, its record filled by field name (the ones given, defaults for the
+  ## rest). Upstream: `PluginManager::fire` and `WasmPlugin::handle_event`: the blocking handlers run first, in
+  ## registration order, each seeing what the one before left in the event (`handle_blocking` stores the returned event
+  ## back), and `cancelled` comes from them. The non-blocking handlers run after, on the final event, and what they
+  ## return is dropped (`handle`). The WIT `priority` is stored by upstream and orders nothing, and a cancelled event
+  ## still reaches every handler: neither is done here either.
+  result = EventOutcome(cancelled: false, handled: 0, fieldNames: fieldNames, fieldVals: fieldVals)
+  var pass = 0
+  while pass < 2:
+    var p = 0
+    while p < h.plugins.len:
+      let pe = h.plugins[p]
+      if pe.active and pe.handleEvent >= 0:
+        var r = 0
+        while r < pe.eventRegs.len:
+          if pe.eventRegs[r].eventName == eventName and pe.eventRegs[r].blocking == (pass == 0):
+            let sig = funcSig(pe.ci, pe.handleEvent)
+            let evT = sig.params[2]
+            let ci0 = caseIndex(evT, eventName)
+            if ci0 >= 0:
+              let payloadT = evT.types[ci0]
+              var rec = vRecord(@[])
+              var f = 0
+              while f < payloadT.types.len:
+                var v = defaultVal(payloadT.types[f])
+                var k = 0
+                while k < fieldNames.len:
+                  if payloadT.names[f] == fieldNames[k]: v = result.fieldVals[k]
+                  inc k
+                rec.items.add v
+                inc f
+              var res: seq[CVal] = @[]
+              let e = callExport(pe.ci, pe.handleEvent, @[vInt(int64(pe.eventRegs[r].handlerId)), vInt(0), vVariant(ci0, rec)], res)
+              if e.len > 0:
+                say(h, "[" & pe.name & "] event handler failed: " & e)
+              else:
+                inc result.handled
+                if pass == 0 and res.len > 0 and res[0].items.len > 0:
+                  var found = false
+                  let c = fieldOf(payloadT, res[0].items[0], "cancelled", found)
+                  if found and c.i != 0: result.cancelled = true
+                  if res[0].i == int64(ci0):
+                    # the next handler sees what this one left in the event
+                    var k2 = 0
+                    while k2 < fieldNames.len:
+                      let nv = fieldOf(payloadT, res[0].items[0], fieldNames[k2], found)
+                      if found: result.fieldVals[k2] = nv
+                      inc k2
+          inc r
+      inc p
+    inc pass
 
 proc activeCount*(h: PluginHost): int =
   result = 0
   for p in h.plugins:
     if p.active: inc result
+
+proc runTask*(h: PluginHost; pluginId, handlerId: int): string =
+  ## Calls the plugin's `handle-task(handler-id, server)` for a due scheduled task (`WasmPlugin::handle_task`).
+  ## Returns "" or why it failed. Tasks of an unloaded plugin or of a plugin without the export are skipped.
+  if pluginId < 0 or pluginId >= h.plugins.len: return ""
+  let pe = h.plugins[pluginId]
+  if not pe.active: return ""
+  let f = findExportFunc(pe.ci, "handle-task")
+  if f < 0: return ""
+  var res: seq[CVal] = @[]
+  let e = callExport(pe.ci, f, @[vInt(int64(handlerId)), vInt(0)], res)
+  if e.len > 0:
+    say(h, "[" & pe.name & "] scheduled task failed: " & e)
+    return e
+  result = ""

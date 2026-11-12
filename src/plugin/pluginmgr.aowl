@@ -8,12 +8,21 @@
 ## any event name, the call sites in the server are the missing part); the host interfaces behind them are listed in
 ## pluginhost.aowl.
 
-import std/[syncio, strutils, dirs, paths]
+import std/[syncio, strutils, dirs, paths, options]
+import ../util/gamemode
+import ../util/math/position
 import pluginhost
+import pluginwire
+import ../server/scheduler
 import wasm/canonabi
 import ../command/[fallbackdispatch, cmdsource]
 import ../server/serverbase
 import ../util/text/text
+import ../util/vector3
+import ../server/entity/entitymod
+import ../server/world/worldmod
+import pluginhooks
+import wit/[witserver, witeventsplayer]
 
 const
   PluginsFolder = "plugins"
@@ -26,9 +35,77 @@ proc readWasm(file: string): string =
   except:
     result = ""
 
+proc playersOfWorld(player: Player): seq[Player] =
+  result = @[]
+  for p in player.world.players: result.add p
+
+proc installPlayerEventHooks(server: Server) =
+  ## The call sites of `PluginManager::fire` for the player events that are not join and leave: the network handlers
+  ## call the closures of pluginhooks.aowl, the entity code the two hooks chained here.
+  gLink.server = server
+  gPluginChatHook = proc(player: Player; message: string): (bool, string) {.closure.} =
+    if gHost.activeCount() == 0: return (false, message)
+    let o = playerChatEvent(gHost, player, message, playersOfWorld(player))
+    (o.cancelled, o.message)
+  gPluginCommandHook = proc(player: Player; command: string): (bool, string) {.closure.} =
+    if gHost.activeCount() == 0: return (false, command)
+    let o = playerCommandSendEvent(gHost, player, command)
+    (o.cancelled, o.message)
+  gPluginMoveHook = proc(player: Player; fromPos, toPos: Vector3[float64]): (bool, Vector3[float64]) {.closure.} =
+    if gHost.activeCount() == 0: return (false, toPos)
+    let o = playerMoveEvent(gHost, player, fromPos, toPos)
+    (o.cancelled, o.pos)
+  gPluginToggleHook = proc(player: Player; kind: int; value: bool): bool {.closure.} =
+    if gHost.activeCount() == 0: return false
+    playerToggleEvent(gHost, player, kind, value).cancelled
+  gPluginGameModeHook = proc(player: Player; previous, next: GameMode): (bool, GameMode) {.closure.} =
+    if gHost.activeCount() == 0: return (false, next)
+    let o = playerGamemodeChangeEvent(gHost, player, previous, next)
+    (o.cancelled, GameMode(max(0, min(3, o.value))))
+  gPluginItemHeldHook = proc(player: Player; previous, next: int): bool {.closure.} =
+    if gHost.activeCount() == 0: return false
+    playerItemHeldEvent(gHost, player, previous, next).cancelled
+  gPluginTeleportHook = proc(player: Player; fromPos, toPos: Vector3[float64]): (bool, Vector3[float64]) {.closure.} =
+    if gHost.activeCount() == 0: return (false, toPos)
+    let o = playerTeleportEvent(gHost, player, fromPos, toPos)
+    (o.cancelled, o.pos)
+  gPluginChangeWorldHook = proc(player: Player; previous, next: World; pos: Vector3[float64]; yaw, pitch: float32): (bool, Vector3[float64], float32, float32) {.closure.} =
+    if gHost.activeCount() == 0: return (false, pos, yaw, pitch)
+    let o = playerChangeWorldEvent(gHost, player, worldRep(previous), worldRep(next), pos, yaw, pitch)
+    (o.cancelled, o.pos, o.yaw, o.pitch)
+  gPluginLoginHook = proc(player: Player): (bool, TextComponent) {.closure.} =
+    if gHost.activeCount() == 0: return (false, text(""))
+    let o = playerLoginEvent(gHost, player, text("You have been kicked from the server"))
+    (o.cancelled, o.text)
+  gPluginInteractHook = proc(player: Player; action: int; pos: Option[BlockPos]): bool {.closure.} =
+    if gHost.activeCount() == 0: return false
+    var name = "minecraft:air"
+    if pos.isSome:
+      name = dataBlockOf(uint32(player.world.getBlockStateId(pos.unsafeGet))).name
+    playerInteractEvent(gHost, player, action, pos, name).cancelled
+  let prevExp = gPlayerHooks.addExperiencePoints
+  gPlayerHooks.addExperiencePoints = proc(player: Player; amount: int32) {.closure.} =
+    if gHost.activeCount() == 0:
+      prevExp(player, amount)
+      return
+    prevExp(player, int32(playerExpChangeEvent(gHost, player, int(amount)).value))
+  let prevRespawned = gPlayerRespawnedHook
+  gPlayerRespawnedHook = proc(world: World; player: Player) {.closure.} =
+    prevRespawned(world, player)
+    if gHost.activeCount() == 0: return
+    let wr = worldRep(world)
+    playerRespawnEvent(gHost, player, wr, wr, player.pos, player.yaw, player.pitch, true)
+  let prevKilled = gPlayerHooks.handleKilled
+  gPlayerHooks.handleKilled = proc(player: Player; deathMessage: TextComponent) {.closure.} =
+    prevKilled(player, deathMessage)
+    if gHost.activeCount() == 0: return
+    discard playerDeathEvent(gHost, player, deathMessage)
+
 proc startPlugins*(server: Server) =
   ## `PluginManager::load_plugins` for the WebAssembly loader. Called once by `loadServer`, after the dispatcher exists.
   gHost.logLine = proc (line: string) {.closure.} = echo line
+  wireWit(gHost.ws, server)
+  installPlayerEventHooks(server)
   gHost.registerTree = proc (tree: CommandTree; permission: string) {.closure.} =
     let d = server.commandDispatcher
     if d != nil:
@@ -62,12 +139,13 @@ proc firePlayerJoin*(player: Player) =
   ## `PluginManager::fire(PlayerJoinEvent)`: the player and `<name> joined the game`, cancellable upstream (a cancel
   ## suppresses the broadcast; the broadcast itself is not routed through here yet).
   if gHost.activeCount() == 0: return
-  gHost.texts.add player.gameprofile.name & " joined the game"
-  discard fireEvent(gHost, "player-join-event", @["player", "join-message", "cancelled"],
-    @[vInt(int64(player.entityId)), vInt(int64(gHost.texts.len - 1)), vBool(false)])
+  discard playerJoinEvent(gHost, player, text(player.gameprofile.name & " joined the game"))
 
 proc firePlayerLeave*(player: Player) =
   if gHost.activeCount() == 0: return
-  gHost.texts.add player.gameprofile.name & " left the game"
-  discard fireEvent(gHost, "player-leave-event", @["player", "leave-message", "cancelled"],
-    @[vInt(int64(player.entityId)), vInt(int64(gHost.texts.len - 1)), vBool(false)])
+  discard playerLeaveEvent(gHost, player, text(player.gameprofile.name & " left the game"))
+
+proc runPluginTasks*(due: seq[ScheduledTask]) =
+  ## The plugin tasks `TaskScheduler::tick` returned this server tick: each is its plugin's `handle-task(handler-id, server)`.
+  for t in due:
+    discard runTask(gHost, t.pluginId, int(t.handlerId))
