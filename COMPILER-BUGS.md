@@ -593,3 +593,17 @@ proc main =
   echo s[0].f()
 main()
 ```
+
+## Nested call fails type inference where the same call bound to a name works
+
+`executeInput(d, "kill", withEntity(source, entity)).value` gave `Type mismatch at [position]`
+(src/server/command/savelistkilltest.aowl, argument position of the inner call), although
+`let s = withEntity(source, entity)` followed by `executeInput(d, "kill", s)` compiles and
+passes. Found by splitting the expression; the cause in the frontend is not isolated. Workaround:
+bind intermediate calls to names.
+
+## `case` over distinct integer constants passes `check` but fails in gcc
+
+`case id of blockIdX:` where the labels are `const X = BlockId(n)` (a distinct type) type-checks, then
+gcc rejects the emitted C with "case label does not reduce to an integer constant". Hit by several
+block files (cauldron, coral); worked around with if-chains. `check` does not catch it.
