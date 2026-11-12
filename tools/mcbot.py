@@ -2660,10 +2660,15 @@ def player_session(c, st, w, biomes, ctx, args):
 
     # 6. A pig follows the carrot the bot holds (last: it leaves a carrot in the inventory and pigs round the bot).
     bx, by, bz = int(w.pos[0] // 1), int(w.pos[1] // 1), int(w.pos[2] // 1)
+    # Pigs run TemptGoal only for the carrot in the SELECTED slot, and the hotbar already holds other things (the stone and
+    # the rest of the earlier stages): pick the slot the /give changed, not the first one that is not empty.
+    before = list(w.window0[36:45]) if w.window0 is not None else [(0, 0)] * 9
     cmd('give @s minecraft:carrot 4')
-    wait(lambda: w.window0 is not None and any(w.window0[i][0] > 0 for i in range(36, 45)), 'the carrot in the hotbar', 10.0)
-    hand = next(i for i in range(36, 45) if w.window0[i][0] > 0) - 36
+    wait(lambda: w.window0 is not None and any(tuple(w.window0[36 + i]) != tuple(before[i]) and w.window0[36 + i][0] > 0
+                                                for i in range(9)), 'the carrot in the hotbar', 10.0)
+    hand = next(i for i in range(9) if tuple(w.window0[36 + i]) != tuple(before[i]) and w.window0[36 + i][0] > 0)
     c.send(SB_CARRIED, struct.pack('>h', hand))   # the pigs look at the selected slot
+    print('  carrot in hotbar slot %d, hotbar now %r' % (hand, [tuple(x) for x in w.window0[36:45]]))
     settle(0.8)
     pigs = []
     for dx, dz in ((-4, 0), (0, 6), (7, 0)):   # three directions: the ground round the spawn is not flat everywhere
@@ -3052,10 +3057,27 @@ def run(args):
     st.hit('stayed_up')
     c.close()
     st.hit('clean_disconnect')
-    time.sleep(0.5)
-    after = status_ping(args.host, args.port)
-    print('status after disconnect: online=%d' % after['players']['online'])
+    # The server removes a player as soon as it sees the socket close (vanilla does too), so a short poll is enough; a
+    # count that stays up is a leave-path bug (the player is only dropped by the keep-alive timeout), not slowness.
+    leave_start = time.time()
+    while True:
+        after = status_ping(args.host, args.port)
+        if after['players']['online'] <= online_before or time.time() - leave_start > 3.0:
+            break
+        time.sleep(0.05)
+    print('status after disconnect: online=%d (after %.2fs)' % (after['players']['online'], time.time() - leave_start))
     check(after['players']['online'] <= online_before, 'the server still counts the player: %r' % after['players'])
+    if args.relogin:
+        # A second login under the same name straight away: it must not be refused as a duplicate.
+        again = Conn(args.host, args.port)
+        again.send(0, handshake(args.host, args.port, 2))
+        again.send(SB_LOGIN_HELLO, string(args.name) + bytes(16))
+        pid, r = again.recv()
+        reason = r.string() if pid == LOGIN_DISCONNECT else ''
+        again.close()
+        check(pid != LOGIN_DISCONNECT, 'the immediate re-login was refused: %s' % reason)
+        print('  immediate re-login accepted (packet 0x%02x)' % pid)
+        time.sleep(0.3)
     st.hit('server_alive_after')
     return st
 
@@ -3361,6 +3383,7 @@ def main():
     ap.add_argument('--query-players', help='comma separated names the full status must list')
     ap.add_argument('--status', action='store_true', help='join, and check the status holds a favicon and the player sample')
     ap.add_argument('--status-delay', type=float, default=6.0, help='seconds after the start that --status pings')
+    ap.add_argument('--relogin', action='store_true', help='after the disconnect, log in again under the same name at once: the server must not call it a duplicate')
     ap.add_argument('--online-offline', action='store_true', help='an online-mode server whose session server is --session-port here')
     ap.add_argument('--session-port', type=int, help='the port the server was told to reach the session server on')
     ap.add_argument('--no-register', action='store_true', help='with --online-offline: do not tell the session server we joined')
