@@ -652,15 +652,25 @@ def read_metadata(r):
         if index == 0xFF:
             return
         kind = r.varint()
-        check(kind in (0, 1, 7, 8, 20), 'metadata type %d: this bot only reads bytes, ints, stacks, booleans and arms' % kind)
-        if kind == 0:
+        # 774's serializer ids (generated/meta_data_type.aowl, v1_21_11). Holder-backed variants are one varint each.
+        check(kind in (0, 1, 2, 3, 6, 7, 8, 10, 11, 12, 14, 15, 19, 20, 21, 22, 23, 25, 26, 27, 30),
+              'metadata type %d: this bot does not read it' % kind)
+        if kind == 0 or kind == 8:
             r.u8()
+        elif kind == 3:
+            r.f32()
+        elif kind == 6:
+            if r.boolean():
+                skip_network_nbt(r)
         elif kind == 7:
             META_LOG.append((entity, index, kind, read_slot(r)))
-        elif kind == 8:
-            r.u8()
+        elif kind == 10:
+            r.take(8)
+        elif kind == 11:
+            if r.boolean():
+                r.take(8)
         else:
-            r.varint()
+            r.varint()   # varint, varlong, direction, block states, optional int, pose and the variant holders
 
 
 # 774's layouts for the rest of the join, as aoughwl.mcnet reads them; each must be consumed exactly.
@@ -918,6 +928,8 @@ class Stages:
     COMMANDS2_NAMES = ['tree2_children', 'clone_copied', 'clone_moved', 'place_template', 'place_structure', 'item_slot',
                        'item_mainhand', 'spreadplayers_teleport', 'rotate_absolute', 'rotate_facing', 'fillbiome_chunk',
                        'loot_given', 'ride_not_riding', 'spectate_self', 'spectate_stopped']
+    COMMANDS3_NAMES = ['tree3_children', 'help_page', 'help_command', 'pumpkin_version', 'attribute_get', 'attribute_base_set',
+                       'advancement_grant', 'advancement_revoke', 'advancement_revoke_again', 'dialog_show', 'dialog_clear']
     SCOREBOARD_NAMES = ['objective_added', 'sidebar_shown', 'score_enabled', 'trigger_score', 'team_created', 'team_joined',
                         'team_updated', 'bossbar_added', 'bossbar_health', 'bossbar_name', 'border_size', 'border_center',
                         'border_lerp', 'tick_rate', 'tick_frozen', 'tick_query', 'data_get_player']
@@ -925,9 +937,23 @@ class Stages:
     BLOCKS_NAMES = ['door_placed', 'door_opened', 'door_closed', 'lamp_line_placed', 'lamp_lit', 'lamp_dark', 'sand_fell',
                     'water_flowed']
     BLOCKS_VERIFY_NAMES = ['blocks_persisted']
+    PLAYA_NAMES = ['pa_shift_click', 'pa_drag_split', 'pa_tab_complete', 'pa_chat_sent']
+    PLAYA_LISTEN_NAMES = ['pa_chat_heard']
+    PLUGIN_NAMES = ['plugin_welcome', 'plugin_chat_passes', 'plugin_chat_cancelled']
+    C2_NAMES = ['sign_placed', 'sign_text_set', 'bed_placed', 'bed_slept', 'piston_pushed']
+    C2_VERIFY_NAMES = ['sign_persisted', 'bed_persisted', 'piston_persisted']
+    CONTAINERS_NAMES = ['container_placed', 'container_opened', 'container_filled', 'window_opens', 'item_replace_block']
+    CONTAINERS_VERIFY_NAMES = ['containers_persisted']
     WORLD_NAMES = ['world_survival', 'dirt_placed', 'dirt_broken', 'drop_spawned', 'drop_item', 'portal_built',
                    'portal_entered', 'nether_respawn', 'nether_position', 'nether_portal_found', 'night_set',
                    'mobs_spawned']
+    PLAYER_NAMES = ['cow_summoned', 'mob_hit', 'damage_dealt', 'hunger_drained', 'fill_stairs_states', 'fill_portal_state',
+                    'fill_bad_property', 'player_died', 'death_drops', 'player_respawned', 'respawn_point_used', 'cow_wandered', 'pig_followed']
+    PLAYER_VERIFY_NAMES = ['entity_after_join']
+    PARTSB_NAMES = {'pearl': ['pearl_cooldown_sent', 'pearl_blocked', 'pearl_again'],
+                    'bed': ['bed_slept', 'night_skipped', 'bed_woken_by_skip', 'bed_woken_by_command'],
+                    'villager': ['villager_summoned', 'villager_window_opened', 'villager_offers_sent'],
+                    'dragon': ['dragon_spawned', 'dragon_damaged']}
     WATCH_NAMES = ['other_appeared', 'other_moved', 'other_swung', 'other_block_change', 'other_chat', 'other_left']
 
     def __init__(self, extra=()):
@@ -1349,6 +1375,43 @@ def commands_session(c, st, w, biomes, ctx, args):
             json.dump(dict(setblock=[sx, sy, sz], fill=cube, tp=[tx, ty, tz]), f)
 
 
+def commands3_session(c, st, w, biomes, ctx, args):
+    """--commands3: /help, /pumpkin, /attribute, /advancement and /dialog, over the wire. The bot must be an operator of
+    level 4. Each one is judged by what the server says back: feedback goes out as translation keys or plain text."""
+    def wait(cond, what, seconds=10.0):
+        pump(c, st, w, biomes, ctx, cond, what, seconds)
+
+    def run_command(line):
+        print('  /%s' % line, flush=True)
+        c.send(SB_CHAT_COMMAND, string(line))
+
+    def says(line, fragment, stage):
+        at = len(w.chat)
+        run_command(line)
+        wait(lambda: any(fragment in said for said in w.chat[at:]), 'the answer to /%s containing %r' % (line, fragment))
+        print('  said: %r' % w.chat[at:][-1][:160])
+        st.hit(stage)
+
+    wait(lambda: w.pos is not None and ctx['chunk_parsed'], 'a position and a chunk', 40.0)
+    wait(lambda: w.window0 is not None and w.health is not None, 'the inventory and health')
+    wait(lambda: 'nodes' in COMMAND_TREE, 'the command tree')
+    nodes = COMMAND_TREE['nodes']
+    names = sorted(nodes[i]['name'] for i in nodes[COMMAND_TREE['root']]['children'])
+    for wanted in ('help', 'dialog', 'attribute', 'advancement'):
+        check(wanted in names, 'the root has no %s' % wanted)
+    st.hit('tree3_children')
+    says('help', 'Help - Page 1/', 'help_page')
+    says('help gamemode', 'Help - /gamemode', 'help_command')
+    says('pumpkin', 'Pumpkin ', 'pumpkin_version')
+    says('attribute @s minecraft:max_health get', 'commands.attribute.value.get.success', 'attribute_get')
+    says('attribute @s minecraft:max_health base set 30', 'commands.attribute.base_value.set.success', 'attribute_base_set')
+    says('advancement grant @s only minecraft:story/root', 'commands.advancement.grant.one.to.one.success', 'advancement_grant')
+    says('advancement revoke @s only minecraft:story/root', 'commands.advancement.revoke.one.to.one.success', 'advancement_revoke')
+    says('advancement revoke @s only minecraft:story/root', 'commands.advancement.revoke.one.to.one.failure', 'advancement_revoke_again')
+    says('dialog show @s {type:"minecraft:notice",title:"Hello"}', 'Showed dialog to', 'dialog_show')
+    says('dialog clear @s', 'Cleared dialog for', 'dialog_clear')
+
+
 def commands2_session(c, st, w, biomes, ctx, args):
     """--commands2: /clone, /place, /item, /spreadplayers, /rotate, /fillbiome, /loot, /ride and /spectate, over the wire.
     The bot must be an operator of level 4. Each command is judged by the packets it makes: the block updates a clone and a
@@ -1474,6 +1537,31 @@ def commands2_session(c, st, w, biomes, ctx, args):
     st.hit('spectate_stopped')
     run_command('gamemode survival')
     wait(lambda: w.mode == 0, 'survival')
+
+
+def plugin_session(c, st, w, biomes, ctx, args):
+    """--plugin X Y Z: a plugin that scheduled a task at load has, by the time the bot is in, set the block at X Y Z and
+    shown the bot a boss bar. Waits for both on the wire: a boss event (add, then health 0.5) and the block update."""
+    def wait(cond, what, seconds=60.0):
+        pump(c, st, w, biomes, ctx, cond, what, seconds)
+
+    wait(lambda: w.pos is not None and ctx['chunk_parsed'], 'a position and a chunk', 40.0)
+    x, y, z = args.plugin
+    base = len(w.events)
+    before = w.block(x, y, z)
+    print('  block %d %d %d before the plugin task: %r' % (x, y, z, before), flush=True)
+    wait(lambda: any(e[0] == 'boss' for e in w.events[base:]), 'the boss bar of the plugin', 120.0)
+    boss = [e for e in w.events[base:] if e[0] == 'boss']
+    print('  boss events: %r' % (boss,), flush=True)
+    check(boss[0][2] == 0, 'the first boss event is not an add: %r' % (boss[0],))
+    wait(lambda: any(e[0] == 'boss' and e[2] == 2 for e in w.events[base:]), 'the boss bar health update', 20.0)
+    health = [e for e in w.events[base:] if e[0] == 'boss' and e[2] == 2]
+    check(abs(health[0][3] - 0.5) < 1e-6, 'boss bar health %r' % (health[0],))
+    wait(lambda: w.block(x, y, z) is not None and w.block(x, y, z) != before, 'the block change of the plugin', 20.0)
+    print('  block %d %d %d is now state %r' % (x, y, z, w.block(x, y, z)), flush=True)
+    if args.plugin_state is not None:
+        check(w.block(x, y, z) == args.plugin_state, 'block state %r, wanted %r' % (w.block(x, y, z), args.plugin_state))
+    print('  plugin session ok', flush=True)
 
 
 def scoreboard_session(c, st, w, biomes, ctx, args):
@@ -1994,6 +2082,222 @@ def blocks_verify_session(c, st, w, biomes, ctx, args):
     st.hit('blocks_persisted')
 
 
+PLAY_OPEN_SCREEN = 57
+
+
+def containers_session(c, st, w, biomes, ctx, args):
+    """--containers: a chest, a barrel and a trapped chest are opened over the wire and a stack is shift-clicked into each.
+    The bot must be an operator of level 4, on a COPY of a world. --containers-verify FILE, after a restart, opens them again
+    and wants the stacks still there."""
+    log = []
+    ctx['tap'] = lambda pid, data: log.append((pid, bytes(data)))
+
+    def wait(cond, what, seconds=10.0):
+        pump(c, st, w, biomes, ctx, cond, what, seconds)
+
+    def settle(seconds=0.6):
+        end = time.time() + seconds
+        while time.time() < end:
+            try:
+                pid, r = c.recv()
+            except socket.timeout:
+                continue
+            one_packet(c, st, w, biomes, ctx, pid, r)
+
+    def cmd(line):
+        print('  /%s' % line, flush=True)
+        c.send(SB_CHAT_COMMAND, string(line))
+
+    token = [0x7100]
+
+    def sync():
+        token[0] += 1
+        c.send(SB_PING, struct.pack('>q', token[0]))
+        t = token[0]
+        wait(lambda: t in w.pongs, 'a pong')
+
+    def item_of(name):
+        return BLOCK_TABLE['by_name'][name]['item_id']
+
+    def hold(name):
+        """Puts 64 of the item in hotbar slot 0 by the server's own /give: the ids of --blocks' table are not 774's."""
+        cmd('clear @s')
+        cmd('give @s minecraft:%s 64' % name)
+        c.send(SB_CARRIED, struct.pack('>h', 0))
+        settle(0.6)
+        sync()
+
+    seq = [300]
+
+    def use_on(x, y, z, face, cursor=(0.5, 0.5, 0.5)):
+        seq[0] += 1
+        c.send(SB_USE_ON, varint(0) + block_pos(x, y, z) + varint(face) + struct.pack('>fff', *cursor) + bytes([0, 0]) +
+               varint(seq[0]))
+
+    def name_at(x, y, z):
+        return block_name(w.block(x, y, z))
+
+    def window_content(sync_id):
+        for p, d in log:
+            if p == PLAY_CONTAINER_CONTENT:
+                r2 = Reader(d)
+                if r2.varint() == sync_id:
+                    r2.varint()
+                    return [read_slot(r2) for _ in range(r2.varint())]
+        return None
+
+    def open_window(x, y, z, face=1):
+        """Right-clicks the block and answers (sync id, window type, [stacks of the window])."""
+        del log[:]
+        use_on(x, y, z, face, (0.5, 1.0, 0.5))
+        wait(lambda: any(p == PLAY_OPEN_SCREEN for p, _ in log), 'an open screen packet')
+        r = Reader([d for p, d in log if p == PLAY_OPEN_SCREEN][0])
+        sync_id, wtype = r.varint(), r.varint()
+        print('  opened window %d, type %d' % (sync_id, wtype), flush=True)
+        wait(lambda: window_content(sync_id) is not None, 'the window content')
+        return sync_id, wtype, window_content(sync_id)
+
+    def slot_update(sync_id, slot):
+        """The latest value of (window, slot) from the set-slot and whole-window packets, in the order they came, or None."""
+        got = None
+        for p, d in log:
+            if p == PLAY_CONTAINER_SLOT:
+                r2 = Reader(d)
+                if struct.unpack('>b', r2.take(1))[0] == sync_id:
+                    r2.varint()
+                    if r2.i16() == slot:
+                        got = read_slot(r2)
+            elif p == PLAY_CONTAINER_CONTENT:
+                r2 = Reader(d)
+                if r2.varint() == sync_id:
+                    r2.varint()
+                    stacks = [read_slot(r2) for _ in range(r2.varint())]
+                    if slot < len(stacks):
+                        got = stacks[slot]
+        return got
+
+    def shift_click(sync_id, slot):
+        c.send(SB_CONTAINER_CLICK, varint(sync_id) + varint(0) + struct.pack('>h', slot) + bytes([0]) + varint(1) +
+               varint(0) + bytes([0]))
+
+    wait(lambda: w.pos is not None and ctx['chunk_parsed'], 'a position and a chunk', 40.0)
+    wait(lambda: w.health is not None, 'health')
+    c.send(SB_CHANGE_GAME_MODE, varint(1))
+    wait(lambda: w.mode == 1, 'creative')
+    px, py, pz = int(w.pos[0] // 1), int(w.pos[1] // 1), int(w.pos[2] // 1)
+    wait(lambda: w.block(px, py - 1, pz) is not None, 'the chunk under the player', 30.0)
+    sx, fy, sz = px + 2, py - 1, pz + 2
+    cmd('fill %d %d %d %d %d %d minecraft:air' % (sx - 1, fy + 1, sz - 1, sx + 12, fy + 8, sz + 7))
+    cmd('fill %d %d %d %d %d %d minecraft:stone' % (sx - 1, fy, sz - 1, sx + 12, fy, sz + 7))
+    cmd('tp @s %d %d %d' % (sx + 6, fy + 1, sz + 6))
+    wait(lambda: name_at(sx + 6, fy, sz + 6) == 'stone' and name_at(sx + 6, fy + 3, sz + 6) == 'air', 'the stage')
+    settle(1.0)
+
+    saved = {}
+    stone = STONE_ITEM
+    for k, name in enumerate(('chest', 'barrel', 'trapped_chest')):
+        bx, bz = sx + 4 + 2 * k, sz + 4  # within reach of the bot at sx + 6, sz + 6
+        hold(name)
+        use_on(bx, fy, bz, 1, (0.5, 1.0, 0.5))
+        # The bot's block table is not 774's for every state id, so a placement is a state that is not air.
+        try:
+            wait(lambda: w.block(bx, fy + 1, bz) not in (None, 0), 'a %s' % name)
+        except Fail:
+            raise Fail('no %s at %d %d %d: the state there is %s, chat %r' % (name, bx, fy + 1, bz, w.block(bx, fy + 1, bz), w.chat[-3:]))
+        settle(0.4)
+        print('  %s placed at %d %d %d' % (name, bx, fy + 1, bz), flush=True)
+        st.hit('container_placed')
+        hold('stone')
+        sync_id, wtype, slots = open_window(bx, fy + 1, bz)
+        check(wtype == 2, '%s: window type %d, not generic 9x3 (2)' % (name, wtype))
+        check(len(slots) == 27 + 36, '%s: %d slots in its window' % (name, len(slots)))
+        check(all(s[0] == 0 for s in slots[:27]), '%s is not empty to begin with' % name)
+        st.hit('container_opened')
+        # Hotbar slot 0 is window slot 54 of a 9x3 container.
+        check(slots[54] == (64, stone), '%s: hotbar 0 reads %s' % (name, (slots[54],)))
+        del log[:]
+        shift_click(sync_id, 54)
+        wait(lambda: slot_update(sync_id, 0) == (64, stone), 'the stone to arrive in slot 0 of the %s' % name, 8.0)
+        print('  %s slot 0 now %s' % (name, slot_update(sync_id, 0)), flush=True)
+        st.hit('container_filled')
+        c.send(SB_CONTAINER_CLOSE, varint(sync_id))
+        settle(1.0)
+        saved[name] = [bx, fy + 1, bz, stone, 64, w.block(bx, fy + 1, bz)]
+    # `/item replace block` reaches a block entity's inventory through the world's getBlockContainer.
+    bx, by, bz = saved['barrel'][:3]
+    cmd('item replace block %d %d %d container.1 with minecraft:stone 5' % (bx, by, bz))
+    settle(0.8)
+    sync_id, wtype, slots = open_window(bx, by, bz)
+    check(slots[0] == (64, stone) and slots[1] == (5, stone), 'barrel after /item replace: %s' % (slots[:3],))
+    print('  /item replace block: barrel slot 1 = %s' % (slots[1],), flush=True)
+    st.hit('item_replace_block')
+    c.send(SB_CONTAINER_CLOSE, varint(sync_id))
+    settle(0.5)
+    # Blocks that only open a window: the type each answers (generated/screen.aowl's order: generic 9x3 2, generic 3x3 6,
+    # anvil 8, crafting 12, enchantment 13, hopper 16, stonecutter 24).
+    for k, (name, want) in enumerate((('crafting_table', 12), ('ender_chest', 2), ('shulker_box', 2), ('hopper', 16),
+                                      ('dropper', 6), ('anvil', 8), ('stonecutter', 24), ('enchanting_table', 13))):
+        bx, bz = sx + 3 + k, sz + 5
+        hold(name)
+        use_on(bx, fy, bz, 1, (0.5, 1.0, 0.5))
+        wait(lambda: w.block(bx, fy + 1, bz) not in (None, 0), 'a %s' % name)
+        settle(0.4)
+        sync_id, wtype, slots = open_window(bx, fy + 1, bz)
+        check(wtype == want, '%s: window type %d, wanted %d' % (name, wtype, want))
+        print('  %s opens window type %d with %d slots' % (name, wtype, len(slots)), flush=True)
+        st.hit('window_opens')
+        c.send(SB_CONTAINER_CLOSE, varint(sync_id))
+        settle(0.5)
+    ctx['containers_state'] = saved
+
+
+def containers_verify_session(c, st, w, biomes, ctx, args):
+    """--containers-verify FILE: after a restart each container opens with the stack still in slot 0."""
+    with open(args.containers_verify) as f:
+        saved = json.load(f)
+    log = []
+    ctx['tap'] = lambda pid, data: log.append((pid, bytes(data)))
+
+    def settle(seconds):
+        end = time.time() + seconds
+        while time.time() < end:
+            try:
+                pid, r = c.recv()
+            except socket.timeout:
+                continue
+            one_packet(c, st, w, biomes, ctx, pid, r)
+
+    def window_content(sync_id):
+        for p, d in log:
+            if p == PLAY_CONTAINER_CONTENT:
+                r2 = Reader(d)
+                if r2.varint() == sync_id:
+                    r2.varint()
+                    return [read_slot(r2) for _ in range(r2.varint())]
+        return None
+
+    pump(c, st, w, biomes, ctx, lambda: w.pos is not None and ctx['chunk_parsed'], 'a position and a chunk', 40.0)
+    pump(c, st, w, biomes, ctx, lambda: w.health is not None, 'health')
+    c.send(SB_CHANGE_GAME_MODE, varint(1))
+    pump(c, st, w, biomes, ctx, lambda: w.mode == 1, 'creative')
+    for name, (x, y, z, item, count, state) in saved.items():
+        c.send(SB_CHAT_COMMAND, string('tp @s %d %d %d' % (x, y + 2, z)))
+        pump(c, st, w, biomes, ctx, lambda: w.block(x, y, z) is not None, 'the chunk of the %s' % name, 30.0)
+        settle(1.0)
+        check(w.block(x, y, z) == state, 'the %s is state %s, was %s' % (name, w.block(x, y, z), state))
+        del log[:]
+        c.send(SB_USE_ON, varint(0) + block_pos(x, y, z) + varint(1) + struct.pack('>fff', 0.5, 1.0, 0.5) + bytes([0, 0]) +
+               varint(900))
+        pump(c, st, w, biomes, ctx, lambda: any(p == PLAY_OPEN_SCREEN for p, _ in log), 'an open screen packet')
+        sync_id = Reader([d for p, d in log if p == PLAY_OPEN_SCREEN][0]).varint()
+        pump(c, st, w, biomes, ctx, lambda: window_content(sync_id) is not None, 'the window content')
+        slots = window_content(sync_id)
+        print('  %s after the restart: slot 0 = %s' % (name, (slots[0],)))
+        check(slots[0] == (count, item), '%s slot 0 is %s, wanted %s' % (name, slots[0], (count, item)))
+        c.send(SB_CONTAINER_CLOSE, varint(sync_id))
+    st.hit('containers_persisted')
+
+
 PLAY_RESPAWN = 80
 ITEM_META_INDEX = 8
 
@@ -2153,6 +2457,254 @@ def world_session(c, st, w, biomes, ctx, args):
     st.hit('mobs_spawned')
 
 
+PLAY_COMBAT_KILL = 66
+
+
+def player_session(c, st, w, biomes, ctx, args):
+    """--player: the player systems over the wire. The bot must be an operator of level 4, on a COPY of a world.
+
+    1. A mob hits the player: a zombie is summoned on the bot, in survival at night, and the health packets must show the
+       health fall below full (damage through `LivingEntity::damage`, armour and hurt cooldown included).
+    2. Hunger drains: `/effect give @s hunger` and the food level in the health packets must fall (`HungerManager::tick`).
+    3. Death, then respawn: a forced spawn point is set a few blocks away, the bot carries 64 stone, and is sent below the
+       world. Health must reach nothing, a `CCombatDeath` must arrive, a stack must drop where it died, and a client
+       command 0 must bring health back and a position at the spawn point (`calculate_respawn_point`).
+    4. `/fill` takes block-state syntax: stairs facing east and facing west differ, a nether portal frame filled with
+       `nether_portal[axis=x]` holds portal blocks, and a bad property answers with a proper error.
+    5. An entity visible after join: a cow is summoned and recorded in --save; --player-verify joins again and must be
+       told about it at once (`send_entities_to`)."""
+    def wait(cond, what, seconds=10.0):
+        pump(c, st, w, biomes, ctx, cond, what, seconds)
+
+    def settle(seconds=0.6):
+        end = time.time() + seconds
+        while time.time() < end:
+            try:
+                pid, r = c.recv()
+            except socket.timeout:
+                continue
+            one_packet(c, st, w, biomes, ctx, pid, r)
+
+    def cmd(line):
+        print('  /%s' % line, flush=True)
+        c.send(SB_CHAT_COMMAND, string(line))
+
+    spawned = []   # (entity id, type, x, y, z)
+    deaths = []    # entity ids of the CCombatDeath packets
+    respawns = []
+    moves = {}     # entity id -> relative move packets seen
+    where = {}     # entity id -> [x, y, z] kept from its spawn and its relative moves
+
+    def tap(pid, data):
+        r = Reader(data)
+        if pid == PLAY_ADD_ENTITY:
+            eid = r.varint()
+            r.take(16)
+            kind = r.varint()
+            spawned.append((eid, kind, r.f64(), r.f64(), r.f64()))
+            where[eid] = [spawned[-1][2], spawned[-1][3], spawned[-1][4]]
+        elif pid == PLAY_COMBAT_KILL:
+            deaths.append(r.varint())
+        elif pid == PLAY_RESPAWN:
+            respawns.append(len(respawns))
+        elif pid in (PLAY_MOVE_POS, PLAY_MOVE_POS_ROT):
+            eid = r.varint()
+            moves[eid] = moves.get(eid, 0) + 1
+            at = where.get(eid)
+            if at is not None:   # relative moves are 1/4096 of a block
+                at[0] += r.i16() / 4096.0
+                at[1] += r.i16() / 4096.0
+                at[2] += r.i16() / 4096.0
+    ctx['tap'] = tap
+
+    wait(lambda: w.pos is not None and ctx['chunk_parsed'], 'a position and a chunk', 60.0)
+    wait(lambda: w.health is not None, 'a health packet')
+    home = w.pos
+    x, y, z = int(home[0] // 1), int(home[1] // 1), int(home[2] // 1)
+    print('  joined at %.2f %.2f %.2f' % home)
+    cmd('gamemode survival')
+    wait(lambda: w.mode == 0, 'survival mode')
+    cmd('difficulty normal')
+    cmd('time set night')
+    settle(0.8)
+    print('  said: %r' % (w.chat[-4:],))
+
+    # 5 (first half). A cow, recorded for the second connection.
+    mark = len(spawned)
+    cmd('summon minecraft:cow %d %d %d' % (x + 4, y, z))
+    def near(spawn_x, spawn_z, since):
+        return [e for e in spawned[since:] if abs(e[2] - (spawn_x + 0.5)) <= 3.0 and abs(e[4] - (spawn_z + 0.5)) <= 3.0]
+    wait(lambda: near(x + 4, z, mark), 'the cow to be spawned on the wire', 15.0)
+    cow = near(x + 4, z, mark)[0]
+    print('  cow: entity %d type %d at %.1f %.1f %.1f' % cow)
+    ctx['player_state'] = dict(kind=cow[1], x=cow[2], y=cow[3], z=cow[4])
+    if args.save:
+        with open(args.save, 'w') as f:
+            json.dump(ctx['player_state'], f)
+    st.hit('cow_summoned')
+
+    # 1. A mob hits the player.
+    settle(0.5)
+    wait(lambda: w.health[0] >= 19.5, 'full health first')
+    mark = len(spawned)
+    cmd('summon minecraft:zombie %d %d %d' % (x, y, z))
+    wait(lambda: near(x, z, mark), 'the zombie to be spawned on the wire', 15.0)
+    zombie = near(x, z, mark)[0]
+    print('  zombie: entity %d type %d at %.1f %.1f %.1f, health %.1f' % (zombie + (w.health[0],)))
+    mob_hit = True
+    try:
+        wait(lambda: w.health[0] < 20.0, 'the zombie to hurt the bot', 30.0)
+        print('  health after the hit: %.1f' % w.health[0])
+        st.hit('mob_hit')
+    except Fail:
+        print('  the zombie moved %d times (move packets for entity %d); health %r' % (moves.get(zombie[0], 0), zombie[0], w.health))
+        print('  the cow (entity %d) moved %d times' % (cow[0], moves.get(cow[0], 0)))
+        mob_hit = False   # reported at the end: the other steps still run
+    cmd('kill @e[type=minecraft:zombie]')
+    settle(1.0)
+    # With real mob AI the night brings real hostile mobs: the rest of the scenario must not be eaten by them.
+    cmd('gamerule spawn_mobs false')
+    cmd('time set day')
+    settle(0.5)
+    # The same damage without the mob: `/damage` goes through `damage_with_context` of the player (armour, hurt cooldown).
+    before = w.health[0]
+    cmd('damage @s 3 minecraft:generic')
+    wait(lambda: w.health[0] < before, 'the damage command to hurt the bot', 10.0)
+    print('  health %.1f -> %.1f' % (before, w.health[0]))
+    check(abs((before - w.health[0]) - 3.0) < 0.6, 'damage 3 changed health by %.2f' % (before - w.health[0]))
+    st.hit('damage_dealt')
+
+    # 2. Hunger.
+    food0 = w.health[1]
+    print('  food %d saturation %.1f' % (food0, w.health[2]))
+    cmd('effect give @s minecraft:hunger 30 255')
+    wait(lambda: w.health[1] < food0, 'the food level to fall', 40.0)
+    print('  food fell to %d' % w.health[1])
+    st.hit('hunger_drained')
+    cmd('effect clear @s')
+    settle(0.5)
+
+    # 1b. Mob AI over the wire: the cow wanders off by itself, and a pig follows the carrot the bot holds.
+    cow_start = (cow[2], cow[4])
+    def cow_walked():
+        at = where[cow[0]]
+        return ((at[0] - cow_start[0]) ** 2 + (at[2] - cow_start[1]) ** 2) ** 0.5
+    wait(lambda: cow_walked() > 1.0, 'the cow to wander', 60.0)
+    print('  the cow wandered %.1f blocks (%d move packets)' % (cow_walked(), moves.get(cow[0], 0)))
+    st.hit('cow_wandered')
+
+
+    # 4. /fill with block states.
+    fx, fy, fz = x + 8, y + 3, z + 8
+    cmd('fill %d %d %d %d %d %d minecraft:air' % (fx - 1, fy - 1, fz - 1, fx + 6, fy + 6, fz + 2))
+    settle(0.8)
+    at = len(w.chat)
+    cmd('fill %d %d %d %d %d %d minecraft:oak_stairs[facing=east,half=top]' % (fx, fy, fz + 1, fx, fy, fz + 1))
+    cmd('fill %d %d %d %d %d %d minecraft:oak_stairs[facing=west,half=top]' % (fx + 2, fy, fz + 1, fx + 2, fy, fz + 1))
+    wait(lambda: w.block(fx, fy, fz + 1) not in (None, 0) and w.block(fx + 2, fy, fz + 1) not in (None, 0), 'both stairs', 15.0)
+    check(w.block(fx, fy, fz + 1) != w.block(fx + 2, fy, fz + 1),
+          'east and west stairs are the same state: %r' % w.block(fx, fy, fz + 1))
+    check(not any('argument.block' in said or 'Unknown block' in said for said in w.chat[at:]),
+          'the stairs were refused: %r' % w.chat[at:])
+    st.hit('fill_stairs_states')
+    cmd('fill %d %d %d %d %d %d minecraft:obsidian hollow' % (fx + 3, fy, fz, fx + 6, fy + 4, fz))
+    settle(0.8)
+    cmd('fill %d %d %d %d %d %d minecraft:nether_portal[axis=x]' % (fx + 4, fy + 1, fz, fx + 5, fy + 3, fz))
+    wait(lambda: w.block(fx + 4, fy + 1, fz) not in (None, 0), 'the portal blocks', 15.0)
+    settle(1.0)
+    portal = w.block(fx + 4, fy + 1, fz)
+    check(portal not in (None, 0) and w.block(fx + 5, fy + 3, fz) == portal, 'the portal broke up: %r' % portal)
+    check(not any('argument.block.id.invalid' in said for said in w.chat[at:]),
+          'nether_portal[axis=x] was refused: %r' % w.chat[at:])
+    st.hit('fill_portal_state')
+    at = len(w.chat)
+    cmd('fill %d %d %d %d %d %d minecraft:oak_stairs[facing=sideways]' % (fx, fy + 4, fz, fx, fy + 4, fz))
+    wait(lambda: len(w.chat) > at, 'the bad property error')
+    print('  said: %r' % w.chat[at:])
+    check(any('argument.block.property.invalid' in said or 'does not accept' in said for said in w.chat[at:]),
+          'no property error: %r' % w.chat[at:])
+    st.hit('fill_bad_property')
+
+    # 3. Death, then respawn at a forced spawn point.
+    cmd('give @s minecraft:stone 64')
+    sp = (x + 5, y, z - 5)
+    cmd('spawnpoint @s %d %d %d' % sp)
+    settle(1.0)
+    mark = len(spawned)
+    deaths_before = len(deaths)
+    cmd('tp @s %d -200 %d' % (x, z))
+    wait(lambda: len(deaths) > deaths_before, 'the death screen (CCombatDeath)', 40.0)
+    wait(lambda: w.health[0] <= 0.0, 'health to fall to nothing', 10.0)
+    print('  dead, health %.1f' % w.health[0])
+    st.hit('player_died')
+    settle(1.0)
+    drops = [e for e in spawned[mark:] if abs(e[2] - x) <= 3.0 and abs(e[4] - z) <= 3.0]
+    print('  entities where it died: %r' % (drops,))
+    check(drops, 'nothing dropped where the player died')
+    st.hit('death_drops')
+    w.pos = None
+    c.send(SB_CLIENT_COMMAND, varint(0))
+    wait(lambda: w.health[0] > 0.0, 'the respawn', 30.0)
+    wait(lambda: w.pos is not None, 'a position after the respawn', 60.0)
+    print('  respawned, health %.1f at %.2f %.2f %.2f' % ((w.health[0],) + w.pos))
+    check(abs(w.pos[0] - (sp[0] + 0.5)) <= 1.5 and abs(w.pos[2] - (sp[2] + 0.5)) <= 1.5,
+          'respawned at %r, the spawn point is %r' % (w.pos, sp))
+    st.hit('player_respawned')
+    check(len(respawns) >= 1, 'no Respawn packet')
+    st.hit('respawn_point_used')
+
+    # 6. A pig follows the carrot the bot holds (last: it leaves a carrot in the inventory and pigs round the bot).
+    bx, by, bz = int(w.pos[0] // 1), int(w.pos[1] // 1), int(w.pos[2] // 1)
+    cmd('give @s minecraft:carrot 4')
+    wait(lambda: w.window0 is not None and any(w.window0[i][0] > 0 for i in range(36, 45)), 'the carrot in the hotbar', 10.0)
+    hand = next(i for i in range(36, 45) if w.window0[i][0] > 0) - 36
+    c.send(SB_CARRIED, struct.pack('>h', hand))   # the pigs look at the selected slot
+    settle(0.8)
+    pigs = []
+    for dx, dz in ((-4, 0), (0, 6), (7, 0)):   # three directions: the ground round the spawn is not flat everywhere
+        mark = len(spawned)
+        cmd('summon minecraft:pig %d %d %d' % (bx + dx, by, bz + dz))
+        wait(lambda: near(bx + dx, bz + dz, mark), 'a pig to be spawned on the wire', 15.0)
+        pigs.append(near(bx + dx, bz + dz, mark)[0])
+    def pig_distance(pig):
+        at = where[pig[0]]
+        return ((at[0] - w.pos[0]) ** 2 + (at[2] - w.pos[2]) ** 2) ** 0.5
+    start_distances = [pig_distance(p) for p in pigs]
+    print('  pigs %r at distances %r, carrot in the hand' % ([p[0] for p in pigs], ['%.1f' % d for d in start_distances]))
+    wait(lambda: any(pig_distance(p) < 3.0 and d > 3.5 for p, d in zip(pigs, start_distances)), 'a pig to come to the carrot', 40.0)
+    print('  the pigs followed the carrot: %r -> %r blocks' % (['%.1f' % d for d in start_distances],
+                                                               ['%.1f' % pig_distance(p) for p in pigs]))
+    st.hit('pig_followed')
+    cmd('kill @e[type=minecraft:pig]')
+    settle(0.5)
+    check(mob_hit, 'the zombie never hurt the bot (the rest of the scenario ran)')
+
+
+def player_verify_session(c, st, w, biomes, ctx, args):
+    """--player-verify FILE: join again; the cow summoned by --player must be spawned on the wire straight away."""
+    with open(args.player_verify) as f:
+        want = json.load(f)
+    spawned = []
+
+    def tap(pid, data):
+        r = Reader(data)
+        if pid == PLAY_ADD_ENTITY:
+            eid = r.varint()
+            r.take(16)
+            kind = r.varint()
+            spawned.append((eid, kind, r.f64(), r.f64(), r.f64()))
+    ctx['tap'] = tap
+    pump(c, st, w, biomes, ctx, lambda: w.pos is not None and ctx['chunk_parsed'], 'a position and a chunk', 60.0)
+    def cows_near():
+        return [e for e in spawned if e[1] == want['kind'] and abs(e[2] - want['x']) <= 16 and abs(e[4] - want['z']) <= 16]
+    pump(c, st, w, biomes, ctx, lambda: cows_near(), 'the cow after joining', 20.0)
+    cows = [e for e in spawned if e[1] == want['kind']]
+    print('  spawned at join: %r' % (cows,))
+    near = [e for e in cows if abs(e[2] - want['x']) <= 16 and abs(e[4] - want['z']) <= 16]
+    check(near, 'no cow near %r among %r' % (want, cows))
+    st.hit('entity_after_join')
+
+
 def watch_session(c, st, w, biomes, ctx, args):
     """--watch: another client's play as this one is told about it."""
     counts = ctx['counts']
@@ -2187,18 +2739,41 @@ def run(args):
         extra = list(extra) + Stages.COMMAND_NAMES
     if args.commands2:
         extra = list(extra) + Stages.COMMANDS2_NAMES
+    if args.commands3:
+        extra = list(extra) + Stages.COMMANDS3_NAMES
     if args.scoreboard:
         extra = list(extra) + Stages.SCOREBOARD_NAMES
     if args.commands_verify:
         extra = list(extra) + Stages.COMMAND_VERIFY_NAMES
-    if args.blocks or args.blocks_verify or args.world:
+    if args.blocks or args.blocks_verify or args.world or args.containers or args.containers_verify or args.c2 or args.c2_verify or args.c1 or args.c1_verify or args.last or args.partsb:
         load_block_table(args.assets)
     if args.world:
         extra = list(extra) + Stages.WORLD_NAMES
+    if args.player:
+        extra = list(extra) + Stages.PLAYER_NAMES
+    if args.player_verify:
+        extra = list(extra) + Stages.PLAYER_VERIFY_NAMES
     if args.blocks:
         extra = list(extra) + Stages.BLOCKS_NAMES
     if args.blocks_verify:
         extra = list(extra) + Stages.BLOCKS_VERIFY_NAMES
+    if args.c2:
+        extra = list(extra) + Stages.C2_NAMES
+    if args.wasm_plugin:
+        extra = list(extra) + Stages.PLUGIN_NAMES
+    if args.playa:
+        extra = list(extra) + (Stages.PLAYA_LISTEN_NAMES if args.playa == 'listen' else Stages.PLAYA_NAMES)
+    if args.c2_verify:
+        extra = list(extra) + Stages.C2_VERIFY_NAMES
+    if args.partsb:
+        only = [n for n in os.environ.get('PARTSB_ONLY', '').split(',') if n]
+        for group, names in Stages.PARTSB_NAMES.items():
+            if not only or group in only:
+                extra = list(extra) + names
+    if args.containers:
+        extra = list(extra) + Stages.CONTAINERS_NAMES
+    if args.containers_verify:
+        extra = list(extra) + Stages.CONTAINERS_VERIFY_NAMES
     st = Stages(extra)
     status = status_ping(args.host, args.port)
     print('status: %s' % json.dumps(status))
@@ -2380,10 +2955,14 @@ def run(args):
             play_session(c, st, w, biomes, ctx, args)
         elif args.verify:
             verify_session(c, st, w, biomes, ctx, args)
+        if args.plugin:
+            plugin_session(c, st, w, biomes, ctx, args)
         if args.commands:
             commands_session(c, st, w, biomes, ctx, args)
         if args.commands2:
             commands2_session(c, st, w, biomes, ctx, args)
+        if args.commands3:
+            commands3_session(c, st, w, biomes, ctx, args)
         if args.scoreboard:
             scoreboard_session(c, st, w, biomes, ctx, args)
         elif args.commands_verify:
@@ -2394,6 +2973,38 @@ def run(args):
             blocks_session(c, st, w, biomes, ctx, args)
         elif args.blocks_verify:
             blocks_verify_session(c, st, w, biomes, ctx, args)
+        if args.playa:
+            import mcbot_playa
+            mcbot_playa.playa_session(sys.modules[__name__], c, st, w, biomes, ctx, args)
+        if args.wasm_plugin:
+            import mcbot_plugin
+            mcbot_plugin.plugin_session(sys.modules[__name__], c, st, w, biomes, ctx, args)
+        if args.c2 or args.c2_verify:
+            import mcbot_c2
+            if args.c2:
+                mcbot_c2.c2_session(sys.modules[__name__], c, st, w, biomes, ctx, args)
+            else:
+                mcbot_c2.c2_verify_session(sys.modules[__name__], c, st, w, biomes, ctx, args)
+        if args.partsb:
+            import mcbot_partsb
+            mcbot_partsb.partsb_session(sys.modules[__name__], c, st, w, biomes, ctx, args)
+        if args.last:
+            import mcbot_last
+            mcbot_last.last_session(sys.modules[__name__], c, st, w, biomes, ctx, args)
+        if args.c1 or args.c1_verify:
+            import mcbot_c1
+            if args.c1:
+                mcbot_c1.c1_session(sys.modules[__name__], c, st, w, biomes, ctx, args)
+            else:
+                mcbot_c1.c1_verify_session(sys.modules[__name__], c, st, w, biomes, ctx, args)
+        if args.containers:
+            containers_session(c, st, w, biomes, ctx, args)
+        elif args.containers_verify:
+            containers_verify_session(c, st, w, biomes, ctx, args)
+        if args.player:
+            player_session(c, st, w, biomes, ctx, args)
+        elif args.player_verify:
+            player_verify_session(c, st, w, biomes, ctx, args)
         if args.far_chunk:
             far_session(c, st, w, biomes, ctx, args)
         if args.watch:
@@ -2407,9 +3018,21 @@ def run(args):
     except (ConnectionError, OSError) as e:
         raise Fail('connection lost %.1fs into play: %s' % (time.time() - start, e))
     counts, chunks, keep_alives = ctx['counts'], ctx['chunks'], ctx['keep_alives']
+    if args.c1 and args.save:
+        with open(args.save, 'w') as f:
+            json.dump(ctx['c1_state'], f)
+    if args.containers and args.save:
+        with open(args.save, 'w') as f:
+            json.dump(ctx['containers_state'], f)
+    if args.c2 and args.save:
+        with open(args.save, 'w') as f:
+            json.dump(ctx['c2_state'], f)
     if args.blocks and args.save:
         with open(args.save, 'w') as f:
             json.dump(ctx['blocks_state'], f)
+    if args.player and args.save:
+        with open(args.save, 'w') as f:
+            json.dump(ctx['player_state'], f)
     if args.play and args.save:
         with open(args.save, 'w') as f:
             json.dump(dict(placed_at=ctx['placed_at'], walked_to=ctx['walked_to']), f)
@@ -2692,12 +3315,27 @@ def main():
     ap.add_argument('--verify', help='a file from --save: check it is all still there')
     ap.add_argument('--commands', action='store_true', help='run real commands as an operator; see commands_session')
     ap.add_argument('--commands2', action='store_true', help='run /clone, /place, /item, /spreadplayers, /rotate, /fillbiome, /loot, /ride and /spectate; see commands2_session')
+    ap.add_argument('--commands3', action='store_true', help='run /help, /pumpkin, /attribute, /advancement and /dialog; see commands3_session')
+    ap.add_argument('--plugin', type=int, nargs=3, metavar=('X', 'Y', 'Z'), help='a plugin has set this block and shown the bot a boss bar; see plugin_session')
+    ap.add_argument('--plugin-state', type=int, default=None, help='with --plugin: the state id the block must have on the wire')
     ap.add_argument('--scoreboard', action='store_true', help='run the scoreboard, team, bossbar, border, tick and data commands; see scoreboard_session')
     ap.add_argument('--commands-verify', help='a file from --commands --save: check what the commands did is still there')
     ap.add_argument('--world', action='store_true', help='drops, a nether portal and night spawns as an operator; see world_session')
     ap.add_argument('--blocks', action='store_true', help='play with blocks as an operator; see blocks_session')
     ap.add_argument('--blocks-verify', help='a file from --blocks --save: check the door, lamp and sand are still there')
     ap.add_argument('--assets', default=os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '..', 'ref', 'pumpkin-1.21.11', 'assets', 'blocks.json'), help='blocks.json of the pinned upstream, for --blocks')
+    ap.add_argument('--playa', choices=['act', 'listen'], help='play packets as an operator: shift-click, drag split, tab completion and chat (act), or hear the actor chat (listen); see mcbot_playa.py')
+    ap.add_argument('--wasm-plugin', action='store_true', help='a wasm plugin welcomes the player and cancels chat starting with x; see mcbot_plugin.py')
+    ap.add_argument('--c2', action='store_true', help='a sign with text, a bed slept in and a piston push; see mcbot_c2.py')
+    ap.add_argument('--c2-verify', help='a file from --c2 --save: the sign, bed and piston are still there')
+    ap.add_argument('--last', action='store_true', help='command blocks, a cauldron, a flower pot and a dragon egg; see mcbot_last.py')
+    ap.add_argument('--partsb', action='store_true', help='pearl cooldown, bed night skip, villager trading window and the dragon; see mcbot_partsb.py')
+    ap.add_argument('--c1', action='store_true', help='a furnace smelts over the wire; see mcbot_c1.py')
+    ap.add_argument('--c1-verify', help='a file from --c1 --save: the smelted output is still in the furnace')
+    ap.add_argument('--containers', action='store_true', help='open a chest, a barrel and a trapped chest and fill them; see containers_session')
+    ap.add_argument('--containers-verify', help='a file from --containers --save: check the stacks are still in the containers')
+    ap.add_argument('--player', action='store_true', help='mob damage, hunger, death and respawn, /fill states, a cow; see player_session')
+    ap.add_argument('--player-verify', help='a file from --player --save: the cow must be spawned on joining')
     ap.add_argument('--watch', action='store_true', help='watch another player play')
     ap.add_argument('--encrypt', action='store_true', help='answer the encryption request; stops once in play')
     ap.add_argument('--expect-refusal', help='wants a login disconnect containing this')
