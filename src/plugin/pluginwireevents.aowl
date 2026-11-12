@@ -1,0 +1,130 @@
+## Fills the hooks of pluginhooksevents.aowl (and `gPacketSentHook` of net/java/javamod.aowl, and the command server's
+## `fireSpawnChange`) with the conversions of wit/witeventsblock.aowl, witeventsworld.aowl and witeventsserver.aowl, so the
+## server's block, world and server events reach the loaded plugins: the call sites of `PluginManager::fire` for
+## BlockGrowEvent, BlockRedstoneEvent, SpawnChangeEvent, ServerCommandEvent, ServerBroadcastEvent, ServerTickStartEvent,
+## ServerTickEndEvent, ServerLoadEvent, PacketReceivedEvent and PacketSentEvent. `startPlugins` (pluginmgr.aowl) calls
+## `installEventHooks` once, after the player hooks.
+## Each hook returns at once, building no event, unless a loaded plugin registered for that event (`hasHandlers`).
+## BlockBreakEvent and BlockPlaceEvent are the player agent's path (pluginhooks.aowl); BlockBurnEvent, BlockCanBuildEvent and
+## the chunk events have no call site upstream either.
+import std/options
+import pluginhost
+import pluginhooksevents
+import ../command/cmdsource
+import ../server/serverbase
+import ../server/net/java/javamod
+import ../util/math/position
+import ../util/text/text
+import ../data/block_ext
+from "../server/block/blockbehaviour" import BlockWorld
+from ../data/block_state import BlockStateId
+import "api/events/block/mod"
+import "api/events/world/mod"
+import "api/events/server/mod"
+import wasm/canonabi
+import wit/[witeventresult, witeventsblock, witeventsworld, witeventsserver, witstate]
+
+var gInPacketSent = false
+
+proc worldOfBlockWorld(server: Server; bw: BlockWorld): nil World =
+  for w in server.worlds:
+    if w.blockWorld == bw: return w
+  nil
+
+proc hasHandlers*(h: PluginHost; eventName: string): bool =
+  ## True when an active plugin registered for `eventName`: the packet events build a list<u8> per packet, so a call site
+  ## checks this first.
+  for p in h.plugins:
+    if p.active:
+      for r in p.eventRegs:
+        if r.eventName == eventName: return true
+  false
+
+proc listeningTo(h: PluginHost; eventName: string): bool =
+  h.activeCount() > 0 and hasHandlers(h, eventName)
+
+proc fireOn(h: PluginHost; eventName: string; fields: seq[string]; values: seq[CVal]): EventResult =
+  ## `PluginManager::fire`: `fireEvent` of pluginhost.aowl, its outcome as the `EventResult` the conversions read.
+  let o = fireEvent(h, eventName, fields, values)
+  EventResult(cancelled: o.cancelled, fieldNames: o.fieldNames, fieldVals: o.fieldVals)
+
+proc installEventHooks*(server: Server; host: PluginHost) =
+  let h = host
+
+  gPluginBlockGrowHook = proc(world: BlockWorld; oldBlock: Block; oldState: BlockStateId; newBlock: Block;
+                              newState: BlockStateId; pos: BlockPos): (bool, BlockStateId) {.closure.} =
+    if not listeningTo(h, "block-grow-event"): return (false, newState)
+    let w = worldOfBlockWorld(server, world)
+    if w == nil: return (false, newState)
+    let ev = newBlockGrowEvent(w, oldBlock, oldState, newBlock, newState, pos)
+    let e = fromWasm(fireOn(h, "block-grow-event", GrowFields, toWasm(ev)), ev)
+    (e.cancelled, e.newStateId)
+
+  gPluginBlockRedstoneHook = proc(world: BlockWorld; stateId: BlockStateId; pos: BlockPos;
+                                  oldCurrent, newCurrent: int32): (bool, int32) {.closure.} =
+    if not listeningTo(h, "block-redstone-event"): return (false, newCurrent)
+    let w = worldOfBlockWorld(server, world)
+    if w == nil: return (false, newCurrent)
+    let ev = newBlockRedstoneEvent(w, stateId, pos, oldCurrent, newCurrent)
+    let e = fromWasm(fireOn(h, "block-redstone-event", RedstoneFields, toWasm(ev)), ev)
+    (e.cancelled, e.newCurrent)
+
+  let commandServer = server.commandServer
+  if commandServer != nil:
+    commandServer.fireSpawnChange = proc(world: CommandWorld; previous, next: CmdSpawn): CmdSpawn {.closure.} =
+      ## `/setworldspawn`'s `SpawnChangeEvent`: what the plugins left in the new position, yaw and pitch is applied.
+      if not listeningTo(h, "spawn-change-event"): return next
+      var target: nil World = nil
+      for w in server.worlds:
+        if w.commandWorld == world: target = w
+      if target == nil: return next
+      let ev = newSpawnChangeEvent(target, newBlockPos(previous.x, previous.y, previous.z), previous.yaw,
+        previous.pitch, newBlockPos(next.x, next.y, next.z), next.yaw, next.pitch)
+      let e = fromWasm(fireOn(h, "spawn-change-event", SpawnChangeFields, toWasm(ev)), ev)
+      CmdSpawn(x: e.newPosition.vec.x, y: e.newPosition.vec.y, z: e.newPosition.vec.z, yaw: e.newYaw, pitch: e.newPitch)
+
+  gPluginServerCommandHook = proc(command: string): bool {.closure.} =
+    if not listeningTo(h, "server-command-event"): return false
+    let ev = newServerCommandEvent(command)
+    fromWasm(fireOn(h, "server-command-event", CommandFields, toWasm(ev)), ev).cancelled
+
+  gPluginServerBroadcastHook = proc(message, sender: TextComponent): (bool, TextComponent, TextComponent) {.closure.} =
+    if not listeningTo(h, "server-broadcast-event"): return (false, message, sender)
+    let ev = newServerBroadcastEvent(message, sender)
+    let e = fromWasm(h.ws, fireOn(h, "server-broadcast-event", BroadcastFields, toWasm(h.ws, ev)), ev)
+    (e.cancelled, e.message, e.sender)
+
+  gPluginTickStartHook = proc(tick: int32) {.closure.} =
+    if listeningTo(h, "server-tick-start-event"):
+      let ev = newServerTickStartEvent(tick)
+      discard fireOn(h, "server-tick-start-event", TickStartFields, toWasm(ev))
+
+  gPluginTickEndHook = proc(tick: int32; durationNanos: int64) {.closure.} =
+    if listeningTo(h, "server-tick-end-event"):
+      let ev = newServerTickEndEvent(tick, durationNanos)
+      discard fireOn(h, "server-tick-end-event", TickEndFields, toWasm(ev))
+
+  gPluginServerLoadHook = proc(reload: bool) {.closure.} =
+    if listeningTo(h, "server-load-event"):
+      let ev = newServerLoadEvent(if reload: ltReload else: ltStartup)
+      discard fireOn(h, "server-load-event", LoadFields, toWasm(ev))
+
+  gPluginPacketReceivedHook = proc(player: Player; packetId: int32; payload: seq[byte]): bool {.closure.} =
+    if not listeningTo(h, "packet-received-event"): return false
+    let ev = newPacketReceivedEvent(player, packetId, payload)
+    fromWasm(fireOn(h, "packet-received-event", PacketFields, toWasm(ev)), ev).cancelled
+
+  gPacketSentHook = proc(client: JavaClient; packetId: int32; payload: seq[byte]): bool {.closure.} =
+    ## `Player::fire_packet_sent_no_obj`, for the client's player once it has one. A packet a handler sends while
+    ## handling one is not offered again (upstream would recurse).
+    if gInPacketSent or not listeningTo(h, "packet-sent-event"): return false
+    var owner: nil Player = nil
+    for w in server.worlds:
+      for p in w.players:
+        if p.client == client: owner = p
+    if owner == nil: return false
+    gInPacketSent = true
+    let ev = newPacketSentEvent(owner, packetId, payload, nil)
+    let e = fromWasm(fireOn(h, "packet-sent-event", PacketFields, toWasm(ev)), ev)
+    gInPacketSent = false
+    e.cancelled

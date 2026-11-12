@@ -179,3 +179,20 @@ bed enter and leave (block/worldhooks.aowl), item consume (entitymod.aowl) and p
 Tests: `wit/witplayer3test` (every function above through the registry against a real Server and Player, packets read back),
 `wit/witeventsplayer2test` (a hand-assembled plugin cancels a one-item drop and answers permission checks). Over the wire:
 `python tools/mcbot.py --wasm-plugin2 --op` with the plugin written by `witeventsplayer2test --write`.
+
+## Block, world and server events
+
+    src/plugin/api/events/{block,world,server}/*.aowl   the event types (`BlockBreakEvent` .. `ServerTickEndEvent`), `mod.aowl` re-exports them
+    src/plugin/pluginhooksevents.aowl     the closure hooks the server's call sites use (grow, redstone, spawn change, console command, broadcast,
+                                          tick start/end, load, packet received); `gPacketSentHook` is in net/java/javamod.aowl (`writePacketFor`)
+    src/plugin/pluginwireevents.aowl      `installEventHooks`: fills those hooks (and `CommandServer.fireSpawnChange`) with the conversions below
+    src/plugin/wit/witeventsblock.aowl    `toWasm` / `fromWasm` / `fire...` for the six block events (typed; witeventsplayer2.aowl keeps the string-typed break and place the player path uses)
+    src/plugin/wit/witeventsworld.aowl    SpawnChangeEvent
+    src/plugin/wit/witeventsserver.aowl   packet received/sent (payload only, `unknown` packet case: PARTIAL), command, broadcast, load, tick start/end
+    src/plugin/wit/witargs.aowl           `OwnedArg`, `ConsumedArgsResource`
+
+Fired from: crop random tick (`BlockGrowEvent`), pressure plate (`BlockRedstoneEvent`), `/setworldspawn` (`SpawnChangeEvent`), console line
+(`ServerCommandEvent`), `/say` and `/me` (`ServerBroadcastEvent`), the ticker, the start of the accept loop (`ServerLoadEvent`), `handlePlayPacket`
+(`PacketReceivedEvent`) and `writePacketFor` (`PacketSentEvent`). Not fired, as upstream: `BlockBurnEvent`, `BlockCanBuildEvent`, `ChunkLoad`/`ChunkSave`
+(`ChunkSend` is fired upstream and not here). Test: `wit/witeventsblocktest` (conversions against known values and a host with no plugin; no component handles
+these events in a test), `wit/witargstest`.
