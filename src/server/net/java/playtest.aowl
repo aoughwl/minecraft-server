@@ -6,7 +6,14 @@ import ../../../inventory/[inventory, player_inventory, player_screen_handler, s
 import ../../../nbt/tag
 import ../../../protocol/java/packet_decoder
 import ../../../protocol/java/server/play/[chat_message, player_action, player_position, set_held_item, use_item_on,
-  swing_arm, ping_request, player_rotation, player_input]
+  swing_arm, ping_request, player_rotation, player_input, keep_alive, player_abilities, confirm_teleport,
+  click_container, set_creative_slot, player_session, place_recipe]
+import ../authentication
+import ../../data/banlist_serializer
+import ../../../util/uuid
+import ../../../protocol/itemstackserializer
+import ../../../protocol/[proto, varint]
+
 import ../../../util/math/position
 import ../../../world/[chunkdata, playerdata, worldfs, worldinfo]
 import ../../../world/blockstates as states
@@ -18,6 +25,7 @@ import ../../serverbase
 import ../../tick_rate_manager
 import ../../world/worldmod
 import ../winsock
+import ../../../generated/recipes as generatedrecipes
 import javamod, play
 
 proc scratch(): string =
@@ -181,5 +189,192 @@ block nbt_round_trip:
   assert other.experienceLevel == 3'i32
   assert other.inventory.getSelectedSlot() == 3'u8
   assert Inventory(other.inventory).getStack(0).itemCount == 1'u8, "the stack came back"
+
+proc nowUnixMsTest(): int64 =
+  (nowUtcSeconds() + 1'i64) * 1000'i64
+
+proc packetList(client: JavaClient): seq[RawPacket] =
+  var decoder = newTCPNetworkDecoder()
+  decoder.feed(client.networkWriter.flush())
+  result = @[]
+  while decoder.packetReady():
+    let res = decoder.getRawPacket()
+    assert res.isOk
+    result.add(res.value)
+
+block keep_alive_handling:
+  let ka = newTestPlayer(server)
+  ka.client.waitForKeepAlive = true
+  ka.client.keepAliveId = 77'i64
+  ka.client.handleKeepAlive(ka, SKeepAlive(keepAliveId: 77'i64))
+  assert not ka.client.waitForKeepAlive and not ka.client.isClosed, "the right id clears the wait"
+  ka.client.waitForKeepAlive = true
+  ka.client.handleKeepAlive(ka, SKeepAlive(keepAliveId: 78'i64))
+  assert ka.client.isClosed, "the wrong id is a timeout kick"
+  let ka2 = newTestPlayer(server)
+  ka2.client.handleKeepAlive(ka2, SKeepAlive(keepAliveId: 0'i64))
+  assert ka2.client.isClosed, "an answer to nothing is a kick"
+
+block abilities_handling:
+  let ab = newTestPlayer(server)
+  ab.client.handlePlayerAbilities(ab, SPlayerAbilities(flags: 2'i8))
+  assert not ab.abilities.flying, "no flying without allow_flying"
+  ab.abilities.allowFlying = true
+  ab.fallDistance = 5.0'f32
+  ab.client.handlePlayerAbilities(ab, SPlayerAbilities(flags: 2'i8))
+  assert ab.abilities.flying and ab.fallDistance == 0.0'f32
+  ab.client.handlePlayerAbilities(ab, SPlayerAbilities(flags: 0'i8))
+  assert not ab.abilities.flying
+
+block confirm_teleport_handling:
+  let ct = newTestPlayer(server)
+  ct.client.handleConfirmTeleport(ct, SConfirmTeleport(teleportId: newVarInt(1'i32)))
+  assert ct.client.isClosed, "a confirmation of nothing is a kick"
+  let ct2 = newTestPlayer(server)
+  ct2.awaitingTeleport = some((5'i32, Vector3[float64](x: 9.0, y: 70.0, z: 9.0)))
+  ct2.client.handleConfirmTeleport(ct2, SConfirmTeleport(teleportId: newVarInt(4'i32)))
+  assert ct2.client.isClosed, "the wrong id is a kick"
+  let ct3 = newTestPlayer(server)
+  ct3.awaitingTeleport = some((5'i32, Vector3[float64](x: 9.0, y: 70.0, z: 9.0)))
+  ct3.client.handleConfirmTeleport(ct3, SConfirmTeleport(teleportId: newVarInt(5'i32)))
+  assert not ct3.client.isClosed and ct3.awaitingTeleport.isNone and ct3.pos.x == 9.0
+
+proc noHash(): OptionalItemStackHash =
+  OptionalItemStackHash(value: none[ItemStackHash]())
+
+proc clickPacket(h: ScreenHandler; slot: int16; button: int8; mode: SlotActionType): SClickSlot =
+  SClickSlot(syncId: newVarInt(int32(h.syncId())), revision: newVarInt(int32(h.getBehaviour().revision)), slot: slot,
+    button: button, mode: mode, lengthOfArray: newVarInt(0'i32), arrayOfChangedSlots: @[], carriedItem: noHash())
+
+block click_shift_and_drag:
+  let cp = newTestPlayer(server)
+  let stoneItem = Item.fromRegistryKey("stone")
+  assert stoneItem != nil
+  let h = cp.currentScreenHandler
+  # Shift-click on the hotbar (window slot 36) moves the stack into the main inventory, starting at 9.
+  Inventory(cp.inventory).setStack(0, newItemStack(64'u8, stoneItem))
+  cp.onSlotClick(clickPacket(h, 36'i16, 0'i8, satQuickMove))
+  assert Inventory(cp.inventory).getStack(0).isEmpty(), "the hotbar slot emptied"
+  assert Inventory(cp.inventory).getStack(9).itemCount == 64'u8, "and the stack arrived in slot 9"
+  # Pick up, then a left drag over two slots splits the cursor stack evenly.
+  Inventory(cp.inventory).setStack(9, newItemStack(0'u8, stoneItem))
+  h.getBehaviour().cursorStack = newItemStack(10'u8, stoneItem)
+  cp.onSlotClick(clickPacket(h, -999'i16, 0'i8, satQuickCraft))
+  cp.onSlotClick(clickPacket(h, 10'i16, 1'i8, satQuickCraft))
+  cp.onSlotClick(clickPacket(h, 11'i16, 1'i8, satQuickCraft))
+  cp.onSlotClick(clickPacket(h, -999'i16, 2'i8, satQuickCraft))
+  assert Inventory(cp.inventory).getStack(10).itemCount == 5'u8 and Inventory(cp.inventory).getStack(11).itemCount == 5'u8,
+    "a left drag splits 10 into 5 and 5"
+  assert h.getBehaviour().cursorStack.isEmpty()
+  # A wrong sync id is ignored.
+  var wrong = clickPacket(h, 10'i16, 0'i8, satPickup)
+  wrong.syncId = newVarInt(9'i32)
+  cp.onSlotClick(wrong)
+  assert h.getBehaviour().cursorStack.isEmpty()
+  # A left click picks the stack up.
+  cp.onSlotClick(clickPacket(h, 10'i16, 0'i8, satPickup))
+  assert h.getBehaviour().cursorStack.itemCount == 5'u8 and Inventory(cp.inventory).getStack(10).isEmpty()
+
+block creative_slot:
+  let cr = newTestPlayer(server)
+  let stoneItem = Item.fromRegistryKey("stone")
+  assert stoneItem != nil
+  assert not cr.client.handleSetCreativeSlot(cr, SSetCreativeSlot(slot: 36'i16, clickedItem: toSerializer(newItemStack(5'u8, stoneItem))))
+  assert Inventory(cr.inventory).getStack(0).isEmpty(), "survival may not"
+  discard cr.setGamemode(Creative)
+  assert cr.client.handleSetCreativeSlot(cr, SSetCreativeSlot(slot: 36'i16, clickedItem: toSerializer(newItemStack(5'u8, stoneItem))))
+  assert Inventory(cr.inventory).getStack(0).itemCount == 5'u8
+  discard cr.client.handleSetCreativeSlot(cr, SSetCreativeSlot(slot: 37'i16, clickedItem: toSerializer(newItemStack(200'u8, stoneItem))))
+  assert Inventory(cr.inventory).getStack(1).isEmpty(), "an illegal count is refused"
+
+const
+  MojangKeyB64 = "MIGfMA0GCSqGSIb3DQEBAQUAA4GNADCBiQKBgQDGIJT2HLuJ5v7qqVswOgNwpBaFWO829BGWF7G+7t2UA47OhJBH6DkIjRehtwpX/MbxF2wJc5Ny+WrdFzWnjx1tcgK0O6hHTKk3Enm/eVh03rDk+bTCxAFm9cW3kUKzJRhz8A6OzKbttTPJv3jRPqoXz91wiZgRMGl7wGpRxnN7JQIDAQAB"
+  SessionSigB64 = "ZV0fJZkz2KMUE02wbH7MCIEjPHi1/pzKbN3tUJp2tMKVWADXN6MMXfigS2gcMRthruZfSGQ70YA55XQNCXU8ePTbyiLj1ghi8ZQBPTAU8YTs6aQZnrnUNNNJITsDE6oeAkwkw3Lg2xVDBM+s2fokZcrdmO4C6hPx8cSQzGOtm1M="
+  SessionExpiry = 4102444800000'i64
+
+block chat_session_signature:
+  # A key pair and a signature made with OpenSSL over uuid(16) + expiry(i64 BE) + public key (1..39), for the uuid of "Tester".
+  let (keyOk, mojangKey) = base64Decode(MojangKeyB64)
+  let (sigOk, sig) = base64Decode(SessionSigB64)
+  assert keyOk and sigOk
+  var pub: seq[byte] = @[]
+  for i in 1 .. 39:
+    pub.add(byte(i))
+  let cs = newTestPlayer(server)
+  server.mojangPublicKeys = @[mojangKey]
+  let session = SPlayerSession(sessionId: offlineUuid("Other"), expiresAt: SessionExpiry, publicKey: pub, keySignature: sig)
+  assert cs.client.validateChatSession(cs, server, session)[0], "a signature made over the player's uuid, expiry and key"
+  var tampered = session
+  tampered.expiresAt = SessionExpiry + 1'i64
+  assert not cs.client.validateChatSession(cs, server, tampered)[0], "another expiry"
+  var expired = session
+  expired.expiresAt = 1000'i64
+  assert not cs.client.validateChatSession(cs, server, expired)[0], "an expired key"
+  server.mojangPublicKeys = @[]
+  assert not cs.client.validateChatSession(cs, server, session)[0], "no Mojang key to check against"
+  # With reports on, the update installs the session and a bad one is a kick.
+  server.basicConfig.allowChatReports = true
+  server.mojangPublicKeys = @[mojangKey]
+  cs.client.handleChatSessionUpdate(cs, server, session)
+  assert not cs.client.isClosed and cs.chatSession.expiresAt == SessionExpiry
+  let cs2 = newTestPlayer(server)
+  cs2.client.handleChatSessionUpdate(cs2, server, tampered)
+  assert cs2.client.isClosed
+  # Secure chat: unsigned is a kick, a 256 byte signature with a current timestamp goes out.
+  let unsigned = newTestPlayer(server)
+  unsigned.client.handleChatMessage(server, unsigned, SChatMessage(message: "hi", timestamp: 0'i64, salt: 1'i64,
+    signature: none[seq[byte]](), messageCount: newVarInt(0'i32), acknowledged: @[], checksum: 0'u8))
+  assert unsigned.client.isClosed
+  discard packetIds(cs.client)
+  var fake: seq[byte] = @[]
+  for i in 0 ..< 256:
+    fake.add(byte(i))
+  cs.client.handleChatMessage(server, cs, SChatMessage(message: "signed hi", timestamp: nowUnixMsTest(), salt: 1'i64,
+    signature: some(fake), messageCount: newVarInt(0'i32), acknowledged: @[], checksum: 0'u8))
+  assert not cs.client.isClosed
+  assert CB_PLAY_PLAYER_CHAT.toId(v) in packetIds(cs.client), "the signed message is broadcast as player chat"
+  var stale = SChatMessage(message: "old", timestamp: nowUnixMsTest() - 1000000'i64, salt: 1'i64,
+    signature: some(fake), messageCount: newVarInt(0'i32), acknowledged: @[], checksum: 0'u8)
+  cs.client.handleChatMessage(server, cs, stale)
+  assert cs.client.isClosed, "a message older than two minutes is out of order"
+  server.basicConfig.allowChatReports = false
+  server.mojangPublicKeys = @[]
+
+block place_recipe:
+  # The recipe book click: acacia_pressure_plate is "##" of acacia planks, so slots 0 and 1 of the 2x2 grid fill.
+  let pr = newTestPlayer(server)
+  let planks = Item.fromRegistryKey("acacia_planks")
+  assert planks != nil
+  Inventory(pr.inventory).setStack(9, newItemStack(5'u8, planks))
+  var displayId = -1
+  var counter = 0
+  for r in generatedrecipes.RECIPES_CRAFTING:
+    if r.kind == generatedrecipes.crkCraftingDecoratedPot:
+      continue
+    if r.kind == generatedrecipes.crkCraftingShaped and r.shaped.id == "minecraft:acacia_pressure_plate":
+      displayId = counter
+      break
+    inc counter
+  assert displayId >= 0
+  let grid = pr.currentScreenHandler.getBehaviour().slots[1].getInventory()
+  pr.client.handlePlaceRecipe(pr, SPlaceRecipe(containerId: 0'i8, recipeDisplayId: newVarInt(int32(displayId)), useMaxItems: false))
+  assert grid.getStack(0).itemCount == 1'u8 and grid.getStack(1).itemCount == 1'u8 and grid.getStack(2).isEmpty()
+  assert Inventory(pr.inventory).getStack(9).itemCount == 3'u8, "two planks left the inventory"
+  # Again: the same recipe stacks one more of each.
+  pr.client.handlePlaceRecipe(pr, SPlaceRecipe(containerId: 0'i8, recipeDisplayId: newVarInt(int32(displayId)), useMaxItems: false))
+  assert grid.getStack(0).itemCount == 2'u8 and grid.getStack(1).itemCount == 2'u8
+  # Shift (use max): as many as the inventory allows, 5 of each is 10 planks and there are 5 in all.
+  pr.client.handlePlaceRecipe(pr, SPlaceRecipe(containerId: 0'i8, recipeDisplayId: newVarInt(int32(displayId)), useMaxItems: true))
+  assert grid.getStack(0).itemCount == 2'u8 and grid.getStack(1).itemCount == 2'u8, "5 planks make 2 of each"
+
+block chat_reaches_other_players:
+  let a = newTestPlayer(server)
+  let b = newTestPlayer(server)
+  discard packetIds(a.client)
+  discard packetIds(b.client)
+  a.client.handleChatMessage(server, a, SChatMessage(message: "to everyone", timestamp: 0'i64, salt: 0'i64,
+    signature: none[seq[byte]](), messageCount: newVarInt(0'i32), acknowledged: @[], checksum: 0'u8))
+  assert CB_PLAY_SYSTEM_CHAT.toId(v) in packetIds(a.client), "the sender hears it"
+  assert CB_PLAY_SYSTEM_CHAT.toId(v) in packetIds(b.client), "another player in the world hears it"
 
 echo "play handlers ok"

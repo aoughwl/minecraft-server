@@ -1,0 +1,466 @@
+## Port of pumpkin/src/net/bedrock/mod.rs (the RakNet session: framing, reliability, ordering, splitting, acknowledgement,
+## resend, the game-packet batch in and out) and pumpkin/src/net/bedrock/connection.rs (the connected RakNet messages).
+## PARTIAL: pumpkin/src/net/bedrock/mod.rs - `send_chunks`, `enqueue_spawn_packet`, `handle_play_packet` and the plugin events (`fire_packet_sent_no_obj`, `PacketReceivedEvent`, `ChunkSend`) belong to the player/world side and are not here: a packet that is not part of the login sequence is handed to `BedrockHooks.onPlayPacket` (bedrocklogin.aowl). The login sequence is bedrocklogin.aowl, the offline handling and the socket bedrockserver.aowl.
+##
+## Upstream runs a task per client with mpsc queues, an outgoing task that ticks every 100 ms, and tokio locks. Here the
+## server loop owns every client: `processDatagram` handles one datagram from the socket, `tick` does what the 100 ms
+## interval did (timeout, flush acks, resend), and a send goes out through `sendRaw` at once. `sendRaw` is the socket
+## write, a closure, so a test can run a whole session without a socket. Time is the caller's `now` in milliseconds.
+##
+## Differences from upstream, all in how the session is driven:
+## - Acknowledgements go out at the end of each datagram as well as on the 100 ms tick (RakNet's own behaviour; upstream
+##   waits for its tick, which is the same thing a little later).
+## - A frame split into more than `MaxSplitFragments` parts is refused instead of allocating its compound, and a
+##   datagram sequence older than the 4096 kept is accepted again after upstream's "clear the set" step, as upstream does.
+## - NACKs are answered with a resend of the datagram (as upstream); none are sent, as upstream sends none.
+## - A client that is closed sends one `CDisconnect` and then answers nothing.
+
+import std/[options, tables]
+import ../../../protocol/[protobase, proto, netcodec, serial, varint]
+import ../../../protocol/bedrock/[bedrockmod, ack, frame_set, packet_decoder, packet_encoder]
+import ../../../protocol/bedrock/client/raknet/connection as cconn
+import ../../../protocol/bedrock/server/raknet/connection as sconn
+import ../../../util/javaversion
+import ../../../protocol/bedrock/server/login as slogin
+import ../../../protocol/bedrock/client/disconnect_player
+import ../../logging
+import ../netbase
+import bedrockreason
+import bedrockcrypto
+
+export bedrockreason
+
+const
+  BedrockTarget = "pumpkin::net::bedrock"
+  TimeoutMs = 10000'i64         ## `last_seen.elapsed() > 10 s`
+  TickIntervalMs = 100'i64
+  ResendAfterMs = 1000'i64
+  MaxResendsPerTick = 50
+  MaxKeptSequences = 4096
+  MaxSplitFragments = 8192
+  MaxChannels = 32              ## RakNet's channel count; a frame on a higher channel is refused (upstream keeps a map and accepts any).
+
+type
+  Compound = ref object
+    ## The fragments of one split frame (`compounds`): `None` slots are the ones not arrived.
+    frames: seq[Frame]
+    have: seq[bool]
+    missing: int
+
+  Unacked = object
+    ## `(id, data, timestamp)` of `unacked_outgoing_frames`.
+    data: seq[byte]
+    sentAt: int64
+
+  OrderQueue = ref object
+    ## `ordered_queues[channel]`: frames that arrived ahead of their turn.
+    frames: seq[Frame]
+
+  ClientPhase* = enum
+    cpLogin    ## `handle_login_sequence` is still running.
+    cpPlay     ## It returned `ReadyToPlay`; packets go to the player.
+
+  GamePacketHandler* = proc(client: BedrockClient; packet: RawPacket) {.closure.}
+  ClosedHandler* = proc(client: BedrockClient) {.closure.}
+  SendRaw* = proc(data: seq[byte]) {.closure.}
+
+  BedrockClient* = ref object
+    address*: serial.SocketAddr
+    peerIp*: uint32            ## Network byte order, as winsock's `UdpPeer.ip`.
+    peerPort*: uint16
+    sendRaw: SendRaw
+    onGamePacket*: GamePacketHandler
+    onClosed*: ClosedHandler
+    phase*: ClientPhase
+    version*: BedrockMinecraftVersion
+    clientData*: Option[slogin.ClientData]
+    pendingProfile*: Option[GameProfile]
+    signJob*: nil CryptoJob        ## The handshake JWT's signature, on a worker thread (bedrockcrypto.aowl); nil when none is running.
+    ecdhJob*: nil CryptoJob        ## The ECDH with the client's key, likewise.
+    handshakeSalt*: seq[byte]
+    handshakeSigningInput*: string
+    pendingConfig*: PlayerConfig
+    hasPlayer*: bool           ## Set by whoever adds the player (upstream's `player: Mutex<Option<Arc<Player>>>`).
+    nextFormId*: uint32
+    inventoryOpened*: bool
+    closed: bool
+    closeSent: bool
+    now: int64
+    lastSeen: int64
+    lastTick: int64
+    encoder*: UDPNetworkEncoder
+    decoder*: UDPNetworkDecoder
+    outputSequenceNumber: uint32
+    outputReliableNumber: uint32
+    outputSplitNumber: uint16
+    outputSequencedIndex: uint32
+    outputOrderedIndex: uint32
+    compounds: Table[uint16, Compound]
+    receivedSequences: Table[uint32, bool]
+    pendingAcks: seq[uint32]
+    unacked: Table[uint32, Unacked]
+    expectedOrderIndex: seq[uint32]
+    highestSequenceIndex: seq[uint32]
+    orderedQueues: seq[OrderQueue]
+    incoming*: seq[RawPacket]  ## Game packets of a client in play that the hook has not taken (`incoming_game_packet_recv`).
+
+proc newOrderQueues(): seq[OrderQueue] =
+  result = @[]
+  for i in 0 ..< MaxChannels:
+    result.add(OrderQueue(frames: @[]))
+
+proc newBedrockClient*(address: serial.SocketAddr; peerIp: uint32; peerPort: uint16; sendRaw: SendRaw; now: int64): BedrockClient =
+  ## `BedrockClient::new`.
+  BedrockClient(address: address, peerIp: peerIp, peerPort: peerPort, sendRaw: sendRaw, phase: cpLogin,
+    version: bmvUnknown, clientData: none[slogin.ClientData](), pendingProfile: none[GameProfile](), signJob: nil, ecdhJob: nil, handshakeSalt: @[], handshakeSigningInput: "",
+    pendingConfig: defaultPlayerConfig(), closed: false, now: now, lastSeen: now, lastTick: now,
+    encoder: newUDPNetworkEncoder(), decoder: newUDPNetworkDecoder(), compounds: initTable[uint16, Compound](),
+    receivedSequences: initTable[uint32, bool](), pendingAcks: @[], unacked: initTable[uint32, Unacked](),
+    expectedOrderIndex: newSeq[uint32](MaxChannels), highestSequenceIndex: newSeq[uint32](MaxChannels),
+    orderedQueues: newOrderQueues(), incoming: @[])
+
+proc isClosed*(self: BedrockClient): bool = self.closed
+
+proc peerKey*(self: BedrockClient): uint64 =
+  (uint64(self.peerIp) shl 16) or uint64(self.peerPort)
+
+# --- sending -------------------------------------------------------------------------------------------------------
+
+proc writeDatagram(self: BedrockClient; data: seq[byte]) =
+  ## `network_writer.write_packet`: one UDP datagram to this client.
+  if not self.closed or not self.closeSent:
+    self.sendRaw(data)
+
+proc sendFrameSet(self: BedrockClient; frameSet: FrameSet; id: uint8) =
+  ## `send_frame_set`.
+  var fs = frameSet
+  let sequence = self.outputSequenceNumber
+  self.outputSequenceNumber += 1'u32
+  fs.sequence = U24(value: sequence)
+  var w = newNetWriter()
+  fs.writePacketData(w, id)
+  var reliable = false
+  for f in fs.frames:
+    if f.reliability.isReliable():
+      reliable = true
+  if reliable:
+    self.unacked[sequence] = Unacked(data: w.buf, sentAt: self.now)
+  self.writeDatagram(w.buf)
+
+proc sendFramedPacketData*(self: BedrockClient; packetBuf: seq[byte]; reliabilityIn: RakReliability) =
+  ## `send_framed_packet_data`: splits what does not fit one MTU, numbers the frames, and sends each in its own frame set.
+  var reliability = reliabilityIn
+  var splitSize = 0'u32
+  var splitId = 0'u16
+  var orderIndex = 0'u32
+  var maxContentLen = MTU - UDP_HEADER_SIZE - 12 - (if reliability.isOrdered(): 4 else: 0)
+  var count = 1
+  if packetBuf.len > maxContentLen:
+    reliability = rrReliableOrdered
+    splitId = self.outputSplitNumber
+    self.outputSplitNumber += 1'u16
+    maxContentLen = SPLIT_FRAME_MAX_CONTENT
+    splitSize = uint32((packetBuf.len + maxContentLen - 1) div maxContentLen)
+    count = int(splitSize)
+  if reliability.isOrdered():
+    orderIndex = self.outputOrderedIndex
+    self.outputOrderedIndex += 1'u32
+  for i in 0 ..< count:
+    var endLen = maxContentLen
+    if i + 1 == count and packetBuf.len mod maxContentLen != 0:
+      endLen = packetBuf.len mod maxContentLen
+    let startAt = i * maxContentLen
+    var frame = Frame(reliability: reliability, payload: packetBuf[startAt ..< startAt + endLen], reliableNumber: 0'u32,
+      sequenceIndex: 0'u32, orderIndex: orderIndex, orderChannel: 0'u8, splitSize: splitSize, splitId: splitId,
+      splitIndex: uint32(i))
+    if reliability.isReliable():
+      frame.reliableNumber = self.outputReliableNumber
+      self.outputReliableNumber += 1'u32
+    if reliability.isSequenced():
+      frame.sequenceIndex = self.outputSequencedIndex
+      self.outputSequencedIndex += 1'u32
+    let id = if i == 0: 0x84'u8 else: 0x8c'u8
+    self.sendFrameSet(FrameSet(sequence: U24(value: 0'u32), frames: @[frame]), id)
+
+template sendFramedPacket*(self: BedrockClient; packetId: int32; packet: untyped; reliability: RakReliability) =
+  ## `send_framed_packet`: a RakNet message, the id byte then the body.
+  block:
+    var bodyWriter = newNetWriter()
+    packetWrite(packet, bodyWriter)
+    var framed: seq[byte] = @[uint8(packetId)]
+    for b in bodyWriter.buf:
+      framed.add(b)
+    sendFramedPacketData(self, framed, reliability)
+
+proc sendGameBody*(self: BedrockClient; packetId: int32; body: seq[byte]) =
+  ## `write_game_packet` and the outgoing task: the batch, then the encryption of everything after the 0xfe byte, then the
+  ## reliable ordered frame.
+  var wire = newNetWriter()
+  let res = self.encoder.writeGamePacket(uint16(packetId), scMain, scMain, body, wire)
+  if not res.isOk:
+    error("Failed to write game packet: " & res.error.msg, BedrockTarget)
+    return
+  var data = wire.buf
+  if data.len > 1 and data[0] == 0xfe'u8 and self.encoder.hasEncryptor:
+    var rest = data[1 ..< data.len]
+    self.encoder.encryptor.encrypt(rest)
+    data = @[0xfe'u8]
+    for b in rest:
+      data.add(b)
+  self.sendFramedPacketData(data, rrReliableOrdered)
+
+template sendGamePacket*(self: BedrockClient; packetId: int32; packet: untyped) =
+  ## `send_game_packet` / `enqueue_packet_internal`.
+  block:
+    var gameBody = newNetWriter()
+    packetWrite(packet, gameBody)
+    sendGameBody(self, packetId, gameBody.buf)
+
+proc sendAcknowledgement(self: BedrockClient; ackPacket: Acknowledge; id: uint8) =
+  var w = newNetWriter()
+  ackPacket.write(w, id)
+  self.writeDatagram(w.buf)
+
+proc flushAcks(self: BedrockClient) =
+  if self.pendingAcks.len > 0:
+    let a = newAcknowledge(self.pendingAcks)
+    self.pendingAcks = @[]
+    self.sendAcknowledgement(a, RAKNET_ACK)
+
+# --- closing -------------------------------------------------------------------------------------------------------
+
+proc close*(self: BedrockClient) =
+  ## `close`: cancel, tell the peer once, leave the table (the server loop drops a closed client).
+  if self.closed:
+    return
+  self.closed = true
+  self.sendFramedPacket(cconn.CDisconnectPacketId, cconn.CDisconnect(), rrUnreliable)
+  self.closeSent = true
+  if self.onClosed != nil:
+    self.onClosed(self)
+
+proc kick*(self: BedrockClient; reason: DisconnectReason; message: string) =
+  ## `kick`: `CDisconnectPlayer`, then close.
+  if self.closed:
+    return
+  sendGamePacket(self, CDisconnectPlayerPacketId, newCDisconnectPlayer(int32(ord(reason)), message))
+  self.close()
+
+# --- receiving -----------------------------------------------------------------------------------------------------
+
+proc handleRakNetPacket(self: BedrockClient; packetId: int32; payload: seq[byte]) =
+  ## `handle_raknet_packet`; `payload` is the body after the id byte.
+  var r = newNetReader(payload)
+  case packetId
+  of sconn.SConnectionRequestPacketId:
+    let request = packetRead(sconn.SConnectionRequest, r)
+    if not request.isOk:
+      self.kick(drBadPacket, request.error.msg)
+      return
+    var systemAddresses: seq[serial.SocketAddr] = @[]
+    for i in 0 ..< 10:
+      systemAddresses.add(serial.SocketAddr(isV6: false, ip: @[0'u8, 0, 0, 0], port: 19132'u16, flowInfo: 0'u32, scopeId: 0'u32))
+    self.sendFramedPacket(cconn.CConnectionRequestAcceptedPacketId,
+      cconn.newCConnectionRequestAccepted(self.address, 0'u16, systemAddresses, request.value.time, uint64(self.now)),
+      rrUnreliable)
+  of sconn.SNewIncomingConnectionPacketId:
+    let incoming = packetRead(sconn.SNewIncomingConnection, r)
+    if not incoming.isOk:
+      self.kick(drBadPacket, incoming.error.msg)
+  of sconn.SConnectedPingPacketId:
+    let ping = packetRead(sconn.SConnectedPing, r)
+    if not ping.isOk:
+      self.kick(drBadPacket, ping.error.msg)
+      return
+    # `handle_connected_ping`
+    self.sendFramedPacket(cconn.CConnectedPongPacketId, cconn.newCConnectedPong(ping.value.time, uint64(self.now)), rrUnreliable)
+  of sconn.SDisconnectPacketId, sconn.SConnectionLostPacketId:
+    self.close()
+  else:
+    warn("Bedrock: Received Unknown RakNet Online packet: " & $packetId, BedrockTarget)
+
+proc handleGameBatch(self: BedrockClient; payload: seq[byte]) =
+  ## The game-packet half of `process_frame_payload`.
+  let batch = self.decoder.getPacketPayload(payload)
+  if not batch.isOk:
+    if batch.error.kind != pdeConnectionClosed:
+      warn("Failed to decode packet from client: " & batch.error.msg, BedrockTarget)
+      self.kick(drBadPacket, "Error while reading incoming packet " & batch.error.msg)
+    return
+  var cursor = newNetReader(batch.value)
+  while remaining(cursor) > 0 and not self.closed:
+    let gamePacket = self.decoder.getGamePacket(cursor)
+    if not gamePacket.isOk:
+      self.kick(drBadPacket, gamePacket.error.msg)
+      return
+    if self.onGamePacket != nil:
+      self.onGamePacket(self, gamePacket.value)
+
+proc processFramePayload(self: BedrockClient; payload: seq[byte]) =
+  if payload.len == 0:
+    return
+  let id = payload[0]
+  if int32(id) == RAKNET_GAME_PACKET:
+    self.handleGameBatch(payload)
+  else:
+    self.handleRakNetPacket(int32(id), payload[1 ..< payload.len])
+
+proc takeNextOrdered(self: BedrockClient; channel: uint8; expected: uint32): Option[Frame] =
+  let queue = self.orderedQueues[int(channel)]
+  var i = 0
+  while i < queue.frames.len:
+    if queue.frames[i].orderIndex == expected:
+      let f = queue.frames[i]
+      queue.frames.delete(i)
+      return some(f)
+    inc i
+  none[Frame]()
+
+proc handleFrame(self: BedrockClient; frameIn: Frame): string =
+  ## `handle_frame`: reassembly, sequencing, ordering. The empty string is success.
+  var frame = frameIn
+  if frame.orderChannel >= uint8(MaxChannels):
+    return "Order channel " & $frame.orderChannel & " is out of range"
+  if frame.splitSize > 0'u32:
+    let fragmentIndex = int(frame.splitIndex)
+    let compoundId = frame.splitId
+    if int(frame.splitSize) > MaxSplitFragments:
+      return "Split size " & $frame.splitSize & " is too large"
+    if not self.compounds.hasKey(compoundId):
+      self.compounds[compoundId] = Compound(frames: newSeq[Frame](int(frame.splitSize)),
+        have: newSeq[bool](int(frame.splitSize)), missing: int(frame.splitSize))
+    let entry = self.compounds.mgetOrPut(compoundId, Compound(frames: @[], have: @[], missing: 0))
+    if fragmentIndex >= entry.frames.len:
+      return "Fragment index " & $fragmentIndex & " out of bounds for size " & $entry.frames.len
+    if not entry.have[fragmentIndex]:
+      entry.have[fragmentIndex] = true
+      entry.missing -= 1
+    entry.frames[fragmentIndex] = frame
+    if entry.missing > 0:
+      return ""
+    var merged: seq[byte] = @[]
+    for f in entry.frames:
+      for b in f.payload:
+        merged.add(b)
+    frame = entry.frames[0]
+    frame.payload = merged
+    frame.splitSize = 0'u32
+    self.compounds.del(compoundId)
+
+  if frame.reliability.isSequenced():
+    let current = self.highestSequenceIndex[int(frame.orderChannel)]
+    if frame.sequenceIndex < current:
+      return ""
+    self.highestSequenceIndex[int(frame.orderChannel)] = frame.sequenceIndex
+
+  if frame.reliability.isOrdered():
+    var expected = self.expectedOrderIndex[int(frame.orderChannel)]
+    if frame.orderIndex == expected:
+      expected += 1'u32
+      self.processFramePayload(frame.payload)
+      while true:
+        let next = self.takeNextOrdered(frame.orderChannel, expected)
+        if next.isNone:
+          break
+        expected += 1'u32
+        self.processFramePayload(next.unsafeGet.payload)
+      self.expectedOrderIndex[int(frame.orderChannel)] = expected
+    elif frame.orderIndex > expected:
+      self.orderedQueues[int(frame.orderChannel)].frames.add(frame)
+    # An index below the expected one is an old frame: discarded.
+  else:
+    self.processFramePayload(frame.payload)
+  ""
+
+proc handleFrameSet(self: BedrockClient; frameSet: FrameSet): string =
+  let sequence = frameSet.sequence.value
+  if self.receivedSequences.hasKey(sequence):
+    debug("Received duplicate RakNet sequence: " & $sequence, BedrockTarget)
+    return ""
+  self.receivedSequences[sequence] = true
+  if self.receivedSequences.len > MaxKeptSequences:
+    self.receivedSequences = initTable[uint32, bool]()
+  self.pendingAcks.add(sequence)
+  for i in 0 ..< frameSet.frames.len:
+    if self.closed:
+      break
+    let err = self.handleFrame(frameSet.frames[i])
+    if err.len > 0:
+      return err
+  ""
+
+proc handleNack(self: BedrockClient; nack: Acknowledge) =
+  for seqNo in nack.sequences:
+    if self.unacked.hasKey(seqNo):
+      self.writeDatagram(self.unacked.mgetOrPut(seqNo, Unacked()).data)
+
+proc processDatagram*(self: BedrockClient; data: seq[byte]; now: int64) =
+  ## `process_packet` and `handle_packet_payload`: one datagram whose first byte has the 0x80 bit.
+  self.now = now
+  self.lastSeen = now
+  if self.closed or data.len == 0:
+    return
+  var r = newNetReader(data)
+  let head = getU8(r)
+  if not head.isOk:
+    return
+  let id = head.value
+  var err = ""
+  if id == RAKNET_ACK:
+    let a = readAcknowledge(r)
+    if a.isOk:
+      for seqNo in a.value.sequences:
+        self.unacked.del(seqNo)
+    else:
+      err = a.error.msg
+  elif id == RAKNET_NACK:
+    let a = readAcknowledge(r)
+    if a.isOk:
+      self.handleNack(a.value)
+    else:
+      err = a.error.msg
+  elif id >= RAKNET_VALID and id <= 0x8d'u8:
+    let fs = readFrameSet(r)
+    if fs.isOk:
+      err = self.handleFrameSet(fs.value)
+    else:
+      err = fs.error.msg
+  else:
+    warn("Bedrock: Received unknown packet header " & $id, BedrockTarget)
+  if err.len > 0:
+    error("Failed to handle packet payload for " & $self.peerIp & ":" & $self.peerPort & ": " & err, BedrockTarget)
+    self.kick(drBadPacket, err)
+  self.flushAcks()
+
+proc tick*(self: BedrockClient; now: int64) =
+  ## One interval of the outgoing task: the timeout, the acknowledgements, the resends.
+  self.now = now
+  if self.closed:
+    return
+  if now - self.lastTick < TickIntervalMs:
+    return
+  self.lastTick = now
+  if now - self.lastSeen > TimeoutMs:
+    debug("Bedrock client " & $self.peerPort & " timed out", BedrockTarget)
+    self.close()
+    return
+  self.flushAcks()
+  var resend: seq[uint32] = @[]
+  for seqNo, entry in self.unacked:
+    if now - entry.sentAt > ResendAfterMs:
+      resend.add(seqNo)
+      if resend.len >= MaxResendsPerTick:
+        break
+  for seqNo in resend:
+    if self.unacked.hasKey(seqNo):
+      self.unacked.mgetOrPut(seqNo, Unacked()).sentAt = now
+      debug("Resending reliable sequence " & $seqNo, BedrockTarget)
+      self.writeDatagram(self.unacked.mgetOrPut(seqNo, Unacked()).data)
+
+proc getPacket*(self: BedrockClient): Option[RawPacket] =
+  ## `get_packet` for a client in play: the next game packet, in order.
+  if self.incoming.len == 0:
+    return none[RawPacket]()
+  let p = self.incoming[0]
+  self.incoming.delete(0)
+  some(p)

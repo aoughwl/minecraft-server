@@ -1,0 +1,407 @@
+## Port of pumpkin/src/net/bedrock/login.rs, and `handle_login_sequence` / `handle_play_packet`'s routing from
+## pumpkin/src/net/bedrock/mod.rs (the part that is the login: RequestNetworkSettings, Login, ClientToServerHandshake, the resource
+## pack exchange).
+## PARTIAL: pumpkin/src/net/bedrock/login.rs - `handle_resource_pack_response` ends at `STATUS_COMPLETED` in `BedrockHooks.onResourcePacksCompleted`, which is where upstream calls `world.spawn_bedrock_player` (the player and world side, not this layer); `STATUS_SEND_PACKS` is a TODO upstream and here. Online mode needs `BedrockContext.oidcJwks`, which the owner of an HTTP client fills from `fetchOidcJwks` (upstream does the same at startup in `Server::new`); until then a Full login is refused with upstream's "OIDC keys not initialized".
+##
+## `handle_login_sequence` is a loop over packets from a task; here `handleGamePacket` is the closure the client calls with each
+## packet and the `ClientPhase` says which half of that function it is in. The encrypted handshake is upstream's: on a
+## `Login` the server sends `CHandshake` (a signed JWT with a random salt, unencrypted), then switches both directions to AES-256-CTR with
+## `SHA-256(salt ++ ecdh_x)` as the key, and only on `ClientToServerHandshake` sends `LoginSuccess` and the resource packs info.
+
+import std/[options, tables]
+import ../../../protocol/[protobase, proto, netcodec, serial, varint]
+import ../../../protocol/bedrock/[bedrockmod, packet_decoder, packet_encoder]
+import ../../../protocol/bedrock/client/[handshake, network_settings, play_status, resource_packs_info, resource_pack_stack, start_game]
+import ../../../protocol/bedrock/server/[login as slogin, request_network_settings, resource_pack_response, client_to_server_handshake]
+import ../../../codecs/json_value
+import ../../../config/networking/bedrock
+import ../../../config/resource_pack as rpconfig
+import ../../../util/javaversion
+import ../../../util/jwtmod
+import ../../../util/uuid as uuidutil
+import ../../logging
+import ../netbase
+import bedrockclient
+import bedrockcrypto
+import sha2, ecdsa
+
+export bedrockclient
+
+const
+  LoginTarget = "pumpkin::net::bedrock::login"
+  BcryptUseSystemPreferredRng = 2'u32
+
+proc bcryptGenRandom(alg: nil pointer, buf: pointer, len: uint32, flags: uint32): int32
+  {.stdcall, importc: "BCryptGenRandom", dynlib: "bcrypt.dll".}
+
+type
+  BedrockHooks* = ref object
+    ## What the player and world side of the server supplies; each may stay unset.
+    onReadyToPlay*: proc(client: BedrockClient; profile: GameProfile; config: PlayerConfig) {.closure.}
+      ## `PacketHandlerResult::ReadyToPlay`: upstream calls `server.add_player`. The hook sets `client.hasPlayer`.
+    onPlayPacket*: proc(client: BedrockClient; packet: RawPacket) {.closure.}
+      ## `progress_player_packets` / `handle_play_packet` for every packet but the resource pack response.
+    onResourcePacksCompleted*: proc(client: BedrockClient): bool {.closure.}
+      ## `STATUS_COMPLETED`: `world.spawn_bedrock_player`. False when there is no player (upstream kicks).
+    onClientClosed*: proc(client: BedrockClient) {.closure.}
+    playerCount*: proc(): int {.closure.}
+    isBanned*: proc(ip: string): bool {.closure.}
+    gameMode*: proc(): string {.closure.}
+      ## `defaultgamemode.gamemode.to_str()` for the pong.
+    levelName*: proc(): string {.closure.}
+      ## `basic_config.default_level_name` for the pong.
+
+  BedrockContext* = ref object
+    ## The server fields the Bedrock side reads: `advanced_config.networking.bedrock`, `advanced_config.resource_pack.bedrock`,
+    ## `server_guid`, `bedrock_private_key` and `bedrock_oidc_keys`.
+    config*: BedrockConfig
+    resourcePack*: rpconfig.BedrockResourcePackConfig
+    serverGuid*: uint64
+    hooks*: BedrockHooks
+    privateKey*: Option[P384SigningKey]
+    publicKeyB64*: string
+      ## The server key's public half as the standard base64 of its DER, the `x5u` of every handshake JWT. One P-384 scalar
+      ## multiplication (about a second here) is saved per login by computing it with the key.
+    oidcIssuer*: string
+    oidcJwks*: Option[Jwks]
+
+proc randomU64*(): uint64 =
+  ## `rand::random::<u64>()` for the server guid.
+  var b = [0'u8, 0, 0, 0, 0, 0, 0, 0]
+  discard bcryptGenRandom(nil, addr b[0], 8'u32, BcryptUseSystemPreferredRng)
+  var v = 0'u64
+  for x in b:
+    v = (v shl 8) or uint64(x)
+  v
+
+proc newBedrockContext*(config: BedrockConfig; resourcePack: rpconfig.BedrockResourcePackConfig; hooks: BedrockHooks;
+    serverGuid: uint64 = 0'u64): BedrockContext =
+  BedrockContext(config: config, resourcePack: resourcePack, serverGuid: (if serverGuid == 0'u64: randomU64() else: serverGuid),
+    hooks: hooks, privateKey: none[P384SigningKey](), publicKeyB64: "", oidcIssuer: "", oidcJwks: none[Jwks]())
+
+# --- the login ------------------------------------------------------------------------------------------------------
+
+type
+  LoginOutcome = object
+    ## `Result<Option<PacketHandlerResult>, LoginError>` with the text of the error.
+    ok: bool
+    error: string
+
+proc loginErr(text: string): LoginOutcome = LoginOutcome(ok: false, error: text)
+
+proc packsInfo(ctx: BedrockContext): CResourcePacksInfo =
+  var entries: seq[ResourcePackEntry] = @[]
+  if ctx.resourcePack.enabled:
+    for pack in ctx.resourcePack.packs:
+      entries.add(ResourcePackEntry(uuid: pack.uuid, version: pack.version, size: pack.size, contentKey: pack.contentKey,
+        subPackName: pack.subPackName, contentId: pack.contentId, hasScripts: pack.hasScripts, addonPack: pack.addonPack,
+        rtxEnabled: pack.rtxEnabled, downloadUrl: pack.downloadUrl))
+  CResourcePacksInfo(resourcePackRequired: ctx.resourcePack.force, hasAddonPacks: false, hasScripts: false,
+    isVibrantVisualsForceDisabled: false, worldTemplateId: NilUuid, worldTemplateVersion: "", resourcePacks: entries)
+
+proc finishLogin(ctx: BedrockContext; client: BedrockClient; profile: GameProfile; config: PlayerConfig) =
+  ## The tail shared by the plain login and the encrypted handshake: `LoginSuccess`, the packs info, then `ReadyToPlay`.
+  client.sendGamePacket(CPlayStatusPacketId, cpsLoginSuccess)
+  client.sendGamePacket(CResourcePacksInfoPacketId, packsInfo(ctx))
+  client.phase = cpPlay
+  if ctx.hooks != nil and ctx.hooks.onReadyToPlay != nil:
+    ctx.hooks.onReadyToPlay(client, profile, config)
+
+proc handleRequestNetworkSettings(ctx: BedrockContext; client: BedrockClient; packet: SRequestNetworkSettings) =
+  ## `handle_request_network_settings`.
+  if packet.protocolVersion < int32(CurrentBedrockMcProtocol):
+    client.sendGamePacket(CPlayStatusPacketId, cpsOutdatedClient)
+    return
+  elif packet.protocolVersion > int32(CurrentBedrockMcProtocol):
+    client.sendGamePacket(CPlayStatusPacketId, cpsOutdatedServer)
+    return
+  client.version = bedrockFromProtocol(uint32(packet.protocolVersion))
+  let compression = ctx.config.compression.info
+  client.sendGamePacket(CNetworkSettingsPacketId,
+    newCNetworkSettings(uint16(compression.threshold), 0'u16, false, 0'i8, 0.0'f32))
+  # `set_compression`: from here on both directions carry the compression method byte.
+  client.decoder.setCompression(int(compression.threshold))
+  client.encoder.setCompression(int(compression.threshold), compression.level)
+
+proc jsonIntField(v: JsonValue; key: string): (bool, int64) =
+  let (present, field) = v.get(key)
+  if present and field.kind == jvInt: (true, field.intVal)
+  else: (false, 0'i64)
+
+proc jsonStrField(v: JsonValue; key: string): (bool, string) =
+  let (present, field) = v.get(key)
+  if present and field.kind == jvString: (true, field.strVal)
+  else: (false, "")
+
+proc bytesToString(b: seq[byte]): string =
+  result = newStringOfCap(b.len)
+  for x in b:
+    result.add(char(x))
+
+proc bytesToBytes(s: string): seq[byte] =
+  result = @[]
+  for c in s:
+    result.add(uint8(c))
+
+proc newServerKey(): P384SigningKey =
+  ## The loop in `get_or_init`: 48 random bytes until they make a valid scalar.
+  while true:
+    var bytes = newSeq[byte](48)
+    discard bcryptGenRandom(nil, addr bytes[0], 48'u32, BcryptUseSystemPreferredRng)
+    let key = signingKeyFromBytes(bytes)
+    if key.isOk:
+      return key.value
+
+const B64Alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+
+proc b64Encode(data: openArray[byte]; urlSafe, padded: bool): string =
+  result = ""
+  var i = 0
+  while i < data.len:
+    let b0 = uint32(data[i])
+    let b1 = if i + 1 < data.len: uint32(data[i + 1]) else: 0'u32
+    let b2 = if i + 2 < data.len: uint32(data[i + 2]) else: 0'u32
+    let n = (b0 shl 16) or (b1 shl 8) or b2
+    let take = if i + 2 < data.len: 4 elif i + 1 < data.len: 3 else: 2
+    for k in 0 ..< take:
+      var c = B64Alphabet[int((n shr uint32(18 - 6 * k)) and 63'u32)]
+      if urlSafe:
+        if c == '+': c = '-'
+        elif c == '/': c = '_'
+      result.add(c)
+    if padded:
+      for k in take ..< 4:
+        result.add('=')
+    i += 3
+
+proc ensureServerKey*(ctx: BedrockContext) =
+  ## `bedrock_private_key.get_or_init`, and the public half for the handshake. Call it when the listener starts so the first login does not pay for it.
+  if ctx.privateKey.isNone:
+    ctx.privateKey = some(newServerKey())
+  if ctx.publicKeyB64.len == 0:
+    ctx.publicKeyB64 = b64Encode(toPublicKeyDer(verifyingKey(ctx.privateKey.unsafeGet)), false, true)
+
+proc handshakeJwtFor(ctx: BedrockContext; salt: openArray[byte]): string =
+  ## `generate_handshake_jwt` (util/jwtmod.aowl) with the `x5u` kept from `ensureServerKey`: `{"alg":"ES384","x5u":..}`.
+  ## `{"salt":..}` and an ES384 signature, each part base64url without padding, the salt in standard base64 without padding.
+  let headerB64 = b64Encode(bytesToBytes("{\"alg\":\"ES384\",\"x5u\":\"" & ctx.publicKeyB64 & "\"}"), true, false)
+  let payloadB64 = b64Encode(bytesToBytes("{\"salt\":\"" & b64Encode(salt, false, false) & "\"}"), true, false)
+  let signingInput = headerB64 & "." & payloadB64
+  signingInput & "." & b64Encode(signEs384(ctx.privateKey.unsafeGet, bytesToBytes(signingInput)), true, false)
+
+proc handleLogin(ctx: BedrockContext; client: BedrockClient; packet: slogin.SLogin): LoginOutcome =
+  ## `try_handle_login`. On success the client is either waiting for the encrypted handshake or already in `cpPlay`.
+  let parsed = parseJsonValue(bytesToString(packet.jwt))
+  if not parsed.ok or parsed.value.kind != jvObject:
+    return loginErr("Login packet data is not valid JSON")
+  let (hasType, authType) = jsonIntField(parsed.value, "AuthenticationType")
+  let (hasToken, token) = jsonStrField(parsed.value, "Token")
+  if not hasType or not hasToken or authType < 0 or authType > 2:
+    return loginErr("Login packet data is not valid JSON")
+
+  var claims: PlayerClaims
+  if ctx.config.onlineMode:
+    case authType
+    of 0:   # Full
+      if ctx.oidcJwks.isNone:
+        return loginErr("JWT chain validation failed: OIDC keys not initialized")
+      let verified = verifyOidcToken(token, ctx.oidcIssuer, ctx.oidcJwks.unsafeGet)
+      if not verified.isOk:
+        return loginErr("JWT chain validation failed: " & $verified.error)
+      claims = verified.value
+    of 2:   # SelfSigned
+      if ctx.config.authentication.enabled:
+        return loginErr("Cannot accept self-signed token. Authentication is enforced by server config.")
+      let verified = verifyOidcTokenSelfSigned(token)
+      if not verified.isOk:
+        return loginErr("JWT chain validation failed: " & $verified.error)
+      claims = verified.value
+    else:
+      return loginErr("Got a guest/splitscreen login request. Currently unimplemented.")
+  else:
+    let extracted = extractOidcTokenPlayerClaims(token)
+    if not extracted.isOk:
+      return loginErr("JWT chain validation failed: " & $extracted.error)
+    claims = extracted.value
+
+  # The raw token's payload is the client data.
+  let rawTokenStr = bytesToString(packet.rawToken)
+  var parts: seq[string] = @[]
+  var part = ""
+  for c in rawTokenStr:
+    if c == '.':
+      parts.add(part)
+      part = ""
+    else:
+      part.add(c)
+  parts.add(part)
+  if parts.len < 2:
+    return loginErr("JWT chain validation failed: Invalid token format")
+  let payloadBytes = decodeB64UrlNopad(parts[1])
+  if not payloadBytes.isOk:
+    return loginErr("Failed to decode extra using decode_b64_url_nopad.")
+  let clientJson = parseJsonValue(bytesToString(payloadBytes.value))
+  if not clientJson.ok:
+    return loginErr("Login packet data is not valid JSON")
+  let clientData = slogin.clientDataFromJson(clientJson.value)
+  if not clientData.isOk:
+    return loginErr("Login packet data is not valid JSON")
+
+  # Bedrock allows spaces in names; commands cannot parse them, so they become underscores.
+  var underScoreName = ""
+  for c in claims.displayName:
+    underScoreName.add(if c == ' ': '_' else: c)
+  let (uuidOk, uuid) = parseStr(claims.uuid)
+  if not uuidOk:
+    return loginErr("Could not parse UUID from validated token")
+  let profile = GameProfile(id: uuid, name: underScoreName, properties: @[], profileActions: @[])
+  let config = PlayerConfig(locale: clientData.value.languageCode, viewDistance: defaultPlayerConfig().viewDistance,
+    chatMode: cmEnabled, chatColors: true, skinParts: 0x7F'u8, mainHand: hRight, textFiltering: false, serverListing: false)
+
+  if ctx.config.encryption:
+    let clientPublicKey = extractCpkFromToken(token)
+    if not clientPublicKey.isOk:
+      return loginErr("JWT chain validation failed: " & $clientPublicKey.error)
+    ensureServerKey(ctx)
+    let serverKey = ctx.privateKey.unsafeGet
+    var salt = newSeq[byte](16)
+    discard bcryptGenRandom(nil, addr salt[0], 16'u32, BcryptUseSystemPreferredRng)
+    # The two multiplications run on worker threads (bedrockcrypto.aowl); `pollHandshake` finishes the handshake when both are done.
+    let headerB64 = b64Encode(bytesToBytes("{\"alg\":\"ES384\",\"x5u\":\"" & ctx.publicKeyB64 & "\"}"), true, false)
+    let payloadB64 = b64Encode(bytesToBytes("{\"salt\":\"" & b64Encode(salt, false, false) & "\"}"), true, false)
+    let signingInput = headerB64 & "." & payloadB64
+    var signInput = scalarBytes(serverKey)
+    for b in bytesToBytes(signingInput):
+      signInput.add(b)
+    var ecdhInput = scalarBytes(serverKey)
+    for b in pointBytes(clientPublicKey.value):
+      ecdhInput.add(b)
+    client.handshakeSalt = salt
+    client.handshakeSigningInput = signingInput
+    client.signJob = startCryptoJob(0, signInput)
+    client.ecdhJob = startCryptoJob(1, ecdhInput)
+    if client.signJob == nil or client.ecdhJob == nil:
+      return loginErr("JWT chain validation failed: no thread for the key exchange")
+    client.clientData = some(clientData.value)
+    client.pendingProfile = some(profile)
+    client.pendingConfig = config
+    return LoginOutcome(ok: true, error: "")
+
+  client.clientData = some(clientData.value)
+  finishLogin(ctx, client, profile, config)
+  LoginOutcome(ok: true, error: "")
+
+proc pollHandshake*(ctx: BedrockContext; client: BedrockClient) =
+  ## The second half of the encrypted login, once both worker threads have answered: the handshake JWT goes out unencrypted,
+  ## then both directions switch to AES-256-CTR with `SHA-256(salt ++ ecdh_x)`.
+  let signJob = client.signJob
+  let ecdhJob = client.ecdhJob
+  if signJob == nil or ecdhJob == nil:
+    return
+  if not (pollCryptoJob(signJob) and pollCryptoJob(ecdhJob)):
+    return
+  let signature = takeCryptoJob(signJob)
+  let sharedSecret = takeCryptoJob(ecdhJob)
+  client.signJob = nil
+  client.ecdhJob = nil
+  if signature.len != 96 or sharedSecret.len != 48:
+    client.kick(drUnknown, "JWT chain validation failed: key exchange error")
+    return
+  let jwt = client.handshakeSigningInput & "." & b64Encode(signature, true, false)
+  # The handshake itself is not encrypted: the keys are set after it has gone out.
+  client.sendGamePacket(CHandshakePacketId, newCHandshake(jwt))
+  var keyInput: seq[byte] = @[]
+  for b in client.handshakeSalt:
+    keyInput.add(b)
+  for b in sharedSecret:
+    keyInput.add(b)
+  let digest = sha256(keyInput)
+  var keyBytes: array[32, uint8]
+  for i in 0 ..< 32:
+    keyBytes[i] = digest[i]
+  let readerOk = client.decoder.setEncryption(keyBytes)
+  let writerOk = client.encoder.setEncryption(keyBytes)
+  if not readerOk.isOk or not writerOk.isOk:
+    client.kick(drUnknown, "JWT chain validation failed: encryption enable error")
+
+proc handleResourcePackResponse(ctx: BedrockContext; client: BedrockClient; packet: SResourcePackResponse) =
+  ## `handle_resource_pack_response`.
+  case packet.response
+  of SResourcePackResponseStatusRefused:
+    debug("Bedrock: SResourcePackResponse::STATUS_REFUSED", LoginTarget)
+    client.kick(drResourcePackProblem, "You must accept resource packs to join this server.")
+  of SResourcePackResponseStatusSendPacks:
+    debug("Bedrock: SResourcePackResponse::STATUS_SEND_PACKS", LoginTarget)
+    # TODO upstream: send packs
+  of SResourcePackResponseStatusHaveAllPacks:
+    debug("Bedrock: SResourcePackResponse::STATUS_HAVE_ALL_PACKS", LoginTarget)
+    var resourcePacks: seq[ResourcePackStackEntry] = @[]
+    if ctx.resourcePack.enabled:
+      for pack in ctx.resourcePack.packs:
+        resourcePacks.add(ResourcePackStackEntry(uuid: $pack.uuid, version: pack.version, subPackName: ""))
+    client.sendGamePacket(CResourcePackStackPacketPacketId,
+      newCResourcePackStackPacket(ctx.resourcePack.force, resourcePacks, CurrentBedrockMcVersion,
+        Experiments(namesSize: 0'u32, experimentsEverToggled: false), false))
+  of SResourcePackResponseStatusCompleted:
+    debug("Bedrock: SResourcePackResponse::STATUS_COMPLETED", LoginTarget)
+    var spawned = false
+    if client.hasPlayer and ctx.hooks != nil and ctx.hooks.onResourcePacksCompleted != nil:
+      spawned = ctx.hooks.onResourcePacksCompleted(client)
+    if not spawned:
+      error("Got SResourcePackResponse::STATUS_COMPLETED before authentication was completed.", LoginTarget)
+      client.kick(drDisconnected, "")
+  else:
+    error("Bedrock: SResourcePackResponse bad response type", LoginTarget)
+    client.kick(drDisconnected, "")
+
+proc handleLoginPacket(ctx: BedrockContext; client: BedrockClient; packet: RawPacket) =
+  ## The `match packet.id` of `handle_login_sequence`.
+  var r = newNetReader(packet.payload)
+  case packet.id
+  of SRequestNetworkSettingsPacketId:
+    let p = packetRead(SRequestNetworkSettings, r)
+    if not p.isOk:
+      error("Failed to read SRequestNetworkSettings: " & p.error.msg, LoginTarget)
+      return
+    handleRequestNetworkSettings(ctx, client, p.value)
+  of slogin.SLoginPacketId:
+    let p = packetRead(slogin.SLogin, r)
+    if not p.isOk:
+      error("Failed to read SLogin: " & p.error.msg, LoginTarget)
+      client.kick(drBadPacket, p.error.msg)
+      return
+    let outcome = handleLogin(ctx, client, p.value)
+    if not outcome.ok:
+      client.kick(drUnknown, outcome.error)
+  of SClientToServerHandshakePacketId:
+    let p = packetRead(SClientToServerHandshake, r)
+    if not p.isOk:
+      error("Failed to read SClientToServerHandshake: " & p.error.msg, LoginTarget)
+      return
+    if client.pendingProfile.isSome:
+      let profile = client.pendingProfile.unsafeGet
+      client.pendingProfile = none[GameProfile]()
+      finishLogin(ctx, client, profile, client.pendingConfig)
+    else:
+      error("Received ClientToServerHandshake but no pending profile was found.", LoginTarget)
+      client.kick(drBadPacket, "Handshake error")
+  else:
+    debug("Received unexpected game packet " & $packet.id & " during login sequence", LoginTarget)
+
+proc handleGamePacket*(ctx: BedrockContext; client: BedrockClient; packet: RawPacket) =
+  ## What the client calls for each game packet: the login sequence first, then the play side.
+  case client.phase
+  of cpLogin:
+    handleLoginPacket(ctx, client, packet)
+  of cpPlay:
+    if packet.id == SResourcePackResponsePacketId:
+      var r = newNetReader(packet.payload)
+      let p = packetRead(SResourcePackResponse, r)
+      if p.isOk:
+        handleResourcePackResponse(ctx, client, p.value)
+      else:
+        error("Failed to handle Bedrock play packet: " & p.error.msg, LoginTarget)
+    elif ctx.hooks != nil and ctx.hooks.onPlayPacket != nil:
+      ctx.hooks.onPlayPacket(client, packet)
+    else:
+      client.incoming.add(packet)

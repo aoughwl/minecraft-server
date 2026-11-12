@@ -1,5 +1,5 @@
 ## Port of pumpkin/src/net/java/play.rs
-## PARTIAL: pumpkin/src/net/java/play.rs - every handler is here and routed; what each calls that is not ported stops at a hook and says so in place. No plugin events anywhere (`send_cancellable!` runs its `after`). `handle_chat_command`, `handle_command_suggestion` wait on src/command's dispatcher, held back by the compiler bug. `handle_attack` and the attack half of `handle_interact` reach `Player::attack`, which needs damage (living.rs). `handle_use_item` and `prepare_hand_item_for_use` need `item_registry`, status effects and cooldowns. `handle_set_command_block`, `handle_set_jigsaw_block`, `handle_jigsaw_generate` and `handle_sign_update` need block entities. `handle_place_recipe` needs a crafting grid recipe placement against `generated/recipes`, `handle_pick_item_from_entity` entities, `handle_select_trade` a merchant, `handle_move_vehicle` and `handle_paddle_boat` vehicles. `validate_chat_session` has no Mojang public keys to check against, since they come over the HTTP that is missing, and refuses.
+## PARTIAL: pumpkin/src/net/java/play.rs - every handler is here and routed; what each calls that is not ported stops at a hook and says so in place. No plugin events anywhere (`send_cancellable!` runs its `after`; the `PlayerInteractEvent` raycasts of `handle_use_item` and `handle_swing_arm` and the fishing event are left out with them). `prepare_hand_item_for_use` lacks the consumable / blocks-attacks `set_active_hand` and the use-cooldown check (status effects, active hand). `item_in_use` / `on_stopped_using` of `handle_player_action` need item behaviour for a held use. `handle_pick_item_from_entity` needs entities, `handle_select_trade` a merchant, `handle_move_vehicle` and `handle_paddle_boat` vehicles, `on_rename_item` an anvil menu. `handle_place_recipe` leaves cooking recipes, a TODO upstream too. `handle_jigsaw_generate`, `handle_set_command_block`, `handle_set_jigsaw_block` and `handle_sign_update` go through the block entity hooks of block/blockedit.aowl and block/worldhooks.aowl. `validate_chat_session` checks against `server.mojangPublicKeys`, which main fills only when allow_chat_reports and online mode are on, as upstream.
 ##
 ## Upstream's movement handlers differ in one place that is kept: `handle_position` jumps when the client left the
 ## ground, `handle_position_rotation` when it did not. Both are as upstream wrote them.
@@ -22,9 +22,19 @@ from ../../../data/block_state import asU16, isAir
 import "../../../data/item_stack/mod"
 import ../../../command/[cmdsource, cmddispatch]
 import ../../../generated/screen
+import ../../../generated/recipes as generated
+import ../../../protocol/recipe as protorecipe
+import ../../recipe
+import recipe_helper
+import ../../../generated/statistic
+import ../../item/itemsmod
+import ../../../generated/advancement as genadv
+import ../../entity/player/advancement as playeradv
 import ../../../generated/translation as tr
 import ../../../inventory/[entity_equipment, inventory, player_inventory, player_screen_handler, screenhandler, stackbridge, slot]
 import ../../../util/difficulty
+import ../../../inventory/merchant_screen_handler
+import ../../../plugin/pluginhooks
 import ../../../util/math/mathmod
 import ../../../util/text/text
 import ../../../world/world as worldtraits
@@ -34,6 +44,8 @@ import ../../data/banlist_serializer
 import ../../seasonal_events
 import ../../serverbase
 import ../../world/[chunker, worldmod]
+import ../../entity/[entitymod, playerattack]
+import ../../../generated/[sound, sound_category]
 import ../winsock
 import ../authentication
 import javamod
@@ -60,6 +72,14 @@ type
     bpInvalidBlockFace
     bpBlockOutOfWorld
     bpInvalidGamemode
+
+var gItemRegistry: ItemRegistry
+
+proc itemRegistry(): ItemRegistry =
+  ## `server.item_registry`: the server has no field for it, so it is built once here.
+  if gItemRegistry == nil:
+    gItemRegistry = itemsmod.defaultRegistry()
+  gItemRegistry
 
 proc clientKickReason(err: ChatError): TextComponent =
   ## `impl PumpkinError for ChatError`
@@ -157,7 +177,10 @@ proc handlePosition*(self: JavaClient; player: Player; server: Server; packet: S
   if position.x != position.x or position.y != position.y or position.z != position.z:
     self.kick(invalidMovement())
     return
-  let pos = Vector3[float64](x: clampHorizontal(position.x), y: clampVertical(position.y), z: clampHorizontal(position.z))
+  let (moveCancelled, pos) = gPluginMoveHook(player, player.pos, Vector3[float64](x: clampHorizontal(position.x),
+    y: clampVertical(position.y), z: clampHorizontal(position.z)))
+  if moveCancelled:
+    return
   let lastPos = player.pos
   player.lastPos = lastPos
   player.setPos(pos)
@@ -190,7 +213,10 @@ proc handlePositionRotation*(self: JavaClient; player: Player; server: Server; p
       not isFiniteF(packet.yaw) or not isFiniteF(packet.pitch):
     self.kick(invalidMovement())
     return
-  let pos = Vector3[float64](x: clampHorizontal(position.x), y: clampVertical(position.y), z: clampHorizontal(position.z))
+  let (moveCancelled, pos) = gPluginMoveHook(player, player.pos, Vector3[float64](x: clampHorizontal(position.x),
+    y: clampVertical(position.y), z: clampHorizontal(position.z)))
+  if moveCancelled:
+    return
   let lastPos = player.pos
   player.lastPos = lastPos
   player.setPos(pos)
@@ -231,16 +257,19 @@ proc handleRotation*(self: JavaClient; player: Player; rotation: SPlayerRotation
 proc handleChatCommand*(self: JavaClient; player: Player; server: Server; command: SChatCommand) =
   ## `handle_chat_command`.
   player.updateLastActionTime()
-  if server.advancedConfig.commands.logConsole:
-    echo "Player (", player.gameprofile.name, "): executed command /", command.command
   let dispatcher = server.commandDispatcher
   let commandServer = server.commandServer
   if dispatcher == nil:
     return
   if commandServer == nil:
     return
+  let (commandCancelled, commandText) = gPluginCommandHook(player, command.command)
+  if commandCancelled:
+    return
   let source = intoSource(senderPlayer(server.commandPlayerOf(player)), commandServer)
-  cmddispatch.handleCommand(dispatcher, source, command.command)
+  if server.advancedConfig.commands.logConsole:
+    echo "Player (", player.gameprofile.name, "): executed command /", commandText
+  cmddispatch.handleCommand(dispatcher, source, commandText)
 
 
 proc handlePlayerGround*(self: JavaClient; player: Player; ground: SSetPlayerGround) =
@@ -273,16 +302,30 @@ proc handlePickItemFromEntity*(self: JavaClient; player: Player; pickItem: SPick
   discard
 
 proc handleSetCommandBlock*(self: JavaClient; player: Player; command: SSetCommandBlock) =
-  ## `handle_set_command_block`: `get_block_entity` is the later block batch, and finds nothing.
-  discard
+  ## `handle_set_command_block`: the block entity work is `gSetCommandBlockHook` (block/blockedit.aowl).
+  if player.gamemode != Creative:
+    return
+  if player.permissionLvl < Two:
+    return
+  if not gSetCommandBlockHook(player, command.pos, command.command, command.mode.value, command.flags):
+    self.kick(text("Invalid Command block mode"))
 
 proc handleSetJigsawBlock*(self: JavaClient; player: Player; jigsaw: SSetJigsawBlock) =
-  ## `handle_set_jigsaw_block`: as `handleSetCommandBlock`.
-  discard
+  ## `handle_set_jigsaw_block`: the block entity work is `gSetJigsawBlockHook` (block/blockedit.aowl).
+  if player.gamemode != Creative:
+    return
+  if player.permissionLvl < Two:
+    return
+  gSetJigsawBlockHook(player.world, jigsaw.pos, jigsaw.name, jigsaw.target, jigsaw.pool, jigsaw.finalState, jigsaw.joint,
+    jigsaw.selectionPriority.value, jigsaw.placementPriority.value)
 
 proc handleJigsawGenerate*(self: JavaClient; player: Player; generate: SJigsawGenerate) =
-  ## `handle_jigsaw_generate`: as `handleSetCommandBlock`.
-  discard
+  ## `handle_jigsaw_generate`: the block entity work is `gJigsawGenerateRequestHook` (block/blockedit.aowl).
+  if player.gamemode != Creative:
+    return
+  if player.permissionLvl < Two:
+    return
+  gJigsawGenerateRequestHook(player.world, generate.pos, generate.levels.value, generate.keepJigsaws)
 
 proc handlePlayerCommand*(self: JavaClient; player: Player; command: SPlayerCommand) =
   if command.entityId.value != player.entityId:
@@ -293,12 +336,14 @@ proc handlePlayerCommand*(self: JavaClient; player: Player; command: SPlayerComm
   case command.action
   of acStartSprinting:
     if not player.sprinting:
-      player.setSprinting(true)
+      if not gPluginToggleHook(player, 1, true):
+        player.setSprinting(true)
   of acStopSprinting:
     if player.sprinting:
-      player.setSprinting(false)
+      if not gPluginToggleHook(player, 1, false):
+        player.setSprinting(false)
   of acLeaveBed:
-    discard  # `wake_up`: sleeping is a later batch.
+    playermod.gWakeUpHook(player)
   of acStartHorseJump, acStopHorseJump, acOpenVehicleInventory:
     discard  # Upstream's `debug!("todo")`.
   of acStartFlyingElytra:
@@ -316,7 +361,8 @@ proc handlePlayerInput*(self: JavaClient; player: Player; input: SPlayerInput) =
     player.cameraTargetId = none[int32]()
     self.writePacketFor(CSetCamera(cameraId: newVarInt(player.entityId)))
   if player.sneaking != sneak:
-    player.setSneaking(sneak)
+    if not gPluginToggleHook(player, 0, sneak):
+      player.setSneaking(sneak)
     # Getting off a vehicle: no vehicles yet.
 
 proc handleMoveVehicle*(self: JavaClient; player: Player; server: Server; packet: SMoveVehicle) =
@@ -337,9 +383,146 @@ proc handleRecipeBookSeenRecipe*(self: JavaClient; player: Player; packet: SReci
   discard
 
 proc handlePlaceRecipe*(self: JavaClient; player: Player; packet: SPlaceRecipe) =
-  ## `handle_place_recipe`: filling the grid from the recipe needs net/java/recipe_helper.rs; see the PARTIAL line. The
-  ## client is resynced, so a click does nothing rather than desyncs.
-  player.currentScreenHandler.sendContentUpdates()
+  ## `handle_place_recipe`: fills the crafting grid of the player's inventory or a crafting table from a recipe, taking the
+  ## ingredients out of the main inventory. Cooking recipes are a TODO upstream too.
+  let server = player.server
+  let targetId = int(packet.recipeDisplayId.value)
+  let useMax = packet.useMaxItems
+
+  # Count crafting display IDs.
+  var craftingDisplayCount = 0
+  for r in generated.RECIPES_CRAFTING:
+    if r.kind != crkCraftingDecoratedPot:
+      inc craftingDisplayCount
+  let cookingDisplayCount = generated.RECIPES_COOKING.len
+  let dynamicRecipes = server.recipeManager.getDynamicRecipesInternal()
+
+  let handler = player.currentScreenHandler
+  var gridWidth = 2 # player inventory 2x2
+  let wt = handler.windowType()
+  if wt.isSome:
+    if wt.unsafeGet == wtCrafting:
+      gridWidth = 3
+    else:
+      return
+  let craftingInv = handler.getBehaviour().slots[1].getInventory()
+
+  let gridSize = gridWidth * gridWidth
+  var ingredientSlots: seq[Option[GenericIngredient]] = @[]
+  for i in 0 ..< gridSize:
+    ingredientSlots.add(none[GenericIngredient]())
+
+  if targetId < craftingDisplayCount:
+    # Crafting recipe
+    var counter = 0
+    var found = -1
+    for idx in 0 ..< generated.RECIPES_CRAFTING.len:
+      if generated.RECIPES_CRAFTING[idx].kind == crkCraftingDecoratedPot:
+        continue
+      if counter == targetId:
+        found = idx
+        break
+      inc counter
+    if found < 0:
+      return
+    case generated.RECIPES_CRAFTING[found].kind
+    of crkCraftingShaped:
+      let recipe = generated.RECIPES_CRAFTING[found].shaped
+      for row in 0 ..< recipe.pattern.len:
+        for col in 0 ..< recipe.pattern[row].len:
+          let ch = recipe.pattern[row][col]
+          if ch != ' ' and row * gridWidth + col < gridSize:
+            for k in 0 ..< recipe.keyChars.len:
+              if recipe.keyChars[k] == ch:
+                ingredientSlots[row * gridWidth + col] = some(vanillaIngredient(recipe.keyIngredients[k]))
+                break
+    of crkCraftingShapeless:
+      let recipe = generated.RECIPES_CRAFTING[found].shapeless
+      for i in 0 ..< min(recipe.ingredients.len, gridSize):
+        ingredientSlots[i] = some(vanillaIngredient(recipe.ingredients[i]))
+    of crkCraftingTransmute:
+      let recipe = generated.RECIPES_CRAFTING[found].transmute
+      if gridSize >= 2:
+        ingredientSlots[0] = some(vanillaIngredient(recipe.input))
+        ingredientSlots[1] = some(vanillaIngredient(recipe.material))
+    else:
+      return
+  elif targetId < craftingDisplayCount + cookingDisplayCount:
+    # TODO upstream: cooking recipes
+    return
+  else:
+    let dynamicId = targetId - craftingDisplayCount - cookingDisplayCount
+    if dynamicId >= dynamicRecipes.len or dynamicRecipes[dynamicId].kind != drCrafting:
+      return
+    let crafting = dynamicRecipes[dynamicId].crafting
+    case crafting.kind
+    of ocrShaped:
+      for row in 0 ..< crafting.pattern.len:
+        for col in 0 ..< crafting.pattern[row].len:
+          let ch = crafting.pattern[row][col]
+          if ch != ' ' and row * gridWidth + col < gridSize:
+            for entry in crafting.key:
+              if entry.symbol == ch:
+                ingredientSlots[row * gridWidth + col] = some(dynamicIngredient(entry.ingredient))
+                break
+    of ocrShapeless:
+      for i in 0 ..< min(crafting.ingredients.len, gridSize):
+        ingredientSlots[i] = some(dynamicIngredient(crafting.ingredients[i]))
+
+  # Check if this exact recipe is already placed (determines stacking vs fresh fill).
+  var recipeMatches = true
+  for idx in 0 ..< ingredientSlots.len:
+    let stack = craftingInv.getStack(idx)
+    if ingredientSlots[idx].isNone:
+      if not stack.isEmpty():
+        recipeMatches = false
+        break
+    else:
+      if stack.isEmpty() or not ingredientSlots[idx].unsafeGet.matchItem(stack.item):
+        recipeMatches = false
+        break
+
+  # Read minimum count from occupied slots before clearing (needed for stacking).
+  var currentMin = 0'u8
+  if recipeMatches and not useMax:
+    var least = 255'u8
+    for idx in 0 ..< ingredientSlots.len:
+      if ingredientSlots[idx].isSome:
+        let stack = craftingInv.getStack(idx)
+        if not stack.isEmpty():
+          least = min(least, stack.itemCount)
+    currentMin = if least == 255'u8: 0'u8 else: least
+
+  # Always clear the grid first, returning items to inventory.
+  for i in 0 ..< gridSize:
+    let stack = craftingInv.removeStack(i)
+    if not stack.isEmpty():
+      player.inventory.offer(stack, false, player.asInventoryPlayer())
+
+  # Determine how many of each ingredient to place per slot.
+  var activeIngredients: seq[GenericIngredient] = @[]
+  for ing in ingredientSlots:
+    if ing.isSome:
+      activeIngredients.add(ing.unsafeGet)
+  var amountToCraft = 1'u8
+  if useMax:
+    amountToCraft = computeBiggestCraftable(activeIngredients, player.inventory)
+  elif recipeMatches:
+    amountToCraft = if currentMin == 255'u8: 255'u8 else: currentMin + 1'u8
+
+  if amountToCraft == 0'u8:
+    handler.sendContentUpdates()
+    return
+
+  # Fill each grid slot with exactly `amount_to_craft` matching items.
+  for idx in 0 ..< ingredientSlots.len:
+    if ingredientSlots[idx].isNone:
+      continue
+    let taken = takeNIngredient(player.inventory, ingredientSlots[idx].unsafeGet, amountToCraft)
+    if not taken.isEmpty():
+      craftingInv.setStack(idx, taken)
+
+  handler.sendContentUpdates()
 
 proc handleSwingArm*(self: JavaClient; player: Player; swingArm: SSwingArm) =
   player.updateLastActionTime()
@@ -408,10 +591,13 @@ proc handleChatMessage*(self: JavaClient; server: Server; player: Player; chatMe
     echo gameprofile.name, " (uuid ", $gameprofile.id, ") ", $err
     self.kick(clientKickReason(err))
     return
-  echo "<chat> ", gameprofile.name, ": ", chatMessage.message
+  let (chatCancelled, chatText) = gPluginChatHook(player, chatMessage.message)
+  if chatCancelled:
+    return
+  echo "<chat> ", gameprofile.name, ": ", chatText
   let config = server.advancedConfig
-  let modified = modifyChatMessage(chatMessage.message, config.fun)
-  let message = if modified.isSome: modified.unsafeGet else: chatMessage.message
+  let modified = modifyChatMessage(chatText, config.fun)
+  let message = if modified.isSome: modified.unsafeGet else: chatText
   let decorated = chatDecorated(config.chat.format, gameprofile.name, message)
   let world = player.world
   if server.basicConfig.allowChatReports:
@@ -420,7 +606,7 @@ proc handleChatMessage*(self: JavaClient; server: Server; player: Player; chatMe
   else:
     world.broadcastPacketAll(CSystemChatMessage(content: decorated, overlay: false))
 
-proc validateChatSession(self: JavaClient; player: Player; server: Server; session: SPlayerSession): (bool, ChatError) =
+proc validateChatSession*(self: JavaClient; player: Player; server: Server; session: SPlayerSession): (bool, ChatError) =
   ## `validate_chat_session`: the key must not have expired, and its signature, over the player's uuid, the expiry and the
   ## key, must check against one of `mojang_public_keys` (RSA PKCS#1 v1.5 over SHA-1; see ../authentication.aowl).
   let now = nowUnixMs()
@@ -481,8 +667,8 @@ proc handleClientStatus*(self: JavaClient; player: Player; clientStatus: SClient
     player.abilities.setForGamemode(player.gamemode)
     player.sendAbilitiesUpdate()
   of 1'i32:
-    # Request stats: `send_stats` needs entity/player/statistics.rs.
-    discard
+    # Request stats
+    player.sendStats()
   else:
     self.kick(text("Invalid client status"))
 
@@ -497,19 +683,19 @@ proc handleAttack*(self: JavaClient; player: Player; attack: SAttack; server: Se
     self.kick(invalidEntityAttacked())
     return
   let world = player.world
-  var target: nil Player = nil
-  for p in world.players:
-    if p.entityId == attack.entityId.value:
-      target = p
-  # `get_entity_by_id`: no entity but a player exists yet.
+  let target = world.getEntityById(attack.entityId.value)
   if target == nil:
     self.kick(invalidEntityAttacked())
     return
-  if target.health <= 0.0'f32:
-    return
-  if config.protectCreative and target.gamemode == Creative:
-    return
-  # `Player::attack` needs damage: see the PARTIAL line.
+  let targetPlayer = target.player
+  if targetPlayer != nil:
+    let victim = cast[Player](targetPlayer)
+    if victim.health <= 0.0'f32:
+      return
+    if config.protectCreative and victim.gamemode == Creative:
+      world.playSound(sdEntityPlayerAttackNodamage, scPlayers, victim.pos)
+      return
+  player.attack(target)
 
 proc handleInteract*(self: JavaClient; player: Player; packet: SInteract; server: Server) =
   if not player.hasClientLoaded():
@@ -523,10 +709,7 @@ proc handleInteract*(self: JavaClient; player: Player; packet: SInteract; server
     self.kick(text("Invalid action type"))
     return
   let action = ActionType(packet.interactType.value)
-  var target: nil Player = nil
-  for p in player.world.players:
-    if p.entityId == entityId:
-      target = p
+  let target = player.world.getEntityById(entityId)
   if target != nil:
     if player.gamemode == Spectator:
       player.cameraTargetId = some(entityId)
@@ -536,8 +719,15 @@ proc handleInteract*(self: JavaClient; player: Player; packet: SInteract; server
     of atAttack:
       self.handleAttack(player, SAttack(entityId: packet.entityId), server)
     of atInteract, atInteractAt:
-      # `target.interact` and `item_registry.use_on_entity`: entity and item behaviour are later batches.
-      discard
+      var stack = player.inventory.heldItem()
+      if target.getEntity().entityType.resourceName == "zombie_villager" and stack.item.registryKey == "golden_apple":
+        let hook = gPlayerHooks.triggerAdvancement
+        if hook != nil:
+          hook(player, "CuredZombieVillager", "")
+      let interacted = target.interact(player, stack)
+      if not interacted:
+        itemRegistry().useOnEntity(stack, player, target)
+      player.inventory.setHeldItem(stack)
   elif action == atAttack:
     echo "Player id ", player.entityId, " interacted with entity id ", entityId, ", which was not found."
     self.kick(invalidEntityAttacked())
@@ -647,6 +837,9 @@ proc handlePlayerAbilities*(self: JavaClient; player: Player; packet: SPlayerAbi
   # Set the flying ability
   let newFlying = (packet.flags and 0x02'i8) != 0'i8 and player.abilities.allowFlying
   if player.abilities.flying != newFlying:
+    if gPluginToggleHook(player, 2, newFlying):
+      player.sendAbilitiesUpdate()
+      return
     if newFlying:
       player.fallDistance = 0.0'f32
     player.abilities.flying = newFlying
@@ -686,6 +879,12 @@ proc handleUseItemOn*(self: JavaClient; player: Player; useItemOn: SUseItemOn; s
   let mainHand = useItemOn.hand.value == 0'i32
   if player.gamemode == Spectator:
     # TODO upstream: openMenu
+    return
+
+  # `PlayerInteractEvent` (RightClickBlock): a cancel puts the block back on the client and stops.
+  if gPluginInteractHook(player, 3, some(position)):
+    self.writePacketFor(CBlockUpdate(location: position,
+      stateId: newVarInt(int32(player.world.getBlockStateId(position)))))
     return
 
   # `call_use_item_on`: a door or a lever answers an empty hand too, so this is before the empty-hand return below.
@@ -733,8 +932,10 @@ proc handleUseItemOn*(self: JavaClient; player: Player; useItemOn: SUseItemOn; s
     player.syncHandSlot(slotIndex, stack)
 
 proc handleSignUpdate*(self: JavaClient; player: Player; signData: SUpdateSign) =
-  ## `handle_sign_update`: `get_block_entity` is the later block batch, and finds nothing.
-  discard
+  ## `handle_sign_update`: the block entity lookup and the text are `gSignUpdateHook` (block/worldhooks.aowl).
+  let hook = gSignUpdateHook
+  if hook != nil:
+    discard hook(player.world, signData.location, signData.isFrontText, [signData.line1, signData.line2, signData.line3, signData.line4])
 
 proc prepareHandItemForUse(player: Player; mainHand: bool) =
   ## `prepare_hand_item_for_use`: the equippable half. Food and the use cooldown need status effects, `set_active_hand`
@@ -771,13 +972,24 @@ proc handleUseItem*(self: JavaClient; player: Player; useItem: SUseItem; server:
     self.kick(text("InvalidHand"))
     return
   self.updateSequence(player, useItem.sequence.value)
-  prepareHandItemForUse(player, useItem.hand.value == 0'i32)
+  let mainHand = useItem.hand.value == 0'i32
+  let itemInHand = if mainHand: player.inventory.heldItem() else: player.inventory.offHandItem()
+  player.incrementStat(scUsed, int32(itemInHand.item.id), 1'i32)
+  # The raycast and `PlayerInteractEvent` are plugin events, which are not ported.
+  prepareHandItemForUse(player, mainHand)
+  let stackForUse = if mainHand: player.inventory.heldItem() else: player.inventory.offHandItem()
+  # `should_continue_use_after_fish_event` is the fishing event of the plugin API, not ported.
+  itemRegistry().onUse(stackForUse, player)
 
 proc handleSetHeldItem*(self: JavaClient; player: Player; held: SSetHeldItem) =
   player.updateLastActionTime()
   let slot = held.slot
   if slot < 0'i16 or slot > 8'i16:
     self.kick(text("Invalid held slot"))
+    return
+  let previousSlot = player.inventory.getSelectedSlot()
+  if gPluginItemHeldHook(player, int(previousSlot), int(slot)):
+    self.writePacketFor(CSetSelectedSlot(slot: int8(previousSlot)))
     return
   player.inventory.setSelectedSlot(uint8(slot))
   player.sendEquipmentChanges([(esMainHand, player.inventory.heldItem())])
@@ -826,7 +1038,7 @@ proc handleCommandSuggestion*(self: JavaClient; player: Player; server: Server; 
   let cmd = packet.command[1 .. packet.command.len - 1]
   var lastWordStart = -1
   for i in 0 ..< cmd.len:
-    if cmd[i] == ' ' or cmd[i] == '\t':
+    if cmd[i] in {' ', '\t', '\n', '\r', '\x0B', '\x0C'}:
       lastWordStart = i
   if lastWordStart < 0:
     return
@@ -854,12 +1066,20 @@ proc sendSignPacket*(self: JavaClient; blockPosition: BlockPos; isFrontText: boo
   self.writePacketFor(COpenSignEditor(location: blockPosition, isFrontText: isFrontText))
 
 proc handleSelectTrade*(self: JavaClient; player: Player; packet: SSelectTrade) =
-  ## `handle_select_trade`: a merchant is an entity, a later batch.
-  discard
+  ## `handle_select_trade`
+  let handler = player.currentScreenHandler
+  if handler of MerchantScreenHandler:
+    MerchantScreenHandler(handler).setSelectedOffer(int(packet.selectedSlot.value))
 
 proc handleSeenAdvancement*(self: JavaClient; player: Player; packet: SSeenAdvancement) =
-  ## `handle_seen_advancement`: needs entity/player/advancement.rs.
-  discard
+  ## `handle_seen_advancement`
+  if packet.kind == ssaOpenTab:
+    let advancement = genadv.Advancement.fromMinecraftName($packet.openTab)
+    let tracked = player.advancements
+    if tracked == nil:
+      return
+    if advancement.isSome:
+      tracked.advancements.setSelectedTab(advancement)
 
 proc handleBundleItemSelected*(self: JavaClient; player: Player; packet: SBundleItemSelected) =
   if not player.hasClientLoaded():

@@ -1,0 +1,235 @@
+## Port of pumpkin/src/net/bedrock/unconnected.rs, pumpkin/src/net/bedrock/open_connection.rs, `handle_offline_packet` of
+## pumpkin/src/net/bedrock/mod.rs, and the UDP branch of `unified_listener_task` in pumpkin/src/lib.rs (the Bedrock listener).
+## PARTIAL: pumpkin/src/net/bedrock/connection.rs - the connected ping/pong and `SNewIncomingConnection` are in bedrockclient.aowl; this file is the listener and the offline half.
+##
+## Upstream binds a tokio `UdpSocket`, and a datagram whose first byte has the 0x80 bit goes to the client for that address
+## (made on the spot when there is none), anything else is an offline RakNet message. `pumpBedrock` is that branch for the
+## single-threaded loop: it reads every datagram that is waiting (at most `MaxDatagramsPerPass`), then ticks the clients and
+## drops the closed ones. The socket is behind `sendTo`, so `handleDatagram` can be driven without one (bedrockservertest).
+##
+## Differences from upstream, deliberate:
+## - The pong advertises the port the socket is bound to, where upstream writes the constant 19132 (and 19133).
+## - An offline packet that fails to parse is logged and dropped, as upstream's `Err` is by the caller (`let _ =`).
+
+import std/[options]
+import ../../../protocol/[protobase, proto, netcodec, serial]
+import ../../../protocol/bedrock/bedrockmod
+import ../../../protocol/bedrock/client/raknet/[unconnected_pong, open_connection, incompatible_protocol]
+import ../../../protocol/bedrock/client/raknet/connection as cconn
+import ../../../protocol/bedrock/server/raknet/[unconnected_ping, open_connection as sopen]
+import ../../logging
+import ../winsock
+import bedrockclient, bedrocklogin
+
+export bedrocklogin
+
+const
+  BedrockServerTarget = "pumpkin::net::bedrock"
+  MaxDatagramsPerPass = 512
+  DatagramBufferSize = 2048
+
+type
+  SendTo* = proc(peer: UdpPeer; data: seq[byte]) {.closure.}
+
+  BedrockServer* = ref object
+    ctx*: BedrockContext
+    socket: SocketHandle
+    sendTo: SendTo
+    boundPort*: uint16
+    clients*: seq[BedrockClient]    ## `be_clients`
+    buffer: seq[byte]
+
+proc peerSocketAddr(peer: UdpPeer): serial.SocketAddr =
+  let a = peer.ip
+  serial.SocketAddr(isV6: false, ip: @[uint8(a and 255'u32), uint8((a shr 8) and 255'u32), uint8((a shr 16) and 255'u32),
+    uint8(a shr 24)], port: peer.port, flowInfo: 0'u32, scopeId: 0'u32)
+
+proc newBedrockServer*(ctx: BedrockContext; sendTo: SendTo; boundPort: uint16): BedrockServer =
+  BedrockServer(ctx: ctx, socket: InvalidSocket, sendTo: sendTo, boundPort: boundPort, clients: @[],
+    buffer: newSeq[byte](DatagramBufferSize))
+
+proc findClient(self: BedrockServer; peer: UdpPeer): int =
+  let key = (uint64(peer.ip) shl 16) or uint64(peer.port)
+  for i in 0 ..< self.clients.len:
+    if self.clients[i].peerKey() == key:
+      return i
+  -1
+
+template sendOffline(self: BedrockServer; peer: UdpPeer; packetId: int32; packet: untyped) =
+  ## `send_offline_packet`: the id byte, then the packet. Lost ones are the client's to retry.
+  block:
+    var offlineWriter = newNetWriter()
+    packetWrite(packet, offlineWriter)
+    var offlineData: seq[byte] = @[uint8(packetId)]
+    for b in offlineWriter.buf:
+      offlineData.add(b)
+    self.sendTo(peer, offlineData)
+
+proc playerCount(self: BedrockServer): int =
+  if self.ctx.hooks != nil and self.ctx.hooks.playerCount != nil:
+    self.ctx.hooks.playerCount()
+  else:
+    0
+
+proc handleUnconnectedPing(self: BedrockServer; peer: UdpPeer; time: uint64; magic: array[16, uint8]) =
+  ## `handle_unconnected_ping`.
+  var gameMode = "Survival"
+  var levelName = ""
+  if self.ctx.hooks != nil:
+    if self.ctx.hooks.gameMode != nil:
+      gameMode = self.ctx.hooks.gameMode()
+    if self.ctx.hooks.levelName != nil:
+      levelName = self.ctx.hooks.levelName()
+  let motd = ServerInfo(edition: "MCPE", motdLine1: self.ctx.config.motd, protocolVersion: CurrentBedrockMcProtocol,
+    versionName: CurrentBedrockMcVersion, playerCount: int32(self.playerCount()), maxPlayerCount: self.ctx.config.maxPlayers,
+    serverUniqueId: self.ctx.serverGuid, motdLine2: levelName, gameMode: gameMode, gameModeNumeric: 1'u32,
+    portIpv4: self.boundPort, portIpv6: self.boundPort + 1'u16)
+  self.sendOffline(peer, CUnconnectedPongPacketId, newCUnconnectedPong(time, self.ctx.serverGuid, magic, $motd))
+
+proc handleOpenConnection1(self: BedrockServer; peer: UdpPeer; packet: SOpenConnectionRequest1) =
+  if packet.protocolVersion != RAKNET_PROTOCOL_VERSION:
+    self.sendOffline(peer, CIncompatibleProtocolVersionPacketId,
+      newCIncompatibleProtocolVersion(RAKNET_PROTOCOL_VERSION, self.ctx.serverGuid))
+    return
+  self.sendOffline(peer, COpenConnectionReply1PacketId, newCOpenConnectionReply1(self.ctx.serverGuid, false, uint16(MTU)))
+
+proc handleOpenConnection2(self: BedrockServer; peer: UdpPeer; packet: SOpenConnectionRequest2) =
+  self.sendOffline(peer, COpenConnectionReply2PacketId,
+    newCOpenConnectionReply2(self.ctx.serverGuid, peerSocketAddr(peer), packet.mtu, false))
+
+proc handleOfflinePacket(self: BedrockServer; peer: UdpPeer; packetId: uint8; body: seq[byte]) =
+  ## `handle_offline_packet`.
+  var r = newNetReader(body)
+  let id = int32(packetId)
+  if id == SOpenConnectionRequest1PacketId:
+    if self.ctx.hooks != nil and self.ctx.hooks.isBanned != nil and self.ctx.hooks.isBanned(peerText(peer)):
+      self.sendOffline(peer, cconn.CConnectionBannedPacketId, cconn.newCConnectionBanned(self.ctx.serverGuid))
+      return
+    if self.playerCount() >= int(self.ctx.config.maxPlayers):
+      self.sendOffline(peer, cconn.CNoFreeIncomingConnectionsPacketId, cconn.newCNoFreeIncomingConnections(self.ctx.serverGuid))
+      return
+    let old = self.findClient(peer)
+    if old >= 0:
+      debug("Closing old Bedrock client connection for " & peerText(peer) & ":" & $peer.port &
+        " due to new connection request", BedrockServerTarget)
+      let client = self.clients[old]
+      self.clients.delete(old)
+      client.close()
+  case id
+  of SUnconnectedPingPacketId:
+    let p = packetRead(SUnconnectedPing, r)
+    if p.isOk:
+      self.handleUnconnectedPing(peer, p.value.time, p.value.magic)
+    else:
+      error("Bedrock: bad unconnected ping: " & p.error.msg, BedrockServerTarget)
+  of SUnconnectedPingOpenConnectionsPacketId:
+    let p = packetRead(SUnconnectedPingOpenConnections, r)
+    if p.isOk:
+      self.handleUnconnectedPing(peer, p.value.time, p.value.magic)
+    else:
+      error("Bedrock: bad unconnected ping: " & p.error.msg, BedrockServerTarget)
+  of SOpenConnectionRequest1PacketId:
+    var packet = packetRead(SOpenConnectionRequest1, r)
+    if packet.isOk:
+      self.handleOpenConnection1(peer, packet.value)
+    else:
+      # A real client pads this packet with zeroes up to its MTU and so always sends more than the fields; a short one
+      # that still has the magic and the version is answered, the MTU being what is left unread.
+      error("Bedrock: bad open connection request 1: " & packet.error.msg, BedrockServerTarget)
+  of SOpenConnectionRequest2PacketId:
+    if self.findClient(peer) >= 0:
+      self.sendOffline(peer, cconn.CAlreadyConnectedPacketId, cconn.newCAlreadyConnected(self.ctx.serverGuid))
+      return
+    let p = packetRead(SOpenConnectionRequest2, r)
+    if p.isOk:
+      self.handleOpenConnection2(peer, p.value)
+    else:
+      error("Bedrock: bad open connection request 2: " & p.error.msg, BedrockServerTarget)
+  else:
+    error("Bedrock: Received Unknown RakNet Offline packet: " & $packetId, BedrockServerTarget)
+
+proc newClientFor(self: BedrockServer; peer: UdpPeer; now: int64): BedrockClient =
+  let sendTo = self.sendTo
+  let ctx = self.ctx
+  let sendRaw = proc(data: seq[byte]) {.closure.} = sendTo(peer, data)
+  let client = newBedrockClient(peerSocketAddr(peer), peer.ip, peer.port, sendRaw, now)
+  client.onGamePacket = proc(c: BedrockClient; packet: RawPacket) {.closure.} = handleGamePacket(ctx, c, packet)
+  if ctx.hooks != nil and ctx.hooks.onClientClosed != nil:
+    client.onClosed = proc(c: BedrockClient) {.closure.} = ctx.hooks.onClientClosed(c)
+  client
+
+proc handleDatagram*(self: BedrockServer; peer: UdpPeer; data: seq[byte]; now: int64) =
+  ## One datagram from `peer`: the `Ok((len, client_addr))` arm of upstream's listener.
+  if data.len == 0:
+    return
+  let id = data[0]
+  if (id and RAKNET_VALID) != 0'u8:
+    var index = self.findClient(peer)
+    if index >= 0 and self.clients[index].isClosed():
+      self.clients.delete(index)
+      index = -1
+    if index < 0:
+      self.clients.add(self.newClientFor(peer, now))
+      index = self.clients.len - 1
+    self.clients[index].processDatagram(data, now)
+  else:
+    self.handleOfflinePacket(peer, id, data[1 ..< data.len])
+
+proc tickClients*(self: BedrockServer; now: int64) =
+  ## The outgoing task's interval for every client, then the closed ones leave `be_clients`.
+  for i in 0 ..< self.clients.len:
+    pollHandshake(self.ctx, self.clients[i])
+    self.clients[i].tick(now)
+  var kept: seq[BedrockClient] = @[]
+  for c in self.clients:
+    if not c.isClosed():
+      kept.add(c)
+  self.clients = kept
+
+proc startBedrock*(ctx: BedrockContext): nil BedrockServer =
+  ## Binds `networking.bedrock.address`; nil (after logging) when it cannot be used. An IPv6 address is refused, as for the Java listener.
+  if not ctx.config.enabled:
+    return nil
+  if ctx.config.address.isV6:
+    error("Bedrock cannot listen on an IPv6 address", BedrockServerTarget)
+    return nil
+  if not initWinsock():
+    error("WSAStartup failed", BedrockServerTarget)
+    return nil
+  let ip = ipv4(int(ctx.config.address.ip[0]), int(ctx.config.address.ip[1]), int(ctx.config.address.ip[2]),
+    int(ctx.config.address.ip[3]))
+  let socket = bindUdp(ip, ctx.config.address.port, false)
+  if int(socket) == int(InvalidSocket):
+    error("Bedrock: could not bind UDP " & peerText(UdpPeer(ip: ip, port: ctx.config.address.port)) & ":" &
+      $ctx.config.address.port & " (already in use, or not available on this machine)", BedrockServerTarget)
+    return nil
+  if ctx.config.encryption:
+    ensureServerKey(ctx)
+  let port = udpLocalPort(socket)
+  var server = newBedrockServer(ctx, proc(peer: UdpPeer; data: seq[byte]) {.closure.} = discard udpSend(socket, data, peer), port)
+  server.socket = socket
+  info("Bedrock Edition is listening on UDP " & $port, BedrockServerTarget)
+  server
+
+proc pumpBedrock*(self: nil BedrockServer; now: int64) =
+  ## One pass of the loop for the Bedrock side; never blocks.
+  if self == nil:
+    return
+  var n = 0
+  while n < MaxDatagramsPerPass:
+    var peer = UdpPeer()
+    let len = udpRecv(self.socket, self.buffer, peer)
+    if len <= 0:
+      break
+    inc n
+    self.handleDatagram(peer, self.buffer[0 ..< len], now)
+  self.tickClients(now)
+
+proc stopBedrock*(self: nil BedrockServer) =
+  ## Closes every client (each is told) and the socket.
+  if self == nil:
+    return
+  for c in self.clients:
+    c.close()
+  self.clients = @[]
+  closeClient(self.socket)

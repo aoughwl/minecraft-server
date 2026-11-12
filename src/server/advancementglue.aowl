@@ -1,0 +1,150 @@
+## What the server does with `PlayerAdvancement` and `TriggerPlayer` (src/server/entity/player/advancement/*), the
+## parts of upstream that live in `Player`, `Server` and `lib.rs`:
+##
+## - `Server::new`: `advancement_manager` (`installAdvancements`), and the hook entity/living.rs, ender_eye.rs,
+##   entity/ai/goal/breed.rs and the rest call as `trigger_advancement` (`gPlayerHooks.triggerAdvancement`);
+## - `Server::add_player`: `advancements.load()` and `advancements.player = Arc::downgrade(&player)` (`joinAdvancements`);
+## - `Player::tick`: `check_inventory_advancements` and `flush_dirty(self, true)` (`tickAdvancements`);
+## - `lib.rs` shutdown: `advancement_manager.save_all_players` (`saveAllAdvancements`).
+##
+## Port of pumpkin/src/server/mod.rs (advancement_manager, the join half), pumpkin/src/entity/player.rs
+## (`advancements`, `has_item_in_inventory`, `check_inventory_advancements`), pumpkin/src/lib.rs (the save).
+##
+## HOOK (src/server/serverbase.aowl and src/server/servermod.aowl): `Server.advancementManager` and `Player.advancements`
+## are the fields; `installAdvancements(server)` after the worlds load, `joinAdvancements(self, player)` in `addPlayer`
+## after `readNbt`, `tickAdvancements(player)` from the player tick, and `saveAllAdvancements(server)` in `shutdown`.
+
+import std/[math, options, syncio]
+import ../generated/[biome, game_rules]
+import ../inventory/inventory
+import ../protocol/java/client/play/[select_advancements_tab, update_advancement]
+import ../util/math/position
+import ../util/text/[textbase, text]
+import ../util/uuid
+import ../world/level
+import ../world/worldfs
+import entity/entitymod
+import entity/player/advancement as playeradv
+import entity/player/advancement/trigger
+import serverbase
+import world/worldmod
+import "../data/item_stack/mod" as itemstackmod
+
+proc hasItemInInventory(player: Player; itemKey: string): bool =
+  ## `Player::has_item_in_inventory`: the main inventory and the equipment slots, which share one inventory here.
+  let inv = Inventory(player.inventory)
+  var i = 0
+  let total = inventory.size(inv)
+  while i < total:
+    let stack = inventory.getStack(inv, i)
+    if not stack.isEmpty() and stack.item.registryKey == itemKey:
+      return true
+    inc i
+  false
+
+proc mainInventoryHasEnchanted(player: Player): bool =
+  ## `main_inventory_has_enchanted`.
+  let inv = Inventory(player.inventory)
+  var i = 0
+  let total = inventory.size(inv)
+  while i < total:
+    let stack = inventory.getStack(inv, i)
+    if not stack.isEmpty() and stack.hasEnchantments():
+      return true
+    inc i
+  false
+
+proc roughBiomeId(player: Player): string =
+  ## `biome.registry_id` at the player's block, `get_rough_biome`.
+  let pos = newBlockPos(int32(floor(player.pos.x)), int32(floor(player.pos.y)), int32(floor(player.pos.z)))
+  let found = Biome.fromId(uint8(getRoughBiome(player.world.level, pos)))
+  if found == nil: "" else: found.registryId
+
+proc triggerFromName(name, argument: string; trigger: var AdvancementTrigger): bool =
+  ## The names `gPlayerHooks.triggerAdvancement` is called with (entity/entitymod.aowl and the callers beside it).
+  for i in 0 .. ord(high(AdvancementTriggerKind)):
+    let kind = AdvancementTriggerKind(i)
+    if $kind == "at" & name:
+      trigger = AdvancementTrigger(kind: kind, arg: argument)
+      return true
+  false
+
+proc tickAdvancements*(player: Player) =
+  ## `check_inventory_advancements` and `flush_dirty(self, true)`, from `Player::tick`.
+  let tracked = player.advancements
+  if tracked == nil:
+    return
+  tracked.triggerAdvancement(AdvancementTrigger(kind: atInventoryChanged, arg: ""))
+  tracked.advancements.flushDirty(true)
+
+proc installAdvancements*(server: Server) =
+  ## `AdvancementManager::new(players_dir, save_advancements)`, the `trigger_advancement` hook and the tick.
+  let previousTick = gPlayerEntityTickHook
+  gPlayerEntityTickHook = proc(world: World; player: Player; server: Server) {.closure.} =
+    previousTick(world, player, server)
+    tickAdvancements(player)
+  server.advancementManager = playeradv.newAdvancementManager(joinPathW(server.levelFolder, "players"),
+    server.advancedConfig.advancement.saveAdvancements)
+  gPlayerHooks.triggerAdvancement = proc(player: Player; trigger, argument: string) {.closure.} =
+    let tracked = player.advancements
+    if tracked == nil:
+      return
+    var t = AdvancementTrigger()
+    if triggerFromName(trigger, argument, t):
+      tracked.triggerAdvancement(t)
+
+proc joinAdvancements*(server: Server; player: Player) =
+  ## `new_player_advancement(gameprofile.id)` in `Player::new`, then `load()` and `set_player` in `Server::add_player`.
+  let manager = server.advancementManager
+  if manager == nil:
+    return
+  let guard = playeradv.newPlayerAdvancement(manager, player.gameprofile.id)
+  let hooks = playeradv.AdvancementPlayer()
+  hooks.sendUpdateAdvancements = proc(packet: CUpdateAdvancements) {.closure.} = player.client.writePacketFor(packet)
+  hooks.sendSelectAdvancementsTab = proc(packet: CSelectAdvancementsTab) {.closure.} = player.client.writePacketFor(packet)
+  hooks.addExperiencePoints = proc(amount: int32) {.closure.} =
+    let hooked = server.commandPlayerOf
+    if hooked != nil:
+      let commandPlayer = hooked(player)
+      if commandPlayer.addExperiencePoints != nil:
+        commandPlayer.addExperiencePoints(amount)
+  hooks.showAdvancementMessages = proc(): bool {.closure.} =
+    game_rules.get(player.world.levelInfo.gameRules, grShowAdvancementMessages).boolValue
+  hooks.getDisplayName = proc(): TextComponent {.closure.} = text(player.gameprofile.name)
+  hooks.broadcastSystemMessage = proc(message: TextComponent; overlay: bool) {.closure.} =
+    for w in server.worlds:
+      w.broadcastSystemMessage(message, overlay)
+  let loaded = guard.load()
+  if not loaded.ok:
+    echo "Error loading player ", $player.gameprofile.id, ": ", loaded.error.message
+  guard.setPlayer(hooks)
+  player.advancements = TriggerPlayer(advancements: guard,
+    hasItemInInventory: proc(itemKey: string): bool {.closure.} = hasItemInInventory(player, itemKey),
+    mainInventoryHasEnchanted: proc(): bool {.closure.} = mainInventoryHasEnchanted(player),
+    roughBiome: proc(): string {.closure.} = roughBiomeId(player))
+
+proc saveAllAdvancements*(server: Server): bool =
+  ## `advancement_manager.save_all_players(&get_all_players())`; false on an error, which is logged.
+  let manager = server.advancementManager
+  if manager == nil:
+    return true
+  var all: seq[playeradv.PlayerAdvancement] = @[]
+  for w in server.worlds:
+    for p in w.players:
+      let tracked = p.advancements
+      if tracked != nil:
+        all.add(tracked.advancements)
+  let r = manager.saveAllPlayers(all)
+  if not r.ok:
+    echo "Error saving all players advancements: ", r.error.message
+  r.ok
+
+proc saveAdvancementsOnLeave*(server: Server; player: Player) =
+  ## Writes one player's advancements when they leave, so a crash after that loses nothing. Upstream only writes them
+  ## in `save_all_players` and at shutdown.
+  let tracked = player.advancements
+  if tracked == nil:
+    return
+  let r = tracked.advancements.save()
+  if not r.ok:
+    echo "Error saving advancements of ", $player.gameprofile.id, ": ", r.error.message

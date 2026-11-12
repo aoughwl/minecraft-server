@@ -1,6 +1,6 @@
 ## Port of pumpkin-protocol/src/codec/data_component.rs
-## PARTIAL: pumpkin-protocol/src/codec/data_component.rs - no id validation against registries that are not ported: `Enchantment::from_id`, `StatusEffect::from_id`/`from_minecraft_name`, `IDSetContent::from_id` and the `Sound` lookup in `proto_to_data_sound`. Those ids are carried raw, so a bad id from a client reaches the caller rather than failing here. Every wire layout, count limit and other check is ported.
-## PARTIAL: pumpkin-data/src/data_component_impl/mod.rs - minimal `*Impl` value types: the fields this codec reads and writes. No `read_data`/`write_data` NBT forms, no `get_hash`.
+## Registry ids are checked as upstream's `from_id` calls do: `Enchantment::from_id`, `StatusEffect::from_id` / `from_minecraft_name` (so `StatusEffectInstance.effectId` is the effect's name), `IDSetContent::from_id` for status effects and entity types, and `proto_to_data_sound` (a wire sound id must index the sound table). A sound stays the wire's `IdOr[SoundEvent]` here, not the data tree's `Sound`.
+## PARTIAL: pumpkin-data/src/data_component_impl/mod.rs - minimal `*Impl` value types of this module, apart from the richer ones in src/data/data_component_impl (this codec has its own `IdOr`/`IDSet`/`EnchantmentEntry`, joined by src/inventory/stackbridge): the fields this codec reads and writes. No `read_data`/`write_data` NBT forms, no `get_hash`.
 ## PARTIAL: pumpkin-data/src/item_stack/mod.rs - minimal `ItemStack`: count, item id, component patch, `is_empty`. Consumers in src/inventory still use their own stub.
 ##
 ## Upstream dispatches over `Box<dyn DataComponentImpl>`. Here that is the closed
@@ -15,6 +15,8 @@ import protobase, netcodec, varint, proto
 import ../util/text/text
 import ../generated/data_component
 import ../generated/item as itemdata
+import ../generated/[effect, enchantment, entity_type]
+import ../generated/sound as sounddata
 import ../nbt/[nbtbase, serializer, tag]
 
 export data_component
@@ -32,8 +34,13 @@ type
     of idsTag: tag*: string
     of idsIds: ids*: seq[int32]
 
+  IDSetContent* = enum
+    ## The `T` of upstream's `IDSet<T>` (`IDSetContent`) that this codec reads: `from_id` checks the registry.
+    icStatusEffect
+    icEntityType
+
   StatusEffectInstance* = object
-    effectId*: int32  ## Registry id. Upstream resolves this to the effect's name.
+    effectId*: string  ## The effect's `minecraft_name`, as upstream resolves it from the registry id.
     amplifier*: int32
     duration*: int32
     ambient*: bool
@@ -220,7 +227,13 @@ proc deserialize*(id: DataComponent; r: var NetReader): ProtoReadResult[DataComp
 
 # --- IDSet --------------------------------------------------------------------
 
-proc deserializeIdset(r: var NetReader): ProtoReadResult[IDSet] =
+proc idsetFromId(content: IDSetContent; id: uint16): bool =
+  ## `T::from_id(id).is_some()`.
+  case content
+  of icStatusEffect: StatusEffect.fromId(id).isSome
+  of icEntityType: EntityType.fromRaw(id).isSome
+
+proc deserializeIdset(r: var NetReader; content: IDSetContent): ProtoReadResult[IDSet] =
   let idType = tryRead(IDSet, getVarInt(r)).value
   if idType == 0'i32:
     let tagName = tryRead(IDSet, getStr(r))
@@ -230,7 +243,11 @@ proc deserializeIdset(r: var NetReader): ProtoReadResult[IDSet] =
   let len = idType - 1'i32
   var contentVec: seq[int32] = @[]
   for i in 0 ..< len:
-    contentVec.add(tryRead(IDSet, getVarInt(r)).value)
+    let varintId = tryRead(IDSet, getVarInt(r)).value
+    # `varint_id as u16`
+    if not idsetFromId(content, uint16(cast[uint32](varintId) and 0xFFFF'u32)):
+      return readErr[IDSet](messageRead("Invalid registry id VarInt in IDSet"))
+    contentVec.add(varintId)
   readOk(IDSet(kind: idsIds, ids: contentVec))
 
 proc serializeIdset(idset: IDSet; w: var NetWriter): ProtoWriteVoidResult =
@@ -272,6 +289,9 @@ proc deserializeStatusEffects(r: var NetReader): ProtoReadResult[seq[StatusEffec
   var customEffects: R = @[]
   for i in 0 ..< effectsLen:
     let effectRegistryId = tryRead(R, getVarInt(r)).value
+    let effectData = StatusEffect.fromId(uint16(cast[uint32](effectRegistryId) and 0xFFFF'u32))
+    if effectData.isNone:
+      return readErr[R](messageRead("Invalid effect_id!"))
     # Effect parameters
     let amplifier = tryRead(R, getVarInt(r)).value
     let duration = tryRead(R, getVarInt(r)).value
@@ -281,14 +301,17 @@ proc deserializeStatusEffects(r: var NetReader): ProtoReadResult[seq[StatusEffec
     # Hidden effect (optional, recursive) - we skip it for now
     if tryRead(R, getBool(r)):
       tryReadVoid(R, skipEffectParameters(r))
-    customEffects.add(StatusEffectInstance(effectId: effectRegistryId, amplifier: amplifier,
+    customEffects.add(StatusEffectInstance(effectId: effectData.unsafeGet.minecraftName, amplifier: amplifier,
       duration: duration, ambient: ambient, showParticles: showParticles, showIcon: showIcon))
   readOk(customEffects)
 
-proc serializeStatusEffects(effects: seq[StatusEffectInstance]; w: var NetWriter) =
+proc serializeStatusEffects(effects: seq[StatusEffectInstance]; w: var NetWriter): ProtoWriteVoidResult =
   writeVarInt(w, newVarInt(int32(effects.len)))
   for effect in effects:
-    writeVarInt(w, newVarInt(effect.effectId))
+    let effectData = StatusEffect.fromMinecraftName(effect.effectId)
+    if effectData.isNone:
+      return writeErrVoid(messageWrite("Invalid status effect: " & effect.effectId))
+    writeVarInt(w, newVarInt(int32(effectData.unsafeGet.registryId)))
     # Effect parameters
     writeVarInt(w, newVarInt(effect.amplifier))
     writeVarInt(w, newVarInt(effect.duration))
@@ -297,9 +320,19 @@ proc serializeStatusEffects(effects: seq[StatusEffectInstance]; w: var NetWriter
     writeBool(w, effect.showIcon)
     # No hidden effect for now
     writeBool(w, false)
+  writeOkVoid()
 
 proc readIdOrSound(r: var NetReader): ProtoReadResult[IdOr[SoundEvent]] =
   readIdOr[SoundEvent](r, readSoundEvent)
+
+proc protoToDataSound(idOr: IdOr[SoundEvent]): bool =
+  ## `proto_to_data_sound(..).is_some()`: an id must index `Sound::NAMES`, and the name must resolve.
+  ## A value passes through. The sound itself is carried as the wire's `IdOr`.
+  case idOr.kind
+  of iokId:
+    int(idOr.id) < 1968 and sounddata.fromName(sounddata.toName(sounddata.Sound(int(idOr.id))))[0]
+  of iokValue:
+    true
 
 proc writeIdOrSound(w: var NetWriter; v: IdOr[SoundEvent]): ProtoWriteVoidResult =
   writeIdOr[SoundEvent](v, w, writeSoundEvent)
@@ -314,7 +347,7 @@ proc deserializeConsumeEffect(r: var NetReader): ProtoReadResult[ConsumeEffect] 
     let effects = tryRead(ConsumeEffect, deserializeStatusEffects(r))
     readOk(ConsumeEffect(kind: ceApplyEffects, effects: effects, probability: probability))
   of 1'i32:
-    let idset = tryRead(ConsumeEffect, deserializeIdset(r))
+    let idset = tryRead(ConsumeEffect, deserializeIdset(r, icStatusEffect))
     readOk(ConsumeEffect(kind: ceRemoveEffects, removed: idset))
   of 2'i32:
     readOk(ConsumeEffect(kind: ceClearAllEffects))
@@ -325,6 +358,8 @@ proc deserializeConsumeEffect(r: var NetReader): ProtoReadResult[ConsumeEffect] 
     let soundRes = readIdOrSound(r)
     if not soundRes.isOk:
       return readErr[ConsumeEffect](messageRead("No sound IdOr<SoundEvent> in ConsumeEffect: " & soundRes.error.msg))
+    if not protoToDataSound(soundRes.value):
+      return readErr[ConsumeEffect](messageRead("Invalid sound in ConsumeEffect"))
     readOk(ConsumeEffect(kind: cePlaySound, sound: soundRes.value))
   else:
     readErr[ConsumeEffect](messageRead("Invalid effect_type in ConsumeEffect"))
@@ -333,7 +368,7 @@ proc serializeConsumeEffect(effect: ConsumeEffect; w: var NetWriter): ProtoWrite
   writeVarInt(w, newVarInt(int32(ord(effect.kind))))
   case effect.kind
   of ceApplyEffects:
-    serializeStatusEffects(effect.effects, w)
+    tryWrite serializeStatusEffects(effect.effects, w)
     writeF32(w, effect.probability)
     writeOkVoid()
   of ceRemoveEffects:
@@ -370,7 +405,7 @@ proc writeEnchantmentList(list: seq[EnchantmentEntry]; w: var NetWriter) =
     writeVarInt(w, newVarInt(int32(entry.id)))
     writeVarInt(w, newVarInt(entry.level))
 
-proc readEnchantmentList(r: var NetReader): ProtoReadResult[seq[EnchantmentEntry]] =
+proc readEnchantmentList(r: var NetReader; enchantmentError: string): ProtoReadResult[seq[EnchantmentEntry]] =
   const MaxEnchantments = 256
   type R = seq[EnchantmentEntry]
   let len = tryRead(R, getVarInt(r)).value
@@ -381,6 +416,8 @@ proc readEnchantmentList(r: var NetReader): ProtoReadResult[seq[EnchantmentEntry
     # `as u8`: only the low byte counts.
     let id = uint8(cast[uint32](tryRead(R, getVarInt(r)).value) and 0xFF'u32)
     let level = tryRead(R, getVarInt(r)).value
+    if Enchantment.fromId(id).isNone:
+      return readErr[R](messageRead(enchantmentError))
     enc.add(EnchantmentEntry(id: id, level: level))
   readOk(enc)
 
@@ -388,14 +425,14 @@ proc serialize*(self: EnchantmentsImpl; w: var NetWriter) =
   writeEnchantmentList(self.enchantment, w)
 
 proc deserialize*(_: typedesc[EnchantmentsImpl]; r: var NetReader): ProtoReadResult[EnchantmentsImpl] =
-  let list = tryRead(EnchantmentsImpl, readEnchantmentList(r))
+  let list = tryRead(EnchantmentsImpl, readEnchantmentList(r, "EnchantmentsImpl Enchantment VarInt Incorrect!"))
   readOk(EnchantmentsImpl(enchantment: list))
 
 proc serialize*(self: StoredEnchantmentsImpl; w: var NetWriter) =
   writeEnchantmentList(self.enchantment, w)
 
 proc deserialize*(_: typedesc[StoredEnchantmentsImpl]; r: var NetReader): ProtoReadResult[StoredEnchantmentsImpl] =
-  let list = tryRead(StoredEnchantmentsImpl, readEnchantmentList(r))
+  let list = tryRead(StoredEnchantmentsImpl, readEnchantmentList(r, "StoredEnchantmentsImpl Enchantment VarInt Incorrect!"))
   readOk(StoredEnchantmentsImpl(enchantment: list))
 
 proc serialize*(self: UnbreakableImpl; w: var NetWriter) =
@@ -441,6 +478,8 @@ proc deserialize*(_: typedesc[ConsumableImpl]; r: var NetReader): ProtoReadResul
     return readErr[ConsumableImpl](messageRead("Invalid ConsumableImpl animation id!"))
   let soundEvent = tryRead(ConsumableImpl, readIdOrSound(r))
   let consumeParticles = tryRead(ConsumableImpl, getBool(r))
+  if not protoToDataSound(soundEvent):
+    return readErr[ConsumableImpl](messageRead("Invalid sound in ConsumableImpl"))
   let effectsLen = tryRead(ConsumableImpl, getVarInt(r)).value
   var effects: seq[ConsumeEffect] = @[]
   for i in 0 ..< effectsLen:
@@ -476,6 +515,8 @@ proc deserialize*(_: typedesc[EquippableImpl]; r: var NetReader): ProtoReadResul
   if slotIndex < 0'i32 or slotIndex > 7'i32:
     return readErr[EquippableImpl](messageRead("Invalid equipment slot index " & $slotIndex))
   let equipSound = tryRead(EquippableImpl, readIdOrSound(r))
+  if not protoToDataSound(equipSound):
+    return readErr[EquippableImpl](messageRead("Invalid sound in EquippableImpl"))
 
   var assetId = none[string]()
   if tryRead(EquippableImpl, getBool(r)):
@@ -488,7 +529,7 @@ proc deserialize*(_: typedesc[EquippableImpl]; r: var NetReader): ProtoReadResul
   let hasAllowedEntities = tryRead(EquippableImpl, getBool(r))
   var allowedEntities = IDSet(kind: idsIds, ids: @[])
   if hasAllowedEntities:
-    allowedEntities = tryRead(EquippableImpl, deserializeIdset(r))
+    allowedEntities = tryRead(EquippableImpl, deserializeIdset(r, icEntityType))
 
   let dispensable = tryRead(EquippableImpl, getBool(r))
   let swappable = tryRead(EquippableImpl, getBool(r))
@@ -496,6 +537,8 @@ proc deserialize*(_: typedesc[EquippableImpl]; r: var NetReader): ProtoReadResul
   let equipOnInteract = tryRead(EquippableImpl, getBool(r))
   let canBeSheared = tryRead(EquippableImpl, getBool(r))
   let shearingSound = tryRead(EquippableImpl, readIdOrSound(r))
+  if not protoToDataSound(shearingSound):
+    return readErr[EquippableImpl](messageRead("Invalid sound in EquippableImpl shearing sound"))
 
   readOk(EquippableImpl(slot: EquipmentSlot(slotIndex), equipSound: equipSound, assetId: assetId,
     cameraOverlay: cameraOverlay, hasAllowedEntities: hasAllowedEntities, allowedEntities: allowedEntities,
@@ -512,7 +555,7 @@ proc serialize*(self: PotionContentsImpl; w: var NetWriter): ProtoWriteVoidResul
   if self.customColor.isSome:
     writeI32(w, self.customColor.unsafeGet)
   # Custom effects list
-  serializeStatusEffects(self.customEffects, w)
+  tryWrite serializeStatusEffects(self.customEffects, w)
   # Custom name (optional)
   writeBool(w, self.customName.isSome)
   if self.customName.isSome:

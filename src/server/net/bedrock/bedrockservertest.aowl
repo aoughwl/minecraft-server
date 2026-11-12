@@ -1,0 +1,541 @@
+{.feature: "untyped".}
+## Test for bedrockclient.aowl, bedrocklogin.aowl and bedrockserver.aowl: a whole Bedrock session driven in memory, with no
+## socket (the server's `sendTo` collects the datagrams). The client side is written here from the RakNet layout and the
+## Bedrock login flow, not from the code under test: offline ping/pong and the open connection handshake (expected bytes
+## worked out by hand, guid and MTU BIG-endian), the connection request, RequestNetworkSettings, a Login with a self-made
+## token, the encrypted handshake (the test does the ECDH and the key derivation itself and checks that what the server sends
+## decrypts), the resource pack exchange, then reliability: resend of an unacknowledged datagram, a split frame in each direction,
+## an ordered frame that arrives early, duplicates, and the 10 second timeout.
+
+import std/[options]
+import ../../../protocol/bedrock/bedrocktestutil
+import ../../../protocol/bedrock/[bedrockmod, ack, frame_set, packet_decoder, packet_encoder]
+import ../../../protocol/bedrock/server/[login as slogin, text]
+import ../../../protocol/proto
+import ../../../util/jwtmod
+import ../../../config/networking/bedrock
+import ../../../config/resource_pack as rpconfig
+import ../../../config/networking/compression
+import ../../../util/javaversion
+import ../netbase
+import ../winsock
+import bedrockserver
+import ecdsa, sha2
+
+const
+  ServerGuid = 0x1122334455667788'u64
+  Magic = "00ffff00fefefefefdfdfdfd12345678"
+  ClientGuid = 0x0102030405060708'u64
+
+# --- base64, for the tokens ---------------------------------------------------------------------------------------
+const B64Std = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+
+proc b64(data: openArray[byte]; urlSafe, padded: bool): string =
+  result = ""
+  var i = 0
+  while i < data.len:
+    let b0 = uint32(data[i])
+    let b1 = if i + 1 < data.len: uint32(data[i + 1]) else: 0'u32
+    let b2 = if i + 2 < data.len: uint32(data[i + 2]) else: 0'u32
+    let n = (b0 shl 16) or (b1 shl 8) or b2
+    let chars = [B64Std[int((n shr 18) and 63'u32)], B64Std[int((n shr 12) and 63'u32)], B64Std[int((n shr 6) and 63'u32)],
+      B64Std[int(n and 63'u32)]]
+    let take = if i + 2 < data.len: 4 elif i + 1 < data.len: 3 else: 2
+    for k in 0 ..< take:
+      var c = chars[k]
+      if urlSafe:
+        if c == '+': c = '-'
+        elif c == '/': c = '_'
+      result.add(c)
+    if padded:
+      for k in take ..< 4:
+        result.add('=')
+    i += 3
+
+proc b64Decode(s: string): seq[byte] =
+  result = @[]
+  var acc = 0'u32
+  var bits = 0
+  for ch in s:
+    var v = -1
+    for k in 0 ..< 64:
+      if B64Std[k] == ch:
+        v = k
+    if ch == '-': v = 62
+    if ch == '_': v = 63
+    if v < 0:
+      continue
+    acc = (acc shl 6) or uint32(v)
+    bits += 6
+    if bits >= 8:
+      bits -= 8
+      result.add(uint8((acc shr uint32(bits)) and 0xFF'u32))
+
+proc strBytes(s: string): seq[byte] =
+  result = @[]
+  for c in s:
+    result.add(uint8(c))
+
+proc fe(rest: seq[byte]): seq[byte] =
+  result = @[0xfe'u8]
+  for b in rest:
+    result.add(b)
+
+proc bytesStr(b: seq[byte]): string =
+  result = ""
+  for x in b:
+    result.add(char(x))
+
+proc jsonField(text, key: string): string =
+  ## The string value of `"key":"..."` in flat JSON text.
+  let needle = "\"" & key & "\":\""
+  var i = 0
+  while i + needle.len <= text.len:
+    if text[i ..< i + needle.len] == needle:
+      var j = i + needle.len
+      var r = ""
+      while j < text.len and text[j] != '"':
+        r.add(text[j])
+        inc j
+      return r
+    inc i
+  ""
+
+# --- the in-memory client ------------------------------------------------------------------------------------------
+type
+  TestClient = ref object
+    server: BedrockServer
+    peer: UdpPeer
+    sent: seq[seq[byte]]          ## What the server has sent, not yet read.
+    encoder: UDPNetworkEncoder
+    decoder: UDPNetworkDecoder
+    seqNo: uint32
+    reliable: uint32
+    ordered: uint32
+    pendingFragments: seq[Frame]
+    acksSeen: seq[uint32]
+    seenSequences: seq[uint32]
+    duplicates: int
+
+var now = 1000'i64
+let peerA = UdpPeer(ip: ipv4(127, 0, 0, 1), port: 50000'u16)
+
+proc newTestClient(server: BedrockServer; peer: UdpPeer): TestClient =
+  TestClient(server: server, peer: peer, sent: @[], encoder: newUDPNetworkEncoder(), decoder: newUDPNetworkDecoder(),
+    pendingFragments: @[], acksSeen: @[], seenSequences: @[])
+
+proc offline(c: TestClient; data: seq[byte]) =
+  c.server.handleDatagram(c.peer, data, now)
+
+proc takeSent(c: TestClient): seq[seq[byte]] =
+  result = c.sent
+  c.sent = @[]
+
+proc sendDatagramFrame(c: TestClient; frame: Frame; sequence: uint32) =
+  var w = newNetWriter()
+  FrameSet(sequence: U24(value: sequence), frames: @[frame]).writePacketData(w, 0x84'u8)
+  c.server.handleDatagram(c.peer, w.buf, now)
+
+proc sendRak(c: TestClient; payload: seq[byte]) =
+  ## One ReliableOrdered frame in its own datagram.
+  var f = defaultFrame()
+  f.payload = payload
+  f.reliableNumber = c.reliable
+  f.orderIndex = c.ordered
+  c.reliable += 1'u32
+  c.ordered += 1'u32
+  c.sendDatagramFrame(f, c.seqNo)
+  c.seqNo += 1'u32
+
+proc sendGame(c: TestClient; id: int32; body: seq[byte]) =
+  var wire = newNetWriter()
+  check(c.encoder.writeGamePacket(uint16(id), scMain, scMain, body, wire).isOk, "client write game packet")
+  var data = wire.buf
+  if c.encoder.hasEncryptor:
+    var rest = data[1 ..< data.len]
+    c.encoder.encryptor.encrypt(rest)
+    data = @[0xfe'u8]
+    for b in rest:
+      data.add(b)
+  c.sendRak(data)
+
+type Incoming = object
+  rak: seq[seq[byte]]        ## RakNet messages (id first).
+  game: seq[RawPacket]
+
+proc readServer(c: TestClient; datagrams: seq[seq[byte]]): Incoming =
+  ## Takes the datagrams the server sent apart: acks are noted, frames reassembled, game batches decoded.
+  result = Incoming(rak: @[], game: @[])
+  for d in datagrams:
+    var r = newNetReader(d)
+    let head = getU8(r).value
+    if head == RAKNET_ACK:
+      let a = readAcknowledge(r)
+      check(a.isOk, "ack parses")
+      for s in a.value.sequences:
+        c.acksSeen.add(s)
+      continue
+    check(head >= 0x80'u8 and head <= 0x8d'u8, "datagram is a frame set")
+    let fs = readFrameSet(r)
+    check(fs.isOk, "frame set parses")
+    if fs.value.sequence.value in c.seenSequences:
+      c.duplicates += 1   # a resend of a datagram already read: a real client drops it by sequence number
+      continue
+    c.seenSequences.add(fs.value.sequence.value)
+    for f in fs.value.frames:
+      var payload = f.payload
+      if f.splitSize > 0'u32:
+        c.pendingFragments.add(f)
+        if uint32(c.pendingFragments.len) < f.splitSize:
+          continue
+        payload = @[]
+        for i in 0 ..< int(f.splitSize):
+          var found = false
+          for p in c.pendingFragments:
+            if p.splitIndex == uint32(i):
+              for b in p.payload:
+                payload.add(b)
+              found = true
+          check(found, "all fragments present")
+        c.pendingFragments = @[]
+      if payload.len > 0 and payload[0] == 0xfe'u8:
+        let batch = c.decoder.getPacketPayload(payload)
+        check(batch.isOk, "client decodes the server's batch")
+        var cursor = newNetReader(batch.value)
+        while remaining(cursor) > 0:
+          let gp = c.decoder.getGamePacket(cursor)
+          check(gp.isOk, "client reads a game packet")
+          result.game.add(gp.value)
+      else:
+        result.rak.add(payload)
+
+proc ackFor(c: TestClient; sequences: seq[uint32]) =
+  var w = newNetWriter()
+  newAcknowledge(sequences).write(w, RAKNET_ACK)
+  c.server.handleDatagram(c.peer, w.buf, now)
+
+# --- the server -----------------------------------------------------------------------------------------------------
+type Recorder = ref object
+  ready: int
+  profileName: string
+  profileUuid: string
+  locale: string
+  playPackets: seq[int32]
+  completed: int
+  closed: int
+
+proc main() =
+  var rec = Recorder(playPackets: @[])
+  var bcfg = defaultBedrockConfig()
+  bcfg.onlineMode = false
+  bcfg.encryption = true
+  bcfg.maxPlayers = 5'u32
+  bcfg.motd = "Test Server"
+  let hooks = BedrockHooks()
+  hooks.onReadyToPlay = proc(client: BedrockClient; profile: GameProfile; cfg: PlayerConfig) {.closure.} =
+    rec.ready += 1
+    rec.profileName = profile.name
+    rec.profileUuid = $profile.id
+    rec.locale = cfg.locale
+    client.hasPlayer = true
+  hooks.onPlayPacket = proc(client: BedrockClient; packet: RawPacket) {.closure.} =
+    rec.playPackets.add(packet.id)
+  hooks.onResourcePacksCompleted = proc(client: BedrockClient): bool {.closure.} =
+    rec.completed += 1
+    true
+  hooks.onClientClosed = proc(client: BedrockClient) {.closure.} =
+    rec.closed += 1
+  hooks.playerCount = proc(): int {.closure.} = rec.ready
+  hooks.gameMode = proc(): string {.closure.} = "Survival"
+  hooks.levelName = proc(): string {.closure.} = "World"
+  let ctx = newBedrockContext(bcfg, rpconfig.defaultBedrockResourcePackConfig(), hooks, ServerGuid)
+  var outbox: seq[seq[byte]] = @[]
+  let server = newBedrockServer(ctx, proc(peer: UdpPeer; data: seq[byte]) {.closure.} =
+    outbox.add(data), 19132'u16)
+  let c = newTestClient(server, peerA)
+
+  proc pull() {.closure.} =
+    for d in outbox:
+      c.sent.add(d)
+    outbox = @[]
+
+  # --- 1. Unconnected ping -> pong. Everything RakNet is big-endian: time, guid, the string length. -----------------
+  c.offline(hx("01 0000000000012345 " & Magic & " 0102030405060708"))
+  pull()
+  let info = "MCPE;Test Server;1001;1.26.30;0;5;1234605616436508552;World;Survival;1;19132;19133;0;"
+  eqHex(c.sent[0], "1c 0000000000012345 1122334455667788 " & Magic & " 0055 " & utf8Hex(info), "unconnected pong")
+  discard c.takeSent()
+  c.offline(hx("02 0000000000000007 " & Magic & " 0102030405060708"))
+  pull()
+  check(c.sent[0][0] == 0x1c'u8 and c.sent[0].len == 1 + 8 + 8 + 16 + 2 + 85, "ping from open connections is answered the same")
+  discard c.takeSent()
+
+  # --- 2. Open connection 1 and 2 ------------------------------------------------------------------------------------
+  c.offline(hx("05 " & Magic & " 0b 0578 0000000000000000"))
+  pull()
+  eqHex(c.sent[0], "06 " & Magic & " 1122334455667788 00 0578", "open connection reply 1: guid and MTU big-endian")
+  discard c.takeSent()
+  c.offline(hx("05 " & Magic & " 0a 0578"))
+  pull()
+  eqHex(c.sent[0], "19 0b " & Magic & " 1122334455667788", "incompatible protocol version")
+  discard c.takeSent()
+  c.offline(hx("07 " & Magic & " 04 80fffffe 4abc 0578 0102030405060708"))
+  pull()
+  eqHex(c.sent[0], "08 " & Magic & " 1122334455667788 04 80fffffe c350 0578 00", "open connection reply 2: address inverted, port and MTU big-endian")
+  discard c.takeSent()
+  c.offline(hx("99 00"))   # unknown offline id: logged, no answer
+  pull()
+  check(c.sent.len == 0, "unknown offline packet gets no answer")
+
+  # --- 3. Connection request ------------------------------------------------------------------------------------------
+  c.sendRak(hx("09 0102030405060708 0000000000012345 00"))
+  pull()
+  check(c.sent.len == 2, "ack and accept")
+  check(c.sent[1][0] == RAKNET_ACK, "the datagram is acknowledged at once, after the reply")
+  let accepted = c.readServer(c.takeSent())
+  check(c.acksSeen == @[0'u32], "ack for datagram 0")
+  # The accept: id 0x10, address, system index, ten addresses, requested time echoed big-endian, timestamp.
+  check(accepted.rak.len == 1 and accepted.rak[0][0] == 0x10'u8, "connection request accepted")
+  eqHex(accepted.rak[0][0 ..< 1 + 7 + 2], "10 04 80fffffe c350 0000", "accepted: client address as SystemAddress, system index")
+  check(accepted.rak[0].len == 1 + 7 + 2 + 70 + 8 + 8, "accepted length")
+  eqHex(accepted.rak[0][1 + 7 + 2 + 70 ..< 1 + 7 + 2 + 70 + 8], "0000000000012345", "accepted: request time echoed")
+  c.sendRak(hx("13 " & "04 80fffffe 4abc " & "04 80fffffe c350 " & "0000000000012345 0000000000012346"))
+  # Connected ping -> pong, big-endian.
+  c.sendRak(hx("00 000000000000abcd"))
+  pull()
+  let pong = c.readServer(c.takeSent())
+  check(pong.rak.len == 1 and pong.rak[0][0] == 0x03'u8, "connected pong")
+  eqHex(pong.rak[0][0 ..< 9], "03 000000000000abcd", "pong echoes the ping time, big-endian")
+
+  # --- 4. Request network settings -------------------------------------------------------------------------------------
+  var body = newNetWriter()
+  packetWriteBe(1001'i32, body)
+  c.sendGame(0xC1'i32, body.buf)
+  pull()
+  let settings = c.readServer(c.takeSent())
+  check(settings.game.len == 1 and settings.game[0].id == 143'i32, "network settings")
+  # Threshold 256 (LE u16), zlib (0), no throttle.
+  eqHex(settings.game[0].payload, "0001 0000 00 00 00000000", "network settings body")
+  c.encoder.setCompression(256, 4'u32)
+  c.decoder.setCompression(256)
+
+  # An outdated client gets PlayStatus 1, a newer one 2 (big-endian i32) -- on a second connection.
+  block:
+    let peerB = UdpPeer(ip: ipv4(127, 0, 0, 1), port: 50001'u16)
+    let b = newTestClient(server, peerB)
+    var oldBody = newNetWriter()
+    packetWriteBe(900'i32, oldBody)
+    b.sendGame(0xC1'i32, oldBody.buf)
+    pull()
+    let r1 = b.readServer(c.takeSent())
+    check(r1.game.len == 1 and r1.game[0].id == 2'i32, "play status for an old client")
+    eqHex(r1.game[0].payload, "00000001", "outdated client")
+    var newBody = newNetWriter()
+    packetWriteBe(2000'i32, newBody)
+    b.sendGame(0xC1'i32, newBody.buf)
+    pull()
+    let r2 = b.readServer(c.takeSent())
+    eqHex(r2.game[0].payload, "00000002", "outdated server")
+    check(server.clients.len == 2, "two clients")
+    server.clients[1].close()
+    server.tickClients(now)
+    check(server.clients.len == 1, "a closed client is dropped")
+    pull()
+    discard c.takeSent()
+
+  # --- 5. Login with the encrypted handshake ---------------------------------------------------------------------------
+  var clientSecret = newSeq[byte](48)
+  for i in 0 ..< 48:
+    clientSecret[i] = uint8(i * 5 + 3)
+  let clientKey = signingKeyFromBytes(clientSecret).value
+  let clientPubB64 = b64(toPublicKeyDer(verifyingKey(clientKey)), false, true)
+  let tokenHeader = "{\"alg\":\"ES384\",\"x5u\":\"" & clientPubB64 & "\"}"
+  let tokenPayload = "{\"cpk\":\"" & clientPubB64 & "\",\"xname\":\"Steve Test\",\"xid\":\"2535400000000001\",\"exp\":9999999999}"
+  let tokenSigningInput = b64(strBytes(tokenHeader), true, false) & "." & b64(strBytes(tokenPayload), true, false)
+  let token = tokenSigningInput & "." & b64(signEs384(clientKey, strBytes(tokenSigningInput)), true, false)
+  let identity = "{\"AuthenticationType\":2,\"Token\":\"" & token & "\",\"Certificate\":\"\"}"
+  let clientDataJson = "{\"ClientRandomId\":-123456789012,\"DeviceOS\":7,\"DeviceId\":\"dev-1\",\"GameVersion\":\"1.26.30\"," &
+    "\"LanguageCode\":\"en_US\",\"CurrentInputMode\":1,\"DefaultInputMode\":2,\"UIProfile\":0,\"ServerAddress\":\"localhost:19132\"," &
+    "\"MaxViewDistance\":12}"
+  let rawToken = b64(strBytes("{\"alg\":\"ES384\"}"), true, false) & "." & b64(strBytes(clientDataJson), true, false) & ".c2ln"
+  var login = newNetWriter()
+  packetWriteBe(1001'i32, login)
+  let jwtBytes = strBytes(identity)
+  let tokenBytes = strBytes(rawToken)
+  packetWrite(newVarUInt(uint32(4 + jwtBytes.len + 4 + tokenBytes.len)), login)
+  packetWrite(uint32(jwtBytes.len), login)
+  writeSlice(login, jwtBytes)
+  packetWrite(uint32(tokenBytes.len), login)
+  writeSlice(login, tokenBytes)
+  c.sendGame(1'i32, login.buf)
+  pull()
+  let hs = c.readServer(c.takeSent())
+  check(hs.game.len == 1 and hs.game[0].id == 3'i32, "server handshake")
+  var hr = newNetReader(hs.game[0].payload)
+  let jwtLen = getVarUInt(hr).value.value
+  let handshakeJwt = bytesStr(readSlice(hr, int(jwtLen)).value)
+  let jwtParts = [jsonField(bytesStr(b64Decode(handshakeJwt[0 ..< handshakeJwt.find('.')])), "x5u"), handshakeJwt]
+  check(jwtParts[0].len > 0, "handshake jwt has an x5u")
+  var dot1 = 0
+  var dot2 = 0
+  for i in 0 ..< handshakeJwt.len:
+    if handshakeJwt[i] == '.':
+      if dot1 == 0: dot1 = i
+      else: dot2 = i
+  let saltB64 = jsonField(bytesStr(b64Decode(handshakeJwt[dot1 + 1 ..< dot2])), "salt")
+  let salt = b64Decode(saltB64)
+  check(salt.len == 16, "salt is 16 bytes")
+  # The handshake JWT is signed ES384 by the key in its x5u.
+  let serverPub = buildPublicKeyFromB64(jwtParts[0])
+  check(serverPub.isOk, "server public key")
+  check(verifyEs384Signature(serverPub.value, handshakeJwt[0 ..< dot2], handshakeJwt[dot2 + 1 ..< handshakeJwt.len]).value, "handshake signature verifies")
+  let secret = computeSharedSecret(clientKey, serverPub.value)
+  var keyInput = salt
+  for b in secret:
+    keyInput.add(b)
+  let digest = sha256(keyInput)
+  var keyBytes: array[32, uint8]
+  for i in 0 ..< 32:
+    keyBytes[i] = digest[i]
+  check(c.encoder.setEncryption(keyBytes).isOk and c.decoder.setEncryption(keyBytes).isOk, "client encryption on")
+  check(rec.ready == 0, "not ready before the client's handshake")
+  c.sendGame(4'i32, @[])
+  pull()
+  let afterHandshake = c.readServer(c.takeSent())
+  check(afterHandshake.game.len == 2, "login success and packs info")
+  check(afterHandshake.game[0].id == 2'i32, "play status")
+  eqHex(afterHandshake.game[0].payload, "00000000", "login success")
+  check(afterHandshake.game[1].id == 6'i32, "resource packs info")
+  check(rec.ready == 1 and rec.profileName == "Steve_Test" and rec.locale == "en_US", "hook saw the profile: " & rec.profileName)
+  check(rec.profileUuid.len == 36, "uuid")
+
+  # --- 6. Resource packs ------------------------------------------------------------------------------------------------
+  c.sendGame(8'i32, hx("03 0000"))
+  pull()
+  let stack = c.readServer(c.takeSent())
+  check(stack.game.len == 1 and stack.game[0].id == 7'i32, "resource pack stack")
+  check(rec.completed == 0, "not completed yet")
+  c.sendGame(8'i32, hx("04 0000"))
+  check(rec.completed == 1, "completed reaches the hook")
+  c.sendGame(0x4D'i32, hx("0102"))
+  check(rec.playPackets == @[0x4D'i32], "other play packets go to the hook")
+
+  # --- 7. Reliability ----------------------------------------------------------------------------------------------------
+  # Nothing the server has sent was acknowledged: the next tick after a second resends it.
+  discard c.takeSent()
+  now += 1200
+  server.tickClients(now)
+  pull()
+  let resent = c.takeSent()
+  check(resent.len > 0, "unacknowledged datagrams are resent")
+  discard c.readServer(resent)
+  # Five datagrams were reliable (settings, handshake, login success, packs info, pack stack); the accept and the pong were unreliable and are not resent. The rest are acknowledgements.
+  check(c.duplicates == 5, "the five reliable datagrams are resent: " & $c.duplicates)
+  # Acknowledge everything the server numbered so far; nothing is resent after that.
+  var everything: seq[uint32] = @[]
+  for s in 0'u32 ..< 20'u32:
+    everything.add(s)
+  c.ackFor(everything)
+  now += 1200
+  server.tickClients(now)
+  pull()
+  check(c.sent.len == 0, "acknowledged datagrams are not resent")
+
+  # A game packet too big for one datagram goes out in fragments that the client reassembles.
+  var big = newSeq[byte](5000)
+  var lcg = 12345'u32
+  for i in 0 ..< big.len:
+    lcg = lcg * 1103515245'u32 + 12345'u32
+    big[i] = uint8((lcg shr 16) and 0xFF'u32)
+  let sc = server.clients[0]
+  sc.sendGameBody(0x2A'i32, big)
+  pull()
+  let bigDatagrams = c.takeSent()
+  check(bigDatagrams.len == 4, "5000 bytes plus header in four fragments: " & $bigDatagrams.len)
+  let bigIn = c.readServer(bigDatagrams)
+  check(bigIn.game.len == 1 and bigIn.game[0].id == 0x2A'i32 and bigIn.game[0].payload == big, "split game packet reassembled")
+
+  # A split frame from the client: a connected ping in three fragments, sent out of order.
+  block:
+    let ping = hx("00 0000000000001111")
+    var fragments: seq[Frame] = @[]
+    for i in 0 ..< 3:
+      var f = defaultFrame()
+      f.payload = ping[i * 3 ..< i * 3 + 3]
+      f.reliableNumber = c.reliable
+      c.reliable += 1'u32
+      f.orderIndex = c.ordered
+      f.splitSize = 3'u32
+      f.splitId = 7'u16
+      f.splitIndex = uint32(i)
+      fragments.add(f)
+    c.ordered += 1'u32
+    for i in [2, 0, 1]:
+      c.sendDatagramFrame(fragments[i], c.seqNo)
+      c.seqNo += 1'u32
+    pull()
+    let r = c.readServer(c.takeSent())
+    check(r.rak.len == 1 and r.rak[0][0] == 0x03'u8, "split ping answered once all fragments arrived")
+    eqHex(r.rak[0][0 ..< 9], "03 0000000000001111", "split ping time")
+
+  # An ordered frame ahead of its turn waits; a duplicate datagram is ignored.
+  block:
+    let before = rec.playPackets.len
+    # Two game packets; the second is sent first (order index +1).
+    var w1 = newNetWriter()
+    check(c.encoder.writeGamePacket(0x50'u16, scMain, scMain, @[1'u8], w1).isOk, "w1")
+    var d1 = w1.buf
+    var r1 = d1[1 ..< d1.len]
+    c.encoder.encryptor.encrypt(r1)
+    var w2 = newNetWriter()
+    check(c.encoder.writeGamePacket(0x51'u16, scMain, scMain, @[2'u8], w2).isOk, "w2")
+    var r2 = w2.buf[1 ..< w2.buf.len]
+    c.encoder.encryptor.encrypt(r2)
+    var f1 = defaultFrame()
+    f1.payload = fe(r1)
+    f1.orderIndex = c.ordered
+    f1.reliableNumber = c.reliable
+    var f2 = defaultFrame()
+    f2.payload = fe(r2)
+    f2.orderIndex = c.ordered + 1'u32
+    f2.reliableNumber = c.reliable + 1'u32
+    c.ordered += 2'u32
+    c.reliable += 2'u32
+    c.sendDatagramFrame(f2, c.seqNo)
+    c.seqNo += 1'u32
+    check(rec.playPackets.len == before, "an early ordered frame is held back")
+    c.sendDatagramFrame(f1, c.seqNo)
+    c.seqNo += 1'u32
+    check(rec.playPackets.len == before + 2 and rec.playPackets[before] == 0x50'i32 and rec.playPackets[before + 1] == 0x51'i32,
+      "both delivered in order")
+    # The same datagram again changes nothing.
+    c.seqNo -= 1'u32
+    c.sendDatagramFrame(f1, c.seqNo)
+    c.seqNo += 1'u32
+    check(rec.playPackets.len == before + 2, "a duplicate datagram is dropped")
+  discard c.takeSent()
+  outbox = @[]
+
+  # --- 8. Refusals and the timeout -----------------------------------------------------------------------------------------
+  # Another request 2 from an address that is connected is refused with AlreadyConnected.
+  c.offline(hx("07 " & Magic & " 04 80fffffe 4abc 0578 0102030405060708"))
+  pull()
+  eqHex(c.sent[0], "12 " & Magic & " 1122334455667788", "already connected")
+  discard c.takeSent()
+  # A new open connection request while the server is "full" (ready == max players is simulated by the count hook).
+  rec.ready = 5
+  let peerC = UdpPeer(ip: ipv4(127, 0, 0, 1), port: 50002'u16)
+  server.handleDatagram(peerC, hx("05 " & Magic & " 0b 0578"), now)
+  pull()
+  eqHex(c.sent[0], "14 " & Magic & " 1122334455667788", "no free incoming connections")
+  discard c.takeSent()
+  rec.ready = 1
+  # Silence for more than ten seconds closes the client, and it is dropped.
+  let openBefore = server.clients.len
+  now += 11000
+  server.tickClients(now)
+  check(server.clients.len < openBefore, "timed out clients are dropped")
+  check(rec.closed >= 1, "the close hook ran")
+
+main()
+echo "all bedrock server checks passed"

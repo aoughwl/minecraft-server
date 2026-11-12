@@ -1,5 +1,5 @@
 ## Port of pumpkin/src/net/java/login.rs
-## PARTIAL: pumpkin/src/net/java/login.rs - online mode asks Mojang's session server (src/auth/winhttp.aowl, ../authentication.aowl) from inside the loop, so a slow answer holds up every client for up to the config's `connect_timeout` plus `read_timeout`; upstream's await only holds the one connection. Upstream does not compare the verify token the client echoes, and neither does this. Unlike upstream, a failed session check ends the login there instead of carrying on after the kick.
+## PARTIAL: pumpkin/src/net/java/login.rs - online mode asks Mojang's session server (src/auth/asyncget.aowl on a worker thread, `progressLogin` polls it; ../authentication.aowl) so a slow answer holds up only that connection, as upstream. A client that hangs up mid-request leaves its worker to finish, then frees it. Upstream does not compare the verify token the client echoes, and neither does this. Unlike upstream, a failed session check ends the login there instead of carrying on after the kick.
 
 import std/[options, syncio]
 import ../../../protocol/java/client/config/[add_resource_pack, server_links, known_packs, plugin_message]
@@ -10,7 +10,7 @@ import ../../../generated/translation as tr
 import ../../../util/text/text
 import ../../../config/networking/compression
 import ../../connection_cache
-import ../../../auth/winhttp
+import ../../../auth/[winhttp, asyncget]
 import ../../key_store
 import ../authentication
 import ../proxy
@@ -94,6 +94,31 @@ proc handleLoginStart*(self: JavaClient; server: Server; loginStart: SLoginStart
   self.finishLogin(profile)
   self.gameprofile = some(profile)
 
+proc completeLogin(self: JavaClient; server: Server; profile: GameProfile) =
+  ## The end of `handle_encryption_response`: no duplicate UUID or name, then the login succeeds.
+  if server.getPlayerByUuid(profile.id).isSome or server.getPlayerByName(profile.name).isSome:
+    self.kick(translateCross(tr.JAVA_MULTIPLAYER_DISCONNECT_DUPLICATE_LOGIN, tr.JAVA_MULTIPLAYER_DISCONNECT_DUPLICATE_LOGIN))
+    return
+  self.finishLogin(profile)
+
+proc completeAuth(self: JavaClient; server: Server; found: AuthResult) =
+  ## What follows the session server's answer: the profile's actions and textures, then `completeLogin`.
+  let authConfig = server.advancedConfig.networking.java.authentication
+  var checked = found
+  if found.ok:
+    checked = checkProfile(found.profile, authConfig)
+  if not checked.ok:
+    case checked.error.kind
+    of aeFailedResponse:
+      self.kick(translateCross(tr.JAVA_MULTIPLAYER_DISCONNECT_AUTHSERVERS_DOWN, tr.JAVA_MULTIPLAYER_DISCONNECT_AUTHSERVERS_DOWN))
+    of aeUnverifiedUsername:
+      self.kick(translateCross(tr.JAVA_MULTIPLAYER_DISCONNECT_UNVERIFIED_USERNAME, tr.JAVA_MULTIPLAYER_DISCONNECT_UNVERIFIED_USERNAME))
+    else:
+      self.kick(text(checked.error.message))
+    return
+  self.gameprofile = some(checked.profile)
+  self.completeLogin(server, checked.profile)
+
 proc handleEncryptionResponse*(self: JavaClient; server: Server; encryptionResponse: SEncryptionResponse) =
   ## `handle_encryption_response`
   let store = server.keyStore
@@ -115,39 +140,43 @@ proc handleEncryptionResponse*(self: JavaClient; server: Server; encryptionRespo
     return
   let profile0 = self.gameprofile.unsafeGet
 
-  var profile = profile0
   if server.advancedConfig.networking.java.onlineMode:
     # `authenticate`: the session server's say-so, then the profile's actions and textures. Upstream carries on after a
     # failed check, having kicked; that is not done here.
     let authConfig = server.advancedConfig.networking.java.authentication
     let hash = store.getDigest(secret)
-    var found = AuthResult(ok: false, profile: profile, error: authError(aeFailedResponse))
     let configured = server.authTransport
-    if configured == nil:
-      found = authenticate(newWinHttpTransport(), profile.name, hash, self.peerIp, authConfig)
-    else:
-      found = authenticate(configured, profile.name, hash, self.peerIp, authConfig)
-    var checked = found
-    if found.ok:
-      checked = checkProfile(found.profile, authConfig)
-    if not checked.ok:
-      case checked.error.kind
-      of aeFailedResponse:
+    if configured == nil or configured.real:
+      # The answer is fetched on a worker thread, so a slow session server holds up this connection only, as in
+      # upstream; `progressLogin` finishes the login when the thread is done.
+      let job = startAsyncGet(authenticateUrl(profile0.name, hash, self.peerIp, authConfig),
+        int(authConfig.connectTimeout), int(authConfig.readTimeout))
+      if job == nil:
         self.kick(translateCross(tr.JAVA_MULTIPLAYER_DISCONNECT_AUTHSERVERS_DOWN, tr.JAVA_MULTIPLAYER_DISCONNECT_AUTHSERVERS_DOWN))
-      of aeUnverifiedUsername:
-        self.kick(translateCross(tr.JAVA_MULTIPLAYER_DISCONNECT_UNVERIFIED_USERNAME, tr.JAVA_MULTIPLAYER_DISCONNECT_UNVERIFIED_USERNAME))
-      else:
-        self.kick(text(checked.error.message))
+        return
+      self.pendingAuth = job
       return
-    profile = checked.profile
-    self.gameprofile = some(profile)
-
-  # Do not allow duplicate UUIDs or a duplicate username.
-  if server.getPlayerByUuid(profile.id).isSome or server.getPlayerByName(profile.name).isSome:
-    self.kick(translateCross(tr.JAVA_MULTIPLAYER_DISCONNECT_DUPLICATE_LOGIN, tr.JAVA_MULTIPLAYER_DISCONNECT_DUPLICATE_LOGIN))
+    let found = authenticate(configured, profile0.name, hash, self.peerIp, authConfig)
+    self.completeAuth(server, found)
     return
 
-  self.finishLogin(profile)
+  self.completeLogin(server, profile0)
+
+proc progressLogin*(self: JavaClient; server: Server) =
+  ## Called every pass of the loop: takes the session server's answer once the worker thread has it.
+  let job = self.pendingAuth
+  if job == nil:
+    return
+  if self.isClosed:
+    # Nobody will read the answer; wait for the thread to end, then free its memory.
+    if job.pollAsyncGet():
+      discard job.takeAsyncGet()
+      self.pendingAuth = nil
+    return
+  if not job.pollAsyncGet():
+    return
+  self.pendingAuth = nil
+  self.completeAuth(server, authenticateResponse(job.takeAsyncGet()))
 
 proc handleLoginPluginResponse*(self: JavaClient; server: Server; response: SLoginPluginResponse) =
   ## `handle_plugin_response`: the proxy's answer to `velocityRequest`.

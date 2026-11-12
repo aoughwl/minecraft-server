@@ -1,0 +1,118 @@
+## The two P-384 scalar multiplications of a Bedrock encrypted login (the ES384 signature of the handshake JWT and the ECDH
+## with the client's key) on worker threads. No upstream file: upstream runs them on the client's tokio task, where a
+## second of arithmetic only delays that client; here the server loop is one thread and the bignum of ../../../jwt/src
+## takes about a second and a quarter per multiplication (binary long division, not constant time), so it must not run
+## there. Same design as ../../../auth/asyncget.aowl: only raw libc memory crosses between the threads; the worker builds its
+## own aowlmony values from it and copies the answer back, so no refcounted object is touched by two threads.
+##
+## A job is `kind`, its input bytes and its output bytes: kind 0 is `signEs384(key, message)` with the key's 48 byte scalar then
+## the message as input; kind 1 is `computeSharedSecret(key, point)` with the scalar then the point's x and y (48 bytes each).
+
+import ../../../util/jwtmod
+import bignum, ecdsa
+
+type
+  CryptoJobRec = object
+    kind: int
+    inLen: int
+    inp: nil pointer
+    outLen: int
+    outp: nil pointer
+
+  CryptoJob* = ref object
+    job: nil pointer
+    thread: nil pointer
+    collected: bool
+
+proc cMalloc(n: uint): nil pointer {.importc: "malloc", header: "<stdlib.h>".}
+proc cFree(p: nil pointer) {.importc: "free", header: "<stdlib.h>".}
+proc cMemcpy(dst, src: nil pointer; n: uint): nil pointer {.importc: "memcpy", header: "<string.h>".}
+type ThreadStart = proc (param: pointer): uint32 {.stdcall.}
+
+proc createThread(attrs: nil pointer; stack: uint; start: ThreadStart; param: pointer; flags: uint32; id: ptr uint32): nil pointer
+  {.stdcall, importc: "CreateThread", dynlib: "kernel32.dll".}
+proc waitForSingleObject(h: nil pointer; ms: uint32): uint32 {.stdcall, importc: "WaitForSingleObject", dynlib: "kernel32.dll".}
+proc closeHandle(h: nil pointer): int32 {.stdcall, importc: "CloseHandle", dynlib: "kernel32.dll".}
+
+proc copyOutBytes(b: seq[byte]): (nil pointer, int) =
+  if b.len == 0:
+    return (nil, 0)
+  let p = cMalloc(uint(b.len))
+  var tmp = b
+  discard cMemcpy(p, addr tmp[0], uint(b.len))
+  (p, b.len)
+
+proc readOutBytes(p: nil pointer; n: int): seq[byte] =
+  result = newSeq[byte](n)
+  if n > 0:
+    discard cMemcpy(addr result[0], p, uint(n))
+
+proc workerMain(param: pointer): uint32 {.stdcall.} =
+  let job = cast[ptr CryptoJobRec](param)
+  let input = readOutBytes(job.inp, job.inLen)
+  var answer: seq[byte] = @[]
+  var scalar: seq[byte] = @[]
+  for i in 0 ..< 48:
+    scalar.add(input[i])
+  let key = signingKeyFromBytes(scalar)
+  if key.isOk:
+    if job.kind == 0:
+      var message: seq[byte] = @[]
+      for i in 48 ..< input.len:
+        message.add(input[i])
+      answer = signEs384(key.value, message)
+    else:
+      var xb: seq[byte] = @[]
+      var yb: seq[byte] = @[]
+      for i in 0 ..< 48:
+        xb.add(input[48 + i])
+        yb.add(input[96 + i])
+      let point = EcPoint(x: bnFromBytesBE(xb), y: bnFromBytesBE(yb), infinity: false)
+      let secret = computeSharedSecret(key.value, point)
+      for i in 0 ..< 48:
+        answer.add(secret[i])
+  let (p, n) = copyOutBytes(answer)
+  job.outp = p
+  job.outLen = n
+  0'u32
+
+proc startCryptoJob*(kind: int; input: seq[byte]): nil CryptoJob =
+  ## nil when the thread could not be made.
+  let job = cast[ptr CryptoJobRec](cMalloc(uint(sizeof(CryptoJobRec))))
+  job.kind = kind
+  let (p, n) = copyOutBytes(input)
+  job.inp = p
+  job.inLen = n
+  job.outLen = 0
+  job.outp = nil
+  var id = 0'u32
+  let h = createThread(nil, 0'u, workerMain, job, 0'u32, addr id)
+  if h == nil:
+    if job.inp != nil:
+      cFree(job.inp)
+    cFree(job)
+    return nil
+  CryptoJob(job: job, thread: h, collected: false)
+
+proc pollCryptoJob*(self: CryptoJob): bool =
+  ## True once the worker has finished.
+  waitForSingleObject(self.thread, 0'u32) == 0'u32
+
+proc takeCryptoJob*(self: CryptoJob): seq[byte] =
+  ## The answer (empty on a bad key); only after `pollCryptoJob`, and only once.
+  if self.collected:
+    return @[]
+  self.collected = true
+  let job = cast[ptr CryptoJobRec](self.job)
+  result = readOutBytes(job.outp, job.outLen)
+  if job.inp != nil:
+    cFree(job.inp)
+  if job.outp != nil:
+    cFree(job.outp)
+  cFree(job)
+  discard closeHandle(self.thread)
+
+proc pointBytes*(point: EcPoint): seq[byte] =
+  result = bnToBytesBE(point.x, 48)
+  for b in bnToBytesBE(point.y, 48):
+    result.add(b)
