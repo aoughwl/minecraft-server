@@ -1,0 +1,184 @@
+## `<world>/data/scoreboard.dat`: the scoreboard in the layout a vanilla 1.21.11 server saves, `{data: {Objectives, PlayerScores,
+## Teams, DisplaySlots}, DataVersion}`. Not upstream, whose scoreboard lives in memory only, so every objective, score and team
+## was lost when the server stopped and a vanilla save's scoreboard was never read.
+##
+## PARTIAL: number formats (`format` of an objective or a score) are not stored, and `DisplaySlots` is kept as the file had
+## it, since `Scoreboard` here has no display slots. Both would be lost on a vanilla save that used them only if this port
+## rewrote the file from nothing; it merges into the compound it read.
+
+import std/options
+import ../../nbt/tag
+import ../../world/[nbtget, worldfs]
+import ../../protocol/proto
+import ../../protocol/varint
+import ../../protocol/java/client/play/update_objectives
+import ../../util/text/[text, textbase, color, serform]
+import ../serverbase
+import scoreboard
+import worlddata
+
+const
+  ScoreboardFile = "scoreboard.dat"
+  ColorNames = ["black", "dark_blue", "dark_green", "dark_aqua", "dark_red", "dark_purple", "gold", "gray", "dark_gray",
+    "blue", "green", "aqua", "red", "light_purple", "yellow", "white"]
+
+proc renderTypeName(r: RenderType): string =
+  case r
+  of rtInteger: "integer"
+  of rtHearts: "hearts"
+
+proc componentTag(c: TextComponent): NbtTag =
+  c.toNbt()
+
+proc componentOr(c: NbtCompound; name: string; fallback: TextComponent): TextComponent =
+  let (found, tag) = get(c, name)
+  if not found:
+    return fallback
+  let parsed = TextComponent.fromNbt(tag)
+  if parsed.ok: parsed.value else: fallback
+
+proc colorFromName(name: string): NamedColor =
+  for i in 0 ..< ColorNames.len:
+    if ColorNames[i] == name:
+      return NamedColor(i)
+  ncWhite
+
+proc visibilityFromName(name: string): NameTagVisibility =
+  for v in [ntvAlways, ntvNever, ntvHideForOtherTeams, ntvHideForOwnTeam]:
+    if v.toStr() == name:
+      return v
+  ntvAlways
+
+proc collisionFromName(name: string): CollisionRule =
+  for v in [crAlways, crNever, crPushOtherTeams, crPushOwnTeam]:
+    if v.toStr() == name:
+      return v
+  crAlways
+
+proc scoreboardToNbt*(board: Scoreboard; old: NbtCompound): NbtCompound =
+  ## `board` over `old`: the three lists replaced, anything else in the file left.
+  result = old
+  var objectives: seq[NbtTag] = @[]
+  for o in board.objectives:
+    var c = newCompound()
+    put(c, "Name", stringTag(o.name))
+    put(c, "CriteriaName", stringTag(o.criterion))
+    put(c, "DisplayName", componentTag(o.displayName))
+    put(c, "RenderType", stringTag(renderTypeName(o.renderType)))
+    objectives.add(compoundTag(c))
+  insert(result, "Objectives", listTag(objectives))
+  var scores: seq[NbtTag] = @[]
+  for s in board.scores:
+    var c = newCompound()
+    put(c, "Name", stringTag(s.entityName))
+    put(c, "Objective", stringTag(s.objectiveName))
+    put(c, "Score", intTag(s.value.value))
+    if s.locked:
+      put(c, "Locked", boolTag(true))
+    if s.displayName.isSome:
+      put(c, "display", componentTag(s.displayName.unsafeGet))
+    scores.add(compoundTag(c))
+  insert(result, "PlayerScores", listTag(scores))
+  var teams: seq[NbtTag] = @[]
+  for t in board.teams:
+    var c = newCompound()
+    put(c, "Name", stringTag(t.name))
+    put(c, "DisplayName", componentTag(t.displayName))
+    put(c, "TeamColor", stringTag(ColorNames[ord(t.color)]))
+    put(c, "AllowFriendlyFire", boolTag((t.options and 1'i8) != 0'i8))
+    put(c, "SeeFriendlyInvisibles", boolTag((t.options and 2'i8) != 0'i8))
+    put(c, "MemberNamePrefix", componentTag(t.playerPrefix))
+    put(c, "MemberNameSuffix", componentTag(t.playerSuffix))
+    put(c, "NameTagVisibility", stringTag(t.nametagVisibility.toStr()))
+    put(c, "DeathMessageVisibility", stringTag("always"))
+    put(c, "CollisionRule", stringTag(t.collisionRule.toStr()))
+    var members: seq[NbtTag] = @[]
+    for p in t.players:
+      members.add(stringTag(p))
+    put(c, "Players", listTag(members))
+    teams.add(compoundTag(c))
+  insert(result, "Teams", listTag(teams))
+
+proc scoreboardFromNbt*(inner: NbtCompound): Scoreboard =
+  result = newScoreboard()
+  let (hasObjectives, objectives) = nbtList(inner, "Objectives")
+  if hasObjectives:
+    for tag in objectives:
+      if tag.kind != ntkCompound:
+        continue
+      let c = tag.compoundVal
+      let (hasName, name) = nbtString(c, "Name")
+      if not hasName:
+        continue
+      let (_, criterion) = nbtString(c, "CriteriaName")
+      let (_, render) = nbtString(c, "RenderType")
+      var o = newScoreboardObjective(name, componentOr(c, "DisplayName", text(name)),
+        if criterion.len > 0: criterion else: "dummy")
+      if render == "hearts":
+        o.renderType = rtHearts
+      result.objectives.add(o)
+  let (hasScores, scores) = nbtList(inner, "PlayerScores")
+  if hasScores:
+    for tag in scores:
+      if tag.kind != ntkCompound:
+        continue
+      let c = tag.compoundVal
+      let (hasName, name) = nbtString(c, "Name")
+      let (hasObjective, objective) = nbtString(c, "Objective")
+      let (hasScore, value) = nbtInt(c, "Score")
+      if not (hasName and hasObjective and hasScore):
+        continue
+      var display = none[TextComponent]()
+      if c.containsKey("display"):
+        display = some(componentOr(c, "display", text("")))
+      var s = newScoreboardScore(name, objective, newVarInt(value), display, none[NumberFormat]())
+      let (hasLocked, locked) = nbtBool(c, "Locked")
+      s.locked = hasLocked and locked
+      result.scores.add(s)
+  let (hasTeams, teams) = nbtList(inner, "Teams")
+  if hasTeams:
+    for tag in teams:
+      if tag.kind != ntkCompound:
+        continue
+      let c = tag.compoundVal
+      let (hasName, name) = nbtString(c, "Name")
+      if not hasName:
+        continue
+      var t = Team(name: name, displayName: componentOr(c, "DisplayName", text(name)), options: 0'i8,
+        nametagVisibility: ntvAlways, collisionRule: crAlways, color: ncWhite, playerPrefix: text(""),
+        playerSuffix: text(""), players: @[])
+      let (_, colorName) = nbtString(c, "TeamColor")
+      t.color = colorFromName(colorName)
+      let (hasFriendly, friendly) = nbtBool(c, "AllowFriendlyFire")
+      let (hasInvisible, invisible) = nbtBool(c, "SeeFriendlyInvisibles")
+      if hasFriendly and friendly:
+        t.options = t.options or 1'i8
+      if hasInvisible and invisible:
+        t.options = t.options or 2'i8
+      t.playerPrefix = componentOr(c, "MemberNamePrefix", text(""))
+      t.playerSuffix = componentOr(c, "MemberNameSuffix", text(""))
+      let (_, visibility) = nbtString(c, "NameTagVisibility")
+      t.nametagVisibility = visibilityFromName(visibility)
+      let (_, collision) = nbtString(c, "CollisionRule")
+      t.collisionRule = collisionFromName(collision)
+      let (hasPlayers, players) = nbtList(c, "Players")
+      if hasPlayers:
+        for p in players:
+          if p.kind == ntkString:
+            t.players.add(p.stringVal)
+      result.teams.add(t)
+
+proc scoreboardPath*(levelFolder: string): string =
+  ## The overworld's data folder holds the one scoreboard of the save.
+  joinPathW(dimensionDataFolder(levelFolder, OVERWORLD), ScoreboardFile)
+
+proc loadScoreboard*(levelFolder: string): Scoreboard =
+  let (ok, inner) = readInner(scoreboardPath(levelFolder))
+  if ok: scoreboardFromNbt(inner) else: newScoreboard()
+
+proc saveScoreboard*(board: Scoreboard; levelFolder: string): bool =
+  let path = scoreboardPath(levelFolder)
+  let (existed, old) = readInner(path)
+  if not existed and board.objectives.len == 0 and board.scores.len == 0 and board.teams.len == 0:
+    return true
+  writeInner(path, scoreboardToNbt(board, old))

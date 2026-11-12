@@ -10,7 +10,11 @@
 
 import std/[options, tables]
 import ../../generated/[effect, potion, sound_category]
-import ../../protocol/java/client/play/[custom_payload, sound_effect, tab_list, update_mob_effect]
+from ../../data/block_state import asU16
+import ../../protocol/java/client/play/[custom_payload, sound_effect, tab_list, update_mob_effect, set_camera]
+import ../../generated/[entity_type, entity_pose, statistic, tag]
+import ../../util/math/boundingbox
+import ../world/chunker
 import ../../protocol/proto
 import ../../protocol/varint
 import ../../util/text/text
@@ -21,7 +25,7 @@ import entitymod
 
 var gTabListHeaders = initTable[int32, TextComponent]()
 var gTabListFooters = initTable[int32, TextComponent]()
-var gLastSentXp = initTable[int32, int32]()
+var gLastSentXp* = initTable[int32, int32]()
 
 proc effectFlags*(effect: Effect): int8 =
   ## The flag byte of `CUpdateMobEffect`: ambient 1, particles 2, icon 4, blend 8.
@@ -99,3 +103,117 @@ proc forgetPlayerExtras*(self: Player) =
   gTabListHeaders.del(self.entityId)
   gTabListFooters.del(self.entityId)
   gLastSentXp.del(self.entityId)
+
+# --- Pose, movement statistic, camera ------------------------------------------------------------------
+
+proc isFlying(self: Player): bool = self.abilities.flying
+
+proc isSleeping(self: Player): bool =
+  ## `is_sleeping`: `sleeping_since` is set.
+  self.sleepingSince >= 0'i32
+
+proc canFitPose*(self: Player; pose: EntityPose): bool =
+  ## `can_fit_pose`
+  let entity = playerBase(self).entity
+  let dimensions = getEntityDimensions(pose)
+  let aabb = BoundingBox.newFromPos(entity.pos.x, entity.pos.y, entity.pos.z, dimensions)
+  entity.world.isSpaceEmpty(aabb.contractAll(1.0E-7'f64))
+
+proc isSwimmingPose(self: Player; flying: bool): bool =
+  ## `is_swimming`: upstream's inferred check, as it is.
+  let base = playerBase(self)
+  let entity = base.entity
+  let swimHeight = mustLiving(base).getSwimHeight()
+  entity.touchingWater and entity.waterHeight > swimHeight and entity.sprinting and not entity.onGround and
+    not flying and not entity.hasVehicle()
+
+proc updatePlayerPose*(self: Player) =
+  ## `update_player_pose`: vanilla updates it in `PlayerEntity#tick` after `super.tick()`. `is_auto_spin_attack` is
+  ## upstream's constant false.
+  let base = playerBase(self)
+  let entity = base.entity
+  if not self.canFitPose(epSwimming):
+    return
+  let flying = self.isFlying()
+  let desiredPose =
+    if self.isSleeping(): epSleeping
+    elif self.isSwimmingPose(flying): epSwimming
+    elif entity.isFallFlying(): epFallFlying
+    elif entity.isSneaking() and not flying: epCrouching
+    else: epStanding
+  let newPose =
+    if self.gamemode == Spectator or entity.hasVehicle() or self.canFitPose(desiredPose): desiredPose
+    elif self.canFitPose(epCrouching): epCrouching
+    else: epSwimming
+  if entity.pose != newPose:
+    entity.setPose(newPose)
+
+proc getMovementStatistic*(self: Player): CustomStatistic =
+  ## `get_movement_statistic`. The movement handlers (net/java/play.aowl) add `distance * 100` cm of it per packet.
+  let base = playerBase(self)
+  let entity = base.entity
+  let vehicle = entity.vehicle
+  if vehicle != nil:
+    let id = vehicle.entity.entityType.id
+    for t in [EntityType.OAK_BOAT, EntityType.SPRUCE_BOAT, EntityType.BIRCH_BOAT, EntityType.JUNGLE_BOAT,
+        EntityType.ACACIA_BOAT, EntityType.DARK_OAK_BOAT, EntityType.MANGROVE_BOAT, EntityType.CHERRY_BOAT,
+        EntityType.BAMBOO_RAFT]:
+      if id == t.id:
+        return csBoatOneCm
+    for t in [EntityType.MINECART, EntityType.CHEST_MINECART, EntityType.FURNACE_MINECART, EntityType.TNT_MINECART,
+        EntityType.HOPPER_MINECART, EntityType.COMMAND_BLOCK_MINECART, EntityType.SPAWNER_MINECART]:
+      if id == t.id:
+        return csMinecartOneCm
+    for t in [EntityType.HORSE, EntityType.DONKEY, EntityType.MULE, EntityType.SKELETON_HORSE, EntityType.ZOMBIE_HORSE]:
+      if id == t.id:
+        return csHorseOneCm
+    if id == EntityType.PIG.id:
+      return csPigOneCm
+    if id == EntityType.STRIDER.id:
+      return csStriderOneCm
+  if self.isFlying():
+    return csFlyOneCm
+  if entity.fallFlying:
+    return csAviateOneCm
+  if entity.swimming:
+    return csSwimOneCm
+  let blockRef = entity.world.getBlock(entity.blockPos)
+  if hasTag(asU16(blockRef.id), Block_MINECRAFT_CLIMBABLE):
+    return csClimbOneCm
+  if entity.touchingWater:
+    return csWalkUnderWaterOneCm
+  if entity.sneaking:
+    return csCrouchOneCm
+  if entity.sprinting:
+    return csSprintOneCm
+  if not entity.onGround and entity.velocity.y < -0.005'f64:
+    return csFallOneCm
+  csWalkOneCm
+
+proc tickCameraTarget*(self: Player; server: Server) =
+  ## The camera target follow at the top of `Player::tick`.
+  if self.cameraTargetId.isNone:
+    return
+  let cameraId = self.cameraTargetId.unsafeGet
+  if cameraId == self.entityId:
+    self.cameraTargetId = none[int32]()
+    return
+  let world = self.world
+  var targetPos = Vector3[float64](x: 0.0, y: 0.0, z: 0.0)
+  var found = false
+  let other = world.getPlayerById(cameraId)
+  if other != nil:
+    targetPos = other.pos
+    found = true
+  else:
+    let target = world.getEntityById(cameraId)
+    if target != nil:
+      targetPos = target.entity.pos
+      found = true
+  if found:
+    if not (self.pos == targetPos):
+      playermod.setPos(self, targetPos)
+      chunker.updatePosition(self, server)
+  else:
+    self.cameraTargetId = none[int32]()
+    self.client.writePacketFor(CSetCamera(cameraId: newVarInt(self.entityId)))

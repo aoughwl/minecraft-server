@@ -932,7 +932,7 @@ class Stages:
                        'loot_given', 'ride_not_riding', 'spectate_self', 'spectate_stopped']
     COMMANDS3_NAMES = ['tree3_children', 'help_page', 'help_command', 'pumpkin_version', 'attribute_get', 'attribute_base_set',
                        'advancement_grant', 'advancement_revoke', 'advancement_revoke_again', 'dialog_show', 'dialog_clear']
-    SCOREBOARD_NAMES = ['objective_added', 'sidebar_shown', 'score_enabled', 'trigger_score', 'team_created', 'team_joined',
+    SCOREBOARD_NAMES = ['objective_added', 'sidebar_shown', 'score_enabled', 'trigger_score', 'players_set_add_remove', 'players_get_reset', 'team_created', 'team_joined',
                         'team_updated', 'bossbar_added', 'bossbar_health', 'bossbar_name', 'border_size', 'border_center',
                         'border_lerp', 'tick_rate', 'tick_frozen', 'tick_query', 'data_get_player']
     COMMAND_VERIFY_NAMES = ['setblock_persisted', 'fill_persisted', 'give_persisted', 'tp_persisted', 'alive_on_return']
@@ -942,6 +942,7 @@ class Stages:
     PLAYA_NAMES = ['pa_shift_click', 'pa_drag_split', 'pa_tab_complete', 'pa_chat_sent']
     PLAYA_LISTEN_NAMES = ['pa_chat_heard']
     PLUGIN_NAMES = ['plugin_welcome', 'plugin_chat_passes', 'plugin_chat_cancelled']
+    PLUGIN2_NAMES = ['plugin2_given', 'plugin2_drop_stack_allowed', 'plugin2_drop_one_cancelled']
     PLUGMGR_NAMES = ['plugmgr_tree', 'plugmgr_chat_before', 'plugmgr_list', 'plugmgr_load_error', 'plugmgr_loaded', 'plugmgr_already_loaded',
                      'plugmgr_chat_cancelled', 'plugmgr_unloaded', 'plugmgr_chat_after_unload', 'plugmgr_reloaded']
     C2_NAMES = ['sign_placed', 'sign_text_set', 'bed_placed', 'bed_slept', 'piston_pushed']
@@ -1621,6 +1622,25 @@ def scoreboard_session(c, st, w, biomes, ctx, args):
     at = len(w.chat)
     run_command('trigger kills')
     wait(lambda: heard('commands.trigger.failed.unprimed', at), 'the unprimed error')
+
+    # /scoreboard players set, add, remove, get and reset (the newer tree's), then /execute if biome.
+    for line, want in (('set %s kills 7', 7), ('add %s kills 5', 12), ('remove %s kills 2', 10)):
+        base = len(w.events)
+        run_command('scoreboard players ' + line % me)
+        e = expect('score', what='the score packet from players ' + line.split()[0])
+        check(e[1:] == (me, 'kills', want), 'players %s score %r' % (line.split()[0], e))
+    st.hit('players_set_add_remove')
+    at = len(w.chat)
+    run_command('scoreboard players get %s kills' % me)
+    wait(lambda: heard('commands.scoreboard.players.get.success', at), 'the players get answer')
+    run_command('scoreboard players reset %s kills' % me)
+    at = len(w.chat)
+    run_command('scoreboard players get %s kills' % me)
+    wait(lambda: heard('commands.scoreboard.players.get.null', at), 'no score after players reset')
+    st.hit('players_get_reset')
+    at = len(w.chat)
+    run_command('execute unless biome ~ ~ ~ minecraft:the_void run tag @s add not_the_void')
+    wait(lambda: heard('not_the_void', at), 'the tag through /execute unless biome')
 
     # Teams: created with the packet's name, joined by the bot, then changed.
     base = len(w.events)
@@ -2755,7 +2775,7 @@ def run(args):
         extra = list(extra) + Stages.SCOREBOARD_NAMES
     if args.commands_verify:
         extra = list(extra) + Stages.COMMAND_VERIFY_NAMES
-    if args.blocks or args.blocks_verify or args.world or args.containers or args.containers_verify or args.c2 or args.c2_verify or args.c1 or args.c1_verify or args.last or args.partsb:
+    if args.blocks or args.blocks_verify or args.world or args.containers or args.containers_verify or args.c2 or args.c2_verify or args.c1 or args.c1_verify or args.last or args.partsb or args.nbtfam or args.nbtfam_verify:
         load_block_table(args.assets)
     if args.world:
         extra = list(extra) + Stages.WORLD_NAMES
@@ -2771,6 +2791,8 @@ def run(args):
         extra = list(extra) + Stages.C2_NAMES
     if args.wasm_plugin:
         extra = list(extra) + Stages.PLUGIN_NAMES
+    if args.wasm_plugin2:
+        extra = list(extra) + Stages.PLUGIN2_NAMES
     if args.plugmgr:
         extra = list(extra) + Stages.PLUGMGR_NAMES
     if args.playa:
@@ -2991,6 +3013,9 @@ def run(args):
         if args.wasm_plugin:
             import mcbot_plugin
             mcbot_plugin.plugin_session(sys.modules[__name__], c, st, w, biomes, ctx, args)
+        if args.wasm_plugin2:
+            import mcbot_plugin2
+            mcbot_plugin2.plugin2_session(sys.modules[__name__], c, st, w, biomes, ctx, args)
         if args.plugmgr:
             import mcbot_plugmgr
             mcbot_plugmgr.plugmgr_session(sys.modules[__name__], c, st, w, biomes, ctx, args)
@@ -3003,6 +3028,12 @@ def run(args):
         if args.partsb:
             import mcbot_partsb
             mcbot_partsb.partsb_session(sys.modules[__name__], c, st, w, biomes, ctx, args)
+        if args.nbtfam or args.nbtfam_verify:
+            import mcbot_nbtfam
+            if args.nbtfam:
+                mcbot_nbtfam.nbtfam_session(sys.modules[__name__], c, st, w, biomes, ctx, args)
+            else:
+                mcbot_nbtfam.nbtfam_verify_session(sys.modules[__name__], c, st, w, biomes, ctx, args)
         if args.last:
             import mcbot_last
             mcbot_last.last_session(sys.modules[__name__], c, st, w, biomes, ctx, args)
@@ -3016,6 +3047,9 @@ def run(args):
             containers_session(c, st, w, biomes, ctx, args)
         elif args.containers_verify:
             containers_verify_session(c, st, w, biomes, ctx, args)
+        if args.itemuse:
+            import mcbot_itemuse
+            mcbot_itemuse.itemuse_session(sys.modules[__name__], c, st, w, biomes, ctx, args)
         if args.player:
             player_session(c, st, w, biomes, ctx, args)
         elif args.player_verify:
@@ -3358,15 +3392,19 @@ def main():
     ap.add_argument('--assets', default=os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '..', 'ref', 'pumpkin-1.21.11', 'assets', 'blocks.json'), help='blocks.json of the pinned upstream, for --blocks')
     ap.add_argument('--playa', choices=['act', 'listen'], help='play packets as an operator: shift-click, drag split, tab completion and chat (act), or hear the actor chat (listen); see mcbot_playa.py')
     ap.add_argument('--wasm-plugin', action='store_true', help='a wasm plugin welcomes the player and cancels chat starting with x; see mcbot_plugin.py')
+    ap.add_argument('--wasm-plugin2', action='store_true', help='a wasm plugin cancels dropping one item (needs --op); see mcbot_plugin2.py')
     ap.add_argument('--plugmgr', action='store_true', help='the plugin manager at run time: /plugin list, load, unload, reload; see mcbot_plugmgr.py')
     ap.add_argument('--c2', action='store_true', help='a sign with text, a bed slept in and a piston push; see mcbot_c2.py')
     ap.add_argument('--c2-verify', help='a file from --c2 --save: the sign, bed and piston are still there')
+    ap.add_argument('--nbtfam', action='store_true', help='/data on storage and a chest and /execute store, over the wire; see mcbot_nbtfam.py')
+    ap.add_argument('--nbtfam-verify', help='a file from --nbtfam --save: the storage and the chest still hold what it wrote')
     ap.add_argument('--last', action='store_true', help='command blocks, a cauldron, a flower pot and a dragon egg; see mcbot_last.py')
     ap.add_argument('--partsb', action='store_true', help='pearl cooldown, bed night skip, villager trading window and the dragon; see mcbot_partsb.py')
     ap.add_argument('--c1', action='store_true', help='a furnace smelts over the wire; see mcbot_c1.py')
     ap.add_argument('--c1-verify', help='a file from --c1 --save: the smelted output is still in the furnace')
     ap.add_argument('--containers', action='store_true', help='open a chest, a barrel and a trapped chest and fill them; see containers_session')
     ap.add_argument('--containers-verify', help='a file from --containers --save: check the stacks are still in the containers')
+    ap.add_argument('--itemuse', action='store_true', help='eat, shoot a bow, raise a shield, pick up experience, crouch; see mcbot_itemuse.py')
     ap.add_argument('--player', action='store_true', help='mob damage, hunger, death and respawn, /fill states, a cow; see player_session')
     ap.add_argument('--player-verify', help='a file from --player --save: the cow must be spawned on joining')
     ap.add_argument('--watch', action='store_true', help='watch another player play')

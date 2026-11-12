@@ -7,6 +7,7 @@
 
 import std/[math, options, strutils, syncio, tables]
 import ../../data/block_ext
+import ../../plugin/pluginhooks
 from ../../data/block_state import BlockStateId, asU16, newBlockStateIdUnchecked
 import ../../generated/[biome, damage_type, effect, entity_type, particle, potion, sound, sound_category, sound_id_remap, statistic,
   tracked_data, meta_data_type]
@@ -36,10 +37,13 @@ import ../../util/text/text
 import ../entity/entitymod
 import ../entity/itementity
 import ../entity/tnt
+import ../entity/projectile/arrow
+import ../item/placing_items
 import ../entity/falling
 import ../entity/mob/mobsmod
 import ../entity/ai/aibase
 import ../entity/playerextras
+import ../entity/playerxp
 import ../entity/mob/mobvts
 import ../entity/passive/villager/villagermod as villagermod
 import ../entity/player as playermod
@@ -129,6 +133,14 @@ proc fillActor(a: BlockActor; base: EntityBase) =
   a.setFuse0 = proc(ticks: uint32) {.closure.} =
     if base of TNTEntity:
       TNTEntity(base).fuse = ticks
+  a.setPower0 = proc(power: float32) {.closure.} =
+    if base of TNTEntity:
+      TNTEntity(base).power = power
+  a.setRotation0 = proc(yaw, pitch: float32) {.closure.} = entity.setRotation(yaw, pitch)
+  a.setPickupAllowed0 = proc() {.closure.} =
+    if base of ArrowEntity:
+      ArrowEntity(base).pickup = apAllowed
+  a.applyVariant0 = proc(item: ItemStack) {.closure.} = applyEntityVariant(item, base)
   a.remove0 = proc() {.closure.} = entity.remove()
   a.getItemStack0 = proc(): (bool, ItemStack) {.closure.} =
     if base of ItemEntity: (true, ItemEntity(base).itemStack) else: (false, emptyItemStack())
@@ -223,6 +235,10 @@ proc blockPlayerOf*(player: Player): BlockPlayer =
 proc sleepPlayer(player: Player; bedHeadPos: BlockPos) =
   ## `Player::sleep`. The 1.21.11 client reads the bed from `SLEEPING_POSITION`, which is what upstream's `SLEEPING_POS_ID`
   ## names from 26.1. `sleeping_since` starts at 0 here; `Player::tick` counts it and `World::tick_environment` skips the night.
+  var bedEnterEv = newPlayerEv(pekBedEnter)
+  bedEnterEv.pos = bedHeadPos
+  if gPluginPlayerEventHook(player, bedEnterEv)[0]:
+    return  # `PlayerBedEnterEvent` cancelled (the caller has already marked the bed; upstream returns before that)
   let base = playerBase(player)
   let entity = base.entity
   entity.setPose(epSleeping)
@@ -244,6 +260,9 @@ proc wakeUpPlayer(player: Player) =
   if entity.pose != epSleeping:
     return
   let world = player.world
+  var bedLeaveEv = newPlayerEv(pekBedLeave)
+  if player.respawnPoint.isSome: bedLeaveEv.pos = player.respawnPoint.unsafeGet.position
+  discard gPluginPlayerEventHook(player, bedLeaveEv)
   if player.respawnPoint.isSome:
     let bedPos = player.respawnPoint.unsafeGet.position
     let bedStateId = world.getBlockStateId(bedPos)
@@ -284,15 +303,28 @@ proc playerLivingTick(world: World; player: Player; server: Server) =
   ## is the client's.
   if player.dead or player.health <= 0.0'f32:
     return
+  playerextras.tickCameraTarget(player, server)
+  let xpDelay = gPlayerHooks.experiencePickUpDelay(player)   # `experience_pick_up_delay` counts down at the top of the tick
+  if xpDelay > 0'u32:
+    gPlayerHooks.setExperiencePickUpDelay(player, xpDelay - 1'u32)
   let base = playerBase(player)
   let living = mustLiving(base)
   entityTick(base.entity, base, server)
   if base.entity.tickBlockCollisions(base, server):
     discard base.damageWithContext(base, 1.0'f32, IN_WALL, none[Vector3[float64]](), nil, nil)
   tickEffects(living)
+  # `LivingEntity::tick`'s "current active item": the use time runs down and the item is consumed at the end (food, a
+  # potion), which is also what `is_blocking` reads for a shield.
+  if living.itemInUse.isSome:
+    let inUse = living.itemInUse.unsafeGet
+    let wasUseTime = living.itemUseTime
+    living.itemUseTime = wasUseTime - 1'i32
+    if wasUseTime <= 0'i32:
+      living.consumeItem(base, inUse)
   if living.hurtCooldown > 0'i32:
     living.hurtCooldown -= 1'i32
   syncToPlayer(base)
+  playerextras.updatePlayerPose(player)   # vanilla updates the pose after `super.tick()`
   breathmod.breathOf(player).tick(player)
   hungermod.tickHungerManager(player)
   playerextras.tickExperience(player)
@@ -305,7 +337,9 @@ proc installBlockHooks*(world: World) =
   gBlockRecipeProvider = RecipeProvider(world.server.recipeManager)
   world.blockPlayerOf = proc(player: Player): BlockPlayer {.closure.} = blockPlayerOf(player)
   world.tickEntitiesHook = proc(server: Server) {.closure.} = tickEntities(world, server)
-  world.playerJoinedHook = proc(player: Player) {.closure.} = sendEntitiesTo(world, player)
+  world.playerJoinedHook = proc(player: Player) {.closure.} =
+    sendEntitiesTo(world, player)
+    playerextras.sendActiveEffects(player)   # `World::add_player`: `send_active_effects`
   world.shutdownHook = proc() {.closure.} = saveAllEntities(world)
   world.spawnEntityHook = proc(entityType: string; pos: Vector3[float64]): TextComponent {.closure.} =
     ## `/summon`: `from_type`, then `spawn_entity`. The entity's display name is what the feedback says.
@@ -627,6 +661,54 @@ villagermod.gOpenHandledScreen = proc(player: Player; factory: ScreenHandlerFact
 villagermod.gBedSetOccupied = proc(occupied: bool; world: World; blockRef: Block; pos: BlockPos; stateId: BlockStateId) {.closure.} =
   setOccupied(occupied, BlockWorld(world.blockWorld), blockRef, pos, stateId)
 playermod.gWakeUpHook = proc(player: Player) {.closure.} = wakeUpPlayer(player)
+gPlayerHooks.addExperiencePoints = proc(player: Player; amount: int32) {.closure.} = playerxp.addExperiencePoints(player, amount)
+gPlayerHooks.applyMendingFromXp = proc(player: Player; amount: int32): int32 {.closure.} = playerxp.applyMendingFromXp(player, amount)
+playermod.gPlayerLivingWriteHook = proc(player: Player; nbt: var NbtCompound) {.closure.} =
+  ## What `Entity::write_nbt` and `LivingEntity::write_nbt` add to a player's data that `Player::write_nbt` does not repeat.
+  let base = playerBase(player)
+  let entity = base.entity
+  nbt.putShort("Fire", cast[int16](entity.fireTicks))
+  nbt.putInt("PortalCooldown", int32(entity.portalCooldown))
+  nbt.putInt("TicksFrozen", entity.frozenTicks)
+  nbt.putShort("Air", int16(breathmod.breathOf(player).airSupply))
+  let living = mustLiving(base)
+  if living.activeEffects.len > 0:
+    var effectsList: seq[NbtTag] = @[]
+    for effect in living.activeEffects:
+      var effectNbt = newCompound()
+      effectToNbt(effect, effectNbt)
+      effectsList.add(nbtTag(effectNbt))
+    nbt.put("active_effects", NbtTag(kind: ntkList, listVal: effectsList))
+playermod.gPlayerLivingReadHook = proc(player: Player; nbt: NbtCompound) {.closure.} =
+  ## Their `read_nbt` halves: the fire, the portal cooldown, the frozen ticks, the air and the effects.
+  let base = playerBase(player)
+  let entity = base.entity
+  let fire = nbt.getShort("Fire")
+  entity.fireTicks = if fire.isSome: int32(fire.unsafeGet) else: 0'i32
+  let portal = nbt.getInt("PortalCooldown")
+  entity.portalCooldown = if portal.isSome: cast[uint32](portal.unsafeGet) else: 0'u32
+  let frozen = nbt.getInt("TicksFrozen")
+  entity.frozenTicks = if frozen.isSome: frozen.unsafeGet else: 0'i32
+  let air = nbt.getShort("Air")
+  if air.isSome:
+    breathmod.breathOf(player).airSupply = clamp(int32(air.unsafeGet), 0'i32, breathmod.MaxAir)
+  let living = mustLiving(base)
+  let nbtEffects = nbt.getList("active_effects")
+  if nbtEffects.isSome:
+    for tag in nbtEffects.unsafeGet:
+      if tag.kind == ntkCompound:
+        let parsed = effectFromNbt(tag.compoundVal)
+        if parsed.isSome:
+          var effect = parsed.unsafeGet
+          effect.blend = true
+          var at = -1
+          for i in 0 ..< living.activeEffects.len:
+            if living.activeEffects[i].effectType.id == effect.effectType.id:
+              at = i
+          if at >= 0:
+            living.activeEffects[at] = effect
+          else:
+            living.activeEffects.add(effect)
 playermod.gPlayerKillHook = proc(player: Player) {.closure.} =
   let base = playerBase(player)
   base.kill(base)

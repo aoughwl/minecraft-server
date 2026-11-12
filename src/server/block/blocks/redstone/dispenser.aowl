@@ -1,5 +1,5 @@
 ## Port of pumpkin/src/block/blocks/redstone/dispenser.rs
-## PARTIAL: pumpkin/src/block/blocks/redstone/dispenser.rs - boats are dropped as items instead of placed on the water (`BoatItem` is above the blocks); a spawn egg is spawned without `apply_entity_variant` and a random yaw, an armor stand and a boat-less dispense without the facing rotation (there is no rotation hook on a `BlockActor`); an arrow is not marked `ArrowPickup::Allowed` and a primed TNT keeps the default power, both being fields no hook reaches. Items dropped, arrows, TNT, armor stands and spawn eggs are dispensed as upstream does.
+## PARTIAL: pumpkin/src/block/blocks/redstone/dispenser.rs - a spawn egg takes its variant from the egg it split off (upstream reads the stack it took from, empty after the last egg), and a boat is spawned by its entity name through `spawnEntity0` where upstream builds a `BoatEntity` around a bare `Entity`.
 ## Items leave through the hooks of `BlockWorld`: `spawnItemWithVelocity` for `drop_item` (pickup delay 40), `spawnEntity0` with the entity type's name for the rest.
 
 {.feature: "untyped".}
@@ -39,6 +39,26 @@ proc targetPosition(ctx: DispenseContext): BlockPos =
   let facing = toNormal(ctx.facing)
   ctx.position.offset(Vector3[int32](x: int32(facing.x), y: int32(facing.y), z: int32(facing.z)))
 
+proc facingYaw(ctx: DispenseContext): float32 =
+  ## `facing.x.atan2(facing.z) as f32 * 57.295_776`
+  let facing = toNormal(ctx.facing)
+  float32(arctan2(float64(facing.x), float64(facing.z))) * 57.295776'f32
+
+proc hasRoomFor(ctx: DispenseContext; spawnPos: Vector3[float64]; width, height, eyeHeight: float32): bool =
+  ## `has_room_for`: no block in the box and no entity in it
+  let box = BoundingBox.newFromPos(spawnPos.x, spawnPos.y, spawnPos.z, newEntityDimensions(width, height, eyeHeight))
+  let empty = ctx.world.isSpaceEmpty0
+  (empty == nil or empty(box)) and ctx.world.getEntitiesAtBox(box).len == 0
+
+proc wrapDeg(x: float32): float32 =
+  ## `wrap_degrees`
+  var v = x mod 360.0'f32
+  if v >= 180.0'f32:
+    v -= 360.0'f32
+  if v < -180.0'f32:
+    v += 360.0'f32
+  v
+
 proc dispenseSound(ctx: DispenseContext) =
   ctx.world.syncWorldEvent(weSoundDispenserDispense, ctx.position, 0'i32)
 
@@ -56,6 +76,7 @@ proc fireArrow(ctx: DispenseContext, item: var ItemStack) =
   if spawn != nil:
     let arrow = spawn(entityName, spawnPos, none[NbtCompound]())
     if arrow != nil:
+      arrow.setPickupAllowed()
       # `ArrowEntity::set_velocity(x, y + 0.1, z, power, uncertainty)`: normalised, a triangular spread per axis, times the power
       let dir = Vector3[float64](x: facing.x, y: facing.y + 0.1, z: facing.z).normalize()
       let spread = 0.0172275 * ARROW_DISPENSE_UNCERTAINTY
@@ -71,19 +92,20 @@ proc dispenseArmorStand(ctx: DispenseContext, item: var ItemStack): bool =
   let spawnPos = targetPosition(ctx).toF64()
   # upstream first checks that the box of an armor stand has room there (`has_room_for`)
   let dimension = EntityType.ARMOR_STAND.dimension
-  let box = BoundingBox.newFromPos(spawnPos.x, spawnPos.y, spawnPos.z,
-    newEntityDimensions(dimension[0], dimension[1], EntityType.ARMOR_STAND.eyeHeight))
-  if ctx.world.getEntitiesAtBox(box).len > 0:
+  if not hasRoomFor(ctx, spawnPos, dimension[0], dimension[1], EntityType.ARMOR_STAND.eyeHeight):
     return false
   discard item.split(1'u8)
   ctx.world.playSound(sdEntityArmorStandPlace, scBlocks, spawnPos)
   let spawn = ctx.world.spawnEntity0
   if spawn != nil:
-    discard spawn("armor_stand", spawnPos, none[NbtCompound]())
+    let stand = spawn("armor_stand", spawnPos, none[NbtCompound]())
+    if stand != nil:
+      stand.setRotation(facingYaw(ctx), 0.0'f32)
   dispenseSound(ctx)
   true
 
 proc dispenseTnt(ctx: DispenseContext, item: var ItemStack) =
+  const TNT_POWER: float32 = 4.0'f32
   const TNT_FUSE: uint32 = 80
   discard item.split(1'u8)
   let spawnPos = targetPosition(ctx).toF64()
@@ -91,6 +113,7 @@ proc dispenseTnt(ctx: DispenseContext, item: var ItemStack) =
   if spawn != nil:
     let tnt = spawn("tnt", spawnPos, none[NbtCompound]())
     if tnt != nil:
+      tnt.setPower(TNT_POWER)
       tnt.setFuse(TNT_FUSE)
   ctx.world.playSound(sdEntityTntPrimed, scBlocks, spawnPos)
   dispenseSound(ctx)
@@ -103,12 +126,45 @@ proc eggEntityName(item: ItemStack): (bool, string) =
   (false, "")
 
 proc dispenseSpawnEgg(ctx: DispenseContext, item: var ItemStack, entityName: string) =
-  discard item.split(1'u8)
+  # DEVIATION: the variant is read off the split-off egg, since upstream reads it off the stack it just took from
+  # (empty when that was the last one)
+  let egg = item.split(1'u8)
   let spawnPos = targetPosition(ctx).toF64()
   let spawn = ctx.world.spawnEntity0
   if spawn != nil:
-    discard spawn(entityName, spawnPos, none[NbtCompound]())
+    let mob = spawn(entityName, spawnPos, none[NbtCompound]())
+    if mob != nil:
+      # `wrap_degrees(random::<f32>() * 360.0) % 360.0`
+      mob.setRotation(wrapDeg(randomOf(float32) * 360.0'f32) mod 360.0'f32, 0.0'f32)
+      mob.applyVariant(egg)
   dispenseSound(ctx)
+
+proc dispenseBoat(ctx: DispenseContext, item: var ItemStack): bool =
+  ## `dispense_boat`: onto the water at the target or the block below it. The boat's entity has its item's name.
+  let target = targetPosition(ctx)
+  proc isWater(id: uint16): bool = id == Fluid.WATER.id or id == Fluid.FLOWING_WATER.id
+  var spawnPos: Vector3[float64]
+  if isWater(ctx.world.getFluid(target).id):
+    spawnPos = target.toF64()
+  elif ctx.world.getBlockState(target).isAir() and isWater(ctx.world.getFluid(target.down()).id):
+    spawnPos = target.down().toF64()
+  else:
+    return false
+  let entityName = item.getItem().registryKey
+  let kind = EntityType.fromName(entityName)
+  if kind.isNone:
+    return false
+  let dimension = kind.unsafeGet.dimension
+  if not hasRoomFor(ctx, spawnPos, dimension[0], dimension[1], kind.unsafeGet.eyeHeight):
+    return false
+  discard item.split(1'u8)
+  let spawn = ctx.world.spawnEntity0
+  if spawn != nil:
+    let boat = spawn(entityName, spawnPos, none[NbtCompound]())
+    if boat != nil:
+      boat.setRotation(facingYaw(ctx), 0.0'f32)
+  dispenseSound(ctx)
+  true
 
 proc dropItem(ctx: DispenseContext, item: var ItemStack) =
   let dropItem = item.split(1'u8)
@@ -184,8 +240,12 @@ proc dispenserBlockOnScheduledTick_BlockBehaviour(args: OnScheduledTickArgs) =
   elif egg[0]:
     # Spawn eggs
     dispenseSpawnEgg(ctx, item, egg[1])
+  elif key.endsWith("_boat") or key.endsWith("_raft"):
+    # Boats
+    if not dispenseBoat(ctx, item):
+      dropItem(ctx, item)
   else:
-    # Default / Drop (and the boats, see the PARTIAL line)
+    # Default / Drop
     dropItem(ctx, item)
   # the stack was taken from the slot in place upstream
   dispenser.inv.items[slot] = item

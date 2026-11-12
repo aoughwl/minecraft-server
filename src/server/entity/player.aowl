@@ -1,7 +1,7 @@
 ## Port of pumpkin/src/entity/player.rs
 ## Port of pumpkin/src/entity/living.rs
 ## Port of pumpkin/src/entity/hunger.rs: the data only; `tick` and `eat` are entity/hunger.aowl.
-## PARTIAL: pumpkin/src/entity/player.rs - the player a client plays as: `ChunkManager`, `Abilities`, chat sessions, health and hunger, mining, screen handlers (`open_handled_screen` is here, Java half), gamemode, NBT, `impl InventoryPlayer`, statistics (`gPlayerStats`, kept in the player's NBT as upstream does), `set_respawn_point`, `drop_item` and `increment_stat` through hooks. `attack` is entity/playerattack.aowl, `calculate_respawn_point` is entity/respawn.aowl, item cooldowns are item/itembehaviour.aowl, `tick_maps` is world/mapglue.aowl, `send_effect`, `tick_experience`, `set_tab_list_header_footer` and the like are entity/playerextras.aowl, damage, death, wake up (with the bed's `occupied` reset), breath and the hunger tick are block/worldhooks.aowl, the night skip and the cross-dimension `respawn_player` are world/worldmod.aowl. Still missing: the camera target follow in `tick`, `update_player_pose`/`can_fit_pose`, `open_handled_screen_direct`, `get_movement_statistic`, Bedrock halves, particles and sounds of a few calls, `PlayerChangeWorldEvent` and `PlayerRespawnEvent`, and portals (`teleport_world` is only the half a respawn needs).
+## PARTIAL: pumpkin/src/entity/player.rs - the player a client plays as: `ChunkManager`, `Abilities`, chat sessions, health and hunger, mining, screen handlers (`open_handled_screen` is here, Java half), gamemode, NBT, `impl InventoryPlayer`, statistics (`gPlayerStats`, kept in the player's NBT as upstream does), `set_respawn_point`, `drop_item` and `increment_stat` through hooks. `attack` is entity/playerattack.aowl, `calculate_respawn_point` is entity/respawn.aowl, item cooldowns are item/itembehaviour.aowl, `tick_maps` is world/mapglue.aowl, `send_effect`, `tick_experience`, `set_tab_list_header_footer` and the like are entity/playerextras.aowl, damage, death, wake up (with the bed's `occupied` reset), breath and the hunger tick are block/worldhooks.aowl, the night skip and the cross-dimension `respawn_player` are world/worldmod.aowl. `update_player_pose`, `can_fit_pose`, the camera target follow and `get_movement_statistic` (counted by net/java/play.aowl's `afterMove`) are entity/playerextras.aowl, `open_handled_screen_direct` is here, the item in use is the `LivingEntity`'s (`set_active_hand`; `start_using_item` and friends are its `item_in_use`), and the `Entity`/`LivingEntity` NBT halves (fire, air, effects) go through `gPlayerLivingWriteHook`. Still missing: the Bedrock halves, a player's bounding box and eye height stay the standing ones (entitymod's `syncFromPlayer`), so a crouching or swimming pose changes the metadata only, particles and sounds of a few calls, `PlayerChangeWorldEvent` and `PlayerRespawnEvent`, and portals (`teleport_world` is only the half a respawn needs).
 ## PARTIAL: pumpkin/src/entity/living.rs - what a player reads of it: health, absorption, `fall` (with its damage through block/worldhooks.aowl), `send_equipment_changes`, NBT. `LivingEntity::tick` runs for a player as the entity tick, block collisions, effects and the hurt cooldown, not `tick_movement`.
 ##
 ## The types are in ../serverbase.aowl. Everything sent here goes through the client's single outgoing buffer, so
@@ -718,6 +718,10 @@ proc onHandledScreenClosed*(self: Player) =
   ## `on_handled_screen_closed`
   let current = self.currentScreenHandler
   current.onClosed(self.asInventoryPlayer())
+  var closeEv = newPlayerEv(pekInventoryClose)
+  let closeType = current.windowType()
+  closeEv.n = (if closeType.isSome: int64(ord(closeType.unsafeGet)) else: -1'i64)
+  discard gPluginPlayerEventHook(self, closeEv)
   let playerHandler = ScreenHandler(self.playerScreenHandler)
   if playerHandler != current:
     playerHandler.copySharedSlots(current)
@@ -728,6 +732,22 @@ proc closeHandledScreen*(self: Player) =
   ## `close_handled_screen`
   self.client.writePacketFor(CCloseContainer(syncId: newVarInt(int32(self.currentScreenHandler.syncId()))))
   self.onHandledScreenClosed()
+
+proc openHandledScreenDirect*(self: Player; handler: ScreenHandler; title: TextComponent): Option[uint8] =
+  ## `open_handled_screen_direct`: opens a handler that is already built (Java half; the Bedrock container id table is
+  ## not here). A handler without a window type is not openable: upstream panics, this returns none.
+  if self.currentScreenHandler != ScreenHandler(self.playerScreenHandler):
+    self.closeHandledScreen()
+  let windowType = handler.windowType()
+  if windowType.isNone:
+    return none[uint8]()
+  let syncId = handler.syncId()
+  self.client.writePacketFor(COpenScreen(syncId: newVarInt(int32(syncId)),
+    windowType: newVarInt(int32(ord(windowType.unsafeGet))), windowTitle: title))
+  self.onScreenHandlerOpened(handler)
+  self.currentScreenHandler = handler
+  self.openContainerPos = none[BlockPos]()
+  some(syncId)
 
 proc openHandledScreen*(self: Player; factory: ScreenHandlerFactory; blockPos: Option[BlockPos]): Option[uint8] =
   ## `open_handled_screen`: the Java half of the window open (`COpenScreen`), the Bedrock container open is not here.
@@ -754,6 +774,11 @@ proc dropHeldItem*(self: Player; dropStack: bool) =
   if itemStack.isEmpty():
     return
   let dropAmount = if dropStack: itemStack.itemCount else: 1'u8
+  var dropEv = newPlayerEv(pekDropItem)
+  dropEv.text = itemStack.item.registryKey
+  dropEv.n = int64(dropAmount)
+  if gPluginPlayerEventHook(self, dropEv)[0]:
+    return
   let dropped = itemStack.copyWithCount(dropAmount)
   itemStack.decrement(dropAmount)
   self.inventory.setHeldItem(itemStack)
@@ -926,6 +951,14 @@ proc readEnderChestNbt(self: EnderChestInventory; nbt: NbtCompound) =
           if stack.isSome:
             Inventory(self).setStack(int(slot.unsafeGet), stack.unsafeGet)
 
+var gPlayerLivingWriteHook*: proc(player: Player; nbt: var NbtCompound) {.closure.} =
+  proc(player: Player; nbt: var NbtCompound) {.closure.} = discard
+  ## The `Entity` and `LivingEntity` halves of `write_nbt` that live above this module (`Fire`, `PortalCooldown`,
+  ## `TicksFrozen`, `active_effects`, `Air`): block/worldhooks.aowl sets it.
+var gPlayerLivingReadHook*: proc(player: Player; nbt: NbtCompound) {.closure.} =
+  proc(player: Player; nbt: NbtCompound) {.closure.} = discard
+  ## Their `read_nbt` halves.
+
 proc writeNbt*(self: Player; nbt: var NbtCompound) =
   ## `impl NBTStorage for Player`, with `Entity`'s and `LivingEntity`'s.
   nbt.putInt("DataVersion", self.world.levelInfo.dataVersion)
@@ -970,6 +1003,12 @@ proc writeNbt*(self: Player; nbt: var NbtCompound) =
     nbt.putString("SpawnDimension", respawn.dimension.minecraftName)
     nbt.putBool("SpawnForced", respawn.force)
   nbt.putInt("XpSeed", self.enchantmentSeed)
+  if self.scoreboardTags.len > 0:
+    var tags: seq[NbtTag] = @[]
+    for tag in self.scoreboardTags:
+      tags.add(nbtTag(tag))
+    nbt.put("Tags", NbtTag(kind: ntkList, listVal: tags))
+  gPlayerLivingWriteHook(self, nbt)
   gPlayerStats.getOrDefault(self.entityId).writeNbt(nbt)
 
 proc nbtFlag(c: NbtCompound; key: string): bool =
@@ -1075,6 +1114,13 @@ proc readNbt*(self: Player; nbt: NbtCompound) =
   let seed = nbt.getInt("XpSeed")
   if seed.isSome:
     self.enchantmentSeed = seed.unsafeGet
+  let tags = nbt.getList("Tags")
+  if tags.isSome:
+    self.scoreboardTags = @[]
+    for tag in tags.unsafeGet:
+      if tag.kind == ntkString:
+        self.scoreboardTags.add(tag.stringVal)
+  gPlayerLivingReadHook(self, nbt)
   var stats = gPlayerStats.getOrDefault(self.entityId)
   stats.readNbt(nbt)
   gPlayerStats[self.entityId] = stats

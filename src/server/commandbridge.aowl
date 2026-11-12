@@ -64,8 +64,9 @@ import ../world/generation/[proto_chunk, protochunkbase]
 import ../protocol/java/client/play/[chunk_data, set_camera]
 import ../generated/[block_loot, chest_loot]
 import world/loot as lootmod
-import world/[time, weather, worldmod, scoreboard, border, bossbar, custom_bossbar]
-from "block/blockbehaviour" import BlockWorld, BlockEntity, getBlockEntity, getInventory, getBlockAndStateId
+import world/[time, weather, worldmod, scoreboard, border, bossbar, custom_bossbar, worlddata, scoreboardsave]
+from "block/blockbehaviour" import BlockWorld, BlockEntity, getBlockEntity, getInventory, getBlockAndStateId, writeNbt, resourceLocation, addBlockEntity, updateBlockEntity
+import command_storage
 from "block/entities/command_block" import CommandBlockEntity
 
 const DataFolder = "data"
@@ -90,6 +91,25 @@ type
 
   BossbarBox = ref object
     bars: CustomBossbars
+
+var gScoreboards: seq[(Server, ScoreboardBox)] = @[]
+
+proc scoreboardBoxOf(server: Server): ScoreboardBox =
+  ## The server's one scoreboard (a save has one, in the overworld's `data/scoreboard.dat`), read from the save the first
+  ## time a command needs it.
+  for i in 0 ..< gScoreboards.len:
+    if gScoreboards[i][0] == server:
+      return gScoreboards[i][1]
+  let box = ScoreboardBox(board: loadScoreboard(server.levelFolder))
+  gScoreboards.add((server, box))
+  box
+
+proc saveServerScoreboard*(server: Server): bool =
+  ## Writes the scoreboard back; nothing is written when no command has used it, so the file stays as it was.
+  for i in 0 ..< gScoreboards.len:
+    if gScoreboards[i][0] == server:
+      return saveScoreboard(gScoreboards[i][1].board, server.levelFolder)
+  true
 
 proc cmdTeamOf(t: Team): CmdTeamInfo =
   CmdTeamInfo(name: t.name, displayName: t.displayName, color: t.color, players: t.players, options: t.options,
@@ -237,6 +257,8 @@ proc buildCommandWorld(server: Server; world: World): CommandWorld =
       chunk.dirty = true
       world.broadcastToChunk(Vector2[int32](x: chunkX, y: chunkZ), CChunkData(data: chunk))
     count
+  result.getBiomeAt = proc(x, y, z: int32): int32 {.closure.} =
+    int32(getRoughBiome(world.level, newBlockPos(x, y, z)))
   result.getSurfaceHeight = proc(x, z: int32): int32 {.closure.} =
     let chunk = chunkOf(world, x shr 4, z shr 4)
     if chunk == nil:
@@ -257,6 +279,45 @@ proc buildCommandWorld(server: Server; world: World): CommandWorld =
     let container = found.unsafeGet
     for i in 0 ..< inventory.size(container):
       result.add(blockContainerSlot(container, i))
+  result.getBlockEntityNbt = proc(x, y, z: int32; res: var NbtCompound): bool {.closure.} =
+    ## `/data ... block`: `write_internal`, with the `id` and position vanilla shows.
+    let bw = world.blockWorld
+    if bw == nil:
+      return false
+    let entity = getBlockEntity(BlockWorld(bw), newBlockPos(x, y, z))
+    if entity.isNone:
+      return false
+    var nbt = newCompound()
+    entity.unsafeGet.writeNbt(nbt)
+    nbt.insert("id", NbtTag(kind: ntkString, stringVal: entity.unsafeGet.resourceLocation()))
+    nbt.insert("x", NbtTag(kind: ntkInt, intVal: x))
+    nbt.insert("y", NbtTag(kind: ntkInt, intVal: y))
+    nbt.insert("z", NbtTag(kind: ntkInt, intVal: z))
+    res = nbt
+    true
+  result.setBlockEntityNbt = proc(x, y, z: int32; nbt: NbtCompound): bool {.closure.} =
+    ## `add_block_entity_nbt`: the entity is rebuilt from the compound, keeping its type and position, and saved with its chunk.
+    let bw = world.blockWorld
+    if bw == nil:
+      return false
+    let blockWorld = BlockWorld(bw)
+    let current = getBlockEntity(blockWorld, newBlockPos(x, y, z))
+    if current.isNone:
+      return false
+    var full = nbt
+    full.insert("id", NbtTag(kind: ntkString, stringVal: current.unsafeGet.resourceLocation()))
+    full.insert("x", NbtTag(kind: ntkInt, intVal: x))
+    full.insert("y", NbtTag(kind: ntkInt, intVal: y))
+    full.insert("z", NbtTag(kind: ntkInt, intVal: z))
+    let make = blockWorld.blockEntityFromNbt0
+    if make == nil:
+      return false
+    let rebuilt = make(full)
+    if rebuilt.isNone:
+      return false
+    blockWorld.addBlockEntity(rebuilt.unsafeGet)
+    blockWorld.updateBlockEntity(rebuilt.unsafeGet)
+    true
   result.isLiquidAt = proc(x, y, z: int32): bool {.closure.} =
     isLiquid(BlockState.fromId(newBlockStateIdUnchecked(uint16(worldmod.getBlockStateId(world, newBlockPos(x, y, z))))))
   result.generateBlockLoot = proc(x, y, z: int32; hasTool: bool; tool: string; found: var bool): seq[CmdItemStack] {.closure.} =
@@ -282,7 +343,7 @@ proc buildCommandWorld(server: Server; world: World): CommandWorld =
 
   # Scoreboard, teams and the border. `World` holds no scoreboard (scoreboard.aowl imports serverbase), so the one of
   # this world lives in the closures here.
-  let board = ScoreboardBox(board: newScoreboard())
+  let board = scoreboardBoxOf(server)
   result.getObjectiveNames = proc(): seq[string] {.closure.} =
     var names: seq[string] = @[]
     for o in board.board.objectives:
@@ -296,6 +357,12 @@ proc buildCommandWorld(server: Server; world: World): CommandWorld =
     false
   result.addObjective = proc(name: string; displayName: TextComponent; criterion: string) {.closure.} =
     board.board.addObjective(world, newScoreboardObjective(name, displayName, criterion))
+  result.getScoreHolderNames = proc(): seq[string] {.closure.} =
+    var names: seq[string] = @[]
+    for sc in board.board.scores:
+      if sc.entityName notin names:
+        names.add(sc.entityName)
+    names
   result.getScore = proc(playerName, objective: string): int32 {.closure.} =
     for sc in board.board.scores:
       if sc.entityName == playerName and sc.objectiveName == objective:
@@ -315,6 +382,10 @@ proc buildCommandWorld(server: Server; world: World): CommandWorld =
         next.numberFormat = sc.numberFormat
     next.locked = locked
     board.board.updateScore(world, next)
+  result.removeScoreEntry = proc(entity, objective: string) {.closure.} =
+    board.board.removeScore(world, entity, objective)
+  result.removeObjective = proc(name: string) {.closure.} =
+    board.board.removeObjective(world, name)
   result.getTeamNames = proc(): seq[string] {.closure.} =
     var names: seq[string] = @[]
     for t in board.board.teams:
@@ -345,19 +416,8 @@ proc buildCommandWorld(server: Server; world: World): CommandWorld =
     board.board.removePlayerFromTeam(world, team, player)
   result.getForcedChunks = proc(): seq[Vector2[int32]] {.closure.} = world.forcedChunks
   result.setForcedChunk = proc(x, z: int32; forced: bool) {.closure.} =
-    var kept: seq[Vector2[int32]] = @[]
-    for c in world.forcedChunks:
-      if c.x != x or c.y != z:
-        kept.add(c)
-    if forced:
-      kept.add(Vector2[int32](x: x, y: z))
-    world.forcedChunks = kept
-    worldmod.updateActiveChunks(world)
-  result.clearForcedChunks = proc(): int32 {.closure.} =
-    let count = int32(world.forcedChunks.len)
-    world.forcedChunks = @[]
-    worldmod.updateActiveChunks(world)
-    count
+    worlddata.setForcedChunk(world, x, z, forced)
+  result.clearForcedChunks = proc(): int32 {.closure.} = worlddata.clearForcedChunks(world)
   result.getBorder = proc(): CmdBorder {.closure.} =
     let b = world.worldborder
     CmdBorder(centerX: b.centerX, centerZ: b.centerZ, newDiameter: b.newDiameter, warningBlocks: b.warningBlocks,
@@ -682,6 +742,16 @@ proc buildCommandPlayer(server: Server; player: Player): CommandPlayer =
         found = advgen.Advancement.fromMinecraftName(id)
       exists = found.isSome
       exists and progress.progress.containsKey(found.unsafeGet) and progress.progress.getMutOrStartProgress(found.unsafeGet).isDone()
+    result.isAdvancementCriterionDone = proc(id, criterion: string; exists: var bool): bool {.closure.} =
+      var found = advgen.Advancement.fromName(id)
+      if found.isNone:
+        found = advgen.Advancement.fromMinecraftName(id)
+      exists = false
+      if found.isNone:
+        return false
+      let state = progress.progress.getMutOrStartProgress(found.unsafeGet)
+      exists = state.criteria.hasKey(criterion)
+      exists and state.criteria.getOrDefault(criterion).isDone()
   result.showDialog = proc(dialog: NbtTag) {.closure.} =
     if dialog.kind == ntkCompound:
       player.client.writePacketFor(CPlayShowDialog(dialog: proto.IdOr[dialogmod.DialogNBT](kind: proto.iokValue,
@@ -862,6 +932,13 @@ proc playerEntry(id: Uuid; name, source, reason: string): BannedPlayerEntry =
 
 proc buildCommandServer(server: Server; registry: PermissionRegistry): CommandServer =
   result = CommandServer(permissionRegistry: registry, opPermissionLevel: server.basicConfig.opPermissionLevel)
+  # Command storage: `<world>/data/command_storage_<namespace>.dat`, read now and written on every change.
+  let storage = loadCommandStorage(server.levelFolder & "/data")
+  result.getCommandStorage = proc(id: string): NbtCompound {.closure.} = getStorage(storage, id)
+  result.setCommandStorage = proc(id: string; value: NbtCompound) {.closure.} =
+    setStorage(storage, id, value)
+    if not saveCommandStorage(storage):
+      echo "Could not save command storage ", id
   result.getAllPlayers = proc(): seq[CommandPlayer] {.closure.} =
     var list: seq[CommandPlayer] = @[]
     for p in allPlayers(server):

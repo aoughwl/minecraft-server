@@ -1,5 +1,5 @@
 ## Port of pumpkin/src/server/mod.rs
-## PARTIAL: pumpkin/src/server/mod.rs - construction from a save, all three dimensions, `add_player`, `remove_player`, lookups, counts, branding, status, `decrypt`, `digest_secret` and the tick, with the tick-rate manager, recipe manager, key store and `data/`. No plugin manager, command dispatcher (held back by the compiler fix), block or item registries, advancement manager or listing. The types are in serverbase.aowl.
+## PARTIAL: pumpkin/src/server/mod.rs - construction from a save, all three dimensions, `add_player`, `remove_player`, lookups, counts (`has_n_players`), `for_each_player`, `broadcast_tab_list_header_footer`, branding, status, the tick and the tick-rate manager, recipe manager, key store and `data/`; plugins start in `loadServer`, the command dispatcher is commandbridge.aowl and advancements are advancementglue.aowl. Not here: `new_container_id` (containers number themselves per player here), `spawn_task` (single-threaded). The types are in serverbase.aowl.
 
 import std/[options, syncio, tables]
 import ../generated/statistic
@@ -24,11 +24,15 @@ import entity/player as playermod
 import world/worldmod
 import world/natural_spawner as spawnergen
 import "block/worldhooks"
+from "block/worldadapter" import saveBlockEntities
 import commandbridge
+import world/levelsync
+import world/worlddata
 import advancementglue
 import world/dragon_fight_world
 import ../plugin/[pluginmgr, pluginhooks]
 import net/java/javamod
+import entity/playerextras
 
 type
   ServerLoadResult* = object
@@ -53,6 +57,63 @@ proc settingsFor(dim: Dimension): (int32, int32) =
     (gensettings.END.seaLevel, dim.minY)
   else:
     (gensettings.OVERWORLD.seaLevel, dim.minY)
+
+proc createWorld*(self: Server; name: string; dim: Dimension): World =
+  ## `Server::create_world` (newer tree): a world called `name` inside the save, or the one that is already there. The
+  ## plugins' `server.create-world` calls it through `gServerCreateWorldHook`. No `WorldInitEvent` is fired (PARTIAL).
+  for w in self.worlds:
+    if getWorldName(w) == name and w.dimension.minecraftName == dim.minecraftName:
+      return w
+  let worldPath = joinPathW(self.levelFolder, name)
+  discard createDirAllW(worldPath)
+  let info = self.worlds[0].levelInfo
+  let level = intoLevel(self.advancedConfig, worldPath, info.worldGenSettings.seed, dim)
+  level.worldPortal = worldgenPortal()
+  let (seaLevel, minY) = settingsFor(dim)
+  let loaded = loadWorld(level, info, dim, seaLevel, minY, self)
+  level.worldPortal = worldPortalFor(loaded, level.worldPortal)
+  installBlockHooks(loaded)
+  discard installDragonFight(loaded)
+  self.worlds.add(loaded)
+  loaded
+
+proc unloadWorld*(self: Server; name: string): string =
+  ## `Server::unload_world`: "" on success, else upstream's error text.
+  var idx = -1
+  for i in 0 ..< self.worlds.len:
+    if idx < 0 and (getWorldName(self.worlds[i]) == name or self.worlds[i].dimension.minecraftName == name):
+      idx = i
+  if idx < 0:
+    return "World '" & name & "' not found"
+  if idx == 0:
+    return "Cannot unload the primary/default world"
+  let target = self.worlds[idx]
+  if target.players.len > 0:
+    return "Cannot unload world '" & name & "': " & $target.players.len & " players are still in this world"
+  worldmod.shutdown(target)
+  self.worlds.delete(idx)
+  ""
+
+proc saveAll*(self: Server): string =
+  ## `Server::save_all`: "" on success. The chunks are flagged for the next save pass (`World::save` here is that flag).
+  saveAllPlayers(self)
+  if not saveAllAdvancements(self):
+    return "Failed to save player advancements"
+  var info = self.worlds[0].levelInfo
+  info.dayTime = self.worlds[0].levelTime.timeOfDay
+  syncLevelExtras(self, info)
+  let (ok, err) = writeWorldInfo(info, self.levelFolder)
+  if not ok:
+    return "Failed to save world info: " & $err
+  for w in self.worlds:
+    if not saveDimensionData(w, self.levelFolder):
+      return "Failed to save the data files of " & w.dimension.minecraftName
+  if not saveServerScoreboard(self):
+    return "Failed to save scoreboard.dat"
+  for w in self.worlds:
+    w.saveBlockEntities()
+    w.level.shouldSave = true
+  ""
 
 proc loadServer*(basicConfig: BasicConfiguration; advancedConfig: AdvancedConfiguration; levelFolder: string): ServerLoadResult =
   ## `Server::new`, reading the worlds from a save; a folder with no level.dat is a new world, as `Level::from_root_folder` makes it.
@@ -84,10 +145,14 @@ proc loadServer*(basicConfig: BasicConfiguration; advancedConfig: AdvancedConfig
     level.worldPortal = worldgenPortal()
     let (seaLevel, minY) = settingsFor(dim)
     let loaded = loadWorld(level, levelInfo, dim, seaLevel, minY, server)
+    applyLevelExtras(loaded, levelInfo)
+    loadWorldBorder(loaded, levelFolder)
     level.worldPortal = worldPortalFor(loaded, level.worldPortal)
     installBlockHooks(loaded)
     discard installDragonFight(loaded)
     server.worlds.add(loaded)
+  for loaded in server.worlds:
+    loadForcedChunks(loaded, levelFolder)
   let java = advancedConfig.networking.java
   if java.onlineMode or java.encryption:
     echo "Creating encryption keys..."
@@ -96,12 +161,42 @@ proc loadServer*(basicConfig: BasicConfiguration; advancedConfig: AdvancedConfig
   installEndPortalHook()
   installCommands(server)
   startPlugins(server)
+  gServerCreateWorldHook = proc(name: string; dimension: int): int {.closure.} =
+    let dim = (if dimension == 1: THE_NETHER elif dimension == 2: THE_END else: OVERWORLD)
+    let made = createWorld(server, name, dim)
+    var found = 0
+    for i in 0 ..< server.worlds.len:
+      if server.worlds[i] == made: found = i
+    found
+  gServerUnloadWorldHook = proc(name: string): string {.closure.} = unloadWorld(server, name)
+  gServerSaveAllHook = proc(): string {.closure.} = saveAll(server)
   ServerLoadResult(ok: true, server: server, error: "")
 
 proc getPlayerCount*(self: Server): int =
   result = 0
   for world in self.worlds:
     result += world.players.len
+
+proc broadcastTabListHeaderFooter*(self: Server; header, footer: TextComponent) =
+  ## `broadcast_tab_list_header_footer`: every player in every world keeps and is sent the pair.
+  for world in self.worlds:
+    for player in world.players:
+      player.setTabListHeaderFooter(header, footer)
+
+proc hasNPlayers*(self: Server; n: int): bool =
+  ## `has_n_players`: stops counting as soon as `n` players were found.
+  var count = 0
+  for world in self.worlds:
+    count += world.players.len
+    if count >= n:
+      return true
+  false
+
+proc forEachPlayer*(self: Server; f: proc(player: Player) {.closure.}) =
+  ## `for_each_player`
+  for world in self.worlds:
+    for player in world.players:
+      f(player)
 
 proc getPlayerByUuid*(self: Server; id: Uuid): Option[Player] =
   for world in self.worlds:
@@ -251,6 +346,12 @@ proc shutdown*(self: Server) =
     worldmod.shutdown(world)
   var info = self.worlds[0].levelInfo
   info.dayTime = self.worlds[0].levelTime.timeOfDay
+  syncLevelExtras(self, info)
   let (ok, err) = writeWorldInfo(info, self.levelFolder)
   if not ok:
     echo "Could not save level.dat: ", $err
+  for world in self.worlds:
+    if not saveDimensionData(world, self.levelFolder):
+      echo "Could not save the data files of ", world.dimension.minecraftName
+  if not saveServerScoreboard(self):
+    echo "Could not save scoreboard.dat"

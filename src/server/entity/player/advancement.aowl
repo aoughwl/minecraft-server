@@ -8,9 +8,11 @@
 ## is a plain call. `Arc<AdvancementManager>` is a ref. `IndexMap` and the `HashSet`s keep insertion order in a seq with
 ## a table to look up by.
 ##
-## On disk, as serde writes them: a `SystemTime` is `{"secs_since_epoch":n,"nanos_since_epoch":n}`, an ungranted
-## criterion is null, and PlayerAdvancement is `{id: {criterion: time-or-null}}` holding only advancements with
-## progress. `to_string_pretty`'s two-space layout is `prettyJson` below.
+## On disk: upstream writes `{id: {criterion: {"secs_since_epoch":n,"nanos_since_epoch":n} or null}}`, which a vanilla
+## server cannot read and which cannot read a vanilla file. This port writes the vanilla layout instead,
+## `{"DataVersion": n, id: {"criteria": {criterion: "2026-09-11 08:32:50 -0400"}, "done": bool}}` with only the
+## advancements that have progress and only the granted criteria, in `<world>/advancements/<uuid>.json`; `load` reads
+## that and upstream's form as well. `to_string_pretty`'s two-space layout is `prettyJson` below.
 
 import std/[assertions, options, tables, times]
 import ../../../codecs/json_value
@@ -180,6 +182,90 @@ proc getCompletedCriteria*(self: AdvancementProgress): seq[string] =
     if self.criteria.getOrDefault(name).isDone():
       result.add(name)
 
+const AdvancementDataVersion* = 4671'i32
+  ## The `DataVersion` written to a player's advancement file: Minecraft 1.21.11, the newest a vanilla 1.21.11 reads.
+
+proc daysFromCivil(y0: int64; m: int64; d: int64): int64 =
+  ## Days since 1970-01-01 of a proleptic Gregorian date (Howard Hinnant's algorithm).
+  let y = if m <= 2: y0 - 1 else: y0
+  let era = (if y >= 0: y else: y - 399) div 400
+  let yoe = y - era * 400
+  let mp = (m + 9) mod 12
+  let doy = (153 * mp + 2) div 5 + d - 1
+  let doe = yoe * 365 + yoe div 4 - yoe div 100 + doy
+  era * 146097 + doe - 719468
+
+proc civilFromDays(z0: int64): (int64, int64, int64) =
+  let z = z0 + 719468
+  let era = (if z >= 0: z else: z - 146096) div 146097
+  let doe = z - era * 146097
+  let yoe = (doe - doe div 1460 + doe div 36524 - doe div 146096) div 365
+  let y = yoe + era * 400
+  let doy = doe - (365 * yoe + yoe div 4 - yoe div 100)
+  let mp = (5 * doy + 2) div 153
+  let d = doy - (153 * mp + 2) div 5 + 1
+  let m = if mp < 10: mp + 3 else: mp - 9
+  let year = if m <= 2: y + 1 else: y
+  (year, m, d)
+
+proc two(n: int64): string =
+  if n < 10: "0" & $n else: $n
+
+proc formatAdvancementTime*(secs: int64): string =
+  ## Vanilla's `yyyy-MM-dd HH:mm:ss Z` for a time in UTC.
+  var days = secs div 86400
+  var rest = secs mod 86400
+  if rest < 0:
+    rest += 86400
+    days -= 1
+  let (y, m, d) = civilFromDays(days)
+  var year = $y
+  while year.len < 4:
+    year = "0" & year
+  year & "-" & two(m) & "-" & two(d) & " " & two(rest div 3600) & ":" & two((rest mod 3600) div 60) & ":" &
+    two(rest mod 60) & " +0000"
+
+proc parseTwo(s: string; at: int): int64 =
+  if at + 1 >= s.len or s[at] < '0' or s[at] > '9' or s[at + 1] < '0' or s[at + 1] > '9':
+    return -1
+  int64(ord(s[at]) - ord('0')) * 10 + int64(ord(s[at + 1]) - ord('0'))
+
+proc parseAdvancementTime*(s: string): (bool, int64) =
+  ## Vanilla's `yyyy-MM-dd HH:mm:ss Z` (an offset like -0400) back to seconds since the epoch.
+  if s.len < 25 or s[4] != '-' or s[7] != '-' or s[10] != ' ' or s[13] != ':' or s[16] != ':' or s[19] != ' ':
+    return (false, 0'i64)
+  var y = 0'i64
+  for i in 0 ..< 4:
+    if s[i] < '0' or s[i] > '9':
+      return (false, 0'i64)
+    y = y * 10 + int64(ord(s[i]) - ord('0'))
+  let mo = parseTwo(s, 5)
+  let d = parseTwo(s, 8)
+  let h = parseTwo(s, 11)
+  let mi = parseTwo(s, 14)
+  let se = parseTwo(s, 17)
+  let oh = parseTwo(s, 21)
+  let om = parseTwo(s, 23)
+  if mo < 1 or mo > 12 or d < 1 or d > 31 or h < 0 or h > 23 or mi < 0 or mi > 59 or se < 0 or se > 60 or oh < 0 or om < 0:
+    return (false, 0'i64)
+  if s[20] != '+' and s[20] != '-':
+    return (false, 0'i64)
+  var offset = oh * 3600 + om * 60
+  if s[20] == '-':
+    offset = -offset
+  (true, daysFromCivil(y, mo, d) * 86400 + h * 3600 + mi * 60 + se - offset)
+
+proc toVanillaJson*(self: AdvancementProgress): JsonValue =
+  ## One advancement as vanilla's `AdvancementProgress` codec writes it: the granted criteria with their time, and `done`.
+  var criteria = jsonObject()
+  for name in self.criteriaNames:
+    let value = self.criteria.getOrDefault(name)
+    if value.isDone():
+      criteria.put(name, jsonString(formatAdvancementTime(value.time.unsafeGet.secsSinceEpoch)))
+  result = jsonObject()
+  result.put("criteria", criteria)
+  result.put("done", jsonBool(self.isDone()))
+
 proc toJson*(self: CriterionProgress): JsonValue =
   if self.time.isNone:
     return jsonNull()
@@ -212,6 +298,17 @@ proc advancementProgressFromJson*(v: JsonValue): (bool, AdvancementProgress) =
   var progress = AdvancementProgress(requirements: AdvancementRequirement(requirements: @[]))
   if v.kind != jvObject:
     return (false, progress)
+  let (hasCriteria, vanillaCriteria) = v.get("criteria")
+  if hasCriteria and vanillaCriteria.kind == jvObject:
+    # Vanilla's layout: {"criteria": {name: "date"}, "done": bool}.
+    for i in 0 ..< vanillaCriteria.keys.len:
+      var secs = 0'i64
+      if vanillaCriteria.vals[i].kind == jvString:
+        let (parsedOk, parsed) = parseAdvancementTime(vanillaCriteria.vals[i].strVal)
+        if parsedOk:
+          secs = parsed
+      progress.addCriterion(vanillaCriteria.keys[i], CriterionProgress(time: some(SystemTime(secsSinceEpoch: secs, nanosSinceEpoch: 0'i32))))
+    return (true, progress)
   for i in 0 ..< v.keys.len:
     let (ok, value) = criterionProgressFromJson(v.vals[i])
     if not ok:
@@ -314,14 +411,12 @@ proc prettyJson*(v: JsonValue): string =
   prettyJsonInto(result, v, 0)
 
 proc toJson*(self: PlayerAdvancement): JsonValue =
-  ## `impl Serialize for PlayerAdvancement`. Every criterion is written, null when not granted, which `load` reads back.
+  ## What vanilla's `PlayerAdvancements.save` writes: the advancements with progress, then the `DataVersion`.
   result = jsonObject()
   for i in 0 ..< self.progress.keys.len:
     if self.progress.values[i].hasProgress():
-      var criteria = jsonObject()
-      for name in self.progress.values[i].criteriaNames:
-        criteria.put(name, self.progress.values[i].criteria.getOrDefault(name).toJson())
-      result.put($self.progress.keys[i], criteria)
+      result.put($self.progress.keys[i], self.progress.values[i].toVanillaJson())
+  result.put("DataVersion", jsonInt(int64(AdvancementDataVersion)))
 
 proc writeJson(path, json: string): bool =
   var bytes = newSeq[byte](json.len)
@@ -364,6 +459,8 @@ proc load*(self: PlayerAdvancement): AdvancementResult =
     return errResult(adeJson, "Invalid advancement JSON in " & self.path)
   var loaded: seq[(string, AdvancementProgress)] = @[]
   for i in 0 ..< parsed.value.keys.len:
+    if parsed.value.keys[i] == "DataVersion":
+      continue
     let (ok, progress) = advancementProgressFromJson(parsed.value.vals[i])
     if not ok:
       return errResult(adeJson, "Invalid advancement progress for " & parsed.value.keys[i])

@@ -1,0 +1,214 @@
+## The per-dimension data files a vanilla 1.21.11 save keeps in `<dimension folder>/data/`: `world_border.dat` and the forced
+## chunks of `chunks.dat`. Not upstream, which keeps the border and `/forceload` in memory only, so a border set in game,
+## or a vanilla world's forced chunks, were lost on the next start and a vanilla server lost them too.
+##
+## Both files are a gzip compound `{data: {...}, DataVersion: int}`. The overworld's folder is the save itself, the nether's
+## is `DIM-1` and the end's `DIM1` (as `servermod.intoLevel` lays the levels out). Fields this port has no use for are read
+## and written back as they were.
+##
+## A forced chunk takes a ticket at `FullChunkLevel`, so it loads and ticks with no player near, which is what the command
+## is for; upstream only adds it to the active set, where a chunk nothing loaded is never ticked.
+
+import std/[options, math]
+import ../../nbt/tag
+import ../../world/[worldfs, nbtget, worldinfodatafiles, level]
+import ../../world/chunk_system/chunk_system
+import ../../generated/dimension
+import ../../util/vector2
+import ../serverbase
+import worldmod
+
+const
+  DataFileVersion* = 4671'i32  ## `DataVersion` of what is written: Minecraft 1.21.11, the newest a vanilla 1.21.11 reads.
+  BorderFile = "world_border.dat"
+  ChunksFile = "chunks.dat"
+  ForcedTicket = "minecraft:forced"
+  VanillaForcedLevel = 31'i32  ## What a vanilla server writes for a forced chunk's ticket level.
+
+proc dimensionDataFolder*(levelFolder: string; dim: Dimension): string =
+  var root = levelFolder
+  if dim.minecraftName == THE_NETHER.minecraftName:
+    root = joinPathW(levelFolder, "DIM-1")
+  elif dim.minecraftName == THE_END.minecraftName:
+    root = joinPathW(levelFolder, "DIM1")
+  joinPathW(root, "data")
+
+proc readInner*(path: string): (bool, NbtCompound) =
+  ## The `data` compound of a data file; false when it is absent or unreadable.
+  let (status, bytes) = readFileBytes(path)
+  if status != rsOk:
+    return (false, newCompound())
+  let (ok, root, _) = readGzipCompound(bytes)
+  if not ok:
+    return (false, newCompound())
+  let (hasData, inner) = nbtCompound(root, "data")
+  if not hasData:
+    return (false, newCompound())
+  (true, inner)
+
+proc writeInner*(path: string; inner: NbtCompound): bool =
+  ## `{data: inner, DataVersion}` gzipped, to a temporary file that then replaces the old one, so a stop in the middle of a
+  ## save leaves the old file whole.
+  if not createDirAllW(parentDirW(path)):
+    return false
+  var root = newCompound()
+  put(root, "data", compoundTag(inner))
+  put(root, "DataVersion", intTag(DataFileVersion))
+  let temporary = path & ".tmp"
+  let (ok, _) = writeGzipCompoundFile(temporary, root)
+  if not ok:
+    return false
+  renameReplace(temporary, path)
+
+proc dblOr(c: NbtCompound; name: string; d: float64): float64 =
+  let (ok, v) = nbtDouble(c, name)
+  if ok: v else: d
+
+proc intOr(c: NbtCompound; name: string; d: int32): int32 =
+  let (ok, v) = nbtInt(c, name)
+  if ok: v else: d
+
+# --- world_border.dat ------------------------------------------------------------------------------------------------
+
+proc worldBorderToNbt*(b: Worldborder; old: NbtCompound): NbtCompound =
+  ## The vanilla fields. An unfinished resize is written as finished: nothing here steps `oldDiameter` to `newDiameter`.
+  result = old
+  insert(result, "center_x", doubleTag(b.centerX))
+  insert(result, "center_z", doubleTag(b.centerZ))
+  insert(result, "damage_per_block", doubleTag(float64(b.damagePerBlock)))
+  insert(result, "warning_time", intTag(b.warningTime))
+  insert(result, "size", doubleTag(b.newDiameter))
+  insert(result, "safe_zone", doubleTag(float64(b.buffer)))
+  insert(result, "warning_blocks", intTag(b.warningBlocks))
+  insert(result, "lerp_target", doubleTag(b.newDiameter))
+  insert(result, "lerp_time", longTag(0'i64))
+
+proc worldBorderFromNbt*(d: NbtCompound; into: Worldborder): Worldborder =
+  ## `into` with the file's values over it; a field the file lacks keeps `into`'s.
+  result = into
+  result.centerX = dblOr(d, "center_x", into.centerX)
+  result.centerZ = dblOr(d, "center_z", into.centerZ)
+  result.damagePerBlock = float32(dblOr(d, "damage_per_block", float64(into.damagePerBlock)))
+  result.buffer = float32(dblOr(d, "safe_zone", float64(into.buffer)))
+  result.warningBlocks = intOr(d, "warning_blocks", into.warningBlocks)
+  result.warningTime = intOr(d, "warning_time", into.warningTime)
+  let size = dblOr(d, "size", into.newDiameter)
+  let target = dblOr(d, "lerp_target", size)
+  let (hasLerp, lerpTicks) = nbtLong(d, "lerp_time")
+  result.oldDiameter = size
+  if hasLerp and lerpTicks > 0'i64:
+    # Still resizing: the rest of it, as the client is told on joining (milliseconds, 50 to a tick).
+    result.newDiameter = target
+    result.speed = lerpTicks * 50'i64
+  else:
+    result.newDiameter = size
+    result.speed = 0'i64
+
+proc loadWorldBorder*(world: World; levelFolder: string) =
+  let (ok, inner) = readInner(joinPathW(dimensionDataFolder(levelFolder, world.dimension), BorderFile))
+  if ok:
+    world.worldborder = worldBorderFromNbt(inner, world.worldborder)
+
+proc saveWorldBorder*(world: World; levelFolder: string): bool =
+  ## Written when the file exists or the border is no longer the fresh default, so a save nobody touched stays as it was.
+  let path = joinPathW(dimensionDataFolder(levelFolder, world.dimension), BorderFile)
+  let (existed, old) = readInner(path)
+  let b = world.worldborder
+  let fresh = b.centerX == 0.0 and b.centerZ == 0.0 and b.newDiameter == 5.999_996_8e7 and b.warningBlocks == 5'i32 and
+    b.warningTime == 300'i32 and b.damagePerBlock == 0.0'f32 and b.buffer == 0.0'f32
+  if not existed and fresh:
+    return true
+  writeInner(path, worldBorderToNbt(b, old))
+
+# --- chunks.dat -------------------------------------------------------------------------------------------------------
+
+proc isForced(world: World; x, z: int32): bool =
+  for c in world.forcedChunks:
+    if c.x == x and c.y == z:
+      return true
+  false
+
+proc setForcedChunk*(world: World; x, z: int32; forced: bool) =
+  ## `/forceload add` and `remove` for one chunk: the list the active set reads, and the ticket that keeps it loaded.
+  let was = world.isForced(x, z)
+  if forced == was:
+    return
+  discard ensureChunkSystem(world.level)
+  if forced:
+    world.forcedChunks.add(Vector2[int32](x: x, y: z))
+    addTicket(world.level.chunkLoading, chunkPos(x, z), FullChunkLevel)
+  else:
+    var kept: seq[Vector2[int32]] = @[]
+    for c in world.forcedChunks:
+      if c.x != x or c.y != z:
+        kept.add(c)
+    world.forcedChunks = kept
+    removeTicket(world.level.chunkLoading, chunkPos(x, z), FullChunkLevel)
+  sendChange(world.level.chunkLoading)
+  updateActiveChunks(world)
+
+proc clearForcedChunks*(world: World): int32 =
+  ## `/forceload remove all`
+  result = int32(world.forcedChunks.len)
+  if result == 0'i32:
+    return
+  discard ensureChunkSystem(world.level)
+  for c in world.forcedChunks:
+    removeTicket(world.level.chunkLoading, chunkPos(c.x, c.y), FullChunkLevel)
+  world.forcedChunks = @[]
+  sendChange(world.level.chunkLoading)
+  updateActiveChunks(world)
+
+proc forcedFromNbt*(inner: NbtCompound): seq[Vector2[int32]] =
+  ## The `minecraft:forced` tickets of a chunks.dat.
+  result = @[]
+  let (hasTickets, tickets) = nbtList(inner, "tickets")
+  if not hasTickets:
+    return
+  for t in tickets:
+    if t.kind != ntkCompound:
+      continue
+    let (hasType, kind) = nbtString(t.compoundVal, "type")
+    let (hasPos, pos) = nbtIntArray(t.compoundVal, "chunk_pos")
+    if hasType and kind == ForcedTicket and hasPos and pos.len == 2:
+      result.add(Vector2[int32](x: pos[0], y: pos[1]))
+
+proc ticketsToNbt*(forced: seq[Vector2[int32]]; old: NbtCompound): NbtCompound =
+  ## `old` with its forced tickets replaced by `forced`; the other tickets stay as they were.
+  result = old
+  var tickets: seq[NbtTag] = @[]
+  let (hasTickets, oldTickets) = nbtList(old, "tickets")
+  if hasTickets:
+    for t in oldTickets:
+      if t.kind == ntkCompound:
+        let (hasType, kind) = nbtString(t.compoundVal, "type")
+        if hasType and kind == ForcedTicket:
+          continue
+      tickets.add(t)
+  for c in forced:
+    var t = newCompound()
+    put(t, "chunk_pos", intArrayTag(@[c.x, c.y]))
+    put(t, "level", intTag(VanillaForcedLevel))
+    put(t, "type", stringTag(ForcedTicket))
+    tickets.add(compoundTag(t))
+  insert(result, "tickets", listTag(tickets))
+
+proc loadForcedChunks*(world: World; levelFolder: string) =
+  ## Called once a world is built: the saved forced chunks are forced again, each with its ticket.
+  let (ok, inner) = readInner(joinPathW(dimensionDataFolder(levelFolder, world.dimension), ChunksFile))
+  if not ok:
+    return
+  for c in forcedFromNbt(inner):
+    world.setForcedChunk(c.x, c.y, true)
+
+proc saveForcedChunks*(world: World; levelFolder: string): bool =
+  let path = joinPathW(dimensionDataFolder(levelFolder, world.dimension), ChunksFile)
+  let (existed, old) = readInner(path)
+  if not existed and world.forcedChunks.len == 0:
+    return true
+  writeInner(path, ticketsToNbt(world.forcedChunks, old))
+
+proc saveDimensionData*(world: World; levelFolder: string): bool =
+  let border = saveWorldBorder(world, levelFolder)
+  let chunks = saveForcedChunks(world, levelFolder)
+  border and chunks
