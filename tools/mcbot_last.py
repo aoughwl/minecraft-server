@@ -57,6 +57,8 @@ def last_session(m, c, st, w, biomes, ctx, args):
            'the stage', 30.0)
     y = fy + 1
 
+    cmd('weather clear')   # the copied world may be mid-rain, which is not what this scenario is about
+    settle(0.5)
     # --- A command block and a chain block behind it, east of the impulse block.
     bx, bz = sx, sz
     cmd('setblock %d %d %d minecraft:command_block[facing=east]' % (bx, y, bz))

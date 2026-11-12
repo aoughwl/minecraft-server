@@ -186,9 +186,14 @@ def itemuse_session(m, c, st, w, biomes, ctx, args):
         clear()
         cmd('item replace entity @s weapon.offhand with minecraft:shield')
         settle(0.8)
+        wait(lambda: w.window0[45][0] > 0, 'the shield in the off hand slot', 10.0)
         mark = len(flags)
         use(1)
         settle(0.6)
+        try:
+            wait(lambda: any(v & 1 and v & 2 for _, v in flags[mark:]), 'the using flag', 5.0)
+        except m.Fail:
+            pass
         got = flags[mark:]
         print('  living flags: %s' % (got,))
         check(any(v & 1 and v & 2 for _, v in got), 'the using flag with the off hand bit was not sent')
