@@ -718,3 +718,16 @@ All of these pass `check`/hexer and fail in gcc or at sem; none is fixable here 
 - **`let made = newItemEntity(..); let item: EntityBase = made`** emits `wasMoved(&(cast)made)` ("lvalue required"): write `let item: EntityBase = newItemEntity(..)`.
 - **A nimcache path under a shared checkout**: another session's half-edited tree (an import cycle in bedrockplay) breaks every build; build from a
   `git worktree` of origin/main next to the repo (`../mcs-wt`), so `../toolchain`, `../jwt` still resolve.
+
+- **The runtime crashes of every dispatcher test (2026-11-14) were a stale lowering pass, not the sources.** `toolchain/aowlmony/root/bin/hexer.exe` was built from
+  aowlhexer fae305e; aowlhexer HEAD (196c1d2) has the fixes "closures in object fields", "closures and moves" and "ref-base lowering: destroy, copy, module
+  scopes". With the old binary a closure field of a type declared in another module was assigned and called without the env's dup/destroy
+  (`h.f = proc ...` stored the env without a count, a call copied the closure and destroyed the copy), so any capturing hook freed its env twice
+  ("corrupted free list entry" in mimalloc, or a SIGSEGV in `playerBase`). Rebuild with `aowlhexer/tools/selfbuild.sh <fresh dir>` (about 2 min, aowlmony stack
+  only; `AOWL_TOOLCHAIN=<toolchain> NIMONY_SRC=<toolchain>/aowlmony/root/src`) and copy `hexer.exe` over `root/bin/hexer.exe` (the old one is kept as
+  `hexer.before-196c1d2.exe`). stoptest, clonetest, datatest, playtest, playerextrastest, configtest and joinflowtest all pass with it. The `closureSet`
+  and `hk*` workarounds above were written before this was known; they are harmless and may be removed once the new hexer is the staged one everywhere.
+- **`proc x(c: ContainerInventory)` upcasts**: `Inventory(c)` as the last use of a local is emitted as `wasMoved(&cast)` ("lvalue required"); the block entities
+  convert through `containerAsInventory(c)` (a parameter) instead.
+- **A use after the last-use move in the mover**: `entity.base = result` after `entity` went into `EntityBase(entity: entity, ..)` dereferenced NULL (a field
+  store through a ref local is not a read). `playerBase` writes `result.entity.base = result`.
