@@ -693,3 +693,28 @@ C compiler. Use a nimcache path of at most 4 characters on this machine for the 
   closure in the module does not help; put the nil checks in a proc of the module that declares the type.
 - Copying a closure field out of a world into a local in another module (`let by = self.blockPlayerOf` in `worldmod.aowl`) emits
   a temp of a differently named closure type ("invalid initializer"). Use a helper in the declaring module (`blockPlayerFor`).
+
+
+### C-stage traps, worked around in the sources (2026-11-14, getting `net/java/configtest` to link and pass)
+All of these pass `check`/hexer and fail in gcc or at sem; none is fixable here (no Nim to rebuild hexer/lengc), so the sources route around them.
+- **`x.closureField != nil` / `== nil` where `x`'s type is declared in another module** is emitted as `((void*)(*x).d_00.f_0) == NIM_NIL`
+  ("cannot convert to a pointer type"): the closure struct is cast. A same-module check is fine; so is a helper proc in the declaring module;
+  a generic helper does not compile (`!=` on `T`); a proc taking the closure *value* works but needs one overload per signature. What works
+  everywhere: `src/util/closureset.aowl`, `closureSet(x.field)` (a template comparing the first word of the closure,
+  `cast[ptr pointer](addr f)[] != nil`). About 400 sites were rewritten with it. A `nil T` holder's non-nil fact survives it (it is a
+  template, not a call). Do not write `proc has(o: nil T)` helpers instead: in `a != nil and has(a)` the prover forgets `a != nil` after the call
+  (any call in an `and` chain drops it; nested `if`s keep it).
+- **A call of a closure field reached through a captured variable inside a closure** (`we.be.hooks.kind(..)` in an `witFn` body) is emitted as a direct
+  call of the closure struct: "called object is not a function". Use a same-module wrapper that takes the hooks object (`hkKind(h, ..)`, now
+  generated for `WitHooks` and `BlockEntityHooks` in plugin/wit/witstate.aowl and witblockentity.aowl; the scoreboard and recipe hooks already had them).
+- **`eQdestroyQ_Aref<T>` calling the object destructor by value instead of by address** (CommandDispatcher: `Server.commandDispatcher` made the
+  Aref destroy in serverbase.c): fixed by declaring the object separately and writing the hook explicitly
+  (`CommandDispatcherObj = object ...`, `CommandDispatcher = ref CommandDispatcherObj`, an empty `=destroy(d: var CommandDispatcherObj)`), so the hook is
+  a frontend hook the importing module can load. Other types in the list above may need the same.
+- **A field name equal to a local name in the same function** (`for x in ..` and `pos.x`; `var buf` and `value.buf`; a local `chunkPos` and a
+  template reading `player.chunkPos`): the field access becomes the local's lifted temp (`pos_0.X60Qlf_2 has no member`). Rename the local.
+  Templates are the trap: `broadcastToChunk` now reads the field through `playerChunkPos(p)`.
+- **`for m in obj.getOrDefault(k).modifiers`**: `no member named X60Qii_3`. Bind the object, then the seq, to `let`s and use an index loop.
+- **`let made = newItemEntity(..); let item: EntityBase = made`** emits `wasMoved(&(cast)made)` ("lvalue required"): write `let item: EntityBase = newItemEntity(..)`.
+- **A nimcache path under a shared checkout**: another session's half-edited tree (an import cycle in bedrockplay) breaks every build; build from a
+  `git worktree` of origin/main next to the repo (`../mcs-wt`), so `../toolchain`, `../jwt` still resolve.
