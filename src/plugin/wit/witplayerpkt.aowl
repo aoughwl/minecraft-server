@@ -1,0 +1,354 @@
+## The packet and dialog host functions of the `java-player` and `bedrock-player` resources of
+## pumpkin/src/plugin/loader/wasm/wasm_host/wit/v0_1/player.rs: `java-player.send-packet`, `java-player.show-dialog`,
+## `bedrock-player.get-version`, `bedrock-player.get-settings` and `bedrock-player.send-packet`.
+## Called by `installPlayer3` (witplayer3.aowl), which owns the rest of the `player` interface.
+##
+## The pure halves (`dialogOf`, `dialogToNbt`, `bedrockSettingsVal`, `javaPacketCase`, `bedrockPacketBody`) take lifted `CVal`s and
+## answer plain values, so witplayer3test.aowl can hold them against known answers.
+##
+## PARTIAL: pumpkin/src/plugin/loader/wasm/wasm_host/wit/v0_1/generated_packets.rs - `serialize_java_packet` and
+## `serialize_bedrock_packet` are ~2700 generated lines, one arm per packet of the WIT `clientbound-packet` variants. Here the arms
+## exist for java: c-custom-payload, c-game-event, c-entity-status, c-keep-alive, c-set-experience, c-set-health, c-clear-title,
+## c-open-book, c-action-bar, c-title-text, c-close-container, c-play-disconnect, c-play-clear-dialog; for bedrock: c-chunk-radius-updated,
+## c-set-time, c-set-difficulty, c-set-health, c-transfer, c-remove-actor, c-modal-form-request, c-disconnect, c-show-credits.
+## Every other case sends nothing, which is what upstream does for a case whose arm answers `None`; the rest of the arms follow the
+## same shape and are added one by one.
+## PARTIAL: pumpkin/src/plugin/loader/wasm/wasm_host/wit/v0_1/player.rs - `java-player.show-dialog`: upstream builds the protocol
+## `Dialog` and hands it to `DialogNBT::from_dialog`, whose writer answers "Serializing Dialog struct to NBT is not supported" (so the
+## client never receives it). Here the same `Dialog` struct is built (`dialogOf`) and then written as the dialog NBT of the 1.21.6+
+## registry format (`dialogToNbt`): `notice` carries its first button as `action`, `confirmation` its first two as `yes` / `no`,
+## `multi_action` all as `actions`; an input gets the key `input_<index>` (the struct has none), a `dialog-body.item` is an `air` item
+## (upstream writes `item: 0`, "TODO: Map ItemStack correctly") and the links are not written. The event `DialogShowEvent` of the
+## newer tree is not fired. A player in the configuration state is not reachable from the plugin host, so only the play packet is sent.
+import std/[options, strutils]
+import ../wasm/[component, canonabi]
+import ../../nbt/tag
+import ../../protocol/[proto, varint, netcodec, serial]
+import ../../protocol/java/client/dialog as dialogmod
+import ../../protocol/java/client/play/show_dialog
+import ../../protocol/java/client/play/[custom_payload, game_event, entity_status, keep_alive, set_experience,
+  clear_title, open_book, actionbar, set_title, close_container, clear_dialog]
+import ../../protocol/java/client/play/disconnect as pdisc
+import ../../protocol/java/client/play/set_health as jhealth
+import ../../protocol/bedrock/client/chunk_radius_update as bchunk
+import ../../protocol/bedrock/client/set_time as btime
+import ../../protocol/bedrock/client/set_difficulty as bdiff
+import ../../protocol/bedrock/client/set_health as bhealth
+import ../../protocol/bedrock/client/transfer as btransfer
+import ../../protocol/bedrock/client/remove_actor as bremove
+import ../../protocol/bedrock/client/modal_form_request as bform
+import ../../protocol/bedrock/client/disconnect_player as bdisc
+import ../../protocol/bedrock/client/show_credits as bcredits
+import ../../protocol/bedrock/server/login as slogin
+import ../../util/text/text
+import ../../server/entity/player as playermod
+import ../../server/serverbase
+import ../../server/net/netbase
+import ../../server/net/java/javamod
+import ../pluginhooks
+import witstate, witserver
+
+const
+  IfPlayer = "pumpkin:plugin/player"
+  DialogTypes = ["minecraft:notice", "minecraft:confirmation", "minecraft:multi_action", "minecraft:dialog_list",
+    "minecraft:server_links"]
+
+# ---- java-player.show-dialog ---------------------------------------------------------------------
+
+proc dialogOf*(w: WitState; v: CVal): dialogmod.Dialog =
+  ## The protocol `Dialog` of the WIT `dialog` record (title, type, body, inputs, buttons, links, after-action,
+  ## can-close-with-escape, external-title), as `show_dialog` builds it.
+  let title = textAt(w, int(v.items[0].i))
+  var body: seq[dialogmod.DialogBody] = @[]
+  for b in v.items[2].items:
+    if b.i == 0: body.add dialogmod.DialogBody(kind: dbkPlainMessage, contents: textAt(w, int(b.items[0].i)))
+    else: body.add dialogmod.DialogBody(kind: dbkItem, item: 0'i32)         # "TODO: Map ItemStack correctly"
+  var inputs: seq[dialogmod.DialogInput] = @[]
+  for inp in v.items[3].items:
+    let f = inp.items[0].items
+    case inp.i
+    of 0:
+      inputs.add dialogmod.DialogInput(kind: dikBoolean, label: textAt(w, int(f[0].i)), booleanDefault: f[1].i != 0)
+    of 1:
+      inputs.add dialogmod.DialogInput(kind: dikText, label: textAt(w, int(f[0].i)), placeholder: textAt(w, int(f[1].i)),
+        textDefault: f[2].s)
+    of 2:
+      var fmt = none[string]()
+      if f[5].i != 0: fmt = some(f[5].items[0].s)
+      inputs.add dialogmod.DialogInput(kind: dikNumberRange, label: textAt(w, int(f[0].i)), min: float32(f[1].f),
+        max: float32(f[2].f), initial: float32(f[3].f), step: float32(f[4].f), labelFormat: fmt)
+    else:
+      var opts: seq[TextComponent] = @[]
+      for o in f[1].items: opts.add textAt(w, int(o.i))
+      inputs.add dialogmod.DialogInput(kind: dikSingleOption, label: textAt(w, int(f[0].i)), options: opts,
+        initialIndex: uint32(f[2].i))
+  var buttons: seq[dialogmod.ActionButton] = @[]
+  for b in v.items[4].items:
+    let f = b.items
+    var tip = none[TextComponent]()
+    if f[1].i != 0: tip = some(textAt(w, int(f[1].items[0].i)))
+    var width = none[uint32]()
+    if f[2].i != 0: width = some(uint32(f[2].items[0].i))
+    var act: dialogmod.DialogAction
+    if f[3].i == 0:
+      act = dialogmod.DialogAction(kind: dakOpenUrl, url: f[3].items[0].s)
+    else:
+      let c = f[3].items[0].items
+      var payload = none[seq[byte]]()
+      if c[1].i != 0:
+        var bs: seq[byte] = @[]
+        for x in c[1].items[0].items: bs.add byte(x.i)
+        payload = some(bs)
+      act = dialogmod.DialogAction(kind: dakCustom, id: c[0].s, payload: payload)
+    buttons.add dialogmod.ActionButton(text: textAt(w, int(f[0].i)), tooltip: tip, width: width, action: act)
+  var links: seq[dialogmod.DialogLink] = @[]
+  for l in v.items[5].items:
+    let lab = l.items[0].items[0]
+    if l.items[0].i == 0:
+      links.add dialogmod.DialogLink(label: Label(kind: lkBuiltIn, builtIn: LinkType(int(lab.i))), url: l.items[1].s)
+    else:
+      links.add dialogmod.DialogLink(label: Label(kind: lkTextComponent, textComponent: textAt(w, int(lab.i))), url: l.items[1].s)
+  var after = none[string]()
+  if v.items[6].i != 0:
+    after = some(if v.items[6].items[0].i == 0: "peek" else: "pop")
+  var ext = none[TextComponent]()
+  if v.items[8].i != 0: ext = some(textAt(w, int(v.items[8].items[0].i)))
+  dialogmod.Dialog(dialogType: DialogTypes[max(0, min(int(v.items[1].i), DialogTypes.len - 1))], title: title, body: body,
+    inputs: inputs, buttons: buttons, links: links, exitAction: none[dialogmod.DialogAction](), afterAction: after,
+    canCloseWithEscape: v.items[7].i != 0, externalTitle: ext)
+
+proc actionNbt(a: dialogmod.DialogAction): NbtCompound =
+  result = newCompound()
+  case a.kind
+  of dakOpenUrl:
+    putString(result, "type", "minecraft:open_url")
+    putString(result, "url", a.url)
+  of dakCustom:
+    putString(result, "type", "minecraft:custom")
+    putString(result, "id", a.id)
+
+proc buttonNbt(b: dialogmod.ActionButton): NbtCompound =
+  result = newCompound()
+  put(result, "label", toNbt(b.text))
+  if b.tooltip.isSome: put(result, "tooltip", toNbt(b.tooltip.unsafeGet))
+  if b.width.isSome: putInt(result, "width", int32(b.width.unsafeGet))
+  putCompound(result, "action", actionNbt(b.action))
+
+proc dialogToNbt*(d: dialogmod.Dialog): NbtCompound =
+  ## The dialog as the registry-format compound (see this file's PARTIAL line for what it keeps).
+  result = newCompound()
+  putString(result, "type", d.dialogType)
+  put(result, "title", toNbt(d.title))
+  if d.externalTitle.isSome: put(result, "external_title", toNbt(d.externalTitle.unsafeGet))
+  putBool(result, "can_close_with_escape", d.canCloseWithEscape)
+  if d.afterAction.isSome: putString(result, "after_action", d.afterAction.unsafeGet)
+  var body: seq[NbtTag] = @[]
+  for b in d.body:
+    var c = newCompound()
+    case b.kind
+    of dbkPlainMessage:
+      putString(c, "type", "minecraft:plain_message")
+      put(c, "contents", toNbt(b.contents))
+    of dbkItem:
+      putString(c, "type", "minecraft:item")
+      var it = newCompound()
+      putString(it, "id", "minecraft:air")
+      putInt(it, "count", 1'i32)
+      putCompound(c, "item", it)
+    body.add nbtTag(c)
+  putList(result, "body", body)
+  var inputs: seq[NbtTag] = @[]
+  var n = 0
+  for inp in d.inputs:
+    var c = newCompound()
+    putString(c, "key", "input_" & $n)
+    put(c, "label", toNbt(inp.label))
+    case inp.kind
+    of dikBoolean:
+      putString(c, "type", "minecraft:boolean")
+      putBool(c, "initial", inp.booleanDefault)
+    of dikText:
+      putString(c, "type", "minecraft:text")
+      putString(c, "initial", inp.textDefault)
+    of dikNumberRange:
+      putString(c, "type", "minecraft:number_range")
+      putFloat(c, "start", inp.min)
+      putFloat(c, "end", inp.max)
+      putFloat(c, "initial", inp.initial)
+      putFloat(c, "step", inp.step)
+      if inp.labelFormat.isSome: putString(c, "label_format", inp.labelFormat.unsafeGet)
+    of dikSingleOption:
+      putString(c, "type", "minecraft:single_option")
+      var opts: seq[NbtTag] = @[]
+      var i = 0
+      for o in inp.options:
+        var oc = newCompound()
+        putString(oc, "id", $i)
+        put(oc, "display", toNbt(o))
+        putBool(oc, "initial", uint32(i) == inp.initialIndex)
+        opts.add nbtTag(oc)
+        inc i
+      putList(c, "options", opts)
+    inputs.add nbtTag(c)
+    inc n
+  putList(result, "inputs", inputs)
+  if d.dialogType == "minecraft:notice" and d.buttons.len > 0:
+    putCompound(result, "action", buttonNbt(d.buttons[0]))
+  elif d.dialogType == "minecraft:confirmation" and d.buttons.len > 1:
+    putCompound(result, "yes", buttonNbt(d.buttons[0]))
+    putCompound(result, "no", buttonNbt(d.buttons[1]))
+  else:
+    var acts: seq[NbtTag] = @[]
+    for b in d.buttons: acts.add nbtTag(buttonNbt(b))
+    putList(result, "actions", acts)
+
+# ---- bedrock-player.get-version / get-settings -----------------------------------------------------
+
+proc bedrockVersionIdx*(v: BedrockMinecraftVersion): int =
+  ## `to_wasm_bedrock_version`: v-1-21, v-1-26-30, unknown.
+  case v
+  of bmvV1_21: 0
+  of bmvV1_26_30: 1
+  else: 2
+
+proc bedrockDeviceOs*(os: int32): int =
+  ## `to_wasm_bedrock_device_os`: android .. linux are 1 .. 15 and cases 0 .. 14, everything else `unknown` (15).
+  if os >= 1 and os <= 15: int(os) - 1 else: 15
+
+proc bedrockInputMode*(mode: int32): int =
+  ## `to_wasm_bedrock_input_mode`: unknown, mouse, touch, game-pad, motion-controller.
+  if mode >= 1 and mode <= 4: int(mode) else: 0
+
+proc bedrockUiProfile*(p: int32): int =
+  ## classic, pocket, unknown.
+  if p == 0: 0 elif p == 1: 1 else: 2
+
+proc bedrockGraphicsMode*(m: int32): int =
+  ## simple, fancy, ray-traced, unknown.
+  if m >= 0 and m <= 2: int(m) else: 3
+
+proc bedrockSettingsVal*(data: slogin.ClientData): CVal =
+  ## The WIT `bedrock-player-settings` record of a client's login data (game-version, device-os, device-id, device-model,
+  ## language-code, current-input-mode, default-input-mode, ui-profile, gui-scale, is-editor-mode, max-view-distance, memory-tier,
+  ## graphics-mode, playfab-id, client-random-id, platform-offline-id, platform-online-id, skin-id, arm-size, is-persona-skin,
+  ## is-premium-skin, is-trusted-skin).
+  vRecord(@[vStr(data.gameVersion), vInt(int64(bedrockDeviceOs(data.deviceOs))), vStr(data.deviceId), vStr(data.deviceModel),
+    vStr(data.languageCode), vInt(int64(bedrockInputMode(data.currentInputMode))),
+    vInt(int64(bedrockInputMode(data.defaultInputMode))), vInt(int64(bedrockUiProfile(data.uiProfile))),
+    vInt(int64(data.guiScale)), vBool(data.clientIsEditorCapable), vInt(int64(data.maxViewDistance)),
+    vInt(int64(data.memoryTier)), vInt(int64(bedrockGraphicsMode(data.graphicsMode))), vStr(data.playFabId),
+    vInt(data.clientRandomId), vStr(data.platformOfflineId), vStr(data.platformOnlineId), vStr(data.skinId),
+    vStr(data.armSize), vBool(data.personaSkin), vBool(data.premiumSkin), vBool(data.trustedSkin)])
+
+# ---- bedrock-player.send-packet ----------------------------------------------------------------------
+
+proc bedrockPacketBody*(name: string; v: CVal; id: var int32; body: var seq[byte]): bool =
+  ## `serialize_bedrock_packet` for the cases listed in the PARTIAL line: the packet id and the body written before the frame
+  ## header (what `send_game_packet` takes). False for a case without an arm.
+  var wr = newNetWriter()
+  let f = v.items
+  case name
+  of "c-chunk-radius-updated":
+    id = bchunk.CChunkRadiusUpdatePacketId
+    packetWrite(bchunk.CChunkRadiusUpdate(chunkRadius: newVarInt(int32(f[0].i))), wr)
+  of "c-set-time":
+    id = btime.CSetTimePacketId
+    packetWrite(btime.newCSetTime(int32(f[0].i)), wr)
+  of "c-set-difficulty":
+    id = bdiff.CSetDifficultyPacketId
+    packetWrite(bdiff.newCSetDifficulty(uint32(f[0].i)), wr)
+  of "c-set-health":
+    id = bhealth.CSetHealthPacketId
+    packetWrite(bhealth.newCSetHealth(int32(f[0].i)), wr)
+  of "c-transfer":
+    id = btransfer.CTransferPacketId
+    packetWrite(btransfer.newCTransfer(f[0].s, uint16(f[1].i), f[2].i != 0), wr)
+  of "c-remove-actor":
+    id = bremove.CRemoveActorPacketId
+    packetWrite(bremove.newCRemoveActor(newVarLong(f[0].i)), wr)
+  of "c-modal-form-request":
+    id = bform.CModalFormRequestPacketId
+    packetWrite(bform.CModalFormRequest(formId: newVarInt(int32(f[0].i)), formData: f[1].s), wr)
+  of "c-disconnect":
+    id = bdisc.CDisconnectPlayerPacketId
+    packetWrite(bdisc.CDisconnectPlayer(reason: newVarInt(int32(f[0].i)), skipMessage: f[1].i != 0, message: f[2].s,
+      filteredMessage: f[3].s), wr)
+  of "c-show-credits":
+    id = bcredits.CShowCreditsPacketId
+    packetWrite(bcredits.newCShowCredits(newVarULong(uint64(f[0].i)), newVarInt(int32(f[1].i))), wr)
+  else:
+    return false
+  body = wr.buf
+  true
+
+# ---- java-player.send-packet ------------------------------------------------------------------------
+
+proc sendJavaPacket*(w: WitState; p: Player; name: string; v: CVal): bool =
+  ## `serialize_java_packet` + `send_packet_now_data` for the cases listed in the PARTIAL line; false for a case without an arm.
+  let f = v.items
+  case name
+  of "c-custom-payload":
+    var data: seq[byte] = @[]
+    for b in f[1].items: data.add byte(b.i)
+    p.client.writePacketFor(CCustomPayload(channel: f[0].s, data: data))
+  of "c-game-event":
+    p.client.writePacketFor(CGameEvent(event: uint8(f[0].i), value: float32(f[1].f)))
+  of "c-entity-status":
+    p.client.writePacketFor(CEntityStatus(entityId: int32(f[0].i), entityStatus: int8(f[1].i)))
+  of "c-keep-alive":
+    p.client.writePacketFor(CKeepAlive(keepAliveId: f[0].i))
+  of "c-set-experience":
+    p.client.writePacketFor(CSetExperience(progress: float32(f[0].f), level: newVarInt(int32(f[1].i)),
+      totalExperience: newVarInt(int32(f[2].i))))
+  of "c-set-health":
+    p.client.writePacketFor(jhealth.CSetHealth(health: float32(f[0].f), food: newVarInt(int32(f[1].i)),
+      foodSaturation: float32(f[2].f)))
+  of "c-clear-title":
+    p.client.writePacketFor(CClearTitle(reset: f[0].i != 0))
+  of "c-open-book":
+    p.client.writePacketFor(COpenBook(hand: int32(f[0].i)))
+  of "c-action-bar":
+    p.client.writePacketFor(CActionBar(actionBar: text(f[0].s)))
+  of "c-title-text":
+    p.client.writePacketFor(CTitleText(title: text(f[0].s)))
+  of "c-close-container":
+    p.client.writePacketFor(CCloseContainer(syncId: newVarInt(int32(f[0].i))))
+  of "c-play-disconnect":
+    p.client.writePacketFor(CPlayDisconnect(reason: text(f[0].s)))
+  of "c-play-clear-dialog":
+    p.client.writePacketFor(CPlayClearDialog())
+  else:
+    return false
+  true
+
+proc caseNameAt(t: CmType; i: int): string =
+  if i >= 0 and i < t.names.len: t.names[i] else: ""
+
+proc installPlayerPackets*(r: HostRegistry; w: WitState) =
+  hostFn(r, IfPlayer, "[method]java-player.send-packet"):
+    let p = playerById(int(args[0].i))
+    if p == nil: return "player is gone"
+    discard sendJavaPacket(w, p, caseNameAt(paramTy(ci, 1), int(args[1].i)), (if args[1].items.len > 0: args[1].items[0] else: vRecord(@[])))
+  hostFn(r, IfPlayer, "[method]java-player.show-dialog"):
+    let p = playerById(int(args[0].i))
+    if p == nil: return "player is gone"
+    let nbt = dialogToNbt(dialogOf(w, args[1]))
+    p.client.writePacketFor(CPlayShowDialog(dialog: proto.IdOr[dialogmod.DialogNBT](kind: proto.iokValue,
+      value: dialogmod.fromNbt(nbt))))
+  hostFn(r, IfPlayer, "[method]bedrock-player.get-version"):
+    let p = playerById(int(args[0].i))
+    if p == nil: return "player is gone"
+    results.add vInt(int64(callPluginBedrockVersionHook(p)))
+  hostFn(r, IfPlayer, "[method]bedrock-player.get-settings"):
+    let p = playerById(int(args[0].i))
+    if p == nil: return "player is gone"
+    let data = callPluginBedrockDataHook(p)
+    if data.isNone: return "client data not available"
+    results.add bedrockSettingsVal(data.unsafeGet)
+  hostFn(r, IfPlayer, "[method]bedrock-player.send-packet"):
+    let p = playerById(int(args[0].i))
+    if p == nil: return "player is gone"
+    var id = 0'i32
+    var body: seq[byte] = @[]
+    if bedrockPacketBody(caseNameAt(paramTy(ci, 1), int(args[1].i)), (if args[1].items.len > 0: args[1].items[0] else: vRecord(@[])), id, body):
+      discard callPluginBedrockSendHook(p, id, body)

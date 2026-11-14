@@ -194,5 +194,5 @@ Tests: `wit/witplayer3test` (every function above through the registry against a
 Fired from: crop random tick (`BlockGrowEvent`), pressure plate (`BlockRedstoneEvent`), `/setworldspawn` (`SpawnChangeEvent`), console line
 (`ServerCommandEvent`), `/say` and `/me` (`ServerBroadcastEvent`), the ticker, the start of the accept loop (`ServerLoadEvent`), `handlePlayPacket`
 (`PacketReceivedEvent`) and `writePacketFor` (`PacketSentEvent`). Not fired, as upstream: `BlockBurnEvent`, `BlockCanBuildEvent`, `ChunkLoad`/`ChunkSave`
-(`ChunkSend` is fired upstream and not here). Test: `wit/witeventsblocktest` (conversions against known values and a host with no plugin; no component handles
+(`ChunkSend` is fired through javamod.aowl's `gChunkSendHook`, set by pluginwireevents.aowl). Test: `wit/witeventsblocktest` (conversions against known values and a host with no plugin; no component handles
 these events in a test), `wit/witargstest`.
