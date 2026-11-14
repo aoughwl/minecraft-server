@@ -1,0 +1,163 @@
+## Port of pumpkin/src/plugin/loader/wasm/wasm_host/logging.rs: `log_tracing`, which decodes the postcard bytes of a
+## `tracing_serde_structured::SerializeEvent` a plugin sends through `logging.log-tracing`, and turns it into one
+## host log record (message, `plugin.target`, `plugin.module`, `plugin.file`, `plugin.line` and the `plugin.fields`
+## of every field but `message`).
+## Wire layout (postcard, from the serialized shape of tracing-serde-structured): SerializeEvent = fields (a map: varint
+## count, then name string and SerializeValue per field), metadata (name, target, level index, module_path option,
+## file option, line option of u32, the field-set name list, is_span, is_event) and parent (option of u64). A
+## SerializeValue is a variant index (0 debug, 1 str, 2 f64, 3 i64, 4 u64, 5 i128, 6 u128, 7 bool, 8 error) and its
+## payload; a debug record is a string. Any other index prints `<unknown>` as upstream's `_` arm does.
+## PARTIAL: pumpkin/src/plugin/loader/wasm/wasm_host/logging.rs - the layout above is taken from the crate's shape, not
+## from its source (it is not in the pinned tree), so it is checked only against bytes built here; i128/u128/error
+## values print as `<unknown>`; the record goes to the host's line writer, not to a tracing subscriber.
+
+type
+  TraceField* = object
+    name*: string
+    text*: string        ## `format_value` of the value
+    isMessage*: bool
+
+  TraceEvent* = object
+    ok*: bool
+    err*: string
+    level*: int          ## 0 trace .. 4 error
+    message*: string
+    target*: string
+    modulePath*: string
+    file*: string
+    line*: int64
+    extra*: seq[TraceField]
+
+  PReader = object
+    s: string
+    pos: int
+    bad: bool
+
+proc u8(r: var PReader): int =
+  if r.pos >= r.s.len:
+    r.bad = true
+    return 0
+  result = int(uint8(r.s[r.pos]))
+  inc r.pos
+
+proc varint(r: var PReader): uint64 =
+  var shift = 0
+  result = 0
+  while true:
+    if r.bad or shift > 63:
+      r.bad = true
+      return 0
+    let b = r.u8()
+    result = result or (uint64(b and 0x7F) shl uint64(shift))
+    if (b and 0x80) == 0: break
+    shift += 7
+
+proc zigzag(n: uint64): int64 =
+  result = int64(n shr 1) xor (-int64(n and 1))
+
+proc str(r: var PReader): string =
+  let n = r.varint()
+  if r.bad or n > uint64(r.s.len - r.pos):
+    r.bad = true
+    return ""
+  result = r.s[r.pos ..< r.pos + int(n)]
+  r.pos += int(n)
+
+proc optStr(r: var PReader; dflt: string): string =
+  case r.u8()
+  of 0: dflt
+  of 1: r.str()
+  else:
+    r.bad = true
+    dflt
+
+proc f64Text(bits: uint64): string =
+  let f = cast[float64](bits)
+  result = $f
+  if result.len > 2 and result[result.len - 2] == '.' and result[result.len - 1] == '0':
+    result.setLen(result.len - 2)   # Rust prints 1f64 as `1`
+
+proc value(r: var PReader): string =
+  ## One SerializeValue, as `format_value` prints it.
+  case int(r.varint())
+  of 0, 1: r.str()
+  of 2:
+    var bits = 0'u64
+    for i in 0 ..< 8: bits = bits or (uint64(r.u8()) shl uint64(8 * i))
+    f64Text(bits)
+  of 3: $zigzag(r.varint())
+  of 4: $r.varint()
+  of 7: (if r.u8() != 0: "true" else: "false")
+  of 5, 6:
+    # i128 / u128: a varint of up to 19 bytes, skipped (`_ => "<unknown>"`)
+    var n = 0
+    while not r.bad and n < 19:
+      if (r.u8() and 0x80) == 0: break
+      inc n
+    "<unknown>"
+  of 8:
+    discard r.str()
+    "<unknown>"
+  else:
+    r.bad = true
+    "<unknown>"
+
+proc decodeTracingEvent*(bytes: string): TraceEvent =
+  ## `postcard::from_bytes` plus the field extraction of upstream's `log_tracing`.
+  var r = PReader(s: bytes)
+  result = TraceEvent(file: "unknown")
+  let n = r.varint()
+  if r.bad or n > uint64(bytes.len):
+    result.err = "bad field count"
+    return
+  for _ in 0 ..< int(n):
+    let k = r.str()
+    let v = r.value()
+    if r.bad:
+      result.err = "bad field value"
+      return
+    if k == "message": result.message = v
+    else: result.extra.add TraceField(name: k, text: v)
+  discard r.str()                       # metadata.name
+  result.target = r.str()
+  let lv = int(r.varint())
+  if lv > 4: r.bad = true
+  result.level = lv
+  result.modulePath = r.optStr("")
+  result.file = r.optStr("unknown")
+  case r.u8()
+  of 0: result.line = 0
+  of 1: result.line = int64(r.varint())
+  else: r.bad = true
+  let nf = r.varint()                   # the field-set names
+  if not r.bad and nf <= uint64(bytes.len):
+    for _ in 0 ..< int(nf): discard r.str()
+  else:
+    r.bad = true
+  discard r.u8()                        # is_span
+  discard r.u8()                        # is_event
+  if r.bad:
+    result.err = "unexpected end of input or bad tag"
+    return
+  result.ok = true
+
+proc fieldsText*(e: TraceEvent): string =
+  ## `plugin.fields`: `k=v, k=v` over every field but `message`; "" when there are none.
+  result = ""
+  for i, f in e.extra:
+    if i > 0: result.add ", "
+    result.add f.name & "=" & f.text
+
+proc tracingLine*(e: TraceEvent): string =
+  ## The host log text of one decoded event (or upstream's deserialize error line).
+  if not e.ok: return "[plugin] failed to deserialize tracing event: " & e.err
+  result = e.message & " plugin.target=" & e.target & " plugin.module=" & e.modulePath & " plugin.file=" & e.file &
+           " plugin.line=" & $e.line
+  let f = fieldsText(e)
+  if f.len > 0: result.add " plugin.fields=" & f
+
+proc logTracing*(bytes: string): (int, string) =
+  ## (level 0..4, line). A bytes string that does not decode is an error-level line.
+  let e = decodeTracingEvent(bytes)
+  if not e.ok: (4, tracingLine(e))
+  else: (e.level, tracingLine(e))
