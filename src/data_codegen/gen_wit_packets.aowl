@@ -1,0 +1,420 @@
+## Port of the lowering half of pumpkin-codegen/src/wit/packet_mapping.rs (`MappingMode::Serialize`): the table the WASM host
+## uses for `java-player.send-packet` and `bedrock-player.send-packet`, written to src/plugin/wit/witpktgen.aowl.
+##
+## Upstream reads the `#[java_packet]` / `#[packet]` structs of pumpkin-protocol with `syn` and emits one `match` arm per struct
+## whose fields are all of a few simple types (`convert_value`): String, TextComponent, Identifier, ints, bool, floats, the Var*
+## types, BlockPos, Vector3, Uuid and slices of those. A struct with any other field gets no arm and `serialize_*_packet` answers
+## None for it. This reads the same pinned struct files (`../ref/pumpkin-1.21.11/pumpkin-protocol/src`), applies the same
+## test, and emits the arm against the port's own struct of the same name under src/protocol, so that a struct the port does
+## not have, or has with other field names or types, is left out instead of emitted wrong. The WIT case name is
+## `<state>-<kebab name>` outside play and `<kebab name>` in play and for bedrock, as `java_packet.rs` builds it.
+##
+## PARTIAL: pumpkin-codegen/src/wit/packet_mapping.rs - only `MappingMode::Serialize` (the clientbound lowering). Not ported: the
+## serverbound `Deserialize` mapping, `ToWit` and the `Any` downcast, which turn received packets into WIT values for packet events.
+## PARTIAL: pumpkin-codegen/src/wit/packet_mapping.rs - not lowered, and listed in the header of the generated file with the reason:
+## Identifier fields (the port keeps them in another type), `DynamicRecipe` fields, the enum packets (`process_enum`), and
+## a struct the port lacks or declares differently.
+import std/[syncio, strutils, paths, dirs, algorithm]
+
+const
+  UpRoot = "../ref/pumpkin-1.21.11/pumpkin-protocol/src"
+  PortRoot = "src/protocol"
+  OutPath = "src/plugin/wit/witpktgen.aowl"
+  JavaStates = ["config", "login", "play", "status"]
+
+type
+  Fld = object
+    name: string
+    ty: string
+
+  Pkt = object
+    name: string
+    state: string     # "" for bedrock
+    fields: seq[Fld]
+    unit: bool        # `struct X;` or an unreadable body: upstream emits no arm
+    isEnum: bool
+
+  PortStruct = object
+    name: string
+    state: string
+    stem: string      # module file name without .aowl
+    fields: seq[Fld]
+
+proc isUpper(c: char): bool = c >= 'A' and c <= 'Z'
+proc isLower(c: char): bool = c >= 'a' and c <= 'z'
+proc isDigit(c: char): bool = c >= '0' and c <= '9'
+
+proc kebab(s: string): string =
+  ## `heck::ToKebabCase` for the PascalCase packet names.
+  result = ""
+  for i in 0 ..< s.len:
+    let c = s[i]
+    if isUpper(c) and i > 0:
+      let prev = s[i - 1]
+      let nextLower = i + 1 < s.len and isLower(s[i + 1])
+      if isLower(prev) or isDigit(prev) or (isUpper(prev) and nextLower):
+        result.add('-')
+    result.add(toLowerAscii(c))
+
+proc camel(s: string): string =
+  ## snake_case field name to the port's camelCase.
+  result = ""
+  var up = false
+  for c in s:
+    if c == '_':
+      up = true
+    elif up:
+      result.add(toUpperAscii(c))
+      up = false
+    else:
+      result.add(c)
+
+proc listFiles(dir: string; ext: string): seq[string] =
+  ## Sorted files of one directory ending in `ext`; one pass of its own, as walkDir and readFile do not nest in a try.
+  result = @[]
+  try:
+    for kind, entry in walkDir(path(dir)):
+      if kind == pcFile and ($entry).endsWith(ext):
+        result.add($entry)
+  except ErrorCode as e:
+    echo "walkDir " & dir & " failed: " & $e
+  result.sort(proc(a, b: string): int = cmp(a, b))
+
+proc slurp(file: string): string =
+  result = ""
+  try:
+    result = readFile(file)
+  except ErrorCode as e:
+    echo "readFile " & file & " failed: " & $e
+
+proc lastIdx(s: string; sub: string): int =
+  result = -1
+  var i = 0
+  while i + sub.len <= s.len:
+    if s.substr(i, i + sub.len - 1) == sub: result = i
+    inc i
+
+proc baseName(p: string): string =
+  var b = p
+  let a = lastIdx(b, "/")
+  let c = lastIdx(b, "\\")
+  let slash = if a > c: a else: c
+  if slash >= 0: b = b.substr(slash + 1)
+  b
+
+proc identAt(s: string; start: int): string =
+  result = ""
+  var i = start
+  while i < s.len and (isUpper(s[i]) or isLower(s[i]) or isDigit(s[i]) or s[i] == '_'):
+    result.add(s[i])
+    inc i
+
+proc parseUpstream(text: string; state: string; attr: string): seq[Pkt] =
+  ## The `#[attr(...)] pub struct X { pub a: T, ... }` items of one file, in file order.
+  result = @[]
+  let lines = text.split('\n')
+  var armed = false
+  var i = 0
+  while i < lines.len:
+    let l = lines[i].strip()
+    if l.startsWith("#[" & attr & "("):
+      armed = true
+    elif armed and l.startsWith("pub struct "):
+      armed = false
+      var p = Pkt(name: identAt(l, 11), state: state, fields: @[], unit: false, isEnum: false)
+      if l.endsWith("{}"):
+        discard
+      elif l.endsWith("{"):
+        inc i
+        while i < lines.len and lines[i].strip() != "}":
+          let f = lines[i].strip()
+          if f.len == 0 or f.startsWith("//") or f.startsWith("#["):
+            discard
+          elif f.startsWith("pub ") and f.contains(": "):
+            let colon = f.find(": ")
+            var ty = f.substr(colon + 2).strip()
+            if ty.endsWith(","): ty = ty.substr(0, ty.len - 2)
+            p.fields.add(Fld(name: f.substr(4, colon - 1), ty: ty))
+          else:
+            p.unit = true     # a private or multi-line field
+          inc i
+      else:
+        p.unit = true
+      result.add(p)
+    elif armed and l.startsWith("pub enum "):
+      armed = false
+      result.add(Pkt(name: identAt(l, 9), state: state, fields: @[], unit: false, isEnum: true))
+    inc i
+
+proc parsePort(text: string; state: string; stem: string): seq[PortStruct] =
+  ## The `  Name* = object` blocks of one port module with their `    field*: type` lines.
+  result = @[]
+  let lines = text.split('\n')
+  var i = 0
+  while i < lines.len:
+    let l = lines[i]
+    if l.startsWith("  ") and not l.startsWith("   ") and l.contains("* = object"):
+      var ps = PortStruct(name: l.strip().split('*')[0], state: state, stem: stem, fields: @[])
+      inc i
+      while i < lines.len and (lines[i].startsWith("    ") or lines[i].strip().len == 0):
+        let f = lines[i]
+        if f.startsWith("    ") and not f.startsWith("     "):
+          let star = f.find("*: ")
+          if star > 0:
+            var ty = f.substr(star + 3)
+            let hash = ty.find("##")
+            if hash >= 0: ty = ty.substr(0, hash - 1)
+            ps.fields.add(Fld(name: f.substr(4, star - 1), ty: ty.strip()))
+        inc i
+      result.add(ps)
+    else:
+      inc i
+
+# ---- the type table: `convert_value` for Serialize ----
+
+proc cleanTy(ty: string): string =
+  ## A Rust field type without references, lifetimes and module paths.
+  var t = ty.strip()
+  while t.startsWith("&"):
+    t = t.substr(1).strip()
+    if t.startsWith("'"):
+      let sp = t.find(' ')
+      t = if sp >= 0: t.substr(sp + 1).strip() else: ""
+  if t.startsWith("mut "): t = t.substr(4)
+  let lt = t.find('<')
+  let head = if lt >= 0: t.substr(0, lt - 1) else: t
+  let cc = lastIdx(head, "::")
+  if cc >= 0 and not t.startsWith("["): t = t.substr(cc + 2)
+  t
+
+proc intPort(rust: string): string =
+  case rust
+  of "i8": "int8"
+  of "u8": "uint8"
+  of "i16": "int16"
+  of "u16": "uint16"
+  of "i32": "int32"
+  of "u32": "uint32"
+  of "i64": "int64"
+  of "u64": "uint64"
+  else: ""
+
+proc scalarLift(rust: string; port: string; src: string): string =
+  ## The aowl expression building a port field of type `port` from the lifted `src` (a CVal), "" when `convert_value` has no
+  ## case for `rust` or the port declares the field as something else.
+  case rust
+  of "String", "str":
+    if port == "string": src & ".s" else: ""
+  of "TextComponent":
+    if port == "TextComponent": "text(" & src & ".s)" else: ""
+  of "bool":
+    if port == "bool": src & ".i != 0" else: ""
+  of "f32":
+    if port == "float32": "float32(" & src & ".f)" else: ""
+  of "f64":
+    if port == "float64": src & ".f" else: ""
+  of "VarInt":
+    if port == "VarInt": "newVarInt(int32(" & src & ".i))" else: ""
+  of "VarUInt":
+    if port == "VarUInt": "newVarUInt(uint32(" & src & ".i))" else: ""
+  of "VarLong":
+    if port == "VarLong": "newVarLong(" & src & ".i)" else: ""
+  of "VarULong":
+    if port == "VarULong": "newVarULong(uint64(" & src & ".i))" else: ""
+  of "Uuid":
+    if port == "Uuid": "Uuid(hi: uint64(" & src & ".items[0].i), lo: uint64(" & src & ".items[1].i))" else: ""
+  of "BlockPos":
+    if port == "BlockPos":
+      "newBlockPos(int32(" & src & ".items[0].i), int32(" & src & ".items[1].i), int32(" & src & ".items[2].i))"
+    else: ""
+  else:
+    let ip = intPort(rust)
+    if ip.len > 0 and port == ip: ip & "(" & src & ".i)" else: ""
+
+proc liftField(rustTy: string; port: string; src: string): string =
+  ## "" when the field cannot be lowered.
+  let t = cleanTy(rustTy)
+  if rustTy.contains("Option<") or rustTy.contains("Vec<") or rustTy.contains("Box<"):
+    return ""      # `get_type_info` names these "Option" / "Vec" / "Box", which `convert_value` has no case for
+  if t.startsWith("["):
+    if rustTy.contains("'a [u8]") or rustTy.contains("&[u8]"):
+      return (if port == "seq[byte]": "liftBytes(" & src & ")" else: "")
+    if rustTy.contains("[VarInt]"):
+      return (if port == "seq[VarInt]": "liftVarInts(" & src & ")" else: "")
+    if rustTy.contains("Uuid]"):
+      return (if port == "seq[Uuid]": "liftUuids(" & src & ")" else: "")
+    if rustTy.contains("[i64]"):
+      return (if port == "seq[int64]": "liftI64s(" & src & ")" else: "")
+    return ""
+  if t.startsWith("Vector3"):
+    let lt = t.find('<')
+    let gt = t.find('>')
+    if lt < 0 or gt < 0: return ""
+    let arg = t.substr(lt + 1, gt - 1).strip()
+    var elem = ""
+    var conv = ""
+    if arg == "f64":
+      elem = "float64"
+      conv = ".f"
+    elif arg == "f32":
+      elem = "float32"
+      conv = ".f"
+    elif intPort(arg).len > 0:
+      elem = intPort(arg)
+      conv = ".f"
+    else:
+      return ""
+    if port != "Vector3[" & elem & "]": return ""
+    return "Vector3[" & elem & "](x: " & elem & "(" & src & ".items[0]" & conv & "), y: " & elem & "(" & src & ".items[1]" & conv &
+      "), z: " & elem & "(" & src & ".items[2]" & conv & "))"
+  scalarLift(t, port, src)
+
+proc emitArm(p: Pkt; ps: PortStruct; alias: string; java: bool; reason: var string): string =
+  ## One `of "case":` arm, "" with `reason` set when the struct is not lowered.
+  reason = ""
+  if p.isEnum:
+    reason = "enum packet"
+    return ""
+  if p.unit:
+    reason = "no named fields (upstream emits no arm)"
+    return ""
+  if ps.name.len == 0:
+    reason = "not in the port"
+    return ""
+  if ps.fields.len != p.fields.len:
+    reason = "port declares " & $ps.fields.len & " fields, upstream " & $p.fields.len
+    return ""
+  var inits = ""
+  for k in 0 ..< p.fields.len:
+    let f = p.fields[k]
+    if f.name.startsWith("r#") or camel(f.name) != ps.fields[k].name:
+      reason = "field " & f.name & " is " & ps.fields[k].name & " in the port"
+      return ""
+    let e = liftField(f.ty, ps.fields[k].ty, "f[" & $k & "]")
+    if e.len == 0:
+      reason = "field " & f.name & ": " & f.ty & " (port " & ps.fields[k].ty & ")"
+      return ""
+    if k > 0: inits.add(", ")
+    inits.add(ps.fields[k].name & ": " & e)
+  let wit = if p.state.len == 0 or p.state == "play": kebab(p.name) else: p.state & "-" & kebab(p.name)
+  let ctor = alias & "." & p.name & "(" & inits & ")"
+  result = "  of \"" & wit & "\":\n"
+  if java:
+    result.add("    let pk = " & ctor & "\n")
+    result.add("    let pid = typeof(pk).toId(ver)\n")
+    result.add("    if pid == -1'i32: return false\n")
+    result.add("    var jw = newNetWriter()\n")
+    result.add("    writeJavaPacketId(jw, pid)\n")
+    result.add("    let pres = writePacket(pk, jw, ver)\n")
+    result.add("    if not pres.isOk: return false\n")
+    result.add("    id = pid\n")
+    result.add("    body = jw.buf\n")
+  else:
+    result.add("    id = " & alias & "." & p.name & "PacketId\n")
+    result.add("    packetWrite(" & ctor & ", wr)\n")
+
+proc build(): string =
+  # pass 1: paths, pass 2: contents
+  var upFiles: seq[(string, string, string)] = @[]     # (state, attr, file)
+  for st in JavaStates:
+    for f in listFiles(UpRoot & "/java/client/" & st, ".rs"):
+      if baseName(f) != "mod.rs": upFiles.add((st, "java_packet", f))
+  for f in listFiles(UpRoot & "/bedrock/client", ".rs"):
+    if baseName(f) != "mod.rs": upFiles.add(("", "packet", f))
+  var portFiles: seq[(string, string, string)] = @[]   # (state, "", file)
+  for st in JavaStates:
+    for f in listFiles(PortRoot & "/java/client/" & st, ".aowl"):
+      portFiles.add((st, "", f))
+  for f in listFiles(PortRoot & "/bedrock/client", ".aowl"):
+    portFiles.add(("", "", f))
+
+  var javaPkts: seq[Pkt] = @[]
+  var bedrockPkts: seq[Pkt] = @[]
+  for (st, attr, f) in upFiles:
+    let found = parseUpstream(slurp(f), st, attr)
+    for p in found:
+      if st.len > 0: javaPkts.add(p) else: bedrockPkts.add(p)
+  var ports: seq[PortStruct] = @[]
+  for (st, unused, f) in portFiles:
+    var stem = baseName(f)
+    stem = stem.substr(0, stem.len - 6)
+    for ps in parsePort(slurp(f), st, stem):
+      ports.add(ps)
+
+  var imports: seq[string] = @[]
+  var javaArms = ""
+  var bedrockArms = ""
+  var notes = ""
+  var javaDone = 0
+  var bedrockDone = 0
+  var seen: seq[string] = @[]
+  for java in [true, false]:
+    let pkts = if java: javaPkts else: bedrockPkts
+    for p in pkts:
+      var ps = PortStruct(name: "")
+      for c in ports:
+        if c.name == p.name and c.state == p.state:
+          ps = c
+          break
+      var alias = ""
+      if ps.name.len > 0:
+        alias = (if java: "j" & p.state.substr(0, 0) else: "b") & "_" & ps.stem
+      var reason = ""
+      let arm = emitArm(p, ps, alias, java, reason)
+      let wit = (if java: "J:" else: "B:") & (if p.state.len == 0 or p.state == "play": kebab(p.name) else: p.state & "-" & kebab(p.name))
+      if arm.len == 0:
+        notes.add("##   " & wit & " - " & reason & "\n")
+        continue
+      if wit in seen:
+        continue
+      seen.add(wit)
+      if java:
+        javaArms.add(arm)
+        inc javaDone
+      else:
+        bedrockArms.add(arm)
+        inc bedrockDone
+      let dir = if java: "java/client/" & p.state else: "bedrock/client"
+      let imp = "import ../../protocol/" & dir & "/" & ps.stem & " as " & alias
+      if not (imp in imports): imports.add(imp)
+
+  var s = "## GENERATED by src/data_codegen/gen_wit_packets.aowl - do not edit by hand.\n"
+  s.add("## The clientbound lowering of the WIT `java-packets` / `bedrock-packets` variants (pumpkin's `serialize_java_packet` and\n")
+  s.add("## `serialize_bedrock_packet`): " & $javaDone & " java and " & $bedrockDone & " bedrock cases. Not lowered (this file has no arm, and the host\n")
+  s.add("## sends nothing for the case, as upstream does where its generator has none):\n")
+  s.add(notes)
+  s.add("import ../wasm/canonabi\n")
+  s.add("import ../../protocol/[proto, varint, netcodec, serial, packetbase]\n")
+  s.add("import ../../util/javaversion\n")
+  s.add("import ../../util/vector3\n")
+  s.add("import ../../util/math/position\n")
+  s.add("import ../../util/text/text\n")
+  for imp in imports:
+    s.add(imp & "\n")
+  s.add("\n")
+  s.add("proc liftBytes(v: CVal): seq[byte] =\n  result = @[]\n  for b in v.items: result.add byte(b.i)\n\n")
+  s.add("proc liftVarInts(v: CVal): seq[VarInt] =\n  result = @[]\n  for b in v.items: result.add newVarInt(int32(b.i))\n\n")
+  s.add("proc liftUuids(v: CVal): seq[Uuid] =\n  result = @[]\n  for b in v.items: result.add Uuid(hi: uint64(b.items[0].i), lo: uint64(b.items[1].i))\n\n")
+  s.add("proc liftI64s(v: CVal): seq[int64] =\n  result = @[]\n  for b in v.items: result.add b.i\n\n")
+  s.add("proc javaPacketWire*(name: string; v: CVal; ver: JavaMinecraftVersion; id: var int32; body: var seq[byte]): bool =\n")
+  s.add("  ## The packet id and the framed bytes (id then fields) `serialize_java_packet` writes for a case; false for a case without an arm.\n")
+  s.add("  let f = v.items\n")
+  s.add("  case name\n")
+  s.add(javaArms)
+  s.add("  else:\n    return false\n  true\n\n")
+  s.add("proc bedrockPacketWire*(name: string; v: CVal; id: var int32; body: var seq[byte]): bool =\n")
+  s.add("  ## The packet id and the body before the frame header (`serialize_bedrock_packet`); false for a case without an arm.\n")
+  s.add("  var wr = newNetWriter()\n")
+  s.add("  let f = v.items\n")
+  s.add("  case name\n")
+  s.add(bedrockArms)
+  s.add("  else:\n    return false\n  body = wr.buf\n  true\n")
+  s
+
+when isMainModule:
+  let generated = build()
+  try:
+    writeFile(OutPath, generated)
+    echo "wrote " & OutPath & " (" & $generated.len & " bytes)"
+  except ErrorCode as e:
+    echo "write failed: " & $e
