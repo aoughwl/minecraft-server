@@ -607,3 +607,40 @@ no longer builds a source with an entity: `newCommandSource(..., entity, ...)` f
 `case id of blockIdX:` where the labels are `const X = BlockId(n)` (a distinct type) type-checks, then
 gcc rejects the emitted C with "case label does not reduce to an integer constant". Hit by several
 block files (cauldron, coral); worked around with if-chains. `check` does not catch it.
+
+## hexer assertion failures that broke `server/entity`, `server/command` (clone/data) and `server/net/java` tests
+
+At HEAD these tests failed in `nifmake` at `hexer c <module>.s.nif` ("[Assertion Failure]", "body must consume all children",
+"could not find symbol: vtableTemp.1", "could not find symbol: make.0") or at the C link (see below). Each failing module was
+shrunk to a repro with a source-level delta reduction (one module at a time, `hexer c` run on its `.s.nif`). The root causes, all
+in the hexer phase (they pass `check`/nimsem), and the workaround used in the port:
+
+1. **A call of an imported global closure variable.** `var gHook*: proc(x: int) {.closure.}` in module A, `gHook(1)` in module B,
+   asserts in hexer for B (a same-module call, a non-closure proc type and `let h = gHook; h(1)` are fine). 84 call sites
+   (the plugin event hooks of commit 1b8573a, `gDropStack`, `gFromType`, `gSetCommandBlockHook`, ...) were hit. Workaround:
+   every `var gName*: proc(...)` now has an exported wrapper `callName(...)` right after it (a same-module call), and importers
+   call the wrapper. The `writePacketFor` template in `net/java/javamod.aowl` binds `gPacketSentHook` to a local first.
+2. **A closure call with a temporary argument.** `let f = b.prepareImpl; f(PrepareArgs(...))`, `gDropItemHook(ownerOf(self), item)`,
+   `gDropStack(w, pos, newItemStack(...))` and `f($category & ":" & $stat, n)` assert ("body must consume all children").
+   Workaround: bind the argument to a `let` first (`blockbehaviour.aowl` x5, `player.aowl`, `entitymod.aowl`, `blockprelude.aowl`),
+   and call a closure field directly (`b.prepareImpl(args)`) rather than through a local copy.
+3. **A downcast of a call result.** `BellBlockEntity(t1.unsafeGet)`, `T(e)` inside `some(...)` and `x.unsafeGet.field = v` on an
+   `Option[ref]` give "could not find symbol: vtableTemp.1". Workaround: bind the value to a local first (`asType` in
+   `blockprelude.aowl`, `crafter`, `dispenser`, `dropper`, `comparator`).
+4. **A closure local declared in a loop over `stacks[i]`.** `let item = stacks[i].item; let isTagged = proc ... item ...` inside
+   `applyFunction`'s loop (src/server/world/loot.aowl) gives "could not compute type of: (dot (hderef (call [] ...". Moved into
+   its own proc `smeltStack`.
+5. **A closure that calls its captured closure parameter plus another closure local** (`newScreenFactory`,
+   src/server/block/containers.aowl) gives "could not find symbol: make.0" / an assertion. The body is a plain proc
+   `makeScreenHandler(make, syncId, player)` that the closure calls.
+
+Not fixed: `src/server/block/blocks/bed.aowl` still asserts ("body must consume all children") and the entity and `net/java` test
+chains import it. The shrinker kept `bedBlockNormalUse_BlockBehaviour` plus most of the file; stubbing any one of several procs
+makes it go away, so the trigger is not a single construct (possibly the number of closure locals in one proc). Other modules
+may surface once this one is passed.
+
+Source bugs found on the way: `resourcePackResponseMessage` in net/java/config.aowl named a parameter `result`, shadowing the
+implicit result (renamed `response`); `configtest.aowl` used `echo` without importing `std/syncio`; `clonetest` no longer keeps
+a `run` closure over the dispatcher (the Aref[CommandDispatcher] destructor C error in item 1's family: the destructor call
+emitted in the test module passes the pointee by value instead of its address; the module does not reach C for any test that
+drops its local dispatcher, none of which was verified here beyond clonetest).
