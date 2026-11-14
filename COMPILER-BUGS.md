@@ -644,3 +644,8 @@ implicit result (renamed `response`); `configtest.aowl` used `echo` without impo
 a `run` closure over the dispatcher (the Aref[CommandDispatcher] destructor C error in item 1's family: the destructor call
 emitted in the test module passes the pointee by value instead of its address; the module does not reach C for any test that
 drops its local dispatcher, none of which was verified here beyond clonetest).
+
+## Hexer traps found porting entity/net (2026-11-14)
+- `vtableTemp.N` / bare assertion: bind closure-call results and downcast results to a `let` first; use index loops where a for-in loop variable is downcast.
+- `previousTick.0` / `worldFor.0` style "could not find symbol": a captured closure variable called inside a closure; call it from a plain helper proc.
+- Entity and net/java test builds now pass hexer but fail at the final `nifmake` step with no message; the link command line is about 46KB, over Windows' 32KB limit (unconfirmed). `clonetest`/`datatest` also fail at C link (destructor on `Aref[CommandDispatcher]` passed by value).
