@@ -30,7 +30,7 @@ for folder in args or ['.']:
     for dirpath, _, names in os.walk(os.path.join('src', folder)):
         tests += [os.path.join(dirpath, n).replace(os.sep, '/') for n in names if n.endswith('test.aowl')]
 tests.sort()
-work = tempfile.mkdtemp(prefix='srvtest')
+work = tempfile.mkdtemp(prefix='s', dir=os.environ.get('SRVTEST_TMP', 'C:/m'))  # a short path keeps hexer's final command line under Windows' 32KB limit
 
 
 def one(item):
