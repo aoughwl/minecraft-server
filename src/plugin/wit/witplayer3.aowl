@@ -14,7 +14,10 @@
 ## PARTIAL: pumpkin/src/plugin/loader/wasm/wasm_host/wit/v0_1/player.rs - not done here: `java-player.send-packet` and
 ## `show-dialog` (the generated packet and dialog variants are not lowered; `clear-dialog` is), `get-scoreboard` answers the
 ## world's scoreboard handle, `launch-projectile` for arrow, splash-potion and trident answers none, the `bedrock-player` resource
-## except `open-form` and `reset-scoreboard` (`as-bedrock` answers none for a Java client).
+## except `open-form`, `reset-scoreboard`, `get-ability`/`set-ability` (the shared `Abilities`) and the status flags (kept here per
+## entity id: the `Entity` has no Bedrock flag words and nothing resends the metadata); `get-version`, `get-settings` and `send-packet`
+## of `bedrock-player` are not done (the session's client data is not exposed to the plugin host). `get-world-players` is done.
+## (`as-bedrock` answers none for a Java client).
 import std/[options, strutils, tables]
 import ../wasm/[component, canonabi]
 import "../../data/item_stack/mod"
@@ -23,6 +26,7 @@ import "../../generated/advancement" as advgen
 import ../../inventory/[inventory, player_inventory, screenhandler, genericcontainer]
 import ../../generated/translation
 import ../../protocol/varint
+import ../../protocol/bedrock/client/set_actor_data
 import ../../protocol/java/client/play/[open_book, delete_chat, resource_pack, game_event]
 import ../../protocol/java/client/play/entity_status as entitystatuspkt
 import ../../util/uuid
@@ -56,6 +60,72 @@ const
     "hero-of-the-village", "darkness", "trial-omen", "raid-omen", "wind-charged", "weaving", "oozing", "infested"]
 
 proc gone3(): string = "player is gone"
+
+## `from_wasm_bedrock_status_flag`: the WIT `bedrock-status-flag` case index (upstream's match arm order) to the Bedrock
+## `entity_data_flag` bit.
+const BedrockStatusFlagBits* = [
+  EDF_ON_FIRE, EDF_SNEAKING, EDF_RIDING, EDF_SPRINTING, EDF_USING_ITEM, EDF_INVISIBLE, EDF_TEMPTED, EDF_IN_LOVE,
+  EDF_SADDLED, EDF_POWERED, EDF_IGNITED, EDF_BABY, EDF_CONVERTING, EDF_CRITICAL, EDF_SHOW_NAME, EDF_ALWAYS_SHOW_NAME,
+  EDF_NO_AI, EDF_SILENT, EDF_WALL_CLIMBING, EDF_CLIMB, EDF_SWIM, EDF_FLY, EDF_WALK, EDF_RESTING, EDF_SITTING,
+  EDF_ANGRY, EDF_INTERESTED, EDF_CHARGED, EDF_TAMED, EDF_ORPHANED, EDF_LEASHED, EDF_SHEARED, EDF_GLIDING, EDF_ELDER,
+  EDF_MOVING, EDF_BREATHING, EDF_CHESTED, EDF_STACKABLE, EDF_SHOW_BOTTOM, EDF_STANDING, EDF_SHAKING, EDF_IDLING,
+  EDF_CASTING, EDF_CHARGING, EDF_KEYBOARD_CONTROLLED, EDF_POWER_JUMP, EDF_DASH, EDF_LINGERING, EDF_HAS_COLLISION,
+  EDF_HAS_GRAVITY, EDF_FIRE_IMMUNE, EDF_DANCING, EDF_ENCHANTED, EDF_RETURN_TRIDENT, EDF_CONTAINER_PRIVATE,
+  EDF_TRANSFORMING, EDF_DAMAGE_NEARBY_MOBS, EDF_SWIMMING, EDF_BRIBED, EDF_PREGNANT, EDF_LAYING_EGG,
+  EDF_PASSENGER_CAN_PICK, EDF_TRANSITION_SITTING, EDF_EATING, EDF_LAYING_DOWN, EDF_SNEEZING, EDF_TRUSTING,
+  EDF_ROLLING, EDF_SCARED, EDF_IN_SCAFFOLDING, EDF_OVER_SCAFFOLDING, EDF_DESCEND_THROUGH_BLOCK, EDF_BLOCKING,
+  EDF_TRANSITION_BLOCKING, EDF_BLOCKED_USING_SHIELD, EDF_BLOCKED_USING_DAMAGED_SHIELD, EDF_SLEEPING,
+  EDF_WANTS_TO_WAKE, EDF_TRADE_INTEREST, EDF_DOOR_BREAKER, EDF_BREAKING_OBSTRUCTION, EDF_DOOR_OPENER, EDF_CAPTAIN,
+  EDF_STUNNED, EDF_ROARING, EDF_DELAYED_ATTACK, EDF_AVOIDING_MOBS, EDF_AVOIDING_BLOCK,
+  EDF_FACING_TARGET_TO_RANGE_ATTACK, EDF_HIDDEN_WHEN_INVISIBLE, EDF_IN_UI, EDF_STALKING, EDF_EMOTING,
+  EDF_CELEBRATING, EDF_ADMIRING, EDF_CELEBRATING_SPECIAL, EDF_OUT_OF_CONTROL, EDF_RAM_ATTACK, EDF_PLAYING_DEAD,
+  EDF_IN_ASCENDING_BLOCK, EDF_OVER_DESCENDING_BLOCK, EDF_CROAKING, EDF_DIGEST_MOB, EDF_JUMP_GOAL, EDF_EMERGING,
+  EDF_SNIFFING, EDF_DIGGING, EDF_SONIC_BOOM, EDF_HAS_DASH_TIMEOUT, EDF_PUSH_TOWARDS_CLOSEST_SPACE, EDF_SCENTING,
+  EDF_RISING, EDF_FEELING_HAPPY, EDF_SEARCHING, EDF_CRAWLING, EDF_BODY_ROTATION_BLOCKED, EDF_RENDER_WHEN_INVISIBLE,
+  EDF_BODY_ROTATION_AXIS_ALIGNED, EDF_COLLIDABLE, EDF_WASD_AIR_CONTROLLED, EDF_DOES_SERVER_AUTH_ONLY_DISMOUNT,
+  EDF_BODY_ROTATION_ALWAYS_FOLLOWS_HEAD, EDF_CAN_USE_VERTICAL_MOVEMENT_ACTION]
+
+var gBedrockFlags: Table[int, (uint64, uint64)] = initTable[int, (uint64, uint64)]()
+
+proc bedrockFlagGet*(entityId, flag: int): bool =
+  ## `get-status-flag`: bits below 64 are `bedrock_flags`, the rest `bedrock_flags_two`. Kept here per entity id (the
+  ## server's `Entity` has no Bedrock flag words); an unknown case reads false.
+  if flag < 0 or flag >= BedrockStatusFlagBits.len: return false
+  let idx = int(BedrockStatusFlagBits[flag])
+  let (a, b) = gBedrockFlags.getOrDefault(entityId, (0'u64, 0'u64))
+  if idx < 64: (a and (1'u64 shl uint64(idx))) != 0'u64
+  else: (b and (1'u64 shl uint64(idx - 64))) != 0'u64
+
+proc bedrockFlagSet*(entityId, flag: int; value: bool) =
+  if flag < 0 or flag >= BedrockStatusFlagBits.len: return
+  let idx = int(BedrockStatusFlagBits[flag])
+  var cur = gBedrockFlags.getOrDefault(entityId, (0'u64, 0'u64))
+  if idx < 64:
+    let m = 1'u64 shl uint64(idx)
+    cur[0] = if value: (cur[0] or m) else: (cur[0] and not m)
+  else:
+    let m = 1'u64 shl uint64(idx - 64)
+    cur[1] = if value: (cur[1] or m) else: (cur[1] and not m)
+  gBedrockFlags[entityId] = cur
+
+proc bedrockAbilityGet*(ab: Abilities; ability: int): bool =
+  ## `get-ability` over the shared `Abilities`: build/mine are `allow_modify_world`; the Bedrock-only abilities read false.
+  case ability
+  of 0, 1: ab.allowModifyWorld
+  of 8: ab.invulnerable
+  of 9: ab.flying
+  of 10: ab.allowFlying
+  of 11: ab.creative
+  else: false
+
+proc bedrockAbilitySet*(ab: var Abilities; ability: int; value: bool) =
+  case ability
+  of 0, 1: ab.allowModifyWorld = value
+  of 8: ab.invulnerable = value
+  of 9: ab.flying = value
+  of 10: ab.allowFlying = value
+  of 11: ab.creative = value
+  else: discard
 
 proc bareKey(k: string): string =
   if k.startsWith("minecraft:"): k[10 ..< k.len] else: k
@@ -658,6 +728,32 @@ proc installPlayer3*(r: HostRegistry; w: WitState; ss: StackState; gs: GuiState)
     # `gPluginBedrockSessionHook` answers whether the player is on Bedrock
     if callPluginBedrockSessionHook(p): results.add vSome(vInt(args[0].i))
     else: results.add vNone()
+  # ---- bedrock-player abilities and status flags, and the player interface's `get-world-players` ----
+  hostFn(r, IfacePlayer, "get-world-players"):
+    # `world.players`: every player of the world, as player handles (the entity id)
+    let wr = int(args[0].i)
+    let srv = gLink.server
+    if srv == nil or wr < 0 or wr >= srv.worlds.len: return "invalid world resource handle"
+    var items: seq[CVal] = @[]
+    for p in srv.worlds[wr].players: items.add vInt(int64(p.entityId))
+    results.add vList(items)
+  hostFn(r, IfacePlayer, "[method]bedrock-player.get-ability"):
+    let p = playerById(int(args[0].i))
+    if p == nil: return gone3()
+    results.add vBool(bedrockAbilityGet(p.abilities, int(args[1].i)))
+  hostFn(r, IfacePlayer, "[method]bedrock-player.set-ability"):
+    let p = playerById(int(args[0].i))
+    if p == nil: return gone3()
+    bedrockAbilitySet(p.abilities, int(args[1].i), args[2].i != 0)
+    playermod.sendAbilitiesUpdate(p)
+  hostFn(r, IfacePlayer, "[method]bedrock-player.get-status-flag"):
+    let p = playerById(int(args[0].i))
+    if p == nil: return gone3()
+    results.add vBool(bedrockFlagGet(int(p.entityId), int(args[1].i)))
+  hostFn(r, IfacePlayer, "[method]bedrock-player.set-status-flag"):
+    let p = playerById(int(args[0].i))
+    if p == nil: return gone3()
+    bedrockFlagSet(int(p.entityId), int(args[1].i), args[2].i != 0)
   hostFn(r, IfacePlayer, "[method]bedrock-player.open-form"):
     # `send_form`: the form as the JSON of witforms.aowl, the id the response event (`bedrock-form-response-event`) carries.
     let p = playerById(int(args[0].i))
