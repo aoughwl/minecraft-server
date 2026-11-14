@@ -1,0 +1,144 @@
+## `ClientPlatform`, the editioned broadcasts (serverbase.aowl, worldmod.aowl) and the Bedrock half of scoreboard.aowl, on a
+## world with a Java player (bytes read back) and a Bedrock player's stand-in (a `tap` and a `bedrockSend` that record).
+import std/[assertions, options, syncio, cmdline]
+import ../../generated/packet
+import ../../protocol/java/client/play/[system_chat_message, update_objectives]
+import ../../protocol/java/packet_decoder
+import ../../protocol/bedrock/client/scoreboard as bsb
+import ../../protocol/[protobase, netcodec, serial, varint, proto]
+import ../../util/text/text
+import ../../world/[playerdata, worldfs, worldinfo]
+import ../data/datamod
+import ../entity/player as playermod
+import ../net/winsock
+import ../recipe
+import ../scheduler
+import ../serverbase
+import ../tick_rate_manager
+import scoreboard, worldmod
+
+proc scratch(): string =
+  result = parentDirW(paramStr(0)) & "/editioned_scratch"
+  discard createDirAllW(result)
+
+let adv = defaultAdvancedConfiguration()
+let server = Server(basicConfig: defaultBasicConfiguration(), advancedConfig: adv, worlds: @[], dimensions: @[OVERWORLD],
+  tickCounter: 0'i64, nextEntityId: 1'i32, tickRateManager: newServerTickRateManager(20.0'f32), keyStore: nil,
+  recipeManager: newRecipeManager(), scheduler: newTaskScheduler(), data: ServerData(),
+  playerDataStorage: PlayerDataStorage(), levelFolder: "", playerIdleTimeout: 0'i32, mojangPublicKeys: @[],
+  stopRequested: false, stopAtMs: 0'i64)
+let theLevel = fromRootFolder(adv.world, scratch(), 1'i64, OVERWORLD)
+let testWorld = loadWorld(theLevel, defaultLevelData(1'u64), OVERWORLD, 63'i32, -64'i32, server)
+server.worlds.add(testWorld)
+let v = jmvV1_21_11
+
+let javaClient = newJavaClient(InvalidSocket, 1'u64)
+javaClient.connectionState = csPlay
+javaClient.version = v
+let javaProfile = GameProfile(id: offlineUuid("JavaPlayer"), name: "JavaPlayer", properties: @[], profileActions: @[])
+let javaPlayer = newPlayer(javaClient, javaProfile, defaultPlayerConfig(), testWorld, server, Survival, 1'i32)
+worldmod.addPlayer(testWorld, javaPlayer)
+
+var tapped = 0
+var bedrockIds: seq[int32] = @[]
+var bedrockBodies: seq[seq[byte]] = @[]
+let standIn = newJavaClient(InvalidSocket, 2'u64)
+standIn.connectionState = csPlay
+standIn.version = v
+standIn.tap = proc(packet: seq[byte]) {.closure.} = tapped += 1
+standIn.bedrockSend = proc(packetId: int32; body: seq[byte]) {.closure.} =
+  bedrockIds.add(packetId)
+  bedrockBodies.add(body)
+let bedrockProfile = GameProfile(id: offlineUuid("BedrockPlayer"), name: "BedrockPlayer", properties: @[], profileActions: @[])
+let bedrockPlayer = newPlayer(standIn, bedrockProfile, defaultPlayerConfig(), testWorld, server, Survival, 2'i32)
+worldmod.addPlayer(testWorld, bedrockPlayer)
+
+proc javaPacketIds(): seq[int32] =
+  var decoder = newTCPNetworkDecoder()
+  decoder.feed(javaClient.networkWriter.flush())
+  result = @[]
+  while decoder.packetReady():
+    let res = decoder.getRawPacket()
+    assert res.isOk
+    result.add(res.value.id)
+
+proc resetRecords() =
+  discard javaPacketIds()
+  tapped = 0
+  bedrockIds = @[]
+  bedrockBodies = @[]
+
+proc bytesOf(parts: varargs[int]): seq[byte] =
+  result = @[]
+  for p in parts:
+    result.add(byte(p))
+
+block platforms:
+  echo "platforms"
+  assert javaClient.platform() == cpJava
+  assert standIn.platform() == cpBedrock
+  assert ord(cpJava) == 0 and ord(cpBedrock) == 1
+
+block broadcast_editioned:
+  echo "broadcast_editioned"
+  resetRecords()
+  testWorld.broadcastEditioned(CSystemChatMessage(content: text("hi"), overlay: false), 77'i32, bsb.CRemoveObjective(objectiveName: "x"))
+  assert javaPacketIds() == @[CSystemChatMessage.toId(v)], "the Java player gets the Java packet"
+  assert tapped == 0, "a Bedrock stand-in is not written the Java packet"
+  assert bedrockIds == @[77'i32], "the Bedrock player gets the Bedrock packet"
+  assert bedrockBodies[0] == bytesOf(1, 0x78), "a string is its length and its bytes"
+
+block broadcast_except_editioned:
+  echo "broadcast_except_editioned"
+  resetRecords()
+  testWorld.broadcastPacketExceptEditioned([bedrockProfile.id], CSystemChatMessage(content: text("hi"), overlay: false), 77'i32,
+    bsb.CRemoveObjective(objectiveName: "x"))
+  assert javaPacketIds() == @[CSystemChatMessage.toId(v)]
+  assert bedrockIds.len == 0 and tapped == 0, "the excluded Bedrock player gets nothing"
+  resetRecords()
+  testWorld.broadcastPacketExceptEditioned([javaProfile.id], CSystemChatMessage(content: text("hi"), overlay: false), 77'i32,
+    bsb.CRemoveObjective(objectiveName: "x"))
+  assert javaPacketIds().len == 0, "the excluded Java player gets nothing"
+  assert bedrockIds == @[77'i32]
+
+block scoreboard_ids:
+  echo "scoreboard_ids"
+  # FNV-1a, 64 bit: the offset basis for no bytes, and the published vector for "a".
+  assert scoreboardIdOf("") == cast[int64](14695981039346656037'u64)
+  assert scoreboardIdOf("a") == cast[int64](0xaf63dc4c8601ec8c'u64)
+  assert scoreboardIdOf("alice") != scoreboardIdOf("bob")
+
+block scoreboard_bedrock_half:
+  echo "scoreboard_bedrock_half"
+  var board = newScoreboard()
+  resetRecords()
+  board.addObjective(testWorld, newScoreboardObjective("obj", text("Obj"), "dummy"))
+  assert bedrockIds == @[bsb.CSetDisplayObjectivePacketId]
+  # "sidebar", "obj", "Obj", "dummy", then the sort order 0 as a zigzag VarInt.
+  assert bedrockBodies[0] == bytesOf(7, 0x73, 0x69, 0x64, 0x65, 0x62, 0x61, 0x72, 3, 0x6f, 0x62, 0x6a, 3, 0x4f, 0x62, 0x6a,
+    5, 0x64, 0x75, 0x6d, 0x6d, 0x79, 0), "SetDisplayObjective bytes"
+  let jIds = javaPacketIds()
+  assert jIds.len == 2 and jIds[0] == CUpdateObjectives.toId(v), "the Java player gets the objective, then the display slot"
+  assert tapped == 1, "only the display slot's Java packet reaches the stand-in (Bedrock's packet already set the slot)"
+  resetRecords()
+  board.updateScore(testWorld, newScoreboardScore("alice", "obj", newVarInt(5'i32), none[TextComponent](), none[NumberFormat]()))
+  assert bedrockIds == @[bsb.CSetScorePacketId]
+  var expected = bytesOf(0, 1)  # action change (zigzag 0), one entry
+  let id = scoreboardIdOf("alice")
+  for k in 0 ..< 8:
+    expected.add(byte((uint64(cast[uint64](id)) shr (8 * k)) and 0xff'u64))
+  for b in bytesOf(3, 0x6f, 0x62, 0x6a, 10, 6, 5, 0x61, 0x6c, 0x69, 0x63, 0x65):  # "obj"
+    expected.add(b)
+  #, score 5 (zigzag 10), type 3 (zigzag 6), "alice"
+  assert bedrockBodies[0] == expected, "SetScore bytes"
+  assert tapped == 0
+  resetRecords()
+  board.removeScore(testWorld, "alice", "obj")
+  assert bedrockIds == @[bsb.CSetScorePacketId]
+  assert bedrockBodies[0][0] == 2'u8, "remove is action 1 (zigzag 2)"
+  resetRecords()
+  board.removeObjective(testWorld, "obj")
+  assert bedrockIds == @[bsb.CRemoveObjectivePacketId]
+  assert bedrockBodies[0] == bytesOf(3, 0x6f, 0x62, 0x6a)
+
+echo "editioned: all checks passed"
