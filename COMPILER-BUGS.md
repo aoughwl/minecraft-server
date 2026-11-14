@@ -649,3 +649,47 @@ drops its local dispatcher, none of which was verified here beyond clonetest).
 - `vtableTemp.N` / bare assertion: bind closure-call results and downcast results to a `let` first; use index loops where a for-in loop variable is downcast.
 - `previousTick.0` / `worldFor.0` style "could not find symbol": a captured closure variable called inside a closure; call it from a plain helper proc.
 - Entity and net/java test builds now pass hexer but fail at the final `nifmake` step with no message; the link command line is about 46KB, over Windows' 32KB limit (unconfirmed). `clonetest`/`datatest` also fail at C link (destructor on `Aref[CommandDispatcher]` passed by value).
+
+### More hexer traps, found getting `net/java/configtest` through hexer (2026-11-14, second pass)
+All modules of `configtest` now pass hexer (about 1,370 modules); each trap below was a module that did not. Bisect recipe that
+worked: run `hexer.exe c --bits:64 --cpu:le --flags:br <module>.s.nif` straight on the module's `.s.nif` in the nimcache (0.5 s),
+and blank statements of the `.s.nif` with same-length spaces (the `.s.idx.nif` offsets must stay valid).
+- **A captured `let`/param named like a field read in the closure** (`let board = ...` then `board.board.items`, `let client` and
+  `player.client`, a parameter `position` and `entity.position`): hexer rewrites the field as a capture (asserts). Rename the local.
+  Reproduced with a 20-line file.
+- **A closure made inside another closure** (`let cb = proc ... {.closure.}` inside an executor or `loadImpl`, `handler.onTrade = proc ...`):
+  assertion. Make the inner closure in a plain proc the outer one calls.
+- **A closure field of a captured value called inside a closure** (`hk.addObjective(...)`, `fs.dataFolder(..)`, `ops.load(..)`,
+  `w.permissions(..)`), and a captured closure variable/parameter called inside a closure (`prev(..)`, `keyOf(..)`): assertion or
+  "could not find symbol". Call it from a plain helper proc that takes the value as a parameter.
+- **`x of T` or a downcast `T(x)` whose operand is not a plain local** (`e.unsafeGet of T`, `T(e.unsafeGet).f`, `T(list[i])`, `T(e).field`
+  as an expression): `vtableTemp.N` not found. Bind the operand, the `of` result and the downcast to `let`s first. Also when
+  they are inside a closure over a captured `base`: put them in a plain helper (`setFuseVia`).
+- **`for x in seq` and `for x in f()` in or around closures**: `el.0` not found, or "could not compute type of (dot ii.N ...)". Use
+  `for i in 0 ..< s.len` with `let x = s[i]`; an index on a seq of objects field-assigned in place (`v.gossips[at].value = x`) needs
+  `var e = v.gossips[at]; e.value = x; v.gossips[at] = e`.
+- **A call result used directly as the argument of a captured closure parameter** (`warn("Plugin '" & p & "'...")`): "expected ')'" from
+  the NIF reader. Bind the string to a `let` first.
+- **A pure expression closure returning a value built by a call** (`proc(): CmdItemStack = fromItemStack(inventory.getStack(inv, i))`)
+  is safe only when it calls a plain helper.
+- **A closure body of more than ~20 statements that mixes the above**: hoist the whole body to a plain proc and keep a one-line closure
+  that calls it (`runLoot`, `runCommandBlockHere`, `createVillagerScreenHandler`).
+
+### Final link: the DCE command line is the 32KB problem (confirmed, 2026-11-14)
+`configtest` ends in `nifmake: hexer.exe dl --bits:64 --cpu:le <one .dce.nif per module> ...`: 51,223 characters with
+`--nimcache:C:	mp1
+c_configtest` (about 1,370 modules x 41 characters), over CreateProcess' 32,767. It fails with no message from
+hexer, only `FAILURE: nifmake.exe ... final.build.nif`. A short nimcache fixes it: `--nimcache:C:/m` gives about 28,000 characters and the build continues to the
+C compiler. Use a nimcache path of at most 4 characters on this machine for the big test targets.
+
+### C errors after hexer (not source traps, open)
+- `eQdestroyQ_Aref<T>` calls the object destructor with `(*dest_0).d_00` where the extern takes `T*` (CommandDispatcher), and
+  with `&(*dest_0).d_00` where it takes `T` by value (GlobalChunkListener, SingleChunkListener, SyncHandler, EntityEquipment,
+  AdvancementManager): lifter.nim `isMutFirstParam` cannot load the hook symbol of another module and defaults to by-value, so
+  the call site disagrees with the declaration for the types whose hook was generated in their own module. Hand-patching the
+  seral0qab1.c calls (add `&` for T*, drop it for T) gets past it.
+- A nil check on a closure field of a `BlockWorld` from another module (`world.portalPoiInSquare0 != nil` in
+  `world/portal/nether.aowl`) is emitted as `((void*)(*world).d_00.f == NIM_NIL)`: "cannot convert to a pointer type" in C. A dummy
+  closure in the module does not help; put the nil checks in a proc of the module that declares the type.
+- Copying a closure field out of a world into a local in another module (`let by = self.blockPlayerOf` in `worldmod.aowl`) emits
+  a temp of a differently named closure type ("invalid initializer"). Use a helper in the declaring module (`blockPlayerFor`).
