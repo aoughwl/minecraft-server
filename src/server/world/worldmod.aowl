@@ -1,5 +1,5 @@
 ## Port of pumpkin/src/world/mod.rs
-## PARTIAL: pumpkin/src/world/mod.rs - everything the Rust file does is here or in the modules beside it (entities: ../entity/entitymod.aowl and world/worldquery.aowl, block entities and block/fluid behaviour: ../block/, sounds and particles: block/worldhooks.aowl, scoreboard, border, bossbar, time, weather, dragon fight, portals, spawning: this folder). `respawn_player` uses respawn.aowl's bed and anchor points and fires `PlayerChangeWorldEvent`. The pinned Rust has no statistics or advancement call in the death path (checked: no such reference in world/mod.rs), `migrate_pending_block_entities` is `migrateBlockEntities` in ../block/worldadapter.aowl (run each tick over the active chunks, `blockEntityChunks` marks the chunks done), and `spawn_world_entity_chunks` is block/worldhooks.aowl's hook with chunker.aowl. The editioned broadcasts are templates: `broadcastEditioned` and `broadcastPacketExceptEditioned` (also upstream's `_sync`) in ../serverbase.aowl, `broadcastToChunkEditioned` and `broadcastToChunkExceptEditioned` below; used by scoreboard.aowl and a Bedrock player's emote. Still missing: `broadcast_system_message` and `broadcast_message` still write the Java packet to a Bedrock player's stand-in (bedrockplay.aowl turns it into a Bedrock text), not upstream's `component_to_bedrock_text`. See ../block/block_place.aowl for `place_block`.
+## PARTIAL: pumpkin/src/world/mod.rs - everything the Rust file does is here or in the modules beside it (entities: ../entity/entitymod.aowl and world/worldquery.aowl, block entities and block/fluid behaviour: ../block/, sounds and particles: block/worldhooks.aowl, scoreboard, border, bossbar, time, weather, dragon fight, portals, spawning: this folder). `respawn_player` uses respawn.aowl's bed and anchor points and fires `PlayerChangeWorldEvent`. The pinned Rust has no statistics or advancement call in the death path (checked: no such reference in world/mod.rs), `migrate_pending_block_entities` is `migrateBlockEntities` in ../block/worldadapter.aowl (run each tick over the active chunks, `blockEntityChunks` marks the chunks done), and `spawn_world_entity_chunks` is block/worldhooks.aowl's hook with chunker.aowl. The editioned broadcasts are templates: `broadcastEditioned` and `broadcastPacketExceptEditioned` (also upstream's `_sync`) in ../serverbase.aowl, `broadcastToChunkEditioned` and `broadcastToChunkExceptEditioned` below; used by scoreboard.aowl and a Bedrock player's emote. `broadcast_system_message` and `broadcast_message` send a Bedrock player `componentToBedrockText` / a chat `SText`, as upstream. Nothing else is known to be missing. See ../block/block_place.aowl for `place_block`.
 ##
 ## The types are in ../serverbase.aowl.
 ##
@@ -22,6 +22,7 @@ import ../../protocol/java/client/play/player_info_update except Player
 import ../../protocol/java/client/play/[recipe_book_add, recipe_book_settings]
 import ../../protocol/itemstackserializer
 import ../../protocol/bedrock/client/change_dimension
+import ../../protocol/bedrock/server/text as betext
 import ../../command/[client_suggestions, cmdsource]
 import ../../generated/translation as tr
 import ../../generated/entity_type
@@ -76,15 +77,28 @@ proc addPlayer*(self: World; player: Player) =
 
 # --- Broadcasts ----------------------------------------------------------------------------------------
 
+proc componentToBedrockText*(message: TextComponent): SText =
+  ## `component_to_bedrock_text`: a translation keeps its key (the Bedrock one if it has one) and its parameters as
+  ## Bedrock strings; anything else is a system message of the legacy-coded text.
+  let content = message.base.content
+  if content.kind == tcTranslate:
+    let key = if content.bedrockTranslate.isSome: content.bedrockTranslate.unsafeGet else: content.translate
+    var parameters: seq[string] = @[]
+    for w in content.translateWith:
+      parameters.add toBedrockString(w)
+    SText.translation(key, parameters)
+  else:
+    SText.systemMessage(toBedrockLegacy(message.base, lcEnUs))
+
 proc broadcastSystemMessage*(self: World; message: TextComponent; overlay: bool) =
-  for p in self.players:
-    p.client.writePacketFor(CSystemChatMessage(content: message, overlay: overlay))
+  ## `broadcast_system_message`: `CSystemChatMessage` for Java, `component_to_bedrock_text` for Bedrock.
+  self.broadcastEditioned(CSystemChatMessage(content: message, overlay: overlay), STextPacketId,
+    componentToBedrockText(message))
 
 proc broadcastMessage*(self: World; message, senderName: TextComponent; chatType: uint8; targetName: Option[TextComponent]) =
-  ## `broadcast_message`: the Java half (`CDisguisedChatMessage`, `chat_type + 1`); this server has no Bedrock players.
-  for p in self.players:
-    p.client.writePacketFor(CDisguisedChatMessage(message: message, chatType: newVarInt(int32(chatType) + 1'i32),
-      senderName: senderName, targetName: targetName))
+  ## `broadcast_message`: `CDisguisedChatMessage` (`chat_type + 1`) for Java, a chat `SText` of the plain texts for Bedrock.
+  self.broadcastEditioned(CDisguisedChatMessage(message: message, chatType: newVarInt(int32(chatType) + 1'i32),
+    senderName: senderName, targetName: targetName), STextPacketId, newSText(getText(message), getText(senderName)))
 
 proc playerChunkPos*(p: Player): Vector2[int32] =
   ## Templates below read the field here: a caller local named `chunkPos` would otherwise capture the field name (COMPILER-BUGS.md).
@@ -691,11 +705,11 @@ proc respawnPlayer*(self: World; player: Player; alive: bool) =
     dimension: target.dimension,
     hashedSeed: hashSeed(target.level.seed),
     gameMode: uint8(ord(player.gamemode)),
-    previousGamemode: int8(ord(player.gamemode)),
+    previousGamemode: (if player.previousGamemode.isSome: int8(ord(player.previousGamemode.unsafeGet)) else: -1'i8),
     debug: false,
     isFlat: false,
     deathDimensionName: some((deathDimension, deathLocation)),
-    portalCooldown: newVarInt(0'i32),
+    portalCooldown: newVarInt(callPlayerPortalCooldownHook(player)),
     sealevel: newVarInt(target.seaLevel)), dataKept: if alive: 1'u8 else: 0'u8))
 
   player.client.writePacketFor(CPlayerSpawnPosition(dimensionName: target.dimension.minecraftName,
@@ -722,8 +736,8 @@ proc teleportWorld*(self: World; player: Player; position0: Vector3[float64]; ya
   ## change of level and the `Respawn` with all data kept run here; the rest (spawn chunk, world info, the teleport)
   ## is `finishRespawn`, when the chunk under the player has arrived. `PlayerChangeWorldEvent` (cancellable, may move the
   ## target), the `EnterDimension` advancement (`gPlayerEnteredDimensionHook`), the Bedrock `ChangeDimension` and `send_health`
-  ## are here. Not here: the `Respawn`'s portal cooldown (0; the cooldown is the entity's, which a `Player` here does not
-  ## hold) and `previous_gamemode` (a `Player` keeps none, so the current mode is sent).
+  ## are here. The `Respawn`'s previous gamemode is the
+  ## `Player`'s (the current mode if none) and its portal cooldown is the entity's, through `gPlayerPortalCooldownHook`.
   let currentWorld = player.world
   let yaw1 = if yaw0.isSome: yaw0.unsafeGet else: self.levelInfo.spawnYaw
   let pitch1 = if pitch0.isSome: pitch0.unsafeGet else: self.levelInfo.spawnPitch
@@ -760,11 +774,11 @@ proc teleportWorld*(self: World; player: Player; position0: Vector3[float64]; ya
       dimension: self.dimension,
       hashedSeed: hashSeed(self.level.seed),
       gameMode: uint8(ord(player.gamemode)),
-      previousGamemode: int8(ord(player.gamemode)),
+      previousGamemode: int8(ord(if player.previousGamemode.isSome: player.previousGamemode.unsafeGet else: player.gamemode)),
       debug: false,
       isFlat: false,
       deathDimensionName: some((currentWorld.dimension.minecraftName, deathLocation)),
-      portalCooldown: newVarInt(0'i32),
+      portalCooldown: newVarInt(callPlayerPortalCooldownHook(player)),
       sealevel: newVarInt(self.seaLevel)), dataKept: 3'u8))  # CRespawn::KEEP_ALL_DATA
   player.sendPermissionLvlUpdate()
   player.sendAbilitiesUpdate()
