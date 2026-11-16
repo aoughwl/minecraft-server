@@ -1,0 +1,136 @@
+## Builds a component by hand, in the shape wit-component produces (a main module, a shim module with an
+## indirect call table, a fixup module that fills the table with `canon lower`ed host functions, `canon lift`
+## for the export), loads it, and calls it in both directions:
+##   host -> guest `handle(n: u32, s: string) -> string`
+##   guest -> host `log(msg: string)` and `greet(a: u32, b: string) -> string`
+import std/[syncio, assertions]
+import wasmvm, canonabi, component
+
+proc leb(n: int): string =
+  result = ""
+  var x = n
+  while true:
+    let b = x and 0x7F
+    x = x shr 7
+    if x == 0:
+      result.add char(b)
+      break
+    result.add char(b or 0x80)
+
+proc nm(s: string): string = leb(s.len) & s
+proc sec(id: int; body: string): string =
+  result = ""
+  result.add char(id)
+  result.add leb(body.len)
+  result.add body
+proc bs(xs: openArray[int]): string =
+  result = ""
+  for x in xs: result.add char(x)
+proc vec(items: openArray[string]): string =
+  result = leb(items.len)
+  for it in items: result.add it
+const hdr = "\0asm\x01\0\0\0"
+
+let t0 = bs([0x60, 2, 0x7f, 0x7f, 0])                        # (i32 i32) -> ()
+let t1 = bs([0x60, 4, 0x7f, 0x7f, 0x7f, 0x7f, 0])           # (i32 i32 i32 i32) -> ()
+let t2 = bs([0x60, 4, 0x7f, 0x7f, 0x7f, 0x7f, 1, 0x7f])     # realloc
+let t3 = bs([0x60, 3, 0x7f, 0x7f, 0x7f, 1, 0x7f])           # handle
+
+proc mainModule(): string =
+  let realloc = bs([0x01, 0x01, 0x7f,
+    0x23,0x00,0x20,0x02,0x6a,0x41,0x01,0x6b,0x41,0x00,0x20,0x02,0x6b,0x71,0x21,0x04,
+    0x20,0x04,0x20,0x03,0x6a,0x24,0x00, 0x20,0x04,0x0b])
+  let handle = bs([0x00, 0x20,1, 0x20,2, 0x10,0,                 # host.0(sptr, slen)   (log)
+                   0x20,0, 0x20,1, 0x20,2, 0x41,0x80,0x10, 0x10,1,  # host.1(n, sptr, slen, 2048)  (greet)
+                   0x41,0x80,0x10, 0x0b])                         # return 2048
+  result = hdr &
+    sec(1, vec([t0, t1, t2, t3])) &
+    sec(2, vec([nm("host") & nm("0") & bs([0, 0]), nm("host") & nm("1") & bs([0, 1])])) &
+    sec(3, vec([bs([2]), bs([3])])) &
+    sec(5, vec([bs([0, 1])])) &
+    sec(6, vec([bs([0x7f, 1, 0x41, 0x80, 0x08, 0x0b])])) &
+    sec(7, vec([nm("memory") & bs([2, 0]), nm("cabi_realloc") & bs([0, 2]), nm("handle") & bs([0, 3])])) &
+    sec(10, vec([leb(realloc.len) & realloc, leb(handle.len) & handle]))
+
+proc shimModule(): string =
+  let f0 = bs([0x00, 0x20,0, 0x20,1, 0x41,0, 0x11,0,0, 0x0b])
+  let f1 = bs([0x00, 0x20,0, 0x20,1, 0x20,2, 0x20,3, 0x41,1, 0x11,1,0, 0x0b])
+  result = hdr &
+    sec(1, vec([t0, t1])) &
+    sec(3, vec([bs([0]), bs([1])])) &
+    sec(4, vec([bs([0x70, 0, 2])])) &
+    sec(7, vec([nm("0") & bs([0, 0]), nm("1") & bs([0, 1]), nm("$imports") & bs([1, 0])])) &
+    sec(10, vec([leb(f0.len) & f0, leb(f1.len) & f1]))
+
+proc fixupModule(): string =
+  result = hdr &
+    sec(1, vec([t0, t1])) &
+    sec(2, vec([nm("") & nm("0") & bs([0, 0]), nm("") & nm("1") & bs([0, 1]), nm("") & nm("$imports") & bs([1, 0x70, 0, 2])])) &
+    sec(9, vec([bs([0, 0x41, 0, 0x0b, 2, 0, 1])]))
+
+proc buildComponent(): string =
+  let instType = bs([0x42]) & vec([
+    bs([0x01, 0x40, 1]) & nm("msg") & bs([0x73, 1, 0]),
+    bs([0x01, 0x40, 2]) & nm("a") & bs([0x79]) & nm("b") & bs([0x73, 0, 0x73]),
+    bs([0x04, 0x00]) & nm("log") & bs([0x01, 0]),
+    bs([0x04, 0x00]) & nm("greet") & bs([0x01, 1])])
+  let handleType = bs([0x40, 2]) & nm("n") & bs([0x79]) & nm("s") & bs([0x73, 0, 0x73])
+  let opts = vec([bs([0x03, 0]), bs([0x04, 0])])
+  result = "\0asm\x0d\0\x01\0" &
+    sec(7, vec([instType, handleType])) &
+    sec(10, vec([bs([0x00]) & nm("test:host/api@0.1.0") & bs([0x05, 0])])) &
+    sec(6, vec([bs([0x01, 0x00, 0]) & nm("log"), bs([0x01, 0x00, 0]) & nm("greet")])) &
+    sec(1, shimModule()) & sec(1, mainModule()) & sec(1, fixupModule()) &
+    sec(2, vec([bs([0x00, 0]) & vec([]),
+                bs([0x00, 1]) & vec([nm("host") & bs([0x12, 0])])])) &
+    sec(6, vec([bs([0x00, 0x02, 0x01, 1]) & nm("memory"),
+                bs([0x00, 0x00, 0x01, 1]) & nm("cabi_realloc"),
+                bs([0x00, 0x00, 0x01, 1]) & nm("handle"),
+                bs([0x00, 0x01, 0x01, 0]) & nm("$imports")])) &
+    sec(8, vec([bs([0x01, 0x00, 0]) & opts, bs([0x01, 0x00, 1]) & opts,
+                bs([0x00, 0x00, 1]) & opts & bs([1])])) &
+    sec(2, vec([bs([0x01]) & vec([nm("0") & bs([0x00, 2]), nm("1") & bs([0x00, 3]), nm("$imports") & bs([0x01, 0])]),
+                bs([0x00, 2]) & vec([nm("") & bs([0x12, 2])])])) &
+    sec(11, vec([bs([0x00]) & nm("handle") & bs([0x01, 2, 0])]))
+
+var logged: seq[string] = @[]
+
+proc main() =
+  let vm = newWasmVm()
+  let reg = newHostRegistry()
+  reg.defineHostFn("test:host/api", "log", proc (ci: CompInst; args: seq[CVal]; results: var seq[CVal]): string {.closure.} =
+    logged.add args[0].s
+    result = "")
+  reg.defineHostFn("test:host/api", "greet", proc (ci: CompInst; args: seq[CVal]; results: var seq[CVal]): string {.closure.} =
+    results.add vStr("hello " & args[1].s & $args[0].i)
+    result = "")
+  let ci = newCompInst(vm, reg, 1)
+  let ok = instantiateComponent(ci, buildComponent())
+  if not ok:
+    echo "load failed: ", ci.err
+    quit 1
+  assert ci.unresolved.len == 0
+  let f = findExportFunc(ci, "handle")
+  assert f >= 0
+  var res: seq[CVal] = @[]
+  let e = callExport(ci, f, @[vInt(7), vStr("abc")], res)
+  if e.len > 0:
+    echo "call failed: ", e
+    quit 1
+  assert res.len == 1 and res[0].s == "hello abc7"
+  assert logged.len == 1 and logged[0] == "abc"
+  # second call reuses the instance and its allocator
+  res = @[]
+  assert callExport(ci, f, @[vInt(1), vStr("\xC3\xA9")], res).len == 0
+  assert res[0].s == "hello \xC3\xA91" and logged.len == 2
+  # a host function missing from the registry traps the call instead of failing the load
+  let reg2 = newHostRegistry()
+  let ci2 = newCompInst(newWasmVm(), reg2, 2)
+  assert instantiateComponent(ci2, buildComponent())
+  assert ci2.unresolved.len == 2
+  res = @[]
+  let e2 = callExport(ci2, findExportFunc(ci2, "handle"), @[vInt(1), vStr("x")], res)
+  assert e2.len > 0
+  echo "componenttest ok"
+
+main()

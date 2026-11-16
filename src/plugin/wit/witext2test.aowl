@@ -1,0 +1,322 @@
+## Host-function level tests of witworld2 (block records and the free block functions), witsrv2 (op, ban and whitelist
+## managers, the enchantment registry, advancements, sys-info), witblockentity2 (typed views, containers, custom data) and the
+## component / custom-enchantment / attribute-modifier methods of witstack, each called through the registry as the canonical
+## ABI would (lifted `CVal`s). The managers run against a bare `Server` whose files go to a scratch folder that is removed at the
+## end. The world border and chunk resources need a loaded `World` and are exercised over the wire (tools/mcbot_plugmgr.py).
+import std/[syncio, options, dirs, paths]
+import ../wasm/[wasmvm, canonabi, component]
+import ../../util/text/text
+import ../../util/uuid
+import ../../inventory/inventory
+import "../../data/item_stack/mod"
+import ../../config/[op, whitelist]
+import ../../server/serverbase
+import ../../server/data/[datamod, banned_ip, banned_player]
+import ../../generated/data_component
+import witstate, witserver, witall
+
+var failures = 0
+
+proc ck(ok: bool; msg: string) =
+  if not ok:
+    echo "FAILED ", msg
+    inc failures
+
+proc call(r: HostRegistry; ci: CompInst; iface, fname: string; args: seq[CVal]; results: var seq[CVal]): string =
+  let key = iface & "#" & fname
+  var i = 0
+  while i < r.keys.len:
+    if r.keys[i] == key:
+      return r.fns[i].fn(ci, args, results)
+    inc i
+  result = "no host function " & key
+
+proc c(r: HostRegistry; ci: CompInst; iface, fname: string; args: seq[CVal]): seq[CVal] =
+  var res: seq[CVal] = @[]
+  let e = call(r, ci, iface, fname, args, res)
+  if e.len > 0:
+    echo "FAILED call ", fname, ": ", e
+    inc failures
+  res
+
+proc traps(r: HostRegistry; ci: CompInst; iface, fname: string; args: seq[CVal]): bool =
+  var res: seq[CVal] = @[]
+  call(r, ci, iface, fname, args, res).len > 0
+
+const
+  W = "pumpkin:plugin/world"
+  V = "pumpkin:plugin/server"
+  S = "pumpkin:plugin/item-stack"
+  E = "pumpkin:plugin/block-entity"
+
+proc uuidv(hi, lo: int64): CVal = vRecord(@[vInt(hi), vInt(lo)])
+
+proc main() =
+  let r = newHostRegistry()
+  let st = newWitState()
+  let ext = installWitInterfaces(r, st)
+  let ci = newCompInst(newWasmVm(), r, 0)
+
+  # ---- block records (pure data)
+  var res = c(r, ci, W, "get-block-state-by-id", @[vInt(1)])
+  ck(res[0].i == 1, "state 1 exists")
+  let stone = res[0].items[0]
+  ck(stone.items[0].i == 1 and stone.items[1].i == 1 and stone.items[2].s == "stone", "stone ids and name")
+  ck(stone.items[5].f == 1.5, "stone hardness")
+  ck(stone.items[6].i == 0 and stone.items[8].i == 1, "stone is not air and is solid")
+  ck(stone.items[19].items.len >= 1, "stone has a collision box")
+  res = c(r, ci, W, "get-block-state-by-id", @[vInt(0)])
+  ck(res[0].items[0].items[6].i == 1, "state 0 is air")
+  res = c(r, ci, W, "get-block-state-by-id", @[vInt(40000)])
+  ck(res[0].i == 0, "state out of range")
+  res = c(r, ci, W, "get-block-by-name", @[vStr("minecraft:stone")])
+  ck(res[0].i == 1 and res[0].items[0].items[0].i == 1 and res[0].items[0].items[1].s == "stone", "get-block-by-name")
+  ck(res[0].items[0].items[9].i == 1 and res[0].items[0].items[10].items.len == 1, "stone default state and state ids")
+  res = c(r, ci, W, "get-block-by-name", @[vStr("no_such_block")])
+  ck(res[0].i == 0, "unknown block")
+  res = c(r, ci, W, "get-block-count", @[])
+  ck(res[0].i == 1196, "block count")
+  res = c(r, ci, W, "get-block-state-count", @[])
+  ck(res[0].i == 32366, "state count")
+  res = c(r, ci, W, "block-state-to-info", @[vInt(1)])
+  ck(res[0].items[0].items[0].s == "minecraft:stone" and res[0].items[0].items[1].items.len == 0, "block-state-to-info")
+  res = c(r, ci, W, "get-all-block-names", @[])
+  ck(res[0].items.len == 1196 and res[0].items[0].s == "air", "all block names")
+
+  # properties and resolve-block-state
+  res = c(r, ci, W, "resolve-block-state", @[vStr("minecraft:oak_log"), vList(@[vRecord(@[vStr("axis"), vStr("x")])])])
+  ck(res[0].i == 1, "resolve oak_log axis=x")
+  let logX = res[0].items[0].i
+  res = c(r, ci, W, "get-block-properties", @[vInt(logX)])
+  ck(res[0].items.len == 1 and res[0].items[0].items[0].s == "axis" and res[0].items[0].items[1].s == "x", "properties of the resolved state")
+  res = c(r, ci, W, "resolve-block-state", @[vStr("oak_log"), vList(@[])])
+  ck(res[0].i == 1, "no properties is the default state")
+  let logDefault = res[0].items[0].i
+  res = c(r, ci, W, "get-block-properties", @[vInt(logDefault)])
+  ck(res[0].items[0].items[1].s == "y", "oak_log defaults to axis=y")
+  res = c(r, ci, W, "resolve-block-state", @[vStr("oak_log"), vList(@[vRecord(@[vStr("axis"), vStr("w")])])])
+  ck(res[0].i == 0, "an invalid enum value is none (upstream's caught panic)")
+  res = c(r, ci, W, "resolve-block-state", @[vStr("no_such"), vList(@[])])
+  ck(res[0].i == 0, "unknown block resolves to none")
+  res = c(r, ci, W, "resolve-block-state", @[vStr("stone"), vList(@[vRecord(@[vStr("axis"), vStr("x")])])])
+  ck(res[0].i == 0, "properties on a block without any: none")
+  res = c(r, ci, W, "get-states-for-block-id", @[vInt(int64(logX))])
+  ck(res[0].items.len >= 0, "states for a block id")
+  res = c(r, ci, W, "get-state-ids-for-block-id", @[vInt(13)])
+  ck(res[0].items.len >= 1, "state ids of oak planks")
+  res = c(r, ci, W, "get-default-state-from-block-id", @[vInt(1)])
+  ck(res[0].i == 1 and res[0].items[0].items[0].i == 1, "default state of stone")
+  res = c(r, ci, W, "get-block-from-state-id", @[vInt(1)])
+  ck(res[0].i == 1 and res[0].items[0].items[1].s == "stone", "block of state 1")
+
+  # ---- item-stack: components, custom enchantments, attribute modifiers
+  res = c(r, ci, S, "[constructor]item-stack", @[vStr("minecraft:diamond_sword"), vInt(1)])
+  let sw = res[0].i
+  discard c(r, ci, S, "[method]item-stack.set-component", @[vInt(sw), vInt(int64(dcMaxStackSize.toId())), vList(@[vInt(32)])])
+  res = c(r, ci, S, "[method]item-stack.get-components", @[vInt(sw)])
+  ck(res[0].items.len == 1 and res[0].items[0].items[0].i == int64(dcMaxStackSize.toId()) and res[0].items[0].items[1].items.len == 1 and
+     res[0].items[0].items[1].items[0].i == 32, "set-component then get-components gives the network bytes back")
+  discard c(r, ci, S, "[method]item-stack.set-component", @[vInt(sw), vInt(int64(dcMaxStackSize.toId())), vList(@[vInt(8)])])
+  res = c(r, ci, S, "[method]item-stack.get-components", @[vInt(sw)])
+  ck(res[0].items.len == 1 and res[0].items[0].items[1].items[0].i == 8, "set-component replaces")
+  discard c(r, ci, S, "[method]item-stack.remove-component", @[vInt(sw), vInt(int64(dcMaxStackSize.toId()))])
+  res = c(r, ci, S, "[method]item-stack.get-components", @[vInt(sw)])
+  ck(res[0].items.len == 0, "remove-component")
+
+  discard c(r, ci, S, "[method]item-stack.add-custom-enchantment", @[vInt(sw), vStr("plug:fire"), vInt(3)])
+  res = c(r, ci, S, "[method]item-stack.get-custom-enchantment-level", @[vInt(sw), vStr("plug:fire")])
+  ck(res[0].i == 1 and res[0].items[0].i == 3, "custom enchantment level")
+  res = c(r, ci, S, "[method]item-stack.has-custom-enchantment", @[vInt(sw), vStr("plug:fire")])
+  ck(res[0].i == 1, "has custom enchantment")
+  discard c(r, ci, S, "[method]item-stack.add-custom-enchantment", @[vInt(sw), vStr("minecraft:sharpness"), vInt(2)])
+  res = c(r, ci, S, "[method]item-stack.get-custom-enchantments", @[vInt(sw)])
+  ck(res[0].items.len == 2, "the custom list holds both")
+  res = c(r, ci, S, "[method]item-stack.get-enchantments", @[vInt(sw)])
+  ck(res[0].items.len == 1 and res[0].items[0].items[1].i == 2, "a vanilla custom enchantment is also a real one")
+  discard c(r, ci, S, "[method]item-stack.remove-custom-enchantment", @[vInt(sw), vStr("sharpness")])
+  res = c(r, ci, S, "[method]item-stack.get-enchantments", @[vInt(sw)])
+  ck(res[0].items.len == 0, "removing by the bare name removes the vanilla one")
+  discard c(r, ci, S, "[method]item-stack.remove-custom-enchantment", @[vInt(sw), vStr("plug:fire")])
+  res = c(r, ci, S, "[method]item-stack.has-custom-enchantment", @[vInt(sw), vStr("plug:fire")])
+  ck(res[0].i == 0, "removed")
+
+  let mod1 = vRecord(@[vInt(3), vRecord(@[vStr("plug:boost"), vFloat(2.5), vInt(1)]), vInt(1)])
+  discard c(r, ci, S, "[method]item-stack.add-attribute-modifier", @[vInt(sw), mod1])
+  discard c(r, ci, S, "[method]item-stack.add-attribute-modifier", @[vInt(sw), mod1])
+  res = c(r, ci, S, "[method]item-stack.get-attribute-modifiers", @[vInt(sw)])
+  ck(res[0].items.len == 1 and res[0].items[0].items[0].i == 3 and res[0].items[0].items[1].items[0].s == "plug:boost" and
+     res[0].items[0].items[1].items[1].f == 2.5 and res[0].items[0].items[1].items[2].i == 1 and res[0].items[0].items[2].i == 1,
+     "attribute modifier added once (same attribute, id and slot replace)")
+  discard c(r, ci, S, "[method]item-stack.add-attribute-modifier", @[vInt(sw), vRecord(@[vInt(5), vRecord(@[vStr("plug:b"), vFloat(1.0), vInt(0)]), vInt(0)])])
+  discard c(r, ci, S, "[method]item-stack.remove-attribute-modifiers", @[vInt(sw), vInt(3)])
+  res = c(r, ci, S, "[method]item-stack.get-attribute-modifiers", @[vInt(sw)])
+  ck(res[0].items.len == 1 and res[0].items[0].items[0].i == 5, "remove-attribute-modifiers keeps the other attribute")
+  discard c(r, ci, S, "[method]item-stack.clear-attribute-modifiers", @[vInt(sw)])
+  res = c(r, ci, S, "[method]item-stack.get-attribute-modifiers", @[vInt(sw)])
+  ck(res[0].items.len == 0, "clear-attribute-modifiers")
+
+  # ---- server managers, against a bare server and a scratch folder
+  try:
+    createDir(path("ext2test_scratch"))
+    setCurrentDir(path("ext2test_scratch"))
+  except:
+    echo "cannot enter the scratch folder"
+  let srv = Server(worlds: @[], data: ServerData(operatorConfig: OperatorConfig(ops: @[]), whitelistConfig: WhitelistConfig(whitelist: @[]),
+    bannedPlayerList: BannedPlayerList(dataDir: "data", bannedPlayers: @[]), bannedIpList: BannedIpList(dataDir: "data", bannedIps: @[])))
+  gLink.server = srv
+  let u1 = uuidv(0x1111, 0x2222)
+  res = c(r, ci, V, "[method]op-manager.is-op", @[vInt(0), u1])
+  ck(res[0].i == 0, "not an op")
+  discard c(r, ci, V, "[method]op-manager.op-player", @[vInt(0), vStr("Steve"), u1, vInt(3), vBool(true)])
+  res = c(r, ci, V, "[method]op-manager.is-op", @[vInt(0), u1])
+  ck(res[0].i == 1, "op-player")
+  res = c(r, ci, V, "[method]op-manager.get-permission-level", @[vInt(0), u1])
+  ck(res[0].i == 3, "permission level")
+  res = c(r, ci, V, "[method]op-manager.get-op", @[vInt(0), u1])
+  ck(res[0].i == 1 and res[0].items[0].items[1].s == "Steve" and res[0].items[0].items[3].i == 1, "get-op entry")
+  discard c(r, ci, V, "[method]op-manager.op-player", @[vInt(0), vStr("Steve2"), u1, vInt(4), vBool(false)])
+  res = c(r, ci, V, "[method]op-manager.list-ops", @[vInt(0)])
+  ck(res[0].items.len == 1 and res[0].items[0].items[1].s == "Steve2" and res[0].items[0].items[2].i == 4, "op-player updates in place")
+  res = c(r, ci, V, "[method]op-manager.deop-player", @[vInt(0), u1])
+  ck(res[0].i == 1, "deop")
+  res = c(r, ci, V, "[method]op-manager.deop-player", @[vInt(0), u1])
+  ck(res[0].i == 0, "deop of a non-op")
+
+  let noOpts = vRecord(@[vNone(), vNone(), vNone(), vNone(), vBool(false), vBool(false)])
+  discard c(r, ci, V, "[method]ban-manager.ban-player", @[vInt(0), vStr("Alex"), u1, noOpts])
+  res = c(r, ci, V, "[method]ban-manager.is-player-banned", @[vInt(0), u1])
+  ck(res[0].i == 1, "banned")
+  res = c(r, ci, V, "[method]ban-manager.get-player-ban", @[vInt(0), u1])
+  ck(res[0].i == 1 and res[0].items[0].items[1].s == "Alex" and res[0].items[0].items[3].s == "Plugin" and res[0].items[0].items[4].i == 0 and
+     res[0].items[0].items[5].s == "Banned by plugin.", "ban entry defaults: source Plugin, no expiry, upstream's reason")
+  let timed = vRecord(@[vNone(), vSome(vStr("Mod")), vNone(), vSome(vInt(3600)), vBool(false), vBool(false)])
+  discard c(r, ci, V, "[method]ban-manager.ban-player", @[vInt(0), vStr("Alex"), u1, timed])
+  res = c(r, ci, V, "[method]ban-manager.list-player-bans", @[vInt(0)])
+  ck(res[0].items.len == 1 and res[0].items[0].items[3].s == "Mod" and res[0].items[0].items[4].i == 1, "re-ban updates, with an expiry")
+  res = c(r, ci, V, "[method]ban-manager.unban-player", @[vInt(0), u1])
+  ck(res[0].i == 1, "unban")
+  discard c(r, ci, V, "[method]ban-manager.ban-ip", @[vInt(0), vStr("10.0.0.1"), vRecord(@[vNone(), vNone(), vSome(vStr("2099-01-01T00:00:00Z")), vNone(), vBool(false), vBool(false)])])
+  res = c(r, ci, V, "[method]ban-manager.is-ip-banned", @[vInt(0), vStr("10.0.0.1")])
+  ck(res[0].i == 1, "ip banned")
+  res = c(r, ci, V, "[method]ban-manager.get-ip-ban", @[vInt(0), vStr("10.0.0.1")])
+  ck(res[0].items[0].items[3].i == 1 and res[0].items[0].items[3].items[0].s == "2099-01-01 00:00:00+00:00", "rfc3339 expiry parsed and written in the ban list's format")
+  res = c(r, ci, V, "[method]ban-manager.unban-ip", @[vInt(0), vStr("10.0.0.1")])
+  ck(res[0].i == 1, "unban ip")
+
+  res = c(r, ci, V, "[method]whitelist-manager.add-player", @[vInt(0), vStr("Bob"), u1])
+  ck(res[0].i == 1, "whitelist add")
+  res = c(r, ci, V, "[method]whitelist-manager.add-player", @[vInt(0), vStr("Bob"), u1])
+  ck(res[0].i == 0, "whitelist add twice")
+  res = c(r, ci, V, "[method]whitelist-manager.is-whitelisted", @[vInt(0), u1])
+  ck(res[0].i == 1, "is-whitelisted")
+  res = c(r, ci, V, "[method]whitelist-manager.list-entries", @[vInt(0)])
+  ck(res[0].items.len == 1 and res[0].items[0].items[1].s == "Bob", "whitelist entries")
+  res = c(r, ci, V, "[method]whitelist-manager.remove-player", @[vInt(0), u1])
+  ck(res[0].i == 1, "whitelist remove")
+  for f in ["data/banned-ips.json", "data/banned-players.json", "data/ops.json", "data/whitelist.json"]:
+    try:
+      removeFile(path(f))
+    except:
+      discard
+  try:
+    removeDir(path("data"))
+    setCurrentDir(path(".."))
+    removeDir(path("ext2test_scratch"))
+  except:
+    echo "cannot remove the scratch folder"
+
+  # enchantment registry
+  let desc = newTextRep(st, text("Fire!"))
+  let ench = vRecord(@[vStr("plug:fire"), vInt(int64(desc)), vInt(3), vInt(2), vStr("#minecraft:swords"), vInt(5), vList(@[vInt(1)]), vList(@[vStr("plug:ice")])])
+  res = c(r, ci, V, "[method]enchantment-manager.register-enchantment", @[vInt(0), ench])
+  ck(res[0].i == 0, "register")
+  res = c(r, ci, V, "[method]enchantment-manager.register-enchantment", @[vInt(0), ench])
+  ck(res[0].i == 1 and res[0].items[0].s == "Enchantment 'plug:fire' is already registered", "duplicate registration")
+  res = c(r, ci, V, "[method]enchantment-manager.get-enchantment", @[vInt(0), vStr("plug:fire")])
+  ck(res[0].i == 1 and res[0].items[0].items[2].i == 3 and res[0].items[0].items[7].items[0].s == "plug:ice", "get custom enchantment")
+  res = c(r, ci, V, "[method]enchantment-manager.get-enchantment", @[vInt(0), vStr("sharpness")])
+  ck(res[0].i == 1 and res[0].items[0].items[0].s == "minecraft:sharpness" and res[0].items[0].items[2].i == 5, "vanilla enchantment by the bare name")
+  res = c(r, ci, V, "[method]enchantment-manager.has-enchantment", @[vInt(0), vStr("minecraft:mending")])
+  ck(res[0].i == 1, "has vanilla")
+  res = c(r, ci, V, "[method]server.get-all-enchantment-ids", @[vInt(0)])
+  ck(res[0].items.len > 30 and res[0].items[0].s == "plug:fire", "all ids: custom first")
+
+  res = c(r, ci, V, "[method]server.get-all-advancement-ids", @[vInt(0)])
+  ck(res[0].items.len > 100, "advancement ids")
+  res = c(r, ci, V, "[method]server.get-advancement", @[vInt(0), vStr("story/root")])
+  ck(res[0].i == 1 and res[0].items[0].items[0].s == "minecraft:story/root" and res[0].items[0].items[1].i == 0, "story/root has no parent")
+  res = c(r, ci, V, "[method]server.get-advancement", @[vInt(0), vStr("no/such")])
+  ck(res[0].i == 0, "unknown advancement")
+  res = c(r, ci, V, "[method]server.get-sys-info", @[vInt(0)])
+  ck(res[0].items[0].i == 1 and res[0].items[0].items[0].i >= 1 and res[0].items[1].i == 1 and res[0].items[3].items[0].s == "Windows", "sys-info has real values")
+  discard c(r, ci, V, "[method]server.get-datapack-manager", @[vInt(0)])
+  res = c(r, ci, V, "[method]datapack-manager.list-all-packs", @[vInt(0)])
+  ck(res[0].items.len == 0, "no datapacks")
+  ck(traps(r, ci, V, "[method]server.create-world", @[vInt(0), vStr("w2"), vInt(0)]), "create-world without a server hook traps cleanly")
+
+  # ---- block entities: typed views and containers
+  let bh = ext.blockEntities.hooks
+  bh.kind = proc (w, x, y, z: int): string {.closure.} =
+    if y == 70: "furnace-block-entity" elif y == 71: "chest-block-entity" else: ""
+  bh.field = proc (w, x, y, z: int; view, name: string; res: var CVal): bool {.closure.} =
+    if view == "furnace-block-entity" and name == "get-lit-total-time":
+      res = vInt(1600)
+      return true
+    if view == "furnace-block-entity" and name == "is-burning":
+      res = vBool(true)
+      return true
+    false
+  let arr = newArrayInventory(3)
+  let inv: Inventory = arr
+  bh.inventory = proc (w, x, y, z: int): nil Inventory {.closure.} =
+    if y == 70 or y == 71: return inv
+    nil
+  let fur = newBlockEntityRep(ext.blockEntities, 0, 5, 70, 5)
+  res = c(r, ci, E, "[method]furnace-block-entity.get-lit-total-time", @[vInt(int64(fur))])
+  ck(res[0].i == 1600, "furnace view getter")
+  res = c(r, ci, E, "[method]furnace-block-entity.is-burning", @[vInt(int64(fur))])
+  ck(res[0].i == 1, "furnace is-burning")
+  ck(traps(r, ci, E, "[method]furnace-block-entity.get-cooking-time-spent", @[vInt(int64(fur))]), "a getter the hook does not know traps (Not a view)")
+  res = c(r, ci, E, "[method]furnace-block-entity.get-container", @[vInt(int64(fur))])
+  let cont = res[0].i
+  res = c(r, ci, E, "[method]container-block-entity.get-size", @[vInt(cont)])
+  ck(res[0].i == 3, "container size")
+  res = c(r, ci, E, "[method]container-block-entity.is-empty", @[vInt(cont)])
+  ck(res[0].i == 1, "container empty")
+  res = c(r, ci, S, "[constructor]item-stack", @[vStr("minecraft:coal"), vInt(7)])
+  discard c(r, ci, E, "[method]container-block-entity.set-stack", @[vInt(cont), vInt(1), vSome(vInt(res[0].i))])
+  res = c(r, ci, E, "[method]container-block-entity.get-stack", @[vInt(cont), vInt(1)])
+  ck(res[0].i == 1, "get-stack after set-stack")
+  let got = res[0].items[0].i
+  res = c(r, ci, S, "[method]item-stack.get-count", @[vInt(got)])
+  ck(res[0].i == 7, "the stack kept its count")
+  res = c(r, ci, E, "[method]container-block-entity.get-stack", @[vInt(cont), vInt(0)])
+  ck(res[0].i == 0, "an empty slot is none")
+  res = c(r, ci, E, "[method]container-block-entity.remove-stack", @[vInt(cont), vInt(1)])
+  ck(res[0].i == 1, "remove-stack gives the stack")
+  res = c(r, ci, E, "[method]container-block-entity.is-empty", @[vInt(cont)])
+  ck(res[0].i == 1, "empty again")
+  # custom data of a block entity
+  let tree = vRecord(@[vInt(0), vList(@[vVariant(2, vInt(41))])])
+  discard c(r, ci, E, "[method]block-entity.set-custom-data", @[vInt(int64(fur)), vStr("plug"), vStr("k"), tree])
+  res = c(r, ci, E, "[method]block-entity.get-custom-data", @[vInt(int64(fur)), vStr("plug"), vStr("k")])
+  ck(res[0].i == 1 and res[0].items[0].items[1].items[0].items[0].i == 41, "block entity custom data round trip")
+  res = c(r, ci, E, "[method]block-entity.has-custom-data", @[vInt(int64(fur)), vStr("plug"), vStr("k")])
+  ck(res[0].i == 1, "has")
+  discard c(r, ci, E, "[method]block-entity.remove-custom-data", @[vInt(int64(fur)), vStr("plug"), vStr("k")])
+  res = c(r, ci, E, "[method]block-entity.has-custom-data", @[vInt(int64(fur)), vStr("plug"), vStr("k")])
+  ck(res[0].i == 0, "removed")
+  # the hanging sign shares the sign methods
+  bh.sign = proc (w, x, y, z: int; res: var BeSign): bool {.closure.} =
+    res = BeSign(front: SignFace(messages: @["h", "", "", ""], color: 0, glowing: false),
+                 back: SignFace(messages: @["", "", "", ""], color: 0, glowing: false), waxed: false)
+    true
+  res = c(r, ci, E, "[method]hanging-sign-block-entity.get-front-text", @[vInt(int64(fur))])
+  ck(res[0].items[0].items[0].s == "h", "hanging sign front text")
+
+  if failures > 0:
+    echo failures, " failures"
+    quit(1)
+  echo "witext2test ok"
+
+main()

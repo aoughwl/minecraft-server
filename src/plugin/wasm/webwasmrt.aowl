@@ -1,0 +1,2616 @@
+## Copied from the titicaca app's aoughwl.web.dom mod (Desktop/jester_data/apps/titicaca/basemods): stdlib-only WebAssembly decoder,
+## validator and interpreter written in aowlmony. Used here as the plugin runtime; see ../README.md.
+## WebAssembly: the store, instantiation and the interpreter.
+##
+## Pure. `webwasm.aowl` hands over a validated, pre-compiled `WModule`; this
+## file keeps every function, table, memory, global, tag, exception and GC
+## object a realm has made (the specification's *store*) and runs code.
+##
+## MEMORY BYTES LIVE OUTSIDE THE STORE
+## -----------------------------------
+## A memory's bytes are one row of a `bank: seq[seq[int]]` the caller passes
+## in, one `int` per byte. The JavaScript binding passes the engine's own
+## `ArrayBuffer` storage, so `memory.buffer` IS the memory rather than a copy
+## that goes stale; a unit test passes a local bank. Nothing here caches a
+## row across a host call, because the host may move a memory to a fresh row
+## (that is how a grown memory detaches its old buffer).
+##
+## THE MACHINE
+## -----------
+## One operand stack of 16-byte slots (a v128 fills a wSlot, everything else
+## uses `lo`). A frame's locals sit at the bottom of its stack window, so a
+## call's arguments become the callee's first locals without a copy. Frames
+## are an explicit `seq`, never native recursion, so wasm-to-wasm calls and
+## tail calls cost no C stack; only a call out to the host and back in nests.
+##
+## REFERENCES
+## ----------
+## A reference is a `uint64`: 0 is null, otherwise a 4-bit tag in bits 60..63
+## and a payload. Bit 59 marks an internal reference externalised by
+## `extern.convert_any`.
+
+import std/math
+import webwasm
+
+func rintf(x: float32): float32 {.importc: "rintf", header: "<math.h>".}
+func rintd(x: float64): float64 {.importc: "rint", header: "<math.h>".}
+
+const
+  wrFunc* = 1'u64
+  wrExtern* = 2'u64     ## a host value handle
+  wrI31* = 3'u64
+  wrGc* = 4'u64         ## a struct or array
+  wrExn* = 5'u64
+  wrHostAny* = 6'u64    ## a host value internalised by any.convert_extern
+  WExtBit* = 0x0800_0000_0000_0000'u64
+  WPayMask* = 0x07FF_FFFF_FFFF_FFFF'u64
+
+  wsOk* = 0
+  wsTrap* = 1
+  wsThrow* = 2
+  wsExhausted* = 3
+
+  MaxFrames = 30000
+  WPageSize* = 65536
+  WMaxBankBytes* = 256 * 1024 * 1024
+  WMaxRowBytes* = 32 * 1024 * 1024
+    ## A memory the host has moved into an ArrayBuffer row costs eight host
+    ## bytes per byte, so it may grow less far.
+    ## An implementation limit on one memory: bytes are `int`s here, so this
+    ## is already eight times as much host memory. `memory.grow` past it
+    ## fails (returns -1), which the specification permits at any time.
+
+type
+  WSlot* = object
+    lo*: uint64
+    hi*: uint64
+
+  WFunc* = object
+    isHost*: bool
+    canon*: int
+    inst*: int
+    start*: int
+    nparams*: int
+    nresults*: int
+    nlocals*: int
+    maxStack*: int
+    tryLo*: int
+    tryHi*: int
+    host*: int
+
+  WTable* = object
+    elem*: int
+    data*: seq[uint64]
+    max*: uint64
+    hasMax*: bool
+    is64*: bool
+
+  WMem* = object
+    row*: int                ## the bank row holding the bytes, or -1 while
+                             ## they are still in `data`
+    data*: seq[uint8]        ## the bytes, until the host moves them to a row
+    grows*: int              ## successful grows so far (a buffer's generation)
+    max*: uint64
+    hasMax*: bool
+    is64*: bool
+    shared*: bool
+
+  WGlobal* = object
+    vt*: int
+    mut*: bool
+    val*: WSlot
+
+  WExn* = object
+    tag*: int                ## a tag address, or -1 for a host exception
+    payload*: seq[WSlot]
+    host*: int               ## the host's handle for a host exception
+
+  WGcObj* = object
+    canon*: int
+    fields*: seq[WSlot]
+
+  WInst* = object
+    modId*: int
+    types*: seq[int]
+    funcs*: seq[int]
+    tables*: seq[int]
+    mems*: seq[int]
+    globals*: seq[int]
+    tags*: seq[int]
+    elems*: seq[seq[uint64]]
+    elemTypes*: seq[int]
+    datas*: seq[string]
+    exports*: seq[WExport]
+
+  WLoadedMod* = object
+    m*: WModule
+    codeBase*: int
+    brBase*: int
+    v128Base*: int
+    tryBase*: int
+
+  Frame = object
+    fn: int
+    retPc: int
+    fp: int
+    inst: int
+
+  WHostCallFn* = nil proc (ctx: nil pointer; s: var WStore; bank: var seq[seq[int]];
+                      host: int; args: seq[WSlot]; results: var seq[WSlot]): int {.nimcall.}
+    ## Run host function `host`. Returns wsOk, or wsThrow with
+    ## `s.pendingExn` set, or wsTrap with `s.trapMsg` set.
+
+  WExternVal* = object
+    kind*: int
+    addr0*: int
+
+  WStore* = object
+    reg*: TypeReg
+    mods*: seq[WLoadedMod]
+    code*: seq[Ins]
+    brTab*: seq[int]
+    v128*: seq[uint64]
+    tries*: seq[TryEntry]
+    funcs*: seq[WFunc]
+    tables*: seq[WTable]
+    mems*: seq[WMem]
+    globals*: seq[WGlobal]
+    tags*: seq[int]          ## canonical type of each tag
+    exns*: seq[WExn]
+    gcs*: seq[WGcObj]
+    insts*: seq[WInst]
+    stack*: seq[WSlot]
+    sp*: int
+    frames: seq[Frame]
+    trapMsg*: string
+    pendingExn*: int
+    hostCall*: WHostCallFn
+    hostCtx*: nil pointer
+    newRow*: nil proc (ctx: nil pointer; bank: var seq[seq[int]]): int {.nimcall.}
+      ## Make a fresh bank row for a new memory (the binding makes an
+      ## ArrayBuffer); nil means just append to the bank.
+
+proc newWStore*(): WStore =
+  result = WStore(reg: newTypeReg(), mods: @[], code: @[], brTab: @[], v128: @[],
+                 tries: @[], funcs: @[], tables: @[], mems: @[], globals: @[],
+                 tags: @[], exns: @[], gcs: @[], insts: @[], stack: @[], sp: 0,
+                 frames: @[], trapMsg: "", pendingExn: -1, hostCall: nil,
+                 hostCtx: nil, newRow: nil)
+
+proc wSlot*(lo: uint64): WSlot = WSlot(lo: lo, hi: 0'u64)
+
+proc wRefTag*(r: uint64): uint64 = (r shr 60) and 0xF'u64
+proc wRefPay*(r: uint64): int = int(r and 0x00FF_FFFF_FFFF_FFFF'u64)
+proc wMkRef*(tag: uint64; pay: int): uint64 = (tag shl 60) or uint64(pay)
+
+# ---------------------------------------------------------------------------
+# Loading a compiled module into the store's shared code arrays.
+
+proc wLoadModule*(s: var WStore; m: WModule): int =
+  let cb = s.code.len
+  let bb = s.brTab.len
+  let vb = s.v128.len div 2
+  let tb = s.tries.len
+  var i = 0
+  while i < m.code.len:
+    var ins = m.code[i]
+    case ins.op
+    of opJump, opBr, opBrIf, opIfFalse, opBrOnNull, opBrOnNonNull, opBrOnCast,
+       opBrOnCastFail:
+      ins.a = ins.a + cb
+    of opBrTable:
+      ins.a = ins.a + bb
+    of 0x20C, 0x20D:
+      ins.a = ins.a + vb
+    else: discard
+    s.code.add ins
+    inc i
+  i = 0
+  while i < m.brTab.len:
+    s.brTab.add m.brTab[i]
+    inc i
+  # relocate br_table targets: count, then (target, dest) pairs
+  i = 0
+  while i < m.code.len:
+    if m.code[i].op == opBrTable:
+      let t = m.code[i].a
+      let n = m.brTab[t]
+      var k = 0
+      while k < n:
+        s.brTab[bb + t + 1 + k * 2] = m.brTab[t + 1 + k * 2] + cb
+        inc k
+    inc i
+  i = 0
+  while i < m.v128.len:
+    s.v128.add m.v128[i]
+    inc i
+  i = 0
+  while i < m.tries.len:
+    var e = m.tries[i]
+    e.startPc = e.startPc + cb
+    e.endPc = e.endPc + cb
+    var k = 0
+    while k < e.catches.len:
+      let slotAt = e.catches[k].target
+      s.brTab[bb + slotAt] = m.brTab[slotAt] + cb
+      e.catches[k].target = bb + slotAt
+      inc k
+    s.tries.add e
+    inc i
+  s.mods.add WLoadedMod(m: m, codeBase: cb, brBase: bb, v128Base: vb, tryBase: tb)
+  result = s.mods.len - 1
+
+# ---------------------------------------------------------------------------
+# Numbers.
+
+template f32of(x: uint64): float32 = cast[float32](uint32(x and 0xFFFF_FFFF'u64))
+template b32(f: float32): uint64 = uint64(cast[uint32](f))
+template f64of(x: uint64): float64 = cast[float64](x)
+template b64(f: float64): uint64 = cast[uint64](f)
+template i32of(x: uint64): int32 = cast[int32](uint32(x and 0xFFFF_FFFF'u64))
+template u32of(x: uint64): uint32 = uint32(x and 0xFFFF_FFFF'u64)
+template i64of(x: uint64): int64 = cast[int64](x)
+template w32(x: uint32): uint64 = uint64(x)
+template ws32(x: int32): uint64 = uint64(cast[uint32](x))
+template ws64(x: int64): uint64 = cast[uint64](x)
+
+proc bool01(b: bool): uint64 = (if b: 1'u64 else: 0'u64)
+
+proc clz32(x: uint32): uint32 =
+  if x == 0: return 32
+  var n = 0'u32
+  var v = x
+  while (v and 0x8000_0000'u32) == 0:
+    v = v shl 1
+    inc n
+  result = n
+
+proc ctz32(x: uint32): uint32 =
+  if x == 0: return 32
+  var n = 0'u32
+  var v = x
+  while (v and 1'u32) == 0:
+    v = v shr 1
+    inc n
+  result = n
+
+proc pop32(x: uint32): uint32 =
+  var n = 0'u32
+  var v = x
+  while v != 0:
+    v = v and (v - 1)
+    inc n
+  result = n
+
+proc clz64(x: uint64): uint64 =
+  if x == 0: return 64
+  var n = 0'u64
+  var v = x
+  while (v and 0x8000_0000_0000_0000'u64) == 0:
+    v = v shl 1
+    inc n
+  result = n
+
+proc ctz64(x: uint64): uint64 =
+  if x == 0: return 64
+  var n = 0'u64
+  var v = x
+  while (v and 1'u64) == 0:
+    v = v shr 1
+    inc n
+  result = n
+
+proc pop64(x: uint64): uint64 =
+  var n = 0'u64
+  var v = x
+  while v != 0:
+    v = v and (v - 1)
+    inc n
+  result = n
+
+proc rotl32(a: uint32; k0: uint32): uint32 =
+  let k = int(k0 and 31)
+  if k == 0: return a
+  result = (a shl k) or (a shr (32 - k))
+
+proc rotr32(a: uint32; k0: uint32): uint32 =
+  let k = int(k0 and 31)
+  if k == 0: return a
+  result = (a shr k) or (a shl (32 - k))
+
+proc rotl64(a: uint64; k0: uint64): uint64 =
+  let k = int(k0 and 63)
+  if k == 0: return a
+  result = (a shl k) or (a shr (64 - k))
+
+proc rotr64(a: uint64; k0: uint64): uint64 =
+  let k = int(k0 and 63)
+  if k == 0: return a
+  result = (a shr k) or (a shl (64 - k))
+
+proc sar32(a: uint32; k: uint32): uint32 =
+  cast[uint32](ashr(cast[int32](a), int(k and 31)))
+
+proc sar64(a: uint64; k: uint64): uint64 =
+  cast[uint64](ashr(cast[int64](a), int(k and 63)))
+
+proc isNan32(x: uint64): bool =
+  ((x and 0x7F80_0000'u64) == 0x7F80_0000'u64) and ((x and 0x007F_FFFF'u64) != 0)
+
+proc isNan64(x: uint64): bool =
+  ((x and 0x7FF0_0000_0000_0000'u64) == 0x7FF0_0000_0000_0000'u64) and
+    ((x and 0x000F_FFFF_FFFF_FFFF'u64) != 0)
+
+proc wFmin32*(a, b: uint64): uint64 =
+  if isNan32(a): return a or 0x0040_0000'u64
+  if isNan32(b): return b or 0x0040_0000'u64
+  let x = f32of(a)
+  let y = f32of(b)
+  if x == y:
+    # equal: -0 wins for min
+    return a or b
+  result = (if x < y: a else: b)
+
+proc wFmax32*(a, b: uint64): uint64 =
+  if isNan32(a): return a or 0x0040_0000'u64
+  if isNan32(b): return b or 0x0040_0000'u64
+  let x = f32of(a)
+  let y = f32of(b)
+  if x == y:
+    return a and b
+  result = (if x > y: a else: b)
+
+proc wFmin64*(a, b: uint64): uint64 =
+  if isNan64(a): return a or 0x0008_0000_0000_0000'u64
+  if isNan64(b): return b or 0x0008_0000_0000_0000'u64
+  let x = f64of(a)
+  let y = f64of(b)
+  if x == y: return a or b
+  result = (if x < y: a else: b)
+
+proc wFmax64*(a, b: uint64): uint64 =
+  if isNan64(a): return a or 0x0008_0000_0000_0000'u64
+  if isNan64(b): return b or 0x0008_0000_0000_0000'u64
+  let x = f64of(a)
+  let y = f64of(b)
+  if x == y: return a and b
+  result = (if x > y: a else: b)
+
+proc truncSat32s(f: float64): uint64 =
+  if f != f: return 0
+  if f <= -2147483648.0: return ws32(-2147483647'i32 - 1'i32)
+  if f >= 2147483647.0: return ws32(2147483647'i32)
+  result = ws32(int32(trunc(f)))
+
+proc truncSat32u(f: float64): uint64 =
+  if f != f: return 0
+  if f <= 0.0: return 0
+  if f >= 4294967295.0: return 0xFFFF_FFFF'u64
+  result = w32(uint32(trunc(f)))
+
+proc truncSat64s(f: float64): uint64 =
+  if f != f: return 0
+  if f <= -9223372036854775808.0: return 0x8000_0000_0000_0000'u64
+  if f >= 9223372036854775808.0: return 0x7FFF_FFFF_FFFF_FFFF'u64
+  result = ws64(int64(trunc(f)))
+
+proc truncSat64u(f: float64): uint64 =
+  if f != f: return 0
+  if f <= 0.0: return 0
+  if f >= 18446744073709551616.0: return 0xFFFF_FFFF_FFFF_FFFF'u64
+  result = uint64(trunc(f))
+
+proc u64ToF32(u: uint64): float32 = float32(u)
+proc u64ToF64(u: uint64): float64 = float64(u)
+
+# ---------------------------------------------------------------------------
+# SIMD lanes. A v128 is (lo, hi), lane 0 in the low bits of lo.
+
+type V = object
+  lo, hi: uint64
+
+proc lane8(v: WSlot; i: int): uint64 =
+  if i < 8: (v.lo shr uint64(8 * i)) and 0xFF'u64
+  else: (v.hi shr uint64(8 * (i - 8))) and 0xFF'u64
+
+proc setLane8(v: var WSlot; i: int; x: uint64) =
+  let b = x and 0xFF'u64
+  if i < 8:
+    let sh = uint64(8 * i)
+    v.lo = (v.lo and not (0xFF'u64 shl sh)) or (b shl sh)
+  else:
+    let sh = uint64(8 * (i - 8))
+    v.hi = (v.hi and not (0xFF'u64 shl sh)) or (b shl sh)
+
+proc lane16(v: WSlot; i: int): uint64 =
+  if i < 4: (v.lo shr uint64(16 * i)) and 0xFFFF'u64
+  else: (v.hi shr uint64(16 * (i - 4))) and 0xFFFF'u64
+
+proc setLane16(v: var WSlot; i: int; x: uint64) =
+  let b = x and 0xFFFF'u64
+  if i < 4:
+    let sh = uint64(16 * i)
+    v.lo = (v.lo and not (0xFFFF'u64 shl sh)) or (b shl sh)
+  else:
+    let sh = uint64(16 * (i - 4))
+    v.hi = (v.hi and not (0xFFFF'u64 shl sh)) or (b shl sh)
+
+proc lane32(v: WSlot; i: int): uint64 =
+  if i < 2: (v.lo shr uint64(32 * i)) and 0xFFFF_FFFF'u64
+  else: (v.hi shr uint64(32 * (i - 2))) and 0xFFFF_FFFF'u64
+
+proc setLane32(v: var WSlot; i: int; x: uint64) =
+  let b = x and 0xFFFF_FFFF'u64
+  if i < 2:
+    let sh = uint64(32 * i)
+    v.lo = (v.lo and not (0xFFFF_FFFF'u64 shl sh)) or (b shl sh)
+  else:
+    let sh = uint64(32 * (i - 2))
+    v.hi = (v.hi and not (0xFFFF_FFFF'u64 shl sh)) or (b shl sh)
+
+proc lane64(v: WSlot; i: int): uint64 = (if i == 0: v.lo else: v.hi)
+proc setLane64(v: var WSlot; i: int; x: uint64) =
+  if i == 0: v.lo = x else: v.hi = x
+
+proc sx8(x: uint64): int64 =
+  let b = int64(x and 0xFF'u64)
+  if b >= 128: b - 256 else: b
+proc sx16(x: uint64): int64 =
+  let b = int64(x and 0xFFFF'u64)
+  if b >= 32768: b - 65536 else: b
+proc sx32(x: uint64): int64 = int64(i32of(x))
+
+proc satS(v: int64; bits: int): uint64 =
+  let hi = (1'i64 shl (bits - 1)) - 1
+  let lo = -(1'i64 shl (bits - 1))
+  var x = v
+  if x > hi: x = hi
+  if x < lo: x = lo
+  result = cast[uint64](x) and ((1'u64 shl uint64(bits)) - 1)
+
+proc satU(v: int64; bits: int): uint64 =
+  let hi = (1'i64 shl bits) - 1
+  var x = v
+  if x > hi: x = hi
+  if x < 0: x = 0
+  result = uint64(x)
+
+proc laneGet(v: WSlot; sz, i: int): uint64 =
+  case sz
+  of 8: lane8(v, i)
+  of 16: lane16(v, i)
+  of 32: lane32(v, i)
+  else: lane64(v, i)
+
+proc laneSet(v: var WSlot; sz, i: int; x: uint64) =
+  case sz
+  of 8: setLane8(v, i, x)
+  of 16: setLane16(v, i, x)
+  of 32: setLane32(v, i, x)
+  else: setLane64(v, i, x)
+
+proc sext(x: uint64; sz: int): int64 =
+  case sz
+  of 8: sx8(x)
+  of 16: sx16(x)
+  of 32: sx32(x)
+  else: cast[int64](x)
+
+proc maskOf(sz: int): uint64 =
+  if sz == 64: 0xFFFF_FFFF_FFFF_FFFF'u64 else: (1'u64 shl uint64(sz)) - 1
+
+proc intCmp(kind: int; a, b: uint64; sz: int): bool =
+  ## kind: 0 eq 1 ne 2 lt_s 3 lt_u 4 gt_s 5 gt_u 6 le_s 7 le_u 8 ge_s 9 ge_u
+  let sa = sext(a, sz)
+  let sb = sext(b, sz)
+  case kind
+  of 0: a == b
+  of 1: a != b
+  of 2: sa < sb
+  of 3: a < b
+  of 4: sa > sb
+  of 5: a > b
+  of 6: sa <= sb
+  of 7: a <= b
+  of 8: sa >= sb
+  else: a >= b
+
+proc f32Arith(k: int; a, b: uint64): uint64 =
+  let x = f32of(a)
+  let y = f32of(b)
+  case k
+  of 0: b32(x + y)
+  of 1: b32(x - y)
+  of 2: b32(x * y)
+  else: b32(x / y)
+
+proc f64Arith(k: int; a, b: uint64): uint64 =
+  let x = f64of(a)
+  let y = f64of(b)
+  case k
+  of 0: b64(x + y)
+  of 1: b64(x - y)
+  of 2: b64(x * y)
+  else: b64(x / y)
+
+proc f32Unary(k: int; a: uint64): uint64 =
+  ## 0 abs 1 neg 2 ceil 3 floor 4 trunc 5 nearest 6 sqrt. A NaN out of the
+  ## rounding ones is quieted: some libms hand a signalling NaN back as is,
+  ## and the specification wants an arithmetic NaN.
+  if k >= 2 and isNan32(a): return a or 0x0040_0000'u64
+  case k
+  of 0: a and 0x7FFF_FFFF'u64
+  of 1: a xor 0x8000_0000'u64
+  of 2: b32(ceil(f32of(a)))
+  of 3: b32(floor(f32of(a)))
+  of 4: b32(trunc(f32of(a)))
+  of 5: b32(rintf(f32of(a)))
+  else: b32(sqrt(f32of(a)))
+
+proc f64Unary(k: int; a: uint64): uint64 =
+  if k >= 2 and isNan64(a): return a or 0x0008_0000_0000_0000'u64
+  case k
+  of 0: a and 0x7FFF_FFFF_FFFF_FFFF'u64
+  of 1: a xor 0x8000_0000_0000_0000'u64
+  of 2: b64(ceil(f64of(a)))
+  of 3: b64(floor(f64of(a)))
+  of 4: b64(trunc(f64of(a)))
+  of 5: b64(rintd(f64of(a)))
+  else: b64(sqrt(f64of(a)))
+
+proc fCmp(k: int; x, y: float64): bool =
+  case k
+  of 0: x == y
+  of 1: x != y
+  of 2: x < y
+  of 3: x > y
+  of 4: x <= y
+  else: x >= y
+
+proc simdUnary(sub: int; a: WSlot): WSlot =
+  result = WSlot(lo: 0, hi: 0)
+  case sub
+  of 0x4D:
+    result.lo = not a.lo
+    result.hi = not a.hi
+  of 0x5E:   # f32x4.demote_f64x2_zero
+    setLane32(result, 0, b32(float32(f64of(a.lo))))
+    setLane32(result, 1, b32(float32(f64of(a.hi))))
+  of 0x5F:   # f64x2.promote_low_f32x4
+    result.lo = b64(float64(f32of(lane32(a, 0))))
+    result.hi = b64(float64(f32of(lane32(a, 1))))
+  of 0x60, 0x80, 0xA0, 0xC0:   # abs
+    let sz = (if sub == 0x60: 8 elif sub == 0x80: 16 elif sub == 0xA0: 32 else: 64)
+    var i = 0
+    while i < 128 div sz:
+      let v = sext(laneGet(a, sz, i), sz)
+      laneSet(result, sz, i, cast[uint64](if v < 0: 0'i64 - v else: v) and maskOf(sz))
+      inc i
+  of 0x61, 0x81, 0xA1, 0xC1:   # neg
+    let sz = (if sub == 0x61: 8 elif sub == 0x81: 16 elif sub == 0xA1: 32 else: 64)
+    var i = 0
+    while i < 128 div sz:
+      laneSet(result, sz, i, (0'u64 - laneGet(a, sz, i)) and maskOf(sz))
+      inc i
+  of 0x62:
+    var i = 0
+    while i < 16:
+      setLane8(result, i, pop32(uint32(lane8(a, i))))
+      inc i
+  of 0x67, 0x68, 0x69, 0x6A:
+    let k = (case sub
+             of 0x67: 2
+             of 0x68: 3
+             of 0x69: 4
+             else: 5)
+    var i = 0
+    while i < 4:
+      setLane32(result, i, f32Unary(k, lane32(a, i)))
+      inc i
+  of 0x74, 0x75, 0x7A, 0x94:
+    let k = (case sub
+             of 0x74: 2
+             of 0x75: 3
+             of 0x7A: 4
+             else: 5)
+    result.lo = f64Unary(k, a.lo)
+    result.hi = f64Unary(k, a.hi)
+  of 0x7C, 0x7D, 0x7E, 0x7F:   # extadd_pairwise
+    let sz = (if sub <= 0x7D: 8 else: 16)
+    let signed = sub == 0x7C or sub == 0x7E
+    var i = 0
+    while i < 64 div sz:
+      let x = laneGet(a, sz, 2 * i)
+      let y = laneGet(a, sz, 2 * i + 1)
+      var r: int64
+      if signed: r = sext(x, sz) + sext(y, sz)
+      else: r = int64(x) + int64(y)
+      laneSet(result, sz * 2, i, cast[uint64](r) and maskOf(sz * 2))
+      inc i
+  of 0x87, 0x88, 0x89, 0x8A, 0xA7, 0xA8, 0xA9, 0xAA, 0xC7, 0xC8, 0xC9, 0xCA:
+    var sz = 8
+    var base = 0x87
+    if sub >= 0xC7:
+      sz = 32
+      base = 0xC7
+    elif sub >= 0xA7:
+      sz = 16
+      base = 0xA7
+    let k = sub - base   # 0 low_s 1 high_s 2 low_u 3 high_u
+    let n = 64 div sz
+    let off = (if k == 1 or k == 3: n else: 0)
+    var i = 0
+    while i < n:
+      let x = laneGet(a, sz, off + i)
+      var r: uint64
+      if k <= 1: r = cast[uint64](sext(x, sz)) and maskOf(sz * 2)
+      else: r = x
+      laneSet(result, sz * 2, i, r)
+      inc i
+  of 0xE0, 0xE1, 0xE3:
+    let k = (if sub == 0xE0: 0 elif sub == 0xE1: 1 else: 6)
+    var i = 0
+    while i < 4:
+      setLane32(result, i, f32Unary(k, lane32(a, i)))
+      inc i
+  of 0xEC, 0xED, 0xEF:
+    let k = (if sub == 0xEC: 0 elif sub == 0xED: 1 else: 6)
+    result.lo = f64Unary(k, a.lo)
+    result.hi = f64Unary(k, a.hi)
+  of 0xF8, 0x101:
+    var i = 0
+    while i < 4:
+      setLane32(result, i, truncSat32s(float64(f32of(lane32(a, i)))))
+      inc i
+  of 0xF9, 0x102:
+    var i = 0
+    while i < 4:
+      setLane32(result, i, truncSat32u(float64(f32of(lane32(a, i)))))
+      inc i
+  of 0xFA:
+    var i = 0
+    while i < 4:
+      setLane32(result, i, b32(float32(i32of(lane32(a, i)))))
+      inc i
+  of 0xFB:
+    var i = 0
+    while i < 4:
+      setLane32(result, i, b32(float32(u32of(lane32(a, i)))))
+      inc i
+  of 0xFC, 0x103:
+    setLane32(result, 0, truncSat32s(f64of(a.lo)))
+    setLane32(result, 1, truncSat32s(f64of(a.hi)))
+  of 0xFD, 0x104:
+    setLane32(result, 0, truncSat32u(f64of(a.lo)))
+    setLane32(result, 1, truncSat32u(f64of(a.hi)))
+  of 0xFE:
+    result.lo = b64(float64(i32of(lane32(a, 0))))
+    result.hi = b64(float64(i32of(lane32(a, 1))))
+  of 0xFF:
+    result.lo = b64(float64(u32of(lane32(a, 0))))
+    result.hi = b64(float64(u32of(lane32(a, 1))))
+  else: discard
+
+proc simdTest(sub: int; a: WSlot): uint64 =
+  case sub
+  of 0x53: bool01(a.lo != 0 or a.hi != 0)
+  of 0x63, 0x83, 0xA3, 0xC3:
+    let sz = (if sub == 0x63: 8 elif sub == 0x83: 16 elif sub == 0xA3: 32 else: 64)
+    var i = 0
+    while i < 128 div sz:
+      if laneGet(a, sz, i) == 0: return 0
+      inc i
+    1'u64
+  of 0x64, 0x84, 0xA4, 0xC4:
+    let sz = (if sub == 0x64: 8 elif sub == 0x84: 16 elif sub == 0xA4: 32 else: 64)
+    var r = 0'u64
+    var i = 0
+    while i < 128 div sz:
+      if (laneGet(a, sz, i) shr uint64(sz - 1)) != 0: r = r or (1'u64 shl uint64(i))
+      inc i
+    r
+  else: 0
+
+proc simdShift(sub: int; a: WSlot; cnt: uint64): WSlot =
+  result = WSlot(lo: 0, hi: 0)
+  var sz = 8
+  var base = 0x6B
+  if sub >= 0xCB:
+    sz = 64
+    base = 0xCB
+  elif sub >= 0xAB:
+    sz = 32
+    base = 0xAB
+  elif sub >= 0x8B:
+    sz = 16
+    base = 0x8B
+  let k = sub - base
+  let c = cnt and uint64(sz - 1)
+  var i = 0
+  while i < 128 div sz:
+    let x = laneGet(a, sz, i)
+    var r: uint64
+    case k
+    of 0: r = (x shl c) and maskOf(sz)
+    of 1: r = cast[uint64](ashr(sext(x, sz), int(c))) and maskOf(sz)
+    else: r = x shr c
+    laneSet(result, sz, i, r)
+    inc i
+
+proc q15(x, y: uint64): uint64 =
+  let p = (sx16(x) * sx16(y) + 0x4000) shr 15
+  result = satS(p, 16)
+
+proc simdBinary(sub: int; a, b: WSlot): WSlot =
+  result = WSlot(lo: 0, hi: 0)
+  case sub
+  of 0x0E, 0x100:   # swizzle
+    var i = 0
+    while i < 16:
+      let idx = int(lane8(b, i))
+      setLane8(result, i, (if idx < 16: lane8(a, idx) else: 0'u64))
+      inc i
+  of 0x23 .. 0x40:
+    var sz = 8
+    var k = sub - 0x23
+    if sub >= 0x37:
+      sz = 32
+      k = sub - 0x37
+    elif sub >= 0x2D:
+      sz = 16
+      k = sub - 0x2D
+    var i = 0
+    while i < 128 div sz:
+      laneSet(result, sz, i, (if intCmp(k, laneGet(a, sz, i), laneGet(b, sz, i), sz): maskOf(sz) else: 0'u64))
+      inc i
+  of 0xD6 .. 0xDB:
+    let kk = [0, 1, 2, 4, 6, 8]
+    let k = kk[sub - 0xD6]
+    var i = 0
+    while i < 2:
+      laneSet(result, 64, i, (if intCmp(k, lane64(a, i), lane64(b, i), 64): maskOf(64) else: 0'u64))
+      inc i
+  of 0x41 .. 0x46:
+    var i = 0
+    while i < 4:
+      let r = fCmp(sub - 0x41, float64(f32of(lane32(a, i))), float64(f32of(lane32(b, i))))
+      setLane32(result, i, (if r: 0xFFFF_FFFF'u64 else: 0'u64))
+      inc i
+  of 0x47 .. 0x4C:
+    var i = 0
+    while i < 2:
+      let r = fCmp(sub - 0x47, f64of(lane64(a, i)), f64of(lane64(b, i)))
+      setLane64(result, i, (if r: 0xFFFF_FFFF_FFFF_FFFF'u64 else: 0'u64))
+      inc i
+  of 0x4E:
+    result.lo = a.lo and b.lo
+    result.hi = a.hi and b.hi
+  of 0x4F:
+    result.lo = a.lo and not b.lo
+    result.hi = a.hi and not b.hi
+  of 0x50:
+    result.lo = a.lo or b.lo
+    result.hi = a.hi or b.hi
+  of 0x51:
+    result.lo = a.lo xor b.lo
+    result.hi = a.hi xor b.hi
+  of 0x65, 0x66, 0x85, 0x86:   # narrow
+    let sz = (if sub <= 0x66: 16 else: 32)
+    let signed = sub == 0x65 or sub == 0x85
+    let n = 128 div sz
+    var i = 0
+    while i < 2 * n:
+      let src = (if i < n: a else: b)
+      let v = sext(laneGet(src, sz, i mod n), sz)
+      laneSet(result, sz div 2, i, (if signed: satS(v, sz div 2) else: satU(v, sz div 2)))
+      inc i
+  of 0x6E, 0x6F, 0x70, 0x71, 0x72, 0x73, 0x8E, 0x8F, 0x90, 0x91, 0x92, 0x93,
+     0xAE, 0xB1, 0xCE, 0xD1:
+    var sz = 8
+    var k = 0
+    case sub
+    of 0x6E .. 0x73:
+      sz = 8
+      k = sub - 0x6E
+    of 0x8E .. 0x93:
+      sz = 16
+      k = sub - 0x8E
+    of 0xAE:
+      sz = 32
+      k = 0
+    of 0xB1:
+      sz = 32
+      k = 3
+    of 0xCE:
+      sz = 64
+      k = 0
+    else:
+      sz = 64
+      k = 3
+    var i = 0
+    while i < 128 div sz:
+      let x = laneGet(a, sz, i)
+      let y = laneGet(b, sz, i)
+      var r: uint64
+      case k
+      of 0: r = (x + y) and maskOf(sz)
+      of 1: r = satS(sext(x, sz) + sext(y, sz), sz)
+      of 2: r = satU(int64(x) + int64(y), sz)
+      of 3: r = (x - y) and maskOf(sz)
+      of 4: r = satS(sext(x, sz) - sext(y, sz), sz)
+      else: r = satU(int64(x) - int64(y), sz)
+      laneSet(result, sz, i, r)
+      inc i
+  of 0x76 .. 0x79, 0x96 .. 0x99, 0xB6 .. 0xB9:
+    var sz = 8
+    var k = sub - 0x76
+    if sub >= 0xB6:
+      sz = 32
+      k = sub - 0xB6
+    elif sub >= 0x96:
+      sz = 16
+      k = sub - 0x96
+    var i = 0
+    while i < 128 div sz:
+      let x = laneGet(a, sz, i)
+      let y = laneGet(b, sz, i)
+      var r: uint64
+      case k
+      of 0: r = (if sext(x, sz) < sext(y, sz): x else: y)
+      of 1: r = (if x < y: x else: y)
+      of 2: r = (if sext(x, sz) > sext(y, sz): x else: y)
+      else: r = (if x > y: x else: y)
+      laneSet(result, sz, i, r)
+      inc i
+  of 0x7B, 0x9B:
+    let sz = (if sub == 0x7B: 8 else: 16)
+    var i = 0
+    while i < 128 div sz:
+      laneSet(result, sz, i, (laneGet(a, sz, i) + laneGet(b, sz, i) + 1) shr 1)
+      inc i
+  of 0x82, 0x111:
+    var i = 0
+    while i < 8:
+      setLane16(result, i, q15(lane16(a, i), lane16(b, i)))
+      inc i
+  of 0x95, 0xB5, 0xD5:
+    let sz = (if sub == 0x95: 16 elif sub == 0xB5: 32 else: 64)
+    var i = 0
+    while i < 128 div sz:
+      laneSet(result, sz, i, (laneGet(a, sz, i) * laneGet(b, sz, i)) and maskOf(sz))
+      inc i
+  of 0xBA:
+    var i = 0
+    while i < 4:
+      let p = sx16(lane16(a, 2 * i)) * sx16(lane16(b, 2 * i)) +
+              sx16(lane16(a, 2 * i + 1)) * sx16(lane16(b, 2 * i + 1))
+      setLane32(result, i, cast[uint64](p) and 0xFFFF_FFFF'u64)
+      inc i
+  of 0x9C .. 0x9F, 0xBC .. 0xBF, 0xDC .. 0xDF:
+    var sz = 8
+    var base = 0x9C
+    if sub >= 0xDC:
+      sz = 32
+      base = 0xDC
+    elif sub >= 0xBC:
+      sz = 16
+      base = 0xBC
+    let k = sub - base   # 0 low_s 1 high_s 2 low_u 3 high_u
+    let n = 64 div sz
+    let off = (if k == 1 or k == 3: n else: 0)
+    var i = 0
+    while i < n:
+      let x = laneGet(a, sz, off + i)
+      let y = laneGet(b, sz, off + i)
+      var r: uint64
+      if k <= 1: r = cast[uint64](sext(x, sz) * sext(y, sz))
+      else: r = x * y
+      laneSet(result, sz * 2, i, r and maskOf(sz * 2))
+      inc i
+  of 0xE4 .. 0xEB, 0x10D, 0x10E:
+    var i = 0
+    while i < 4:
+      let x = lane32(a, i)
+      let y = lane32(b, i)
+      var r: uint64
+      case sub
+      of 0xE4, 0xE5, 0xE6, 0xE7: r = f32Arith(sub - 0xE4, x, y)
+      of 0xE8, 0x10D: r = wFmin32(x, y)
+      of 0xE9, 0x10E: r = wFmax32(x, y)
+      of 0xEA: r = (if f32of(y) < f32of(x): y else: x)
+      else: r = (if f32of(x) < f32of(y): y else: x)
+      setLane32(result, i, r)
+      inc i
+  of 0xF0 .. 0xF7, 0x10F, 0x110:
+    var i = 0
+    while i < 2:
+      let x = lane64(a, i)
+      let y = lane64(b, i)
+      var r: uint64
+      case sub
+      of 0xF0, 0xF1, 0xF2, 0xF3: r = f64Arith(sub - 0xF0, x, y)
+      of 0xF4, 0x10F: r = wFmin64(x, y)
+      of 0xF5, 0x110: r = wFmax64(x, y)
+      of 0xF6: r = (if f64of(y) < f64of(x): y else: x)
+      else: r = (if f64of(x) < f64of(y): y else: x)
+      setLane64(result, i, r)
+      inc i
+  of 0x112:   # i16x8.relaxed_dot_i8x16_i7x16_s
+    var i = 0
+    while i < 8:
+      let p = sx8(lane8(a, 2 * i)) * sx8(lane8(b, 2 * i)) +
+              sx8(lane8(a, 2 * i + 1)) * sx8(lane8(b, 2 * i + 1))
+      setLane16(result, i, satS(p, 16))
+      inc i
+  else: discard
+
+proc simdTernary(sub: int; a, b, c: WSlot): WSlot =
+  result = WSlot(lo: 0, hi: 0)
+  case sub
+  of 0x52, 0x109, 0x10A, 0x10B, 0x10C:
+    result.lo = (a.lo and c.lo) or (b.lo and not c.lo)
+    result.hi = (a.hi and c.hi) or (b.hi and not c.hi)
+  of 0x105, 0x106:
+    var i = 0
+    while i < 4:
+      var p = f32of(lane32(a, i)) * f32of(lane32(b, i))
+      if sub == 0x106: p = -p
+      setLane32(result, i, b32(p + f32of(lane32(c, i))))
+      inc i
+  of 0x107, 0x108:
+    var i = 0
+    while i < 2:
+      var p = f64of(lane64(a, i)) * f64of(lane64(b, i))
+      if sub == 0x108: p = -p
+      setLane64(result, i, b64(p + f64of(lane64(c, i))))
+      inc i
+  of 0x113:
+    var i = 0
+    while i < 4:
+      var acc = 0'i64
+      var k = 0
+      while k < 4:
+        acc = acc + sx8(lane8(a, 4 * i + k)) * sx8(lane8(b, 4 * i + k))
+        inc k
+      acc = acc + sx32(lane32(c, i))
+      setLane32(result, i, cast[uint64](acc) and 0xFFFF_FFFF'u64)
+      inc i
+  else: discard
+
+# ---------------------------------------------------------------------------
+# Memory helpers.
+
+template mLen(s: WStore; bank: seq[seq[int]]; m: int): int =
+  (if s.mems[m].row >= 0: bank[s.mems[m].row].len else: s.mems[m].data.len)
+
+template mGet(s: WStore; bank: seq[seq[int]]; m: int; i: int): int =
+  (if s.mems[m].row >= 0: bank[s.mems[m].row][i] else: int(s.mems[m].data[i]))
+
+proc mSet(s: var WStore; bank: var seq[seq[int]]; m: int; i: int; v: int) {.inline.} =
+  if s.mems[m].row >= 0: bank[s.mems[m].row][i] = v
+  else: s.mems[m].data[i] = uint8(v and 0xFF)
+
+proc wMemBytes*(s: WStore; bank: seq[seq[int]]; m: int): int = mLen(s, bank, m)
+
+proc wMemPages*(s: WStore; bank: seq[seq[int]]; m: int): uint64 =
+  uint64(mLen(s, bank, m) div WPageSize)
+
+proc wMemToRow*(s: var WStore; bank: var seq[seq[int]]; m: int; row: int) =
+  ## Move a compact memory's bytes into bank row `row` (an ArrayBuffer's),
+  ## from which on that row is the memory.
+  if s.mems[m].row >= 0: return
+  let n = s.mems[m].data.len
+  bank[row].setLen n
+  var i = 0
+  while i < n:
+    bank[row][i] = int(s.mems[m].data[i])
+    inc i
+  s.mems[m].data = @[]
+  s.mems[m].row = row
+
+proc wGrowMem*(s: var WStore; bank: var seq[seq[int]]; m: int; delta: uint64): int64 =
+  ## memory.grow: the old size in pages, or -1.
+  let old = uint64(mLen(s, bank, m) div WPageSize)
+  let lim = (if s.mems[m].is64: MaxPages64 else: MaxPages32)
+  var mx = lim
+  if s.mems[m].hasMax and s.mems[m].max < mx: mx = s.mems[m].max
+  if delta > mx or old + delta > mx: return -1
+  let newBytes = (old + delta) * uint64(WPageSize)
+  if newBytes > uint64(WMaxBankBytes): return -1
+  if s.mems[m].row >= 0 and newBytes > uint64(WMaxRowBytes): return -1
+  inc s.mems[m].grows
+  if delta > 0:
+    let n = int(newBytes)
+    let row = s.mems[m].row
+    if row >= 0:
+      var i = bank[row].len
+      bank[row].setLen n
+      while i < n:
+        bank[row][i] = 0
+        inc i
+    else:
+      var i = s.mems[m].data.len
+      s.mems[m].data.setLen n
+      while i < n:
+        s.mems[m].data[i] = 0'u8
+        inc i
+  result = int64(old)
+
+proc wNewMemory*(s: var WStore; bank: var seq[seq[int]]; mt: MemType): int =
+  ## A memory of `mt.min` pages; -1 if that is past the implementation limit.
+  if mt.min * uint64(WPageSize) > uint64(WMaxBankBytes): return -1
+  var d: seq[uint8] = @[]
+  let n = int(mt.min) * WPageSize
+  d.setLen n
+  var i = 0
+  while i < n:
+    d[i] = 0'u8
+    inc i
+  s.mems.add WMem(row: -1, data: d, grows: 0, max: mt.max, hasMax: mt.hasMax, is64: mt.is64,
+                  shared: mt.shared)
+  result = s.mems.len - 1
+
+proc wNewTable*(s: var WStore; tt: TableType; init: uint64): int =
+  var t = WTable(elem: tt.elem, data: @[], max: tt.max, hasMax: tt.hasMax, is64: tt.is64)
+  let n = int(tt.min)
+  t.data.setLen n
+  var i = 0
+  while i < n:
+    t.data[i] = init
+    inc i
+  s.tables.add t
+  result = s.tables.len - 1
+
+proc wGrowTable*(s: var WStore; t: int; delta: uint64; init: uint64): int64 =
+  let old = uint64(s.tables[t].data.len)
+  var mx = (if s.tables[t].is64: 0xFFFF_FFFF_FFFF_FFFF'u64 else: 0xFFFF_FFFF'u64)
+  if s.tables[t].hasMax and s.tables[t].max < mx: mx = s.tables[t].max
+  if delta > mx or old + delta > mx: return -1
+  if old + delta > MaxTableSize: return -1
+  let n = int(old + delta)
+  s.tables[t].data.setLen n
+  var i = int(old)
+  while i < n:
+    s.tables[t].data[i] = init
+    inc i
+  result = int64(old)
+
+# ---------------------------------------------------------------------------
+# Runtime type tests on references.
+
+proc wRefHeapMatch*(s: WStore; r: uint64; ht: int; nullable: bool): bool =
+  ## Does reference `r` belong to (ref null? ht)?
+  if r == 0: return nullable
+  let tag = wRefTag(r)
+  if (r and WExtBit) != 0:
+    return ht == htExtern
+  case tag
+  of wrFunc:
+    let c = s.funcs[wRefPay(r)].canon
+    if ht == htFunc: return true
+    if ht >= 0: return isSubCanon(s.reg, c, ht)
+    return false
+  of wrExtern:
+    return ht == htExtern
+  of wrExn:
+    return ht == htExn
+  of wrI31:
+    return ht == htI31 or ht == htEq or ht == htAny
+  of wrHostAny:
+    return ht == htAny
+  of wrGc:
+    let c = s.gcs[wRefPay(r)].canon
+    if ht == htAny or ht == htEq: return true
+    let k = s.reg.types[c].kind
+    if ht == htStruct: return k == ckStruct
+    if ht == htArray: return k == ckArray
+    if ht >= 0: return isSubCanon(s.reg, c, ht)
+    return false
+  else:
+    return false
+
+# ---------------------------------------------------------------------------
+# The interpreter.
+
+proc trap(s: var WStore; msg: string): int =
+  s.trapMsg = msg
+  result = wsTrap
+
+proc ensureStack(s: var WStore; n: int) =
+  if s.stack.len < n:
+    var cap = s.stack.len * 2
+    if cap < n: cap = n + 1024
+    s.stack.setLen cap
+
+proc readMem(s: WStore; bank: seq[seq[int]]; m: int; ea: int; n: int): uint64 =
+  result = 0
+  let row = s.mems[m].row
+  var i = n - 1
+  if row >= 0:
+    while i >= 0:
+      result = (result shl 8) or uint64(bank[row][ea + i])
+      dec i
+  else:
+    while i >= 0:
+      result = (result shl 8) or uint64(s.mems[m].data[ea + i])
+      dec i
+
+proc writeMem(s: var WStore; bank: var seq[seq[int]]; m: int; ea: int; n: int; v: uint64) =
+  var x = v
+  let row = s.mems[m].row
+  var i = 0
+  if row >= 0:
+    while i < n:
+      bank[row][ea + i] = int(x and 0xFF'u64)
+      x = x shr 8
+      inc i
+  else:
+    while i < n:
+      s.mems[m].data[ea + i] = uint8(x and 0xFF'u64)
+      x = x shr 8
+      inc i
+
+proc wNewExn*(s: var WStore; tag: int; payload: seq[WSlot]; host: int): int =
+  s.exns.add WExn(tag: tag, payload: payload, host: host)
+  result = s.exns.len - 1
+
+proc defaultSlot(): WSlot = WSlot(lo: 0, hi: 0)
+
+proc packField(ft: int; v: uint64): uint64 =
+  if ft == stI8: v and 0xFF'u64
+  elif ft == stI16: v and 0xFFFF'u64
+  else: v
+
+proc unpackField(ft: int; v: uint64; signed: bool): uint64 =
+  if ft == stI8:
+    if signed: return ws32(int32(sx8(v)))
+    return v and 0xFF'u64
+  if ft == stI16:
+    if signed: return ws32(int32(sx16(v)))
+    return v and 0xFFFF'u64
+  result = v
+
+proc fieldBytes(ft: int): int =
+  case ft
+  of stI8: 1
+  of stI16: 2
+  of vtI32, vtF32: 4
+  of vtI64, vtF64: 8
+  of vtV128: 16
+  else: 8
+
+proc execLoop(s: var WStore; bank: var seq[seq[int]]; pc0, fp0, sp0, inst0, fn0: int;
+              baseDepth: int): int
+
+proc callHostFn(s: var WStore; bank: var seq[seq[int]]; f: int; sp: var int): int =
+  let F = s.funcs[f]
+  var args: seq[WSlot] = @[]
+  var i = sp - F.nparams
+  while i < sp:
+    args.add s.stack[i]
+    inc i
+  sp = sp - F.nparams
+  s.sp = sp
+  var results: seq[WSlot] = @[]
+  if s.hostCall == nil: return trap(s, "no host")
+  let st = s.hostCall(s.hostCtx, s, bank, F.host, args, results)
+  if st != wsOk: return st
+  ensureStack(s, sp + F.nresults + 16)
+  i = 0
+  while i < F.nresults:
+    s.stack[sp] = (if i < results.len: results[i] else: defaultSlot())
+    inc sp
+    inc i
+  result = wsOk
+
+proc wInvoke*(s: var WStore; bank: var seq[seq[int]]; f: int; args: seq[WSlot];
+             results: var seq[WSlot]): int =
+  ## Call function `f` from outside (the host, or instantiation's start).
+  let base = s.sp
+  let F = s.funcs[f]
+  ensureStack(s, base + args.len + F.maxStack + 16)
+  var i = 0
+  while i < args.len:
+    s.stack[base + i] = args[i]
+    inc i
+  results = @[]
+  if F.isHost:
+    var sp = base + args.len
+    let st = callHostFn(s, bank, f, sp)
+    if st == wsOk:
+      i = 0
+      while i < F.nresults:
+        results.add s.stack[base + i]
+        inc i
+    s.sp = base
+    return st
+  let fp = base
+  i = F.nparams
+  while i < F.nlocals:
+    s.stack[fp + i] = defaultSlot()
+    inc i
+  let depth = s.frames.len
+  if depth >= MaxFrames:
+    s.sp = base
+    return wsExhausted
+  let st = execLoop(s, bank, F.start, fp, fp + F.nlocals, F.inst, f, depth)
+  if st == wsOk:
+    i = 0
+    while i < F.nresults:
+      results.add s.stack[fp + i]
+      inc i
+  s.frames.setLen depth
+  s.sp = base
+  result = st
+
+proc wEvalConst*(s: var WStore; bank: var seq[seq[int]]; inst: int; pc: int;
+                out0: var WSlot): int =
+  ## Run a constant expression starting at absolute pc `pc`.
+  let base = s.sp
+  ensureStack(s, base + 64)
+  let depth = s.frames.len
+  let st = execLoop(s, bank, pc, base, base, inst, -1, depth)
+  if st == wsOk:
+    out0 = s.stack[s.sp - 1]
+  s.frames.setLen depth
+  s.sp = base
+  result = st
+
+proc elemAt(s: WStore; inst: int; x: int): int = s.insts[inst].tables[x]
+
+proc execLoop(s: var WStore; bank: var seq[seq[int]]; pc0, fp0, sp0, inst0, fn0: int;
+              baseDepth: int): int =
+  var pc = pc0
+  var fp = fp0
+  var sp = sp0
+  var inst = inst0
+  var fn = fn0
+  var status = wsOk
+  var exn = -1
+  while true:
+    let ins = s.code[pc]
+    inc pc
+    case ins.op
+    of 0x00:
+      status = trap(s, "unreachable executed")
+    of opJump:
+      pc = ins.a
+    of opBr:
+      let n = ins.b
+      let d = fp + int(ins.c)
+      if d + n != sp:
+        var i = 0
+        while i < n:
+          let tmpv = s.stack[sp - n + i]
+          s.stack[d + i] = tmpv
+          inc i
+      sp = d + n
+      pc = ins.a
+    of opBrIf:
+      dec sp
+      if s.stack[sp].lo != 0:
+        let n = ins.b
+        let d = fp + int(ins.c)
+        if d + n != sp:
+          var i = 0
+          while i < n:
+            let tmpv = s.stack[sp - n + i]
+            s.stack[d + i] = tmpv
+            inc i
+        sp = d + n
+        pc = ins.a
+    of opIfFalse:
+      dec sp
+      if s.stack[sp].lo == 0: pc = ins.a
+    of opBrTable:
+      dec sp
+      let idx = s.stack[sp].lo and 0xFFFF_FFFF'u64
+      let t = ins.a
+      let cnt = s.brTab[t]
+      var k = cnt - 1
+      if idx < uint64(cnt - 1): k = int(idx)
+      let target = s.brTab[t + 1 + k * 2]
+      let d = fp + s.brTab[t + 2 + k * 2]
+      let n = ins.b
+      if d + n != sp:
+        var i = 0
+        while i < n:
+          let tmpv = s.stack[sp - n + i]
+          s.stack[d + i] = tmpv
+          inc i
+      sp = d + n
+      pc = target
+    of opReturn:
+      let F = s.funcs[fn]
+      let n = F.nresults
+      if fp + n != sp:
+        var i = 0
+        while i < n:
+          let tmpv = s.stack[sp - n + i]
+          s.stack[fp + i] = tmpv
+          inc i
+      sp = fp + n
+      if s.frames.len == baseDepth:
+        s.sp = sp
+        return wsOk
+      let fr = s.frames[s.frames.len - 1]
+      s.frames.setLen s.frames.len - 1
+      pc = fr.retPc
+      fp = fr.fp
+      inst = fr.inst
+      fn = fr.fn
+    of opEndExpr:
+      s.sp = sp
+      return wsOk
+    of 0x01: discard
+    of 0x10, 0x12, 0x11, 0x13, 0x14, 0x15:
+      var f = -1
+      if ins.op == 0x10 or ins.op == 0x12:
+        f = s.insts[inst].funcs[ins.a]
+      elif ins.op == 0x11 or ins.op == 0x13:
+        let tab = s.insts[inst].tables[ins.b]
+        dec sp
+        var idx = s.stack[sp].lo
+        if not s.tables[tab].is64: idx = idx and 0xFFFF_FFFF'u64
+        if idx >= uint64(s.tables[tab].data.len):
+          status = trap(s, "undefined element")
+        else:
+          let r = s.tables[tab].data[int(idx)]
+          if r == 0:
+            status = trap(s, "uninitialized element")
+          elif wRefTag(r) != wrFunc:
+            status = trap(s, "indirect call type mismatch")
+          else:
+            f = wRefPay(r)
+            let want = s.insts[inst].types[ins.a]
+            if not isSubCanon(s.reg, s.funcs[f].canon, want):
+              status = trap(s, "indirect call type mismatch")
+              f = -1
+      else:
+        dec sp
+        let r = s.stack[sp].lo
+        if r == 0: status = trap(s, "null function reference")
+        else: f = wRefPay(r)
+      if status == wsOk:
+        let tail = ins.op == 0x12 or ins.op == 0x13 or ins.op == 0x15
+        let F = s.funcs[f]
+        if F.isHost:
+          status = callHostFn(s, bank, f, sp)
+          if status == wsOk and tail:
+            # return straight away with the host's results
+            let n = F.nresults
+            var i = 0
+            while i < n:
+              let tmpv = s.stack[sp - n + i]
+              s.stack[fp + i] = tmpv
+              inc i
+            sp = fp + n
+            if s.frames.len == baseDepth:
+              s.sp = sp
+              return wsOk
+            let fr = s.frames[s.frames.len - 1]
+            s.frames.setLen s.frames.len - 1
+            pc = fr.retPc
+            fp = fr.fp
+            inst = fr.inst
+            fn = fr.fn
+        else:
+          var nfp = sp - F.nparams
+          if tail:
+            # slide the arguments down over the current frame
+            var i = 0
+            while i < F.nparams:
+              let tmpv = s.stack[nfp + i]
+              s.stack[fp + i] = tmpv
+              inc i
+            nfp = fp
+          else:
+            if s.frames.len >= MaxFrames:
+              status = wsExhausted
+            else:
+              s.frames.add Frame(fn: fn, retPc: pc, fp: fp, inst: inst)
+          if status == wsOk:
+            if nfp + F.maxStack + 16 > s.stack.len: ensureStack(s, nfp + F.maxStack + 16)
+            var i = F.nparams
+            while i < F.nlocals:
+              s.stack[nfp + i] = WSlot(lo: 0, hi: 0)
+              inc i
+            fp = nfp
+            sp = nfp + F.nlocals
+            pc = F.start
+            inst = F.inst
+            fn = f
+    of 0x08:
+      let tag = s.insts[inst].tags[ins.a]
+      let np = s.reg.types[s.tags[tag]].params.len
+      var payload: seq[WSlot] = @[]
+      var i = sp - np
+      while i < sp:
+        payload.add s.stack[i]
+        inc i
+      sp = sp - np
+      exn = wNewExn(s, tag, payload, -1)
+      status = wsThrow
+    of 0x0A:
+      dec sp
+      let r = s.stack[sp].lo
+      if r == 0: status = trap(s, "null exception reference")
+      else:
+        exn = wRefPay(r)
+        status = wsThrow
+    of 0x1A:
+      dec sp
+    of opSelect:
+      sp = sp - 2
+      if s.stack[sp + 1].lo == 0:
+        let tmpv = s.stack[sp]
+        s.stack[sp - 1] = tmpv
+    of 0x20:
+      let tmpv = s.stack[fp + ins.a]
+      s.stack[sp] = tmpv
+      inc sp
+    of 0x21:
+      dec sp
+      let tmpv = s.stack[sp]
+      s.stack[fp + ins.a] = tmpv
+    of 0x22:
+      let tmpv = s.stack[sp - 1]
+      s.stack[fp + ins.a] = tmpv
+    of 0x23:
+      s.stack[sp] = s.globals[s.insts[inst].globals[ins.a]].val
+      inc sp
+    of 0x24:
+      dec sp
+      s.globals[s.insts[inst].globals[ins.a]].val = s.stack[sp]
+    of 0x25:
+      let tab = s.insts[inst].tables[ins.a]
+      var idx = s.stack[sp - 1].lo
+      if not s.tables[tab].is64: idx = idx and 0xFFFF_FFFF'u64
+      if idx >= uint64(s.tables[tab].data.len):
+        status = trap(s, "out of bounds table access")
+      else:
+        s.stack[sp - 1] = WSlot(lo: s.tables[tab].data[int(idx)], hi: 0)
+    of 0x26:
+      let tab = s.insts[inst].tables[ins.a]
+      sp = sp - 2
+      var idx = s.stack[sp].lo
+      if not s.tables[tab].is64: idx = idx and 0xFFFF_FFFF'u64
+      if idx >= uint64(s.tables[tab].data.len):
+        status = trap(s, "out of bounds table access")
+      else:
+        s.tables[tab].data[int(idx)] = s.stack[sp + 1].lo
+    of 0x28 .. 0x35:
+      let m = s.insts[inst].mems[ins.a]
+      let row = s.mems[m].row
+      var base = s.stack[sp - 1].lo
+      if not s.mems[m].is64: base = base and 0xFFFF_FFFF'u64
+      let ea = base + ins.c
+      var n = 4
+      case ins.op
+      of 0x29, 0x2B: n = 8
+      of 0x2C, 0x2D, 0x30, 0x31: n = 1
+      of 0x2E, 0x2F, 0x32, 0x33: n = 2
+      of 0x34, 0x35: n = 4
+      else: n = 4
+      if ea < base or uint64(mLen(s, bank, m)) < uint64(n) or ea > uint64(mLen(s, bank, m)) - uint64(n):
+        status = trap(s, "out of bounds memory access")
+      else:
+        let v = readMem(s, bank, m, int(ea), n)
+        var r = v
+        case ins.op
+        of 0x2C: r = ws32(int32(sx8(v)))
+        of 0x2E: r = ws32(int32(sx16(v)))
+        of 0x30: r = cast[uint64](sx8(v))
+        of 0x32: r = cast[uint64](sx16(v))
+        of 0x34: r = cast[uint64](sx32(v))
+        else: discard
+        s.stack[sp - 1] = WSlot(lo: r, hi: 0)
+    of 0x36 .. 0x3E:
+      let m = s.insts[inst].mems[ins.a]
+      let row = s.mems[m].row
+      sp = sp - 2
+      var base = s.stack[sp].lo
+      if not s.mems[m].is64: base = base and 0xFFFF_FFFF'u64
+      let ea = base + ins.c
+      var n = 4
+      case ins.op
+      of 0x37, 0x39: n = 8
+      of 0x3A, 0x3C: n = 1
+      of 0x3B, 0x3D: n = 2
+      else: n = 4
+      if ea < base or uint64(mLen(s, bank, m)) < uint64(n) or ea > uint64(mLen(s, bank, m)) - uint64(n):
+        status = trap(s, "out of bounds memory access")
+      else:
+        writeMem(s, bank, m, int(ea), n, s.stack[sp + 1].lo)
+    of 0x3F:
+      let m = s.insts[inst].mems[ins.a]
+      s.stack[sp] = WSlot(lo: uint64(mLen(s, bank, m) div WPageSize), hi: 0)
+      inc sp
+    of 0x40:
+      let m = s.insts[inst].mems[ins.a]
+      var delta = s.stack[sp - 1].lo
+      if not s.mems[m].is64: delta = delta and 0xFFFF_FFFF'u64
+      let r = wGrowMem(s, bank, m, delta)
+      if s.mems[m].is64: s.stack[sp - 1] = WSlot(lo: cast[uint64](r), hi: 0)
+      else: s.stack[sp - 1] = WSlot(lo: ws32(int32(r)), hi: 0)
+    of 0x41, 0x42, 0x43, 0x44:
+      s.stack[sp] = WSlot(lo: ins.c, hi: 0)
+      inc sp
+    of 0x45:
+      s.stack[sp - 1].lo = bool01((s.stack[sp - 1].lo and 0xFFFF_FFFF'u64) == 0)
+    of 0x46 .. 0x4F:
+      dec sp
+      let a = u32of(s.stack[sp - 1].lo)
+      let b = u32of(s.stack[sp].lo)
+      var r = false
+      case ins.op
+      of 0x46: r = a == b
+      of 0x47: r = a != b
+      of 0x48: r = cast[int32](a) < cast[int32](b)
+      of 0x49: r = a < b
+      of 0x4A: r = cast[int32](a) > cast[int32](b)
+      of 0x4B: r = a > b
+      of 0x4C: r = cast[int32](a) <= cast[int32](b)
+      of 0x4D: r = a <= b
+      of 0x4E: r = cast[int32](a) >= cast[int32](b)
+      else: r = a >= b
+      s.stack[sp - 1] = WSlot(lo: bool01(r), hi: 0)
+    of 0x50:
+      s.stack[sp - 1].lo = bool01(s.stack[sp - 1].lo == 0)
+    of 0x51 .. 0x5A:
+      dec sp
+      let a = s.stack[sp - 1].lo
+      let b = s.stack[sp].lo
+      var r = false
+      case ins.op
+      of 0x51: r = a == b
+      of 0x52: r = a != b
+      of 0x53: r = cast[int64](a) < cast[int64](b)
+      of 0x54: r = a < b
+      of 0x55: r = cast[int64](a) > cast[int64](b)
+      of 0x56: r = a > b
+      of 0x57: r = cast[int64](a) <= cast[int64](b)
+      of 0x58: r = a <= b
+      of 0x59: r = cast[int64](a) >= cast[int64](b)
+      else: r = a >= b
+      s.stack[sp - 1] = WSlot(lo: bool01(r), hi: 0)
+    of 0x5B .. 0x60:
+      dec sp
+      let r = fCmp(ins.op - 0x5B, float64(f32of(s.stack[sp - 1].lo)), float64(f32of(s.stack[sp].lo)))
+      s.stack[sp - 1] = WSlot(lo: bool01(r), hi: 0)
+    of 0x61 .. 0x66:
+      dec sp
+      let r = fCmp(ins.op - 0x61, f64of(s.stack[sp - 1].lo), f64of(s.stack[sp].lo))
+      s.stack[sp - 1] = WSlot(lo: bool01(r), hi: 0)
+    of 0x67:
+      s.stack[sp - 1].lo = w32(clz32(u32of(s.stack[sp - 1].lo)))
+    of 0x68:
+      s.stack[sp - 1].lo = w32(ctz32(u32of(s.stack[sp - 1].lo)))
+    of 0x69:
+      s.stack[sp - 1].lo = w32(pop32(u32of(s.stack[sp - 1].lo)))
+    of 0x6A .. 0x78:
+      dec sp
+      let a = u32of(s.stack[sp - 1].lo)
+      let b = u32of(s.stack[sp].lo)
+      var r = 0'u32
+      case ins.op
+      of 0x6A: r = a + b
+      of 0x6B: r = a - b
+      of 0x6C: r = a * b
+      of 0x6D:
+        if b == 0: status = trap(s, "integer divide by zero")
+        elif a == 0x8000_0000'u32 and b == 0xFFFF_FFFF'u32: status = trap(s, "integer overflow")
+        else: r = cast[uint32](cast[int32](a) div cast[int32](b))
+      of 0x6E:
+        if b == 0: status = trap(s, "integer divide by zero")
+        else: r = a div b
+      of 0x6F:
+        if b == 0: status = trap(s, "integer divide by zero")
+        elif b == 0xFFFF_FFFF'u32: r = 0
+        else: r = cast[uint32](cast[int32](a) mod cast[int32](b))
+      of 0x70:
+        if b == 0: status = trap(s, "integer divide by zero")
+        else: r = a mod b
+      of 0x71: r = a and b
+      of 0x72: r = a or b
+      of 0x73: r = a xor b
+      of 0x74: r = a shl int(b and 31)
+      of 0x75: r = sar32(a, b)
+      of 0x76: r = a shr int(b and 31)
+      of 0x77: r = rotl32(a, b)
+      else: r = rotr32(a, b)
+      s.stack[sp - 1] = WSlot(lo: w32(r), hi: 0)
+    of 0x79:
+      s.stack[sp - 1].lo = clz64(s.stack[sp - 1].lo)
+    of 0x7A:
+      s.stack[sp - 1].lo = ctz64(s.stack[sp - 1].lo)
+    of 0x7B:
+      s.stack[sp - 1].lo = pop64(s.stack[sp - 1].lo)
+    of 0x7C .. 0x8A:
+      dec sp
+      let a = s.stack[sp - 1].lo
+      let b = s.stack[sp].lo
+      var r = 0'u64
+      case ins.op
+      of 0x7C: r = a + b
+      of 0x7D: r = a - b
+      of 0x7E: r = a * b
+      of 0x7F:
+        if b == 0: status = trap(s, "integer divide by zero")
+        elif a == 0x8000_0000_0000_0000'u64 and b == 0xFFFF_FFFF_FFFF_FFFF'u64:
+          status = trap(s, "integer overflow")
+        else: r = cast[uint64](cast[int64](a) div cast[int64](b))
+      of 0x80:
+        if b == 0: status = trap(s, "integer divide by zero")
+        else: r = a div b
+      of 0x81:
+        if b == 0: status = trap(s, "integer divide by zero")
+        elif b == 0xFFFF_FFFF_FFFF_FFFF'u64: r = 0
+        else: r = cast[uint64](cast[int64](a) mod cast[int64](b))
+      of 0x82:
+        if b == 0: status = trap(s, "integer divide by zero")
+        else: r = a mod b
+      of 0x83: r = a and b
+      of 0x84: r = a or b
+      of 0x85: r = a xor b
+      of 0x86: r = a shl int(b and 63)
+      of 0x87: r = sar64(a, b)
+      of 0x88: r = a shr int(b and 63)
+      of 0x89: r = rotl64(a, b)
+      else: r = rotr64(a, b)
+      s.stack[sp - 1] = WSlot(lo: r, hi: 0)
+    of 0x8B .. 0x91:
+      s.stack[sp - 1].lo = f32Unary(ins.op - 0x8B, s.stack[sp - 1].lo)
+    of 0x92 .. 0x98:
+      dec sp
+      let a = s.stack[sp - 1].lo
+      let b = s.stack[sp].lo
+      var r = 0'u64
+      case ins.op
+      of 0x92, 0x93, 0x94, 0x95: r = f32Arith(ins.op - 0x92, a, b)
+      of 0x96: r = wFmin32(a, b)
+      of 0x97: r = wFmax32(a, b)
+      else: r = (a and 0x7FFF_FFFF'u64) or (b and 0x8000_0000'u64)
+      s.stack[sp - 1] = WSlot(lo: r, hi: 0)
+    of 0x99 .. 0x9F:
+      s.stack[sp - 1].lo = f64Unary(ins.op - 0x99, s.stack[sp - 1].lo)
+    of 0xA0 .. 0xA6:
+      dec sp
+      let a = s.stack[sp - 1].lo
+      let b = s.stack[sp].lo
+      var r = 0'u64
+      case ins.op
+      of 0xA0, 0xA1, 0xA2, 0xA3: r = f64Arith(ins.op - 0xA0, a, b)
+      of 0xA4: r = wFmin64(a, b)
+      of 0xA5: r = wFmax64(a, b)
+      else: r = (a and 0x7FFF_FFFF_FFFF_FFFF'u64) or (b and 0x8000_0000_0000_0000'u64)
+      s.stack[sp - 1] = WSlot(lo: r, hi: 0)
+    of 0xA7:
+      s.stack[sp - 1].lo = s.stack[sp - 1].lo and 0xFFFF_FFFF'u64
+    of 0xA8, 0xA9, 0xAA, 0xAB, 0xAE, 0xAF, 0xB0, 0xB1:
+      let v = s.stack[sp - 1].lo
+      let isF32 = ins.op == 0xA8 or ins.op == 0xA9 or ins.op == 0xAE or ins.op == 0xAF
+      let f = (if isF32: float64(f32of(v)) else: f64of(v))
+      if f != f:
+        status = trap(s, "invalid conversion to integer")
+      else:
+        let t = trunc(f)
+        var r = 0'u64
+        var ok = true
+        case ins.op
+        of 0xA8, 0xAA:
+          if t < -2147483648.0 or t > 2147483647.0: ok = false
+          else: r = ws32(int32(t))
+        of 0xA9, 0xAB:
+          if t <= -1.0 or t > 4294967295.0: ok = false
+          else: r = w32(uint32(t))
+        of 0xAE, 0xB0:
+          if t < -9223372036854775808.0 or t >= 9223372036854775808.0: ok = false
+          else: r = ws64(int64(t))
+        else:
+          if t <= -1.0 or t >= 18446744073709551616.0: ok = false
+          else: r = uint64(t)
+        if not ok: status = trap(s, "integer overflow")
+        else: s.stack[sp - 1] = WSlot(lo: r, hi: 0)
+    of 0xAC:
+      s.stack[sp - 1].lo = ws64(int64(i32of(s.stack[sp - 1].lo)))
+    of 0xAD:
+      s.stack[sp - 1].lo = s.stack[sp - 1].lo and 0xFFFF_FFFF'u64
+    of 0xB2:
+      s.stack[sp - 1].lo = b32(float32(i32of(s.stack[sp - 1].lo)))
+    of 0xB3:
+      s.stack[sp - 1].lo = b32(float32(u32of(s.stack[sp - 1].lo)))
+    of 0xB4:
+      s.stack[sp - 1].lo = b32(float32(i64of(s.stack[sp - 1].lo)))
+    of 0xB5:
+      s.stack[sp - 1].lo = b32(u64ToF32(s.stack[sp - 1].lo))
+    of 0xB6:
+      s.stack[sp - 1].lo = b32(float32(f64of(s.stack[sp - 1].lo)))
+    of 0xB7:
+      s.stack[sp - 1].lo = b64(float64(i32of(s.stack[sp - 1].lo)))
+    of 0xB8:
+      s.stack[sp - 1].lo = b64(float64(u32of(s.stack[sp - 1].lo)))
+    of 0xB9:
+      s.stack[sp - 1].lo = b64(float64(i64of(s.stack[sp - 1].lo)))
+    of 0xBA:
+      s.stack[sp - 1].lo = b64(u64ToF64(s.stack[sp - 1].lo))
+    of 0xBB:
+      s.stack[sp - 1].lo = b64(float64(f32of(s.stack[sp - 1].lo)))
+    of 0xBC, 0xBD, 0xBE, 0xBF: discard
+    of 0xC0:
+      s.stack[sp - 1].lo = ws32(int32(sx8(s.stack[sp - 1].lo)))
+    of 0xC1:
+      s.stack[sp - 1].lo = ws32(int32(sx16(s.stack[sp - 1].lo)))
+    of 0xC2:
+      s.stack[sp - 1].lo = cast[uint64](sx8(s.stack[sp - 1].lo))
+    of 0xC3:
+      s.stack[sp - 1].lo = cast[uint64](sx16(s.stack[sp - 1].lo))
+    of 0xC4:
+      s.stack[sp - 1].lo = cast[uint64](sx32(s.stack[sp - 1].lo))
+    of 0xD0:
+      s.stack[sp] = WSlot(lo: 0, hi: 0)
+      inc sp
+    of 0xD1:
+      s.stack[sp - 1] = WSlot(lo: bool01(s.stack[sp - 1].lo == 0), hi: 0)
+    of 0xD2:
+      s.stack[sp] = WSlot(lo: wMkRef(wrFunc, s.insts[inst].funcs[ins.a]), hi: 0)
+      inc sp
+    of 0xD3:
+      dec sp
+      s.stack[sp - 1] = WSlot(lo: bool01(s.stack[sp - 1].lo == s.stack[sp].lo), hi: 0)
+    of 0xD4:
+      if s.stack[sp - 1].lo == 0: status = trap(s, "null reference")
+    of opBrOnNull:
+      if s.stack[sp - 1].lo == 0:
+        dec sp
+        let n = ins.b
+        let d = fp + int(ins.c)
+        if d + n != sp:
+          var i = 0
+          while i < n:
+            let tmpv = s.stack[sp - n + i]
+            s.stack[d + i] = tmpv
+            inc i
+        sp = d + n
+        pc = ins.a
+    of opBrOnNonNull:
+      if s.stack[sp - 1].lo != 0:
+        let n = ins.b
+        let d = fp + int(ins.c)
+        if d + n != sp:
+          var i = 0
+          while i < n:
+            let tmpv = s.stack[sp - n + i]
+            s.stack[d + i] = tmpv
+            inc i
+        sp = d + n
+        pc = ins.a
+      else:
+        dec sp
+    of opBrOnCast, opBrOnCastFail:
+      let info = s.code[pc]
+      inc pc
+      var ht = info.a
+      let r = s.stack[sp - 1].lo
+      let m = wRefHeapMatch(s, r, ht, info.b == 1)
+      if m == (ins.op == opBrOnCast):
+        let n = ins.b
+        let d = fp + int(ins.c)
+        if d + n != sp:
+          var i = 0
+          while i < n:
+            let tmpv = s.stack[sp - n + i]
+            s.stack[d + i] = tmpv
+            inc i
+        sp = d + n
+        pc = ins.a
+    of 0x100 .. 0x107:
+      let v = s.stack[sp - 1].lo
+      let sub = ins.op - 0x100
+      let f = (if sub == 0 or sub == 1 or sub == 4 or sub == 5: float64(f32of(v)) else: f64of(v))
+      var r = 0'u64
+      case sub
+      of 0, 2: r = truncSat32s(f)
+      of 1, 3: r = truncSat32u(f)
+      of 4, 6: r = truncSat64s(f)
+      else: r = truncSat64u(f)
+      s.stack[sp - 1] = WSlot(lo: r, hi: 0)
+    of 0x108:   # memory.init
+      sp = sp - 3
+      let m = s.insts[inst].mems[ins.b]
+      let row = s.mems[m].row
+      var dst = s.stack[sp].lo
+      if not s.mems[m].is64: dst = dst and 0xFFFF_FFFF'u64
+      let src = s.stack[sp + 1].lo and 0xFFFF_FFFF'u64
+      let n = s.stack[sp + 2].lo and 0xFFFF_FFFF'u64
+      let dlen = uint64(s.insts[inst].datas[ins.a].len)
+      if src + n > dlen or dst + n < dst or dst + n > uint64(mLen(s, bank, m)):
+        status = trap(s, "out of bounds memory access")
+      else:
+        var i = 0'u64
+        while i < n:
+          mSet(s, bank, m, int(dst + i), int(s.insts[inst].datas[ins.a][int(src + i)]))
+          inc i
+    of 0x109:
+      s.insts[inst].datas[ins.a] = ""
+    of 0x10A:   # memory.copy
+      sp = sp - 3
+      let md = s.insts[inst].mems[ins.a]
+      let ms = s.insts[inst].mems[ins.b]
+      var dst = s.stack[sp].lo
+      var src = s.stack[sp + 1].lo
+      var n = s.stack[sp + 2].lo
+      if not s.mems[md].is64: dst = dst and 0xFFFF_FFFF'u64
+      if not s.mems[ms].is64: src = src and 0xFFFF_FFFF'u64
+      if not (s.mems[md].is64 and s.mems[ms].is64): n = n and 0xFFFF_FFFF'u64
+      if src + n < src or dst + n < dst or src + n > uint64(mLen(s, bank, ms)) or
+         dst + n > uint64(mLen(s, bank, md)):
+        status = trap(s, "out of bounds memory access")
+      elif n > 0:
+        if md == ms and dst > src:
+          var i = int(n) - 1
+          while i >= 0:
+            let bv = mGet(s, bank, ms, int(src) + i)
+            mSet(s, bank, md, int(dst) + i, bv)
+            dec i
+        else:
+          var i = 0
+          while i < int(n):
+            let bv = mGet(s, bank, ms, int(src) + i)
+            mSet(s, bank, md, int(dst) + i, bv)
+            inc i
+    of 0x10B:   # memory.fill
+      sp = sp - 3
+      let m = s.insts[inst].mems[ins.a]
+      let row = s.mems[m].row
+      var dst = s.stack[sp].lo
+      var n = s.stack[sp + 2].lo
+      if not s.mems[m].is64:
+        dst = dst and 0xFFFF_FFFF'u64
+        n = n and 0xFFFF_FFFF'u64
+      let v = int(s.stack[sp + 1].lo and 0xFF'u64)
+      if dst + n < dst or dst + n > uint64(mLen(s, bank, m)):
+        status = trap(s, "out of bounds memory access")
+      else:
+        var i = 0
+        while i < int(n):
+          mSet(s, bank, m, int(dst) + i, v)
+          inc i
+    of 0x10C:   # table.init
+      sp = sp - 3
+      let tab = s.insts[inst].tables[ins.b]
+      var dst = s.stack[sp].lo
+      if not s.tables[tab].is64: dst = dst and 0xFFFF_FFFF'u64
+      let src = s.stack[sp + 1].lo and 0xFFFF_FFFF'u64
+      let n = s.stack[sp + 2].lo and 0xFFFF_FFFF'u64
+      let elen = uint64(s.insts[inst].elems[ins.a].len)
+      if src + n > elen or dst + n < dst or dst + n > uint64(s.tables[tab].data.len):
+        status = trap(s, "out of bounds table access")
+      else:
+        var i = 0'u64
+        while i < n:
+          s.tables[tab].data[int(dst + i)] = s.insts[inst].elems[ins.a][int(src + i)]
+          inc i
+    of 0x10D:
+      s.insts[inst].elems[ins.a] = @[]
+    of 0x10E:   # table.copy
+      sp = sp - 3
+      let td = s.insts[inst].tables[ins.a]
+      let ts = s.insts[inst].tables[ins.b]
+      var dst = s.stack[sp].lo
+      var src = s.stack[sp + 1].lo
+      var n = s.stack[sp + 2].lo
+      if not s.tables[td].is64: dst = dst and 0xFFFF_FFFF'u64
+      if not s.tables[ts].is64: src = src and 0xFFFF_FFFF'u64
+      if not (s.tables[td].is64 and s.tables[ts].is64): n = n and 0xFFFF_FFFF'u64
+      if src + n < src or dst + n < dst or src + n > uint64(s.tables[ts].data.len) or
+         dst + n > uint64(s.tables[td].data.len):
+        status = trap(s, "out of bounds table access")
+      elif n > 0:
+        if td == ts and dst > src:
+          var i = int(n) - 1
+          while i >= 0:
+            let tv = s.tables[ts].data[int(src) + i]
+            s.tables[td].data[int(dst) + i] = tv
+            dec i
+        else:
+          var i = 0
+          while i < int(n):
+            let tv = s.tables[ts].data[int(src) + i]
+            s.tables[td].data[int(dst) + i] = tv
+            inc i
+    of 0x10F:   # table.grow
+      dec sp
+      let tab = s.insts[inst].tables[ins.a]
+      var n = s.stack[sp].lo
+      if not s.tables[tab].is64: n = n and 0xFFFF_FFFF'u64
+      let r = wGrowTable(s, tab, n, s.stack[sp - 1].lo)
+      if s.tables[tab].is64: s.stack[sp - 1] = WSlot(lo: cast[uint64](r), hi: 0)
+      else: s.stack[sp - 1] = WSlot(lo: ws32(int32(r)), hi: 0)
+    of 0x110:
+      let tab = s.insts[inst].tables[ins.a]
+      s.stack[sp] = WSlot(lo: uint64(s.tables[tab].data.len), hi: 0)
+      inc sp
+    of 0x111:   # table.fill
+      sp = sp - 3
+      let tab = s.insts[inst].tables[ins.a]
+      var dst = s.stack[sp].lo
+      var n = s.stack[sp + 2].lo
+      if not s.tables[tab].is64:
+        dst = dst and 0xFFFF_FFFF'u64
+        n = n and 0xFFFF_FFFF'u64
+      let v = s.stack[sp + 1].lo
+      if dst + n < dst or dst + n > uint64(s.tables[tab].data.len):
+        status = trap(s, "out of bounds table access")
+      else:
+        var i = 0
+        while i < int(n):
+          s.tables[tab].data[int(dst) + i] = v
+          inc i
+    of 0x113, 0x114:   # i64.add128 / i64.sub128
+      sp = sp - 2
+      let alo = s.stack[sp - 2].lo
+      let ahi = s.stack[sp - 1].lo
+      let blo = s.stack[sp].lo
+      let bhi = s.stack[sp + 1].lo
+      var rlo = 0'u64
+      var rhi = 0'u64
+      if ins.op == 0x113:
+        rlo = alo + blo
+        rhi = ahi + bhi + (if rlo < alo: 1'u64 else: 0'u64)
+      else:
+        rlo = alo - blo
+        rhi = ahi - bhi - (if alo < blo: 1'u64 else: 0'u64)
+      s.stack[sp - 2] = WSlot(lo: rlo, hi: 0)
+      s.stack[sp - 1] = WSlot(lo: rhi, hi: 0)
+    of 0x115, 0x116:   # i64.mul_wide_s / i64.mul_wide_u
+      let a = s.stack[sp - 2].lo
+      let b = s.stack[sp - 1].lo
+      let a0 = a and 0xFFFF_FFFF'u64
+      let a1 = a shr 32
+      let b0 = b and 0xFFFF_FFFF'u64
+      let b1 = b shr 32
+      let p00 = a0 * b0
+      let p01 = a0 * b1
+      let p10 = a1 * b0
+      let p11 = a1 * b1
+      let mid = (p00 shr 32) + (p01 and 0xFFFF_FFFF'u64) + (p10 and 0xFFFF_FFFF'u64)
+      let lo = (p00 and 0xFFFF_FFFF'u64) or (mid shl 32)
+      var hi = p11 + (p01 shr 32) + (p10 shr 32) + (mid shr 32)
+      if ins.op == 0x115:
+        # signed: the unsigned high half minus the other operand per negative input
+        if cast[int64](a) < 0: hi = hi - b
+        if cast[int64](b) < 0: hi = hi - a
+      s.stack[sp - 2] = WSlot(lo: lo, hi: 0)
+      s.stack[sp - 1] = WSlot(lo: hi, hi: 0)
+    of 0x200 .. 0x20B, 0x25C, 0x25D, 0x254 .. 0x25B:
+      let sub = ins.op - 0x200
+      let m = s.insts[inst].mems[ins.a]
+      let row = s.mems[m].row
+      var vecIn = WSlot(lo: 0, hi: 0)
+      var val = WSlot(lo: 0, hi: 0)
+      let isStore = sub == 0x0B or (sub >= 0x58 and sub <= 0x5B)
+      let isLane = sub >= 0x54 and sub <= 0x5B
+      if isStore or isLane:
+        dec sp
+        vecIn = s.stack[sp]
+      var base = s.stack[sp - 1].lo
+      dec sp
+      if not s.mems[m].is64: base = base and 0xFFFF_FFFF'u64
+      let ea = base + ins.c
+      var n = 16
+      case sub
+      of 0x01 .. 0x06, 0x0A, 0x5D, 0x57, 0x5B: n = 8
+      of 0x07, 0x54, 0x58: n = 1
+      of 0x08, 0x55, 0x59: n = 2
+      of 0x09, 0x5C, 0x56, 0x5A: n = 4
+      else: n = 16
+      if ea < base or uint64(mLen(s, bank, m)) < uint64(n) or ea > uint64(mLen(s, bank, m)) - uint64(n):
+        status = trap(s, "out of bounds memory access")
+      else:
+        let e = int(ea)
+        case sub
+        of 0x00:
+          val.lo = readMem(s, bank, m, e, 8)
+          val.hi = readMem(s, bank, m, e + 8, 8)
+        of 0x01 .. 0x06:
+          let raw = WSlot(lo: readMem(s, bank, m, e, 8), hi: 0)
+          let sz = (if sub <= 0x02: 8 elif sub <= 0x04: 16 else: 32)
+          let signed = (sub and 1) == 1
+          var i = 0
+          while i < 64 div sz:
+            let x = laneGet(raw, sz, i)
+            laneSet(val, sz * 2, i, (if signed: cast[uint64](sext(x, sz)) and maskOf(sz * 2) else: x))
+            inc i
+        of 0x07, 0x08, 0x09, 0x0A:
+          let sz = n * 8
+          let x = readMem(s, bank, m, e, n)
+          var i = 0
+          while i < 128 div sz:
+            laneSet(val, sz, i, x)
+            inc i
+        of 0x0B:
+          writeMem(s, bank, m, e, 8, vecIn.lo)
+          writeMem(s, bank, m, e + 8, 8, vecIn.hi)
+        of 0x5C, 0x5D:
+          val.lo = readMem(s, bank, m, e, n)
+        of 0x54 .. 0x57:
+          val = vecIn
+          laneSet(val, n * 8, ins.b, readMem(s, bank, m, e, n))
+        else:
+          writeMem(s, bank, m, e, n, laneGet(vecIn, n * 8, ins.b))
+        if not isStore:
+          s.stack[sp] = val
+          inc sp
+    of 0x20C:
+      s.stack[sp] = WSlot(lo: s.v128[ins.a * 2], hi: s.v128[ins.a * 2 + 1])
+      inc sp
+    of 0x20D:
+      dec sp
+      let a = s.stack[sp - 1]
+      let b = s.stack[sp]
+      let sel = WSlot(lo: s.v128[ins.a * 2], hi: s.v128[ins.a * 2 + 1])
+      var r = WSlot(lo: 0, hi: 0)
+      var i = 0
+      while i < 16:
+        let l = int(lane8(sel, i))
+        setLane8(r, i, (if l < 16: lane8(a, l) else: lane8(b, l - 16)))
+        inc i
+      s.stack[sp - 1] = r
+    of 0x20F .. 0x214:
+      let x = s.stack[sp - 1].lo
+      var r = WSlot(lo: 0, hi: 0)
+      case ins.op
+      of 0x20F:
+        var i = 0
+        while i < 16:
+          setLane8(r, i, x)
+          inc i
+      of 0x210:
+        var i = 0
+        while i < 8:
+          setLane16(r, i, x)
+          inc i
+      of 0x211, 0x213:
+        r.lo = (x and 0xFFFF_FFFF'u64) or ((x and 0xFFFF_FFFF'u64) shl 32)
+        r.hi = r.lo
+      else:
+        r.lo = x
+        r.hi = x
+      s.stack[sp - 1] = r
+    of 0x215 .. 0x222:
+      let sub = ins.op - 0x200
+      let lane = ins.a
+      case sub
+      of 0x15: s.stack[sp - 1] = WSlot(lo: ws32(int32(sx8(lane8(s.stack[sp - 1], lane)))), hi: 0)
+      of 0x16: s.stack[sp - 1] = WSlot(lo: lane8(s.stack[sp - 1], lane), hi: 0)
+      of 0x18: s.stack[sp - 1] = WSlot(lo: ws32(int32(sx16(lane16(s.stack[sp - 1], lane)))), hi: 0)
+      of 0x19: s.stack[sp - 1] = WSlot(lo: lane16(s.stack[sp - 1], lane), hi: 0)
+      of 0x1B, 0x1F: s.stack[sp - 1] = WSlot(lo: lane32(s.stack[sp - 1], lane), hi: 0)
+      of 0x1D, 0x21: s.stack[sp - 1] = WSlot(lo: lane64(s.stack[sp - 1], lane), hi: 0)
+      else:
+        dec sp
+        let x = s.stack[sp].lo
+        var v = s.stack[sp - 1]
+        case sub
+        of 0x17: setLane8(v, lane, x)
+        of 0x1A: setLane16(v, lane, x)
+        of 0x1C, 0x20: setLane32(v, lane, x)
+        else: setLane64(v, lane, x)
+        s.stack[sp - 1] = v
+    of 0x20E .. 0x20E, 0x223 .. 0x253, 0x25E .. 0x313:
+      let sub = ins.op - 0x200
+      case simdSigOf(sub)
+      of 1:
+        s.stack[sp - 1] = simdUnary(sub, s.stack[sp - 1])
+      of 2:
+        dec sp
+        s.stack[sp - 1] = simdBinary(sub, s.stack[sp - 1], s.stack[sp])
+      of 3:
+        s.stack[sp - 1] = WSlot(lo: simdTest(sub, s.stack[sp - 1]), hi: 0)
+      of 4:
+        dec sp
+        s.stack[sp - 1] = simdShift(sub, s.stack[sp - 1], s.stack[sp].lo)
+      else:
+        sp = sp - 2
+        s.stack[sp - 1] = simdTernary(sub, s.stack[sp - 1], s.stack[sp], s.stack[sp + 1])
+    of 0x400, 0x401:   # struct.new, struct.new_default
+      let c = s.insts[inst].types[ins.a]
+      let nf = s.reg.types[c].fields.len
+      var o = WGcObj(canon: c, fields: @[])
+      o.fields.setLen nf
+      if ins.op == 0x400:
+        var i = 0
+        while i < nf:
+          let v = s.stack[sp - nf + i]
+          o.fields[i] = WSlot(lo: packField(s.reg.types[c].fields[i], v.lo), hi: v.hi)
+          inc i
+        sp = sp - nf
+      s.gcs.add o
+      s.stack[sp] = WSlot(lo: wMkRef(wrGc, s.gcs.len - 1), hi: 0)
+      inc sp
+    of 0x402, 0x403, 0x404:
+      let r = s.stack[sp - 1].lo
+      if r == 0: status = trap(s, "null structure reference")
+      else:
+        let o = wRefPay(r)
+        let ft = s.gcs[o].canon
+        let fty = s.reg.types[ft].fields[ins.b]
+        let v = s.gcs[o].fields[ins.b]
+        s.stack[sp - 1] = WSlot(lo: unpackField(fty, v.lo, ins.op == 0x403), hi: v.hi)
+    of 0x405:
+      sp = sp - 2
+      let r = s.stack[sp].lo
+      if r == 0: status = trap(s, "null structure reference")
+      else:
+        let o = wRefPay(r)
+        let fty = s.reg.types[s.gcs[o].canon].fields[ins.b]
+        let v = s.stack[sp + 1]
+        s.gcs[o].fields[ins.b] = WSlot(lo: packField(fty, v.lo), hi: v.hi)
+    of 0x406, 0x407, 0x408, 0x409, 0x40A:
+      let c = s.insts[inst].types[ins.a]
+      let et = s.reg.types[c].fields[0]
+      var o = WGcObj(canon: c, fields: @[])
+      case ins.op
+      of 0x406:
+        sp = sp - 2
+        let n = int(s.stack[sp + 1].lo and 0xFFFF_FFFF'u64)
+        if n > 10_000_000: status = trap(s, "out of bounds array access")
+        else:
+          let v = s.stack[sp]
+          o.fields.setLen n
+          var i = 0
+          while i < n:
+            o.fields[i] = WSlot(lo: packField(et, v.lo), hi: v.hi)
+            inc i
+      of 0x407:
+        dec sp
+        let n = int(s.stack[sp].lo and 0xFFFF_FFFF'u64)
+        if n > 10_000_000: status = trap(s, "out of bounds array access")
+        else: o.fields.setLen n
+      of 0x408:
+        let n = ins.b
+        o.fields.setLen n
+        var i = 0
+        while i < n:
+          let v = s.stack[sp - n + i]
+          o.fields[i] = WSlot(lo: packField(et, v.lo), hi: v.hi)
+          inc i
+        sp = sp - n
+      of 0x409:
+        sp = sp - 2
+        let off = s.stack[sp].lo and 0xFFFF_FFFF'u64
+        let n = s.stack[sp + 1].lo and 0xFFFF_FFFF'u64
+        let esz = uint64(fieldBytes(et))
+        let data = s.insts[inst].datas[ins.b]
+        if off + n * esz > uint64(data.len): status = trap(s, "out of bounds memory access")
+        else:
+          o.fields.setLen int(n)
+          var i = 0
+          while i < int(n):
+            let at = int(off) + i * int(esz)
+            var v = WSlot(lo: 0, hi: 0)
+            if esz == 16:
+              var k = 0
+              while k < 8:
+                v.lo = v.lo or (uint64(ord(data[at + k])) shl uint64(8 * k))
+                v.hi = v.hi or (uint64(ord(data[at + 8 + k])) shl uint64(8 * k))
+                inc k
+            else:
+              var k = 0
+              while k < int(esz):
+                v.lo = v.lo or (uint64(ord(data[at + k])) shl uint64(8 * k))
+                inc k
+            o.fields[i] = v
+            inc i
+      else:
+        sp = sp - 2
+        let off = s.stack[sp].lo and 0xFFFF_FFFF'u64
+        let n = s.stack[sp + 1].lo and 0xFFFF_FFFF'u64
+        let el = s.insts[inst].elems[ins.b]
+        if off + n > uint64(el.len): status = trap(s, "out of bounds table access")
+        else:
+          o.fields.setLen int(n)
+          var i = 0
+          while i < int(n):
+            o.fields[i] = WSlot(lo: el[int(off) + i], hi: 0)
+            inc i
+      if status == wsOk:
+        s.gcs.add o
+        s.stack[sp] = WSlot(lo: wMkRef(wrGc, s.gcs.len - 1), hi: 0)
+        inc sp
+    of 0x40B, 0x40C, 0x40D:
+      dec sp
+      let r = s.stack[sp - 1].lo
+      let idx = s.stack[sp].lo and 0xFFFF_FFFF'u64
+      if r == 0: status = trap(s, "null array reference")
+      else:
+        let o = wRefPay(r)
+        if idx >= uint64(s.gcs[o].fields.len): status = trap(s, "out of bounds array access")
+        else:
+          let et = s.reg.types[s.gcs[o].canon].fields[0]
+          let v = s.gcs[o].fields[int(idx)]
+          s.stack[sp - 1] = WSlot(lo: unpackField(et, v.lo, ins.op == 0x40C), hi: v.hi)
+    of 0x40E:
+      sp = sp - 3
+      let r = s.stack[sp].lo
+      let idx = s.stack[sp + 1].lo and 0xFFFF_FFFF'u64
+      if r == 0: status = trap(s, "null array reference")
+      else:
+        let o = wRefPay(r)
+        if idx >= uint64(s.gcs[o].fields.len): status = trap(s, "out of bounds array access")
+        else:
+          let et = s.reg.types[s.gcs[o].canon].fields[0]
+          let v = s.stack[sp + 2]
+          s.gcs[o].fields[int(idx)] = WSlot(lo: packField(et, v.lo), hi: v.hi)
+    of 0x40F:
+      let r = s.stack[sp - 1].lo
+      if r == 0: status = trap(s, "null array reference")
+      else: s.stack[sp - 1] = WSlot(lo: uint64(s.gcs[wRefPay(r)].fields.len), hi: 0)
+    of 0x410:   # array.fill
+      sp = sp - 4
+      let r = s.stack[sp].lo
+      let off = s.stack[sp + 1].lo and 0xFFFF_FFFF'u64
+      let v = s.stack[sp + 2]
+      let n = s.stack[sp + 3].lo and 0xFFFF_FFFF'u64
+      if r == 0: status = trap(s, "null array reference")
+      else:
+        let o = wRefPay(r)
+        if off + n > uint64(s.gcs[o].fields.len): status = trap(s, "out of bounds array access")
+        else:
+          let et = s.reg.types[s.gcs[o].canon].fields[0]
+          var i = 0
+          while i < int(n):
+            s.gcs[o].fields[int(off) + i] = WSlot(lo: packField(et, v.lo), hi: v.hi)
+            inc i
+    of 0x411:   # array.copy
+      sp = sp - 5
+      let rd = s.stack[sp].lo
+      let dst = s.stack[sp + 1].lo and 0xFFFF_FFFF'u64
+      let rs = s.stack[sp + 2].lo
+      let src = s.stack[sp + 3].lo and 0xFFFF_FFFF'u64
+      let n = s.stack[sp + 4].lo and 0xFFFF_FFFF'u64
+      if rd == 0 or rs == 0: status = trap(s, "null array reference")
+      else:
+        let od = wRefPay(rd)
+        let os = wRefPay(rs)
+        if dst + n > uint64(s.gcs[od].fields.len) or src + n > uint64(s.gcs[os].fields.len):
+          status = trap(s, "out of bounds array access")
+        elif od == os and dst > src:
+          var i = int(n) - 1
+          while i >= 0:
+            let tmpv = s.gcs[os].fields[int(src) + i]
+            s.gcs[od].fields[int(dst) + i] = tmpv
+            dec i
+        else:
+          var i = 0
+          while i < int(n):
+            let tmpv = s.gcs[os].fields[int(src) + i]
+            s.gcs[od].fields[int(dst) + i] = tmpv
+            inc i
+    of 0x412, 0x413:   # array.init_data, array.init_elem
+      sp = sp - 4
+      let r = s.stack[sp].lo
+      let dst = s.stack[sp + 1].lo and 0xFFFF_FFFF'u64
+      let src = s.stack[sp + 2].lo and 0xFFFF_FFFF'u64
+      let n = s.stack[sp + 3].lo and 0xFFFF_FFFF'u64
+      if r == 0: status = trap(s, "null array reference")
+      else:
+        let o = wRefPay(r)
+        let et = s.reg.types[s.gcs[o].canon].fields[0]
+        if dst + n > uint64(s.gcs[o].fields.len):
+          status = trap(s, "out of bounds array access")
+        elif ins.op == 0x412:
+          let esz = uint64(fieldBytes(et))
+          let data = s.insts[inst].datas[ins.b]
+          if src + n * esz > uint64(data.len): status = trap(s, "out of bounds memory access")
+          else:
+            var i = 0
+            while i < int(n):
+              let at = int(src) + i * int(esz)
+              var v = WSlot(lo: 0, hi: 0)
+              var k = 0
+              while k < int(esz):
+                if k < 8: v.lo = v.lo or (uint64(ord(data[at + k])) shl uint64(8 * k))
+                else: v.hi = v.hi or (uint64(ord(data[at + k])) shl uint64(8 * (k - 8)))
+                inc k
+              s.gcs[o].fields[int(dst) + i] = v
+              inc i
+        else:
+          let el = s.insts[inst].elems[ins.b]
+          if src + n > uint64(el.len): status = trap(s, "out of bounds table access")
+          else:
+            var i = 0
+            while i < int(n):
+              s.gcs[o].fields[int(dst) + i] = WSlot(lo: el[int(src) + i], hi: 0)
+              inc i
+    of 0x414, 0x415:
+      let r = s.stack[sp - 1].lo
+      s.stack[sp - 1] = WSlot(lo: bool01(wRefHeapMatch(s, r, ins.a, ins.b == 1)), hi: 0)
+    of 0x416, 0x417:
+      let r = s.stack[sp - 1].lo
+      if not wRefHeapMatch(s, r, ins.a, ins.b == 1): status = trap(s, "cast failure")
+    of 0x41A:   # any.convert_extern
+      let r = s.stack[sp - 1].lo
+      if r != 0:
+        if (r and WExtBit) != 0: s.stack[sp - 1].lo = r and not WExtBit
+        elif wRefTag(r) == wrExtern: s.stack[sp - 1].lo = wMkRef(wrHostAny, wRefPay(r))
+    of 0x41B:   # extern.convert_any
+      let r = s.stack[sp - 1].lo
+      if r != 0:
+        if wRefTag(r) == wrHostAny: s.stack[sp - 1].lo = wMkRef(wrExtern, wRefPay(r))
+        else: s.stack[sp - 1].lo = r or WExtBit
+    of 0x41C:
+      s.stack[sp - 1].lo = wMkRef(wrI31, int(s.stack[sp - 1].lo and 0x7FFF_FFFF'u64))
+    of 0x41D, 0x41E:
+      let r = s.stack[sp - 1].lo
+      if r == 0: status = trap(s, "null i31 reference")
+      else:
+        let v = uint64(wRefPay(r)) and 0x7FFF_FFFF'u64
+        if ins.op == 0x41D and (v and 0x4000_0000'u64) != 0:
+          s.stack[sp - 1] = WSlot(lo: (v or 0x8000_0000'u64) and 0xFFFF_FFFF'u64, hi: 0)
+        else:
+          s.stack[sp - 1] = WSlot(lo: v, hi: 0)
+    else:
+      status = trap(s, "unknown internal opcode " & wIts(ins.op))
+
+    if status != wsOk:
+      if status == wsThrow:
+        if exn < 0: exn = s.pendingExn
+        # search try_tables, frame by frame
+        var at = pc - 1
+        var handled = false
+        while true:
+          if fn >= 0:
+            let F = s.funcs[fn]
+            var t = F.tryHi - 1
+            while t >= F.tryLo and not handled:
+              let e = s.tries[t]
+              if at >= e.startPc and at < e.endPc:
+                var k = 0
+                while k < e.catches.len:
+                  let c = e.catches[k]
+                  var match = false
+                  if c.kind >= 2: match = true
+                  elif s.exns[exn].tag >= 0 and s.exns[exn].tag == s.insts[inst].tags[c.tag]:
+                    match = true
+                  if match:
+                    var d = fp + c.dest
+                    if c.kind <= 1:
+                      let pl = s.exns[exn].payload
+                      var i = 0
+                      while i < pl.len:
+                        s.stack[d] = pl[i]
+                        inc d
+                        inc i
+                    if c.kind == 1 or c.kind == 3:
+                      s.stack[d] = WSlot(lo: wMkRef(wrExn, exn), hi: 0)
+                      inc d
+                    sp = d
+                    pc = s.brTab[c.target]
+                    handled = true
+                    break
+                  inc k
+              dec t
+          if handled: break
+          if s.frames.len == baseDepth or fn < 0: break
+          let fr = s.frames[s.frames.len - 1]
+          s.frames.setLen s.frames.len - 1
+          at = fr.retPc - 1
+          pc = fr.retPc
+          fp = fr.fp
+          inst = fr.inst
+          fn = fr.fn
+        if handled:
+          status = wsOk
+          exn = -1
+          continue
+        s.pendingExn = exn
+        s.sp = sp
+        return wsThrow
+      s.sp = sp
+      return status
+
+# ---------------------------------------------------------------------------
+# Instantiation.
+
+proc wAllocHostFunc*(s: var WStore; canon: int; host: int): int =
+  let t = s.reg.types[canon]
+  s.funcs.add WFunc(isHost: true, canon: canon, inst: -1, start: 0,
+                    nparams: t.params.len, nresults: t.results.len,
+                    nlocals: t.params.len, maxStack: t.params.len + t.results.len + 4,
+                    tryLo: 0, tryHi: 0, host: host)
+  result = s.funcs.len - 1
+
+proc wExternMatches*(s: WStore; bank: seq[seq[int]]; m: WModule; im: WImport; ev: WExternVal;
+                    why: var string): bool =
+  ## Import matching (the specification's "external type matching").
+  if ev.kind != im.kind:
+    why = "incompatible import type"
+    return false
+  case im.kind
+  of ekFunc:
+    if not isSubCanon(s.reg, s.funcs[ev.addr0].canon, m.types[im.typeIdx]):
+      why = "imported function does not match the expected type"
+      return false
+  of ekTable:
+    let t = s.tables[ev.addr0]
+    if t.is64 != im.tt.is64:
+      why = "incompatible import type"
+      return false
+    if not (vtMatch(s.reg, t.elem, im.tt.elem) and vtMatch(s.reg, im.tt.elem, t.elem)):
+      why = "incompatible import type"
+      return false
+    if uint64(t.data.len) < im.tt.min:
+      why = "incompatible import type"
+      return false
+    if im.tt.hasMax:
+      if not t.hasMax or t.max > im.tt.max:
+        why = "incompatible import type"
+        return false
+  of ekMem:
+    let mm = s.mems[ev.addr0]
+    if mm.is64 != im.mt.is64:
+      why = "incompatible import type"
+      return false
+    if uint64(mLen(s, bank, ev.addr0) div WPageSize) < im.mt.min:
+      why = "incompatible import type"
+      return false
+    if im.mt.hasMax:
+      if not mm.hasMax or mm.max > im.mt.max:
+        why = "incompatible import type"
+        return false
+  of ekGlobal:
+    let g = s.globals[ev.addr0]
+    if g.mut != im.gt.mut:
+      why = "incompatible import type"
+      return false
+    if g.mut:
+      if not (vtMatch(s.reg, g.vt, im.gt.vt) and vtMatch(s.reg, im.gt.vt, g.vt)):
+        why = "incompatible import type"
+        return false
+    elif not vtMatch(s.reg, g.vt, im.gt.vt):
+      why = "incompatible import type"
+      return false
+  of ekTag:
+    if s.tags[ev.addr0] != m.types[im.typeIdx]:
+      why = "incompatible import type"
+      return false
+  else: discard
+  result = true
+
+proc wInstantiate*(s: var WStore; bank: var seq[seq[int]]; modId: int;
+                  imports: seq[WExternVal]; instOut: var int; runStart = true): int =
+  ## Allocate and initialise an instance. Returns wsOk, wsTrap (a segment
+  ## out of bounds or a trapping start: the instance still exists, partly
+  ## initialised, in `instOut`), wsThrow or wsExhausted. Import matching is
+  ## the caller's job, done before (see `wExternMatches`).
+  let lm = s.mods[modId]
+  let m = lm.m
+  var inst = WInst(modId: modId, types: m.types, funcs: @[], tables: @[], mems: @[],
+                   globals: @[], tags: @[], elems: @[], elemTypes: @[], datas: @[],
+                   exports: m.exports)
+  var i = 0
+  while i < imports.len:
+    case imports[i].kind
+    of ekFunc: inst.funcs.add imports[i].addr0
+    of ekTable: inst.tables.add imports[i].addr0
+    of ekMem: inst.mems.add imports[i].addr0
+    of ekGlobal: inst.globals.add imports[i].addr0
+    else: inst.tags.add imports[i].addr0
+    inc i
+  s.insts.add inst
+  let ii = s.insts.len - 1
+  instOut = ii
+  # functions
+  i = 0
+  while i < m.fcode.len:
+    let fc = m.fcode[i]
+    s.funcs.add WFunc(isHost: false, canon: m.types[m.funcs[m.nImpFuncs + i]], inst: ii,
+                      start: fc.start + lm.codeBase, nparams: fc.nparams,
+                      nresults: fc.nresults, nlocals: fc.nlocals, maxStack: fc.maxStack,
+                      tryLo: fc.tryLo + lm.tryBase, tryHi: fc.tryHi + lm.tryBase, host: -1)
+    s.insts[ii].funcs.add s.funcs.len - 1
+    inc i
+  # tags
+  i = m.nImpTags
+  while i < m.tags.len:
+    s.tags.add m.types[m.tags[i]]
+    s.insts[ii].tags.add s.tags.len - 1
+    inc i
+  # globals, in order: each initialiser sees the ones before it
+  i = m.nImpGlobals
+  while i < m.globals.len:
+    var v = WSlot(lo: 0, hi: 0)
+    let st = wEvalConst(s, bank, ii, m.globalInit[i] + lm.codeBase, v)
+    if st != wsOk: return st
+    var gt = m.globals[i]
+    s.globals.add WGlobal(vt: gt.vt, mut: gt.mut, val: v)
+    s.insts[ii].globals.add s.globals.len - 1
+    inc i
+  # tables
+  i = m.nImpTables
+  while i < m.tables.len:
+    var init = 0'u64
+    if m.tableInit[i] >= 0:
+      var v = WSlot(lo: 0, hi: 0)
+      let st = wEvalConst(s, bank, ii, m.tableInit[i] + lm.codeBase, v)
+      if st != wsOk: return st
+      init = v.lo
+    s.insts[ii].tables.add wNewTable(s, m.tables[i], init)
+    inc i
+  # memories
+  i = m.nImpMems
+  while i < m.mems.len:
+    let mi = wNewMemory(s, bank, m.mems[i])
+    if mi < 0:
+      s.trapMsg = "could not allocate memory"
+      return -1
+    s.insts[ii].mems.add mi
+    inc i
+  # element segments: evaluate every item
+  i = 0
+  while i < m.elems.len:
+    var items: seq[uint64] = @[]
+    var k = 0
+    while k < m.elems[i].items.len:
+      var v = WSlot(lo: 0, hi: 0)
+      let st = wEvalConst(s, bank, ii, m.elems[i].items[k] + lm.codeBase, v)
+      if st != wsOk: return st
+      items.add v.lo
+      inc k
+    s.insts[ii].elems.add items
+    s.insts[ii].elemTypes.add m.elems[i].elemType
+    inc i
+  i = 0
+  while i < m.datas.len:
+    s.insts[ii].datas.add m.datas[i].bytes
+    inc i
+  # active element segments, then declarative drops
+  i = 0
+  while i < m.elems.len:
+    let e = m.elems[i]
+    if e.mode == 1:
+      var v = WSlot(lo: 0, hi: 0)
+      let st = wEvalConst(s, bank, ii, e.offset + lm.codeBase, v)
+      if st != wsOk: return st
+      let tab = s.insts[ii].tables[e.table]
+      var off = v.lo
+      if not s.tables[tab].is64: off = off and 0xFFFF_FFFF'u64
+      let n = uint64(s.insts[ii].elems[i].len)
+      if off + n < off or off + n > uint64(s.tables[tab].data.len):
+        s.trapMsg = "out of bounds table access"
+        return wsTrap
+      var k = 0
+      while k < int(n):
+        s.tables[tab].data[int(off) + k] = s.insts[ii].elems[i][k]
+        inc k
+      s.insts[ii].elems[i] = @[]
+    elif e.mode == 2:
+      s.insts[ii].elems[i] = @[]
+    inc i
+  i = 0
+  while i < m.datas.len:
+    let ds = m.datas[i]
+    if ds.mode == 1:
+      var v = WSlot(lo: 0, hi: 0)
+      let st = wEvalConst(s, bank, ii, ds.offset + lm.codeBase, v)
+      if st != wsOk: return st
+      let mi = s.insts[ii].mems[ds.mem]
+      var off = v.lo
+      if not s.mems[mi].is64: off = off and 0xFFFF_FFFF'u64
+      let n = uint64(ds.bytes.len)
+      if off + n < off or off + n > uint64(mLen(s, bank, mi)):
+        s.trapMsg = "out of bounds memory access"
+        return wsTrap
+      var k = 0
+      while k < int(n):
+        mSet(s, bank, mi, int(off) + k, ord(ds.bytes[k]))
+        inc k
+      s.insts[ii].datas[i] = ""
+    inc i
+  if runStart and m.start >= 0:
+    var res: seq[WSlot] = @[]
+    let st = wInvoke(s, bank, s.insts[ii].funcs[m.start], @[], res)
+    if st != wsOk: return st
+  result = wsOk
