@@ -41,6 +41,7 @@ on(BlockPlaceEvent, function (e) { if (e.blockName == "minecraft:tnt") e.cancel(
 | `FurnaceSmeltEvent` | FurnaceSmeltEvent | `x`, `y`, `z`, `input`, `output` | yes (progress restarts) |
 | `KickEvent` | PlayerKickEvent | `reason` (writable) | no (the kick happens) |
 | `TabCompleteEvent` | TabCompleteEvent | `buffer`, `suggestions` (add to it) | |
+| `TargetEvent` | EntityTargetEvent | `mobId`, `mobType`, `targetId`, `targetType` | yes (the mob picks nobody) |
 | `SwapHandsEvent` | PlayerSwapHandItemsEvent | | yes |
 | `UseItemEvent` | right-click PlayerInteractEvent | | yes |
 | `InteractEntityEvent` | PlayerInteractEntityEvent / PlayerInteractAtEntityEvent | `entityId`, `action`, `sneaking`, `known` | yes |
@@ -91,7 +92,7 @@ on(BlockPlaceEvent, function (e) { if (e.blockName == "minecraft:tnt") e.cancel(
 | `onEnable`, `onDisable` | onEnable, onDisable, PluginEnableEvent | | |
 | tasks | BukkitScheduler | see `after`, `every` | |
 
-That is 72 event types. Events that fire often (movement, packets, ticks, permission checks, block grow, redstone, chunk send, damage)
+That is 73 event types. Events that fire often (movement, packets, ticks, permission checks, block grow, redstone, chunk send, damage)
 cost nothing while no loaded plugin listens to them.
 
 ## Bukkit events that do not exist here, and why
@@ -100,7 +101,7 @@ Bukkit has well over 200 event classes. An event can only exist when the server 
 server (a port of Pumpkin) fires the events above; the rest below either need a firing site added in the server or describe a game
 system the server does not have.
 
-**Needs a firing site in the server (the system exists):** BlockCanBuildEvent, EntityTargetEvent, EntityChangeBlockEvent,
+**Needs a firing site in the server (the system exists):** BlockCanBuildEvent, EntityChangeBlockEvent,
 PlayerAdvancementDoneEvent, PlayerResourcePackStatusEvent (happens before the player exists), InventoryMoveItemEvent,
 PrepareItemCraftEvent, FurnaceBurn/ExtractEvent, BrewEvent, WorldLoad/Unload/InitEvent, ChunkLoad/UnloadEvent
 (upstream declares chunk load and save but never fires them), PortalCreateEvent,
