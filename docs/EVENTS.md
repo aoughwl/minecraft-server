@@ -42,6 +42,7 @@ on(BlockPlaceEvent, function (e) { if (e.blockName == "minecraft:tnt") e.cancel(
 | `KickEvent` | PlayerKickEvent | `reason` (writable) | no (the kick happens) |
 | `TabCompleteEvent` | TabCompleteEvent | `buffer`, `suggestions` (add to it) | |
 | `TargetEvent` | EntityTargetEvent | `mobId`, `mobType`, `targetId`, `targetType` | yes (the mob picks nobody) |
+| `AdvancementEvent` | PlayerAdvancementDoneEvent | `advancement` (the title) | |
 | `SwapHandsEvent` | PlayerSwapHandItemsEvent | | yes |
 | `UseItemEvent` | right-click PlayerInteractEvent | | yes |
 | `InteractEntityEvent` | PlayerInteractEntityEvent / PlayerInteractAtEntityEvent | `entityId`, `action`, `sneaking`, `known` | yes |
@@ -92,7 +93,7 @@ on(BlockPlaceEvent, function (e) { if (e.blockName == "minecraft:tnt") e.cancel(
 | `onEnable`, `onDisable` | onEnable, onDisable, PluginEnableEvent | | |
 | tasks | BukkitScheduler | see `after`, `every` | |
 
-That is 73 event types. Events that fire often (movement, packets, ticks, permission checks, block grow, redstone, chunk send, damage)
+That is 74 event types. Events that fire often (movement, packets, ticks, permission checks, block grow, redstone, chunk send, damage)
 cost nothing while no loaded plugin listens to them.
 
 ## Bukkit events that do not exist here, and why
@@ -102,7 +103,7 @@ server (a port of Pumpkin) fires the events above; the rest below either need a 
 system the server does not have.
 
 **Needs a firing site in the server (the system exists):** BlockCanBuildEvent, EntityChangeBlockEvent,
-PlayerAdvancementDoneEvent, PlayerResourcePackStatusEvent (happens before the player exists), InventoryMoveItemEvent,
+PlayerResourcePackStatusEvent (happens before the player exists), InventoryMoveItemEvent,
 PrepareItemCraftEvent, FurnaceBurn/ExtractEvent, BrewEvent, WorldLoad/Unload/InitEvent, ChunkLoad/UnloadEvent
 (upstream declares chunk load and save but never fires them), PortalCreateEvent,
 VehicleEnter/Exit/Move/DamageEvent.

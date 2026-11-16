@@ -125,6 +125,8 @@ def engine_session(m, c, st, w, biomes, ctx, args):
             command('summon minecraft:zombie 4 66 4')
             expect('A zombie hunts a player', 'the entity target event', 40.0)
             command('kill @e[type=minecraft:zombie]')
+            command('advancement grant %s only minecraft:story/root' % name)
+            expect('Advancement:', 'the advancement event')
             command('giveme minecraft:diamond 5')
             expect('You now carry 5 of minecraft:diamond', 'inventory: a plugin gives items and counts them')
             command('summon minecraft:cow 5 70 5')
