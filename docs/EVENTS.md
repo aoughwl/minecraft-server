@@ -102,15 +102,19 @@ system the server does not have.
 
 **Needs a firing site in the server (the system exists):** BlockCanBuildEvent, BlockDispenseEvent,
 EntityTargetEvent, EntityChangeBlockEvent,
-EntityShootBowEvent, EntityTameEvent, ProjectileLaunchEvent,
+EntityShootBowEvent, EntityTameEvent,
 PlayerAdvancementDoneEvent,
 PlayerShearEntityEvent, PlayerEditBookEvent, PlayerResourcePackStatusEvent,
-InventoryDragEvent, InventoryMoveItemEvent, CraftItemEvent,
+InventoryDragEvent, InventoryMoveItemEvent,
 PrepareItemCraftEvent, FurnaceBurn/ExtractEvent, BrewEvent, WorldLoad/Unload/InitEvent, ChunkLoad/UnloadEvent
-(upstream declares chunk load and save but never fires them), LightningStrikeEvent, PortalCreateEvent,
+(upstream declares chunk load and save but never fires them), PortalCreateEvent,
 VehicleEnter/Exit/Move/DamageEvent.
 
-**Systems the server does not have:** enchanting table and anvil events, raids, villager trade events, hanging entities,
+**Covered by another event:** ProjectileLaunchEvent (the thrown or shot projectile appears as an `EntitySpawnEvent`), CraftItemEvent
+(`StatisticEvent`, crafted), the block events of fire, fluids, growth and decay (`BlockChangeEvent`), PlayerPortalEvent and
+EntityPortalEvent (`PortalEvent`).
+
+**Systems the server does not have:** lightning (no bolt entity or strikes), enchanting table and anvil events, raids, villager trade events, hanging entities,
 maps, beacons, loot generation events and similar.
 
 ## Adding an event
