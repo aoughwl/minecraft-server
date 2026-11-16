@@ -90,6 +90,8 @@ def engine_session(m, c, st, w, biomes, ctx, args):
             expect('Placed minecraft:gold_block', '/block places a block from a plugin')
             command('block 2 70 2')
             expect('Block at 2 70 2: minecraft:gold_block', '/block reads it back')
+            c.send(m.SB_ACTION, m.varint(6) + m.block_pos(0, 0, 0) + bytes([0]) + m.varint(0))
+            expect('Hands stay put.', 'the swap hands event')
             command('giveme minecraft:diamond 5')
             expect('You now carry 5 of minecraft:diamond', 'inventory: a plugin gives items and counts them')
             command('summon minecraft:cow 5 70 5')
