@@ -1018,6 +1018,8 @@ class Stages:
                                  'villager_traded'],
                     'dragon': ['dragon_spawned', 'dragon_damaged'], 'cow': [], 'pig': ['pig_followed_carrot'], 'gaps': ['gaps_done']}
     WATCH_NAMES = ['other_appeared', 'other_moved', 'other_swung', 'other_block_change', 'other_chat', 'other_left']
+    ENGINE_NAMES = ['engine_welcome', 'engine_gamemode', 'engine_teleport', 'engine_pos', 'engine_chat_cancelled']
+    ENGINE_KICK_NAMES = ['engine_welcome', 'engine_kick', 'engine_server_alive_after_kick']
 
     def __init__(self, extra=()):
         self.reached = []
@@ -2914,6 +2916,8 @@ def run(args):
         extra = list(extra) + Stages.PLUGIN_NAMES
     if args.wasm_plugin2:
         extra = list(extra) + Stages.PLUGIN2_NAMES
+    if args.engine_plugin:
+        extra = list(extra) + (Stages.ENGINE_NAMES if args.engine_plugin == 'actions' else Stages.ENGINE_KICK_NAMES)
     if args.plugmgr:
         extra = list(extra) + Stages.PLUGMGR_NAMES
     if args.playa:
@@ -3137,6 +3141,9 @@ def run(args):
         if args.wasm_plugin2:
             import mcbot_plugin2
             mcbot_plugin2.plugin2_session(sys.modules[__name__], c, st, w, biomes, ctx, args)
+        if args.engine_plugin:
+            import mcbot_engine
+            mcbot_engine.engine_session(sys.modules[__name__], c, st, w, biomes, ctx, args)
         if args.plugmgr:
             import mcbot_plugmgr
             mcbot_plugmgr.plugmgr_session(sys.modules[__name__], c, st, w, biomes, ctx, args)
@@ -3517,6 +3524,7 @@ def main():
     ap.add_argument('--assets', default=os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '..', 'ref', 'pumpkin-1.21.11', 'assets', 'blocks.json'), help='blocks.json of the pinned upstream, for --blocks')
     ap.add_argument('--playa', choices=['act', 'listen'], help='play packets as an operator: shift-click, drag split, tab completion and chat (act), or hear the actor chat (listen); see mcbot_playa.py')
     ap.add_argument('--wasm-plugin', action='store_true', help='a wasm plugin welcomes the player and cancels chat starting with x; see mcbot_plugin.py')
+    ap.add_argument('--engine-plugin', choices=['actions', 'kick'], help='a JavaScript plugin on the aoughwl engine acts on the player from chat (gamemode, teleport, position, cancel), or kicks it; see mcbot_engine.py')
     ap.add_argument('--wasm-plugin2', action='store_true', help='a wasm plugin cancels dropping one item (needs --op); see mcbot_plugin2.py')
     ap.add_argument('--plugmgr', action='store_true', help='the plugin manager at run time: /plugin list, load, unload, reload; see mcbot_plugmgr.py')
     ap.add_argument('--c2', action='store_true', help='a sign with text, a bed slept in and a piston push; see mcbot_c2.py')
