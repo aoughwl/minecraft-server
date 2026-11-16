@@ -1,0 +1,275 @@
+## The plugin manager of the server: finds the plugins in `plugins/`, loads, unloads and reloads them on the aoughwl engine, answers
+## `/plugin` and `/plugins`, and reloads a plugin whose files changed. It is ours and sits outside the engine, which only runs programs.
+##
+## A plugin is a folder in `plugins/` (or, for JavaScript, a single `.js` file):
+##   plugins/<name>/main.js                 a JavaScript plugin
+##   plugins/<name>.js                      the same, as one file
+##   plugins/<name>/.plugin/main.txt        an aowlmony plugin that tools/build_plugin.sh has built: the file names the main module's
+##   plugins/<name>/.plugin/live/*.s.nif    typed artifact; the artifacts of every module it uses sit beside it
+##   plugins/<name>/main.aowl               (its source, read to see which events it listens to)
+## JavaScript plugins share one program (the engine runs one JavaScript program per process), so loading or unloading one of them
+## restarts the others' program, which runs their `start` again; an aowlmony plugin is a program of its own and is loaded, unloaded and
+## reloaded alone.
+
+import std/[syncio, strutils, dirs, paths, options, os]
+import engine/engineplugins
+import ../server/serverbase
+import ../server/command/plugin as plugincmd
+import ../command/[cmdsource, fallbackdispatch]
+import ../util/closureset
+
+const
+  PluginsFolder = "plugins"
+  BundleFile = "plugins/.engine-bundle.js"
+  PollTicks = 40            ## the hot reload looks at the files every two seconds
+
+type
+  PluginKind = enum
+    pkJs
+    pkNative
+
+  PluginRec = object
+    name: string
+    kind: PluginKind
+    file: string            ## the JavaScript source, or the main module's typed artifact
+    folder: string          ## "" for a single .js file
+    marker: string          ## what changes when it is rebuilt: the .js file, or the build marker of an aowlmony plugin
+    stamp: int64            ## the marker's modification time when the plugin was last loaded
+    loaded: bool
+
+var
+  gRecs: seq[PluginRec] = @[]
+  gServerOpt: Option[Server] = none[Server]()
+  gHotReload = true
+  gHooksInstalled = false
+  gLastPoll = 0'i64
+
+proc slashed(p: string): string =
+  result = ""
+  for c in p:
+    result.add (if c == '\\': '/' else: c)
+
+proc baseName(p: string): string =
+  var at = -1
+  for k in 0 ..< p.len:
+    if p[k] == '/': at = k
+  if at >= 0: p.substr(at + 1) else: p
+
+proc readAll(file: string): string =
+  try:
+    result = readFile(file)
+  except:
+    result = ""
+
+proc modTime(file: string): int64 =
+  try:
+    result = getLastModificationTime(file)
+  except:
+    result = 0'i64
+
+proc sourcesOf(folder: string): string =
+  ## What a plugin's `.aowl` files say (to see which events it listens to).
+  result = ""
+  if folder.len == 0: return
+  try:
+    for kind, entry in walkDir(path(folder)):
+      let full = slashed($entry)
+      if kind == pcFile and full.endsWith(".aowl"):
+        result.add readAll(full)
+        result.add "\n"
+  except ErrorCode:
+    discard
+
+proc scanPlugins(): seq[PluginRec] =
+  ## Every plugin in `plugins/`, loaded or not.
+  result = @[]
+  try:
+    for kind, entry in walkDir(path(PluginsFolder)):
+      let full = slashed($entry)
+      let base = baseName(full)
+      if base.startsWith("."): continue
+      if kind == pcFile and base.toLowerAscii.endsWith(".js"):
+        result.add PluginRec(name: base.substr(0, base.len - 4), kind: pkJs, file: full, folder: "", marker: full, stamp: 0'i64, loaded: false)
+      elif kind == pcDir:
+        let built = full & "/.plugin/main.txt"
+        if fileExists(built):
+          let artifact = full & "/.plugin/live/" & readAll(built).strip()
+          result.add PluginRec(name: base, kind: pkNative, file: artifact, folder: full, marker: built, stamp: 0'i64, loaded: false)
+        elif fileExists(full & "/main.js"):
+          result.add PluginRec(name: base, kind: pkJs, file: full & "/main.js", folder: full, marker: full & "/main.js", stamp: 0'i64, loaded: false)
+  except ErrorCode:
+    discard
+
+proc indexOfPlugin(name: string): int =
+  result = -1
+  for k in 0 ..< gRecs.len:
+    if gRecs[k].name == name: result = k
+
+proc ensureHooks() =
+  if gHooksInstalled: return
+  if gServerOpt.isNone: return
+  gHooksInstalled = true
+  installEngineEventHooks(gServerOpt.unsafeGet)
+  installEngineMiscHooks()
+
+proc loadedJsNames(): seq[string] =
+  result = @[]
+  for r in gRecs:
+    if r.kind == pkJs and r.loaded: result.add r.name
+
+proc rebuildJs(before: seq[string]): string =
+  ## Restarts the one program the JavaScript plugins share, with the plugins marked loaded. `before` are the ones that were in it.
+  for name in before:
+    dropOwnedBy(name)
+  if programLoaded("js"):
+    discard unloadProgram("js")
+  var found: seq[(string, string)] = @[]
+  for r in gRecs:
+    if r.kind == pkJs and r.loaded: found.add (r.name, r.file)
+  result = ""
+  if found.len == 0: return
+  if loadJsBundle(found, BundleFile) < 0:
+    result = "the JavaScript plugins could not be loaded"
+    return
+  ensureHooks()
+
+proc loadPluginNamed*(name: string): string =
+  ## "" when loaded, else the reason. A plugin that appeared since the last look is found.
+  var at = indexOfPlugin(name)
+  if at < 0:
+    let scanned = scanPlugins()
+    for k in 0 ..< scanned.len:
+      if scanned[k].name == name:
+        gRecs.add scanned[k]
+    at = indexOfPlugin(name)
+  if at < 0: return "Plugin not found: " & name
+  if gRecs[at].loaded: return "Plugin " & name & " is already loaded"
+  if gRecs[at].kind == pkNative:
+    if not fileExists(gRecs[at].file):
+      return "Plugin " & name & " is not built: run tools/build_plugin.sh " & gRecs[at].folder
+    let err = loadNativeProgram(name, gRecs[at].file, sourcesOf(gRecs[at].folder))
+    if err.len > 0:
+      discard unloadProgram(name)
+      return err
+    gRecs[at].loaded = true
+    gRecs[at].stamp = modTime(gRecs[at].marker)
+    ensureHooks()
+  else:
+    let before = loadedJsNames()
+    gRecs[at].loaded = true
+    gRecs[at].stamp = modTime(gRecs[at].marker)
+    let err = rebuildJs(before)
+    if err.len > 0:
+      gRecs[at].loaded = false
+      return err
+  refreshCommandLists()
+  ""
+
+proc unloadPluginNamed*(name: string): string =
+  let at = indexOfPlugin(name)
+  if at < 0 or not gRecs[at].loaded: return "Plugin " & name & " is not loaded"
+  if gRecs[at].kind == pkNative:
+    result = unloadProgram(name)
+    gRecs[at].loaded = false
+  else:
+    let before = loadedJsNames()
+    gRecs[at].loaded = false
+    result = rebuildJs(before)
+    refreshCommandLists()
+
+proc reloadPluginNamed*(name: string): string =
+  ## Unloads the plugin and loads it again from its files as they are now.
+  if indexOfPlugin(name) >= 0 and gRecs[indexOfPlugin(name)].loaded:
+    let e = unloadPluginNamed(name)
+    if e.len > 0: return e
+  # look at the folder again: a rebuilt plugin has a new artifact
+  var fresh: seq[PluginRec] = @[]
+  let scanned = scanPlugins()
+  for k in 0 ..< scanned.len:
+    if scanned[k].name == name: fresh.add scanned[k]
+  let at = indexOfPlugin(name)
+  if at >= 0 and fresh.len > 0:
+    gRecs[at].file = fresh[0].file
+    gRecs[at].marker = fresh[0].marker
+    gRecs[at].kind = fresh[0].kind
+    gRecs[at].folder = fresh[0].folder
+  loadPluginNamed(name)
+
+proc isLoaded*(name: string): bool =
+  let at = indexOfPlugin(name)
+  at >= 0 and gRecs[at].loaded
+
+proc loadedPluginCount*(): int =
+  result = 0
+  for r in gRecs:
+    if r.loaded: inc result
+
+proc pluginMetadata(): seq[PluginMetadata] =
+  result = @[]
+  for r in gRecs:
+    if r.loaded:
+      result.add PluginMetadata(name: r.name, version: "", authors: @[],
+        description: (if r.kind == pkNative: "an aowlmony plugin" else: "a JavaScript plugin"))
+
+proc commandOps(): PluginCommandOps =
+  PluginCommandOps(
+    isActive: proc (name: string): bool {.closure.} = isLoaded(name),
+    load: proc (path: string): string {.closure.} = loadPluginNamed(baseName(slashed(path))),
+    unload: proc (name: string): string {.closure.} = unloadPluginNamed(name),
+    reload: proc (name: string): string {.closure.} = reloadPluginNamed(name),
+    setHotReload: proc (enabled: bool): string {.closure.} =
+      gHotReload = enabled
+      "")
+
+proc tickPluginManager*(tick: int64) =
+  ## Hot reload: every two seconds, a loaded plugin whose files changed is reloaded, and a plugin that has appeared is loaded.
+  if not gHotReload: return
+  if tick - gLastPoll < int64(PollTicks): return
+  gLastPoll = tick
+  let scanned = scanPlugins()
+  for k in 0 ..< scanned.len:
+    let r = scanned[k]
+    let at = indexOfPlugin(r.name)
+    if at < 0:
+      if r.kind == pkNative and not fileExists(r.file): continue
+      gRecs.add r
+      echo "[plugin] found ", r.name
+      let err = loadPluginNamed(r.name)
+      if err.len > 0: echo "[plugin] ", r.name, ": ", err
+    elif gRecs[at].loaded and modTime(r.marker) != gRecs[at].stamp:
+      echo "[plugin] ", r.name, " changed, reloading"
+      let err = reloadPluginNamed(r.name)
+      if err.len > 0: echo "[plugin] ", r.name, ": ", err
+
+proc startPluginManager*(server: Server) =
+  ## Called once by the server after its commands exist: loads everything in `plugins/`, registers `/plugin`, and tells `/plugins` where
+  ## the loaded plugins are. The engine is not started when there is nothing to load.
+  gServerOpt = some(server)
+  setEngineServer(server)
+  gRecs = scanPlugins()
+  let cs = server.commandServer
+  if cs != nil:
+    cs.activePlugins = proc (): seq[PluginMetadata] {.closure.} = pluginMetadata()
+  let d = server.commandDispatcher
+  if d != nil:
+    register(d.fallbackDispatcher, plugincmd.initCommandTree(commandOps()), "pumpkin:command.plugins")
+  # the JavaScript plugins share one program: mark them all and start it once
+  var anyJs = false
+  for k in 0 ..< gRecs.len:
+    if gRecs[k].kind == pkJs:
+      gRecs[k].loaded = true
+      gRecs[k].stamp = modTime(gRecs[k].marker)
+      anyJs = true
+  if anyJs:
+    let err = rebuildJs(@[])
+    if err.len > 0:
+      echo "[plugin] ", err
+      for k in 0 ..< gRecs.len:
+        if gRecs[k].kind == pkJs: gRecs[k].loaded = false
+  for k in 0 ..< gRecs.len:
+    if gRecs[k].kind == pkNative:
+      if not fileExists(gRecs[k].file):
+        echo "[plugin] ", gRecs[k].name, " is not built: run tools/build_plugin.sh ", gRecs[k].folder
+        continue
+      let err = loadPluginNamed(gRecs[k].name)
+      if err.len > 0: echo "[plugin] ", gRecs[k].name, ": ", err

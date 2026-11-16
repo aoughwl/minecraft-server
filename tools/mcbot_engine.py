@@ -24,6 +24,98 @@ def engine_session(m, c, st, w, biomes, ctx, args):
                bytes([0, 0, 0]) + bytes([0]))
 
     wait(lambda: w.pos is not None and ctx['chunk_parsed'], 'a position and a chunk', 40.0)
+    if args.engine_plugin == 'showcase':
+      try:
+            # the server runs examples/hello-world (aowlmony) and examples/hello-world-js; the bot is an operator (data/ops.json)
+            name = args.name
+
+            def command(line):
+                c.send(m.SB_CHAT_COMMAND, m.string(line))
+
+            def heard(fragment, since=0):
+                return any(fragment in said for said in w.chat[since:])
+
+            def expect(fragment, what, seconds=15.0):
+                wait(lambda: heard(fragment), what, seconds)
+                print('  heard: %s' % [said for said in w.chat if fragment in said][0], flush=True)
+
+            expect('Welcome, %s' % name, 'the aowlmony join message')
+            expect('%s joined the game' % name, 'the join broadcast')
+            st.hit('showcase_join')
+
+            command('hello')
+            expect('This plugin:', '/hello')
+            command('jsping')
+            expect('pong from JavaScript', '/jsping (the JavaScript plugin)')
+            st.hit('showcase_commands')
+
+            say('!ping')
+            expect('pong!', 'the !ping chat command')
+            say('!js')
+            expect('This answer is written in JavaScript', 'the JavaScript chat feature')
+            say('this has a badword in it')
+            expect('Please keep it friendly', 'the chat filter')
+            marker = 'smile test %d' % int(time.time())
+            say(marker + ' :)')
+            expect(marker + ' (smile)', 'the chat rewrite')
+            st.hit('showcase_chat')
+
+            command('where')
+            expect('You are at', '/where')
+            command('gm 1')
+            wait(lambda: w.mode == 1, 'creative from /gm 1')
+            expect('survival -> creative', 'the game mode change notice')
+            command('tpme 100 80 100')
+            wait(lambda: w.pos is not None and abs(w.pos[0] - 100.0) < 1.0 and abs(w.pos[2] - 100.0) < 1.0, 'the /tpme teleport')
+            expect('Teleported to 100, 80, 100', '/tpme reply')
+            st.hit('showcase_actions')
+
+            command('remind 2 drink water')
+            expect('I will remind you in 2 seconds', '/remind')
+            expect('Reminder: drink water', 'the reminder two seconds later', 20.0)
+            command('stats')
+            expect('You joined 1 time', '/stats')
+            command('online')
+            expect('1 player online', '/online')
+            command('announce hello everyone')
+            expect('[%s] hello everyone' % name, '/announce')
+            st.hit('showcase_tasks')
+
+            command('plugins')
+            expect('hello-world', '/plugins lists the plugins')
+            command('plugin reload hello-world')
+            expect('hello-world reloaded successfully', '/plugin reload')
+            command('hello')
+            base = len(w.chat)
+            wait(lambda: heard('This plugin:', base - 0), '/hello after a reload', 15.0)
+            st.hit('showcase_manager')
+
+            command('kickme')
+            kicked = False
+            deadline = time.time() + 15.0
+            while time.time() < deadline:
+                try:
+                    pid, r = c.recv()
+                except socket.timeout:
+                    continue
+                except (ConnectionError, OSError, m.Fail):
+                    kicked = True
+                    break
+                try:
+                    m.one_packet(c, st, w, biomes, ctx, pid, r)
+                except m.Fail as e:
+                    m.check('asked to be kicked' in str(e), 'disconnected for another reason: %s' % e)
+                    kicked = True
+                    break
+            m.check(kicked, '/kickme did not kick')
+            st.hit('showcase_kick')
+            print('  engine plugin showcase ok', flush=True)
+            os._exit(0)
+
+      except m.Fail:
+        print('  the chat so far: %r' % (w.chat[-10:],), flush=True)
+        raise
+
     wait(lambda: any('engine welcome' in said for said in w.chat), 'the welcome message the engine plugin sends on join')
     print('  heard: %s' % [said for said in w.chat if 'engine welcome' in said][0], flush=True)
     st.hit('engine_welcome')

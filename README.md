@@ -101,16 +101,8 @@ Smallest/most self-contained crates first, since later crates depend on them:
    Needs a real design pass once the main server crate (the crate that drives the
    server tick loop) clarifies what should drive scheduler turns. See
    `src/scheduler/lib.aowl`'s doc comment.
-4a. `api-macros` (~152 LOC) — **Not ported; by design, documented
-   instead.** This is a Rust proc-macro crate (`#[plugin_method]`,
-   `#[plugin_impl]`, `#[with_runtime]`) that runs as compiler codegen, not
-   runtime code, so there is no aowlmony module for it to become. Its
-   semantics (async-plugin-method wrapping, `#[no_mangle]` plugin-ABI
-   statics, tokio `block_on` bridging) are written up in
-   `src/api_macros/README.md` for whoever builds the plugin host later -
-   the honest aowlmony replacement is a plain template/generic wrapper called
-   by plugin authors plus a small codegen script, not a compiler plugin,
-   once the main server crate's plugin-loading side gives it a concrete target.
+4a. `api-macros` (~152 LOC) — **Not ported; replaced.** A Rust proc-macro crate for the WASM/native plugin ABI. Plugins here run on
+   the aoughwl engine and use `plugin_sdk/pluginsdk.aowl` instead (see `docs/PLUGINS.md`).
 4b. `macros` (~1.15k LOC) — **Not ported; documented instead**
    (`src/macros/README.md`). Single-file proc-macro crate, entirely
    compiler codegen: an `Event` derive + `cancellable`/`send_cancellable[_blocking]`
@@ -245,56 +237,11 @@ Smallest/most self-contained crates first, since later crates depend on them:
    closer look by whoever ports `packet_encoder.rs`/`packet_decoder.rs`
    next, since that's where Jester's client-side framing code is the more
    directly relevant reference.
-8. `plugin-utils` (~710 LOC) — **Done except HTTP.** `models.rs`,
-   `updater.rs`, `license.rs` (lease read/write via `std/json`, grace-period
-   evaluation), and `lib.rs`'s global-state glue → `src/plugin_utils/*.aowl`.
-   `init(context)`'s WASM-guest path is skipped (needs unported
-   `plugin-api`). `http.rs` is a call-shape stub only: aowlmony's
-   stdlib has no HTTP client or TLS at all, so `check_license_online`/
-   `check_for_updates` compile and return a clear "not implemented" error
-   rather than a fake success - needs libcurl/WinHTTP FFI eventually.
-9. `host-bindings` (~70 LOC) — **Not portable yet; documented
-   instead.** The entire file is one `wasmtime::component::bindgen!`
-   macro call over `../plugin-wit/v0.1/*.wit` (~14.2k lines of
-   WIT across 60+ files) - there is no hand-written Rust logic to
-   translate, and aowlmony has no WASM component-model runtime or
-   WIT-bindgen equivalent. See `src/host_bindings/README.md` for the full
-   explanation and the three real options once the plugin ABI is actually
-   being built (wasmtime C API FFI, a custom WIT→aowlmony generator, or
-   dropping the WASM sandbox model for native-loaded plugins).
-9b. `plugin-runtime` (~3.3k LOC) — **Not portable yet; documented
-    instead, except one small data type.** wasmtime `Store`
-    multiplexing/execution (`executor.rs`), cross-plugin re-entry tracking
-    (`chain.rs`), an async admission policy over that (`policy.rs`), and a
-    runtime-agnostic spawn trait (`spawn.rs`) are all tokio+wasmtime
-    plumbing with no aowlmony equivalent (no WASM runtime, and aowlmony's
-    async is `passive` procs + continuations, not poll-based futures).
-    `lifecycle.rs`'s `DriverState`/`DriverError` — the one piece that's
-    plain data — is ported to `src/plugin_runtime/lifecycle.aowl`; the
-    `Lifecycle`/`DriverJoin` types wrapping it in a tokio `watch` channel
-    are not. See `src/plugin_runtime/README.md` for the three replacement
-    paths, including the option (worth real consideration) of skipping
-    WASM sandboxing entirely and loading plugins natively the way the
-    sibling Jester project's `aowli` interpreter already does.
-9c. `plugin-api` (~24k LOC) — **Mostly not portable yet (WASM-guest SDK
-    glue); one real data-model piece landed.** Grepped every top-level and
-    `ext/` source file for `wit::` imports: only `permissions.rs` has none.
-    Everything else - `item.rs`, `block.rs`, `enchantment.rs`, `team.rs`,
-    `mobs.rs`, `forms.rs`, `display.rs`, `persistent_data.rs`, `logging.rs`,
-    `ai.rs`, `worldgen.rs`, `commands.rs`, `scheduler.rs`, `datapack.rs`,
-    `inventory.rs`, `recipe.rs`, `lib.rs` - is WASM-guest SDK code built
-    directly on the same `wasmtime::component::bindgen!`-generated `wit`
-    module that blocks `host-bindings`/`plugin-runtime`. `generated/block.rs`
-    (5.2k LOC) and `generated/item.rs` (6.7k LOC) are build-time-generated
-    registry data, out of scope like `data`. Ported: `permissions.aowl`
-    (plugin sandbox capability-string constants, pure data), and
-    `eventdata.aowl` - a real, transport-independent `EventData` object
-    model for 8 of the ~230 `events/*` types, built from the actual field
-    shapes in `pumpkin-plugin-wit`'s `event.wit` (the `.rs` wrapper files
-    themselves carry no fields). `aowlmony check` clean, and its test
-    (`eventdatatest.aowl`) actually **runs** via `aowlmony c -r` - pure data,
-    unaffected by the closure-through-vtable runtime crash. See
-    `src/plugin_api/README.md`.
+8. `plugin-utils`, `host-bindings`, `plugin-runtime`, `plugin-api` — **Not ported; replaced.** These are Pumpkin's plugin ecosystem: a
+   marketplace/licence client, the WIT bindings, the wasmtime driver and the WASM guest SDK. The port does not carry them. Plugins run
+   on the aoughwl engine, in aowlmony or JavaScript, loaded and managed by `src/plugin/pluginmanager.aowl`; the host calls they
+   get and the events they hear are in `docs/PLUGINS.md`. The WebAssembly host, the WIT interfaces and native plugin loading were
+   written and then removed in favour of the engine.
 10. `world`, `inventory`, `command` (~14.1k LOC) —
     **command: tokenizer layer AND the tree/dispatcher design pass done.**
     `errors/command_syntax_error.rs` (simplified), `context/string_range.rs`,
@@ -672,21 +619,9 @@ Smallest/most self-contained crates first, since later crates depend on them:
    duties are in scope), and a note that these submodules are independent
    of each other and would parallelize well across multiple forks.
 
-14. `pumpkin` main crate's `plugin/` module (~38.9k LOC) - **Small tractable
-    slice ported, bulk confirmed WASM-bridge-specific.** `plugin/loader/wasm/
-    wasm_host/wit/v0_1/**` (~35k+ of the total) is `wasmtime::component::
-    bindgen!`-generated WIT host bindings, the same unportable category as
-    `src/host_bindings/README.md`. Ported: `permissions.aowl` (permission
-    string constants + descriptions) and `native.aowl` (`LoaderError`,
-    `PLUGIN_API_VERSION`, `canLoad`/`canUnload`'s platform-extension logic -
-    NOT the actual dylib load, which needs aowlmony's dynlib FFI investigated
-    and a chosen async model). `plugintest.aowl` has no `entity.aowl`
-    dependency and **actually runs** (`aowlmony c -r`), proving the ported
-    logic for real. `plugin/mod.rs` (1336 lines, the real plugin
-    manager/event-dispatch core) and the ~230 `plugin/api/events/*` files
-    (native counterpart to `src/plugin_api/eventdata.aowl`'s already-ported 8
-    event types) are documented but not ported this pass - see
-    `src/server/plugin/README.md` for the full module map and next steps.
+14. `pumpkin` main crate's `plugin/` module (~38.9k LOC) - **Replaced.** The WASM host bindings, the native loader and the manager of
+    that module are not ported; plugins run on the aoughwl engine (`src/plugin/`, `docs/PLUGINS.md`). What is ported is the event
+    objects under `src/plugin/api/events/` and the hooks the network and entity code call (`pluginhooks.aowl`).
 
 15. `pumpkin` main crate's `command/` implementation directory (~30.3k LOC,
     the concrete `/gamemode`/`/say`/... handlers - distinct from the

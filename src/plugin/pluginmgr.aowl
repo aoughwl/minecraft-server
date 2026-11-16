@@ -1,72 +1,17 @@
-## The server's plugin manager: owns the `PluginHost`, loads `plugins/*.wasm` at start, wires plugin commands into the
-## server's command dispatcher and fires the server's events into the plugins.
-## Port of pumpkin/src/plugin/mod.rs (`PluginManager`: `load_plugins`, `try_load_plugin`, `active_plugins`, `fire`) and
-## the call sites of `PluginManager::fire` for player join and leave in pumpkin/src/net and pumpkin/src/entity/player.rs.
-## The manager itself (loading from `plugins/` in dependency order, the permission cache, `/plugin load|unload|reload`) is
-## pluginserver.aowl over managercore.aowl.
-## PARTIAL: pumpkin/src/plugin/mod.rs - loads WebAssembly components from `./plugins` only: upstream's second loader
-## (`loader/native.rs`) is `libloading` over Rust cdylibs sharing Rust's own ABI (trait objects, `Arc<Server>`), which has no
-## counterpart here and is a deliberate non-goal: native DLL plugins are not wanted. Plugins are meant to be programs run by
-## the aoughwl engine (aowlmony or JavaScript, `aoughwl-engine`'s `aoe_*` API); that host is not written yet. Hot reload polls the plugin folder instead of watching it (pluginserver.aowl). Every event
-## upstream fires has its call site: player events (pluginhooks.aowl, installed below), block, world, server and packet
-## events (pluginwireevents.aowl), fish, egg-throw and the custom click action; the dispatcher in pluginhost.aowl takes any
-## event name. The host interfaces behind them are listed in pluginhost.aowl. The event types upstream declares without a
-## call site (BlockBurn, BlockCanBuild, ChunkLoad, ChunkSave) have none here either.
+## The server's plugin start-up: hands the server to the plugin manager (pluginmanager.aowl), fires the join and leave events, and
+## wraps the experience, respawn and death hooks of the entity code so those events reach the plugins.
+## Plugins run on the aoughwl engine; the manager that finds, loads, unloads and reloads them is pluginmanager.aowl, and the
+## events the engine hears are chained on by engine/engineplugins.aowl. Port of the call sites of `PluginManager::fire` for player
+## join and leave in pumpkin/src/net and pumpkin/src/entity/player.rs.
 
-import std/[syncio, strutils, dirs, paths, options]
-import ../util/gamemode
-import ../util/math/position
-import pluginhost
-import pluginwire
-import pluginwire2
-import pluginserver
-import ../server/scheduler
-import wasm/canonabi
-import ../command/[fallbackdispatch, cmdsource]
 import ../server/serverbase
 import ../util/text/text
-import ../util/vector3
 import ../server/entity/entitymod
 import ../server/world/worldmod
 import pluginhooks
-import pluginwireevents
+import pluginmanager
 import engine/engineplugins
-import api/events/player/[fish, egg_throw, custom_click_action, bedrock_form_response, player_join, player_leave, player_respawn, exp_change, player_permission_check]
-import wit/[witserver, witeventsplayer, witeventsplayer2]
-
-const
-  PluginsFolder = "plugins"
-
-var gHost = newPluginHost("plugins")
-var gInPermissionCheck = false
-
-proc readWasm(file: string): string =
-  try:
-    result = readFile(file)
-  except:
-    result = ""
-
-proc playersOfWorld(player: Player): seq[Player] =
-  result = @[]
-  for p in player.world.players: result.add p
-
-proc callCommandPlayerOf(prev: proc(player: Player): CommandPlayer {.closure.}; player: Player): CommandPlayer =
-  ## A captured closure variable called inside a closure asserts in hexer; the call is made here, on a parameter.
-  prev(player)
-
-proc callPermission(inner: proc(node: string): bool {.closure.}; node: string): bool =
-  inner(node)
-
-proc wrapPermissionCheck(built: CommandPlayer; player: Player) =
-  let inner = built.hasPermission
-  built.hasPermission = proc(node: string): bool {.closure.} =
-    let base = callPermission(inner, node)
-    if gHost.activeCount() == 0 or gInPermissionCheck: return base
-    gInPermissionCheck = true
-    var ev = newPlayerPermissionCheckEvent(player, node, base)
-    firePlayerPermissionCheck(ev)
-    gInPermissionCheck = false
-    ev.result
+import api/events/player/[player_join, player_leave, player_respawn, exp_change]
 
 proc callExpPrev(prev: proc(player: Player; amount: int32) {.closure.}; player: Player; amount: int32) =
   prev(player, amount)
@@ -78,92 +23,8 @@ proc callKilledPrev(prev: proc(player: Player; deathMessage: TextComponent) {.cl
     deathMessage: TextComponent) =
   prev(player, deathMessage)
 
-proc installPlayerEventHooks(server: Server) =
-  ## The call sites of `PluginManager::fire` for the player events that are not join and leave: the network handlers
-  ## call the closures of pluginhooks.aowl, the entity code the two hooks chained here.
-  gLink.server = server
-  gPluginChatHook = proc(player: Player; message: string): (bool, string) {.closure.} =
-    if gHost.activeCount() == 0: return (false, message)
-    let o = playerChatEvent(gHost, player, message, playersOfWorld(player))
-    (o.cancelled, o.message)
-  gPluginCommandHook = proc(player: Player; command: string): (bool, string) {.closure.} =
-    if gHost.activeCount() == 0: return (false, command)
-    let o = playerCommandSendEvent(gHost, player, command)
-    (o.cancelled, o.message)
-  gPluginMoveHook = proc(player: Player; fromPos, toPos: Vector3[float64]): (bool, Vector3[float64]) {.closure.} =
-    if gHost.activeCount() == 0: return (false, toPos)
-    let o = playerMoveEvent(gHost, player, fromPos, toPos)
-    (o.cancelled, o.pos)
-  gPluginToggleHook = proc(player: Player; kind: int; value: bool): bool {.closure.} =
-    if gHost.activeCount() == 0: return false
-    playerToggleEvent(gHost, player, kind, value).cancelled
-  gPluginGameModeHook = proc(player: Player; previous, next: GameMode): (bool, GameMode) {.closure.} =
-    if gHost.activeCount() == 0: return (false, next)
-    let o = playerGamemodeChangeEvent(gHost, player, previous, next)
-    (o.cancelled, GameMode(max(0, min(3, o.value))))
-  gPluginItemHeldHook = proc(player: Player; previous, next: int): bool {.closure.} =
-    if gHost.activeCount() == 0: return false
-    playerItemHeldEvent(gHost, player, previous, next).cancelled
-  gPluginTeleportHook = proc(player: Player; fromPos, toPos: Vector3[float64]): (bool, Vector3[float64]) {.closure.} =
-    if gHost.activeCount() == 0: return (false, toPos)
-    let o = playerTeleportEvent(gHost, player, fromPos, toPos)
-    (o.cancelled, o.pos)
-  gPluginChangeWorldHook = proc(player: Player; previous, next: World; pos: Vector3[float64]; yaw, pitch: float32): (bool, Vector3[float64], float32, float32) {.closure.} =
-    if gHost.activeCount() == 0: return (false, pos, yaw, pitch)
-    let o = playerChangeWorldEvent(gHost, player, worldRep(previous), worldRep(next), pos, yaw, pitch)
-    (o.cancelled, o.pos, o.yaw, o.pitch)
-  gPluginLoginHook = proc(player: Player): (bool, TextComponent) {.closure.} =
-    if gHost.activeCount() == 0: return (false, text(""))
-    let o = playerLoginEvent(gHost, player, text("You have been kicked from the server"))
-    (o.cancelled, o.text)
-  gPluginInteractHook = proc(player: Player; action: int; pos: Option[BlockPos]): bool {.closure.} =
-    if gHost.activeCount() == 0: return false
-    var name = "minecraft:air"
-    if pos.isSome:
-      name = dataBlockOf(uint32(player.world.getBlockStateId(pos.unsafeGet))).name
-    playerInteractEvent(gHost, player, action, pos, name).cancelled
-  gPluginPlayerEventHook = proc(player: Player; ev: PlayerEv): (bool, bool) {.closure.} =
-    if gHost.activeCount() == 0: return (false, ev.flag)
-    playerEvent(gHost, player, ev)
-  gPluginBlockPlaceHook = proc(player: Player; placedBlock, clickedBlock: string; position: BlockPos): bool {.closure.} =
-    if gHost.activeCount() == 0: return false
-    blockPlaceEvent(gHost, player, placedBlock, clickedBlock, position)
-  # `Player::has_permission` fires `PlayerPermissionCheckEvent` with the manager's answer and returns the event's result: the
-  # `hasPermission` of each `CommandPlayer` is wrapped as it is built (a plugin asking inside the event is not offered it again).
-  let prevCommandPlayerOf = server.commandPlayerOf
-  if prevCommandPlayerOf != nil:
-    server.commandPlayerOf = proc(player: Player): CommandPlayer {.closure.} =
-      let existing = player.commandPlayer
-      if existing != nil: return existing
-      let built = callCommandPlayerOf(prevCommandPlayerOf, player)
-      wrapPermissionCheck(built, player)
-      built
-  gFishHook = proc(event: var PlayerFishEvent) {.closure.} =
-    if gHost.activeCount() == 0: return
-    playerFishEvent(gHost, event)
-  gEggThrowHook = proc(event: var PlayerEggThrowEvent) {.closure.} =
-    if gHost.activeCount() == 0: return
-    playerEggThrowEvent(gHost, event)
-  gCustomClickActionHook = proc(event: CustomClickActionEvent) {.closure.} =
-    if gHost.activeCount() == 0: return
-    customClickActionEvent(gHost, event)
-  gBedrockFormResponseHook = proc(event: BedrockFormResponseEvent) {.closure.} =
-    if gHost.activeCount() == 0: return
-    discard bedrockFormResponseEvent(gHost, event.player, event.formId, event.responseData)
-  gPluginJoinHook = proc(player: Player; message: TextComponent): (bool, TextComponent) {.closure.} =
-    if gHost.activeCount() == 0: return (false, message)
-    let o = playerJoinEvent(gHost, player, message)
-    (o.cancelled, o.text)
-  gPluginLeaveHook = proc(player: Player; message: TextComponent): (bool, TextComponent) {.closure.} =
-    if gHost.activeCount() == 0: return (false, message)
-    let o = playerLeaveEvent(gHost, player, message)
-    (o.cancelled, o.text)
-  gPluginExpChangeHook = proc(player: Player; amount: int32): int32 {.closure.} =
-    if gHost.activeCount() == 0: return amount
-    int32(playerExpChangeEvent(gHost, player, int(amount)).value)
-  gPluginRespawnHook = proc(player: Player; previous, respawned: World; pos: Vector3[float64]; yaw, pitch: float32; alive: bool) {.closure.} =
-    if gHost.activeCount() == 0: return
-    playerRespawnEvent(gHost, player, worldRep(previous), worldRep(respawned), pos, yaw, pitch, alive)
+proc installEntityEventHooks() =
+  ## The entity code calls these hooks; each fires the event on its way (to the plugins, through the hook the engine chained).
   let prevExp = gPlayerHooks.addExperiencePoints
   gPlayerHooks.addExperiencePoints = proc(player: Player; amount: int32) {.closure.} =
     var ev = newPlayerExpChangeEvent(player, amount)
@@ -176,39 +37,18 @@ proc installPlayerEventHooks(server: Server) =
   let prevKilled = gPlayerHooks.handleKilled
   gPlayerHooks.handleKilled = proc(player: Player; deathMessage: TextComponent) {.closure.} =
     callKilledPrev(prevKilled, player, deathMessage)
-    if gHost.activeCount() == 0: return
-    discard playerDeathEvent(gHost, player, deathMessage)
+    fireEnginePlayerDeath(player, deathMessage.getText)
 
 proc startPlugins*(server: Server) =
-  ## `PluginManager::load_plugins` for the WebAssembly loader. Called once by `loadServer`, after the dispatcher exists.
-  gHost.logLine = proc (line: string) {.closure.} = echo line
-  wireWit(gHost.ws, server)
-  wireExt(gHost.ext, server)
-  installPlayerEventHooks(server)
-  installEventHooks(server, gHost)   # block, world and server events: plugin/pluginwireevents.aowl
-  gHost.registerTree = proc (tree: CommandTree; permission: string) {.closure.} =
-    let d = server.commandDispatcher
-    if d != nil:
-      register(d.fallbackDispatcher, tree, permission)
-  # the manager (pluginserver.aowl): loads plugins/, registers /plugin, and answers /plugins
-  startPluginManager(gHost, server)
-  # the JavaScript plugins on the aoughwl engine (plugin/engine/engineplugins.aowl); nothing starts without one
-  startEnginePlugins(server)
+  ## Called once by `loadServer`, after the command dispatcher exists: loads the plugins in `plugins/` and starts the manager.
+  installEntityEventHooks()
+  startPluginManager(server)
 
 proc firePlayerJoin*(player: Player) =
-  ## `PluginManager::fire(PlayerJoinEvent)`: the player and `<name> joined the game`, cancellable upstream (a cancel
-  ## suppresses the broadcast; the broadcast itself is not routed through here yet).
+  ## `PluginManager::fire(PlayerJoinEvent)`: the player and `<name> joined the game`.
   var ev = newPlayerJoinEvent(player, text(player.gameprofile.name & " joined the game"))
   firePlayerJoinEvent(ev)
 
 proc firePlayerLeave*(player: Player) =
   var ev = newPlayerLeaveEvent(player, text(player.gameprofile.name & " left the game"))
   firePlayerLeaveEvent(ev)
-
-proc runPluginTasks*(due: seq[ScheduledTask]) =
-  ## The plugin tasks `TaskScheduler::tick` returned this server tick: each is its plugin's `handle-task(handler-id, server)`.
-  let seq1Src = due
-  for idx1 in 0 ..< seq1Src.len:
-    let t = seq1Src[idx1]
-    discard runTask(gHost, t.pluginId, int(t.handlerId))
-  tickPlugins()

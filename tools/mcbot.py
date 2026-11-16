@@ -998,10 +998,6 @@ class Stages:
     BLOCKS_VERIFY_NAMES = ['blocks_persisted']
     PLAYA_NAMES = ['pa_shift_click', 'pa_drag_split', 'pa_tab_complete', 'pa_chat_sent']
     PLAYA_LISTEN_NAMES = ['pa_chat_heard']
-    PLUGIN_NAMES = ['plugin_welcome', 'plugin_chat_passes', 'plugin_chat_cancelled']
-    PLUGIN2_NAMES = ['plugin2_given', 'plugin2_drop_stack_allowed', 'plugin2_drop_one_cancelled']
-    PLUGMGR_NAMES = ['plugmgr_tree', 'plugmgr_chat_before', 'plugmgr_list', 'plugmgr_load_error', 'plugmgr_loaded', 'plugmgr_already_loaded',
-                     'plugmgr_chat_cancelled', 'plugmgr_unloaded', 'plugmgr_chat_after_unload', 'plugmgr_reloaded']
     C2_NAMES = ['sign_placed', 'sign_text_set', 'bed_placed', 'bed_slept', 'piston_pushed']
     C2_VERIFY_NAMES = ['sign_persisted', 'bed_persisted', 'piston_persisted']
     CONTAINERS_NAMES = ['container_placed', 'container_opened', 'container_filled', 'window_opens', 'item_replace_block']
@@ -1021,6 +1017,8 @@ class Stages:
     ENGINE_NAMES = ['engine_welcome', 'engine_gamemode', 'engine_teleport', 'engine_pos', 'engine_chat_cancelled']
     ENGINE_KICK_NAMES = ['engine_welcome', 'engine_kick', 'engine_server_alive_after_kick']
     ENGINE_EVENT_NAMES = ['engine_welcome', 'engine_move_event', 'engine_place_event', 'engine_broadcast']
+    ENGINE_SHOWCASE_NAMES = ['showcase_join', 'showcase_commands', 'showcase_chat', 'showcase_actions',
+                             'showcase_tasks', 'showcase_manager', 'showcase_kick']
 
     def __init__(self, extra=()):
         self.reached = []
@@ -2913,15 +2911,9 @@ def run(args):
         extra = list(extra) + Stages.BLOCKS_VERIFY_NAMES
     if args.c2:
         extra = list(extra) + Stages.C2_NAMES
-    if args.wasm_plugin:
-        extra = list(extra) + Stages.PLUGIN_NAMES
-    if args.wasm_plugin2:
-        extra = list(extra) + Stages.PLUGIN2_NAMES
     if args.engine_plugin:
         extra = list(extra) + {'actions': Stages.ENGINE_NAMES, 'kick': Stages.ENGINE_KICK_NAMES,
-                               'events': Stages.ENGINE_EVENT_NAMES}[args.engine_plugin]
-    if args.plugmgr:
-        extra = list(extra) + Stages.PLUGMGR_NAMES
+                               'events': Stages.ENGINE_EVENT_NAMES, 'showcase': Stages.ENGINE_SHOWCASE_NAMES}[args.engine_plugin]
     if args.playa:
         extra = list(extra) + (Stages.PLAYA_LISTEN_NAMES if args.playa == 'listen' else Stages.PLAYA_NAMES)
     if args.c2_verify:
@@ -3137,18 +3129,9 @@ def run(args):
         if args.playa:
             import mcbot_playa
             mcbot_playa.playa_session(sys.modules[__name__], c, st, w, biomes, ctx, args)
-        if args.wasm_plugin:
-            import mcbot_plugin
-            mcbot_plugin.plugin_session(sys.modules[__name__], c, st, w, biomes, ctx, args)
-        if args.wasm_plugin2:
-            import mcbot_plugin2
-            mcbot_plugin2.plugin2_session(sys.modules[__name__], c, st, w, biomes, ctx, args)
         if args.engine_plugin:
             import mcbot_engine
             mcbot_engine.engine_session(sys.modules[__name__], c, st, w, biomes, ctx, args)
-        if args.plugmgr:
-            import mcbot_plugmgr
-            mcbot_plugmgr.plugmgr_session(sys.modules[__name__], c, st, w, biomes, ctx, args)
         if args.c2 or args.c2_verify:
             import mcbot_c2
             if args.c2:
@@ -3525,10 +3508,7 @@ def main():
     ap.add_argument('--blocks-verify', help='a file from --blocks --save: check the door, lamp and sand are still there')
     ap.add_argument('--assets', default=os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '..', 'ref', 'pumpkin-1.21.11', 'assets', 'blocks.json'), help='blocks.json of the pinned upstream, for --blocks')
     ap.add_argument('--playa', choices=['act', 'listen'], help='play packets as an operator: shift-click, drag split, tab completion and chat (act), or hear the actor chat (listen); see mcbot_playa.py')
-    ap.add_argument('--wasm-plugin', action='store_true', help='a wasm plugin welcomes the player and cancels chat starting with x; see mcbot_plugin.py')
-    ap.add_argument('--engine-plugin', choices=['actions', 'kick', 'events'], help='a JavaScript plugin on the aoughwl engine acts on the player from chat (gamemode, teleport, position, cancel), or kicks it; see mcbot_engine.py')
-    ap.add_argument('--wasm-plugin2', action='store_true', help='a wasm plugin cancels dropping one item (needs --op); see mcbot_plugin2.py')
-    ap.add_argument('--plugmgr', action='store_true', help='the plugin manager at run time: /plugin list, load, unload, reload; see mcbot_plugmgr.py')
+    ap.add_argument('--engine-plugin', choices=['actions', 'kick', 'events', 'showcase'], help='a JavaScript plugin on the aoughwl engine acts on the player from chat (gamemode, teleport, position, cancel), or kicks it; see mcbot_engine.py')
     ap.add_argument('--c2', action='store_true', help='a sign with text, a bed slept in and a piston push; see mcbot_c2.py')
     ap.add_argument('--c2-verify', help='a file from --c2 --save: the sign, bed and piston are still there')
     ap.add_argument('--nbtfam', action='store_true', help='/data on storage and a chest and /execute store, over the wire; see mcbot_nbtfam.py')

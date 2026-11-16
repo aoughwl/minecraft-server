@@ -12,7 +12,7 @@
 ## aoe_engine.dll.
 
 import std/[syncio, strutils, dirs, paths, options]
-import aoe, enginehost
+import aoe, enginehost, jssdk
 import ../../server/serverbase
 import ../../server/entity/player
 import ../pluginhooks
@@ -21,8 +21,13 @@ import ../../util/vector3
 import ../../util/gamemode
 import ../../util/math/position
 import ../pluginhooksevents
+import ../api/events/player/[fish, egg_throw, custom_click_action]
 import ../../data/blocks
 import ../../command/cmdsource
+import ../../command/fallbackdispatch
+import ../../command/client_suggestions
+import ../../command/args
+import ../../util/permission
 import ../../server/world/worldmod
 import ../../world/chunkdata
 import ../../server/net/java/javamod
@@ -35,6 +40,7 @@ type
   EnginePlugin = object
     name: string
     handle: int32
+    native: bool        ## an aowlmony program of its own; false for the one program all the JavaScript plugins are bundled into
 
 var
   gPlugins: seq[EnginePlugin] = @[]
@@ -44,9 +50,20 @@ var
   gEvPlayerName = ""
   gEvMessage = ""
   gEvCancelled = false
+  gEvValue = 0.0                           ## the event's number a plugin may change (the damage amount), set with event_set_value
+  gEvFlag = false                          ## the event's boolean, for the events that have one (a plugin sets it with event_set_flag)
+  gScope = ""                              ## the plugin whose code is running: commands and tasks it registers are its own
+  gEvOwner = ""                            ## when set, the event is for this plugin only (a command or task it registered)
+  gLive: seq[string] = @[]                 ## the entry names some loaded plugin defines (hot hooks check it)
+  gSubs: seq[(string, string)] = @[]       ## (plugin, entry): an aowlmony plugin that listens to an event (its generic `event` entry is called)
   gSourceText = ""                         ## the plugins' own sources, to see which entries any plugin defines
   gEvStrs: seq[(string, string)] = @[]     ## the current event's extra string fields, read with hostv("event_str", key)
   gEvNums: seq[(string, float64)] = @[]    ## its numeric fields, read with hostv("event_num", key)
+
+proc subscribed(plugin, entry: string): bool =
+  for kv in gSubs:
+    if kv[0] == plugin and kv[1] == entry: return true
+  false
 
 proc textArg(args: seq[HostArg]; k: int): string =
   if k < args.len: args[k].s else: ""
@@ -71,7 +88,8 @@ proc hostServerLog(context: int64; args: seq[HostArg]; res: var HostArg): int32 
 proc hostEventStr(context: int64; args: seq[HostArg]; res: var HostArg): int32 =
   let key = textArg(args, 0)
   res.kind = AoeVString
-  res.s = (if key == "player": gEvPlayerName elif key == "message": gEvMessage elif key == "event": gEvName else: "")
+  res.s = (if key == "player": gEvPlayerName elif key == "message": gEvMessage elif key == "event": gEvName
+           elif key == "owner": gEvOwner else: "")
   for kv in gEvStrs:
     if kv[0] == key: res.s = kv[1]
   1
@@ -83,6 +101,10 @@ proc hostEventNum(context: int64; args: seq[HostArg]; res: var HostArg): int32 =
   res.n = 0.0
   for kv in gEvNums:
     if kv[0] == key: res.n = kv[1]
+  1
+
+proc hostPluginScope(context: int64; args: seq[HostArg]; res: var HostArg): int32 =
+  gScope = textArg(args, 0)
   1
 
 proc hostEventSetMessage(context: int64; args: seq[HostArg]; res: var HostArg): int32 =
@@ -109,10 +131,34 @@ proc hostPlayerCount(context: int64; args: seq[HostArg]; res: var HostArg): int3
     res.i = int64(total)
   1
 
+proc parseNumText(s: string): float64 =
+  ## A decimal number in text ("-12", "3.5"); 0 when it is not one. aowlmony plugins send every argument as text.
+  var i = 0
+  var neg = false
+  if i < s.len and s[i] == '-':
+    neg = true
+    inc i
+  var whole = 0.0
+  while i < s.len and s[i] >= '0' and s[i] <= '9':
+    whole = whole * 10.0 + float64(ord(s[i]) - 48)
+    inc i
+  var frac = 0.0
+  var scale = 1.0
+  if i < s.len and s[i] == '.':
+    inc i
+    while i < s.len and s[i] >= '0' and s[i] <= '9':
+      frac = frac * 10.0 + float64(ord(s[i]) - 48)
+      scale = scale * 10.0
+      inc i
+  result = whole + frac / scale
+  if neg: result = -result
+
 proc numArg(args: seq[HostArg]; k: int): float64 =
-  ## A JavaScript number as the engine passes it: a float, or an int when the value is integral.
+  ## A number as the engine passes it: a float, an int when the value is integral, or text from an aowlmony plugin.
   if k >= args.len: return 0.0
-  if args[k].kind == AoeVNumber: args[k].n else: float64(args[k].i)
+  if args[k].kind == AoeVNumber: args[k].n
+  elif args[k].kind == AoeVString: parseNumText(args[k].s)
+  else: float64(args[k].i)
 
 proc findPlayer(name: string): Option[Player] =
   result = none[Player]()
@@ -197,6 +243,7 @@ proc hostServerBroadcast(context: int64; args: seq[HostArg]; res: var HostArg): 
 
 type EngTask = object
   id: int
+  owner: string
   due: int64
   period: int64     ## 0 for a one-shot task
 
@@ -210,7 +257,7 @@ proc addTask(delayTicks: float64; repeat: bool): int =
   if d < 1: d = 1
   result = gNextTask
   inc gNextTask
-  gTasks.add EngTask(id: result, due: gNowTick + d, period: (if repeat: d else: 0'i64))
+  gTasks.add EngTask(id: result, owner: gScope, due: gNowTick + d, period: (if repeat: d else: 0'i64))
 
 proc hostScheduleAfter(context: int64; args: seq[HostArg]; res: var HostArg): int32 =
   res.kind = AoeVInt
@@ -231,6 +278,7 @@ proc hostScheduleCancel(context: int64; args: seq[HostArg]; res: var HostArg): i
   1
 
 proc registerServerHost() =
+  registerHost("plugin_scope", hostPluginScope)
   registerHost("player_online", hostPlayerOnline)
   registerHost("player_message_to", hostPlayerMessageTo)
   registerHost("player_kick", hostPlayerKick)
@@ -287,11 +335,13 @@ proc scanEnginePlugins*(folder: string): seq[(string, string)] =
   except ErrorCode:
     discard
 
-proc fireEngineEv*(entry, playerName, message: string; strs: seq[(string, string)]; nums: seq[(string, float64)];
+proc fireEngineOwned*(entry, playerName, message, owner: string; strs: seq[(string, string)]; nums: seq[(string, float64)];
     player: Option[Player]): (bool, string) =
-  ## Offers the event to every plugin that has the entry; (cancelled, the message after the plugins). `strs` and `nums` are the
-  ## event's extra fields, which a plugin reads with `hostv("event_str", key)` and `hostv("event_num", key)`.
+  ## Offers the event to every plugin that has the entry (to the plugin `owner` alone when it is not empty); (cancelled, the message
+  ## after the plugins). `strs` and `nums` are the event's extra fields, which a plugin reads with `hostv("event_str", key)` and
+  ## `hostv("event_num", key)`.
   gEvName = entry
+  gEvOwner = owner
   gEvPlayerName = playerName
   gEvMessage = message
   gEvStrs = strs
@@ -300,12 +350,27 @@ proc fireEngineEv*(entry, playerName, message: string; strs: seq[(string, string
   let outer = gCurPlayer
   gCurPlayer = player
   for p in gPlugins:
-    if hasEntry(p.handle, entry):
+    if owner.len > 0 and p.native and p.name != owner: continue
+    if p.native:
+      gScope = p.name
+      if subscribed(p.name, entry):
+        if callPlugin(p.handle, "event") < 0:
+          echo "[plugin] ", p.name, ": ", entry, " failed: ", engineError()
+      elif hasEntry(p.handle, entry):
+        if callPlugin(p.handle, entry) < 0:
+          echo "[plugin] ", p.name, ": ", entry, " failed: ", engineError()
+      gScope = ""
+    elif hasEntry(p.handle, entry):
       if callPlugin(p.handle, entry) < 0:
         echo "[plugin] ", p.name, ": ", entry, " failed: ", engineError()
   gCurPlayer = outer
+  gEvOwner = ""
   flushPluginLog()
   (gEvCancelled, gEvMessage)
+
+proc fireEngineEv*(entry, playerName, message: string; strs: seq[(string, string)]; nums: seq[(string, float64)];
+    player: Option[Player]): (bool, string) =
+  fireEngineOwned(entry, playerName, message, "", strs, nums, player)
 
 proc fireEngineAs*(entry, playerName, message: string; player: Option[Player]): (bool, string) =
   fireEngineEv(entry, playerName, message, @[], @[], player)
@@ -446,22 +511,147 @@ proc callGrowPrev(prev: proc(world: BlockWorld; oldBlock: Block; oldState: Block
 proc callChunkPrev(prev: proc(client: JavaClient; chunk: ChunkData): bool {.closure.}; client: JavaClient; chunk: ChunkData): bool =
   prev(client, chunk)
 
+const HotEntries = ["on_server_tick_start", "on_server_tick_end", "on_packet_received", "on_block_redstone", "on_block_grow",
+  "on_chunk_send"]
+
+proc noteSource*(text: string) =
+  ## Adds a plugin's source to what is known about the loaded plugins, and notes which hot entries it mentions.
+  gSourceText.add text
+  gSourceText.add "\n"
+  for e in HotEntries:
+    var known = false
+    for g in gLive:
+      if g == e: known = true
+    if text.find(e) >= 0 and not known: gLive.add e
+
+proc forgetSources*() =
+  gSourceText = ""
+  gLive = @[]
+
+proc listened(entry: string): bool =
+  ## True when some loaded plugin subscribed to the event, or (a JavaScript or raw entry) its source mentions the entry.
+  for kv in gSubs:
+    if kv[1] == entry: return true
+  gSourceText.find(entry) >= 0
+
 proc entryUsed(name: string): bool =
-  ## True when some plugin's source mentions the entry; the hot hooks (tick, packet, redstone) are installed only then.
-  gSourceText.find(name) >= 0
+  ## True when some loaded plugin's source mentions the entry; the hot hooks (tick, packet, redstone ...) do nothing otherwise.
+  for e in gLive:
+    if e == name: return true
+  false
 
 proc fireServer(entry: string; strs: seq[(string, string)]; nums: seq[(string, float64)]): (bool, string) =
   fireEngineEv(entry, "", "", strs, nums, none[Player]())
+
+# ---- commands: register_command(name, description, level) adds /name (level 0 anyone, 1-4 operators of that level), taking an
+# optional greedy text argument. Running it calls the plugin entry `on_command` (hostv("event_str", "command" | "args" | "player"));
+# the plugin answers with command_reply(text), which goes to whoever ran it (a player or the console), and may call
+# command_fail(text) to make the command fail with that message. ----
+
+var
+  gReply: seq[string] = @[]
+  gCmdFail = ""
+  gCmdOwners: seq[(string, string)] = @[]   ## (command name, the plugin that registered it)
+
+proc ownerOfCommand(name: string): string =
+  result = ""
+  for kv in gCmdOwners:
+    if kv[0] == name: result = kv[1]
+
+proc hostCommandReply(context: int64; args: seq[HostArg]; res: var HostArg): int32 =
+  gReply.add textArg(args, 0)
+  1
+
+proc hostCommandFail(context: int64; args: seq[HostArg]; res: var HostArg): int32 =
+  gCmdFail = textArg(args, 0)
+  1
+
+proc runEngineCommand(cmdName, rest: string; sender: CommandSender): CommandResult =
+  var who = ""
+  if sender.kind == cskPlayer: who = sender.player.gameProfile.name
+  gReply = @[]
+  gCmdFail = ""
+  discard fireEngineOwned("on_command", who, "", ownerOfCommand(cmdName), @[("command", cmdName), ("args", rest)], @[], none[Player]())
+  for line in gReply:
+    sender.sendMessage(text(line))
+  gReply = @[]
+  if gCmdFail.len > 0:
+    let message = gCmdFail
+    gCmdFail = ""
+    return cmdFailed(text(message))
+  cmdSuccess(1'i32)
+
+proc hostRegisterCommand(context: int64; args: seq[HostArg]; res: var HostArg): int32 =
+  res.kind = AoeVBool
+  res.i = 0
+  if gEngineServer.isNone: return 1
+  let srv: Server = gEngineServer.unsafeGet
+  let name = textArg(args, 0)
+  let dispatcher = srv.commandDispatcher
+  if name.len == 0: return 1
+  if dispatcher == nil: return 1
+  let level = int(numArg(args, 2))
+  let node = "engine:command." & name
+  let commandServer = srv.commandServer
+  if commandServer != nil:
+    let registry = commandServer.permissionRegistry
+    if registry != nil:
+      let def = (if level <= 0: permissionAllow() else: permissionOp(PermissionLvl(min(level, 4))))
+      discard registerPermission(registry, newPermission(node, textArg(args, 1), def))
+  let cmdName = name
+  var keptOwners: seq[(string, string)] = @[]
+  for kv in gCmdOwners:
+    if kv[0] != name: keptOwners.add kv
+  gCmdOwners = keptOwners
+  gCmdOwners.add (name, gScope)
+  let exec: FallbackExecutor = proc(sender: CommandSender; server: nil CommandServer; consumed: ConsumedArgs): CommandResult {.closure.} =
+    var rest = ""
+    discard findString(consumed, "args", akMsg, rest)
+    runEngineCommand(cmdName, rest, sender)
+  var tree = newCommandTree([name], textArg(args, 1))
+  tree = then(tree, execute(argument("args", newMsgArgConsumer()), exec))
+  tree = execute(tree, exec)
+  register(dispatcher.fallbackDispatcher, tree, node)
+  res.i = 1
+  1
+
+proc hostSubscribeEvent(context: int64; args: seq[HostArg]; res: var HostArg): int32 =
+  ## subscribe_event(entry): the plugin that is running listens to that event. Busy events are only offered while someone listens.
+  let entry = textArg(args, 0)
+  if not subscribed(gScope, entry): gSubs.add (gScope, entry)
+  for e in HotEntries:
+    if e == entry:
+      var known = false
+      for g in gLive:
+        if g == e: known = true
+      if not known: gLive.add e
+  1
+
+proc hostEventSetFlag(context: int64; args: seq[HostArg]; res: var HostArg): int32 =
+  gEvFlag = numArg(args, 0) != 0.0
+  1
+
+proc hostEventSetValue(context: int64; args: seq[HostArg]; res: var HostArg): int32 =
+  gEvValue = numArg(args, 0)
+  1
+
+proc registerCommandHost() =
+  registerHost("event_set_flag", hostEventSetFlag)
+  registerHost("event_set_value", hostEventSetValue)
+  registerHost("subscribe_event", hostSubscribeEvent)
+  registerHost("register_command", hostRegisterCommand)
+  registerHost("command_reply", hostCommandReply)
+  registerHost("command_fail", hostCommandFail)
 
 proc runDueTasks*(tick: int64) =
   ## Called once per server tick: runs `on_task` for each task whose time has come, repeating tasks are set again. The task list is
   ## copied first, so a plugin that schedules or cancels inside `on_task` changes the next tick's list and not this one.
   gNowTick = tick
-  var due: seq[int] = @[]
+  var due: seq[(int, string)] = @[]
   var next: seq[EngTask] = @[]
   for t in gTasks:
     if t.due <= tick:
-      due.add t.id
+      due.add (t.id, t.owner)
       if t.period > 0:
         var again = t
         again.due = tick + t.period
@@ -469,13 +659,18 @@ proc runDueTasks*(tick: int64) =
     else:
       next.add t
   gTasks = next
-  for id in due:
-    discard fireServer("on_task", @[], @[("id", float64(id))])
+  for d in due:
+    discard fireEngineOwned("on_task", "", "", d[1], @[], @[("id", float64(d[0]))], none[Player]())
 
 const EntryNames = ["start", "stop", "on_player_chat", "on_player_command", "on_player_join", "on_player_leave",
   "on_player_move", "on_player_teleport", "on_player_toggle", "on_player_gamemode_change", "on_player_item_held",
   "on_player_login", "on_player_interact", "on_block_place", "on_server_command", "on_server_broadcast", "on_server_tick_start",
-  "on_server_tick_end", "on_server_load", "on_packet_received", "on_block_redstone", "on_spawn_change", "on_block_grow", "on_chunk_send", "on_task"]
+  "on_server_tick_end", "on_server_load", "on_packet_received", "on_block_redstone", "on_spawn_change", "on_block_grow", "on_chunk_send", "on_task", "on_command", "on_player_exp_change", "on_player_respawn", "on_player_death",
+  "on_player_swing", "on_player_use_item", "on_player_interact_entity", "on_player_custom_payload", "on_player_main_hand_change",
+  "on_inventory_close", "on_inventory_click", "on_block_break", "on_player_drop_item", "on_player_pickup_item", "on_player_item_consume",
+  "on_player_bed_enter", "on_player_bed_leave", "on_sign_change", "on_bucket_empty", "on_bucket_fill", "on_permission_check",
+  "on_player_fish", "on_player_egg_throw", "on_custom_click", "on_player_change_world",
+  "on_entity_damage", "on_entity_death", "on_entity_spawn", "on_entity_remove", "on_explosion", "on_weather_change"]
 
 proc jsString(s: string): string =
   ## A double-quoted JavaScript string literal.
@@ -528,55 +723,161 @@ proc bundleOf(found: seq[(string, string)]): string =
       if k > 0: result.add ", "
       result.add EntryNames[k]
     result.add ";\n"
+    result.add JsSdkSource
+    result.add "\n"
     result.add stripModuleSyntax(readText(file))
     result.add "\n;var __h = {};\n"
     for e in EntryNames:
       result.add "if (typeof " & e & " === \"function\") __h." & e & " = " & e & ";\n"
+    result.add "__h.__sdk = __sdk;\n"
     result.add "__aoeP.push({ name: " & jsString(name) & ", h: __h });\n})();\n"
   for e in EntryNames:
     result.add "function " & e & "() {\n"
     result.add "  for (var i = 0; i < __aoeP.length; i++) {\n"
     result.add "    var p = __aoeP[i];\n"
+    if e == "on_command" or e == "on_task":
+      result.add "    if (hostv(\"event_str\", \"owner\") != \"\" && hostv(\"event_str\", \"owner\") != p.name) continue;\n"
+    result.add "    hostS(\"plugin_scope\", p.name);\n"
     result.add "    if (p.h." & e & ") { try { p.h." & e & "(); } catch (x) { hostS(\"server_log\", p.name + \": " & e & " threw: \" + String(x)); } }\n"
-    result.add "  }\n}\n"
+    result.add "    if (p.h.__sdk) { try { p.h.__sdk.fire(\"" & e & "\"); } catch (x) { hostS(\"server_log\", p.name + \": " & e & " threw: \" + String(x)); } }\n"
+    result.add "  }\n  hostS(\"plugin_scope\", \"\");\n}\n"
 
-proc loadEnginePlugins*(found: seq[(string, string)]; bundleFile: string = "plugins/.engine-bundle.js"): int =
-  ## Starts the engine (only when there is something to load), loads the plugins as one bundled program and runs their `start`
-  ## entries. The number of plugins in it.
-  if found.len == 0: return 0
+var gHostReady = false
+
+proc setEngineServer*(server: Server) =
+  ## The server the host calls act on. Set before any plugin loads: a plugin registers its commands in `start`.
+  gEngineServer = some(server)
+
+proc initEngineHost*(): bool =
+  ## Starts the engine and registers the server's host functions; once. False (with the reason printed) when the engine cannot start.
+  if gHostReady: return true
   if not engineInit():
     echo "[plugin] the engine could not start (is aoe_engine.dll on the DLL path?): ", engineError()
-    return 0
+    return false
   registerServerHost()
-  gSourceText = ""
+  registerCommandHost()
+  gHostReady = true
+  true
+
+proc attachProgram*(name: string; handle: int32; native: bool) =
+  gPlugins.add EnginePlugin(name: name, handle: handle, native: native)
+
+proc detachProgram*(name: string): int32 =
+  ## Takes the program out of the list events go to; its handle, or -1 when there is none by that name.
+  result = -1
+  var kept: seq[EnginePlugin] = @[]
+  for p in gPlugins:
+    if p.name == name: result = p.handle
+    else: kept.add p
+  gPlugins = kept
+
+proc programLoaded*(name: string): bool =
+  for p in gPlugins:
+    if p.name == name: return true
+  false
+
+proc refreshCommandLists*() =
+  ## `Context::reload_commands_for_everyone`: the commands packet again, for every player, after commands were added or removed.
+  if gEngineServer.isNone: return
+  let server: Server = gEngineServer.unsafeGet
+  let d = server.commandDispatcher
+  if d == nil: return
+  for w in server.worlds:
+    for p in w.players:
+      p.client.writePacketFor(buildCCommands(senderPlayer(server.commandPlayerOf(p)), server.commandServer, d))
+
+proc dropOwnedBy*(owner: string) =
+  ## Forgets what a plugin registered: its commands leave the dispatcher and its scheduled tasks stop.
+  var keptTasks: seq[EngTask] = @[]
+  for t in gTasks:
+    if t.owner != owner: keptTasks.add t
+  gTasks = keptTasks
+  var keptSubs: seq[(string, string)] = @[]
+  for kv in gSubs:
+    if kv[0] != owner: keptSubs.add kv
+  gSubs = keptSubs
+  var keptCmds: seq[(string, string)] = @[]
+  var removed = false
+  for kv in gCmdOwners:
+    if kv[1] == owner:
+      if gEngineServer.isSome:
+        let server: Server = gEngineServer.unsafeGet
+        let d = server.commandDispatcher
+        if d != nil:
+          unregister(d.fallbackDispatcher, kv[0])
+          removed = true
+    else:
+      keptCmds.add kv
+  gCmdOwners = keptCmds
+  if removed: refreshCommandLists()
+
+proc loadJsBundle*(found: seq[(string, string)]; bundleFile: string): int32 =
+  ## Bundles the JavaScript plugins into one program (the engine runs one JavaScript program per process), loads it and runs the
+  ## plugins' `start` entries. The program's handle, or -1.
+  if found.len == 0: return -1
+  if not initEngineHost(): return -1
+  forgetSources()
   for (name, file) in found:
-    gSourceText.add readText(file)
-    gSourceText.add "\n"
+    noteSource(readText(file))
   try:
     writeFile(bundleFile, bundleOf(found))
   except:
     echo "[plugin] could not write ", bundleFile
-    return 0
+    return -1
   let h = loadPlugin(bundleFile, 0)
   if h < 0:
     echo "[plugin] could not load the plugin bundle: ", engineError()
-    return 0
-  gPlugins.add EnginePlugin(name: "bundle", handle: h)
+    return -1
+  attachProgram("js", h, false)
   var names = ""
   for (name, file) in found:
     if names.len > 0: names.add ", "
     names.add name
-  echo "[plugin] loaded ", found.len, " engine plugin(s): ", names, " (", pluginMode(h), ")"
+  echo "[plugin] loaded ", found.len, " JavaScript plugin(s): ", names, " (", pluginMode(h), ")"
   if callPlugin(h, "start") < 0:
     echo "[plugin] start failed: ", engineError()
   flushPluginLog()
+  h
+
+proc loadEnginePlugins*(found: seq[(string, string)]; bundleFile: string = "plugins/.engine-bundle.js"): int =
+  ## The JavaScript plugins as one bundled program; how many it holds.
+  if loadJsBundle(found, bundleFile) < 0: return 0
   found.len
 
-proc startEnginePlugins*(server: Server) =
-  ## Loads the JavaScript plugins in `plugins/` and chains the engine onto the chat, command, join and leave hooks. Does nothing
-  ## (and never loads the engine) when there is no JavaScript plugin.
+proc loadNativeProgram*(name, artifact, sourceText: string): string =
+  ## An aowlmony plugin: its typed artifact (the main module's `.s.nif`, its other modules beside it) as a program of its own, its
+  ## `start` entry run. "" when it loaded, else the reason.
+  if not initEngineHost(): return "the engine could not start"
+  if programLoaded(name): return "plugin " & name & " is already loaded"
+  gScope = name
+  let h = loadPlugin(artifact, 0)
+  gScope = ""
+  if h < 0: return "could not load " & artifact & ": " & engineError()
+  attachProgram(name, h, true)
+  noteSource(sourceText)
+  echo "[plugin] loaded aowlmony plugin ", name, " (", pluginMode(h), ")"
+  result = ""
+  if hasEntry(h, "start"):
+    gScope = name
+    if callPlugin(h, "start") < 0: result = "start failed: " & engineError()
+    gScope = ""
+  flushPluginLog()
+
+proc unloadProgram*(name: string): string =
+  ## Unloads a program (the engine runs its `stop` entry) and forgets its commands and tasks. "" when done, else the reason.
+  if not programLoaded(name): return "plugin " & name & " is not loaded"
+  let h = detachProgram(name)
+  gScope = name
+  discard unloadPlugin(h)
+  gScope = ""
+  flushPluginLog()
+  dropOwnedBy(name)
+  ""
+
+proc installEngineEventHooks*(server: Server) =
+  ## Chains the engine onto the server's event hooks, once: each hook offers its event to the loaded plugins after the hook that was
+  ## there. Hooks for entries only some plugins define (tick, packet, redstone, block grow, chunk send) check at run time.
   gEngineServer = some(server)
-  if loadEnginePlugins(scanEnginePlugins(PluginsFolder)) == 0: return
   gPrevChat = gPluginChatHook
   gPluginChatHook = proc(player: Player; message: string): (bool, string) {.closure.} =
     let before = callChatPrev(gPrevChat, player, message)
@@ -688,51 +989,320 @@ proc startEnginePlugins*(server: Server) =
           ("next_x", float64(result0.x)), ("next_y", float64(result0.y)), ("next_z", float64(result0.z)),
           ("yaw", float64(result0.yaw)), ("pitch", float64(result0.pitch))])
       result0
-  if entryUsed("on_block_grow"):
+  block:
     gPrevGrow = gPluginBlockGrowHook
     gPluginBlockGrowHook = proc(world: BlockWorld; oldBlock: Block; oldState: BlockStateId; newBlock: Block; newState: BlockStateId;
         pos: BlockPos): (bool, BlockStateId) {.closure.} =
       let before = callGrowPrev(gPrevGrow, world, oldBlock, oldState, newBlock, newState, pos)
       if before[0]: return before
+      if not entryUsed("on_block_grow"): return before
       let o = fireServer("on_block_grow", @[("old_block", "minecraft:" & oldBlock.name), ("new_block", "minecraft:" & newBlock.name)],
         @[("x", float64(pos.vec.x)), ("y", float64(pos.vec.y)), ("z", float64(pos.vec.z))])
       var answer: (bool, BlockStateId) = before
       answer[0] = o[0]
       answer
-  if entryUsed("on_chunk_send"):
+  block:
     gPrevChunk = gChunkSendHook
     gChunkSendHook = proc(client: JavaClient; chunk: ChunkData): bool {.closure.} =
       if callChunkPrev(gPrevChunk, client, chunk): return true
+      if not entryUsed("on_chunk_send"): return false
       # the event names the chunk, not a player (upstream's ChunkSend holds the world and the chunk)
       fireServer("on_chunk_send", @[], @[("x", float64(chunk.x)), ("z", float64(chunk.z))])[0]
   # hot hooks: installed only when a plugin defines the entry
-  if entryUsed("on_server_tick_start"):
+  block:
     gPrevTickStart = gPluginTickStartHook
     gPluginTickStartHook = proc(tick: int32) {.closure.} =
       callTickStartPrev(gPrevTickStart, tick)
-      discard fireServer("on_server_tick_start", @[], @[("tick", float64(tick))])
-  if entryUsed("on_server_tick_end") or entryUsed("schedule_"):
+      if entryUsed("on_server_tick_start"): discard fireServer("on_server_tick_start", @[], @[("tick", float64(tick))])
+  block:
     # one tick hook serves both: scheduled tasks run first, then the plugins' own tick-end entry when one exists
-    let wantsTickEnd = entryUsed("on_server_tick_end")
     gPrevTickEnd = gPluginTickEndHook
     gPluginTickEndHook = proc(tick: int32; durationNanos: int64) {.closure.} =
       callTickEndPrev(gPrevTickEnd, tick, durationNanos)
       runDueTasks(int64(tick))
-      if wantsTickEnd:
+      if entryUsed("on_server_tick_end"):
         discard fireServer("on_server_tick_end", @[], @[("tick", float64(tick)), ("duration_ns", float64(durationNanos))])
-  if entryUsed("on_packet_received"):
+  block:
     gPrevPacket = gPluginPacketReceivedHook
     gPluginPacketReceivedHook = proc(player: Player; packetId: int32; payload: seq[byte]): bool {.closure.} =
       if callPacketPrev(gPrevPacket, player, packetId, payload): return true
+      if not entryUsed("on_packet_received"): return false
       fireEngineEv("on_packet_received", player.gameprofile.name, "", @[],
         @[("packet_id", float64(packetId)), ("length", float64(payload.len))], some(player))[0]
-  if entryUsed("on_block_redstone"):
+  block:
     gPrevRedstone = gPluginBlockRedstoneHook
     gPluginBlockRedstoneHook = proc(world: BlockWorld; stateId: BlockStateId; pos: BlockPos; oldCurrent, newCurrent: int32): (bool, int32) {.closure.} =
       let before = callRedstonePrev(gPrevRedstone, world, stateId, pos, oldCurrent, newCurrent)
       if before[0]: return before
+      if not entryUsed("on_block_redstone"): return before
       let o = fireServer("on_block_redstone", @[], @[("x", float64(pos.vec.x)), ("y", float64(pos.vec.y)), ("z", float64(pos.vec.z)),
         ("old_current", float64(oldCurrent)), ("new_current", float64(before[1]))])
       var answer: (bool, int32) = before
       answer[0] = o[0]
       answer
+
+proc passDamage(world: World; entityId: int32; entityType: string; amount: float32; damageType: string; attackerId: int32):
+    (bool, float32) {.closure.} = (false, amount)
+proc passEntityDeath(world: World; entityId: int32; entityType, damageType: string; killerId: int32) {.closure.} = discard
+proc passEntitySpawn(world: World; entityId: int32; entityType: string; pos: Vector3[float64]) {.closure.} = discard
+proc passEntityRemove(world: World; entityId: int32; entityType: string) {.closure.} = discard
+proc passExplosion(world: World; pos: Vector3[float64]; power: float32): bool {.closure.} = false
+proc passWeather(world: World; raining, thundering: bool) {.closure.} = discard
+
+var gPrevDamage: proc(world: World; entityId: int32; entityType: string; amount: float32; damageType: string; attackerId: int32):
+    (bool, float32) {.closure.} = passDamage
+var gPrevEntityDeath: proc(world: World; entityId: int32; entityType, damageType: string; killerId: int32) {.closure.} = passEntityDeath
+var gPrevEntitySpawn: proc(world: World; entityId: int32; entityType: string; pos: Vector3[float64]) {.closure.} = passEntitySpawn
+var gPrevEntityRemove: proc(world: World; entityId: int32; entityType: string) {.closure.} = passEntityRemove
+var gPrevExplosion: proc(world: World; pos: Vector3[float64]; power: float32): bool {.closure.} = passExplosion
+var gPrevWeather: proc(world: World; raining, thundering: bool) {.closure.} = passWeather
+
+proc callDamagePrev(prev: proc(world: World; entityId: int32; entityType: string; amount: float32; damageType: string;
+    attackerId: int32): (bool, float32) {.closure.}; world: World; entityId: int32; entityType: string; amount: float32;
+    damageType: string; attackerId: int32): (bool, float32) =
+  prev(world, entityId, entityType, amount, damageType, attackerId)
+
+proc callEntityDeathPrev(prev: proc(world: World; entityId: int32; entityType, damageType: string; killerId: int32) {.closure.};
+    world: World; entityId: int32; entityType, damageType: string; killerId: int32) =
+  prev(world, entityId, entityType, damageType, killerId)
+
+proc callEntitySpawnPrev(prev: proc(world: World; entityId: int32; entityType: string; pos: Vector3[float64]) {.closure.};
+    world: World; entityId: int32; entityType: string; pos: Vector3[float64]) =
+  prev(world, entityId, entityType, pos)
+
+proc callEntityRemovePrev(prev: proc(world: World; entityId: int32; entityType: string) {.closure.}; world: World; entityId: int32;
+    entityType: string) =
+  prev(world, entityId, entityType)
+
+proc callExplosionPrev(prev: proc(world: World; pos: Vector3[float64]; power: float32): bool {.closure.}; world: World;
+    pos: Vector3[float64]; power: float32): bool =
+  prev(world, pos, power)
+
+proc callWeatherPrev(prev: proc(world: World; raining, thundering: bool) {.closure.}; world: World; raining, thundering: bool) =
+  prev(world, raining, thundering)
+
+proc passPlayerEv(player: Player; ev: PlayerEv): (bool, bool) {.closure.} = (false, ev.flag)
+proc passChangeWorld(player: Player; previous, next: World; pos: Vector3[float64]; yaw, pitch: float32): (bool, Vector3[float64], float32, float32)
+    {.closure.} = (false, pos, yaw, pitch)
+proc passFish(event: var PlayerFishEvent) {.closure.} = discard
+proc passEgg(event: var PlayerEggThrowEvent) {.closure.} = discard
+proc passClick(event: CustomClickActionEvent) {.closure.} = discard
+
+var gPrevPlayerEv: proc(player: Player; ev: PlayerEv): (bool, bool) {.closure.} = passPlayerEv
+var gPrevChangeWorld: proc(player: Player; previous, next: World; pos: Vector3[float64]; yaw, pitch: float32):
+    (bool, Vector3[float64], float32, float32) {.closure.} = passChangeWorld
+var gPrevFish: proc(event: var PlayerFishEvent) {.closure.} = passFish
+var gPrevEgg: proc(event: var PlayerEggThrowEvent) {.closure.} = passEgg
+var gPrevClick: proc(event: CustomClickActionEvent) {.closure.} = passClick
+
+proc callPlayerEvPrev(prev: proc(player: Player; ev: PlayerEv): (bool, bool) {.closure.}; player: Player; ev: PlayerEv): (bool, bool) =
+  prev(player, ev)
+
+proc callChangeWorldPrev(prev: proc(player: Player; previous, next: World; pos: Vector3[float64]; yaw, pitch: float32):
+    (bool, Vector3[float64], float32, float32) {.closure.}; player: Player; previous, next: World; pos: Vector3[float64];
+    yaw, pitch: float32): (bool, Vector3[float64], float32, float32) =
+  prev(player, previous, next, pos, yaw, pitch)
+
+proc callFishPrev(prev: proc(event: var PlayerFishEvent) {.closure.}; event: var PlayerFishEvent) = prev(event)
+proc callEggPrev(prev: proc(event: var PlayerEggThrowEvent) {.closure.}; event: var PlayerEggThrowEvent) = prev(event)
+proc callClickPrev(prev: proc(event: CustomClickActionEvent) {.closure.}; event: CustomClickActionEvent) = prev(event)
+
+proc entryOfPlayerEv(kind: PlayerEvKind): string =
+  case kind
+  of pekSwingArm: "on_player_swing"
+  of pekUseItem: "on_player_use_item"
+  of pekInteractEntity, pekInteractUnknownEntity: "on_player_interact_entity"
+  of pekCustomPayload: "on_player_custom_payload"
+  of pekChangedMainHand: "on_player_main_hand_change"
+  of pekInventoryClose: "on_inventory_close"
+  of pekInventoryClick: "on_inventory_click"
+  of pekBlockBreak: "on_block_break"
+  of pekDropItem: "on_player_drop_item"
+  of pekItemPickup: "on_player_pickup_item"
+  of pekItemConsume: "on_player_item_consume"
+  of pekBedEnter: "on_player_bed_enter"
+  of pekBedLeave: "on_player_bed_leave"
+  of pekSignChange: "on_sign_change"
+  of pekBucketEmpty: "on_bucket_empty"
+  of pekBucketFill: "on_bucket_fill"
+  of pekPermissionCheck: "on_permission_check"
+
+proc playerEvFields(ev: PlayerEv; strs: var seq[(string, string)]; nums: var seq[(string, float64)]) =
+  ## What each `PlayerEv` kind carries, as the named fields a plugin reads.
+  case ev.kind
+  of pekInteractEntity, pekInteractUnknownEntity:
+    nums.add ("entity_id", float64(ev.n))
+    nums.add ("action", float64(ev.n2))
+    nums.add ("sneaking", (if ev.flag: 1.0 else: 0.0))
+    nums.add ("known", (if ev.kind == pekInteractEntity: 1.0 else: 0.0))
+  of pekCustomPayload:
+    strs.add ("channel", ev.text)
+    nums.add ("length", float64(ev.data.len))
+  of pekChangedMainHand:
+    nums.add ("hand", float64(ev.n))
+  of pekInventoryClose:
+    nums.add ("window", float64(ev.n))
+  of pekInventoryClick:
+    nums.add ("window", float64(ev.n))
+    nums.add ("click_type", float64(ev.n2))
+    nums.add ("slot", float64(ev.n3))
+    nums.add ("raw_slot", float64(ev.n4))
+    nums.add ("hotbar_button", float64(ev.n5))
+  of pekBlockBreak:
+    strs.add ("block", ev.text)
+    nums.add ("x", float64(ev.pos.vec.x))
+    nums.add ("y", float64(ev.pos.vec.y))
+    nums.add ("z", float64(ev.pos.vec.z))
+  of pekDropItem:
+    strs.add ("item", ev.text)
+    nums.add ("count", float64(ev.n))
+  of pekItemPickup:
+    strs.add ("item", ev.text)
+    nums.add ("count", float64(ev.n))
+    nums.add ("entity_id", float64(ev.n2))
+  of pekItemConsume:
+    strs.add ("item", ev.text)
+  of pekBedEnter, pekBedLeave:
+    nums.add ("x", float64(ev.pos.vec.x))
+    nums.add ("y", float64(ev.pos.vec.y))
+    nums.add ("z", float64(ev.pos.vec.z))
+  of pekSignChange:
+    nums.add ("x", float64(ev.pos.vec.x))
+    nums.add ("y", float64(ev.pos.vec.y))
+    nums.add ("z", float64(ev.pos.vec.z))
+    for k in 0 ..< ev.lines.len:
+      strs.add ("line" & $k, ev.lines[k])
+  of pekBucketEmpty, pekBucketFill:
+    strs.add ("bucket", ev.text)
+    nums.add ("x", float64(ev.pos.vec.x))
+    nums.add ("y", float64(ev.pos.vec.y))
+    nums.add ("z", float64(ev.pos.vec.z))
+  of pekPermissionCheck:
+    strs.add ("node", ev.text)
+  else:
+    discard
+
+proc passExp(player: Player; amount: int32): int32 {.closure.} = amount
+proc passRespawn(player: Player; previous, respawned: World; pos: Vector3[float64]; yaw, pitch: float32; alive: bool) {.closure.} = discard
+
+var gPrevExp: proc(player: Player; amount: int32): int32 {.closure.} = passExp
+var gPrevRespawn: proc(player: Player; previous, respawned: World; pos: Vector3[float64]; yaw, pitch: float32; alive: bool) {.closure.} =
+  passRespawn
+
+proc callExpPrevE(prev: proc(player: Player; amount: int32): int32 {.closure.}; player: Player; amount: int32): int32 =
+  prev(player, amount)
+
+proc callRespawnPrevE(prev: proc(player: Player; previous, respawned: World; pos: Vector3[float64]; yaw, pitch: float32;
+    alive: bool) {.closure.}; player: Player; previous, respawned: World; pos: Vector3[float64]; yaw, pitch: float32; alive: bool) =
+  prev(player, previous, respawned, pos, yaw, pitch, alive)
+
+proc fireEnginePlayerDeath*(player: Player; message: string) =
+  ## `on_player_death`: the death message is `hostv("event_str", "message")`.
+  discard fireEngineEv("on_player_death", player.gameprofile.name, message, @[], @[], some(player))
+
+proc installEngineMiscHooks*() =
+  ## The experience and respawn events (the death event is fired by `fireEnginePlayerDeath`, which pluginmgr.aowl calls).
+  gPrevExp = gPluginExpChangeHook
+  gPluginExpChangeHook = proc(player: Player; amount: int32): int32 {.closure.} =
+    let before = callExpPrevE(gPrevExp, player, amount)
+    discard fireEngineFields("on_player_exp_change", player, @[], @[("amount", float64(before))])
+    before
+  gPrevRespawn = gPluginRespawnHook
+  gPluginRespawnHook = proc(player: Player; previous, respawned: World; pos: Vector3[float64]; yaw, pitch: float32; alive: bool) {.closure.} =
+    callRespawnPrevE(gPrevRespawn, player, previous, respawned, pos, yaw, pitch, alive)
+    discard fireEngineFields("on_player_respawn", player, @[], @[("x", pos.x), ("y", pos.y), ("z", pos.z), ("alive", (if alive: 1.0 else: 0.0))])
+  # the generic player events (swing, use item, interact entity, inventory, block break, drop, pickup, consume, bed, sign, bucket,
+  # permission check ...): one hook, each kind its own entry, offered only while a plugin listens
+  gPrevPlayerEv = gPluginPlayerEventHook
+  gPluginPlayerEventHook = proc(player: Player; ev: PlayerEv): (bool, bool) {.closure.} =
+    let before = callPlayerEvPrev(gPrevPlayerEv, player, ev)
+    if before[0]: return before
+    let entry = entryOfPlayerEv(ev.kind)
+    if not listened(entry): return before
+    var strs: seq[(string, string)] = @[]
+    var nums: seq[(string, float64)] = @[]
+    playerEvFields(ev, strs, nums)
+    nums.add ("flag", (if before[1]: 1.0 else: 0.0))
+    gEvFlag = before[1]
+    let o = fireEngineFields(entry, player, strs, nums)
+    (o[0], gEvFlag)
+  gPrevChangeWorld = gPluginChangeWorldHook
+  gPluginChangeWorldHook = proc(player: Player; previous, next: World; pos: Vector3[float64]; yaw, pitch: float32):
+      (bool, Vector3[float64], float32, float32) {.closure.} =
+    let before = callChangeWorldPrev(gPrevChangeWorld, player, previous, next, pos, yaw, pitch)
+    if before[0]: return before
+    if not listened("on_player_change_world"): return before
+    let o = fireEngineFields("on_player_change_world", player, @[], @[("x", pos.x), ("y", pos.y), ("z", pos.z), ("yaw", float64(yaw)), ("pitch", float64(pitch))])
+    var answer: (bool, Vector3[float64], float32, float32) = before
+    answer[0] = o[0]
+    answer
+  gPrevFish = gFishHook
+  gFishHook = proc(event: var PlayerFishEvent) {.closure.} =
+    callFishPrev(gPrevFish, event)
+    if event.cancelled or not listened("on_player_fish"): return
+    let o = fireEngineFields("on_player_fish", event.player, @[("caught", event.caughtType)],
+      @[("state", float64(ord(event.state))), ("exp", float64(event.expToDrop))])
+    if o[0]: event.cancelled = true
+  gPrevEgg = gEggThrowHook
+  gEggThrowHook = proc(event: var PlayerEggThrowEvent) {.closure.} =
+    callEggPrev(gPrevEgg, event)
+    if event.cancelled or not listened("on_player_egg_throw"): return
+    gEvFlag = event.hatching
+    let o = fireEngineFields("on_player_egg_throw", event.player, @[("hatching_type", event.hatchingType)],
+      @[("num_hatches", float64(event.numHatches)), ("hatching", (if event.hatching: 1.0 else: 0.0))])
+    event.hatching = gEvFlag
+    if o[0]: event.cancelled = true
+  # entities, explosions and weather
+  gPrevDamage = gPluginEntityDamageHook
+  gPluginEntityDamageHook = proc(world: World; entityId: int32; entityType: string; amount: float32; damageType: string;
+      attackerId: int32): (bool, float32) {.closure.} =
+    let before = callDamagePrev(gPrevDamage, world, entityId, entityType, amount, damageType, attackerId)
+    if before[0]: return before
+    if not listened("on_entity_damage"): return before
+    gEvValue = float64(before[1])
+    let o = fireEngineEv("on_entity_damage", "", "", @[("entity_type", entityType), ("damage_type", damageType)],
+      @[("entity_id", float64(entityId)), ("amount", float64(before[1])), ("attacker_id", float64(attackerId))], none[Player]())
+    (o[0], float32(gEvValue))
+  gPrevEntityDeath = gPluginEntityDeathHook
+  gPluginEntityDeathHook = proc(world: World; entityId: int32; entityType, damageType: string; killerId: int32) {.closure.} =
+    callEntityDeathPrev(gPrevEntityDeath, world, entityId, entityType, damageType, killerId)
+    if listened("on_entity_death"):
+      discard fireEngineEv("on_entity_death", "", "", @[("entity_type", entityType), ("damage_type", damageType)],
+        @[("entity_id", float64(entityId)), ("killer_id", float64(killerId))], none[Player]())
+  gPrevEntitySpawn = gPluginEntitySpawnHook
+  gPluginEntitySpawnHook = proc(world: World; entityId: int32; entityType: string; pos: Vector3[float64]) {.closure.} =
+    callEntitySpawnPrev(gPrevEntitySpawn, world, entityId, entityType, pos)
+    if listened("on_entity_spawn"):
+      discard fireEngineEv("on_entity_spawn", "", "", @[("entity_type", entityType)],
+        @[("entity_id", float64(entityId)), ("x", pos.x), ("y", pos.y), ("z", pos.z)], none[Player]())
+  gPrevEntityRemove = gPluginEntityRemoveHook
+  gPluginEntityRemoveHook = proc(world: World; entityId: int32; entityType: string) {.closure.} =
+    callEntityRemovePrev(gPrevEntityRemove, world, entityId, entityType)
+    if listened("on_entity_remove"):
+      discard fireEngineEv("on_entity_remove", "", "", @[("entity_type", entityType)], @[("entity_id", float64(entityId))], none[Player]())
+  gPrevExplosion = gPluginExplosionHook
+  gPluginExplosionHook = proc(world: World; pos: Vector3[float64]; power: float32): bool {.closure.} =
+    if callExplosionPrev(gPrevExplosion, world, pos, power): return true
+    if not listened("on_explosion"): return false
+    fireEngineEv("on_explosion", "", "", @[], @[("x", pos.x), ("y", pos.y), ("z", pos.z), ("power", float64(power))], none[Player]())[0]
+  gPrevWeather = gPluginWeatherHook
+  gPluginWeatherHook = proc(world: World; raining, thundering: bool) {.closure.} =
+    callWeatherPrev(gPrevWeather, world, raining, thundering)
+    if listened("on_weather_change"):
+      discard fireEngineEv("on_weather_change", "", "", @[],
+        @[("raining", (if raining: 1.0 else: 0.0)), ("thundering", (if thundering: 1.0 else: 0.0))], none[Player]())
+  gPrevClick = gCustomClickActionHook
+  gCustomClickActionHook = proc(event: CustomClickActionEvent) {.closure.} =
+    callClickPrev(gPrevClick, event)
+    if not listened("on_custom_click"): return
+    var length = 0
+    if event.payload.isSome: length = event.payload.unsafeGet.len
+    discard fireEngineFields("on_custom_click", event.player, @[("id", event.id)], @[("length", float64(length))])
+
+proc startEnginePlugins*(server: Server) =
+  ## The JavaScript plugins in `plugins/` as one program, with the event hooks installed. Does nothing (and never loads the engine)
+  ## when there is none. The plugin manager (pluginmanager.aowl) does this and more for the server.
+  gEngineServer = some(server)
+  if loadEnginePlugins(scanEnginePlugins(PluginsFolder)) == 0: return
+  installEngineEventHooks(server)
+  installEngineMiscHooks()
