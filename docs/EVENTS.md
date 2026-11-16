@@ -100,21 +100,18 @@ Bukkit has well over 200 event classes. An event can only exist when the server 
 server (a port of Pumpkin) fires the events above; the rest below either need a firing site added in the server or describe a game
 system the server does not have.
 
-**Needs a firing site in the server (the system exists):** BlockCanBuildEvent, BlockDispenseEvent,
-EntityTargetEvent, EntityChangeBlockEvent,
-EntityShootBowEvent, EntityTameEvent,
-PlayerAdvancementDoneEvent,
-PlayerShearEntityEvent, PlayerEditBookEvent, PlayerResourcePackStatusEvent,
-InventoryDragEvent, InventoryMoveItemEvent,
+**Needs a firing site in the server (the system exists):** BlockCanBuildEvent, EntityTargetEvent, EntityChangeBlockEvent,
+PlayerAdvancementDoneEvent, PlayerResourcePackStatusEvent (happens before the player exists), InventoryMoveItemEvent,
 PrepareItemCraftEvent, FurnaceBurn/ExtractEvent, BrewEvent, WorldLoad/Unload/InitEvent, ChunkLoad/UnloadEvent
 (upstream declares chunk load and save but never fires them), PortalCreateEvent,
 VehicleEnter/Exit/Move/DamageEvent.
 
-**Covered by another event:** ProjectileLaunchEvent (the thrown or shot projectile appears as an `EntitySpawnEvent`), CraftItemEvent
+**Covered by another event:** InventoryDragEvent (an `InventoryClickEvent` with the quick-craft click type), ProjectileLaunchEvent (the thrown or shot projectile appears as an `EntitySpawnEvent`), CraftItemEvent
 (`StatisticEvent`, crafted), the block events of fire, fluids, growth and decay (`BlockChangeEvent`), PlayerPortalEvent and
 EntityPortalEvent (`PortalEvent`).
 
-**Systems the server does not have:** lightning (no bolt entity or strikes), enchanting table and anvil events, raids, villager trade events, hanging entities,
+**Systems the server does not have:** dispensers and droppers, bows and crossbows, taming, book editing, shearing (beyond carving a pumpkin, a
+`BlockChangeEvent`), lightning (no bolt entity or strikes), enchanting table and anvil events, raids, villager trade events, hanging entities,
 maps, beacons, loot generation events and similar.
 
 ## Adding an event
