@@ -36,6 +36,7 @@ on(BlockPlaceEvent, function (e) { if (e.blockName == "minecraft:tnt") e.cancel(
 | `EntityTeleportEvent` | EntityTeleportEvent | `entityId`, `entityType`, `origin`, `target` | yes |
 | `PistonEvent` | BlockPistonExtendEvent, BlockPistonRetractEvent | `x`, `y`, `z`, `extend`, `moved`, `broken` | yes |
 | `ProjectileHitEvent` | ProjectileHitEvent | `entityId`, `entityType`, `ownerId`, `hitEntity`, `targetId`, `x`, `y`, `z` | yes (the projectile flies on) |
+| `BlockChangeEvent` | BlockBurn/Fade/Form/Spread/FromTo/Physics/LeavesDecay/Ignite events, and the block changes of players, pistons and explosions | `x`, `y`, `z`, `before`, `after` | yes (the block stays) |
 | `SwapHandsEvent` | PlayerSwapHandItemsEvent | | yes |
 | `UseItemEvent` | right-click PlayerInteractEvent | | yes |
 | `InteractEntityEvent` | PlayerInteractEntityEvent / PlayerInteractAtEntityEvent | `entityId`, `action`, `sneaking`, `known` | yes |
@@ -71,7 +72,7 @@ on(BlockPlaceEvent, function (e) { if (e.blockName == "minecraft:tnt") e.cancel(
 | `ChunkSendEvent` | PlayerChunkLoadEvent (Paper) | `x`, `z` | yes |
 | `HealEvent` | EntityRegainHealthEvent | `entityId`, `entityType`, `amount` (writable) | yes |
 | `FoodLevelChangeEvent` | FoodLevelChangeEvent | `level` (writable), `previous` | yes |
-| `StatisticEvent` | PlayerStatisticIncrementEvent | `category`, `statId`, `amount` | |
+| `StatisticEvent` | PlayerStatisticIncrementEvent; also CraftItemEvent (category 1, crafted, after the player took the result), and the mined (0), used (2), broken (3), picked up (4), dropped (5), killed (6) counts | `category`, `statId`, `amount` | |
 | `ServerListPingEvent` | ServerListPingEvent | `address`, `motd` (writable), `online`, `maxPlayers` (writable) | |
 | `PreLoginEvent` | AsyncPlayerPreLoginEvent | `name`, `address`, `kickMessage` (writable) | yes (turns the client away) |
 | `LevelChangeEvent` | PlayerLevelChangeEvent | `previous`, `level` | |
@@ -86,7 +87,7 @@ on(BlockPlaceEvent, function (e) { if (e.blockName == "minecraft:tnt") e.cancel(
 | `onEnable`, `onDisable` | onEnable, onDisable, PluginEnableEvent | | |
 | tasks | BukkitScheduler | see `after`, `every` | |
 
-That is 67 event types. Events that fire often (movement, packets, ticks, permission checks, block grow, redstone, chunk send, damage)
+That is 68 event types. Events that fire often (movement, packets, ticks, permission checks, block grow, redstone, chunk send, damage)
 cost nothing while no loaded plugin listens to them.
 
 ## Bukkit events that do not exist here, and why
@@ -95,9 +96,8 @@ Bukkit has well over 200 event classes. An event can only exist when the server 
 server (a port of Pumpkin) fires the events above; the rest below either need a firing site added in the server or describe a game
 system the server does not have.
 
-**Needs a firing site in the server (the system exists):** BlockBurnEvent, BlockCanBuildEvent, BlockFadeEvent, BlockFormEvent,
-BlockSpreadEvent, BlockFromToEvent (fluid flow), BlockIgniteEvent, BlockDispenseEvent,
-LeavesDecayEvent, BlockPhysicsEvent, EntityTargetEvent, EntityChangeBlockEvent,
+**Needs a firing site in the server (the system exists):** BlockCanBuildEvent, BlockDispenseEvent,
+EntityTargetEvent, EntityChangeBlockEvent,
 EntityShootBowEvent, EntityTameEvent, ProjectileLaunchEvent,
 PlayerKickEvent, PlayerPortalEvent, PlayerAdvancementDoneEvent,
 PlayerShearEntityEvent, PlayerEditBookEvent, PlayerResourcePackStatusEvent,
