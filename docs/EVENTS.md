@@ -40,6 +40,7 @@ on(BlockPlaceEvent, function (e) { if (e.blockName == "minecraft:tnt") e.cancel(
 | `PortalEvent` | PlayerPortalEvent, EntityPortalEvent | `entityId`, `entityType`, `x`, `y`, `z`, `target` | yes (stays out of the portal) |
 | `FurnaceSmeltEvent` | FurnaceSmeltEvent | `x`, `y`, `z`, `input`, `output` | yes (progress restarts) |
 | `KickEvent` | PlayerKickEvent | `reason` (writable) | no (the kick happens) |
+| `TabCompleteEvent` | TabCompleteEvent | `buffer`, `suggestions` (add to it) | |
 | `SwapHandsEvent` | PlayerSwapHandItemsEvent | | yes |
 | `UseItemEvent` | right-click PlayerInteractEvent | | yes |
 | `InteractEntityEvent` | PlayerInteractEntityEvent / PlayerInteractAtEntityEvent | `entityId`, `action`, `sneaking`, `known` | yes |
@@ -90,7 +91,7 @@ on(BlockPlaceEvent, function (e) { if (e.blockName == "minecraft:tnt") e.cancel(
 | `onEnable`, `onDisable` | onEnable, onDisable, PluginEnableEvent | | |
 | tasks | BukkitScheduler | see `after`, `every` | |
 
-That is 71 event types. Events that fire often (movement, packets, ticks, permission checks, block grow, redstone, chunk send, damage)
+That is 72 event types. Events that fire often (movement, packets, ticks, permission checks, block grow, redstone, chunk send, damage)
 cost nothing while no loaded plugin listens to them.
 
 ## Bukkit events that do not exist here, and why
@@ -106,7 +107,7 @@ PlayerAdvancementDoneEvent,
 PlayerShearEntityEvent, PlayerEditBookEvent, PlayerResourcePackStatusEvent,
 InventoryDragEvent, InventoryMoveItemEvent, CraftItemEvent,
 PrepareItemCraftEvent, FurnaceBurn/ExtractEvent, BrewEvent, WorldLoad/Unload/InitEvent, ChunkLoad/UnloadEvent
-(upstream declares chunk load and save but never fires them), LightningStrikeEvent, PortalCreateEvent, TabCompleteEvent,
+(upstream declares chunk load and save but never fires them), LightningStrikeEvent, PortalCreateEvent,
 VehicleEnter/Exit/Move/DamageEvent.
 
 **Systems the server does not have:** enchanting table and anvil events, raids, villager trade events, hanging entities,

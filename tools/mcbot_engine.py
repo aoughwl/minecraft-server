@@ -99,6 +99,11 @@ def engine_session(m, c, st, w, biomes, ctx, args):
             expect('Slowness for 600 ticks', 'the potion effect event')
             command('pistonme 8 70 8')
             expect('Piston extends', 'the piston event')
+            c.send(m.SB_COMMAND_SUGGESTION, m.varint(31) + m.string('/hello '))
+            wait(lambda: any(s[0] == 31 for s in w.suggestions), 'suggestions for /hello', 15.0)
+            offered = [s for s in w.suggestions if s[0] == 31][0][4]
+            m.check('world' in offered and 'everyone' in offered, 'the tab complete event added nothing: %s' % offered)
+            print('  /hello suggests %s' % offered, flush=True)
             command('tpme 0 66 0')
             expect('Teleported to 0, 66, 0', 'back near spawn, where the chunks are loaded')
             command('block 2 66 0 minecraft:crafting_table')
