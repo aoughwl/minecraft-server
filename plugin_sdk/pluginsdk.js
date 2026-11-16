@@ -93,6 +93,12 @@ var __sdk = (function () {
     BlockChangeEvent: ["on_block_change", function () {
       return { x: num("x"), y: num("y"), z: num("z"), before: str("before"), after: str("after") };
     }],
+    PortalEvent: ["on_portal", function () {
+      return { entityId: num("entity_id"), entityType: str("entity_type"), x: num("x"), y: num("y"), z: num("z"), target: str("target") };
+    }],
+    FurnaceSmeltEvent: ["on_furnace_smelt", function () {
+      return { x: num("x"), y: num("y"), z: num("z"), input: str("input"), output: str("output") };
+    }],
     SwapHandsEvent: ["on_player_swap_hands", function () { return { player: P() }; }],
     SwingEvent: ["on_player_swing", function () { return { player: P() }; }],
     UseItemEvent: ["on_player_use_item", function () { return { player: P() }; }],
@@ -278,6 +284,7 @@ var CombustEvent = __sdk.tokens.CombustEvent, EntityTeleportEvent = __sdk.tokens
 var PistonEvent = __sdk.tokens.PistonEvent;
 var ProjectileHitEvent = __sdk.tokens.ProjectileHitEvent;
 var BlockChangeEvent = __sdk.tokens.BlockChangeEvent;
+var PortalEvent = __sdk.tokens.PortalEvent, FurnaceSmeltEvent = __sdk.tokens.FurnaceSmeltEvent;
 var SwapHandsEvent = __sdk.tokens.SwapHandsEvent, InventoryOpenEvent = __sdk.tokens.InventoryOpenEvent, PotionEffectEvent = __sdk.tokens.PotionEffectEvent;
 var ItemHeldEvent = __sdk.tokens.ItemHeldEvent, InteractEvent = __sdk.tokens.InteractEvent, SwingEvent = __sdk.tokens.SwingEvent;
 var UseItemEvent = __sdk.tokens.UseItemEvent, InteractEntityEvent = __sdk.tokens.InteractEntityEvent, BlockPlaceEvent = __sdk.tokens.BlockPlaceEvent;
