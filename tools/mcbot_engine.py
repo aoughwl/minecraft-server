@@ -158,6 +158,7 @@ def engine_session(m, c, st, w, biomes, ctx, args):
                     m.one_packet(c, st, w, biomes, ctx, pid, r)
                 except m.Fail as e:
                     m.check('asked to be kicked' in str(e), 'disconnected for another reason: %s' % e)
+                    m.check('[seen by hello-world]' in str(e), 'the kick event did not change the reason: %s' % e)
                     kicked = True
                     break
             m.check(kicked, '/kickme did not kick')

@@ -39,6 +39,7 @@ on(BlockPlaceEvent, function (e) { if (e.blockName == "minecraft:tnt") e.cancel(
 | `BlockChangeEvent` | BlockBurn/Fade/Form/Spread/FromTo/Physics/LeavesDecay/Ignite events, and the block changes of players, pistons and explosions | `x`, `y`, `z`, `before`, `after` | yes (the block stays) |
 | `PortalEvent` | PlayerPortalEvent, EntityPortalEvent | `entityId`, `entityType`, `x`, `y`, `z`, `target` | yes (stays out of the portal) |
 | `FurnaceSmeltEvent` | FurnaceSmeltEvent | `x`, `y`, `z`, `input`, `output` | yes (progress restarts) |
+| `KickEvent` | PlayerKickEvent | `reason` (writable) | no (the kick happens) |
 | `SwapHandsEvent` | PlayerSwapHandItemsEvent | | yes |
 | `UseItemEvent` | right-click PlayerInteractEvent | | yes |
 | `InteractEntityEvent` | PlayerInteractEntityEvent / PlayerInteractAtEntityEvent | `entityId`, `action`, `sneaking`, `known` | yes |
@@ -89,7 +90,7 @@ on(BlockPlaceEvent, function (e) { if (e.blockName == "minecraft:tnt") e.cancel(
 | `onEnable`, `onDisable` | onEnable, onDisable, PluginEnableEvent | | |
 | tasks | BukkitScheduler | see `after`, `every` | |
 
-That is 70 event types. Events that fire often (movement, packets, ticks, permission checks, block grow, redstone, chunk send, damage)
+That is 71 event types. Events that fire often (movement, packets, ticks, permission checks, block grow, redstone, chunk send, damage)
 cost nothing while no loaded plugin listens to them.
 
 ## Bukkit events that do not exist here, and why
@@ -101,7 +102,7 @@ system the server does not have.
 **Needs a firing site in the server (the system exists):** BlockCanBuildEvent, BlockDispenseEvent,
 EntityTargetEvent, EntityChangeBlockEvent,
 EntityShootBowEvent, EntityTameEvent, ProjectileLaunchEvent,
-PlayerKickEvent, PlayerAdvancementDoneEvent,
+PlayerAdvancementDoneEvent,
 PlayerShearEntityEvent, PlayerEditBookEvent, PlayerResourcePackStatusEvent,
 InventoryDragEvent, InventoryMoveItemEvent, CraftItemEvent,
 PrepareItemCraftEvent, FurnaceBurn/ExtractEvent, BrewEvent, WorldLoad/Unload/InitEvent, ChunkLoad/UnloadEvent
