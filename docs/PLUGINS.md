@@ -74,6 +74,7 @@ unloading one restarts that program, which runs the others' `onEnable` again. `e
 | a player | `p.tell(text)`, `p.kick(reason)`, `p.teleport(x, y, z)`, `p.setGamemode(mode)`, `p.pos()`, `p.isOnline()`, `playerNamed(name)` | the same methods, `server.player(name)` |
 | the server | `log(text)`, `broadcast(text)`, `onlineCount()` | `server.log`, `server.broadcast`, `server.onlineCount()` |
 | run later | `after(ticks, handler)`, `every(ticks, handler)`, with data: `after(ticks, data, handler)`, `cancelTask(id)` | `after(ticks, fn, data)`, `every(...)`, `cancelTask(id)` |
+| the world (overworld) | `blockAt(x, y, z)`, `setBlock(x, y, z, name)`, `worldTime()`, `setWorldTime(ticks)` | `server.blockAt(x, y, z)`, `server.setBlock(x, y, z, name)`, `server.time()`, `server.setTime(ticks)` |
 | start and stop | `onEnable(handler)`, `onDisable(handler)` | `onEnable(fn)`, `onDisable(fn)` |
 
 Command level 0 lets anyone use it; 1 to 4 an operator of at least that level. 20 ticks make a second.
@@ -103,5 +104,5 @@ have a firing site for, are in **`docs/EVENTS.md`**.
 
 * Plugins run **interpreted** (no native image yet).
 * Registrations happen at the top level of the plugin; create tasks in a handler or `onEnable`, not at the top level.
-* A plugin sees the events in `docs/EVENTS.md` and the calls above. Worlds, entities (beyond the damage, death, spawn and remove events),
+* A plugin sees the events in `docs/EVENTS.md` and the calls above. Blocks and the time of the overworld can be read and set, other worlds, entities (beyond the damage, death, spawn and remove events),
   inventories, scoreboards, boss bars, forms and recipes are not exposed.

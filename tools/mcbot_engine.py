@@ -86,6 +86,10 @@ def engine_session(m, c, st, w, biomes, ctx, args):
             expect('[%s] hello everyone' % name, '/announce')
             st.hit('showcase_tasks')
 
+            command('block 2 70 2 minecraft:gold_block')
+            expect('Placed minecraft:gold_block', '/block places a block from a plugin')
+            command('block 2 70 2')
+            expect('Block at 2 70 2: minecraft:gold_block', '/block reads it back')
             command('xp add %s 3 levels' % name)
             expect('Level 0 -> 3', 'the level change event')
             command('save-all')
