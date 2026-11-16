@@ -21,6 +21,10 @@ import ../../util/vector3
 import ../../util/gamemode
 import ../../util/math/position
 import ../pluginhooksevents
+import ../../data/blocks
+import ../../command/cmdsource
+import ../../world/chunkdata
+import ../../server/net/java/javamod
 from "../../server/block/blockbehaviour" import BlockWorld
 from ../../data/block_state import BlockStateId
 
@@ -288,6 +292,28 @@ proc callRedstonePrev(prev: proc(world: BlockWorld; stateId: BlockStateId; pos: 
     world: BlockWorld; stateId: BlockStateId; pos: BlockPos; oldCurrent, newCurrent: int32): (bool, int32) =
   prev(world, stateId, pos, oldCurrent, newCurrent)
 
+proc passSpawn(world: CommandWorld; previous, next: CmdSpawn): CmdSpawn {.closure.} = next
+proc passGrow(world: BlockWorld; oldBlock: Block; oldState: BlockStateId; newBlock: Block; newState: BlockStateId;
+    pos: BlockPos): (bool, BlockStateId) {.closure.} = (false, newState)
+proc passChunk(client: JavaClient; chunk: ChunkData): bool {.closure.} = false
+
+var gPrevSpawn: proc(world: CommandWorld; previous, next: CmdSpawn): CmdSpawn {.closure.} = passSpawn
+var gPrevGrow: proc(world: BlockWorld; oldBlock: Block; oldState: BlockStateId; newBlock: Block; newState: BlockStateId;
+    pos: BlockPos): (bool, BlockStateId) {.closure.} = passGrow
+var gPrevChunk: proc(client: JavaClient; chunk: ChunkData): bool {.closure.} = passChunk
+
+proc callSpawnPrev(prev: proc(world: CommandWorld; previous, next: CmdSpawn): CmdSpawn {.closure.}; world: CommandWorld;
+    previous, next: CmdSpawn): CmdSpawn =
+  prev(world, previous, next)
+
+proc callGrowPrev(prev: proc(world: BlockWorld; oldBlock: Block; oldState: BlockStateId; newBlock: Block; newState: BlockStateId;
+    pos: BlockPos): (bool, BlockStateId) {.closure.}; world: BlockWorld; oldBlock: Block; oldState: BlockStateId; newBlock: Block;
+    newState: BlockStateId; pos: BlockPos): (bool, BlockStateId) =
+  prev(world, oldBlock, oldState, newBlock, newState, pos)
+
+proc callChunkPrev(prev: proc(client: JavaClient; chunk: ChunkData): bool {.closure.}; client: JavaClient; chunk: ChunkData): bool =
+  prev(client, chunk)
+
 proc entryUsed(name: string): bool =
   ## True when some plugin's source mentions the entry; the hot hooks (tick, packet, redstone) are installed only then.
   gSourceText.find(name) >= 0
@@ -298,7 +324,7 @@ proc fireServer(entry: string; strs: seq[(string, string)]; nums: seq[(string, f
 const EntryNames = ["start", "stop", "on_player_chat", "on_player_command", "on_player_join", "on_player_leave",
   "on_player_move", "on_player_teleport", "on_player_toggle", "on_player_gamemode_change", "on_player_item_held",
   "on_player_login", "on_player_interact", "on_block_place", "on_server_command", "on_server_broadcast", "on_server_tick_start",
-  "on_server_tick_end", "on_server_load", "on_packet_received", "on_block_redstone"]
+  "on_server_tick_end", "on_server_load", "on_packet_received", "on_block_redstone", "on_spawn_change", "on_block_grow", "on_chunk_send"]
 
 proc jsString(s: string): string =
   ## A double-quoted JavaScript string literal.
@@ -317,6 +343,26 @@ proc readText(file: string): string =
   except:
     result = ""
 
+proc stripModuleSyntax(src: string): string =
+  ## A plugin may be written module-style. Everything in the bundle shares one program and reaches the server through the global
+  ## `host`/`hostS`/`hostv`, so a module needs only its syntax removed: a one-line `import ... ;` is dropped, `export default ` and
+  ## `export ` before a declaration are dropped, and a one-line `export { ... };` is dropped. (A multi-line import or export list
+  ## is left alone and will fail to load, which the loader reports.)
+  result = ""
+  let lines = src.splitLines()
+  for k in 0 ..< lines.len:
+    var line = lines[k]
+    if line.startsWith("import ") and (line.find(" from ") >= 0 or line.find("\"") >= 0):
+      line = ""
+    elif line.startsWith("export {"):
+      line = ""
+    elif line.startsWith("export default "):
+      line = line.substr(len("export default "))
+    elif line.startsWith("export "):
+      line = line.substr(len("export "))
+    result.add line
+    result.add "\n"
+
 proc bundleOf(found: seq[(string, string)]): string =
   ## The engine runs one JavaScript program per process, so the plugins are bundled into one: each source in its own function
   ## scope (its `start`, `stop` and `on_player_*` functions are collected, nothing leaks between plugins), and the program's own
@@ -331,7 +377,7 @@ proc bundleOf(found: seq[(string, string)]): string =
       if k > 0: result.add ", "
       result.add EntryNames[k]
     result.add ";\n"
-    result.add readText(file)
+    result.add stripModuleSyntax(readText(file))
     result.add "\n;var __h = {};\n"
     for e in EntryNames:
       result.add "if (typeof " & e & " === \"function\") __h." & e & " = " & e & ";\n"
@@ -480,6 +526,39 @@ proc startEnginePlugins*(server: Server) =
   gPluginServerLoadHook = proc(reload: bool) {.closure.} =
     callLoadPrev(gPrevLoad, reload)
     discard fireServer("on_server_load", @[], @[("reload", (if reload: 1.0 else: 0.0))])
+  # `/setworldspawn`: SpawnChangeEvent is not cancellable and a plugin cannot move the spawn here, it only sees the change
+  let commandServer = server.commandServer
+  if commandServer != nil:
+    gPrevSpawn = commandServer.fireSpawnChange
+    commandServer.fireSpawnChange = proc(world: CommandWorld; previous, next: CmdSpawn): CmdSpawn {.closure.} =
+      let result0 = callSpawnPrev(gPrevSpawn, world, previous, next)
+      discard fireServer("on_spawn_change", @[],
+        @[("previous_x", float64(previous.x)), ("previous_y", float64(previous.y)), ("previous_z", float64(previous.z)),
+          ("next_x", float64(result0.x)), ("next_y", float64(result0.y)), ("next_z", float64(result0.z)),
+          ("yaw", float64(result0.yaw)), ("pitch", float64(result0.pitch))])
+      result0
+  if entryUsed("on_block_grow"):
+    gPrevGrow = gPluginBlockGrowHook
+    gPluginBlockGrowHook = proc(world: BlockWorld; oldBlock: Block; oldState: BlockStateId; newBlock: Block; newState: BlockStateId;
+        pos: BlockPos): (bool, BlockStateId) {.closure.} =
+      let before = callGrowPrev(gPrevGrow, world, oldBlock, oldState, newBlock, newState, pos)
+      if before[0]: return before
+      let o = fireServer("on_block_grow", @[("old_block", "minecraft:" & oldBlock.name), ("new_block", "minecraft:" & newBlock.name)],
+        @[("x", float64(pos.vec.x)), ("y", float64(pos.vec.y)), ("z", float64(pos.vec.z))])
+      var answer: (bool, BlockStateId) = before
+      answer[0] = o[0]
+      answer
+  if entryUsed("on_chunk_send"):
+    gPrevChunk = gChunkSendHook
+    gChunkSendHook = proc(client: JavaClient; chunk: ChunkData): bool {.closure.} =
+      if callChunkPrev(gPrevChunk, client, chunk): return true
+      var owner: Option[Player] = none[Player]()
+      for w in server.worlds:
+        for p in w.players:
+          if p.client == client: owner = some(p)
+      if owner.isNone: return false
+      let who: Player = owner.unsafeGet
+      fireEngineEv("on_chunk_send", who.gameprofile.name, "", @[], @[("x", float64(chunk.x)), ("z", float64(chunk.z))], owner)[0]
   # hot hooks: installed only when a plugin defines the entry
   if entryUsed("on_server_tick_start"):
     gPrevTickStart = gPluginTickStartHook
