@@ -34,6 +34,7 @@ on(BlockPlaceEvent, function (e) { if (e.blockName == "minecraft:tnt") e.cancel(
 | `PotionEffectEvent` | EntityPotionEffectEvent | `entityId`, `entityType`, `effect`, `duration` (writable), `amplifier` | yes |
 | `CombustEvent` | EntityCombustEvent | `entityId`, `entityType`, `ticks` (writable) | yes |
 | `EntityTeleportEvent` | EntityTeleportEvent | `entityId`, `entityType`, `origin`, `target` | yes |
+| `PistonEvent` | BlockPistonExtendEvent, BlockPistonRetractEvent | `x`, `y`, `z`, `extend`, `moved`, `broken` | yes |
 | `SwapHandsEvent` | PlayerSwapHandItemsEvent | | yes |
 | `UseItemEvent` | right-click PlayerInteractEvent | | yes |
 | `InteractEntityEvent` | PlayerInteractEntityEvent / PlayerInteractAtEntityEvent | `entityId`, `action`, `sneaking`, `known` | yes |
@@ -84,7 +85,7 @@ on(BlockPlaceEvent, function (e) { if (e.blockName == "minecraft:tnt") e.cancel(
 | `onEnable`, `onDisable` | onEnable, onDisable, PluginEnableEvent | | |
 | tasks | BukkitScheduler | see `after`, `every` | |
 
-That is 65 event types. Events that fire often (movement, packets, ticks, permission checks, block grow, redstone, chunk send, damage)
+That is 66 event types. Events that fire often (movement, packets, ticks, permission checks, block grow, redstone, chunk send, damage)
 cost nothing while no loaded plugin listens to them.
 
 ## Bukkit events that do not exist here, and why
@@ -94,7 +95,7 @@ server (a port of Pumpkin) fires the events above; the rest below either need a 
 system the server does not have.
 
 **Needs a firing site in the server (the system exists):** BlockBurnEvent, BlockCanBuildEvent, BlockFadeEvent, BlockFormEvent,
-BlockSpreadEvent, BlockFromToEvent (fluid flow), BlockIgniteEvent, BlockPistonExtend/RetractEvent, BlockDispenseEvent,
+BlockSpreadEvent, BlockFromToEvent (fluid flow), BlockIgniteEvent, BlockDispenseEvent,
 LeavesDecayEvent, BlockPhysicsEvent, EntityTargetEvent, EntityChangeBlockEvent,
 EntityShootBowEvent, EntityTameEvent, ProjectileLaunchEvent, ProjectileHitEvent,
 PlayerKickEvent, PlayerPortalEvent, PlayerAdvancementDoneEvent,

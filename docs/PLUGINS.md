@@ -83,7 +83,7 @@ Command level 0 lets anyone use it; 1 to 4 an operator of at least that level. 2
 
 ## Events
 
-65 event types: everything the server fires, with the Bukkit equivalent of each, and the list of Bukkit events the server does not (yet)
+66 event types: everything the server fires, with the Bukkit equivalent of each, and the list of Bukkit events the server does not (yet)
 have a firing site for, are in **`docs/EVENTS.md`**.
 
 ## Managing plugins

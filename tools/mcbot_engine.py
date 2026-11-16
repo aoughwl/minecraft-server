@@ -94,6 +94,8 @@ def engine_session(m, c, st, w, biomes, ctx, args):
             expect('Hands stay put.', 'the swap hands event')
             command('effect give %s minecraft:slowness 30 1' % name)
             expect('Slowness for 600 ticks', 'the potion effect event')
+            command('pistonme 8 70 8')
+            expect('Piston extends', 'the piston event')
             command('giveme minecraft:diamond 5')
             expect('You now carry 5 of minecraft:diamond', 'inventory: a plugin gives items and counts them')
             command('summon minecraft:cow 5 70 5')
