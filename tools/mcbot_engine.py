@@ -144,6 +144,19 @@ def engine_session(m, c, st, w, biomes, ctx, args):
             expect('World saved', 'the world save event')
             command('food 12')
             expect('Food 20 -> 12', 'the food level event')
+            command('jscount')
+            expect('jscount is 1', 'the second JavaScript plugin')
+            command('plugin unload hello-world-js')
+            isolated = os.environ.get('AOE_PLUGIN_WORKERS') == '1'
+            # one worker per plugin: unloading the first leaves the second's state alone; with the plugins in one shared program, the
+            # program restarts and the counter starts again
+            command('jscount')
+            expect('jscount is 2' if isolated else 'jscount is 1', 'the second JavaScript plugin after the first is unloaded')
+            command('plugin load hello-world-js')
+            command('jsping')
+            expect('pong from JavaScript', 'the first JavaScript plugin loads again')
+            command('jscount')
+            expect('jscount is 3' if isolated else 'jscount is 1', 'and the second one counts on')
             command('plugins')
             expect('hello-world', '/plugins lists the plugins')
             command('plugin reload hello-world')

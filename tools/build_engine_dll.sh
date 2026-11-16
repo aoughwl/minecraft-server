@@ -18,3 +18,10 @@ mkdir -p "$OUT"
 gcc -O1 -shared -o "$OUT/aoe_engine.dll" -Wl,--whole-archive "$LIB" -Wl,--no-whole-archive -Wl,--export-all-symbols \
   $(cat "$ENGINE/build/embed/link.flags")
 echo "built $OUT/aoe_engine.dll"
+# the worker mode (AOE_PLUGIN_WORKERS=1, docs/PLUGINS.md): aoe_client.dll talks to aoe_worker.exe, one worker process per plugin. Both come
+# from the engine's tools/build_worker.sh <engine>/build/worker <engine>/build/embed (the script that makes libaoughwl_client.a).
+CLIB="$ENGINE/build/worker/libaoughwl_client.a"
+if [ -f "$CLIB" ]; then
+  gcc -O1 -shared -o "$ENGINE/build/worker/aoe_client.dll" -Wl,--whole-archive "$CLIB" -Wl,--no-whole-archive -Wl,--export-all-symbols     -ladvapi32 -luserenv
+  echo "built $ENGINE/build/worker/aoe_client.dll (with aoe_worker.exe beside it: put that folder on PATH for worker mode)"
+fi

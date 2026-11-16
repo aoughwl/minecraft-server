@@ -60,7 +60,7 @@ command("hello", "Say hello", 0, function (c) { c.reply("Hello, " + c.sender.nam
 ```
 
 All JavaScript plugins share one program (the engine runs one JavaScript program per process), each in its own scope; loading or
-unloading one restarts that program, which runs the others' `onEnable` again. `examples/hello-world-js` is a small one.
+unloading one restarts that program, which runs the others' `onEnable` again (unless the plugins run in worker processes, below). `examples/hello-world-js` is a small one.
 
 ## The API, in both languages
 
@@ -93,6 +93,19 @@ have a firing site for, are in **`docs/EVENTS.md`**.
 * `/plugins` lists the loaded plugins; `/plugin list | load <name> | unload <name> | reload <name> | hotreload enable|disable` (level 3).
 * **Hot reload:** every two seconds the server looks at each plugin's files; a changed plugin is reloaded and a new one is loaded.
 * Unloading a plugin runs its `onDisable` handlers and removes its commands, tasks and event subscriptions.
+
+## Plugins in worker processes (isolation)
+
+By default the engine runs inside the server, and all JavaScript plugins share one program (loading or unloading one restarts that program
+and runs the others' `onEnable` again). Start the server with `AOE_PLUGIN_WORKERS=1` and every plugin, JavaScript or aowlmony, runs in a worker
+process of its own instead: loading, unloading or reloading one touches no other, each keeps its own state, and a crash or runaway plugin
+stays in its worker. Unloading a plugin ends its process.
+
+* Needs `aoe_client.dll` and `aoe_worker.exe` (put their folder on PATH, or name the worker with `AOE_WORKER_EXE`). Build them from the engine:
+  `sh tools/build_worker.sh build/worker build/embed` in the engine checkout, then `sh tools/build_engine_dll.sh` here.
+* Cost: a process per plugin, and every host call and every event crosses a pipe, so busy events (movement, ticks) cost more.
+* `tools/run_plugin_showcase.sh` passes in both modes; with workers the bot also checks that unloading one JavaScript plugin leaves another's
+  state alone.
 
 ## Under the hood
 

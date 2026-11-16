@@ -18,6 +18,7 @@ rm -rf "$RUN"
 mkdir -p "$RUN/plugins" "$RUN/data"
 cp -r "$HERE/examples/hello-world" "$RUN/plugins/hello-world"
 cp -r "$HERE/examples/hello-world-js" "$RUN/plugins/hello-world-js"
+cp -r "$HERE/examples/hello-world-js2" "$RUN/plugins/hello-world-js2"
 sh "$HERE/tools/build_plugin.sh" "$RUN/plugins/hello-world"
 cd "$RUN"
 # first start writes pumpkin.toml; the bot logs in offline, so the Java listener must not encrypt or ask Mojang

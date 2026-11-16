@@ -7,7 +7,7 @@
 ## Everything runs on the thread that called `engineInit`. Host functions are plain procedures looked up by name; none is a
 ## closure, so nothing crosses the C boundary but the engine's own `aoe_value` rows.
 
-import std/[strutils]
+import std/[strutils, envvars]
 import aoe
 
 type
@@ -162,14 +162,24 @@ proc registerHost*(name: string; fn: HostFn) =
       return
   hostTable.add HostEntry(name: name, fn: fn)
 
+var
+  gClients: seq[nil pointer] = @[]    ## worker mode: the worker of each program, by program id (nil once the program is unloaded)
+  gHandles: seq[int32] = @[]          ## and the program's handle inside that worker
+  gWorkerError: string = ""           ## the engine's last error, taken from the worker that raised it
+
 proc engineError*(): string =
   if not aoeLoaded(): return "aoe_engine.dll could not be loaded (put it next to the server executable or on PATH; tools/build_engine_dll.sh builds it)"
+  if aoeWorkerMode(): return gWorkerError
   textOf(aoe_last_error())
 
 proc engineInit*(): bool =
   ## Starts the engine on this thread and installs the host callback. False with `engineError` on failure.
   if engineUp: return true
   if not aoeLoad(): return false
+  if aoeWorkerMode():
+    # each program starts its own worker (and initialises and gets the host callback) when it is loaded
+    engineUp = true
+    return true
   if aoe_init() != AoeOk: return false
   if aoe_set_host_callback(hostCallback) != AoeOk: return false
   engineUp = true
@@ -177,7 +187,13 @@ proc engineInit*(): bool =
 
 proc engineShutdown*() =
   if engineUp:
-    discard aoe_shutdown()
+    if aoeWorkerMode():
+      for k in 0 ..< gClients.len:
+        if gClients[k] != nil:
+          aoe_client_close(gClients[k])
+          gClients[k] = nil
+    else:
+      discard aoe_shutdown()
     engineUp = false
 
 proc loadPlugin*(path: string; context: int64 = 0): int32 =
@@ -186,19 +202,84 @@ proc loadPlugin*(path: string; context: int64 = 0): int32 =
   var pathC = path
   var opts = AoeLoadOptions(size: uint32(sizeof(AoeLoadOptions)), path: toCString(pathC), kind: kind, mode: AoeModeAuto,
                             context: context, copyNative: 1'i32)
-  aoe_load(addr opts)
+  if not aoeWorkerMode():
+    return aoe_load(addr opts)
+  # worker mode: a worker process of its own for this program; the id handed back stands for (worker, handle)
+  var exe = getEnv("AOE_WORKER_EXE")
+  if exe.len == 0: exe = "aoe_worker.exe"
+  let c = aoe_client_open(toCString(exe), nil, 0'i32)
+  if c == nil:
+    gWorkerError = "could not start " & exe & " (put it next to the server executable or on PATH, or set AOE_WORKER_EXE)"
+    return -1
+  let prev = aoe_client_select(c)
+  var h = -1'i32
+  if aoe_init() != AoeOk:
+    gWorkerError = textOf(aoe_last_error())
+  elif aoe_set_host_callback(hostCallback) != AoeOk:
+    gWorkerError = textOf(aoe_last_error())
+  else:
+    h = aoe_load(addr opts)
+    if h < 0: gWorkerError = textOf(aoe_last_error())
+  discard aoe_client_select(prev)
+  if h < 0:
+    aoe_client_close(c)
+    return -1
+  gClients.add c
+  gHandles.add h
+  int32(gClients.len - 1)
 
 proc hasEntry*(h: int32; name: string): bool =
   var n = name
-  aoe_has_entry(h, toCString(n)) == 1'i32
+  if not aoeWorkerMode():
+    return aoe_has_entry(h, toCString(n)) == 1'i32
+  if h < 0 or int(h) >= gClients.len or gClients[int(h)] == nil: return false
+  let prev = aoe_client_select(gClients[int(h)])
+  let r = aoe_has_entry(gHandles[int(h)], toCString(n))
+  discard aoe_client_select(prev)
+  r == 1'i32
+
 proc callPlugin*(h: int32; name: string): int32 =
   var n = name
-  aoe_call(h, toCString(n))
-proc unloadPlugin*(h: int32): int32 = aoe_unload(h)
+  if not aoeWorkerMode():
+    return aoe_call(h, toCString(n))
+  if h < 0 or int(h) >= gClients.len or gClients[int(h)] == nil: return -1
+  # the worker may call the host, and the host may call another worker: put the selection back afterwards
+  let prev = aoe_client_select(gClients[int(h)])
+  let r = aoe_call(gHandles[int(h)], toCString(n))
+  if r < 0: gWorkerError = textOf(aoe_last_error())
+  discard aoe_client_select(prev)
+  r
+
+proc unloadPlugin*(h: int32): int32 =
+  if not aoeWorkerMode():
+    return aoe_unload(h)
+  if h < 0 or int(h) >= gClients.len or gClients[int(h)] == nil: return -1
+  let c = gClients[int(h)]
+  let prev = aoe_client_select(c)
+  result = aoe_unload(gHandles[int(h)])     # runs the program's `stop` entry
+  discard aoe_client_select(prev)
+  gClients[int(h)] = nil
+  aoe_client_close(c)                       # and the worker process ends
+
 proc pluginMode*(h: int32): string =
-  case aoe_mode_of(h)
-  of AoeModeNative: "native"
-  of AoeModeInterpreted: "interpreted: " & textOf(aoe_mode_reason(h))
-  else: "unknown"
+  if not aoeWorkerMode():
+    case aoe_mode_of(h)
+    of AoeModeNative: return "native"
+    of AoeModeInterpreted: return "interpreted: " & textOf(aoe_mode_reason(h))
+    else: return "unknown"
+  if h < 0 or int(h) >= gClients.len or gClients[int(h)] == nil: return "unknown"
+  let prev = aoe_client_select(gClients[int(h)])
+  let m = aoe_mode_of(gHandles[int(h)])
+  var text = "unknown"
+  if m == AoeModeNative: text = "native"
+  elif m == AoeModeInterpreted: text = "interpreted: " & textOf(aoe_mode_reason(gHandles[int(h)]))
+  discard aoe_client_select(prev)
+  "worker, " & text
+
 proc pluginStdout*(h: int32): string =
-  textOf(aoe_stdout(h))
+  if not aoeWorkerMode():
+    return textOf(aoe_stdout(h))
+  if h < 0 or int(h) >= gClients.len or gClients[int(h)] == nil: return ""
+  let prev = aoe_client_select(gClients[int(h)])
+  result = textOf(aoe_stdout(gHandles[int(h)]))
+  discard aoe_client_select(prev)
