@@ -97,6 +97,8 @@ def engine_session(m, c, st, w, biomes, ctx, args):
             command('giveme minecraft:diamond 5')
             expect('You now carry 5 of minecraft:diamond', 'inventory: a plugin gives items and counts them')
             command('summon minecraft:cow 5 70 5')
+            expect('Cow burns for 60 ticks', 'the combust event')
+            expect('Cow teleports to 7', 'the entity teleport event')
             expect('Cow removed', 'entity control: health, move and remove a cow from a plugin')
             command('time set 6000')
             expect('Time set:', 'the time set event')
