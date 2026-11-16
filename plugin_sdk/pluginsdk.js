@@ -27,6 +27,8 @@ var __sdk = (function () {
   // ---- players and the server
   function Player(name) { this.name = name; }
   Player.prototype.tell = function (text) { return hostv("player_message_to", this.name, text); };
+  Player.prototype.itemCount = function (item) { return hostv("player_item_count", this.name, item); };
+  Player.prototype.give = function (item, count) { return hostv("player_give", this.name, item, count) == true; };
   Player.prototype.kick = function (reason) { return hostv("player_kick", this.name, reason); };
   Player.prototype.teleport = function (x, y, z) {
     if (typeof x === "object") { y = x.y; z = x.z; x = x.x; }

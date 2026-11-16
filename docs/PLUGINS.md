@@ -75,6 +75,7 @@ unloading one restarts that program, which runs the others' `onEnable` again. `e
 | the server | `log(text)`, `broadcast(text)`, `onlineCount()` | `server.log`, `server.broadcast`, `server.onlineCount()` |
 | run later | `after(ticks, handler)`, `every(ticks, handler)`, with data: `after(ticks, data, handler)`, `cancelTask(id)` | `after(ticks, fn, data)`, `every(...)`, `cancelTask(id)` |
 | the world (overworld) | `blockAt(x, y, z)`, `setBlock(x, y, z, name)`, `worldTime()`, `setWorldTime(ticks)` | `server.blockAt(x, y, z)`, `server.setBlock(x, y, z, name)`, `server.time()`, `server.setTime(ticks)` |
+| inventory | `p.give(item, count)`, `p.itemCount(item)` | `p.give(item, count)`, `p.itemCount(item)` |
 | an entity (by the id an event gives; overworld) | `entityHealth(id)`, `setEntityHealth(id, h)`, `entityPos(id)`, `teleportEntity(id, x, y, z)`, `removeEntity(id)` | `server.entityHealth(id)`, `server.setEntityHealth(id, h)`, `server.entityPos(id)`, `server.teleportEntity(id, x, y, z)`, `server.removeEntity(id)` |
 | start and stop | `onEnable(handler)`, `onDisable(handler)` | `onEnable(fn)`, `onDisable(fn)` |
 
@@ -106,4 +107,4 @@ have a firing site for, are in **`docs/EVENTS.md`**.
 * Plugins run **interpreted** (no native image yet).
 * Registrations happen at the top level of the plugin; create tasks in a handler or `onEnable`, not at the top level.
 * A plugin sees the events in `docs/EVENTS.md` and the calls above. Blocks and the time of the overworld can be read and set, other worlds, entities (beyond the damage, death, spawn and remove events),
-  inventories, scoreboards, boss bars, forms and recipes are not exposed.
+  scoreboards, boss bars, forms and recipes are not exposed.

@@ -90,6 +90,8 @@ def engine_session(m, c, st, w, biomes, ctx, args):
             expect('Placed minecraft:gold_block', '/block places a block from a plugin')
             command('block 2 70 2')
             expect('Block at 2 70 2: minecraft:gold_block', '/block reads it back')
+            command('giveme minecraft:diamond 5')
+            expect('You now carry 5 of minecraft:diamond', 'inventory: a plugin gives items and counts them')
             command('summon minecraft:cow 5 70 5')
             expect('Cow removed', 'entity control: health, move and remove a cow from a plugin')
             command('time set 6000')
