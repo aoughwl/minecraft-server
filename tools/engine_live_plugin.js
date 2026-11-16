@@ -17,3 +17,19 @@ function on_player_chat() {
   if (m == "bye") { hostv("player_kick", n, "engine kick"); host("event_cancel"); return; }
   if (m.charAt(0) == "x") { host("event_cancel"); }
 }
+
+// events mode (mcbot --play --op --engine-plugin events): the plugin reports what it saw back to the player in chat, and a
+// repeating task broadcasts to everyone
+var moves = 0;
+function on_player_move() {
+  moves++;
+  if (moves == 1) hostv("player_message_to", hostv("event_str", "player"), "engine saw a move");
+}
+
+function on_block_place() {
+  hostv("player_message_to", hostv("event_str", "player"), "engine saw place " + hostv("event_str", "placed"));
+}
+
+function start() { hostv("schedule_repeat", 40); }
+
+function on_task() { hostS("server_broadcast", "engine broadcast"); }

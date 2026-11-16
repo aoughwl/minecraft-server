@@ -28,6 +28,18 @@ def engine_session(m, c, st, w, biomes, ctx, args):
     print('  heard: %s' % [said for said in w.chat if 'engine welcome' in said][0], flush=True)
     st.hit('engine_welcome')
 
+    if args.engine_plugin == 'events':
+        # run with --play --op: play_session has already walked and placed a stone by now
+        wait(lambda: any('engine saw a move' in said for said in w.chat), 'on_player_move reported through chat')
+        st.hit('engine_move_event')
+        wait(lambda: any('engine saw place minecraft:stone' in said for said in w.chat), 'on_block_place reported a stone')
+        print('  heard: %s' % [said for said in w.chat if 'engine saw place' in said][0], flush=True)
+        st.hit('engine_place_event')
+        wait(lambda: any('engine broadcast' in said for said in w.chat), 'server_broadcast from a scheduled task', 20.0)
+        st.hit('engine_broadcast')
+        print('  engine plugin events ok', flush=True)
+        return
+
     if args.engine_plugin == 'actions':
         m.check(w.mode != 1, 'the bot starts in creative (%r), the gamemode check would prove nothing' % (w.mode,))
         say('gm1')
