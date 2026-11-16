@@ -36,5 +36,10 @@ grep -a "plugin" server.txt | tr -d '\r' | cut -c1-160 | head -8 || true
 set +e
 python "$HERE/tools/mcbot.py" --port "$PORT" --name "$NAME" --seconds 60 --engine-plugin showcase
 STATUS=$?
+if [ $STATUS -eq 0 ]; then
+  # the plugin turns a client called Griefer away at login
+  python "$HERE/tools/mcbot.py" --port "$PORT" --name Griefer --seconds 10 --expect-refusal "Griefers are not welcome"
+  STATUS=$?
+fi
 taskkill //IM "$(basename "$EXE")" //F > /dev/null 2>&1
 exit $STATUS

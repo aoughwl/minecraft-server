@@ -39,6 +39,11 @@ def engine_session(m, c, st, w, biomes, ctx, args):
                 wait(lambda: heard(fragment), what, seconds)
                 print('  heard: %s' % [said for said in w.chat if fragment in said][0], flush=True)
 
+            status = m.status_ping(args.host, args.port)
+            motd = status.get('description')
+            motd = motd.get('text', '') if isinstance(motd, dict) else str(motd)
+            m.check('hello-world server' in motd, 'the plugin did not set the server list MOTD: %r' % motd)
+            print('  server list says: %s' % motd, flush=True)
             expect('Welcome, %s' % name, 'the aowlmony join message')
             expect('%s joined the game' % name, 'the join broadcast')
             st.hit('showcase_join')

@@ -62,6 +62,11 @@ on(BlockPlaceEvent, function (e) { if (e.blockName == "minecraft:tnt") e.cancel(
 | `RedstoneEvent` | BlockRedstoneEvent | `x`, `y`, `z`, `oldCurrent`, `newCurrent` | yes |
 | `SpawnChangeEvent` | SpawnChangeEvent | `previous`, `next`, `yaw`, `pitch` | |
 | `ChunkSendEvent` | PlayerChunkLoadEvent (Paper) | `x`, `z` | yes |
+| `HealEvent` | EntityRegainHealthEvent | `entityId`, `entityType`, `amount` (writable) | yes |
+| `FoodLevelChangeEvent` | FoodLevelChangeEvent | `level` (writable), `previous` | yes |
+| `StatisticEvent` | PlayerStatisticIncrementEvent | `category`, `statId`, `amount` | |
+| `ServerListPingEvent` | ServerListPingEvent | `address`, `motd` (writable), `online`, `maxPlayers` (writable) | |
+| `PreLoginEvent` | AsyncPlayerPreLoginEvent | `name`, `address`, `kickMessage` (writable) | yes (turns the client away) |
 | `ServerCommandEvent` | ServerCommandEvent | `command` | yes |
 | `BroadcastEvent` | BroadcastMessageEvent | `message`, `sender` | yes |
 | `ServerLoadEvent` | ServerLoadEvent | `reload` | |
@@ -71,7 +76,7 @@ on(BlockPlaceEvent, function (e) { if (e.blockName == "minecraft:tnt") e.cancel(
 | `onEnable`, `onDisable` | onEnable, onDisable, PluginEnableEvent | | |
 | tasks | BukkitScheduler | see `after`, `every` | |
 
-That is 52 event types. Events that fire often (movement, packets, ticks, permission checks, block grow, redstone, chunk send, damage)
+That is 57 event types. Events that fire often (movement, packets, ticks, permission checks, block grow, redstone, chunk send, damage)
 cost nothing while no loaded plugin listens to them.
 
 ## Bukkit events that do not exist here, and why
@@ -82,11 +87,11 @@ system the server does not have.
 
 **Needs a firing site in the server (the system exists):** BlockBurnEvent, BlockCanBuildEvent, BlockFadeEvent, BlockFormEvent,
 BlockSpreadEvent, BlockFromToEvent (fluid flow), BlockIgniteEvent, BlockPistonExtend/RetractEvent, BlockDispenseEvent,
-LeavesDecayEvent, BlockPhysicsEvent, EntityTargetEvent, EntityChangeBlockEvent, EntityCombustEvent, EntityRegainHealthEvent,
+LeavesDecayEvent, BlockPhysicsEvent, EntityTargetEvent, EntityChangeBlockEvent, EntityCombustEvent,
 EntityShootBowEvent, EntityTameEvent, EntityTeleportEvent, EntityPotionEffectEvent, ProjectileLaunchEvent, ProjectileHitEvent,
-FoodLevelChangeEvent, PlayerKickEvent, PlayerPortalEvent, PlayerAdvancementDoneEvent, PlayerStatisticIncrementEvent,
+PlayerKickEvent, PlayerPortalEvent, PlayerAdvancementDoneEvent,
 PlayerLevelChangeEvent, PlayerSwapHandItemsEvent, PlayerShearEntityEvent, PlayerEditBookEvent, PlayerResourcePackStatusEvent,
-AsyncPlayerPreLoginEvent, ServerListPingEvent, InventoryOpenEvent, InventoryDragEvent, InventoryMoveItemEvent, CraftItemEvent,
+InventoryOpenEvent, InventoryDragEvent, InventoryMoveItemEvent, CraftItemEvent,
 PrepareItemCraftEvent, FurnaceBurn/Smelt/ExtractEvent, BrewEvent, WorldLoad/Unload/Save/InitEvent, ChunkLoad/UnloadEvent
 (upstream declares chunk load and save but never fires them), LightningStrikeEvent, PortalCreateEvent, TimeSkipEvent, TabCompleteEvent,
 VehicleEnter/Exit/Move/DamageEvent.
