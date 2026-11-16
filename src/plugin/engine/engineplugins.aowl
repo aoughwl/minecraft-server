@@ -1,0 +1,276 @@
+## The server's plugins on the aoughwl engine: `plugins/<name>/main.js` (or `plugins/<name>.js`) are JavaScript programs the engine
+## runs. Each is loaded once at start (its `start` entry runs when it has one) and is offered the server's events by name:
+## the entry `on_player_chat`, `on_player_command`, `on_player_join` or `on_player_leave` is called when the event fires, and
+## the plugin reads and answers the event through host functions: `hostv("event_str", "message")` (also "player" and "event")
+## returns a string, `host("event_cancel")`, `hostS("event_set_message", text)`, `hostS("player_message", text)`,
+## `hostS("server_log", text)`. Only `hostv` returns strings to JavaScript: `host` and `hostS` answer a number.
+## The engine runs one JavaScript program per process, so every plugin is bundled into one program (see `bundleOf`).
+## This is the plugin mechanism that replaces the WebAssembly component host; both run side by side until that host is removed.
+##
+## Plugins are classic scripts for now (no `import`/`export`): a module-style program needs the staged `.interp/` copy the
+## engine's node tool writes. Nothing here touches the engine until a plugin exists, so a server with no JS plugins never loads
+## aoe_engine.dll.
+
+import std/[syncio, strutils, dirs, paths, options]
+import aoe, enginehost
+import ../../server/serverbase
+import ../../server/entity/player
+import ../pluginhooks
+import ../../util/text/text
+
+const PluginsFolder = "plugins"
+
+type
+  EnginePlugin = object
+    name: string
+    handle: int32
+
+var
+  gPlugins: seq[EnginePlugin] = @[]
+  gEngineServer: Option[Server] = none[Server]()
+  gCurPlayer: Option[Player] = none[Player]()
+  gEvName = ""
+  gEvPlayerName = ""
+  gEvMessage = ""
+  gEvCancelled = false
+
+proc textArg(args: seq[HostArg]; k: int): string =
+  if k < args.len: args[k].s else: ""
+
+var
+  gLogLines: seq[string] = @[]   ## everything the plugins have logged, for tests
+  gLogPending: seq[string] = @[] ## logged during the current call, printed once it returns
+
+proc pluginLogLines*(): seq[string] = gLogLines
+
+proc flushPluginLog() =
+  ## The engine captures the process's output while a plugin runs, so a line printed from inside a host call never shows; the host
+  ## function buffers it and the caller prints it after the engine call has returned.
+  for line in gLogPending: echo "[plugin] ", line
+  gLogPending = @[]
+
+proc hostServerLog(context: int64; args: seq[HostArg]; res: var HostArg): int32 =
+  gLogLines.add textArg(args, 0)
+  gLogPending.add textArg(args, 0)
+  1
+
+proc hostEventStr(context: int64; args: seq[HostArg]; res: var HostArg): int32 =
+  let key = textArg(args, 0)
+  res.kind = AoeVString
+  res.s = (if key == "player": gEvPlayerName elif key == "message": gEvMessage elif key == "event": gEvName else: "")
+  1
+
+proc hostEventSetMessage(context: int64; args: seq[HostArg]; res: var HostArg): int32 =
+  gEvMessage = textArg(args, 0)
+  1
+
+proc hostEventCancel(context: int64; args: seq[HostArg]; res: var HostArg): int32 =
+  gEvCancelled = true
+  1
+
+proc hostPlayerMessage(context: int64; args: seq[HostArg]; res: var HostArg): int32 =
+  if gCurPlayer.isSome:
+    let target: Player = gCurPlayer.unsafeGet
+    target.sendSystemMessage(text(textArg(args, 0)))
+  1
+
+proc hostPlayerCount(context: int64; args: seq[HostArg]; res: var HostArg): int32 =
+  res.kind = AoeVInt
+  res.i = 0
+  if gEngineServer.isSome:
+    let srv: Server = gEngineServer.unsafeGet
+    var total = 0
+    for w in srv.worlds: total += w.players.len
+    res.i = int64(total)
+  1
+
+proc registerServerHost() =
+  registerHost("server_log", hostServerLog)
+  registerHost("event_str", hostEventStr)
+  registerHost("event_set_message", hostEventSetMessage)
+  registerHost("event_cancel", hostEventCancel)
+  registerHost("player_message", hostPlayerMessage)
+  registerHost("server_player_count", hostPlayerCount)
+
+proc slashedPath(p: string): string =
+  result = ""
+  for c in p:
+    result.add (if c == '\\': '/' else: c)
+
+proc lastSlash(s: string): int =
+  result = -1
+  for k in 0 ..< s.len:
+    if s[k] == '/': result = k
+
+proc scanEnginePlugins*(folder: string): seq[(string, string)] =
+  ## (name, file) for each `<folder>/<name>/main.js` and `<folder>/<name>.js`.
+  result = @[]
+  try:
+    for kind, entry in walkDir(path(folder)):
+      let full = slashedPath($entry)
+      if kind == pcFile and full.toLowerAscii.endsWith(".js"):
+        var base = full
+        let slash = lastSlash(base)
+        if slash >= 0: base = base.substr(slash + 1)
+        if not base.startsWith("."):   # `.engine-bundle.js` is ours
+          result.add (base.substr(0, base.len - 4), full)
+      elif kind == pcDir:
+        let main = full & "/main.js"
+        var found = false
+        try:
+          for k2, e2 in walkDir(path(full)):
+            if k2 == pcFile and slashedPath($e2).toLowerAscii.endsWith("/main.js"): found = true
+        except ErrorCode:
+          discard
+        if found:
+          var base = full
+          let slash = lastSlash(base)
+          if slash >= 0: base = base.substr(slash + 1)
+          result.add (base, main)
+  except ErrorCode:
+    discard
+
+proc fireEngineAs*(entry, playerName, message: string; player: Option[Player]): (bool, string) =
+  ## Offers the event to every plugin that has the entry; (cancelled, the message after the plugins).
+  gEvName = entry
+  gEvPlayerName = playerName
+  gEvMessage = message
+  gEvCancelled = false
+  let outer = gCurPlayer
+  gCurPlayer = player
+  for p in gPlugins:
+    if hasEntry(p.handle, entry):
+      if callPlugin(p.handle, entry) < 0:
+        echo "[plugin] ", p.name, ": ", entry, " failed: ", engineError()
+  gCurPlayer = outer
+  flushPluginLog()
+  (gEvCancelled, gEvMessage)
+
+proc fireEngine(entry: string; player: Player; message: string): (bool, string) =
+  fireEngineAs(entry, player.gameprofile.name, message, some(player))
+
+# ---- chaining onto the hooks pluginmgr.aowl installs (a captured closure called inside a closure asserts in hexer, so the
+# previous hooks are kept in globals and called through procs that take them as parameters) ----
+
+proc passChat(player: Player; message: string): (bool, string) {.closure.} = (false, message)
+proc passText(player: Player; message: TextComponent): (bool, TextComponent) {.closure.} = (false, message)
+
+var gPrevChat: proc(player: Player; message: string): (bool, string) {.closure.} = passChat
+var gPrevCommand: proc(player: Player; command: string): (bool, string) {.closure.} = passChat
+var gPrevJoin: proc(player: Player; message: TextComponent): (bool, TextComponent) {.closure.} = passText
+var gPrevLeave: proc(player: Player; message: TextComponent): (bool, TextComponent) {.closure.} = passText
+
+proc callChatPrev(prev: proc(player: Player; message: string): (bool, string) {.closure.}; player: Player; message: string): (bool, string) =
+  prev(player, message)
+
+proc callCommandPrev(prev: proc(player: Player; command: string): (bool, string) {.closure.}; player: Player; command: string): (bool, string) =
+  prev(player, command)
+
+proc callJoinPrev(prev: proc(player: Player; message: TextComponent): (bool, TextComponent) {.closure.}; player: Player;
+    message: TextComponent): (bool, TextComponent) =
+  prev(player, message)
+
+const EntryNames = ["start", "stop", "on_player_chat", "on_player_command", "on_player_join", "on_player_leave"]
+
+proc jsString(s: string): string =
+  ## A double-quoted JavaScript string literal.
+  result = "\""
+  for c in s:
+    if c == '"': result.add "\\\""
+    elif c == '\\': result.add "\\\\"
+    elif c == '\n': result.add "\\n"
+    elif c == '\r': discard
+    else: result.add c
+  result.add "\""
+
+proc readText(file: string): string =
+  try:
+    result = readFile(file)
+  except:
+    result = ""
+
+proc bundleOf(found: seq[(string, string)]): string =
+  ## The engine runs one JavaScript program per process, so the plugins are bundled into one: each source in its own function
+  ## scope (its `start`, `stop` and `on_player_*` functions are collected, nothing leaks between plugins), and the program's own
+  ## entry points call each plugin's, a throw in one plugin logged and not passed on.
+  result = "var __aoeP = [];\n"
+  for (name, file) in found:
+    result.add "(function () {\n"
+    # the entry names are declared local first: without that, `typeof start` in a plugin that has no `start` finds the program's own
+    # global `start` (the dispatcher below), which would then call itself
+    result.add "var "
+    for k in 0 ..< EntryNames.len:
+      if k > 0: result.add ", "
+      result.add EntryNames[k]
+    result.add ";\n"
+    result.add readText(file)
+    result.add "\n;var __h = {};\n"
+    for e in EntryNames:
+      result.add "if (typeof " & e & " === \"function\") __h." & e & " = " & e & ";\n"
+    result.add "__aoeP.push({ name: " & jsString(name) & ", h: __h });\n})();\n"
+  for e in EntryNames:
+    result.add "function " & e & "() {\n"
+    result.add "  for (var i = 0; i < __aoeP.length; i++) {\n"
+    result.add "    var p = __aoeP[i];\n"
+    result.add "    if (p.h." & e & ") { try { p.h." & e & "(); } catch (x) { hostS(\"server_log\", p.name + \": " & e & " threw: \" + String(x)); } }\n"
+    result.add "  }\n}\n"
+
+proc loadEnginePlugins*(found: seq[(string, string)]; bundleFile: string = "plugins/.engine-bundle.js"): int =
+  ## Starts the engine (only when there is something to load), loads the plugins as one bundled program and runs their `start`
+  ## entries. The number of plugins in it.
+  if found.len == 0: return 0
+  if not engineInit():
+    echo "[plugin] the engine could not start (is aoe_engine.dll on the DLL path?): ", engineError()
+    return 0
+  registerServerHost()
+  try:
+    writeFile(bundleFile, bundleOf(found))
+  except:
+    echo "[plugin] could not write ", bundleFile
+    return 0
+  let h = loadPlugin(bundleFile, 0)
+  if h < 0:
+    echo "[plugin] could not load the plugin bundle: ", engineError()
+    return 0
+  gPlugins.add EnginePlugin(name: "bundle", handle: h)
+  var names = ""
+  for (name, file) in found:
+    if names.len > 0: names.add ", "
+    names.add name
+  echo "[plugin] loaded ", found.len, " engine plugin(s): ", names, " (", pluginMode(h), ")"
+  if callPlugin(h, "start") < 0:
+    echo "[plugin] start failed: ", engineError()
+  flushPluginLog()
+  found.len
+
+proc startEnginePlugins*(server: Server) =
+  ## Loads the JavaScript plugins in `plugins/` and chains the engine onto the chat, command, join and leave hooks. Does nothing
+  ## (and never loads the engine) when there is no JavaScript plugin.
+  gEngineServer = some(server)
+  if loadEnginePlugins(scanEnginePlugins(PluginsFolder)) == 0: return
+  gPrevChat = gPluginChatHook
+  gPluginChatHook = proc(player: Player; message: string): (bool, string) {.closure.} =
+    let before = callChatPrev(gPrevChat, player, message)
+    if before[0]: return before
+    fireEngine("on_player_chat", player, before[1])
+  gPrevCommand = gPluginCommandHook
+  gPluginCommandHook = proc(player: Player; command: string): (bool, string) {.closure.} =
+    let before = callCommandPrev(gPrevCommand, player, command)
+    if before[0]: return before
+    fireEngine("on_player_command", player, before[1])
+  gPrevJoin = gPluginJoinHook
+  gPluginJoinHook = proc(player: Player; message: TextComponent): (bool, TextComponent) {.closure.} =
+    let before = callJoinPrev(gPrevJoin, player, message)
+    if before[0]: return before
+    let o = fireEngine("on_player_join", player, "")
+    var answer: (bool, TextComponent) = before
+    answer[0] = o[0]
+    answer
+  gPrevLeave = gPluginLeaveHook
+  gPluginLeaveHook = proc(player: Player; message: TextComponent): (bool, TextComponent) {.closure.} =
+    let before = callJoinPrev(gPrevLeave, player, message)
+    if before[0]: return before
+    let o = fireEngine("on_player_leave", player, "")
+    var answer: (bool, TextComponent) = before
+    answer[0] = o[0]
+    answer
