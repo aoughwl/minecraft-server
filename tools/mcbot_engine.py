@@ -157,6 +157,26 @@ def engine_session(m, c, st, w, biomes, ctx, args):
             expect('pong from JavaScript', 'the first JavaScript plugin loads again')
             command('jscount')
             expect('jscount is 3' if isolated else 'jscount is 1', 'and the second one counts on')
+            if isolated:
+                # a worker that dies must not take the server down: kill every worker, the server keeps answering, and a reload starts a
+                # new worker for the plugin
+                os.system('taskkill /F /IM aoe_worker.exe >NUL 2>&1')
+                time.sleep(1.0)
+                command('list')
+                expect('players', 'the server still answers after its workers were killed', 20.0)
+                command('plugin reload hello-world-js2')
+                expect('hello-world-js2 reloaded successfully', 'a reload starts a new worker')
+                command('jscount')
+                wait(lambda: sum(1 for x in w.chat if x == 'jscount is 1') >= 2, 'the reloaded plugin counts from the start in its new worker', 20.0)
+                print('  heard: jscount is 1 (again, from the new worker)', flush=True)
+            # what a plugin command costs: 100 /jscount round trips (the plugin runs in the server's engine, or in its own worker process)
+            counted = lambda: sum(1 for x in w.chat if x.startswith('jscount is'))
+            was = counted()
+            started = time.time()
+            for _ in range(100):
+                command('jscount')
+            wait(lambda: counted() >= was + 100, '100 plugin command replies', 60.0)
+            print('  100 plugin commands in %.0f ms (%s)' % ((time.time() - started) * 1000, 'worker processes' if isolated else 'in the server'), flush=True)
             command('plugins')
             expect('hello-world', '/plugins lists the plugins')
             command('plugin reload hello-world')

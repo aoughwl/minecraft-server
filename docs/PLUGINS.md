@@ -103,7 +103,11 @@ stays in its worker. Unloading a plugin ends its process.
 
 * Needs `aoe_client.dll` and `aoe_worker.exe` (put their folder on PATH, or name the worker with `AOE_WORKER_EXE`). Build them from the engine:
   `sh tools/build_worker.sh build/worker build/embed` in the engine checkout, then `sh tools/build_engine_dll.sh` here.
-* Cost: a process per plugin, and every host call and every event crosses a pipe, so busy events (movement, ticks) cost more.
+* Cost: a process per plugin, and every host call and every event crosses a pipe. Measured with the showcase bot: 100 plugin commands take about
+  the same time in both modes (a couple of milliseconds each). Events that fire very often with a plugin listening (movement, ticks, block
+  changes) have not been measured.
+* A worker that dies (killed, crashed) does not take the server down: that plugin's events fail with a log line and `/plugin reload <name>`
+  starts it in a new worker (the showcase kills every worker and checks this).
 * `tools/run_plugin_showcase.sh` passes in both modes; with workers the bot also checks that unloading one JavaScript plugin leaves another's
   state alone.
 
