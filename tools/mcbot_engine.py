@@ -96,6 +96,16 @@ def engine_session(m, c, st, w, biomes, ctx, args):
             expect('Slowness for 600 ticks', 'the potion effect event')
             command('pistonme 8 70 8')
             expect('Piston extends', 'the piston event')
+            command('tpme 0 66 0')
+            expect('Teleported to 0, 66, 0', 'back near spawn, where the chunks are loaded')
+            command('giveme minecraft:snowball 1')
+            expect('You now carry 1 of minecraft:snowball', 'a snowball to throw')
+            c.send(m.SB_CARRIED, struct.pack('>h', 0))
+            # look straight down, so the snowball lands at the bot's feet where the chunks are loaded
+            c.send(m.SB_MOVE_POS_ROT, struct.pack('>dddff', w.pos[0], w.pos[1], w.pos[2], 0.0, 90.0) + bytes([1]))
+            time.sleep(0.5)
+            c.send(m.SB_USE, m.varint(0) + m.varint(90) + struct.pack('>ff', 0.0, 90.0))
+            expect('Snowball hit', 'the projectile hit event')
             command('giveme minecraft:diamond 5')
             expect('You now carry 5 of minecraft:diamond', 'inventory: a plugin gives items and counts them')
             command('summon minecraft:cow 5 70 5')
@@ -147,7 +157,7 @@ def engine_session(m, c, st, w, biomes, ctx, args):
             os._exit(0)
 
       except m.Fail:
-        print('  the chat so far: %r' % (w.chat[-10:],), flush=True)
+        print('  the chat so far: %r' % ([x for x in w.chat if not x.startswith('Cow ')][-14:],), flush=True)
         raise
 
     wait(lambda: any('engine welcome' in said for said in w.chat), 'the welcome message the engine plugin sends on join')
