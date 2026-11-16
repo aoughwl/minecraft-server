@@ -86,6 +86,9 @@ def engine_session(m, c, st, w, biomes, ctx, args):
             expect('[%s] hello everyone' % name, '/announce')
             st.hit('showcase_tasks')
 
+            command('xp add %s 3 levels' % name)
+            expect('Level 0 -> 3', 'the level change event')
+            command('save-all')
             command('plugins')
             expect('hello-world', '/plugins lists the plugins')
             command('plugin reload hello-world')

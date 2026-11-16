@@ -128,6 +128,9 @@ var __sdk = (function () {
     ServerLoadEvent: ["on_server_load", function () { return { reload: num("reload") != 0 }; }],
     TickStartEvent: ["on_server_tick_start", function () { return { tick: num("tick") }; }],
     TickEndEvent: ["on_server_tick_end", function () { return { tick: num("tick"), durationNs: num("duration_ns") }; }],
+    LevelChangeEvent: ["on_player_level_change", function () { return { player: P(), previous: num("previous"), level: num("level") }; }],
+    WorldSaveEvent: ["on_world_save", function () { return { saved: true }; }],
+    TimeSetEvent: ["on_time_set", function () { return { previous: num("previous"), time: num("time") }; }],
     HealEvent: ["on_entity_heal", function () { return { entityId: num("entity_id"), entityType: str("entity_type"), amount: num("amount") }; }],
     FoodLevelChangeEvent: ["on_player_food_change", function () { return { player: P(), level: num("level"), previous: num("previous") }; }],
     StatisticEvent: ["on_player_statistic", function () { return { player: P(), category: num("category"), statId: num("stat_id"), amount: num("amount") }; }],
@@ -211,7 +214,7 @@ var __sdk = (function () {
     ev.cancelled = false;
     ev.cancel = function () { this.cancelled = true; };
     var before = { message: ev.message, kickMessage: ev.kickMessage, drop: ev.drop, granted: ev.granted, hatching: ev.hatching, amount: ev.amount,
-                   motd: ev.motd, maxPlayers: ev.maxPlayers, level: ev.level };
+                   motd: ev.motd, maxPlayers: ev.maxPlayers, level: ev.level, time: ev.time };
     for (var h = 0; h < list.length; h++) list[h](ev);
     if (ev.cancelled) host("event_cancel");
     if (ev.message !== before.message && typeof ev.message === "string") hostS("event_set_message", ev.message);
@@ -223,6 +226,7 @@ var __sdk = (function () {
     if (ev.motd !== before.motd && typeof ev.motd === "string") hostS("event_set_message", ev.motd);
     if (ev.maxPlayers !== before.maxPlayers && typeof ev.maxPlayers === "number") hostv("event_set_value", ev.maxPlayers);
     if (ev.level !== before.level && typeof ev.level === "number") hostv("event_set_value", ev.level);
+    if (ev.time !== before.time && typeof ev.time === "number") hostv("event_set_value", ev.time);
   }
 
   return {
@@ -253,4 +257,5 @@ var BlockGrowEvent = __sdk.tokens.BlockGrowEvent, RedstoneEvent = __sdk.tokens.R
 var ChunkSendEvent = __sdk.tokens.ChunkSendEvent, ServerCommandEvent = __sdk.tokens.ServerCommandEvent, BroadcastEvent = __sdk.tokens.BroadcastEvent;
 var ServerLoadEvent = __sdk.tokens.ServerLoadEvent, TickStartEvent = __sdk.tokens.TickStartEvent, TickEndEvent = __sdk.tokens.TickEndEvent;
 var PacketEvent = __sdk.tokens.PacketEvent, HealEvent = __sdk.tokens.HealEvent, FoodLevelChangeEvent = __sdk.tokens.FoodLevelChangeEvent;
+var LevelChangeEvent = __sdk.tokens.LevelChangeEvent, WorldSaveEvent = __sdk.tokens.WorldSaveEvent, TimeSetEvent = __sdk.tokens.TimeSetEvent;
 var StatisticEvent = __sdk.tokens.StatisticEvent, ServerListPingEvent = __sdk.tokens.ServerListPingEvent, PreLoginEvent = __sdk.tokens.PreLoginEvent;
