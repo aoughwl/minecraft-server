@@ -98,7 +98,9 @@ have a firing site for, are in **`docs/EVENTS.md`**.
 
 * An aowlmony plugin is compiled together with three added procedures (`start`, `event`, `stop`) that hand over to the SDK, because the
   engine finds a program's entries in its main module. `tools/build_plugin.sh` does that on a copy; your file is not touched.
-* The engine's interpreter cannot give the host a runtime string directly, so `pluginsdk` talks in integers and reads text back; you never see it.
+* `pluginsdk` sends each host call as one runtime string (the function name and its arguments joined by a separator) and reads the text
+  answer back. This needs an engine from commit 66b8fbb on (an interpreter that passes runtime strings); with an older `aoe_engine.dll` the
+  SDK finds out at its first call and falls back to sending packed integers. `sdkTransport()` tells which one is in use.
 * The raw interface (host calls by name, plain `on_player_chat` functions in JavaScript) still exists underneath and is documented in the
   source of `src/plugin/engine/engineplugins.aowl`; the SDKs are the way to write plugins.
 

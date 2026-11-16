@@ -97,6 +97,8 @@ def engine_session(m, c, st, w, biomes, ctx, args):
             expect('Hands stay put.', 'the swap hands event')
             command('effect give %s minecraft:slowness 30 1' % name)
             expect('Slowness for 600 ticks', 'the potion effect event')
+            command('transport')
+            expect('SDK transport: runtime strings', 'the SDK passes runtime strings to the host')
             command('pistonme 8 70 8')
             expect('Piston extends', 'the piston event')
             c.send(m.SB_COMMAND_SUGGESTION, m.varint(31) + m.string('/hello '))
