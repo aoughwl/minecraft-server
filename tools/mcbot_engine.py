@@ -92,6 +92,8 @@ def engine_session(m, c, st, w, biomes, ctx, args):
             expect('Block at 2 70 2: minecraft:gold_block', '/block reads it back')
             c.send(m.SB_ACTION, m.varint(6) + m.block_pos(0, 0, 0) + bytes([0]) + m.varint(0))
             expect('Hands stay put.', 'the swap hands event')
+            command('effect give %s minecraft:slowness 30 1' % name)
+            expect('Slowness for 600 ticks', 'the potion effect event')
             command('giveme minecraft:diamond 5')
             expect('You now carry 5 of minecraft:diamond', 'inventory: a plugin gives items and counts them')
             command('summon minecraft:cow 5 70 5')

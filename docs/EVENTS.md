@@ -30,6 +30,8 @@ on(BlockPlaceEvent, function (e) { if (e.blockName == "minecraft:tnt") e.cancel(
 | `ItemHeldEvent` | PlayerItemHeldEvent | `previousSlot`, `nextSlot` | yes |
 | `InteractEvent` | PlayerInteractEvent (block) | `action`, `x`, `y`, `z` | yes |
 | `SwingEvent` | PlayerAnimationEvent, left-click PlayerInteractEvent | | yes |
+| `InventoryOpenEvent` | InventoryOpenEvent | `window` | yes |
+| `PotionEffectEvent` | EntityPotionEffectEvent | `entityId`, `entityType`, `effect`, `duration` (writable), `amplifier` | yes |
 | `SwapHandsEvent` | PlayerSwapHandItemsEvent | | yes |
 | `UseItemEvent` | right-click PlayerInteractEvent | | yes |
 | `InteractEntityEvent` | PlayerInteractEntityEvent / PlayerInteractAtEntityEvent | `entityId`, `action`, `sneaking`, `known` | yes |
@@ -80,7 +82,7 @@ on(BlockPlaceEvent, function (e) { if (e.blockName == "minecraft:tnt") e.cancel(
 | `onEnable`, `onDisable` | onEnable, onDisable, PluginEnableEvent | | |
 | tasks | BukkitScheduler | see `after`, `every` | |
 
-That is 61 event types. Events that fire often (movement, packets, ticks, permission checks, block grow, redstone, chunk send, damage)
+That is 63 event types. Events that fire often (movement, packets, ticks, permission checks, block grow, redstone, chunk send, damage)
 cost nothing while no loaded plugin listens to them.
 
 ## Bukkit events that do not exist here, and why
@@ -92,10 +94,10 @@ system the server does not have.
 **Needs a firing site in the server (the system exists):** BlockBurnEvent, BlockCanBuildEvent, BlockFadeEvent, BlockFormEvent,
 BlockSpreadEvent, BlockFromToEvent (fluid flow), BlockIgniteEvent, BlockPistonExtend/RetractEvent, BlockDispenseEvent,
 LeavesDecayEvent, BlockPhysicsEvent, EntityTargetEvent, EntityChangeBlockEvent, EntityCombustEvent,
-EntityShootBowEvent, EntityTameEvent, EntityTeleportEvent, EntityPotionEffectEvent, ProjectileLaunchEvent, ProjectileHitEvent,
+EntityShootBowEvent, EntityTameEvent, EntityTeleportEvent, ProjectileLaunchEvent, ProjectileHitEvent,
 PlayerKickEvent, PlayerPortalEvent, PlayerAdvancementDoneEvent,
 PlayerShearEntityEvent, PlayerEditBookEvent, PlayerResourcePackStatusEvent,
-InventoryOpenEvent, InventoryDragEvent, InventoryMoveItemEvent, CraftItemEvent,
+InventoryDragEvent, InventoryMoveItemEvent, CraftItemEvent,
 PrepareItemCraftEvent, FurnaceBurn/Smelt/ExtractEvent, BrewEvent, WorldLoad/Unload/InitEvent, ChunkLoad/UnloadEvent
 (upstream declares chunk load and save but never fires them), LightningStrikeEvent, PortalCreateEvent, TabCompleteEvent,
 VehicleEnter/Exit/Move/DamageEvent.

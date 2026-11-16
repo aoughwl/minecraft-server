@@ -74,6 +74,10 @@ var __sdk = (function () {
     GamemodeChangeEvent: ["on_player_gamemode_change", function () { return { player: P(), previous: num("previous"), next: num("next") }; }],
     ItemHeldEvent: ["on_player_item_held", function () { return { player: P(), previousSlot: num("previous"), nextSlot: num("next") }; }],
     InteractEvent: ["on_player_interact", function () { return merge({ player: P(), action: num("action") }, xyz()); }],
+    InventoryOpenEvent: ["on_inventory_open", function () { return { player: P(), window: num("window") }; }],
+    PotionEffectEvent: ["on_entity_potion_effect", function () {
+      return { entityId: num("entity_id"), entityType: str("entity_type"), effect: str("effect"), duration: num("duration"), amplifier: num("amplifier") };
+    }],
     SwapHandsEvent: ["on_player_swap_hands", function () { return { player: P() }; }],
     SwingEvent: ["on_player_swing", function () { return { player: P() }; }],
     UseItemEvent: ["on_player_use_item", function () { return { player: P() }; }],
@@ -227,7 +231,7 @@ var __sdk = (function () {
     ev.cancelled = false;
     ev.cancel = function () { this.cancelled = true; };
     var before = { message: ev.message, kickMessage: ev.kickMessage, drop: ev.drop, granted: ev.granted, hatching: ev.hatching, amount: ev.amount,
-                   motd: ev.motd, maxPlayers: ev.maxPlayers, level: ev.level, time: ev.time };
+                   motd: ev.motd, maxPlayers: ev.maxPlayers, level: ev.level, time: ev.time, duration: ev.duration };
     for (var h = 0; h < list.length; h++) list[h](ev);
     if (ev.cancelled) host("event_cancel");
     if (ev.message !== before.message && typeof ev.message === "string") hostS("event_set_message", ev.message);
@@ -240,6 +244,7 @@ var __sdk = (function () {
     if (ev.maxPlayers !== before.maxPlayers && typeof ev.maxPlayers === "number") hostv("event_set_value", ev.maxPlayers);
     if (ev.level !== before.level && typeof ev.level === "number") hostv("event_set_value", ev.level);
     if (ev.time !== before.time && typeof ev.time === "number") hostv("event_set_value", ev.time);
+    if (ev.duration !== before.duration && typeof ev.duration === "number") hostv("event_set_value", ev.duration);
   }
 
   return {
@@ -253,7 +258,7 @@ var onEnable = __sdk.onEnable, onDisable = __sdk.onDisable, server = __sdk.serve
 var ChatEvent = __sdk.tokens.ChatEvent, PlayerCommandEvent = __sdk.tokens.PlayerCommandEvent, JoinEvent = __sdk.tokens.JoinEvent;
 var LeaveEvent = __sdk.tokens.LeaveEvent, LoginEvent = __sdk.tokens.LoginEvent, MoveEvent = __sdk.tokens.MoveEvent;
 var TeleportEvent = __sdk.tokens.TeleportEvent, ToggleEvent = __sdk.tokens.ToggleEvent, GamemodeChangeEvent = __sdk.tokens.GamemodeChangeEvent;
-var SwapHandsEvent = __sdk.tokens.SwapHandsEvent;
+var SwapHandsEvent = __sdk.tokens.SwapHandsEvent, InventoryOpenEvent = __sdk.tokens.InventoryOpenEvent, PotionEffectEvent = __sdk.tokens.PotionEffectEvent;
 var ItemHeldEvent = __sdk.tokens.ItemHeldEvent, InteractEvent = __sdk.tokens.InteractEvent, SwingEvent = __sdk.tokens.SwingEvent;
 var UseItemEvent = __sdk.tokens.UseItemEvent, InteractEntityEvent = __sdk.tokens.InteractEntityEvent, BlockPlaceEvent = __sdk.tokens.BlockPlaceEvent;
 var BlockBreakEvent = __sdk.tokens.BlockBreakEvent, DropItemEvent = __sdk.tokens.DropItemEvent, PickupItemEvent = __sdk.tokens.PickupItemEvent;
