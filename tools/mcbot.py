@@ -2896,7 +2896,7 @@ def run(args):
         extra = list(extra) + Stages.SCOREBOARD_NAMES
     if args.commands_verify:
         extra = list(extra) + Stages.COMMAND_VERIFY_NAMES
-    if args.blocks or args.blocks_verify or args.world or args.containers or args.containers_verify or args.c2 or args.c2_verify or args.c1 or args.c1_verify or args.last or args.partsb or args.nbtfam or args.nbtfam_verify:
+    if args.blocks or args.blocks_verify or args.world or args.containers or args.containers_verify or args.c2 or args.c2_verify or args.c1 or args.c1_verify or args.last or args.partsb or args.nbtfam or args.nbtfam_verify or args.flint:
         load_block_table(args.assets)
     if args.world:
         extra = list(extra) + Stages.WORLD_NAMES
@@ -3196,6 +3196,9 @@ def run(args):
         if args.itemuse:
             import mcbot_itemuse
             mcbot_itemuse.itemuse_session(sys.modules[__name__], c, st, w, biomes, ctx, args)
+        if args.flint:
+            import mcbot_flint
+            mcbot_flint.flint_session(sys.modules[__name__], c, st, w, biomes, ctx, args)
         if args.player:
             player_session(c, st, w, biomes, ctx, args)
         elif args.player_verify:
@@ -3553,6 +3556,7 @@ def main():
     ap.add_argument('--containers-verify', help='a file from --containers --save: check the stacks are still in the containers')
     ap.add_argument('--meta', action='store_true', help='entity data at 774 indexes and types: names, babies, health, pose, air; see mcbot_meta.py')
     ap.add_argument('--meta-verify', action='store_true', help='a second player joins after --meta: the entity data arrives with the join')
+    ap.add_argument('--flint', action='store_true', help='flint and steel, a fire charge, a campfire and a nether portal; see mcbot_flint.py')
     ap.add_argument('--itemuse', action='store_true', help='eat, shoot a bow, raise a shield, pick up experience, crouch; see mcbot_itemuse.py')
     ap.add_argument('--player', action='store_true', help='mob damage, hunger, death and respawn, /fill states, a cow; see player_session')
     ap.add_argument('--player-verify', help='a file from --player --save: the cow must be spawned on joining')
