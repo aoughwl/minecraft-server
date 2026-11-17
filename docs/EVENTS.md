@@ -43,6 +43,7 @@ on(BlockPlaceEvent, function (e) { if (e.blockName == "minecraft:tnt") e.cancel(
 | `TabCompleteEvent` | TabCompleteEvent | `buffer`, `suggestions` (add to it) | |
 | `TargetEvent` | EntityTargetEvent | `mobId`, `mobType`, `targetId`, `targetType` | yes (the mob picks nobody) |
 | `AdvancementEvent` | PlayerAdvancementDoneEvent | `advancement` (the title) | |
+| `HopperMoveEvent` | InventoryMoveItemEvent (a hopper pushing into a container) | `x`, `y`, `z`, `item` | yes |
 | `SwapHandsEvent` | PlayerSwapHandItemsEvent | | yes |
 | `UseItemEvent` | right-click PlayerInteractEvent | | yes |
 | `InteractEntityEvent` | PlayerInteractEntityEvent / PlayerInteractAtEntityEvent | `entityId`, `action`, `sneaking`, `known` | yes |
@@ -93,7 +94,7 @@ on(BlockPlaceEvent, function (e) { if (e.blockName == "minecraft:tnt") e.cancel(
 | `onEnable`, `onDisable` | onEnable, onDisable, PluginEnableEvent | | |
 | tasks | BukkitScheduler | see `after`, `every` | |
 
-That is 74 event types. Events that fire often (movement, packets, ticks, permission checks, block grow, redstone, chunk send, damage)
+That is 75 event types. Events that fire often (movement, packets, ticks, permission checks, block grow, redstone, chunk send, damage)
 cost nothing while no loaded plugin listens to them.
 
 ## Bukkit events that do not exist here, and why
@@ -102,7 +103,7 @@ Bukkit has well over 200 event classes. An event can only exist when the server 
 server (a port of Pumpkin) fires the events above; the rest below either need a firing site added in the server or describe a game
 system the server does not have.
 
-**Needs a firing site in the server (the system exists):** BlockCanBuildEvent, EntityChangeBlockEvent, InventoryMoveItemEvent (hoppers),
+**Needs a firing site in the server (the system exists):** BlockCanBuildEvent, EntityChangeBlockEvent, a hopper pulling items in (only the push is hooked),
 BrewEvent and FurnaceBurn/ExtractEvent (the block entities exist; the smelt is covered), PortalCreateEvent, VehicleEnter/Exit/Move/DamageEvent
 (boats and minecarts exist).
 
