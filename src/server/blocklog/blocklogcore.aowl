@@ -1,0 +1,759 @@
+## Block logging (CoreProtect style): a compact append-only log of block changes, kept per region file group in
+## `<world>/blocklog/`, plus the queries and the budgeted rollback / restore job that read it.
+##
+## The block layer calls `blockLogRecordChange` from the one place blocks are written (`setBlockState` in
+## block/blockbehaviour.aowl); that only copies a record into a fixed ring on the tick thread. The ring is drained by
+## `blockLogTick` (timer or half-full) into per region blocks that are appended to the files a couple per tick, and fully by
+## `blockLogFlush` (save-all, shutdown, every query).
+##
+## It imports nothing of the server, so the block layer can import it.
+##
+## File `r.<dim>.<rx>.<rz>.bl` (region = 512 x 512 blocks): a run of blocks
+##   0xB1, varint recordCount, varint payloadLen, payload
+## and the payload is delta coded: `0` flag + (zigzag dt, zigzag dx, dy, dz, varint old, varint new, byte cause<<4|kind,
+## varint actor) or `1` flag + varint n = n more records equal in everything but the position, which steps by the delta of
+## the record before (a /fill row or a column of a tower is one run). A truncated tail is ignored.
+## `dims.txt` and `users.txt` hold the interned dimension and actor names (a line each; the record stores the index).
+
+{.feature: "lenientnils".}
+
+import std/[syncio, tables, algorithm, dirs, paths, times, strutils]
+import ../../world/worldfs
+
+const
+  BlockMagic* = 0xB1'u8
+
+  # cause
+  CauseNatural* = 0'u8      ## physics, growth, decay: nothing set a cause
+  CausePlace* = 1'u8        ## a player placed it
+  CauseBreak* = 2'u8        ## a player broke it
+  CauseExplosion* = 3'u8
+  CauseFire* = 4'u8
+  CauseFluid* = 5'u8
+  CauseMod* = 6'u8          ## a plugin or server mod
+  CauseCommand* = 7'u8
+  CauseRollback* = 8'u8
+  CauseRestore* = 9'u8
+  CauseInteract* = 10'u8    ## a player used a block (door, lever, bonemeal)
+
+  # actor kind
+  KindNone* = 0'u8
+  KindPlayer* = 1'u8
+  KindEntity* = 2'u8
+  KindBlock* = 3'u8
+  KindConsole* = 4'u8
+
+  RegionShift = 9
+  RingCapacity* = 65536
+  FlushEveryTicks* = 200       ## timer: the ring goes to disk every 10 seconds
+  WritesPerTick* = 2           ## region blocks appended per tick
+  SetsPerTick* = 400           ## rollback / restore block writes per tick
+
+type
+  BlockLogRec* = object
+    t*: uint32       ## seconds since the epoch
+    dim*: uint8      ## index into the dimension names
+    x*, y*, z*: int32
+    oldS*, newS*: uint16
+    cause*: uint8
+    kind*: uint8
+    actor*: uint16   ## index into the actor names
+
+  BlockRing* = object
+    items*: seq[BlockLogRec]
+    head*: int       ## oldest
+    count*: int
+
+  BlockLogCtx* = object
+    cause*: uint8
+    kind*: uint8
+    actor*: uint16
+
+  LogQuery* = object
+    dim*: int            ## -1: every dimension
+    x*, y*, z*: int32
+    radius*: int32       ## < 0: no position filter
+    sinceT*: int64       ## records with t >= sinceT
+    actor*: int          ## -1: anyone
+    skipRollbacks*: bool ## leave out the rollback / restore records themselves
+
+  ChangeApply* = proc(dim: int; x, y, z: int32; state: uint16) {.closure.}
+  JobDone* = proc(changed: int) {.closure.}
+
+  RollbackJob* = object
+    active*: bool
+    restore*: bool
+    items*: seq[BlockLogRec]   ## already in the order they are applied
+    cursor*: int
+    applied*: int
+    issuer*: string
+
+# ---- varints -------------------------------------------------------------------------------------------------------
+
+proc putVar*(buf: var seq[byte]; v: uint64) =
+  var x = v
+  while x >= 0x80'u64:
+    buf.add(byte((x and 0x7F'u64) or 0x80'u64))
+    x = x shr 7
+  buf.add(byte(x))
+
+proc getVar*(buf: openArray[byte]; pos: var int; ok: var bool): uint64 =
+  var shift = 0
+  var r = 0'u64
+  while true:
+    if pos >= buf.len or shift > 63:
+      ok = false
+      return 0'u64
+    let b = buf[pos]
+    inc pos
+    r = r or (uint64(b and 0x7F'u8) shl shift)
+    if (b and 0x80'u8) == 0'u8:
+      return r
+    shift += 7
+
+proc zig*(v: int64): uint64 =
+  let u = cast[uint64](v)
+  (u shl 1) xor cast[uint64](v shr 63)
+
+proc unzig*(u: uint64): int64 =
+  let a = cast[int64](u shr 1)
+  let b = cast[int64](u and 1'u64)
+  a xor (-b)
+
+# ---- the ring ------------------------------------------------------------------------------------------------------
+
+proc newRing*(capacity: int): BlockRing =
+  BlockRing(items: newSeq[BlockLogRec](capacity), head: 0, count: 0)
+
+proc ringFull*(r: BlockRing): bool = r.count >= r.items.len
+
+proc ringPush*(r: var BlockRing; rec: BlockLogRec): bool =
+  ## False (nothing stored) when full: the caller drains first.
+  if r.count >= r.items.len:
+    return false
+  let at = (r.head + r.count) mod r.items.len
+  r.items[at] = rec
+  inc r.count
+  true
+
+proc ringDrain*(r: var BlockRing): seq[BlockLogRec] =
+  ## Everything in, oldest first.
+  result = newSeq[BlockLogRec](r.count)
+  for i in 0 ..< r.count:
+    result[i] = r.items[(r.head + i) mod r.items.len]
+  r.head = 0
+  r.count = 0
+
+# ---- encode / decode -----------------------------------------------------------------------------------------------
+
+proc sameFields(a, b: BlockLogRec): bool =
+  a.oldS == b.oldS and a.newS == b.newS and a.cause == b.cause and a.kind == b.kind and a.actor == b.actor and a.t == b.t
+
+proc encodeBlock*(recs: openArray[BlockLogRec]): seq[byte] =
+  ## One block (the records of one region file, oldest first).
+  var payload: seq[byte] = @[]
+  var prev = BlockLogRec()
+  var lastDx = 0'i64
+  var lastDy = 0'i64
+  var lastDz = 0'i64
+  var i = 0
+  while i < recs.len:
+    let r = recs[i]
+    let dx = int64(r.x) - int64(prev.x)
+    let dy = int64(r.y) - int64(prev.y)
+    let dz = int64(r.z) - int64(prev.z)
+    # a run: later records equal in the fields whose position steps by the previous delta
+    if i > 0 and sameFields(r, prev) and dx == lastDx and dy == lastDy and dz == lastDz:
+      var n = 0
+      var p2 = prev
+      var j = i
+      while j < recs.len and sameFields(recs[j], p2) and
+          int64(recs[j].x) - int64(p2.x) == lastDx and int64(recs[j].y) - int64(p2.y) == lastDy and
+          int64(recs[j].z) - int64(p2.z) == lastDz:
+        p2 = recs[j]
+        inc n
+        inc j
+      payload.add(1'u8)
+      putVar(payload, uint64(n))
+      prev = p2
+      i = j
+      continue
+    payload.add(0'u8)
+    putVar(payload, zig(int64(r.t) - int64(prev.t)))
+    putVar(payload, zig(dx))
+    putVar(payload, zig(dy))
+    putVar(payload, zig(dz))
+    putVar(payload, uint64(r.oldS))
+    putVar(payload, uint64(r.newS))
+    payload.add(byte((r.cause shl 4) or (r.kind and 0x0F'u8)))
+    putVar(payload, uint64(r.actor))
+    lastDx = dx
+    lastDy = dy
+    lastDz = dz
+    prev = r
+    inc i
+  result = @[BlockMagic]
+  putVar(result, uint64(recs.len))
+  putVar(result, uint64(payload.len))
+  for b in payload:
+    result.add(b)
+
+proc decodeBlocks*(buf: openArray[byte]; dim: uint8): seq[BlockLogRec] =
+  ## Every complete block of a file, in file order. A damaged or truncated tail ends the read.
+  result = @[]
+  var pos = 0
+  while pos < buf.len:
+    if buf[pos] != BlockMagic:
+      return
+    inc pos
+    var ok = true
+    let count = int(getVar(buf, pos, ok))
+    let plen = int(getVar(buf, pos, ok))
+    if not ok or plen < 0 or pos + plen > buf.len:
+      return
+    let endPos = pos + plen
+    var got: seq[BlockLogRec] = @[]
+    var prev = BlockLogRec(dim: dim)
+    var lastDx = 0'i64
+    var lastDy = 0'i64
+    var lastDz = 0'i64
+    var good = true
+    while pos < endPos and good:
+      let flag = buf[pos]
+      inc pos
+      if flag == 1'u8:
+        let n = int(getVar(buf, pos, ok))
+        if not ok:
+          good = false
+          break
+        for _ in 0 ..< n:
+          prev.x = int32(int64(prev.x) + lastDx)
+          prev.y = int32(int64(prev.y) + lastDy)
+          prev.z = int32(int64(prev.z) + lastDz)
+          got.add(prev)
+      elif flag == 0'u8:
+        let dt = unzig(getVar(buf, pos, ok))
+        let dx = unzig(getVar(buf, pos, ok))
+        let dy = unzig(getVar(buf, pos, ok))
+        let dz = unzig(getVar(buf, pos, ok))
+        let o = getVar(buf, pos, ok)
+        let nw = getVar(buf, pos, ok)
+        if pos >= endPos:
+          good = false
+          break
+        let ck = buf[pos]
+        inc pos
+        let actor = getVar(buf, pos, ok)
+        if not ok:
+          good = false
+          break
+        prev.t = uint32(int64(prev.t) + dt)
+        prev.x = int32(int64(prev.x) + dx)
+        prev.y = int32(int64(prev.y) + dy)
+        prev.z = int32(int64(prev.z) + dz)
+        prev.oldS = uint16(o)
+        prev.newS = uint16(nw)
+        prev.cause = ck shr 4
+        prev.kind = ck and 0x0F'u8
+        prev.actor = uint16(actor)
+        lastDx = dx
+        lastDy = dy
+        lastDz = dz
+        got.add(prev)
+      else:
+        good = false
+    if not good or got.len != count:
+      return
+    for r in got:
+      result.add(r)
+    pos = endPos
+
+# ---- the store -----------------------------------------------------------------------------------------------------
+
+var gFolder: string = ""
+var gRing: BlockRing = newRing(16)
+var gDims: seq[string] = @[]
+var gUsers: seq[string] = @[]
+var gUserIdx: Table[string, int] = initTable[string, int]()
+var gCtx: BlockLogCtx = BlockLogCtx()
+var gPendingPaths: seq[string] = @[]
+var gPendingData: seq[seq[byte]] = @[]
+var gLastFlushTick: int = 0
+var gClock: proc(): int64 {.closure.} = proc(): int64 {.closure.} = int64(toUnix(getTime()))
+var gInspect: seq[string] = @[]
+var gStateName: proc(s: uint16): string {.closure.} = proc(s: uint16): string {.closure.} = "#" & $s
+var gJob: RollbackJob = RollbackJob()
+var gApply: ChangeApply = proc(dim: int; x, y, z: int32; state: uint16) {.closure.} = discard
+var gDone: JobDone = proc(changed: int) {.closure.} = discard
+var gLater: seq[proc() {.closure.}] = @[]
+var gLaterAt: seq[int] = @[]
+var gTickNow: int = 0
+var gDropped: int = 0
+var gWritten: int = 0
+var gLastDim: string = ""
+var gLastDimIdx: int = -1
+
+proc blockLogActive*(): bool = gFolder.len > 0
+proc blockLogFolder*(): string = gFolder
+proc blockLogDropped*(): int = gDropped
+proc blockLogRecordsWritten*(): int = gWritten
+proc blockLogBuffered*(): int = gRing.count
+proc blockLogPendingBlocks*(): int = gPendingPaths.len
+
+proc setBlockLogClock*(c: proc(): int64 {.closure.}) = gClock = c
+proc setBlockLogStateNamer*(f: proc(s: uint16): string {.closure.}) = gStateName = f
+proc blockLogStateName*(s: uint16): string = gStateName(s)
+proc blockLogNow*(): int64 = gClock()
+
+proc appendLine(file, line: string) =
+  var f: File
+  if open(f, file, fmAppend):
+    write(f, line & "\n")
+    close(f)
+
+proc readLines(file: string): seq[string] =
+  result = @[]
+  let (st, bytes) = readFileBytes(file)
+  if st != rsOk:
+    return
+  var cur = ""
+  for b in bytes:
+    if b == 10'u8:
+      if cur.len > 0 and cur[cur.len - 1] == '\r':
+        cur = cur[0 ..< cur.len - 1]
+      result.add(cur)
+      cur = ""
+    else:
+      cur.add(char(b))
+  if cur.len > 0:
+    result.add(cur)
+
+proc blockLogInit*(folder: string) =
+  ## Starts logging into `folder` (`<world>/blocklog`), reading the name tables already there.
+  gFolder = folder
+  gRing = newRing(RingCapacity)
+  gDims = @[]
+  gUsers = @[]
+  gUserIdx = initTable[string, int]()
+  gPendingPaths = @[]
+  gPendingData = @[]
+  gCtx = BlockLogCtx()
+  gJob = RollbackJob()
+  gLastDim = ""
+  gLastDimIdx = -1
+  gDropped = 0
+  gWritten = 0
+  gInspect = @[]
+  discard createDirAllW(folder)
+  gDims = readLines(joinPathW(folder, "dims.txt"))
+  gUsers = readLines(joinPathW(folder, "users.txt"))
+  for i in 0 ..< gUsers.len:
+    gUserIdx[gUsers[i]] = i
+
+proc blockLogStop*() =
+  ## For tests: forgets the folder (nothing is recorded afterwards).
+  gFolder = ""
+
+proc dimIndex*(name: string): int =
+  ## The index of a dimension name, new ones are appended to `dims.txt`.
+  if name == gLastDim and gLastDimIdx >= 0:
+    return gLastDimIdx
+  var found = -1
+  for i in 0 ..< gDims.len:
+    if gDims[i] == name:
+      found = i
+  if found < 0:
+    if gDims.len >= 250:
+      return 0
+    gDims.add(name)
+    found = gDims.len - 1
+    if gFolder.len > 0:
+      appendLine(joinPathW(gFolder, "dims.txt"), name)
+  gLastDim = name
+  gLastDimIdx = found
+  found
+
+proc dimName*(idx: int): string =
+  if idx >= 0 and idx < gDims.len: gDims[idx] else: "?"
+
+proc findDim*(name: string): int =
+  ## -1 when never seen.
+  for i in 0 ..< gDims.len:
+    if gDims[i] == name:
+      return i
+  -1
+
+proc userIndex*(name: string): int =
+  let have = gUserIdx.getOrDefault(name, -1)
+  if have >= 0:
+    return have
+  if gUsers.len >= 65000:
+    return 0
+  gUsers.add(name)
+  let idx = gUsers.len - 1
+  gUserIdx[name] = idx
+  if gFolder.len > 0:
+    appendLine(joinPathW(gFolder, "users.txt"), name)
+  idx
+
+proc findUser*(name: string): int =
+  ## -1 when never seen (case sensitive, then case insensitive).
+  let have = gUserIdx.getOrDefault(name, -1)
+  if have >= 0:
+    return have
+  let lower = name.toLowerAscii()
+  for i in 0 ..< gUsers.len:
+    if gUsers[i].toLowerAscii() == lower:
+      return i
+  -1
+
+proc userName*(idx: int): string =
+  if idx >= 0 and idx < gUsers.len: gUsers[idx] else: "?"
+
+# ---- the context the callers set --------------------------------------------------------------------------------------
+
+proc blockLogPush*(cause, kind: uint8; name: string): BlockLogCtx =
+  ## Everything written until `blockLogPop(previous)` is attributed to this. Answers what to restore.
+  result = gCtx
+  gCtx = BlockLogCtx(cause: cause, kind: kind, actor: (if name.len > 0 and gFolder.len > 0: uint16(userIndex(name)) else: 0'u16))
+
+proc blockLogPop*(prev: BlockLogCtx) =
+  gCtx = prev
+
+proc blockLogCurrent*(): BlockLogCtx = gCtx
+
+# ---- writing -----------------------------------------------------------------------------------------------------
+
+proc floorShift(v: int32): int32 =
+  v shr RegionShift   # arithmetic shift: floor division by 512
+
+proc regionPath(dim: int; rx, rz: int32): string =
+  joinPathW(gFolder, "r." & $dim & "." & $rx & "." & $rz & ".bl")
+
+proc groupByRegion(recs: seq[BlockLogRec]; paths: var seq[string]; groups: var seq[seq[BlockLogRec]]) =
+  var idx = initTable[string, int]()
+  for r in recs:
+    let p = regionPath(int(r.dim), floorShift(r.x), floorShift(r.z))
+    let at = idx.getOrDefault(p, -1)
+    if at >= 0:
+      groups[at].add(r)
+    else:
+      idx[p] = paths.len
+      paths.add(p)
+      groups.add(@[r])
+
+proc drainRing() =
+  ## The ring to encoded pending blocks.
+  if gRing.count == 0:
+    return
+  let recs = ringDrain(gRing)
+  var paths: seq[string] = @[]
+  var groups: seq[seq[BlockLogRec]] = @[]
+  groupByRegion(recs, paths, groups)
+  for i in 0 ..< paths.len:
+    gPendingPaths.add(paths[i])
+    gPendingData.add(encodeBlock(groups[i]))
+    gWritten += groups[i].len
+
+proc writeOnePending(): bool =
+  if gPendingPaths.len == 0:
+    return false
+  let p = gPendingPaths[0]
+  let d = gPendingData[0]
+  gPendingPaths.delete(0)
+  gPendingData.delete(0)
+  var f: File
+  if open(f, p, fmAppend):
+    if d.len > 0:
+      discard writeBuffer(f, unsafeAddr d[0], d.len)
+    close(f)
+  true
+
+proc blockLogFlush*() =
+  ## Everything buffered to disk now (save-all, shutdown, before a query).
+  if gFolder.len == 0:
+    return
+  drainRing()
+  while writeOnePending():
+    discard
+
+proc blockLogRecordChange*(dimension: string; x, y, z: int; oldState, newState: int) =
+  ## The seam: one block went from `oldState` to `newState`. Cheap: a name lookup, a clock read and a ring store.
+  if gFolder.len == 0 or oldState == newState:
+    return
+  if gRing.count >= gRing.items.len:
+    blockLogFlush()     # full before the tick could drain it: nothing is dropped, the tick pays once
+  let rec = BlockLogRec(t: uint32(gClock()), dim: uint8(dimIndex(dimension)), x: int32(x), y: int32(y), z: int32(z),
+    oldS: uint16(oldState), newS: uint16(newState), cause: gCtx.cause, kind: gCtx.kind, actor: gCtx.actor)
+  if not ringPush(gRing, rec):
+    inc gDropped
+
+# ---- reading -----------------------------------------------------------------------------------------------------
+
+proc readRegion(dim: int; rx, rz: int32): seq[BlockLogRec] =
+  let (st, bytes) = readFileBytes(regionPath(dim, rx, rz))
+  if st != rsOk:
+    return @[]
+  decodeBlocks(bytes, uint8(dim))
+
+proc matches(q: LogQuery; r: BlockLogRec): bool =
+  if int64(r.t) < q.sinceT:
+    return false
+  if q.actor >= 0 and int(r.actor) != q.actor:
+    return false
+  if q.skipRollbacks and (r.cause == CauseRollback or r.cause == CauseRestore):
+    return false
+  if q.radius >= 0:
+    if abs(r.x - q.x) > q.radius or abs(r.y - q.y) > q.radius or abs(r.z - q.z) > q.radius:
+      return false
+  true
+
+proc cmpKey(a, b: int64): int =
+  if a < b: -1 elif a > b: 1 else: 0
+
+proc blockLogQuery*(q: LogQuery): seq[BlockLogRec] =
+  ## Chronological (oldest first; the order of a region file for equal times). Flushes first.
+  blockLogFlush()
+  result = @[]
+  var dimLo = 0
+  var dimHi = gDims.len - 1
+  if q.dim >= 0:
+    dimLo = q.dim
+    dimHi = q.dim
+  for d in dimLo .. dimHi:
+    var found: seq[BlockLogRec] = @[]
+    if q.radius >= 0:
+      for rx in floorShift(q.x - q.radius) .. floorShift(q.x + q.radius):
+        for rz in floorShift(q.z - q.radius) .. floorShift(q.z + q.radius):
+          for r in readRegion(d, rx, rz):
+            if matches(q, r):
+              found.add(r)
+    else:
+      # no position: every region file of the dimension
+      try:
+        for kind, entry in walkDir(path(gFolder)):
+          if kind != pcFile:
+            continue
+          let full = $entry
+          var cut = -1
+          for i in 0 ..< full.len:
+            if full[i] == '/' or full[i] == '\\':
+              cut = i
+          let base = full[cut + 1 .. ^1]
+          let prefix = "r." & $d & "."
+          if base.startsWith(prefix) and base.endsWith(".bl"):
+            let (st, bytes) = readFileBytes(joinPathW(gFolder, base))
+            if st == rsOk:
+              for r in decodeBlocks(bytes, uint8(d)):
+                if matches(q, r):
+                  found.add(r)
+      except ErrorCode:
+        discard
+    # stable merge by time: sort an index so equal times keep the file order (the same block is in one region)
+    var order = newSeq[int64](found.len)
+    for i in 0 ..< order.len:
+      order[i] = (int64(found[i].t) shl 32) or int64(i)
+    order.sort(cmpKey)
+    for k in order:
+      result.add(found[int(k and 0xFFFFFFFF'i64)])
+
+proc planRollback*(chron: seq[BlockLogRec]): seq[BlockLogRec] =
+  ## The changes to undo in the order to undo them: the last one first. Rollback / restore records are not undone.
+  result = @[]
+  var i = chron.len - 1
+  while i >= 0:
+    let r = chron[i]
+    if r.cause != CauseRollback and r.cause != CauseRestore:
+      result.add(r)
+    dec i
+
+proc planRestore*(chron: seq[BlockLogRec]): seq[BlockLogRec] =
+  ## The changes to redo: the first one first.
+  result = @[]
+  for r in chron:
+    if r.cause != CauseRollback and r.cause != CauseRestore:
+      result.add(r)
+
+# ---- history text (inspect / lookup) ---------------------------------------------------------------------------------
+
+proc agoText*(secs: int64): string =
+  var s = secs
+  if s < 0: s = 0
+  if s < 60: return $s & "s"
+  if s < 3600: return $(s div 60) & "m"
+  if s < 86400: return $(s div 3600) & "h" & $((s mod 3600) div 60) & "m"
+  $(s div 86400) & "d" & $((s mod 86400) div 3600) & "h"
+
+proc causeName*(c: uint8): string =
+  case c
+  of CauseNatural: "natural"
+  of CausePlace: "placed"
+  of CauseBreak: "broke"
+  of CauseExplosion: "exploded"
+  of CauseFire: "burned"
+  of CauseFluid: "flowed"
+  of CauseMod: "mod"
+  of CauseCommand: "command"
+  of CauseRollback: "rollback"
+  of CauseRestore: "restore"
+  of CauseInteract: "used"
+  else: "?"
+
+proc recLine*(r: BlockLogRec; now: int64): string =
+  let who = if r.kind == KindNone: "-" else: userName(int(r.actor))
+  agoText(now - int64(r.t)) & " ago  " & who & " " & causeName(r.cause) & " " & blockLogStateName(r.oldS) & " -> " &
+    blockLogStateName(r.newS) & "  (" & $r.x & " " & $r.y & " " & $r.z & ")"
+
+proc blockLogHistory*(dimension: string; x, y, z: int; maxLines: int): seq[string] =
+  ## Newest first, `maxLines` at most; the first line is the count.
+  let d = findDim(dimension)
+  if d < 0 or gFolder.len == 0:
+    return @["No block history here."]
+  let recs = blockLogQuery(LogQuery(dim: d, x: int32(x), y: int32(y), z: int32(z), radius: 0'i32, sinceT: 0'i64, actor: -1,
+    skipRollbacks: false))
+  var hits: seq[BlockLogRec] = @[]
+  for r in recs:
+    if int(r.x) == x and int(r.y) == y and int(r.z) == z:
+      hits.add(r)
+  if hits.len == 0:
+    return @["No block history at " & $x & " " & $y & " " & $z & "."]
+  result = @[$hits.len & " change(s) at " & $x & " " & $y & " " & $z & ":"]
+  let now = gClock()
+  var i = hits.len - 1
+  while i >= 0 and result.len <= maxLines:
+    result.add(recLine(hits[i], now))
+    dec i
+
+# ---- inspect mode ------------------------------------------------------------------------------------------------
+
+proc blockLogToggleInspect*(name: string): bool =
+  ## True when it is on now.
+  for i in 0 ..< gInspect.len:
+    if gInspect[i] == name:
+      gInspect.delete(i)
+      return false
+  gInspect.add(name)
+  true
+
+proc blockLogInspecting*(name: string): bool =
+  if gInspect.len == 0:
+    return false
+  for n in gInspect:
+    if n == name:
+      return true
+  false
+
+# ---- purge -------------------------------------------------------------------------------------------------------
+
+proc blockLogPurge*(olderThanSecs: int64): int =
+  ## Removes the records older than that from every file; answers how many.
+  blockLogFlush()
+  result = 0
+  if gFolder.len == 0:
+    return
+  let cutoff = gClock() - olderThanSecs
+  var files: seq[string] = @[]
+  try:
+    for kind, entry in walkDir(path(gFolder)):
+      if kind != pcFile:
+        continue
+      let full = $entry
+      var cut = -1
+      for i in 0 ..< full.len:
+        if full[i] == '/' or full[i] == '\\':
+          cut = i
+      let base = full[cut + 1 .. ^1]
+      if base.startsWith("r.") and base.endsWith(".bl"):
+        files.add(base)
+  except ErrorCode:
+    discard
+  for base in files:
+    let parts = base.split('.')
+    if parts.len < 5:
+      continue
+    var d = 0
+    for c in parts[1]:
+      if c >= '0' and c <= '9':
+        d = d * 10 + (ord(c) - ord('0'))
+    let full = joinPathW(gFolder, base)
+    let (st, bytes) = readFileBytes(full)
+    if st != rsOk:
+      continue
+    let recs = decodeBlocks(bytes, uint8(d))
+    var keep: seq[BlockLogRec] = @[]
+    for r in recs:
+      if int64(r.t) >= cutoff:
+        keep.add(r)
+    if keep.len == recs.len:
+      continue
+    result += recs.len - keep.len
+    if keep.len == 0:
+      discard removeFileW(full)
+    else:
+      let tmp = full & ".tmp"
+      if writeFileBytes(tmp, encodeBlock(keep)):
+        discard renameReplace(tmp, full)
+
+# ---- the rollback job --------------------------------------------------------------------------------------------------
+
+proc blockLogJobActive*(): bool = gJob.active
+proc blockLogJobLeft*(): int = (if gJob.active: gJob.items.len - gJob.cursor else: 0)
+
+proc blockLogStartJob*(items: seq[BlockLogRec]; restore: bool; issuer: string; apply: ChangeApply; done: JobDone): bool =
+  ## `items` in apply order (`planRollback` / `planRestore`). False while another job runs.
+  if gJob.active:
+    return false
+  gJob = RollbackJob(active: true, restore: restore, items: items, cursor: 0, applied: 0, issuer: issuer)
+  gApply = apply
+  gDone = done
+  if items.len == 0:
+    gJob.active = false
+    done(0)
+  true
+
+proc runJobSlice*(budget: int) =
+  ## Up to `budget` block writes, logged as cause rollback / restore by the issuer (the recorder runs inside `apply`).
+  if not gJob.active:
+    return
+  let prev = blockLogPush(if gJob.restore: CauseRestore else: CauseRollback, KindPlayer, gJob.issuer)
+  var n = 0
+  while n < budget and gJob.cursor < gJob.items.len:
+    let r = gJob.items[gJob.cursor]
+    inc gJob.cursor
+    inc n
+    gApply(int(r.dim), r.x, r.y, r.z, (if gJob.restore: r.newS else: r.oldS))
+    inc gJob.applied
+  blockLogPop(prev)
+  if gJob.cursor >= gJob.items.len:
+    gJob.active = false
+    gDone(gJob.applied)
+
+# ---- the tick ----------------------------------------------------------------------------------------------------
+
+proc blockLogLater*(delayTicks: int; action: proc() {.closure.}) =
+  ## Runs `action` on the tick thread `delayTicks` ticks from now (a snapshot waits for the chunk saves it asked for).
+  gLater.add(action)
+  gLaterAt.add(gTickNow + delayTicks)
+
+proc blockLogTick*(tick: int) =
+  ## From the server tick: the timer drain, a few block appends, one slice of a rollback.
+  gTickNow = tick
+  var li = 0
+  while li < gLater.len:
+    if gLaterAt[li] <= tick:
+      let act = gLater[li]
+      gLater.delete(li)
+      gLaterAt.delete(li)
+      act()
+    else:
+      inc li
+  if gFolder.len == 0:
+    return
+  if gRing.count > 0 and (tick - gLastFlushTick >= FlushEveryTicks or gRing.count * 2 >= gRing.items.len):
+    drainRing()
+    gLastFlushTick = tick
+  var w = 0
+  while w < WritesPerTick and writeOnePending():
+    inc w
+  if gJob.active:
+    runJobSlice(SetsPerTick)
