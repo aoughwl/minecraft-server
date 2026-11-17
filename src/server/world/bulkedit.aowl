@@ -1,0 +1,512 @@
+## Section-level bulk volume edits: read a box of blocks into a paletted snapshot, remove it, put it back, or place it
+## somewhere else (translated, optionally turned in quarter turns about Y), as one all-or-nothing tick-thread call.
+##
+## Why not `World.setBlockState` per cell (design: overnight/BODIES-DESIGN.md, T1): that path is O(cells x (neighbour updates
+## + a light pass + a client packet entry + heightmap update)). Here a whole section is swapped as one `PalettedContainer`
+## when the box covers it, and everything around the cells runs once per edit:
+##   * heightmaps: one recompute per touched column (`recomputeColumnHeightmaps`), not one update per written cell;
+##   * client: the changes are queued as `unsentBlockChanges`, which `flushBlockUpdates` groups by section, so one
+##     multi-block update per section (`unsentSectionGroups` shows that grouping);
+##   * light: `updateLightingRegion` for the box, block and sky propagation each run once;
+##   * neighbour updates only for the changed cells on the outer surface of the edit (not for the interior);
+##   * block entities move as NBT, with no `onBlockReplaced` callback, so a chest's items do not spill.
+##
+## Staleness. Every block section has a `blockVersion` stamp (world/chunkdata.aowl) that any cell write bumps. A snapshot
+## remembers the stamp of each section it read; `removeVolume` refuses (`esStale`) and writes nothing when any of them moved,
+## and `restoreVolume` refuses when a section moved since the removal. Granularity is the section (16^3), not the box: a
+## change next to the box inside a shared section also makes the snapshot stale. That is on purpose: the caller (a
+## solver that worked on a snapshot) re-queues instead of applying a result computed from old data.
+##
+## Plugin hooks. `World.setBlockState` asks `callPluginBlockChangeHook` (plugin BlockChangeEvent) for each cell while a
+## plugin listens. A bulk edit keeps that contract as an all-or-nothing veto: with `fireHooks` and a listening plugin, the
+## hook is asked once for each cell that would change BEFORE anything is written; if any plugin cancels one, the whole edit is
+## refused (`esVetoed`, `badPos` is that cell) and nothing changes. No new plugin event is added (src/plugin is another
+## session's); a batched `BodyAssemble`/`VolumeEdit` event would replace this per-cell veto later. The cost is zero when no
+## plugin listens.
+##
+## Block log. src/server/blocklog/blocklogcore.aowl exists, so every changed cell is passed to `blockLogRecordChange`
+## (a no-op until the log is started). The cause/kind context is whatever the caller pushed with `blockLogPush`.
+##
+## Not done here (listed in the final report): fluid keeping (waterlogged cells leave a water source), dropping the pending
+## block/fluid ticks of removed cells, block-state rotation tables (a `mapState` closure does it; the caller supplies it),
+## the full-section client packet for edits above ~256 cells per section (a multi-block update carries them).
+
+{.feature: "lenientnils".}
+
+import std/[options, tables]
+import ../../data/block_ext
+from ../../data/block_state import newBlockStateIdUnchecked
+import ../../nbt/tag as nbttag
+import ../../util/math/position
+import ../../world/[chunkdata, level, palette]
+import ../../plugin/pluginhooksblock
+import ../blocklog/blocklogcore
+import ../serverbase
+import "../block/worldadapter"
+
+type
+  VolumeBox* = object
+    ## A box of world cells, both corners inclusive.
+    minX*, minY*, minZ*, maxX*, maxY*, maxZ*: int32
+
+  EditStatus* = enum
+    esOk
+    esStale        ## a section's `blockVersion` is not the one the snapshot was taken at; nothing was written
+    esUnloaded     ## a chunk of the volume is not loaded; nothing was written
+    esOutOfRange   ## the box is empty or outside the world's build height; nothing was written
+    esVetoed       ## a plugin cancelled a cell's block change; nothing was written
+    esBlocked      ## `pmFailIfBlocked`: a target cell was not air; nothing was written
+    esWrongState   ## restore on a snapshot that is not removed, or remove on one already removed
+
+  EditReport* = object
+    status*: EditStatus
+    changed*: int     ## cells whose block state changed
+    sections*: int    ## sections touched
+    skipped*: int     ## cells not written (air source cells, or `pmOnlyAir` targets that were taken)
+    badPos*: BlockPos ## the cell (or section corner for a stale/unloaded section) that stopped the edit
+
+  VolumeSection* = object
+    ## One section's share of a snapshot: the whole 16^3 palette as it was, and the sub-box of it that belongs to the volume.
+    cx*, cz*: int32
+    sy*: int               ## storage index of the section in its chunk
+    baseY*: int32          ## world y of the section's lowest layer
+    version*: uint32       ## `blockVersion` when read (or when last restored)
+    appliedVersion*: uint32  ## `blockVersion` right after `removeVolume` finished; `restoreVolume` expects this
+    x0*, y0*, z0*, x1*, y1*, z1*: int  ## local sub-box, inclusive
+    blocks*: PalettedContainer
+
+  VolumeBlockEntity* = object
+    pos*: BlockPos
+    nbt*: NbtCompound
+
+  VolumeSnapshot* = object
+    box*: VolumeBox
+    status*: EditStatus
+    badPos*: BlockPos
+    sections*: seq[VolumeSection]
+    blockEntities*: seq[VolumeBlockEntity]
+    removed*: bool        ## set by `removeVolume`, cleared by `restoreVolume`
+
+  BulkOptions* = object
+    fireHooks*: bool    ## ask the plugin BlockChange hook for each changed cell first (all-or-nothing veto)
+    notifyEdge*: bool   ## neighbour-update the changed cells on the outer surface of the edit
+    logChanges*: bool   ## pass each changed cell to the block log
+
+  PlaceMode* = enum
+    pmReplace        ## the snapshot's cells overwrite whatever is there
+    pmOnlyAir        ## only cells whose target is air are written, the others count as `skipped`
+    pmFailIfBlocked  ## any non-air target under a non-air source cell refuses the whole placement
+
+  PlaceOptions* = object
+    bulk*: BulkOptions
+    mode*: PlaceMode
+    quarterTurns*: int   ## 0..3 quarter turns about Y (the box is turned about its minimum corner, then moved to `origin`)
+    skipAir*: bool       ## air cells of the snapshot do not write (default true)
+    mapState*: proc(state: uint32): uint32 {.closure.}  ## nil keeps states; the caller's rotation of facing/axis properties
+
+  Target = object
+    chunk: ChunkData
+    cx, cz: int32
+    sy: int
+    hasFull: bool
+    full: PalettedContainer
+    x0, y0, z0, x1, y1, z1: int
+    vals: seq[uint32]
+    masked: seq[bool]
+    idxs: seq[int32]
+    olds: seq[uint32]
+    news: seq[uint32]
+
+var gBeMemo = initTable[uint32, bool]()
+
+proc defaultBulkOptions*(): BulkOptions =
+  BulkOptions(fireHooks: true, notifyEdge: true, logChanges: true)
+
+proc defaultPlaceOptions*(): PlaceOptions =
+  PlaceOptions(bulk: defaultBulkOptions(), mode: pmReplace, quarterTurns: 0, skipAir: true)
+
+proc volumeBox*(x0, y0, z0, x1, y1, z1: int32): VolumeBox =
+  VolumeBox(minX: min(x0, x1), minY: min(y0, y1), minZ: min(z0, z1), maxX: max(x0, x1), maxY: max(y0, y1), maxZ: max(z0, z1))
+
+proc volumeCells*(b: VolumeBox): int =
+  int(b.maxX - b.minX + 1'i32) * int(b.maxY - b.minY + 1'i32) * int(b.maxZ - b.minZ + 1'i32)
+
+proc cellIndex(x, y, z: int): int {.inline.} = y * 256 + z * 16 + x
+
+proc chunkAt(world: World; cx, cz: int32): ChunkData =
+  world.level.loadedChunks.getOrDefault(chunkKey(cx, cz), nil)
+
+proc hasBlockEntity(id: uint32): bool =
+  if id == 0'u32:
+    return false
+  if gBeMemo.hasKey(id):
+    return gBeMemo.getOrDefault(id, false)
+  let st = BlockState.fromId(newBlockStateIdUnchecked(uint16(id)))
+  let r = st.blockEntityType != high(uint16)
+  gBeMemo[id] = r
+  r
+
+proc report(status: EditStatus; at: BlockPos): EditReport =
+  EditReport(status: status, changed: 0, sections: 0, skipped: 0, badPos: at)
+
+proc sectionCorner(s: VolumeSection): BlockPos =
+  newBlockPos(s.cx * 16'i32, s.baseY, s.cz * 16'i32)
+
+# --- reading ----------------------------------------------------------------------------------------------------------
+
+proc captureBlockEntities(world: World; snap: var VolumeSnapshot) =
+  snap.blockEntities = @[]
+  for sec in snap.sections:
+    if sec.blocks.isSingleValued:
+      let v = sec.blocks.cells()[0]
+      if not hasBlockEntity(v):
+        continue
+    let cells = sec.blocks.cells()
+    for y in sec.y0 .. sec.y1:
+      for z in sec.z0 .. sec.z1:
+        for x in sec.x0 .. sec.x1:
+          let id = cells[cellIndex(x, y, z)]
+          if hasBlockEntity(id):
+            let pos = newBlockPos(sec.cx * 16'i32 + int32(x), sec.baseY + int32(y), sec.cz * 16'i32 + int32(z))
+            let nbt = world.bulkCaptureBlockEntity(pos)
+            if nbt.isSome:
+              snap.blockEntities.add(VolumeBlockEntity(pos: pos, nbt: nbt.unsafeGet))
+
+proc readVolume*(world: World; box: VolumeBox): VolumeSnapshot =
+  ## Copies the blocks of `box` into a snapshot, one paletted container per touched section (O(sections), the palettes are
+  ## copied, not walked), with the block entities' NBT. Reads no cell individually. `status` is `esOk`, `esUnloaded` or
+  ## `esOutOfRange`; anything but `esOk` leaves the snapshot unusable.
+  result = VolumeSnapshot(box: box, status: esOk, sections: @[], blockEntities: @[], removed: false)
+  if box.maxX < box.minX or box.maxY < box.minY or box.maxZ < box.minZ:
+    result.status = esOutOfRange
+    return
+  for cz in (box.minZ shr 4) .. (box.maxZ shr 4):
+    for cx in (box.minX shr 4) .. (box.maxX shr 4):
+      let chunk = chunkAt(world, cx, cz)
+      if chunk == nil:
+        result.status = esUnloaded
+        result.badPos = newBlockPos(cx * 16'i32, box.minY, cz * 16'i32)
+        return
+      let minY = chunk.section.minY
+      if box.minY < minY or box.maxY >= minY + int32(chunk.section.blockSections.len) * 16'i32:
+        result.status = esOutOfRange
+        result.badPos = newBlockPos(cx * 16'i32, box.minY, cz * 16'i32)
+        return
+      for sy in int((box.minY - minY) shr 4) .. int((box.maxY - minY) shr 4):
+        let baseY = minY + int32(sy) * 16'i32
+        result.sections.add(VolumeSection(cx: cx, cz: cz, sy: sy, baseY: baseY,
+          version: sectionVersion(chunk.section, sy), appliedVersion: 0'u32,
+          x0: int(max(box.minX, cx * 16'i32) - cx * 16'i32), x1: int(min(box.maxX, cx * 16'i32 + 15'i32) - cx * 16'i32),
+          y0: int(max(box.minY, baseY) - baseY), y1: int(min(box.maxY, baseY + 15'i32) - baseY),
+          z0: int(max(box.minZ, cz * 16'i32) - cz * 16'i32), z1: int(min(box.maxZ, cz * 16'i32 + 15'i32) - cz * 16'i32),
+          blocks: chunk.section.blockSections[sy]))
+  captureBlockEntities(world, result)
+
+proc isFull(s: VolumeSection): bool =
+  s.x0 == 0 and s.y0 == 0 and s.z0 == 0 and s.x1 == 15 and s.y1 == 15 and s.z1 == 15
+
+proc blockAtSnapshot*(snap: VolumeSnapshot; x, y, z: int32): uint32 =
+  ## One cell of a snapshot, by world coordinates (0 outside it).
+  for sec in snap.sections:
+    let lx = int(x - sec.cx * 16'i32)
+    let ly = int(y - sec.baseY)
+    let lz = int(z - sec.cz * 16'i32)
+    if lx >= sec.x0 and lx <= sec.x1 and ly >= sec.y0 and ly <= sec.y1 and lz >= sec.z0 and lz <= sec.z1:
+      return sec.blocks.get(lx, ly, lz)
+  0'u32
+
+# --- the shared commit ------------------------------------------------------------------------------------------------
+
+proc planTarget(t: var Target) =
+  ## Which cells of the target section change: index, old value, new value.
+  t.idxs = @[]
+  t.olds = @[]
+  t.news = @[]
+  let old = t.chunk.section.blockSections[t.sy].cells()
+  if t.hasFull:
+    let nw = t.full.cells()
+    for i in 0 ..< 4096:
+      if old[i] != nw[i]:
+        t.idxs.add(int32(i))
+        t.olds.add(old[i])
+        t.news.add(nw[i])
+  elif t.masked.len > 0:
+    for i in 0 ..< 4096:
+      if t.masked[i] and old[i] != t.vals[i]:
+        t.idxs.add(int32(i))
+        t.olds.add(old[i])
+        t.news.add(t.vals[i])
+  else:
+    for y in t.y0 .. t.y1:
+      for z in t.z0 .. t.z1:
+        for x in t.x0 .. t.x1:
+          let i = cellIndex(x, y, z)
+          if old[i] != t.vals[i]:
+            t.idxs.add(int32(i))
+            t.olds.add(old[i])
+            t.news.add(t.vals[i])
+
+proc targetPos(t: Target; i: int32): BlockPos =
+  let n = int(i)
+  newBlockPos(t.cx * 16'i32 + int32(n and 15), t.chunk.section.minY + int32(t.sy) * 16'i32 + int32(n shr 8),
+    t.cz * 16'i32 + int32((n shr 4) and 15))
+
+proc commitTargets(world: World; targets: var seq[Target]; opts: BulkOptions;
+                   bePuts: seq[VolumeBlockEntity]): EditReport =
+  ## Plans every target, asks the plugin veto, writes all sections, then does the once-per-edit work.
+  result = report(esOk, newBlockPos(0'i32, 0'i32, 0'i32))
+  var total = 0
+  for k in 0 ..< targets.len:
+    planTarget(targets[k])
+    total += targets[k].idxs.len
+  if total == 0:
+    return
+  # Plugin veto before the first write: a refusal leaves the world as it was.
+  if opts.fireHooks and pluginBlockChangeListened():
+    for k in 0 ..< targets.len:
+      for j in 0 ..< targets[k].idxs.len:
+        let pos = targetPos(targets[k], targets[k].idxs[j])
+        if callPluginBlockChangeHook(int(pos.vec.x), int(pos.vec.y), int(pos.vec.z), int(targets[k].olds[j]),
+            int(targets[k].news[j])):
+          return report(esVetoed, pos)
+  # Writes.
+  var columns = initTable[int64, seq[bool]]()
+  var chunks = initTable[int64, ChunkData]()
+  var lo = newBlockPos(high(int32), high(int32), high(int32))
+  var hi = newBlockPos(low(int32), low(int32), low(int32))
+  for k in 0 ..< targets.len:
+    let t = targets[k]
+    if t.idxs.len == 0:
+      continue
+    inc result.sections
+    t.chunk.dirty = true
+    if t.hasFull:
+      replaceBlockSection(t.chunk.section, t.sy, t.full)
+    else:
+      for j in 0 ..< t.idxs.len:
+        let n = int(t.idxs[j])
+        discard setBlockNoHeightmapUpdate(t.chunk.section, n and 15, t.sy * 16 + (n shr 8), (n shr 4) and 15, t.news[j])
+    let ckey = chunkKey(t.cx, t.cz)
+    var cols = columns.getOrDefault(ckey, @[])
+    if cols.len == 0:
+      cols = newSeq[bool](256)
+      chunks[ckey] = t.chunk
+    for j in 0 ..< t.idxs.len:
+      let n = int(t.idxs[j])
+      cols[(((n shr 4) and 15) * 16) + (n and 15)] = true
+      let p = targetPos(t, t.idxs[j])
+      if p.vec.x < lo.vec.x or p.vec.y < lo.vec.y or p.vec.z < lo.vec.z:
+        lo = newBlockPos(min(lo.vec.x, p.vec.x), min(lo.vec.y, p.vec.y), min(lo.vec.z, p.vec.z))
+      if p.vec.x > hi.vec.x or p.vec.y > hi.vec.y or p.vec.z > hi.vec.z:
+        hi = newBlockPos(max(hi.vec.x, p.vec.x), max(hi.vec.y, p.vec.y), max(hi.vec.z, p.vec.z))
+    columns[ckey] = cols
+    result.changed += t.idxs.len
+  # Heightmaps: once per touched column.
+  for ckey, cols in columns:
+    let chunk = chunks.getOrDefault(ckey, nil)
+    for c in 0 ..< 256:
+      if cols[c]:
+        recomputeColumnHeightmaps(chunk, c and 15, c shr 4)
+  # Block entities: the ones of replaced cells go (no spill), the saved ones of the snapshot come back.
+  for k in 0 ..< targets.len:
+    for j in 0 ..< targets[k].idxs.len:
+      if hasBlockEntity(targets[k].olds[j]):
+        world.bulkDropBlockEntity(targetPos(targets[k], targets[k].idxs[j]))
+  for be in bePuts:
+    world.bulkPutBlockEntity(be.pos, be.nbt)
+  # Client changes, block log.
+  let logging = opts.logChanges and blockLogActive()
+  let dimName = world.dimension.minecraftName
+  for k in 0 ..< targets.len:
+    for j in 0 ..< targets[k].idxs.len:
+      let pos = targetPos(targets[k], targets[k].idxs[j])
+      world.bulkRegisterChange(pos, targets[k].news[j])
+      if logging:
+        blockLogRecordChange(dimName, int(pos.vec.x), int(pos.vec.y), int(pos.vec.z), int(targets[k].olds[j]),
+          int(targets[k].news[j]))
+  # Light, once.
+  world.bulkUpdateLighting(lo, hi)
+  # Neighbour updates for the changed cells on the outer surface of the edit only.
+  if opts.notifyEdge:
+    for k in 0 ..< targets.len:
+      for j in 0 ..< targets[k].idxs.len:
+        let pos = targetPos(targets[k], targets[k].idxs[j])
+        if pos.vec.x == lo.vec.x or pos.vec.x == hi.vec.x or pos.vec.y == lo.vec.y or pos.vec.y == hi.vec.y or
+            pos.vec.z == lo.vec.z or pos.vec.z == hi.vec.z:
+          world.bulkNotifyNeighbors(pos)
+
+proc newTarget(chunk: ChunkData; s: VolumeSection): Target =
+  Target(chunk: chunk, cx: s.cx, cz: s.cz, sy: s.sy, hasFull: false, x0: s.x0, y0: s.y0, z0: s.z0, x1: s.x1, y1: s.y1,
+    z1: s.z1, vals: @[], masked: @[], idxs: @[], olds: @[], news: @[])
+
+proc checkSnapshotVersions(world: World; snap: VolumeSnapshot; restoring: bool; chunksOut: var seq[ChunkData]): EditReport =
+  result = report(esOk, newBlockPos(0'i32, 0'i32, 0'i32))
+  chunksOut = @[]
+  for sec in snap.sections:
+    let chunk = chunkAt(world, sec.cx, sec.cz)
+    if chunk == nil:
+      return report(esUnloaded, sectionCorner(sec))
+    let want = if restoring: sec.appliedVersion else: sec.version
+    if sectionVersion(chunk.section, sec.sy) != want:
+      return report(esStale, sectionCorner(sec))
+    chunksOut.add(chunk)
+
+# --- remove / restore -------------------------------------------------------------------------------------------------
+
+proc removeVolume*(world: World; snap: var VolumeSnapshot; opts: BulkOptions): EditReport =
+  ## Replaces every cell of the snapshot's box with air, all or nothing. Refuses with `esStale` (nothing written) if any
+  ## section's `blockVersion` differs from the snapshot's. Block entities are re-read now (their contents change without
+  ## touching the block version) and stored in the snapshot, then dropped from the world with no spill.
+  if snap.status != esOk:
+    return report(snap.status, snap.badPos)
+  if snap.removed:
+    return report(esWrongState, newBlockPos(snap.box.minX, snap.box.minY, snap.box.minZ))
+  var chunks: seq[ChunkData] = @[]
+  let ok = checkSnapshotVersions(world, snap, false, chunks)
+  if ok.status != esOk:
+    return ok
+  captureBlockEntities(world, snap)
+  var targets: seq[Target] = @[]
+  for i in 0 ..< snap.sections.len:
+    let s = snap.sections[i]
+    var t = newTarget(chunks[i], s)
+    if isFull(s):
+      t.hasFull = true
+      t.full = newPalettedContainer(16, 0'u32)
+    else:
+      t.vals = newSeq[uint32](4096)
+    targets.add(t)
+  result = commitTargets(world, targets, opts, @[])
+  if result.status == esOk:
+    snap.removed = true
+    for i in 0 ..< snap.sections.len:
+      snap.sections[i].appliedVersion = sectionVersion(chunks[i].section, snap.sections[i].sy)
+
+proc removeVolume*(world: World; box: VolumeBox; opts: BulkOptions): (EditReport, VolumeSnapshot) =
+  ## Reads and removes in one call: what was there is the returned snapshot, for `restoreVolume` or `placeVolume`.
+  var snap = readVolume(world, box)
+  let r = removeVolume(world, snap, opts)
+  (r, snap)
+
+proc restoreVolume*(world: World; snap: var VolumeSnapshot; opts: BulkOptions): EditReport =
+  ## Puts a removed volume back where it was, all or nothing. Refuses with `esStale` if a touched section changed since
+  ## `removeVolume` finished (someone built into the hole, or a neighbour update broke something in the same section).
+  if snap.status != esOk:
+    return report(snap.status, snap.badPos)
+  if not snap.removed:
+    return report(esWrongState, newBlockPos(snap.box.minX, snap.box.minY, snap.box.minZ))
+  var chunks: seq[ChunkData] = @[]
+  let ok = checkSnapshotVersions(world, snap, true, chunks)
+  if ok.status != esOk:
+    return ok
+  var targets: seq[Target] = @[]
+  for i in 0 ..< snap.sections.len:
+    let s = snap.sections[i]
+    var t = newTarget(chunks[i], s)
+    if isFull(s):
+      t.hasFull = true
+      t.full = s.blocks
+    else:
+      t.vals = s.blocks.cells()
+    targets.add(t)
+  result = commitTargets(world, targets, opts, snap.blockEntities)
+  if result.status == esOk:
+    snap.removed = false
+    for i in 0 ..< snap.sections.len:
+      snap.sections[i].version = sectionVersion(chunks[i].section, snap.sections[i].sy)
+      snap.sections[i].appliedVersion = 0'u32
+
+# --- place ------------------------------------------------------------------------------------------------------------
+
+proc turned(dx, dz, sizeX, sizeZ, k: int): (int, int) =
+  case k and 3
+  of 0: (dx, dz)
+  of 1: (sizeZ - 1 - dz, dx)
+  of 2: (sizeX - 1 - dx, sizeZ - 1 - dz)
+  else: (dz, sizeX - 1 - dx)
+
+proc placedBox*(snap: VolumeSnapshot; origin: BlockPos; quarterTurns: int): VolumeBox =
+  ## The box `placeVolume` writes to.
+  let sizeX = int(snap.box.maxX - snap.box.minX) + 1
+  let sizeY = int(snap.box.maxY - snap.box.minY) + 1
+  let sizeZ = int(snap.box.maxZ - snap.box.minZ) + 1
+  let (w, d) = if (quarterTurns and 1) == 1: (sizeZ, sizeX) else: (sizeX, sizeZ)
+  VolumeBox(minX: origin.vec.x, minY: origin.vec.y, minZ: origin.vec.z, maxX: origin.vec.x + int32(w) - 1'i32,
+    maxY: origin.vec.y + int32(sizeY) - 1'i32, maxZ: origin.vec.z + int32(d) - 1'i32)
+
+proc placeVolume*(world: World; snap: VolumeSnapshot; origin: BlockPos; opts: PlaceOptions): EditReport =
+  ## Writes the snapshot's cells with its minimum corner at `origin`, turned `quarterTurns` about Y, all or nothing. The
+  ## snapshot is not consumed (place it again, or elsewhere). Air cells of the snapshot do not write when `skipAir`.
+  if snap.status != esOk:
+    return report(snap.status, snap.badPos)
+  let sizeX = int(snap.box.maxX - snap.box.minX) + 1
+  let sizeZ = int(snap.box.maxZ - snap.box.minZ) + 1
+  let k = opts.quarterTurns and 3
+  let mapper = opts.mapState
+  var targets: seq[Target] = @[]
+  var index = initTable[int64, int]()
+  var lastKey = low(int64)
+  var lastIdx = -1
+  var skipped = 0
+  for sec in snap.sections:
+    let cells = sec.blocks.cells()
+    for y in sec.y0 .. sec.y1:
+      for z in sec.z0 .. sec.z1:
+        for x in sec.x0 .. sec.x1:
+          var state = cells[cellIndex(x, y, z)]
+          if state == 0'u32 and opts.skipAir:
+            inc skipped
+            continue
+          if mapper != nil:
+            state = mapper(state)
+          let (rx, rz) = turned(int(sec.cx * 16'i32 + int32(x) - snap.box.minX), int(sec.cz * 16'i32 + int32(z) - snap.box.minZ),
+            sizeX, sizeZ, k)
+          let wx = origin.vec.x + int32(rx)
+          let wy = origin.vec.y + int32(sec.baseY + int32(y) - snap.box.minY)
+          let wz = origin.vec.z + int32(rz)
+          let dcx = wx shr 4
+          let dcz = wz shr 4
+          let chunk = chunkAt(world, dcx, dcz)
+          if chunk == nil:
+            return report(esUnloaded, newBlockPos(wx, wy, wz))
+          let minY = chunk.section.minY
+          if wy < minY or wy >= minY + int32(chunk.section.blockSections.len) * 16'i32:
+            return report(esOutOfRange, newBlockPos(wx, wy, wz))
+          let dsy = int((wy - minY) shr 4)
+          let key = (int64(dcx) shl 40) xor (int64(dcz and 0xFFFFF'i32) shl 12) xor int64(dsy)
+          var ti = lastIdx
+          if key != lastKey:
+            if index.hasKey(key):
+              ti = index.getOrDefault(key, 0)
+            else:
+              let fake = VolumeSection(cx: dcx, cz: dcz, sy: dsy, baseY: minY + int32(dsy) * 16'i32, x0: 0, y0: 0, z0: 0,
+                x1: 15, y1: 15, z1: 15)
+              var t = newTarget(chunk, fake)
+              t.vals = chunk.section.blockSections[dsy].cells()
+              t.masked = newSeq[bool](4096)
+              targets.add(t)
+              ti = targets.len - 1
+              index[key] = ti
+            lastKey = key
+            lastIdx = ti
+          let ci = cellIndex(int(wx and 15'i32), int((wy - minY) and 15'i32), int(wz and 15'i32))
+          let cur = targets[ti].vals[ci]
+          if cur != 0'u32 and not targets[ti].masked[ci]:
+            case opts.mode
+            of pmOnlyAir:
+              inc skipped
+              continue
+            of pmFailIfBlocked:
+              return report(esBlocked, newBlockPos(wx, wy, wz))
+            of pmReplace:
+              discard
+          targets[ti].vals[ci] = state
+          targets[ti].masked[ci] = true
+  # Saved block entities move with their cells.
+  var puts: seq[VolumeBlockEntity] = @[]
+  for be in snap.blockEntities:
+    let (rx, rz) = turned(int(be.pos.vec.x - snap.box.minX), int(be.pos.vec.z - snap.box.minZ), sizeX, sizeZ, k)
+    let dest = newBlockPos(origin.vec.x + int32(rx), origin.vec.y + (be.pos.vec.y - snap.box.minY), origin.vec.z + int32(rz))
+    puts.add(VolumeBlockEntity(pos: dest, nbt: be.nbt))
+  result = commitTargets(world, targets, opts.bulk, puts)
+  result.skipped = skipped
