@@ -1,0 +1,471 @@
+## WorldEdit server mod (weworld.aowl) on an in-memory world: every edit through bulkedit, exact undo / redo (blocks, block
+## entities, heightmaps, light), clipboard, shapes, stack, move, counts.
+import std/[assertions, syncio, cmdline, tables, strutils]
+import ../../config/lib as configlib
+import ../../world/[chunkdata, level, lightingruntime, palette, playerdata, worldfs, worldinfo]
+import ../../world/blockstates as states
+import ../../nbt/tag as nbttag
+import ../../plugin/pluginhooksblock
+import ../../util/math/position
+import ../data/datamod
+import ../recipe
+import ../scheduler
+import ../serverbase
+import ../tick_rate_manager
+import ../net/winsock
+import "../block/worldadapter"
+import ../world/[bulkedit, worldmod]
+import wecore, weworld
+
+var failures = 0
+var gCalls = 0
+var gVetoAt: array[3, int] = [20, 20, 20]
+
+proc check(name: string; cond: bool) =
+  if cond:
+    echo "PASS ", name
+  else:
+    echo "FAIL ", name
+    inc failures
+
+proc scratch(): string =
+  result = parentDirW(paramStr(0)) & "/bulkedit_scratch"
+  discard createDirAllW(result)
+
+const Sections = 9   # y -16..127: one section below the edited boxes, so the one-block light shell stays inside the world
+
+let adv = defaultAdvancedConfiguration()
+let theLevel = fromRootFolder(adv.world, scratch(), 1'i64, OVERWORLD)
+let server = Server(basicConfig: defaultBasicConfiguration(), advancedConfig: adv, worlds: @[], dimensions: @[OVERWORLD],
+  tickCounter: 0'i64, nextEntityId: 1'i32, tickRateManager: newServerTickRateManager(20.0'f32), keyStore: nil,
+  recipeManager: newRecipeManager(), scheduler: newTaskScheduler(), data: ServerData(),
+  playerDataStorage: PlayerDataStorage(), levelFolder: "", playerIdleTimeout: 0'i32, mojangPublicKeys: @[],
+  stopRequested: false, stopAtMs: 0'i64)
+let bw = loadWorld(theLevel, defaultLevelData(1'u64), OVERWORLD, 63'i32, 0'i32, server)
+
+proc mkChunk(x, z: int32): ChunkData =
+  let c = newChunkData(x, z, newChunkSections(Sections, -16'i32))
+  c.lightEngine.skyLight = newSeq[LightContainer](Sections)
+  c.lightEngine.blockLight = newSeq[LightContainer](Sections)
+  for i in 0 ..< Sections:
+    c.lightEngine.skyLight[i] = newLightEmpty(0'u8)
+    c.lightEngine.blockLight[i] = newLightEmpty(0'u8)
+  c
+
+let (_, stone) = defaultStateByName("stone")
+let (_, dirt) = defaultStateByName("dirt")
+let (_, glow) = defaultStateByName("glowstone")
+let (_, chest) = defaultStateByName("chest")
+let (_, planks) = defaultStateByName("oak_planks")
+let (_, stairs) = defaultStateByName("oak_stairs")
+
+var chunks: seq[ChunkData] = @[]
+for cz in 0'i32 .. 1'i32:
+  for cx in 0'i32 .. 1'i32:
+    let c = mkChunk(cx, cz)
+    addLoadedChunk(theLevel, c)
+    chunks.add(c)
+
+proc fillBox(x0, y0, z0, x1, y1, z1: int32; id: uint32) =
+  for y in y0 .. y1:
+    for z in z0 .. z1:
+      for x in x0 .. x1:
+        discard setBlockState(theLevel, newBlockPos(x, y, z), id)
+
+proc stateAt(x, y, z: int32): uint32 = getBlockState(theLevel, newBlockPos(x, y, z))
+
+proc rebuildHeightmaps() =
+  for c in chunks:
+    c.heightmap = calculateHeightmap(c)
+
+# --- baseline world: ground y 0..19 (stone, dirt top), two lamps, a chest with contents ----------------------------------
+fillBox(0, -16, 0, 31, -1, 31, stone)   # a floor, so light never has a bottomless void under the edited boxes
+fillBox(0, 0, 0, 31, 17, 31, stone)
+fillBox(0, 18, 0, 31, 19, 31, dirt)
+discard setBlockState(theLevel, newBlockPos(16'i32, 21'i32, 16'i32), glow)
+discard setBlockState(theLevel, newBlockPos(2'i32, 25'i32, 2'i32), glow)
+discard setBlockState(theLevel, newBlockPos(8'i32, 12'i32, 8'i32), chest)
+var chestNbt = newCompound()
+put(chestNbt, "id", "minecraft:chest")
+put(chestNbt, "x", NbtTag(kind: ntkInt, intVal: 8'i32))
+put(chestNbt, "y", NbtTag(kind: ntkInt, intVal: 12'i32))
+put(chestNbt, "z", NbtTag(kind: ntkInt, intVal: 8'i32))
+put(chestNbt, "Lock", "secret")
+putBlockEntity(chunks[0], newBlockPos(8'i32, 12'i32, 8'i32), chestNbt)
+rebuildHeightmaps()
+bw.bulkUpdateLighting(newBlockPos(0'i32, 0'i32, 0'i32), newBlockPos(31'i32, 60'i32, 31'i32))
+
+type Baseline = object
+  blocks: seq[seq[uint32]]
+  hmWs, hmMb, hmNl: seq[seq[int64]]
+  sky, blockL: seq[seq[LightContainer]]
+
+proc takeBaseline(): Baseline =
+  result = Baseline(blocks: @[], hmWs: @[], hmMb: @[], hmNl: @[], sky: @[], blockL: @[])
+  for c in chunks:
+    result.blocks.add(dumpBlocks(c.section))
+    result.hmWs.add(c.heightmap.worldSurface)
+    result.hmMb.add(c.heightmap.motionBlocking)
+    result.hmNl.add(c.heightmap.motionBlockingNoLeaves)
+    result.sky.add(c.lightEngine.skyLight)
+    result.blockL.add(c.lightEngine.blockLight)
+
+proc lightEqual(a, b: seq[LightContainer]): bool =
+  ## By value: an all-zero container may be stored as "empty" or as 2048 zero bytes.
+  if a.len != b.len:
+    return false
+  for i in 0 ..< a.len:
+    for y in 0 ..< 16:
+      for z in 0 ..< 16:
+        for x in 0 ..< 16:
+          if a[i].get(x, y, z) != b[i].get(x, y, z):
+            return false
+  true
+
+proc sameAs(base: Baseline; what: string) =
+  var blocksOk = true
+  var hmOk = true
+  var skyOk = true
+  var blOk = true
+  for i in 0 ..< chunks.len:
+    if dumpBlocks(chunks[i].section) != base.blocks[i]: blocksOk = false
+    if chunks[i].heightmap.worldSurface != base.hmWs[i] or chunks[i].heightmap.motionBlocking != base.hmMb[i] or
+        chunks[i].heightmap.motionBlockingNoLeaves != base.hmNl[i]: hmOk = false
+    if not lightEqual(chunks[i].lightEngine.skyLight, base.sky[i]): skyOk = false
+    if not lightEqual(chunks[i].lightEngine.blockLight, base.blockL[i]): blOk = false
+  check(what & ": blocks identical", blocksOk)
+  check(what & ": heightmaps identical", hmOk)
+  check(what & ": sky light identical", skyOk)
+  check(what & ": block light identical", blOk)
+  if not blOk:
+    var shown = 0
+    var nzBase = 0
+    var nzNow = 0
+    for i in 0 ..< chunks.len:
+      for s in 0 ..< chunks[i].lightEngine.blockLight.len:
+        for y in 0 ..< 16:
+          for z in 0 ..< 16:
+            for x in 0 ..< 16:
+              let a = base.blockL[i][s].get(x, y, z)
+              let b = chunks[i].lightEngine.blockLight[s].get(x, y, z)
+              if a != 0'u8: inc nzBase
+              if b != 0'u8: inc nzNow
+              if a != b and shown < 12:
+                inc shown
+                echo "  DIFF chunk ", i, " x=", x, " y=", s * 16 + y, " z=", z, " base=", a, " now=", b
+    echo "  nonzero base=", nzBase, " now=", nzNow
+
+let base0 = takeBaseline()
+check("setup: chest state present", stateAt(8, 12, 8) == chest)
+check("setup: lamp lights its neighbour", getBlockLightLevel(theLevel.lightAccess, newBlockPos(17'i32, 21'i32, 16'i32)) == (true, 14'u8))
+
+# ======================================================================================================================
+# WorldEdit
+# ======================================================================================================================
+let dim = bw.dimension.minecraftName
+let ses = sessionFor("tester")
+
+proc pat(s: string): Pattern =
+  var p = Pattern()
+  var err = ""
+  if not parsePattern(s, p, err):
+    echo "BAD PATTERN ", s, ": ", err
+    inc failures
+  p
+
+proc msk(s: string): Mask =
+  var m = Mask()
+  var err = ""
+  if not parseMask(s, m, err):
+    echo "BAD MASK ", s, ": ", err
+    inc failures
+  m
+
+proc sel(x0, y0, z0, x1, y1, z1: int) =
+  setPos1(ses, dim, x0, y0, z0)
+  setPos2(ses, dim, x1, y1, z1)
+
+proc allIs(x0, y0, z0, x1, y1, z1: int; id: uint32): bool =
+  result = true
+  for y in y0 .. y1:
+    for z in z0 .. z1:
+      for x in x0 .. x1:
+        if stateAt(int32(x), int32(y), int32(z)) != id:
+          result = false
+
+proc hasChestNbt(): bool =
+  for e in chunks[0].pendingBlockEntities:
+    if e.pos == newBlockPos(8'i32, 12'i32, 8'i32) and e.nbt == chestNbt:
+      return true
+  false
+
+proc blockEntityCount(): int =
+  result = 0
+  for c in chunks:
+    result += c.pendingBlockEntities.len
+
+fillBox(0, 0, 0, 31, 17, 31, stone)
+fillBox(0, 18, 0, 31, 19, 31, dirt)
+fillBox(0, 20, 0, 31, 40, 31, 0'u32)
+discard setBlockState(theLevel, newBlockPos(16'i32, 21'i32, 16'i32), glow)
+discard setBlockState(theLevel, newBlockPos(2'i32, 25'i32, 2'i32), glow)
+discard setBlockState(theLevel, newBlockPos(8'i32, 12'i32, 8'i32), chest)
+putBlockEntity(chunks[0], newBlockPos(8'i32, 12'i32, 8'i32), chestNbt)
+rebuildHeightmaps()
+bw.bulkUpdateLighting(newBlockPos(0'i32, 0'i32, 0'i32), newBlockPos(31'i32, 60'i32, 31'i32))
+bw.flushBlockUpdates()
+let w0 = takeBaseline()
+
+# --- selection errors
+check("no selection refused", not weSet(bw, sessionFor("nobody"), pat("stone")).ok)
+setPos1(ses, "minecraft:the_nether", 0, 0, 0)
+setPos2(ses, "minecraft:the_nether", 3, 3, 3)
+check("selection in another dimension refused", not weSet(bw, ses, pat("stone")).ok)
+
+# --- set + undo + redo on air above the ground, with lighting checked against the per-cell path
+sel(10, 22, 10, 14, 26, 14)
+let rSet = weSet(bw, ses, pat("glowstone"))
+check("set: ok", rSet.ok)
+check("set: 125 changed", rSet.changed == 125)
+check("set: blocks written", allIs(10, 22, 10, 14, 26, 14, glow))
+check("set: outside untouched", stateAt(9, 22, 10) == 0'u32 and stateAt(15, 26, 14) == 0'u32 and stateAt(12, 27, 12) == 0'u32)
+check("set: block light 15 in the middle", getBlockLightLevel(theLevel.lightAccess, newBlockPos(12'i32, 24'i32, 12'i32)) == (true, 15'u8))
+check("set: block light 14 outside the face", getBlockLightLevel(theLevel.lightAccess, newBlockPos(15'i32, 24'i32, 12'i32)) == (true, 14'u8))
+bw.flushBlockUpdates()
+let afterSet = takeBaseline()
+check("set: one undo entry", ses.undo.len == 1)
+let rU = weUndo(bw, ses, 1)
+check("undo: ok", rU.ok)
+check("undo: 125 restored", rU.changed == 125)
+bw.flushBlockUpdates()
+sameAs(w0, "set then undo")
+check("undo: history moved to redo", ses.undo.len == 0 and ses.redo.len == 1)
+let rR = weRedo(bw, ses, 1)
+check("redo: ok", rR.ok and rR.changed == 125)
+bw.flushBlockUpdates()
+sameAs(afterSet, "redo equals the first result")
+discard weUndo(bw, ses, 1)
+bw.flushBlockUpdates()
+sameAs(w0, "redo then undo")
+# the same change through the per-cell path gives the same light as the bulk path
+fillBox(10, 22, 10, 14, 26, 14, glow)
+rebuildHeightmaps()
+bw.bulkUpdateLighting(newBlockPos(0'i32, 0'i32, 0'i32), newBlockPos(31'i32, 60'i32, 31'i32))
+var lightEq = true
+for i in 0 ..< chunks.len:
+  if not lightEqual(chunks[i].lightEngine.blockLight, afterSet.blockL[i]):
+    lightEq = false
+check("light: bulk set equals per-cell setBlockState (block light)", lightEq)
+var skyDiffs = 0
+var skyMax = 0
+for i in 0 ..< chunks.len:
+  for sx in 0 ..< chunks[i].lightEngine.skyLight.len:
+    for y in 0 ..< 16:
+      for z in 0 ..< 16:
+        for x in 0 ..< 16:
+          let a = int(afterSet.sky[i][sx].get(x, y, z))
+          let b = int(chunks[i].lightEngine.skyLight[sx].get(x, y, z))
+          if a != b:
+            inc skyDiffs
+            skyMax = max(skyMax, abs(a - b))
+# The engine's incremental sky pass (a port of upstream's, same for the per-cell path) leaves a shadow edge one level dim
+# next to an opaque cap; a full relight gives 14 where it gives 13. Not a WorldEdit matter: pinned so a change shows.
+echo "INFO sky light: bulk edit vs full relight differ in ", skyDiffs, " cells, at most ", skyMax, " level(s)"
+check("light: sky light of a bulk set is within 1 level of a full relight", skyMax <= 1)
+fillBox(10, 22, 10, 14, 26, 14, 0'u32)
+rebuildHeightmaps()
+bw.bulkUpdateLighting(newBlockPos(0'i32, 0'i32, 0'i32), newBlockPos(31'i32, 60'i32, 31'i32))
+# diagnostic: which light path gives the incremental sky value around the cap?
+fillBox(10, 22, 10, 14, 26, 14, glow)
+rebuildHeightmaps()
+updateLightingRegionExhaustive(theLevel.lightEngine, theLevel.lightAccess, newBlockPos(10'i32, 22'i32, 10'i32), newBlockPos(14'i32, 26'i32, 14'i32))
+echo "DIAG exhaustive region sky at (10,20,10) = ", getSkyLightLevel(theLevel.lightAccess, newBlockPos(10'i32, 20'i32, 10'i32))
+fillBox(10, 22, 10, 14, 26, 14, 0'u32)
+rebuildHeightmaps()
+bw.bulkUpdateLighting(newBlockPos(0'i32, 0'i32, 0'i32), newBlockPos(31'i32, 60'i32, 31'i32))
+fillBox(10, 22, 10, 14, 26, 14, glow)
+rebuildHeightmaps()
+bw.bulkUpdateLighting(newBlockPos(10'i32, 22'i32, 10'i32), newBlockPos(14'i32, 26'i32, 14'i32))
+echo "DIAG dense region sky at (10,20,10) = ", getSkyLightLevel(theLevel.lightAccess, newBlockPos(10'i32, 20'i32, 10'i32))
+fillBox(10, 22, 10, 14, 26, 14, 0'u32)
+rebuildHeightmaps()
+bw.bulkUpdateLighting(newBlockPos(0'i32, 0'i32, 0'i32), newBlockPos(31'i32, 60'i32, 31'i32))
+echo "DIAG baseline sky at (10,20,10) = ", getSkyLightLevel(theLevel.lightAccess, newBlockPos(10'i32, 20'i32, 10'i32))
+bw.flushBlockUpdates()
+
+# --- replace with a mask, undo
+sel(0, 18, 0, 31, 19, 31)
+let rRep = weReplace(bw, ses, msk("dirt"), pat("oak_planks"))
+check("replace: ok", rRep.ok and rRep.changed == 32 * 32 * 2)
+check("replace: dirt gone", allIs(0, 18, 0, 31, 19, 31, planks))
+check("replace: stone below untouched", stateAt(5, 17, 5) == stone)
+discard weUndo(bw, ses, 1)
+check("replace undo: dirt back", allIs(0, 18, 0, 31, 19, 31, dirt))
+let undoBefore = ses.undo.len
+let rNone = weReplace(bw, ses, msk("gold_block"), pat("stone"))
+check("replace with no match changes nothing and adds no undo entry", rNone.ok and rNone.changed == 0 and ses.undo.len == undoBefore)
+
+# --- block entity: set over the chest, undo returns it with its NBT
+sel(6, 10, 6, 10, 14, 10)
+let rChest = weSet(bw, ses, pat("stone"))
+check("chest set: ok", rChest.ok)
+check("chest set: block entity gone", blockEntityCount() == 0 and stateAt(8, 12, 8) == stone)
+let rChestU = weUndo(bw, ses, 1)
+check("chest undo: ok", rChestU.ok)
+check("chest undo: state back", stateAt(8, 12, 8) == chest)
+check("chest undo: block entity NBT identical", hasChestNbt())
+bw.flushBlockUpdates()
+sameAs(w0, "chest set then undo")
+
+# --- random pattern is deterministic and only uses its blocks
+sel(0, 22, 0, 9, 22, 9)
+let rRnd = weSet(bw, ses, pat("50%stone,50%dirt"))
+check("random set: ok", rRnd.ok)
+var nS = 0
+var nD = 0
+var other = 0
+for z in 0 .. 9:
+  for x in 0 .. 9:
+    let v = stateAt(int32(x), 22'i32, int32(z))
+    if v == stone:
+      inc nS
+    elif v == dirt:
+      inc nD
+    else:
+      inc other
+check("random set: only the pattern's blocks", other == 0 and nS + nD == 100)
+check("random set: roughly half each", nS > 30 and nD > 30)
+discard weUndo(bw, ses, 1)
+check("random set undo", allIs(0, 22, 0, 9, 22, 9, 0'u32))
+
+# --- walls and hollow
+sel(4, 22, 4, 12, 26, 12)
+let rWalls = weWalls(bw, ses, pat("oak_planks"))
+check("walls: ok", rWalls.ok)
+check("walls: count is the perimeter x height", rWalls.changed == (9 * 4 - 4) * 5)
+check("walls: centre untouched", stateAt(8, 24, 8) == 0'u32 and stateAt(4, 24, 8) == planks and stateAt(8, 24, 4) == planks)
+discard weUndo(bw, ses, 1)
+let rFill = weSet(bw, ses, pat("stone"))
+let rHol = weHollow(bw, ses, pat("air"))
+check("hollow: ok", rFill.ok and rHol.ok and rHol.changed == 7 * 7 * 3)
+check("hollow: shell stays, inside is air", stateAt(4, 24, 8) == stone and stateAt(8, 26, 8) == stone and stateAt(8, 24, 8) == 0'u32 and stateAt(8, 22, 8) == stone)
+discard weUndo(bw, ses, 2)
+check("hollow+set undone", allIs(4, 22, 4, 12, 26, 12, 0'u32))
+
+# --- sphere and cylinder
+let rSph = weSphere(bw, ses, 16, 28, 16, pat("stone"), 4, 4, 4, false)
+check("sphere: ok and plausible size", rSph.ok and rSph.changed > 250 and rSph.changed < 400)
+check("sphere: centre and pole", stateAt(16, 28, 16) == stone and stateAt(16, 32, 16) == stone and stateAt(16, 33, 16) == 0'u32)
+discard weUndo(bw, ses, 1)
+check("sphere undo: centre air", stateAt(16, 28, 16) == 0'u32)
+let rCyl = weCyl(bw, ses, 20, 22, 20, pat("oak_planks"), 3, 3, 5, true)
+check("cylinder: ok", rCyl.ok and rCyl.changed > 0)
+check("cylinder hollow: wall in, centre out", stateAt(23, 24, 20) == planks and stateAt(20, 24, 20) == 0'u32)
+discard weUndo(bw, ses, 1)
+bw.flushBlockUpdates()
+sameAs(w0, "sphere, cylinder and undo")
+
+# --- count and distribution
+sel(0, 17, 0, 3, 18, 3)
+check("count: stone", weCount(bw, ses, msk("stone")).changed == 16)
+check("count: dirt", weCount(bw, ses, msk("dirt")).changed == 16)
+var lines: seq[string] = @[]
+let undoMark = ses.undo.len
+let rDist = weDistribution(bw, ses, false, lines)
+check("distribution: two blocks, equal, 50%", rDist.ok and lines.len == 2 and lines[0].endsWith("(50.00%)"))
+check("distribution: leaves the world alone", ses.undo.len == undoMark)
+
+# --- copy / paste, with the chest
+sel(6, 10, 6, 10, 14, 10)
+let rCopy = weCopy(bw, ses, 6, 10, 6)
+check("copy: ok", rCopy.ok and ses.hasClip and ses.clip.bes.len == 1)
+let rPaste = wePaste(bw, ses, 20, 22, 20, false, false)
+check("paste: ok", rPaste.ok)
+check("paste: solid stone copied", stateAt(20, 22, 20) == stone and stateAt(24, 26, 24) == stone)
+check("paste: the chest arrived", stateAt(22, 24, 22) == chest)
+check("paste: block entity added (2 in the world)", blockEntityCount() == 2)
+check("copy kept the original", stateAt(8, 12, 8) == chest and hasChestNbt())
+discard weUndo(bw, ses, 1)
+check("paste undo: area is air again", allIs(20, 22, 20, 24, 26, 24, 0'u32))
+check("paste undo: no stray block entity", blockEntityCount() == 1)
+
+# --- cut moves it
+let rCut = weCut(bw, ses, 6, 10, 6, pat("air"))
+check("cut: ok", rCut.ok and ses.hasClip)
+check("cut: source is air", allIs(6, 10, 6, 10, 14, 10, 0'u32))
+check("cut: block entity gone from the source", blockEntityCount() == 0)
+let rPaste2 = wePaste(bw, ses, 6, 10, 6, false, false)
+check("paste back: ok", rPaste2.ok and stateAt(8, 12, 8) == chest and hasChestNbt())
+discard weUndo(bw, ses, 2)
+check("undo paste and cut: the chest is where it was", stateAt(8, 12, 8) == chest and hasChestNbt())
+bw.flushBlockUpdates()
+sameAs(w0, "copy, cut, paste, undo twice")
+
+# --- rotate the clipboard and paste: asymmetric shape
+sel(0, 22, 0, 2, 22, 0)
+discard weSet(bw, ses, pat("stone"))
+check("shape: a bar of 3 along x", stateAt(0, 22, 0) == stone and stateAt(2, 22, 0) == stone and stateAt(3, 22, 0) == 0'u32)
+discard weCopy(bw, ses, 0, 22, 0)
+discard weRotate(ses, 90)
+check("rotate: dimensions swapped", ses.clip.w == 1 and ses.clip.d == 3)
+discard wePaste(bw, ses, 10, 22, 10, false, false)
+check("rotated paste lies along z", stateAt(10, 22, 10) == stone and stateAt(10, 22, 11) == stone and stateAt(10, 22, 12) == stone and stateAt(11, 22, 10) == 0'u32)
+check("rotate rejects 45", not weRotate(ses, 45).ok)
+discard weFlip(ses, 'z')
+check("flip works on the clipboard", ses.clip.d == 3)
+discard weUndo(bw, ses, 2)
+check("everything undone", allIs(0, 22, 0, 12, 22, 12, 0'u32))
+
+# --- stack and move
+sel(0, 22, 0, 1, 23, 1)
+discard weSet(bw, ses, pat("oak_planks"))
+let rStack = weStack(bw, ses, 3, 1, 0, 0, false)
+check("stack: ok, 3 copies of 8 blocks", rStack.ok and rStack.changed == 24)
+check("stack: copies at +2, +4, +6", allIs(2, 22, 0, 3, 23, 1, planks) and allIs(4, 22, 0, 5, 23, 1, planks) and allIs(6, 22, 0, 7, 23, 1, planks) and stateAt(8, 22, 0) == 0'u32)
+sel(0, 22, 0, 1, 23, 1)
+let rMove = weMove(bw, ses, 10, 0, 1, 0, pat("air"), true)
+check("move: ok", rMove.ok)
+check("move: moved up, source emptied", stateAt(0, 32, 0) == planks and stateAt(1, 33, 1) == planks and stateAt(0, 23, 0) == 0'u32)
+check("move: selection followed with -s", ses.p1y == 32)
+discard weUndo(bw, ses, 3)
+check("stack, move and set undone (the lamp at 2,25,2 stays)", stateAt(2, 25, 2) == glow and stateAt(0, 22, 0) == 0'u32 and stateAt(9, 40, 9) == 0'u32)
+for y in 22 .. 40:
+  for z in 0 .. 9:
+    for x in 0 .. 9:
+      if stateAt(int32(x), int32(y), int32(z)) != 0'u32:
+        if not (x == 2 and y == 25 and z == 2):
+          echo "  LEFTOVER at ", x, " ", y, " ", z, " = ", stateAt(int32(x), int32(y), int32(z))
+bw.flushBlockUpdates()
+sameAs(w0, "stack, move, undo")
+
+# --- undo/redo bookkeeping
+sel(0, 22, 0, 2, 22, 2)
+discard weSet(bw, ses, pat("stone"))
+discard weUndo(bw, ses, 1)
+discard weSet(bw, ses, pat("dirt"))
+check("a new edit clears redo", ses.redo.len == 0)
+check("redo with nothing fails", not weRedo(bw, ses, 1).ok)
+discard weUndo(bw, ses, 1)
+let emptied = sessionFor("fresh")
+check("undo on a fresh session fails", not weUndo(bw, emptied, 1).ok)
+
+# --- a big edit and its undo stay exact; timing printed
+if true:
+  bw.bulkUpdateLighting(newBlockPos(0'i32, 0'i32, 0'i32), newBlockPos(31'i32, 60'i32, 31'i32))
+  bw.flushBlockUpdates()
+  let big0 = takeBaseline()
+  sel(0, 22, 0, 31, 40, 31)
+  let t0 = nowNanos()
+  let rBig = weSet(bw, ses, pat("stone"))
+  let t1 = nowNanos()
+  check("big set: ok", rBig.ok and rBig.changed == 32 * 19 * 32)
+  discard weUndo(bw, ses, 1)
+  let t2 = nowNanos()
+  bw.flushBlockUpdates()
+  sameAs(big0, "big set and undo")
+  echo "TIMING big set ", rBig.changed, " blocks: set ", (t1 - t0) div 1000000, " ms, undo ", (t2 - t1) div 1000000, " ms"
+
+if failures > 0:
+  echo "weworldtest: ", failures, " FAILED"
+  quit(1)
+echo "weworldtest: all passed"

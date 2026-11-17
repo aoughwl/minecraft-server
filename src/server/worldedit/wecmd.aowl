@@ -1,0 +1,496 @@
+## The WorldEdit-style commands, the selection wand and the `worldedit:cui` channel. Op level 2.
+##
+##   //wand  //pos1 [x y z]  //pos2 [x y z]  //sel  //size
+##   //set <pattern>   //replace <mask> <pattern>   //walls <pattern>   //hollow [pattern]
+##   //sphere [-h] <pattern> <radius>[,<ry>,<rz>]   //cyl [-h] <pattern> <radius>[,<rz>] [height]
+##   //copy   //cut [leave]   //paste [-a] [-s]   //rotate <degrees>   //flip [direction]
+##   //stack [count] [direction] [-a]   //move [count] [direction] [leave] [-s]
+##   //count <mask>   //distribution [-d]   //undo [n]   //redo [n]
+##
+## A client types `//set stone`, which reaches the server as the command `/set stone`; the commands are registered under the
+## names `/set`, `/pos1`, ... The same logic is also reachable as `/we <name> <args>` (for consoles and for clients that
+## cannot type the double slash).
+##
+## The wand is a wooden axe: left click on a block sets position 1, right click on a block sets position 2 (the click does
+## not break or use the block). The server also sends the selection to clients on the `worldedit:cui` channel: a client that
+## registered the channel, sent `v|<version>` on it, or was granted the Jester `cui` capability gets `s|cuboid` and
+## `p|<index>|<x>|<y>|<z>|<volume>` messages (UTF-8 text, one per packet) whenever the selection changes.
+
+import ../../util/closureset
+import std/[options, strutils, math]
+import ../../command/[cmderrors, cmdsource, fallbackdispatch, args]
+import ../../util/[vector3, permission]
+import ../../util/text/[textbase, text, color]
+import ../../util/math/position
+import ../../plugin/[payloads, pluginhooks]
+import ../serverbase
+import ../entity/[player, entity, playerextras]
+import "../../data/item_stack/mod" as itemstackmod
+import ../../inventory/[inventory, player_inventory, screenhandler]
+import ../../world/blockstates
+import wecore, weworld
+
+const
+  Permission0* = "worldedit:command.we"
+  Description = "WorldEdit-style editing."
+  ArgRest = "args"
+  WandItem = "wooden_axe"
+  CuiChannel* = "worldedit:cui"
+  SessionKeepTicks = 12000'i64
+  CommandNames* = ["pos1", "pos2", "wand", "sel", "desel", "size", "set", "replace", "walls", "hollow", "sphere", "cyl", "copy",
+    "cut", "paste", "rotate", "flip", "stack", "move", "count", "distribution", "undo", "redo"]
+
+var
+  gServer: Option[Server] = none[Server]()
+  gInstalled = false
+  gPrevEvent: proc(player: Player; ev: PlayerEv): (bool, bool) {.closure.} = nil
+  gPrevInteract: proc(player: Player; action: int; pos: Option[BlockPos]): bool {.closure.} = nil
+  gLastTick = 0'i64
+
+proc registerPermission*(registry: PermissionRegistry) =
+  registerPermissionOrPanic(registry, newPermission(Permission0, Description, permissionOp(Two)))
+
+proc say(sender: CommandSender; line: string) =
+  sendMessage(sender, text(line))
+
+proc sayOk(sender: CommandSender; line: string) =
+  sendMessage(sender, colorNamed(text(line), ncGreen))
+
+proc sayBad(sender: CommandSender; line: string) =
+  sendMessage(sender, colorNamed(text(line), ncRed))
+
+proc findPlayer(name: string): Option[Player] =
+  result = none[Player]()
+  if gServer.isNone:
+    return
+  for w in gServer.unsafeGet.worlds:
+    for p in w.players:
+      if p.gameprofile.name == name:
+        return some(p)
+
+proc worldByDimName(dim: string): Option[World] =
+  if gServer.isSome:
+    for w in gServer.unsafeGet.worlds:
+      if w.dimension.minecraftName == dim:
+        return some(w)
+  none[World]()
+
+# ---- the cui channel -------------------------------------------------------------------------------------------------
+
+proc toBytes(s: string): seq[byte] =
+  result = @[]
+  for c in s:
+    result.add byte(c)
+
+proc cuiMessages*(ses: Session): seq[string] =
+  ## What the client is told: the shape, then each point with the selection's volume.
+  result = @["s|cuboid"]
+  let vol = selectionVolume(ses)
+  if ses.has1:
+    result.add("p|0|" & $ses.p1x & "|" & $ses.p1y & "|" & $ses.p1z & "|" & $vol)
+  if ses.has2:
+    result.add("p|1|" & $ses.p2x & "|" & $ses.p2y & "|" & $ses.p2z & "|" & $vol)
+
+proc cuiWanted(ses: Session): bool =
+  ses.cuiHello or payloadChannelDeclared(ses.name, CuiChannel) or playerHasCapability(ses.name, "cui")
+
+proc sendCui(p: Player; ses: Session) =
+  for m in cuiMessages(ses):
+    p.sendCustomPayload(CuiChannel, toBytes(m))
+  ses.cuiDirty = false
+
+proc tickWorldEdit*(server: Server; tick: int64) =
+  ## Once a tick: installs the hooks the first time, sends changed selections to clients, drops sessions of long-gone players.
+  gServer = some(server)
+  gLastTick = tick
+  if not gInstalled:
+    return
+  for ses in allSessions():
+    let who = findPlayer(ses.name)
+    if who.isSome:
+      ses.lastSeen = tick
+      if ses.cuiDirty and cuiWanted(ses):
+        sendCui(who.unsafeGet, ses)
+    elif tick - ses.lastSeen > SessionKeepTicks and ses.lastSeen > 0'i64:
+      dropSession(ses.name)
+
+# ---- command plumbing ------------------------------------------------------------------------------------------------
+
+type Ctx = object
+  sender: CommandSender
+  ses: Session
+  world: World
+  px, py, pz: int
+  yaw, pitch: float
+  parts: seq[string]
+  flags: string
+
+proc setupCtx(sender: CommandSender; line: string; ctx: var Ctx): bool =
+  if sender.kind != cskPlayer or sender.player == nil or sender.player.entity == nil:
+    sayBad(sender, "WorldEdit commands are for players.")
+    return false
+  let name = sender.player.gameProfile.name
+  let cw = sender.player.entity.getWorld()
+  if cw == nil:
+    sayBad(sender, "No world.")
+    return false
+  let w = worldByDimName(cw.dimensionName)
+  if w.isNone:
+    sayBad(sender, "The server has not started ticking yet.")
+    return false
+  ctx.sender = sender
+  ctx.ses = sessionFor(name)
+  ctx.world = w.unsafeGet
+  let p = sender.player.entity.getPos()
+  ctx.px = int(floor(p.x))
+  ctx.py = int(floor(p.y))
+  ctx.pz = int(floor(p.z))
+  let rot = sender.player.entity.getRotation()
+  ctx.pitch = float(rot.x)
+  ctx.yaw = float(rot.y)
+  ctx.parts = @[]
+  ctx.flags = ""
+  for tok in line.splitWhitespace():
+    if tok.len >= 2 and tok[0] == '-' and not (tok[1] >= '0' and tok[1] <= '9'):
+      ctx.flags.add tok.substr(1)
+    else:
+      ctx.parts.add tok
+  true
+
+proc parseInt(s: string; v: var int): bool =
+  if s.len == 0:
+    return false
+  var i = 0
+  var neg = false
+  if s[0] == '-':
+    neg = true
+    i = 1
+  if i >= s.len:
+    return false
+  var n = 0
+  while i < s.len:
+    if s[i] < '0' or s[i] > '9' or n > 100_000_000:
+      return false
+    n = n * 10 + (ord(s[i]) - 48)
+    inc i
+  v = if neg: -n else: n
+  true
+
+proc direction(ctx: Ctx; s: string; dx, dy, dz: var int): bool =
+  if s.len == 0 or s == "me":
+    let f = facingOf(ctx.yaw, ctx.pitch)
+    dx = f[0]
+    dy = f[1]
+    dz = f[2]
+    return true
+  parseDirection(s, dx, dy, dz)
+
+proc report(ctx: Ctx; r: OpResult) =
+  if r.ok:
+    sayOk(ctx.sender, r.msg)
+  else:
+    sayBad(ctx.sender, r.msg)
+
+proc posReply(ctx: Ctx; which: int) =
+  let vol = selectionVolume(ctx.ses)
+  var at = ""
+  if which == 1:
+    at = "(" & $ctx.ses.p1x & ", " & $ctx.ses.p1y & ", " & $ctx.ses.p1z & ")"
+  else:
+    at = "(" & $ctx.ses.p2x & ", " & $ctx.ses.p2y & ", " & $ctx.ses.p2z & ")"
+  sayOk(ctx.sender, "Position " & $which & " set to " & at & (if vol > 0: " (" & $vol & " blocks)." else: "."))
+
+proc coordsFromArgs(ctx: Ctx; x, y, z: var int): bool =
+  ## "x,y,z" or "x y z" or nothing (the player's block).
+  x = ctx.px
+  y = ctx.py - 0
+  z = ctx.pz
+  if ctx.parts.len == 0:
+    return true
+  var nums: seq[string] = @[]
+  for p in ctx.parts:
+    for q in p.split(','):
+      if q.len > 0:
+        nums.add q
+  if nums.len != 3:
+    return false
+  parseInt(nums[0], x) and parseInt(nums[1], y) and parseInt(nums[2], z)
+
+proc giveWand(p: Player) =
+  let it = Item.fromRegistryKey(WandItem)
+  if it == nil:
+    return
+  var s = newItemStack(1'u8, it)
+  discard insertStackAnywhere(p.inventory, s)
+  if not s.isEmpty():
+    p.asInventoryPlayer().dropItem(s, false)
+  p.currentScreenHandler.sendContentUpdates()
+
+proc usage(ctx: Ctx; text: string) =
+  sayBad(ctx.sender, "Usage: " & text)
+
+proc runCommand*(sender: CommandSender; name, line: string) =
+  var ctx = Ctx()
+  if not setupCtx(sender, line, ctx):
+    return
+  let dimName = ctx.world.dimension.minecraftName
+  case name
+  of "pos1", "pos2":
+    var x = 0
+    var y = 0
+    var z = 0
+    if not coordsFromArgs(ctx, x, y, z):
+      usage(ctx, "//" & name & " [x y z]")
+      return
+    if name == "pos1":
+      setPos1(ctx.ses, dimName, x, y, z)
+      posReply(ctx, 1)
+    else:
+      setPos2(ctx.ses, dimName, x, y, z)
+      posReply(ctx, 2)
+  of "wand":
+    let who = findPlayer(ctx.ses.name)
+    if who.isSome:
+      giveWand(who.unsafeGet)
+      sayOk(sender, "Left click a block with the wooden axe for position 1, right click for position 2.")
+  of "sel", "desel":
+    clearSelection(ctx.ses)
+    sayOk(sender, "Selection cleared.")
+  of "size":
+    var b = weBox(0, 0, 0, 0, 0, 0)
+    if not selectionBox(ctx.ses, b):
+      sayBad(sender, "Make a selection first.")
+    else:
+      say(sender, "Size: " & $sizeX(b) & " x " & $sizeY(b) & " x " & $sizeZ(b) & ", " & $volume(b) & " blocks.")
+  of "set":
+    var p = Pattern()
+    var err = ""
+    if ctx.parts.len < 1 or not parsePattern(ctx.parts[0], p, err):
+      sayBad(sender, if err.len > 0: err else: "Usage: //set <pattern>")
+      return
+    report(ctx, weSet(ctx.world, ctx.ses, p))
+  of "replace":
+    var m = Mask()
+    var p = Pattern()
+    var err = ""
+    if ctx.parts.len < 2:
+      usage(ctx, "//replace <mask> <pattern>")
+      return
+    if not parseMask(ctx.parts[0], m, err) or not parsePattern(ctx.parts[1], p, err):
+      sayBad(sender, err)
+      return
+    report(ctx, weReplace(ctx.world, ctx.ses, m, p))
+  of "walls":
+    var p = Pattern()
+    var err = ""
+    if ctx.parts.len < 1 or not parsePattern(ctx.parts[0], p, err):
+      sayBad(sender, if err.len > 0: err else: "Usage: //walls <pattern>")
+      return
+    report(ctx, weWalls(ctx.world, ctx.ses, p))
+  of "hollow":
+    var p = singlePattern(0'u32)
+    var err = ""
+    if ctx.parts.len >= 1 and not parsePattern(ctx.parts[0], p, err):
+      sayBad(sender, err)
+      return
+    report(ctx, weHollow(ctx.world, ctx.ses, p))
+  of "sphere", "cyl":
+    var p = Pattern()
+    var err = ""
+    if ctx.parts.len < 2 or not parsePattern(ctx.parts[0], p, err):
+      sayBad(sender, if err.len > 0: err else: "Usage: //" & name & " [-h] <pattern> <radius> [height]")
+      return
+    var radii: seq[int] = @[]
+    for q in ctx.parts[1].split(','):
+      var n = 0
+      if not parseInt(q, n):
+        usage(ctx, "//" & name & " [-h] <pattern> <radius> [height]")
+        return
+      radii.add n
+    let hollow = 'h' in ctx.flags
+    let raised = if 'r' in ctx.flags: 1 else: 0
+    if name == "sphere":
+      let rx = radii[0]
+      let ry = if radii.len > 1: radii[1] else: rx
+      let rz = if radii.len > 2: radii[2] else: rx
+      report(ctx, weSphere(ctx.world, ctx.ses, ctx.px, ctx.py + raised * ry, ctx.pz, p, rx, ry, rz, hollow))
+    else:
+      let rx = radii[0]
+      let rz = if radii.len > 1: radii[1] else: rx
+      var height = 1
+      if ctx.parts.len > 2 and not parseInt(ctx.parts[2], height):
+        usage(ctx, "//cyl [-h] <pattern> <radius> [height]")
+        return
+      report(ctx, weCyl(ctx.world, ctx.ses, ctx.px, ctx.py, ctx.pz, p, rx, rz, height, hollow))
+  of "copy":
+    report(ctx, weCopy(ctx.world, ctx.ses, ctx.px, ctx.py, ctx.pz))
+  of "cut":
+    var p = singlePattern(0'u32)
+    var err = ""
+    if ctx.parts.len >= 1 and not parsePattern(ctx.parts[0], p, err):
+      sayBad(sender, err)
+      return
+    report(ctx, weCut(ctx.world, ctx.ses, ctx.px, ctx.py, ctx.pz, p))
+  of "paste":
+    report(ctx, wePaste(ctx.world, ctx.ses, ctx.px, ctx.py, ctx.pz, 'a' in ctx.flags, 's' in ctx.flags))
+  of "rotate":
+    var deg = 0
+    if ctx.parts.len < 1 or not parseInt(ctx.parts[0], deg):
+      usage(ctx, "//rotate <degrees>")
+      return
+    report(ctx, weRotate(ctx.ses, deg))
+  of "flip":
+    var dx = 0
+    var dy = 0
+    var dz = 0
+    if not direction(ctx, (if ctx.parts.len > 0: ctx.parts[0] else: "me"), dx, dy, dz):
+      usage(ctx, "//flip [direction]")
+      return
+    let axis = if dx != 0: 'x' elif dy != 0: 'y' else: 'z'
+    report(ctx, weFlip(ctx.ses, axis))
+  of "stack", "move":
+    var count = 1
+    var dx = 0
+    var dy = 0
+    var dz = 0
+    var dirText = "me"
+    for tok in ctx.parts:
+      var n = 0
+      if parseInt(tok, n):
+        count = n
+      else:
+        dirText = tok
+        break
+    if not direction(ctx, dirText, dx, dy, dz):
+      usage(ctx, "//" & name & " [count] [direction]")
+      return
+    if name == "stack":
+      report(ctx, weStack(ctx.world, ctx.ses, count, dx, dy, dz, 'a' in ctx.flags))
+    else:
+      var leave = singlePattern(0'u32)
+      var err = ""
+      if ctx.parts.len >= 3 and not parsePattern(ctx.parts[2], leave, err):
+        sayBad(sender, err)
+        return
+      report(ctx, weMove(ctx.world, ctx.ses, count, dx, dy, dz, leave, 's' in ctx.flags))
+  of "count":
+    var m = Mask()
+    var err = ""
+    if ctx.parts.len < 1 or not parseMask(ctx.parts[0], m, err):
+      sayBad(sender, if err.len > 0: err else: "Usage: //count <mask>")
+      return
+    report(ctx, weCount(ctx.world, ctx.ses, m))
+  of "distribution":
+    var lines: seq[string] = @[]
+    let r = weDistribution(ctx.world, ctx.ses, 'd' in ctx.flags, lines)
+    report(ctx, r)
+    if r.ok:
+      var shown = 0
+      for l in lines:
+        if shown >= 15:
+          break
+        say(sender, "  " & l)
+        inc shown
+  of "undo":
+    var n = 1
+    if ctx.parts.len > 0:
+      discard parseInt(ctx.parts[0], n)
+    report(ctx, weUndo(ctx.world, ctx.ses, n))
+  of "redo":
+    var n = 1
+    if ctx.parts.len > 0:
+      discard parseInt(ctx.parts[0], n)
+    report(ctx, weRedo(ctx.world, ctx.ses, n))
+  else:
+    sayBad(sender, "Unknown WorldEdit command " & name & ".")
+
+proc commandTreeFor(commandName: string; registered: string): CommandTree =
+  let run = proc(sender: CommandSender; server: nil CommandServer; args: ConsumedArgs): CommandResult {.closure.} =
+    var line = ""
+    discard findMsg(args, ArgRest, line)
+    runCommand(sender, commandName, line)
+    cmdSuccess(1'i32)
+  then(execute(newCommandTree([registered], Description), run), execute(argument(ArgRest, newMsgArgConsumer()), run))
+
+proc weAllTree(): CommandTree =
+  ## `/we <name> <args>`: the same commands for a console or a client that cannot type the double slash.
+  let run = proc(sender: CommandSender; server: nil CommandServer; args: ConsumedArgs): CommandResult {.closure.} =
+    var line = ""
+    discard findMsg(args, ArgRest, line)
+    let words = line.splitWhitespace()
+    if words.len == 0:
+      say(sender, "/we <command> [args]: " & CommandNames.join(", "))
+    else:
+      var rest = ""
+      for i in 1 ..< words.len:
+        rest.add(words[i] & " ")
+      runCommand(sender, words[0].strip(chars = {'/'}), rest)
+    cmdSuccess(1'i32)
+  then(execute(newCommandTree(["we", "worldedit"], Description), run), execute(argument(ArgRest, newMsgArgConsumer()), run))
+
+proc registerWorldEditCommands*(fallback: FallbackDispatcher) =
+  for n in CommandNames:
+    register(fallback, commandTreeFor(n, "/" & n), Permission0)
+  register(fallback, weAllTree(), Permission0)
+
+# ---- the wand and the cui handshake ----------------------------------------------------------------------------------
+
+proc isOperator(p: Player): bool =
+  ord(p.permissionLvl) >= 2
+
+proc holdsWand(p: Player): bool =
+  let s = p.heldItem()
+  if s.isEmpty():
+    return false
+  s.item.registryKey == WandItem
+
+proc wandClick(p: Player; which: int; x, y, z: int): bool =
+  ## True when the click was the wand's (the block must not break or be used).
+  if not isOperator(p) or not holdsWand(p):
+    return false
+  let ses = sessionFor(p.gameprofile.name)
+  let dim = p.world.dimension.minecraftName
+  var same = false
+  if which == 1:
+    same = ses.has1 and ses.dim == dim and ses.p1x == x and ses.p1y == y and ses.p1z == z
+    if not same:
+      setPos1(ses, dim, x, y, z)
+  else:
+    same = ses.has2 and ses.dim == dim and ses.p2x == x and ses.p2y == y and ses.p2z == z
+    if not same:
+      setPos2(ses, dim, x, y, z)
+  if not same:
+    let vol = selectionVolume(ses)
+    p.sendSystemMessage(colorNamed(text("Position " & $which & " set to (" & $x & ", " & $y & ", " & $z & ")" &
+      (if vol > 0: " (" & $vol & " blocks)." else: ".")), ncGreen))
+  true
+
+proc installWorldEdit*(server: Server) =
+  ## Chains the wand clicks and the cui handshake onto the plugin event hooks, once; advertises the `cui` capability.
+  if gInstalled:
+    return
+  gInstalled = true
+  gServer = some(server)
+  advertiseCapabilityBit(CapCui)
+  gPrevEvent = gPluginPlayerEventHook
+  gPluginPlayerEventHook = proc(player: Player; ev: PlayerEv): (bool, bool) {.closure.} =
+    let before = gPrevEvent(player, ev)
+    if before[0]:
+      return before
+    if ev.kind == pekBlockBreak:
+      if wandClick(player, 1, int(ev.pos.vec.x), int(ev.pos.vec.y), int(ev.pos.vec.z)):
+        return (true, false)
+    elif ev.kind == pekCustomPayload and ev.text == CuiChannel:
+      let ses = sessionFor(player.gameprofile.name)
+      ses.cuiHello = true
+      ses.cuiDirty = true
+    before
+  gPrevInteract = gPluginInteractHook
+  gPluginInteractHook = proc(player: Player; action: int; pos: Option[BlockPos]): bool {.closure.} =
+    if gPrevInteract(player, action, pos):
+      return true
+    if action == 3 and pos.isSome:
+      let at: BlockPos = pos.unsafeGet
+      if wandClick(player, 2, int(at.vec.x), int(at.vec.y), int(at.vec.z)):
+        return true
+    false

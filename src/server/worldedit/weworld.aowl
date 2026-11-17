@@ -1,0 +1,535 @@
+## WorldEdit-style server mod, the world half: selection sessions, the clipboard, undo / redo history and every edit, all of
+## them applied through bulkedit (src/server/world/bulkedit.aowl) so lighting, heightmaps, client updates, block entities,
+## the plugin veto and the block log behave as for any bulk edit.
+##
+## How an edit runs. `beginEdit` reads the volume the edit may touch into a snapshot and a `Grid` of block states. The edit
+## changes the grid (wecore: patterns, masks, shapes). `finishEdit` writes the changed grid back into a copy of the snapshot
+## and places that with `placeVolume` (one all-or-nothing call: section swaps, one light pass, one client update per section),
+## then keeps the ORIGINAL snapshot as the undo entry. Undo places that snapshot back (reading the current state first for
+## redo), so it restores block states and block entities exactly. Every changed cell also goes to the block log with the
+## command cause and the player's name, so `/bl lookup` shows the edit and `/bl rollback` can undo it from the log too.
+
+import std/[options, strutils]
+import ../../util/math/position
+import ../../nbt/tag as nbttag
+import ../../world/blockstates
+import ../serverbase
+import ../blocklog/blocklogcore
+import ../world/bulkedit
+import wecore
+
+const
+  MaxEditCells* = 4_000_000       ## one edit, in cells of the volume it reads
+  MaxHistoryEntries* = 64
+  MaxHistoryCells* = 24_000_000   ## undo + redo of one player, summed over the boxes
+
+type
+  HistEntry* = object
+    label*: string
+    box*: WeBox
+    snap*: VolumeSnapshot   ## the cells to put back
+
+  Session* = ref object
+    name*: string
+    dim*: string
+    has1*, has2*: bool
+    p1x*, p1y*, p1z*, p2x*, p2y*, p2z*: int
+    hasClip*: bool
+    clip*: Clip
+    undo*: seq[HistEntry]
+    redo*: seq[HistEntry]
+    cuiDirty*: bool        ## the selection changed since the client was told
+    cuiHello*: bool        ## the client said `v|<n>` on worldedit:cui
+    lastSeen*: int64
+
+  OpResult* = object
+    ok*: bool
+    msg*: string
+    changed*: int
+
+  EditCtx = object
+    box: WeBox
+    snap: VolumeSnapshot
+    before: Grid
+    after: Grid
+    bes: seq[VolumeBlockEntity]
+
+var gSessions: seq[Session] = @[]
+
+proc sessionFor*(name: string): Session =
+  for s in gSessions:
+    if s.name == name:
+      return s
+  let s = Session(name: name, dim: "", has1: false, has2: false, hasClip: false, undo: @[], redo: @[], cuiDirty: false,
+    cuiHello: false, lastSeen: 0'i64)
+  gSessions.add s
+  s
+
+proc allSessions*(): seq[Session] = gSessions
+
+proc dropSession*(name: string) =
+  var kept: seq[Session] = @[]
+  for s in gSessions:
+    if s.name != name:
+      kept.add s
+  gSessions = kept
+
+proc resetSessions*() =
+  gSessions = @[]
+
+proc fail(msg: string): OpResult = OpResult(ok: false, msg: msg, changed: 0)
+proc good(msg: string; changed: int): OpResult = OpResult(ok: true, msg: msg, changed: changed)
+
+proc statusText(status: EditStatus): string =
+  case status
+  of esOk: "ok"
+  of esStale: "the area changed while the edit was prepared"
+  of esUnloaded: "part of the area is not loaded"
+  of esOutOfRange: "the area is outside the world's build height"
+  of esVetoed: "a plugin cancelled the change"
+  of esBlocked: "blocked"
+  of esWrongState: "bad snapshot state"
+
+proc toVol(b: WeBox): VolumeBox =
+  volumeBox(int32(b.minX), int32(b.minY), int32(b.minZ), int32(b.maxX), int32(b.maxY), int32(b.maxZ))
+
+proc corner(b: WeBox): BlockPos =
+  newBlockPos(int32(b.minX), int32(b.minY), int32(b.minZ))
+
+# ---- selection -------------------------------------------------------------------------------------------------------
+
+proc setPos1*(ses: Session; dim: string; x, y, z: int) =
+  if ses.dim != dim:
+    ses.has2 = false
+  ses.dim = dim
+  ses.p1x = x
+  ses.p1y = y
+  ses.p1z = z
+  ses.has1 = true
+  ses.cuiDirty = true
+
+proc setPos2*(ses: Session; dim: string; x, y, z: int) =
+  if ses.dim != dim:
+    ses.has1 = false
+  ses.dim = dim
+  ses.p2x = x
+  ses.p2y = y
+  ses.p2z = z
+  ses.has2 = true
+  ses.cuiDirty = true
+
+proc clearSelection*(ses: Session) =
+  ses.has1 = false
+  ses.has2 = false
+  ses.cuiDirty = true
+
+proc selectionBox*(ses: Session; box: var WeBox): bool =
+  if not (ses.has1 and ses.has2):
+    return false
+  box = weBox(ses.p1x, ses.p1y, ses.p1z, ses.p2x, ses.p2y, ses.p2z)
+  true
+
+proc shiftSelection*(ses: Session; dx, dy, dz: int) =
+  ses.p1x += dx
+  ses.p1y += dy
+  ses.p1z += dz
+  ses.p2x += dx
+  ses.p2y += dy
+  ses.p2z += dz
+  ses.cuiDirty = true
+
+proc selectionVolume*(ses: Session): int =
+  var b = weBox(0, 0, 0, 0, 0, 0)
+  if selectionBox(ses, b): volume(b) else: 0
+
+proc needSelection(ses: Session; world: World; box: var WeBox; err: var string): bool =
+  if not selectionBox(ses, box):
+    err = "Make a selection first (//pos1 and //pos2, or the wand)."
+    return false
+  if ses.dim != world.dimension.minecraftName:
+    err = "Your selection is in " & ses.dim & "."
+    return false
+  true
+
+# ---- snapshots and grids ---------------------------------------------------------------------------------------------
+
+proc snapToGrid(snap: VolumeSnapshot; box: WeBox): Grid =
+  result = newGrid(box)
+  for sec in snap.sections:
+    let cells = sec.blocks.cells()
+    for y in sec.y0 .. sec.y1:
+      for z in sec.z0 .. sec.z1:
+        for x in sec.x0 .. sec.x1:
+          let wx = int(sec.cx) * 16 + x
+          let wy = int(sec.baseY) + y
+          let wz = int(sec.cz) * 16 + z
+          result.cells[gridIndex(result, wx, wy, wz)] = cells[y * 256 + z * 16 + x]
+
+proc gridIntoSnap(snap: var VolumeSnapshot; g: Grid) =
+  ## Writes the grid's cells into the snapshot's section palettes (copies, the world is not touched).
+  for i in 0 ..< snap.sections.len:
+    let cx = int(snap.sections[i].cx)
+    let cz = int(snap.sections[i].cz)
+    let baseY = int(snap.sections[i].baseY)
+    let x0 = snap.sections[i].x0
+    let x1 = snap.sections[i].x1
+    let y0 = snap.sections[i].y0
+    let y1 = snap.sections[i].y1
+    let z0 = snap.sections[i].z0
+    let z1 = snap.sections[i].z1
+    for y in y0 .. y1:
+      for z in z0 .. z1:
+        for x in x0 .. x1:
+          let want = g.cells[gridIndex(g, cx * 16 + x, baseY + y, cz * 16 + z)]
+          discard snap.sections[i].blocks.set(x, y, z, want)
+
+proc beginEdit(world: World; box: WeBox; ctx: var EditCtx; err: var string): bool =
+  if volume(box) > MaxEditCells:
+    err = "That region is too large (" & $volume(box) & " blocks, the limit is " & $MaxEditCells & ")."
+    return false
+  ctx.box = box
+  ctx.snap = readVolume(world, toVol(box))
+  if ctx.snap.status != esOk:
+    err = "Cannot edit there: " & statusText(ctx.snap.status) & "."
+    return false
+  ctx.before = snapToGrid(ctx.snap, box)
+  ctx.after = ctx.before
+  ctx.bes = @[]
+  true
+
+proc trimHistory(ses: Session) =
+  var cells = 0
+  for e in ses.undo:
+    cells += volume(e.box)
+  for e in ses.redo:
+    cells += volume(e.box)
+  while ses.undo.len > MaxHistoryEntries or (cells > MaxHistoryCells and ses.undo.len > 1):
+    cells -= volume(ses.undo[0].box)
+    ses.undo.delete(0)
+
+proc finishEdit(world: World; ses: Session; label: string; ctx: var EditCtx): OpResult =
+  var changed = 0
+  for i in 0 ..< ctx.after.cells.len:
+    if ctx.after.cells[i] != ctx.before.cells[i]:
+      inc changed
+  if changed == 0 and ctx.bes.len == 0:
+    return good("No blocks were changed.", 0)
+  var after = ctx.snap
+  gridIntoSnap(after, ctx.after)
+  # block entities: a cell that stays the same block keeps its own; the pasted ones come from the edit
+  var keep: seq[VolumeBlockEntity] = @[]
+  for be in ctx.snap.blockEntities:
+    let x = int(be.pos.vec.x)
+    let y = int(be.pos.vec.y)
+    let z = int(be.pos.vec.z)
+    if ctx.box.inside(x, y, z) and blockIdOf(ctx.after.cellAt(x, y, z)) == blockIdOf(ctx.before.cellAt(x, y, z)):
+      var replaced = false
+      for ne in ctx.bes:
+        if ne.pos == be.pos:
+          replaced = true
+      if not replaced:
+        keep.add be
+  for ne in ctx.bes:
+    keep.add ne
+  after.blockEntities = keep
+  var opts = defaultPlaceOptions()
+  opts.skipAir = false
+  opts.mode = pmReplace
+  let prev = blockLogPush(CauseCommand, KindPlayer, ses.name)
+  let rep = placeVolume(world, after, corner(ctx.box), opts)
+  blockLogPop(prev)
+  if rep.status != esOk:
+    return fail("The edit was refused: " & statusText(rep.status) & ".")
+  ses.undo.add HistEntry(label: label, box: ctx.box, snap: ctx.snap)
+  ses.redo = @[]
+  trimHistory(ses)
+  good(label & ": " & $rep.changed & " block(s) changed.", rep.changed)
+
+# ---- edits on the selection ------------------------------------------------------------------------------------------
+
+proc weSet*(world: World; ses: Session; pat: Pattern): OpResult =
+  var box = weBox(0, 0, 0, 0, 0, 0)
+  var err = ""
+  if not needSelection(ses, world, box, err): return fail(err)
+  var ctx = EditCtx()
+  if not beginEdit(world, box, ctx, err): return fail(err)
+  for y in box.minY .. box.maxY:
+    for z in box.minZ .. box.maxZ:
+      for x in box.minX .. box.maxX:
+        ctx.after.setCell(x, y, z, pick(pat, x, y, z))
+  finishEdit(world, ses, "set", ctx)
+
+proc weReplace*(world: World; ses: Session; mask: Mask; pat: Pattern): OpResult =
+  var box = weBox(0, 0, 0, 0, 0, 0)
+  var err = ""
+  if not needSelection(ses, world, box, err): return fail(err)
+  var ctx = EditCtx()
+  if not beginEdit(world, box, ctx, err): return fail(err)
+  for y in box.minY .. box.maxY:
+    for z in box.minZ .. box.maxZ:
+      for x in box.minX .. box.maxX:
+        if mask.matches(ctx.before.cellAt(x, y, z)):
+          ctx.after.setCell(x, y, z, pick(pat, x, y, z))
+  finishEdit(world, ses, "replace", ctx)
+
+proc weWalls*(world: World; ses: Session; pat: Pattern): OpResult =
+  var box = weBox(0, 0, 0, 0, 0, 0)
+  var err = ""
+  if not needSelection(ses, world, box, err): return fail(err)
+  var ctx = EditCtx()
+  if not beginEdit(world, box, ctx, err): return fail(err)
+  for y in box.minY .. box.maxY:
+    for z in box.minZ .. box.maxZ:
+      for x in box.minX .. box.maxX:
+        if onWalls(box, x, z):
+          ctx.after.setCell(x, y, z, pick(pat, x, y, z))
+  finishEdit(world, ses, "walls", ctx)
+
+proc weHollow*(world: World; ses: Session; pat: Pattern): OpResult =
+  ## The interior of the selection becomes the pattern (air by default at the command), the one-block shell stays.
+  var box = weBox(0, 0, 0, 0, 0, 0)
+  var err = ""
+  if not needSelection(ses, world, box, err): return fail(err)
+  var ctx = EditCtx()
+  if not beginEdit(world, box, ctx, err): return fail(err)
+  for y in box.minY .. box.maxY:
+    for z in box.minZ .. box.maxZ:
+      for x in box.minX .. box.maxX:
+        if not onShell(box, x, y, z):
+          ctx.after.setCell(x, y, z, pick(pat, x, y, z))
+  finishEdit(world, ses, "hollow", ctx)
+
+proc writeCells(world: World; ses: Session; label: string; cells: seq[(int, int, int)]; pat: Pattern): OpResult =
+  if cells.len == 0:
+    return fail("Nothing to generate.")
+  var box = weBox(cells[0][0], cells[0][1], cells[0][2], cells[0][0], cells[0][1], cells[0][2])
+  for c in cells:
+    box = unionBox(box, weBox(c[0], c[1], c[2], c[0], c[1], c[2]))
+  var ctx = EditCtx()
+  var err = ""
+  if not beginEdit(world, box, ctx, err): return fail(err)
+  for c in cells:
+    ctx.after.setCell(c[0], c[1], c[2], pick(pat, c[0], c[1], c[2]))
+  finishEdit(world, ses, label, ctx)
+
+proc weSphere*(world: World; ses: Session; cx, cy, cz: int; pat: Pattern; rx, ry, rz: int; hollow: bool): OpResult =
+  if rx < 1 or ry < 1 or rz < 1:
+    return fail("The radius must be at least 1.")
+  if (2 * rx + 1) * (2 * ry + 1) * (2 * rz + 1) > MaxEditCells:
+    return fail("That sphere is too large.")
+  writeCells(world, ses, "sphere", sphereCells(cx, cy, cz, rx, ry, rz, hollow), pat)
+
+proc weCyl*(world: World; ses: Session; cx, cy, cz: int; pat: Pattern; rx, rz, height: int; hollow: bool): OpResult =
+  if rx < 1 or rz < 1 or height < 1:
+    return fail("The radius and the height must be at least 1.")
+  if (2 * rx + 1) * (2 * rz + 1) * height > MaxEditCells:
+    return fail("That cylinder is too large.")
+  writeCells(world, ses, "cylinder", cylCells(cx, cy, cz, rx, rz, height, hollow), pat)
+
+proc weStack*(world: World; ses: Session; count, dx, dy, dz: int; skipAir: bool): OpResult =
+  ## `count` further copies of the selection, each one selection-size further along the direction.
+  var box = weBox(0, 0, 0, 0, 0, 0)
+  var err = ""
+  if not needSelection(ses, world, box, err): return fail(err)
+  if count < 1:
+    return fail("The count must be at least 1.")
+  let stepX = dx * sizeX(box)
+  let stepY = dy * sizeY(box)
+  let stepZ = dz * sizeZ(box)
+  let last = shifted(box, stepX * count, stepY * count, stepZ * count)
+  let area = unionBox(box, last)
+  var ctx = EditCtx()
+  if not beginEdit(world, area, ctx, err): return fail(err)
+  for i in 1 .. count:
+    for y in box.minY .. box.maxY:
+      for z in box.minZ .. box.maxZ:
+        for x in box.minX .. box.maxX:
+          let v = ctx.before.cellAt(x, y, z)
+          if v == 0'u32 and skipAir:
+            continue
+          ctx.after.setCell(x + stepX * i, y + stepY * i, z + stepZ * i, v)
+  # block entities of the source go along
+  for be in ctx.snap.blockEntities:
+    if box.inside(int(be.pos.vec.x), int(be.pos.vec.y), int(be.pos.vec.z)):
+      for i in 1 .. count:
+        ctx.bes.add(VolumeBlockEntity(pos: newBlockPos(be.pos.vec.x + int32(stepX * i), be.pos.vec.y + int32(stepY * i),
+          be.pos.vec.z + int32(stepZ * i)), nbt: be.nbt))
+  result = finishEdit(world, ses, "stack", ctx)
+
+proc weMove*(world: World; ses: Session; count, dx, dy, dz: int; leave: Pattern; shiftSel: bool): OpResult =
+  ## The selection's blocks move `count` cells along the direction; the vacated cells become `leave` (air).
+  var box = weBox(0, 0, 0, 0, 0, 0)
+  var err = ""
+  if not needSelection(ses, world, box, err): return fail(err)
+  if count < 1:
+    return fail("The distance must be at least 1.")
+  let moved = shifted(box, dx * count, dy * count, dz * count)
+  let area = unionBox(box, moved)
+  var ctx = EditCtx()
+  if not beginEdit(world, area, ctx, err): return fail(err)
+  for y in box.minY .. box.maxY:
+    for z in box.minZ .. box.maxZ:
+      for x in box.minX .. box.maxX:
+        ctx.after.setCell(x, y, z, pick(leave, x, y, z))
+  for y in box.minY .. box.maxY:
+    for z in box.minZ .. box.maxZ:
+      for x in box.minX .. box.maxX:
+        ctx.after.setCell(x + dx * count, y + dy * count, z + dz * count, ctx.before.cellAt(x, y, z))
+  for be in ctx.snap.blockEntities:
+    if box.inside(int(be.pos.vec.x), int(be.pos.vec.y), int(be.pos.vec.z)):
+      ctx.bes.add(VolumeBlockEntity(pos: newBlockPos(be.pos.vec.x + int32(dx * count), be.pos.vec.y + int32(dy * count),
+        be.pos.vec.z + int32(dz * count)), nbt: be.nbt))
+  result = finishEdit(world, ses, "move", ctx)
+  if result.ok and shiftSel:
+    shiftSelection(ses, dx * count, dy * count, dz * count)
+
+# ---- clipboard -------------------------------------------------------------------------------------------------------
+
+proc weCopy*(world: World; ses: Session; px, py, pz: int): OpResult =
+  var box = weBox(0, 0, 0, 0, 0, 0)
+  var err = ""
+  if not needSelection(ses, world, box, err): return fail(err)
+  var ctx = EditCtx()
+  if not beginEdit(world, box, ctx, err): return fail(err)
+  ses.clip = clipFrom(ctx.before, px, py, pz)
+  for be in ctx.snap.blockEntities:
+    ses.clip.bes.add(ClipBE(x: int(be.pos.vec.x) - box.minX, y: int(be.pos.vec.y) - box.minY, z: int(be.pos.vec.z) - box.minZ,
+      nbt: be.nbt))
+  ses.hasClip = true
+  good("Copied " & $volume(box) & " block(s).", volume(box))
+
+proc weCut*(world: World; ses: Session; px, py, pz: int; leave: Pattern): OpResult =
+  let c = weCopy(world, ses, px, py, pz)
+  if not c.ok:
+    return c
+  let r = weSet(world, ses, leave)
+  if not r.ok:
+    ses.hasClip = false
+    return r
+  good("Cut " & $volume(weBox(ses.p1x, ses.p1y, ses.p1z, ses.p2x, ses.p2y, ses.p2z)) & " block(s) to the clipboard.", r.changed)
+
+proc wePaste*(world: World; ses: Session; px, py, pz: int; skipAir: bool; select: bool): OpResult =
+  if not ses.hasClip:
+    return fail("Your clipboard is empty. Use //copy first.")
+  let c = ses.clip
+  let minX = px - c.ox
+  let minY = py - c.oy
+  let minZ = pz - c.oz
+  let box = weBox(minX, minY, minZ, minX + c.w - 1, minY + c.h - 1, minZ + c.d - 1)
+  var ctx = EditCtx()
+  var err = ""
+  if not beginEdit(world, box, ctx, err): return fail(err)
+  for y in 0 ..< c.h:
+    for z in 0 ..< c.d:
+      for x in 0 ..< c.w:
+        let v = c.cells[clipIndex(c, x, y, z)]
+        if v == 0'u32 and skipAir:
+          continue
+        ctx.after.setCell(minX + x, minY + y, minZ + z, v)
+  for be in c.bes:
+    ctx.bes.add(VolumeBlockEntity(pos: newBlockPos(int32(minX + be.x), int32(minY + be.y), int32(minZ + be.z)), nbt: be.nbt))
+  result = finishEdit(world, ses, "paste", ctx)
+  if result.ok and select:
+    setPos1(ses, world.dimension.minecraftName, box.minX, box.minY, box.minZ)
+    setPos2(ses, world.dimension.minecraftName, box.maxX, box.maxY, box.maxZ)
+
+proc weRotate*(ses: Session; degrees: int): OpResult =
+  if not ses.hasClip:
+    return fail("Your clipboard is empty.")
+  if degrees mod 90 != 0:
+    return fail("Rotations are in multiples of 90 degrees.")
+  let k = ((degrees div 90) mod 4 + 4) mod 4
+  ses.clip = rotateClip(ses.clip, k)
+  good("The clipboard was rotated " & $degrees & " degrees.", 0)
+
+proc weFlip*(ses: Session; axis: char): OpResult =
+  if not ses.hasClip:
+    return fail("Your clipboard is empty.")
+  ses.clip = flipClip(ses.clip, axis)
+  good("The clipboard was flipped.", 0)
+
+# ---- queries ---------------------------------------------------------------------------------------------------------
+
+proc weCount*(world: World; ses: Session; mask: Mask): OpResult =
+  var box = weBox(0, 0, 0, 0, 0, 0)
+  var err = ""
+  if not needSelection(ses, world, box, err): return fail(err)
+  var ctx = EditCtx()
+  if not beginEdit(world, box, ctx, err): return fail(err)
+  let n = countMatching(ctx.before, mask)
+  good("Counted " & $n & " block(s).", n)
+
+proc weDistribution*(world: World; ses: Session; byState: bool; lines: var seq[string]): OpResult =
+  var box = weBox(0, 0, 0, 0, 0, 0)
+  var err = ""
+  if not needSelection(ses, world, box, err): return fail(err)
+  var ctx = EditCtx()
+  if not beginEdit(world, box, ctx, err): return fail(err)
+  let rows = distribution(ctx.before, byState)
+  lines = @[]
+  let total = volume(box)
+  for r in rows:
+    let pct = (r[1] * 10000 div total)
+    lines.add(r[0] & ": " & $r[1] & " (" & $(pct div 100) & "." & (if pct mod 100 < 10: "0" else: "") & $(pct mod 100) & "%)")
+  good("Distribution of " & $total & " block(s).", total)
+
+# ---- undo / redo -----------------------------------------------------------------------------------------------------
+
+proc applyEntry(world: World; ses: Session; e: HistEntry; cur: var VolumeSnapshot): OpResult =
+  ## Puts the entry's snapshot back; `cur` is what was there (the entry for the opposite stack).
+  cur = readVolume(world, toVol(e.box))
+  if cur.status != esOk:
+    return fail("Cannot restore: " & statusText(cur.status) & ".")
+  var opts = defaultPlaceOptions()
+  opts.skipAir = false
+  opts.mode = pmReplace
+  let prev = blockLogPush(CauseCommand, KindPlayer, ses.name)
+  let rep = placeVolume(world, e.snap, corner(e.box), opts)
+  blockLogPop(prev)
+  if rep.status != esOk:
+    return fail("Cannot restore: " & statusText(rep.status) & ".")
+  good(e.label & ": " & $rep.changed & " block(s) restored.", rep.changed)
+
+proc weUndo*(world: World; ses: Session; times: int): OpResult =
+  var total = 0
+  var done = 0
+  var lastMsg = ""
+  for i in 0 ..< max(times, 1):
+    if ses.undo.len == 0:
+      break
+    let e = ses.undo[ses.undo.len - 1]
+    var cur = VolumeSnapshot()
+    let r = applyEntry(world, ses, e, cur)
+    if not r.ok:
+      if done == 0:
+        return r
+      break
+    ses.undo.setLen(ses.undo.len - 1)
+    ses.redo.add HistEntry(label: e.label, box: e.box, snap: cur)
+    total += r.changed
+    inc done
+    lastMsg = r.msg
+  if done == 0:
+    return fail("Nothing left to undo.")
+  good("Undid " & $done & " edit(s): " & $total & " block(s) restored.", total)
+
+proc weRedo*(world: World; ses: Session; times: int): OpResult =
+  var total = 0
+  var done = 0
+  for i in 0 ..< max(times, 1):
+    if ses.redo.len == 0:
+      break
+    let e = ses.redo[ses.redo.len - 1]
+    var cur = VolumeSnapshot()
+    let r = applyEntry(world, ses, e, cur)
+    if not r.ok:
+      if done == 0:
+        return r
+      break
+    ses.redo.setLen(ses.redo.len - 1)
+    ses.undo.add HistEntry(label: e.label, box: e.box, snap: cur)
+    total += r.changed
+    inc done
+  if done == 0:
+    return fail("Nothing left to redo.")
+  good("Redid " & $done & " edit(s): " & $total & " block(s) changed.", total)

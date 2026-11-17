@@ -1,0 +1,589 @@
+## WorldEdit-style server mod, the pure half: boxes and grids of block states, patterns, masks, shapes, directions, the
+## rotation / flip of block states and of a clipboard. Nothing here touches a World, so tests run on plain grids. The
+## world half (selection sessions, undo history, edits through bulkedit) is weworld.aowl.
+
+import std/[strutils, options, tables]
+import ../../world/blockstates
+import ../../nbt/tag as nbttag
+
+type
+  WeBox* = object
+    ## Both corners inclusive.
+    minX*, minY*, minZ*, maxX*, maxY*, maxZ*: int
+
+  Grid* = object
+    ## The block state of every cell of a box, x fastest, then z, then y.
+    box*: WeBox
+    cells*: seq[uint32]
+
+  PatternEntry* = object
+    weight*: int
+    state*: uint32
+
+  Pattern* = object
+    entries*: seq[PatternEntry]
+    total*: int
+
+  MaskEntry* = object
+    blockId*: int
+    props*: seq[StateProp]
+    negate*: bool
+    everything*: bool   ## `*`
+
+  Mask* = object
+    entries*: seq[MaskEntry]
+
+  ClipBE* = object
+    x*, y*, z*: int     ## relative to the clipboard's minimum corner
+    nbt*: NbtCompound
+
+  Clip* = object
+    w*, h*, d*: int
+    cells*: seq[uint32]
+    ox*, oy*, oz*: int  ## where the copier stood, relative to the minimum corner
+    bes*: seq[ClipBE]
+
+proc weBox*(x0, y0, z0, x1, y1, z1: int): WeBox =
+  WeBox(minX: min(x0, x1), minY: min(y0, y1), minZ: min(z0, z1), maxX: max(x0, x1), maxY: max(y0, y1), maxZ: max(z0, z1))
+
+proc sizeX*(b: WeBox): int = b.maxX - b.minX + 1
+proc sizeY*(b: WeBox): int = b.maxY - b.minY + 1
+proc sizeZ*(b: WeBox): int = b.maxZ - b.minZ + 1
+proc volume*(b: WeBox): int = sizeX(b) * sizeY(b) * sizeZ(b)
+
+proc inside*(b: WeBox; x, y, z: int): bool =
+  x >= b.minX and x <= b.maxX and y >= b.minY and y <= b.maxY and z >= b.minZ and z <= b.maxZ
+
+proc unionBox*(a, b: WeBox): WeBox =
+  WeBox(minX: min(a.minX, b.minX), minY: min(a.minY, b.minY), minZ: min(a.minZ, b.minZ),
+    maxX: max(a.maxX, b.maxX), maxY: max(a.maxY, b.maxY), maxZ: max(a.maxZ, b.maxZ))
+
+proc shifted*(b: WeBox; dx, dy, dz: int): WeBox =
+  WeBox(minX: b.minX + dx, minY: b.minY + dy, minZ: b.minZ + dz, maxX: b.maxX + dx, maxY: b.maxY + dy, maxZ: b.maxZ + dz)
+
+proc newGrid*(box: WeBox): Grid =
+  Grid(box: box, cells: newSeq[uint32](volume(box)))
+
+proc gridIndex*(g: Grid; x, y, z: int): int =
+  ((y - g.box.minY) * sizeZ(g.box) + (z - g.box.minZ)) * sizeX(g.box) + (x - g.box.minX)
+
+proc cellAt*(g: Grid; x, y, z: int): uint32 =
+  g.cells[gridIndex(g, x, y, z)]
+
+proc setCell*(g: var Grid; x, y, z: int; v: uint32) =
+  g.cells[gridIndex(g, x, y, z)] = v
+
+# ---- parsing ---------------------------------------------------------------------------------------------------------
+
+proc splitTop*(s: string; sep: char): seq[string] =
+  ## Splits at `sep` outside of [] brackets.
+  result = @[]
+  var depth = 0
+  var cur = ""
+  for c in s:
+    if c == '[':
+      inc depth
+    elif c == ']':
+      dec depth
+    if c == sep and depth == 0:
+      result.add cur
+      cur = ""
+    else:
+      cur.add c
+  result.add cur
+
+proc parseProps(raw: string; props: var seq[StateProp]): bool =
+  props = @[]
+  if raw.strip().len == 0:
+    return true
+  for part in raw.split(','):
+    let eq = part.find('=')
+    if eq < 0:
+      return false
+    let key = part.substr(0, eq - 1).strip()
+    let value = part.substr(eq + 1).strip()
+    if key.len == 0 or value.len == 0:
+      return false
+    props.add((key, value))
+  true
+
+proc splitBlock(text: string; name: var string; props: var seq[StateProp]): bool =
+  ## "oak_stairs[facing=north]" into the name and the properties.
+  props = @[]
+  let open = text.find('[')
+  if open < 0:
+    name = text.strip()
+    return name.len > 0
+  if not text.endsWith("]"):
+    return false
+  name = text.substr(0, open - 1).strip()
+  parseProps(text.substr(open + 1, text.len - 2), props) and name.len > 0
+
+proc propsValid(blockId: int; props: seq[StateProp]): bool =
+  ## Every named property exists on the block and holds a value it can.
+  let sample = stateProperties(defaultStateOf(blockId))
+  for want in props:
+    var found = false
+    for have in sample:
+      if have.name == want.name:
+        found = true
+    if not found:
+      return false
+  let st = stateIdFromProps(blockId, props)
+  let back = stateProperties(st)
+  for want in props:
+    var ok = false
+    for have in back:
+      if have.name == want.name and have.value == want.value:
+        ok = true
+    if not ok:
+      return false
+  true
+
+proc parseBlockState*(text: string; state: var uint32; err: var string): bool =
+  ## "stone", "minecraft:oak_stairs[facing=east,half=top]", "air".
+  var name = ""
+  var props: seq[StateProp] = @[]
+  if not splitBlock(text, name, props):
+    err = "bad block '" & text & "'"
+    return false
+  let (found, id) = blockIdByName(name.toLowerAscii())
+  if not found:
+    err = "unknown block '" & name & "'"
+    return false
+  if not propsValid(id, props):
+    err = "bad block state in '" & text & "'"
+    return false
+  state = if props.len == 0: defaultStateOf(id) else: stateIdFromProps(id, props)
+  true
+
+proc parsePattern*(text: string; pat: var Pattern; err: var string): bool =
+  ## "stone", "50%stone,30%dirt,20%gravel", "stone,dirt" (equal odds), with optional [props].
+  pat = Pattern(entries: @[], total: 0)
+  if text.strip().len == 0:
+    err = "empty pattern"
+    return false
+  for part in splitTop(text, ','):
+    var s = part.strip()
+    var weight = 1
+    let pct = s.find('%')
+    if pct > 0:
+      var n = 0
+      var okNum = true
+      for i in 0 ..< pct:
+        if s[i] >= '0' and s[i] <= '9':
+          n = n * 10 + (ord(s[i]) - 48)
+        else:
+          okNum = false
+      if not okNum or n <= 0:
+        err = "bad percentage in '" & part & "'"
+        return false
+      weight = n
+      s = s.substr(pct + 1)
+    var st = 0'u32
+    if not parseBlockState(s, st, err):
+      return false
+    pat.entries.add(PatternEntry(weight: weight, state: st))
+    pat.total += weight
+  true
+
+proc singlePattern*(state: uint32): Pattern =
+  Pattern(entries: @[PatternEntry(weight: 1, state: state)], total: 1)
+
+proc cellHash(x, y, z: int): uint32 =
+  var h = uint32(x and 0xFFFFFF) * 73856093'u32 xor uint32(y and 0xFFFFFF) * 19349663'u32 xor uint32(z and 0xFFFFFF) * 83492791'u32
+  h = h xor (h shr 15)
+  h = h * 2246822519'u32
+  h = h xor (h shr 13)
+  h = h * 3266489917'u32
+  h xor (h shr 16)
+
+proc pick*(p: Pattern; x, y, z: int): uint32 =
+  ## Deterministic by position: the same pattern over the same cells always gives the same blocks.
+  if p.entries.len == 1:
+    return p.entries[0].state
+  var r = int(cellHash(x, y, z) mod uint32(p.total))
+  for e in p.entries:
+    if r < e.weight:
+      return e.state
+    r -= e.weight
+  p.entries[p.entries.len - 1].state
+
+proc parseMask*(text: string; mask: var Mask; err: var string): bool =
+  ## "stone", "stone,dirt", "!air", "*", "oak_stairs[facing=north]".
+  mask = Mask(entries: @[])
+  if text.strip().len == 0:
+    err = "empty mask"
+    return false
+  for part in splitTop(text, ','):
+    var s = part.strip()
+    var neg = false
+    if s.startsWith("!"):
+      neg = true
+      s = s.substr(1)
+    if s == "*":
+      mask.entries.add(MaskEntry(everything: true, negate: neg, blockId: -1, props: @[]))
+      continue
+    var name = ""
+    var props: seq[StateProp] = @[]
+    if not splitBlock(s, name, props):
+      err = "bad block '" & part & "'"
+      return false
+    let (found, id) = blockIdByName(name.toLowerAscii())
+    if not found:
+      err = "unknown block '" & name & "'"
+      return false
+    if not propsValid(id, props):
+      err = "bad block state in '" & part & "'"
+      return false
+    mask.entries.add(MaskEntry(blockId: id, props: props, negate: neg, everything: false))
+  true
+
+proc entryMatches(e: MaskEntry; state: uint32): bool =
+  if e.everything:
+    return true
+  if blockIdOf(state) != e.blockId:
+    return false
+  if e.props.len == 0:
+    return true
+  let have = stateProperties(state)
+  for want in e.props:
+    var ok = false
+    for h in have:
+      if h.name == want.name and h.value == want.value:
+        ok = true
+    if not ok:
+      return false
+  true
+
+proc matches*(m: Mask; state: uint32): bool =
+  var anyPositive = false
+  var hit = false
+  for e in m.entries:
+    if e.negate:
+      if entryMatches(e, state):
+        return false
+    else:
+      anyPositive = true
+      if entryMatches(e, state):
+        hit = true
+  if anyPositive: hit else: true
+
+# ---- directions ------------------------------------------------------------------------------------------------------
+
+proc parseDirection*(s: string; dx, dy, dz: var int): bool =
+  ## n/s/e/w/u/d and the long names. `me` is resolved by the caller (facingOf).
+  case s.toLowerAscii()
+  of "n", "north":
+    dx = 0
+    dy = 0
+    dz = -1
+  of "s", "south":
+    dx = 0
+    dy = 0
+    dz = 1
+  of "e", "east":
+    dx = 1
+    dy = 0
+    dz = 0
+  of "w", "west":
+    dx = -1
+    dy = 0
+    dz = 0
+  of "u", "up":
+    dx = 0
+    dy = 1
+    dz = 0
+  of "d", "down":
+    dx = 0
+    dy = -1
+    dz = 0
+  else:
+    return false
+  true
+
+proc facingOf*(yaw, pitch: float): (int, int, int) =
+  ## The axis direction a player looks along (minecraft yaw: 0 south, 90 west, 180 north, 270 east).
+  if pitch > 60.0:
+    return (0, -1, 0)
+  if pitch < -60.0:
+    return (0, 1, 0)
+  var y = yaw
+  while y < 0.0:
+    y += 360.0
+  while y >= 360.0:
+    y -= 360.0
+  if y >= 315.0 or y < 45.0:
+    (0, 0, 1)
+  elif y < 135.0:
+    (-1, 0, 0)
+  elif y < 225.0:
+    (0, 0, -1)
+  else:
+    (1, 0, 0)
+
+# ---- block state rotation / mirroring --------------------------------------------------------------------------------
+
+const Horiz = ["north", "east", "south", "west"]
+
+proc horizIndex(v: string): int =
+  for i in 0 ..< 4:
+    if Horiz[i] == v:
+      return i
+  -1
+
+proc propValue(props: seq[StateProp]; name: string): string =
+  for p in props:
+    if p.name == name:
+      return p.value
+  ""
+
+proc hasProp(props: seq[StateProp]; name: string): bool =
+  for p in props:
+    if p.name == name:
+      return true
+  false
+
+proc setProp(props: var seq[StateProp]; name, value: string) =
+  for i in 0 ..< props.len:
+    if props[i].name == name:
+      props[i].value = value
+      return
+
+proc intOf(s: string): int =
+  var n = 0
+  for c in s:
+    if c >= '0' and c <= '9':
+      n = n * 10 + (ord(c) - 48)
+  n
+
+proc hasSides(props: seq[StateProp]): bool =
+  hasProp(props, "north") and hasProp(props, "east") and hasProp(props, "south") and hasProp(props, "west")
+
+proc rotateState*(state: uint32; quarterTurns: int): uint32 =
+  ## A quarter turn clockwise about Y (seen from above) takes north to east, east to south, south to west.
+  let k = quarterTurns and 3
+  if k == 0 or state == 0'u32:
+    return state
+  let bid = blockIdOf(state)
+  let props = stateProperties(state)
+  if props.len == 0:
+    return state
+  var changed = props
+  for p in props:
+    if p.name == "facing" or p.name == "horizontal_facing":
+      let i = horizIndex(p.value)
+      if i >= 0:
+        setProp(changed, p.name, Horiz[(i + k) and 3])
+    elif p.name == "axis":
+      if (k and 1) == 1:
+        if p.value == "x":
+          setProp(changed, "axis", "z")
+        elif p.value == "z":
+          setProp(changed, "axis", "x")
+    elif p.name == "rotation":
+      setProp(changed, "rotation", $((intOf(p.value) + 4 * k) and 15))
+  if hasSides(props):
+    for i in 0 ..< 4:
+      setProp(changed, Horiz[(i + k) and 3], propValue(props, Horiz[i]))
+  stateIdFromProps(bid, changed)
+
+proc swapEnds(v: string): string =
+  if v.endsWith("_left"):
+    v.substr(0, v.len - 6) & "_right"
+  elif v.endsWith("_right"):
+    v.substr(0, v.len - 7) & "_left"
+  else:
+    v
+
+proc mirrorState*(state: uint32; axis: char): uint32 =
+  ## Mirrors across the plane normal to `axis` ('x', 'y' or 'z'): `x` swaps east and west.
+  if state == 0'u32:
+    return state
+  let bid = blockIdOf(state)
+  let props = stateProperties(state)
+  if props.len == 0:
+    return state
+  var changed = props
+  for p in props:
+    if p.name == "facing" or p.name == "horizontal_facing":
+      var v = p.value
+      if axis == 'x':
+        if v == "east": v = "west"
+        elif v == "west": v = "east"
+      elif axis == 'z':
+        if v == "north": v = "south"
+        elif v == "south": v = "north"
+      elif axis == 'y':
+        if v == "up": v = "down"
+        elif v == "down": v = "up"
+      setProp(changed, p.name, v)
+    elif p.name == "half" and axis == 'y':
+      if p.value == "top": setProp(changed, "half", "bottom")
+      elif p.value == "bottom": setProp(changed, "half", "top")
+    elif p.name == "type" and axis == 'y':
+      if p.value == "top": setProp(changed, "type", "bottom")
+      elif p.value == "bottom": setProp(changed, "type", "top")
+    elif p.name == "rotation":
+      let r = intOf(p.value)
+      if axis == 'x': setProp(changed, "rotation", $((16 - r) and 15))
+      elif axis == 'z': setProp(changed, "rotation", $((24 - r) and 15))
+    elif p.name == "hinge" and axis != 'y':
+      if p.value == "left": setProp(changed, "hinge", "right")
+      elif p.value == "right": setProp(changed, "hinge", "left")
+    elif p.name == "shape" and axis != 'y':
+      setProp(changed, "shape", swapEnds(p.value))
+  if hasSides(props):
+    if axis == 'x':
+      setProp(changed, "east", propValue(props, "west"))
+      setProp(changed, "west", propValue(props, "east"))
+    elif axis == 'z':
+      setProp(changed, "north", propValue(props, "south"))
+      setProp(changed, "south", propValue(props, "north"))
+  stateIdFromProps(bid, changed)
+
+# ---- shapes ----------------------------------------------------------------------------------------------------------
+
+proc inEllipsoid(dx, dy, dz: int; rx, ry, rz: int): bool =
+  ## Offsets from the centre cell, radii in cells: a cell is in when its centre is inside the ellipsoid of radii r + 0.5.
+  let ax = float(rx) + 0.5
+  let ay = float(ry) + 0.5
+  let az = float(rz) + 0.5
+  (float(dx) * float(dx)) / (ax * ax) + (float(dy) * float(dy)) / (ay * ay) + (float(dz) * float(dz)) / (az * az) <= 1.0
+
+proc sphereCells*(cx, cy, cz, rx, ry, rz: int; hollow: bool): seq[(int, int, int)] =
+  ## The cells of a (possibly stretched) sphere around a centre cell; hollow keeps the cells with a neighbour outside.
+  result = @[]
+  for dy in -ry .. ry:
+    for dz in -rz .. rz:
+      for dx in -rx .. rx:
+        if not inEllipsoid(dx, dy, dz, rx, ry, rz):
+          continue
+        if hollow and inEllipsoid(dx + 1, dy, dz, rx, ry, rz) and inEllipsoid(dx - 1, dy, dz, rx, ry, rz) and
+            inEllipsoid(dx, dy + 1, dz, rx, ry, rz) and inEllipsoid(dx, dy - 1, dz, rx, ry, rz) and
+            inEllipsoid(dx, dy, dz + 1, rx, ry, rz) and inEllipsoid(dx, dy, dz - 1, rx, ry, rz):
+          continue
+        result.add((cx + dx, cy + dy, cz + dz))
+
+proc cylCells*(cx, cy, cz, rx, rz, height: int; hollow: bool): seq[(int, int, int)] =
+  ## A cylinder with its base layer at cy and `height` layers up; hollow keeps only the wall (no caps).
+  result = @[]
+  for dy in 0 ..< height:
+    for dz in -rz .. rz:
+      for dx in -rx .. rx:
+        if not inEllipsoid(dx, 0, dz, rx, 0, rz):
+          continue
+        if hollow and inEllipsoid(dx + 1, 0, dz, rx, 0, rz) and inEllipsoid(dx - 1, 0, dz, rx, 0, rz) and
+            inEllipsoid(dx, 0, dz + 1, rx, 0, rz) and inEllipsoid(dx, 0, dz - 1, rx, 0, rz):
+          continue
+        result.add((cx + dx, cy + dy, cz + dz))
+
+proc onWalls*(b: WeBox; x, z: int): bool =
+  x == b.minX or x == b.maxX or z == b.minZ or z == b.maxZ
+
+proc onShell*(b: WeBox; x, y, z: int): bool =
+  x == b.minX or x == b.maxX or y == b.minY or y == b.maxY or z == b.minZ or z == b.maxZ
+
+# ---- counting --------------------------------------------------------------------------------------------------------
+
+proc countMatching*(g: Grid; m: Mask): int =
+  result = 0
+  for c in g.cells:
+    if m.matches(c):
+      inc result
+
+proc distribution*(g: Grid; byState: bool): seq[(string, int)] =
+  ## (name, count) pairs, most frequent first, ties by name. `byState` keeps the properties in the name.
+  var counts = initTable[uint32, int]()
+  for c in g.cells:
+    let k = if byState: c else: uint32(blockIdOf(c))
+    counts[k] = counts.getOrDefault(k, 0) + 1
+  var rows: seq[(string, int)] = @[]
+  for k, n in counts:
+    var label = ""
+    if byState:
+      label = blockNameOfState(k)
+      let props = stateProperties(k)
+      if props.len > 0:
+        label.add "["
+        for i in 0 ..< props.len:
+          if i > 0:
+            label.add ","
+          label.add props[i].name & "=" & props[i].value
+        label.add "]"
+    else:
+      label = blockName(int(k))
+    rows.add((label, n))
+  # insertion sort: count descending, then name
+  for i in 1 ..< rows.len:
+    let item = rows[i]
+    var j = i - 1
+    while j >= 0 and (rows[j][1] < item[1] or (rows[j][1] == item[1] and rows[j][0] > item[0])):
+      let moved = rows[j]
+      rows[j + 1] = moved
+      dec j
+    rows[j + 1] = item
+  rows
+
+# ---- clipboard transforms --------------------------------------------------------------------------------------------
+
+proc clipIndex*(c: Clip; x, y, z: int): int =
+  (y * c.d + z) * c.w + x
+
+proc clipFrom*(g: Grid; originX, originY, originZ: int): Clip =
+  ## A clipboard of the whole grid; the origin is where the copier stood.
+  Clip(w: sizeX(g.box), h: sizeY(g.box), d: sizeZ(g.box), cells: g.cells, ox: originX - g.box.minX, oy: originY - g.box.minY,
+    oz: originZ - g.box.minZ, bes: @[])
+
+proc turnXZ(x, z, w, d, k: int): (int, int) =
+  case k and 3
+  of 0: (x, z)
+  of 1: (d - 1 - z, x)
+  of 2: (w - 1 - x, d - 1 - z)
+  else: (z, w - 1 - x)
+
+proc rotateClip*(c: Clip; quarterTurns: int): Clip =
+  ## A turn clockwise about Y (seen from above); the copier's origin turns with it.
+  let k = quarterTurns and 3
+  if k == 0:
+    return c
+  let nw = if (k and 1) == 1: c.d else: c.w
+  let nd = if (k and 1) == 1: c.w else: c.d
+  result = Clip(w: nw, h: c.h, d: nd, cells: newSeq[uint32](nw * c.h * nd), ox: 0, oy: c.oy, oz: 0, bes: @[])
+  for y in 0 ..< c.h:
+    for z in 0 ..< c.d:
+      for x in 0 ..< c.w:
+        let (rx, rz) = turnXZ(x, z, c.w, c.d, k)
+        result.cells[(y * nd + rz) * nw + rx] = rotateState(c.cells[clipIndex(c, x, y, z)], k)
+  # the origin is a point in cell space; turn the cell it sits in
+  let (ox, oz) = turnXZ(c.ox, c.oz, c.w, c.d, k)
+  result.ox = ox
+  result.oz = oz
+  for be in c.bes:
+    let (bx, bz) = turnXZ(be.x, be.z, c.w, c.d, k)
+    result.bes.add(ClipBE(x: bx, y: be.y, z: bz, nbt: be.nbt))
+
+proc flipClip*(c: Clip; axis: char): Clip =
+  ## Mirrors the clipboard across the plane normal to `axis`.
+  result = Clip(w: c.w, h: c.h, d: c.d, cells: newSeq[uint32](c.cells.len), ox: c.ox, oy: c.oy, oz: c.oz, bes: @[])
+  for y in 0 ..< c.h:
+    for z in 0 ..< c.d:
+      for x in 0 ..< c.w:
+        var nx = x
+        var ny = y
+        var nz = z
+        if axis == 'x': nx = c.w - 1 - x
+        elif axis == 'y': ny = c.h - 1 - y
+        else: nz = c.d - 1 - z
+        result.cells[clipIndex(c, nx, ny, nz)] = mirrorState(c.cells[clipIndex(c, x, y, z)], axis)
+  if axis == 'x': result.ox = c.w - 1 - c.ox
+  elif axis == 'y': result.oy = c.h - 1 - c.oy
+  else: result.oz = c.d - 1 - c.oz
+  for be in c.bes:
+    var bx = be.x
+    var by = be.y
+    var bz = be.z
+    if axis == 'x': bx = c.w - 1 - be.x
+    elif axis == 'y': by = c.h - 1 - be.y
+    else: bz = c.d - 1 - be.z
+    result.bes.add(ClipBE(x: bx, y: by, z: bz, nbt: be.nbt))
