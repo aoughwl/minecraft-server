@@ -1,0 +1,215 @@
+## The `/replay` command (op level 4). A thin wrapper over replay.aowl (recorder) and replayplay.aowl (playback).
+##
+##   /replay record <name> [radius] [seconds]   record the area around you (radius 4..128, default 48; seconds default 120, at most 1800)
+##   /replay stop                               stop the recording (and the playback you are watching)
+##   /replay status                             what is recording / playing
+##   /replay list                               the recordings of this world
+##   /replay play <name> [speed]                watch it: you become a spectator at the recording centre; nothing real changes
+##   /replay pause | resume | seek <seconds> | speed <x>
+##   /replay export <name>                      <world>/replays/<name>.json: timeline of body events, impacts, block counts
+##   /replay note <text>                        put a marker into the running recording
+## Block changes, bodies and entities are streamed to the viewer only; stopping restores the viewer's real blocks.
+
+import ../../util/closureset
+import std/[options, strutils, math, paths, dirs]
+import ../../command/[cmderrors, cmdsource, fallbackdispatch, args]
+import ../../util/[vector3, permission]
+import ../../util/text/[textbase, text, color]
+import ../serverbase
+import ../body/bodymanager
+import replaycore, replay, replayplay
+
+const
+  Names = ["replay"]
+  Description = "Record and replay a session: bodies, block changes, entities."
+  ArgRest = "args"
+  Permission0* = "replay:command.replay"
+
+proc registerPermission*(registry: PermissionRegistry) =
+  registerPermissionOrPanic(registry, newPermission(Permission0, Description, permissionOp(Four)))
+
+proc say(sender: CommandSender; line: string) =
+  sendMessage(sender, text(line))
+
+proc sayBad(sender: CommandSender; line: string) =
+  sendMessage(sender, colorNamed(text(line), ncRed))
+
+proc sayOk(sender: CommandSender; line: string) =
+  sendMessage(sender, colorNamed(text(line), ncGreen))
+
+proc parseNum(s: string; v: var int): bool =
+  if s.len == 0 or s.len > 9: return false
+  var r = 0
+  for c in s:
+    if c < '0' or c > '9': return false
+    r = r * 10 + (ord(c) - ord('0'))
+  v = r
+  true
+
+proc parseDec(s: string; v: var float64): bool =
+  ## "2", "0.5", "1.25"
+  if s.len == 0 or s.len > 12: return false
+  var whole = 0.0
+  var frac = 0.0
+  var scale = 0.1
+  var seenDot = false
+  var digits = 0
+  for c in s:
+    if c == '.':
+      if seenDot: return false
+      seenDot = true
+    elif c >= '0' and c <= '9':
+      inc digits
+      if seenDot:
+        frac += float64(ord(c) - ord('0')) * scale
+        scale *= 0.1
+      else:
+        whole = whole * 10.0 + float64(ord(c) - ord('0'))
+    else:
+      return false
+  if digits == 0: return false
+  v = whole + frac
+  true
+
+proc worldOf(sender: CommandSender; server: nil CommandServer): nil CommandWorld =
+  if sender.kind == cskPlayer and sender.player.entity != nil and closureSet(sender.player.entity.getWorld):
+    return sender.player.entity.getWorld()
+  if server != nil and closureSet(server.getOverworld):
+    return server.getOverworld()
+  nil
+
+proc listReplays(folder: string): seq[string] =
+  result = @[]
+  try:
+    for kind, entry in walkDir(path(folder)):
+      if kind == pcFile:
+        let full = $entry
+        var cut = -1
+        for i in 0 ..< full.len:
+          if full[i] == '/' or full[i] == '\\': cut = i
+        let nm = full[cut + 1 .. ^1]
+        if nm.endsWith(".rpl"): result.add nm[0 ..< nm.len - 4]
+  except ErrorCode:
+    discard
+
+proc replayCommand(sender: CommandSender; server: nil CommandServer; args: ConsumedArgs): CommandResult =
+  var line = ""
+  discard findMsg(args, ArgRest, line)
+  let parts = line.splitWhitespace()
+  if parts.len == 0:
+    say(sender, "/replay record <name> [radius] [seconds] | stop | status | list | play <name> [speed] | pause | resume | seek <s> | speed <x> | export <name> | note <text>")
+    return cmdSuccess(0'i32)
+  let cw = worldOf(sender, server)
+  if cw == nil:
+    sayBad(sender, "No world")
+    return cmdSuccess(0'i32)
+  let found = worldByDim(cw.dimensionName)
+  if found.isNone:
+    sayBad(sender, "The server has not ticked this world yet.")
+    return cmdSuccess(0'i32)
+  let world = found.get
+  let sv = world.server
+  case parts[0]
+  of "record", "rec":
+    if sender.kind != cskPlayer or sender.player.entity == nil or not closureSet(sender.player.entity.getPos):
+      sayBad(sender, "Recording is centred on a player.")
+      return cmdSuccess(0'i32)
+    if parts.len < 2:
+      sayBad(sender, "Usage: /replay record <name> [radius] [seconds]")
+      return cmdSuccess(0'i32)
+    var radius = DefaultRadius
+    var seconds = DefaultSeconds
+    if parts.len >= 3 and not parseNum(parts[2], radius):
+      sayBad(sender, "Radius is a number.")
+      return cmdSuccess(0'i32)
+    if parts.len >= 4 and not parseNum(parts[3], seconds):
+      sayBad(sender, "Seconds is a number.")
+      return cmdSuccess(0'i32)
+    let pos = sender.player.entity.getPos()
+    let err = recordCommand(world, parts[1], int32(floor(pos.x)), int32(floor(pos.y)), int32(floor(pos.z)), int32(radius), seconds,
+      sender.player.gameProfile.name)
+    if err.len > 0:
+      sayBad(sender, err)
+    else:
+      sayOk(sender, "Recording '" & parts[1] & "' (radius " & $radius & ", at most " & $seconds & " s, " & $(DefaultMaxBytes div 1048576) &
+        " MiB). /replay stop ends it.")
+  of "stop":
+    var said = false
+    if gRec.active:
+      sayOk(sender, recStop("stopped by " & (if sender.kind == cskPlayer: sender.player.gameProfile.name else: "console")))
+      said = true
+    if playActive():
+      sayOk(sender, playStop(sv, "stopped"))
+      said = true
+    if not said: say(sender, "Nothing is recording or playing.")
+  of "status":
+    say(sender, recStatusLine())
+    say(sender, playStatusLine())
+  of "list":
+    let names = listReplays(replayFolder(sv.levelFolder))
+    if names.len == 0:
+      say(sender, "No replays.")
+    else:
+      var joined = ""
+      for i in 0 ..< names.len:
+        if i > 0: joined.add(", ")
+        joined.add(names[i])
+      say(sender, "Replays: " & joined)
+  of "play":
+    if sender.kind != cskPlayer:
+      sayBad(sender, "Playback is shown to a player.")
+      return cmdSuccess(0'i32)
+    if parts.len < 2:
+      sayBad(sender, "Usage: /replay play <name> [speed]")
+      return cmdSuccess(0'i32)
+    var speed = 1.0
+    if parts.len >= 3 and not parseDec(parts[2], speed):
+      sayBad(sender, "Speed is a number like 0.5 or 2.")
+      return cmdSuccess(0'i32)
+    var viewer: nil Player = nil
+    for p in world.players:
+      if p.gameprofile.name == sender.player.gameProfile.name: viewer = p
+    if viewer == nil:
+      sayBad(sender, "Cannot find you in this world.")
+      return cmdSuccess(0'i32)
+    let err = playStart(world, viewer, parts[1], speed)
+    if err.len > 0:
+      sayBad(sender, err)
+    else:
+      sayOk(sender, "Playing '" & parts[1] & "'. You are a spectator at the recording centre. /replay pause|resume|seek|speed|stop")
+  of "pause":
+    say(sender, playPause())
+  of "resume":
+    say(sender, playResume())
+  of "seek":
+    var v = 0.0
+    if parts.len < 2 or not parseDec(parts[1], v):
+      sayBad(sender, "Usage: /replay seek <seconds>")
+    else:
+      say(sender, playSeek(v))
+  of "speed":
+    var v = 0.0
+    if parts.len < 2 or not parseDec(parts[1], v):
+      sayBad(sender, "Usage: /replay speed <x>")
+    else:
+      say(sender, playSpeed(v))
+  of "export":
+    if parts.len < 2:
+      sayBad(sender, "Usage: /replay export <name>")
+    else:
+      let r = exportReplay(sv.levelFolder, parts[1])
+      if r.startsWith("Error: "): sayBad(sender, r[7 .. ^1]) else: sayOk(sender, "Wrote " & r)
+  of "note":
+    if parts.len < 2:
+      sayBad(sender, "Usage: /replay note <text>")
+    elif not gRec.active:
+      sayBad(sender, "Nothing is recording.")
+    else:
+      recNote(sv.tickCounter, line[5 .. ^1].strip())
+      sayOk(sender, "Noted.")
+  else:
+    sayBad(sender, "Unknown /replay subcommand " & parts[0] & ".")
+  cmdSuccess(1'i32)
+
+proc initCommandTree*(): CommandTree =
+  then(execute(newCommandTree(Names, Description), replayCommand), execute(argument(ArgRest, newMsgArgConsumer()), replayCommand))

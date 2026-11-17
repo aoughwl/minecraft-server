@@ -1,0 +1,459 @@
+## Tests of the replay format and recorder: codec round trips and size numbers, seek / speed logic, scene reconstruction, the JSON
+## summary, and the recorder driven by a fake feed. PASS / FAIL lines, exit 1 on a fail. No world, no network.
+import std/[syncio, tables, strutils, math]
+import replaycore, replay
+import ../body/bodymanager
+import ../blocklog/blocklogcore
+import ../../physics/body as physbody
+import ../../physics/bodymass
+import ../../world/worldfs
+import ../net/jester/bodymsg
+
+var fails = 0
+var passes = 0
+
+proc check(name: string; ok: bool) =
+  if ok:
+    inc passes
+    echo "PASS ", name
+  else:
+    inc fails
+    echo "FAIL ", name
+
+proc cnt(s, sub: string): int =
+  result = 0
+  var i = 0
+  while i + sub.len <= s.len:
+    if s[i ..< i + sub.len] == sub:
+      inc result
+      i += sub.len
+    else:
+      inc i
+
+proc near(a, b, eps: float64): bool = abs(a - b) <= eps
+
+proc newHeader(): RplHeader =
+  RplHeader(version: RplVersion, seed: -123456789012'i64, serverVersion: "test 1.21.11", startTick: 5000'i64, name: "t1",
+    dims: @["minecraft:overworld", "minecraft:the_nether"], dim: 0, cx: 100'i32, cy: 64'i32, cz: -50'i32, radius: 48'i32, entityEvery: 4)
+
+proc flatBaseline(cx, cy, cz, radius: int32): RplBaseline =
+  ## stone (1) below cy, air above, a few ores
+  let sx = int(2 * radius + 1)
+  let sy = 81
+  let sz = int(2 * radius + 1)
+  var b = RplBaseline(has: true, minX: cx - radius, minY: cy - 32'i32, minZ: cz - radius, maxX: cx + radius, maxY: cy + 48'i32, maxZ: cz + radius,
+    palette: @[0'u32, 1'u32, 9'u32, 33'u32], cells: newSeq[uint16](sx * sy * sz))
+  for y in 0 ..< sy:
+    for z in 0 ..< sz:
+      for x in 0 ..< sx:
+        var k = 0
+        if y < 32: k = 1
+        if y < 20 and (x * 7 + z * 13 + y * 3) mod 97 == 0: k = 2
+        if y == 31 and x mod 11 == 0: k = 3
+        b.cells[(y * sz + z) * sx + x] = uint16(k)
+  b
+
+proc cubeCells(n: int; state: uint32): seq[RBodyCell] =
+  result = @[]
+  for y in 0 ..< n:
+    for z in 0 ..< n:
+      for x in 0 ..< n:
+        result.add RBodyCell(x: int32(x), y: int32(y), z: int32(z), state: state)
+
+proc sampleRecs(): seq[Rec] =
+  ## a body falling, bouncing, settling; a fill row; entities; weather; effect; note
+  result = @[]
+  var c = newRec(RkBodyCreate, 0'i64)
+  c.bodyId = 7'i32; c.dim = 0; c.comX = 1.5'f32; c.comY = 1.5'f32; c.comZ = 1.5'f32; c.mass = 4000.0'f32
+  c.cells = cubeCells(4, 1'u32)
+  c.px = 100.25; c.py = 90.0; c.pz = -50.5
+  c.quat = packQuat(0.0, 0.0, 0.0, 1.0)
+  result.add c
+  var vy = 0.0
+  var y = 90.0
+  for t in 1 .. 60:
+    vy -= 0.04
+    y += vy
+    var hit = false
+    if y < 70.0:
+      y = 70.0
+      vy = -vy * 0.5
+      hit = true
+    var s = newRec(RkBodyState, int64(t))
+    s.bodyId = 7'i32
+    s.px = 100.25; s.py = y; s.pz = -50.5 + 0.01 * float64(t)
+    s.quat = packQuat(0.1 * float64(t mod 5), 0.0, 0.0, 0.99)
+    s.vy = vy
+    s.sleeping = t >= 58
+    result.add s
+    if hit:
+      var f = newRec(RkFx, int64(t))
+      f.fxKind = 1; f.fxX = 100'i32; f.fxY = 69'i32; f.fxZ = -50'i32; f.fxState = 1'u32; f.impulse = 12000.0'f32; f.bodyId = 7'i32
+      result.add f
+  var bl = newRec(RkBlocks, 20'i64)
+  bl.dim = 0
+  for i in 0 ..< 50: bl.changes.add BlockChg(x: int32(90 + i), y: 64'i32, z: -50'i32, state: 0'u32)
+  result.add bl
+  var e = newRec(RkEntities, 4'i64)
+  e.ents = @[EntRec(id: 11'i32, typ: 94'i32, x: 101.5, y: 64.0, z: -49.5, yaw: 12'u8, pitch: 3'u8),
+    EntRec(id: 5'i32, typ: int32(PlayerTypeMark), x: 98.0, y: 64.0, z: -52.25, yaw: 200'u8, pitch: 250'u8)]
+  result.add e
+  var w = newRec(RkWeather, 30'i64)
+  w.rain = 128; w.thunder = 0
+  result.add w
+  var n = newRec(RkNote, 33'i64)
+  n.text = "collapse starts \"here\""
+  result.add n
+  var d = newRec(RkBodyDestroy, 61'i64)
+  d.bodyId = 7'i32; d.reason = 1
+  result.add d
+  # the writer needs ticks in order; sort by tick (stable)
+  var sorted: seq[Rec] = @[]
+  for r in result:
+    sorted.add r
+    var at = sorted.len - 1
+    while at > 0 and sorted[at - 1].tick > sorted[at].tick:
+      swap(sorted[at - 1], sorted[at])
+      dec at
+  result = sorted
+
+proc encodeAll(h: RplHeader; b: RplBaseline; recs: seq[Rec]; endTick: int64; withEnd: bool): seq[byte] =
+  result = encodeHeader(h)
+  for x in encodeBaseline(b): result.add x
+  var c = newCodec(h.cx, h.cy, h.cz)
+  for r in recs:
+    for x in encodeRec(c, r): result.add x
+  if withEnd:
+    for x in encodeEnd(c, endTick): result.add x
+
+# ---- codec ----------------------------------------------------------------------------------------------------------------------
+
+proc testRoundTrip() =
+  let h = newHeader()
+  let b = flatBaseline(h.cx, h.cy, h.cz, 8'i32)
+  let recs = sampleRecs()
+  let data = encodeAll(h, b, recs, 61'i64, true)
+  let f = decodeReplay(data)
+  check("decode ok", f.ok)
+  check("header round trip", f.header.seed == h.seed and f.header.name == "t1" and f.header.dims.len == 2 and f.header.dims[1] == "minecraft:the_nether" and
+    f.header.cx == 100 and f.header.cy == 64 and f.header.cz == -50 and f.header.radius == 48 and f.header.startTick == 5000'i64 and
+    f.header.serverVersion == "test 1.21.11" and f.header.entityEvery == 4)
+  check("clean end seen", f.clean and f.lastTick == 61'i64)
+  check("baseline round trip", f.baseline.has and f.baseline.cells == b.cells and f.baseline.palette == b.palette and f.baseline.minX == b.minX and
+    f.baseline.maxY == b.maxY)
+  var baOk = true
+  for (dx, dy, dz) in [(0, 0, 0), (3, 5, 2), (16, 80, 16), (7, 31, 9), (2, 45, 14)]:
+    let ix = (dy * 17 + dz) * 17 + dx
+    if baselineAt(f.baseline, b.minX + int32(dx), b.minY + int32(dy), b.minZ + int32(dz)) != b.palette[int(b.cells[ix])]: baOk = false
+  check("baselineAt matches the cells and is 0 outside", baOk and baselineAt(f.baseline, 9999'i32, 0'i32, 0'i32) == 0'u32 and
+    baselineAt(f.baseline, b.minX, b.minY - 1'i32, b.minZ) == 0'u32)
+  check("record count", f.recs.len == recs.len)
+  var allOk = f.recs.len == recs.len
+  var worstPos = 0.0
+  var worstVel = 0.0
+  var quatOk = true
+  if allOk:
+    for i in 0 ..< recs.len:
+      let a = recs[i]
+      let d = f.recs[i]
+      if a.kind != d.kind or a.tick != d.tick: allOk = false
+      if a.kind == RkBodyState or a.kind == RkBodyCreate:
+        worstPos = max(worstPos, max(abs(a.px - d.px), max(abs(a.py - d.py), abs(a.pz - d.pz))))
+        worstVel = max(worstVel, abs(a.vy - d.vy))
+        if a.quat != d.quat or a.sleeping != d.sleeping or a.bodyId != d.bodyId: quatOk = false
+      if a.kind == RkBlocks:
+        if a.changes.len != d.changes.len: allOk = false
+        else:
+          for k in 0 ..< a.changes.len:
+            if a.changes[k].x != d.changes[k].x or a.changes[k].y != d.changes[k].y or a.changes[k].z != d.changes[k].z or a.changes[k].state != d.changes[k].state:
+              allOk = false
+      if a.kind == RkBodyCreate:
+        if a.cells.len != d.cells.len or not near(float64(a.mass), float64(d.mass), 0.0) or a.comX != d.comX: allOk = false
+        else:
+          for k in 0 ..< a.cells.len:
+            if a.cells[k].x != d.cells[k].x or a.cells[k].y != d.cells[k].y or a.cells[k].z != d.cells[k].z or a.cells[k].state != d.cells[k].state:
+              allOk = false
+      if a.kind == RkEntities:
+        if a.ents.len != d.ents.len: allOk = false
+        else:
+          for k in 0 ..< a.ents.len:
+            if a.ents[k].id != d.ents[k].id or a.ents[k].typ != d.ents[k].typ or a.ents[k].yaw != d.ents[k].yaw or a.ents[k].pitch != d.ents[k].pitch or
+                not near(a.ents[k].x, d.ents[k].x, 1.0 / 512.0) or not near(a.ents[k].z, d.ents[k].z, 1.0 / 512.0): allOk = false
+      if a.kind == RkWeather and (a.rain != d.rain or a.thunder != d.thunder): allOk = false
+      if a.kind == RkNote and a.text != d.text: allOk = false
+      if a.kind == RkFx and (a.fxKind != d.fxKind or a.fxX != d.fxX or a.fxZ != d.fxZ or a.fxState != d.fxState or not near(float64(a.impulse), float64(d.impulse), 4.0)):
+        allOk = false
+      if a.kind == RkBodyDestroy and (a.reason != d.reason or a.bodyId != d.bodyId): allOk = false
+  check("every record round trips", allOk)
+  check("positions within 1/512 block (worst " & $worstPos & ")", worstPos <= 1.0 / 512.0 + 1e-9)
+  check("velocity within 1/4096 (worst " & $worstVel & ")", worstVel <= 1.0 / 4096.0 + 1e-9)
+  check("quaternions, sleep flags and ids exact", quatOk)
+
+proc testRobust() =
+  let h = newHeader()
+  let b = flatBaseline(h.cx, h.cy, h.cz, 4'i32)
+  let recs = sampleRecs()
+  let full = encodeAll(h, b, recs, 61'i64, true)
+  # truncated tail: cut inside the last frames
+  var cut = full
+  cut.setLen(full.len - 7)
+  let f1 = decodeReplay(cut)
+  check("a truncated tail is ignored (" & $f1.recs.len & " of " & $recs.len & " records, not clean)", f1.ok and not f1.clean and f1.recs.len > 0 and f1.recs.len < recs.len + 1)
+  # unknown frame kind in the middle
+  var withUnknown = encodeHeader(h)
+  for x in encodeBaseline(b): withUnknown.add x
+  withUnknown.add 99'u8
+  withUnknown.add 3'u8
+  withUnknown.add 1'u8; withUnknown.add 2'u8; withUnknown.add 3'u8
+  var c = newCodec(h.cx, h.cy, h.cz)
+  for r in recs:
+    for x in encodeRec(c, r): withUnknown.add x
+  let f2 = decodeReplay(withUnknown)
+  check("an unknown frame kind is skipped", f2.ok and f2.recs.len == recs.len)
+  var garbage: seq[byte] = @[1'u8, 2'u8, 3'u8, 4'u8, 5'u8, 6'u8, 7'u8, 8'u8, 9'u8]
+  check("garbage is refused", not decodeReplay(garbage).ok)
+  var badMagic = full
+  badMagic[0] = byte(ord('X'))
+  check("wrong magic is refused", not decodeReplay(badMagic).ok)
+
+proc testSizes() =
+  let h = newHeader()
+  # body states: a body falling every tick for 10 s
+  var c = newCodec(h.cx, h.cy, h.cz)
+  var create = newRec(RkBodyCreate, 0'i64)
+  create.bodyId = 1'i32; create.cells = cubeCells(6, 1'u32); create.px = 100.0; create.py = 100.0; create.pz = 0.0
+  create.quat = packQuat(0.0, 0.0, 0.0, 1.0)
+  let cb = encodeRec(c, create)
+  var total = 0
+  var vy = 0.0
+  var y = 100.0
+  for t in 1 .. 200:
+    vy -= 0.04
+    y += vy
+    var s = newRec(RkBodyState, int64(t))
+    s.bodyId = 1'i32; s.px = 100.0 + 0.03 * float64(t); s.py = y; s.pz = 0.0
+    s.quat = packQuat(0.0, 0.002 * float64(t), 0.0, 0.99)
+    s.vx = 0.03; s.vy = vy
+    total += encodeRec(c, s).len
+  echo "INFO body create (216 cells): ", cb.len, " bytes (", (cb.len * 10 div 216), "/10 bytes per cell)"
+  echo "INFO body state: ", total div 200, " bytes per state record, ", total div 10, " bytes per second at 20 Hz for one falling body"
+  check("a body state record is at most 20 bytes", total div 200 <= 20)
+  # block row
+  var bl = newRec(RkBlocks, 5'i64)
+  for i in 0 ..< 1000: bl.changes.add BlockChg(x: int32(i), y: 64'i32, z: 0'i32, state: 0'u32)
+  let blb = encodeRec(c, bl)
+  echo "INFO a fill row of 1000 blocks (state 0): ", blb.len, " bytes"
+  check("a row of 1000 changes is about 4 bytes per block or less", blb.len <= 4200)
+  # entities 5 Hz
+  var ec = newCodec(h.cx, h.cy, h.cz)
+  var etotal = 0
+  for t in 0 ..< 50:
+    var e = newRec(RkEntities, int64(t * 4))
+    for k in 0 ..< 20:
+      e.ents.add EntRec(id: int32(100 + k), typ: 20'i32, x: 100.0 + float64(k) + 0.1 * float64(t), y: 64.0, z: float64(k) * 0.5, yaw: uint8(t), pitch: 0'u8)
+    etotal += encodeRec(ec, e).len
+  echo "INFO 20 entities at 5 Hz: ", etotal div 10, " bytes per second (", etotal div 50 div 20, " bytes per entity sample)"
+  check("an entity sample is at most 8 bytes", etotal div 50 div 20 <= 8)
+  # baseline
+  let bb = encodeBaseline(flatBaseline(h.cx, h.cy, h.cz, 48'i32))
+  echo "INFO baseline radius 48 (97 x 81 x 97 = ", 97 * 81 * 97, " cells): ", bb.len, " bytes"
+  check("a flat baseline RLE is under 1 MB", bb.len < 1_000_000)
+
+# ---- scene / transport ------------------------------------------------------------------------------------------------------------
+
+proc testTransport() =
+  let recs = sampleRecs()
+  let endT = 61.0
+  var tr = newTransport(endT)
+  check("speed is clamped", not setSpeed(tr, 0.0) and not setSpeed(tr, 100.0) and setSpeed(tr, 2.0) and tr.speed == 2.0)
+  let (a0, b0) = transportAdvance(tr, recs, 1.0)
+  check("speed 2: one tick advances 2 ticks of recording", tr.t == 2.0 and a0 == 0 and b0 == upperIdx(recs, 2.0) and b0 > 0)
+  tr.paused = true
+  let (a1, b1) = transportAdvance(tr, recs, 1.0)
+  check("paused: the clock stands still", a1 == b1 and tr.t == 2.0)
+  tr.paused = false
+  discard setSpeed(tr, 1.0)
+  var guard = 0
+  while not tr.finished and guard < 1000:
+    discard transportAdvance(tr, recs, 1.0)
+    inc guard
+  check("reaches the end exactly and finishes (took " & $guard & " steps)", tr.finished and tr.t == endT and tr.idx == recs.len)
+  let (rb1, f1, t1) = transportSeek(tr, recs, 1.0)
+  check("a backward seek rebuilds from 0", rb1 and f1 == 0 and t1 == upperIdx(recs, 20.0) and not tr.finished and tr.t == 20.0)
+  let (rb2, f2, t2) = transportSeek(tr, recs, 2.0)
+  check("a forward seek applies only the gap", (not rb2) and f2 == t1 and t2 == upperIdx(recs, 40.0))
+  let (rb3, f3, t3) = transportSeek(tr, recs, 9999.0)
+  check("a seek past the end is clamped", (not rb3) and tr.t == endT and tr.finished and t3 == recs.len and f3 == t2)
+  let (rb4, f4, t4) = transportSeek(tr, recs, -5.0)
+  check("a negative seek goes to 0", rb4 and f4 == 0 and tr.t == 0.0 and t4 == upperIdx(recs, 0.0))
+  var okSorted = true
+  for i in 1 ..< recs.len:
+    if recs[i].tick < recs[i - 1].tick: okSorted = false
+  check("sample records are ordered", okSorted)
+
+proc sceneAt(f: ReplayFile; upTo: int): Scene =
+  var s = newScene()
+  for i in 0 ..< upTo: sceneApply(s, f.recs[i])
+  s
+
+proc testScene() =
+  let h = newHeader()
+  let b = flatBaseline(h.cx, h.cy, h.cz, 8'i32)
+  let recs = sampleRecs()
+  let f = decodeReplay(encodeAll(h, b, recs, 61'i64, true))
+  var tr = newTransport(61.0)
+  # play to 40 s-ticks forward, then seek back to 10 and compare with a scene built from scratch
+  var live = newScene()
+  let (a, e) = transportAdvance(tr, f.recs, 1.0)
+  discard a
+  discard e
+  tr.t = 0.0
+  tr.idx = 0
+  discard transportSeek(tr, f.recs, 2.0)       # t = 40
+  for i in 0 ..< tr.idx: sceneApply(live, f.recs[i])
+  check("scene has the body, 2 entities after tick 40", live.bodies.len == 1 and live.ents.len == 2 and live.overlay.len == 50 and live.rain == 128)
+  discard sceneTakeDirty(live)
+  let (rebuild, from0, to0) = transportSeek(tr, f.recs, 0.5)    # t = 10
+  check("back to 0.5 s rebuilds", rebuild and from0 == 0)
+  sceneReset(live)
+  for i in from0 ..< to0: sceneApply(live, f.recs[i])
+  let fresh = sceneAt(f, to0)
+  check("a rebuilt scene equals one made from scratch", live.bodies.len == fresh.bodies.len and live.overlay.len == fresh.overlay.len and
+    live.ents.len == fresh.ents.len and live.bodies[0].py == fresh.bodies[0].py and live.rain == fresh.rain)
+  check("the 50 changed cells are dirty after the reset (the viewer must put them back)", live.dirty.len == 50)
+  check("body y at 0.5 s is below the start", live.bodies[0].py < 90.0 and live.bodies[0].py > 70.0)
+  var st = 99'u32
+  check("sceneState: baseline where nothing changed, overlay where changed, nothing outside",
+    sceneState(live, f.baseline, 100'i32, 40'i32, -50'i32, st) and st == baselineAt(f.baseline, 100'i32, 40'i32, -50'i32) and not sceneState(live, f.baseline, 5000'i32, 5'i32, 5'i32, st))
+  let k = cellKey(-12345'i32, -60'i32, 67890'i32)
+  check("cell key round trip", cellKeyPos(k) == (-12345'i32, -60'i32, 67890'i32))
+  var full = sceneAt(f, f.recs.len)
+  check("destroy removes the body", full.bodies.len == 0 and sceneTakeGone(full) == @[7'i32])
+
+proc testSummary() =
+  let h = newHeader()
+  let f = decodeReplay(encodeAll(h, flatBaseline(h.cx, h.cy, h.cz, 4'i32), sampleRecs(), 61'i64, true))
+  let j = summaryJson(f)
+  check("summary names the recording and the dimension", j.contains("\"name\":\"t1\"") and j.contains("\"dimension\":\"minecraft:overworld\""))
+  check("summary has the body timeline", j.contains("\"bodies\":[{\"id\":7,\"createTick\":0,\"destroyTick\":61,\"destroyReason\":1,\"cells\":64"))
+  check("summary finds the bounces as impacts", j.contains("\"impacts\":[{\"tick\":") and cnt(j, "\"dv\":") >= 1)
+  check("summary counts block changes and effects", j.contains("\"blockChanges\":50") and j.contains("\"effects\":") and j.contains("\"cleanStop\":true"))
+  check("summary escapes the note", j.contains("collapse starts \\\"here\\\""))
+  check("summary is balanced JSON", cnt(j, "{") == cnt(j, "}") and cnt(j, "[") == cnt(j, "]") and j[0] == '{' and j[j.len - 1] == '}')
+  echo "INFO summary size: ", j.len, " bytes"
+
+# ---- recorder with a fake feed ----------------------------------------------------------------------------------------------------
+
+proc fakeBody(n: int; state: int32): Body =
+  var cells: seq[physbody.Cell] = @[]
+  for y in 0 ..< n:
+    for z in 0 ..< n:
+      for x in 0 ..< n:
+        cells.add physbody.Cell(x: int32(x), y: int32(y), z: int32(z), state: state)
+  let b = bodyFromCells(1'u64, 2'u64, cells)
+  finalizeMass(b)
+  b
+
+proc bodyEv(kind: BodyEventKind; id: int32; tick: int64; vol: Body; x, y, z: float64; dim: string): BodyEvent =
+  BodyEvent(kind: kind, bodyId: id, uuidHi: 1'u64, uuidLo: 2'u64, tick: tick, dim: dim, reason: drSettled,
+    pos: vec3(x, y, z), orient: quatIdentity(), vel: vec3(0.0, -0.3, 0.0), angVel: vec3(0.0, 0.0, 0.0), sleeping: false, volume: vol)
+
+proc testRecorder() =
+  let dims = @["minecraft:overworld", "minecraft:the_nether"]
+  let path = "C:/m/replaytest_rec.rpl"
+  discard createDirAllW("C:/m")
+  check("off: the block hook is not installed and the feed is ignored", not gRecOn and not gChangeHookOn)
+  recFeed(@[], @[])
+  check("off: status says so", recStatusLine().startsWith("Not recording"))
+  let h = newHeader()
+  let base = flatBaseline(100'i32, 64'i32, -50'i32, 16'i32)
+  let err = recStart("rec1", "minecraft:overworld", dims, 100'i32, 64'i32, -50'i32, 16'i32, 777'i64, 1000'i64, base, path, "tester", 1_000_000, 0'i64)
+  check("recStart ok", err == "" and gRecOn and gChangeHookOn)
+  check("a second start is refused", recStart("rec2", "minecraft:overworld", dims, 0'i32, 0'i32, 0'i32, 16'i32, 1'i64, 1'i64, base, path, "x", 1000, 0'i64).len > 0)
+  let vol = fakeBody(3, 1'i32)
+  # block changes through the block log seam, one far away, one in another dimension
+  blockLogRecordChange("minecraft:overworld", 101, 64, -50, 1, 0)
+  blockLogRecordChange("minecraft:overworld", 102, 64, -50, 1, 0)
+  blockLogRecordChange("minecraft:overworld", 5000, 64, -50, 1, 0)
+  blockLogRecordChange("minecraft:the_nether", 101, 64, -50, 1, 0)
+  blockLogRecordChange("minecraft:overworld", 101, 64, -50, 5, 6)
+  recBodyEvent(bodyEv(bekCreate, 3'i32, 1002'i64, vol, 100.0, 80.0, -50.0, "minecraft:overworld"), dims)
+  recBodyEvent(bodyEv(bekCreate, 4'i32, 1002'i64, vol, 900.0, 80.0, -50.0, "minecraft:overworld"), dims)   # outside the radius
+  recBodyEvent(bodyEv(bekState, 4'i32, 1003'i64, vol, 900.0, 79.0, -50.0, "minecraft:overworld"), dims)
+  recBodyEvent(bodyEv(bekState, 3'i32, 1003'i64, vol, 100.0, 79.7, -50.0, "minecraft:overworld"), dims)
+  recTickCore(1003'i64, true, @[EntRec(id: 1'i32, typ: 20'i32, x: 100.0, y: 64.0, z: -50.0)], 0, 0)
+  recBodyEvent(bodyEv(bekState, 3'i32, 1004'i64, vol, 100.0, 79.3, -50.0, "minecraft:the_nether"), dims)   # other dimension
+  recFx(BodyFxEvent(kind: 1, dim: "minecraft:overworld", x: 100'i32, y: 70'i32, z: -50'i32, state: 1'u32, impulse: 400.0'f32, bodyId: 3'i32, tick: 1004'i64))
+  recFx(BodyFxEvent(kind: 1, dim: "minecraft:overworld", x: 7000'i32, y: 70'i32, z: -50'i32, state: 1'u32, impulse: 400.0'f32, bodyId: 3'i32, tick: 1004'i64))
+  recNote(1004'i64, "hello")
+  recTickCore(1004'i64, false, @[], 255, 0)
+  recBodyEvent(bodyEv(bekDestroy, 3'i32, 1010'i64, vol, 100.0, 70.0, -50.0, "minecraft:overworld"), dims)
+  recTickCore(1010'i64, false, @[], 255, 0)
+  check("recorder counters: 3 block changes inside, 1 body, 1 state, 1 sample, 1 fx, 1 note",
+    gRec.nBlocks == 3 and gRec.nBodyCreates == 1 and gRec.nBodyStates == 1 and gRec.nEntSamples == 1 and gRec.nFx == 1 and gRec.nNotes == 1)
+  let line = recStop("test")
+  echo "INFO ", line
+  check("stop leaves the recorder off and the hook removed", not gRecOn and not gChangeHookOn and not gRec.active)
+  let (st, bytes) = readFileBytes(path)
+  check("the file was written", st == rsOk and bytes.len > 100)
+  let f = decodeReplay(bytes)
+  check("the file decodes and ends cleanly", f.ok and f.clean and f.header.name == "rec1" and f.header.seed == 777'i64 and f.header.startTick == 1000'i64)
+  var nb = 0
+  var nc = 0
+  var ns = 0
+  var nd = 0
+  var cellsOk = false
+  var ents = 0
+  var rainSeen = 0
+  for r in f.recs:
+    if r.kind == RkBlocks: nb += r.changes.len
+    if r.kind == RkBodyCreate:
+      inc nc
+      cellsOk = r.cells.len == 27 and float64(r.mass) == vol.mass and r.comX == float32(vol.com.x)
+      echo "INFO recorded body mass ", r.mass
+    if r.kind == RkBodyState: inc ns
+    if r.kind == RkBodyDestroy: inc nd
+    if r.kind == RkEntities: ents += r.ents.len
+    if r.kind == RkWeather and r.rain == 255: inc rainSeen
+  echo "INFO nb=", nb, " nc=", nc, " cellsOk=", cellsOk, " ns=", ns, " nd=", nd, " ents=", ents, " rain=", rainSeen
+  check("file content: 3 changes, 1 create (27 cells), 1 state, 1 destroy, 1 entity, weather", nb == 3 and nc == 1 and cellsOk and ns == 1 and nd == 1 and ents == 1 and rainSeen == 1)
+  check("record ticks are relative to the start", f.recs.len > 0 and f.recs[0].tick >= 0 and f.lastTick == 10'i64)
+  check("the baseline is in the file", f.baseline.has and f.baseline.cells == base.cells)
+  # size limit stops loudly
+  gRecMessages = @[]
+  let e2 = recStart("rec3", "minecraft:overworld", dims, 100'i32, 64'i32, -50'i32, 16'i32, 1'i64, 2000'i64, base, "C:/m/replaytest_big.rpl", "tester", 1_000_000, 0'i64)
+  check("start with a small size limit", e2 == "")
+  gRec.maxBytes = gRec.buf.len + 400
+  recBodyEvent(bodyEv(bekCreate, 9'i32, 2000'i64, vol, 100.0, 80.0, -50.0, "minecraft:overworld"), dims)
+  var t = 2000'i64
+  while gRec.active and t < 2400'i64:
+    inc t
+    recBodyEvent(bodyEv(bekState, 9'i32, t, vol, 100.0, 80.0 - float64(t - 2000'i64) * 0.01, -50.0, "minecraft:overworld"), dims)
+    recTickCore(t, false, @[], 0, 0)
+  check("the size limit stopped the recording loudly", not gRec.active and gRecMessages.len == 1 and gRecMessages[0].contains("size limit"))
+  let (st3, b3) = readFileBytes("C:/m/replaytest_big.rpl")
+  check("the stopped file is valid and bounded", st3 == rsOk and decodeReplay(b3).ok and decodeReplay(b3).clean and b3.len < gLastFinished.flushedLen + 1)
+  # duration limit
+  gRecMessages = @[]
+  discard recStart("rec4", "minecraft:overworld", dims, 100'i32, 64'i32, -50'i32, 16'i32, 1'i64, 3000'i64, base, "C:/m/replaytest_dur.rpl", "tester", 1_000_000, 40'i64)
+  recTickCore(3039'i64, false, @[], 0, 0)
+  check("still recording at 39 ticks", gRec.active)
+  recTickCore(3040'i64, false, @[], 0, 0)
+  check("duration limit stops at 40 ticks", not gRec.active and gRecMessages.len == 1 and gRecMessages[0].contains("duration"))
+  discard removeFileW("C:/m/replaytest_rec.rpl")
+  discard removeFileW("C:/m/replaytest_big.rpl")
+  discard removeFileW("C:/m/replaytest_dur.rpl")
+
+proc testNames() =
+  check("replay name rules", safeReplayName("fall-1_a") and not safeReplayName("") and not safeReplayName("../x") and not safeReplayName("a b"))
+
+testRoundTrip()
+testRobust()
+testSizes()
+testTransport()
+testScene()
+testSummary()
+testNames()
+testRecorder()
+echo "replay tests: ", passes, " passed, ", fails, " failed"
+if fails > 0: quit(1)

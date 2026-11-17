@@ -1,0 +1,803 @@
+## Replay format, codec and the pure parts of playback (scene model, transport, JSON summary). No world, player or connection imports.
+##
+## FILE `<world>/replays/<name>.rpl`, append-only and cut-tolerant (a truncated tail frame is ignored):
+##   header   "RPL1", varint version, i64 seed, string serverVersion, zigzag startTick, string name, varint nDims + strings,
+##            varint dim (index of the recorded dimension), zigzag centre x y z, varint radius, varint entityEvery
+##   frames   u8 kind, varint payloadLen, payload.   Unknown kinds are skipped, so new kinds can be appended later.
+##     0   baseline   the blocks of the recorded box: zigzag min xyz, max xyz, palette (varint n + states), RLE of the palette index in
+##                    (y, z, x) order (varint runs, then varint length + varint index per run)
+##     1   blocks     varint dt (ticks since the previous frame), u8 dim, varint n, then per change zigzag dx dy dz (against the previous
+##                    change, the first against the centre) + varint state: a /fill row or a column is a few bytes per block
+##     2   body create   varint dt, varint bodyId, u8 dim, f32 com xyz, f32 mass, pose, palette, cells (zigzag deltas + palette index)
+##     3   body state    varint dt, varint bodyId, pose
+##     4   body destroy  varint dt, varint bodyId, u8 reason
+##     5   entities      varint dt, varint n, per entity: varint id, varint type, zigzag position deltas against the entity's previous
+##                       sample, u8 yaw, u8 pitch. A snapshot is the whole set inside the radius: what is missing is gone.
+##     6   weather       varint dt, u8 rain, u8 thunder (level * 255)
+##     7   effect        varint dt, u8 kind, zigzag dx dy dz against the centre, varint state, varint impulse (N*s / 4), varint bodyId
+##     8   note          varint dt, string (chat line, command, marker)
+##     255 end           varint dt: a clean stop
+##   pose  u8 flags (1 asleep, 2 has velocity), zigzag position deltas in 1/256 block against the body's previous pose, u32 smallest-three
+##         quaternion, and when flagged 3 zigzag velocities in 1/2048 block per tick.
+## Positions are the body's local origin (as the body feed gives it), not its centre of mass.
+
+{.feature: "lenientnils".}
+
+import std/[tables, math, strutils]
+import ../net/jester/codec
+import ../net/jester/bodymsg
+
+const
+  RplMagic* = "RPL1"
+  RplVersion* = 1
+  PosScale* = 256.0
+  VelScale* = 2048.0
+  FrBaseline* = 0'u8
+  RkBlocks* = 1'u8
+  RkBodyCreate* = 2'u8
+  RkBodyState* = 3'u8
+  RkBodyDestroy* = 4'u8
+  RkEntities* = 5'u8
+  RkWeather* = 6'u8
+  RkFx* = 7'u8
+  RkNote* = 8'u8
+  FrEnd* = 255'u8
+  PlayerTypeMark* = 0x3FFF
+  MaxBaselineCells* = 24_000_000
+
+type
+  RplHeader* = object
+    version*: int
+    seed*: int64
+    serverVersion*: string
+    startTick*: int64
+    name*: string
+    dims*: seq[string]
+    dim*: int
+    cx*, cy*, cz*: int32
+    radius*: int32
+    entityEvery*: int
+
+  RplBaseline* = object
+    has*: bool
+    minX*, minY*, minZ*, maxX*, maxY*, maxZ*: int32
+    palette*: seq[uint32]
+    cells*: seq[uint16]      ## palette index per cell, (y * sz + z) * sx + x
+
+  BlockChg* = object
+    x*, y*, z*: int32
+    state*: uint32
+
+  RBodyCell* = object
+    x*, y*, z*: int32
+    state*: uint32
+
+  EntRec* = object
+    id*: int32
+    typ*: int32
+    x*, y*, z*: float64
+    yaw*, pitch*: uint8
+
+  Rec* = object
+    tick*: int64               ## ticks since the recording started
+    kind*: uint8
+    dim*: int
+    changes*: seq[BlockChg]
+    bodyId*: int32
+    reason*: int
+    px*, py*, pz*: float64
+    quat*: uint32
+    vx*, vy*, vz*: float64     ## blocks per tick
+    sleeping*: bool
+    comX*, comY*, comZ*: float32
+    mass*: float32
+    cells*: seq[RBodyCell]
+    ents*: seq[EntRec]
+    rain*, thunder*: int
+    fxKind*: int
+    fxX*, fxY*, fxZ*: int32
+    fxState*: uint32
+    impulse*: float32
+    text*: string
+
+  RplCodec* = object
+    ## The state both ends keep to code positions as deltas; encoder and decoder update it the same way.
+    lastTick*: int64
+    cx*, cy*, cz*: int32
+    lastBody*: Table[int32, (int32, int32, int32)]
+    lastEnt*: Table[int32, (int32, int32, int32)]
+
+  ReplayFile* = object
+    ok*: bool
+    error*: string
+    header*: RplHeader
+    baseline*: RplBaseline
+    recs*: seq[Rec]
+    clean*: bool               ## an end frame was seen
+    lastTick*: int64
+    bytes*: int
+
+# ---- small codec helpers ----------------------------------------------------------------------------------------------------------
+
+proc zz*(v: int64): int64 =
+  if v >= 0'i64: v * 2'i64 else: -v * 2'i64 - 1'i64
+
+proc unzz*(u: int64): int64 =
+  if (u and 1'i64) == 0'i64: u div 2'i64 else: -((u + 1'i64) div 2'i64)
+
+proc putZ(w: var seq[byte]; v: int64) = putVarint(w, zz(v))
+proc takeZ(c: var Cursor): int64 = unzz(takeVarint(c))
+
+proc putStr(w: var seq[byte]; s: string) =
+  putVarint(w, int64(s.len))
+  for ch in s: w.add byte(ord(ch))
+
+proc takeStr(c: var Cursor): string =
+  result = ""
+  let n = int(takeVarint(c))
+  if n < 0 or n > c.left():
+    c.bad = true
+    return
+  for i in 0 ..< n: result.add char(takeU8(c))
+
+proc qpos*(v: float64): int32 = int32(floor(v * PosScale + 0.5))
+proc dqpos*(q: int32): float64 = float64(q) / PosScale
+
+proc newCodec*(cx, cy, cz: int32): RplCodec =
+  RplCodec(lastTick: 0'i64, cx: cx, cy: cy, cz: cz, lastBody: initTable[int32, (int32, int32, int32)](),
+    lastEnt: initTable[int32, (int32, int32, int32)]())
+
+proc newRec*(kind: uint8; tick: int64): Rec =
+  Rec(tick: tick, kind: kind, dim: 0, changes: @[], bodyId: 0'i32, reason: 0, quat: 0x00000000'u32, cells: @[], ents: @[], text: "")
+
+# ---- header + baseline --------------------------------------------------------------------------------------------------------------
+
+proc encodeHeader*(h: RplHeader): seq[byte] =
+  result = @[]
+  for ch in RplMagic: result.add byte(ord(ch))
+  putVarint(result, int64(h.version))
+  putBig(result, cast[uint64](h.seed), 8)
+  putStr(result, h.serverVersion)
+  putZ(result, h.startTick)
+  putStr(result, h.name)
+  putVarint(result, int64(h.dims.len))
+  for d in h.dims: putStr(result, d)
+  putVarint(result, int64(h.dim))
+  putZ(result, int64(h.cx))
+  putZ(result, int64(h.cy))
+  putZ(result, int64(h.cz))
+  putVarint(result, int64(h.radius))
+  putVarint(result, int64(h.entityEvery))
+
+proc frame(kind: uint8; payload: seq[byte]): seq[byte] =
+  result = @[]
+  result.add byte(kind)
+  putVarint(result, int64(payload.len))
+  for b in payload: result.add b
+
+proc encodeBaseline*(b: RplBaseline): seq[byte] =
+  var p: seq[byte] = @[]
+  putZ(p, int64(b.minX)); putZ(p, int64(b.minY)); putZ(p, int64(b.minZ))
+  putZ(p, int64(b.maxX)); putZ(p, int64(b.maxY)); putZ(p, int64(b.maxZ))
+  putVarint(p, int64(b.palette.len))
+  for s in b.palette: putVarint(p, int64(s))
+  # RLE
+  var runs: seq[(int, int)] = @[]
+  var i = 0
+  while i < b.cells.len:
+    var j = i + 1
+    while j < b.cells.len and b.cells[j] == b.cells[i]: inc j
+    runs.add((j - i, int(b.cells[i])))
+    i = j
+  putVarint(p, int64(runs.len))
+  for r in runs:
+    putVarint(p, int64(r[0]))
+    putVarint(p, int64(r[1]))
+  frame(FrBaseline, p)
+
+# ---- records ------------------------------------------------------------------------------------------------------------------------
+
+proc putPose(p: var seq[byte]; c: var RplCodec; r: Rec) =
+  var flags = 0
+  if r.sleeping: flags = flags or 1
+  let hasVel = r.vx != 0.0 or r.vy != 0.0 or r.vz != 0.0
+  if hasVel: flags = flags or 2
+  putU8(p, flags)
+  let q = (qpos(r.px), qpos(r.py), qpos(r.pz))
+  var prev = (0'i32, 0'i32, 0'i32)
+  if c.lastBody.hasKey(r.bodyId): prev = c.lastBody.getOrDefault(r.bodyId, (0'i32, 0'i32, 0'i32))
+  putZ(p, int64(q[0]) - int64(prev[0]))
+  putZ(p, int64(q[1]) - int64(prev[1]))
+  putZ(p, int64(q[2]) - int64(prev[2]))
+  c.lastBody[r.bodyId] = q
+  putBig(p, uint64(r.quat), 4)
+  if hasVel:
+    putZ(p, int64(floor(r.vx * VelScale + 0.5)))
+    putZ(p, int64(floor(r.vy * VelScale + 0.5)))
+    putZ(p, int64(floor(r.vz * VelScale + 0.5)))
+
+proc takePose(cur: var Cursor; c: var RplCodec; r: var Rec) =
+  let flags = takeU8(cur)
+  r.sleeping = (flags and 1) != 0
+  var prev = (0'i32, 0'i32, 0'i32)
+  if c.lastBody.hasKey(r.bodyId): prev = c.lastBody.getOrDefault(r.bodyId, (0'i32, 0'i32, 0'i32))
+  let qx = int32(int64(prev[0]) + takeZ(cur))
+  let qy = int32(int64(prev[1]) + takeZ(cur))
+  let qz = int32(int64(prev[2]) + takeZ(cur))
+  c.lastBody[r.bodyId] = (qx, qy, qz)
+  r.px = dqpos(qx); r.py = dqpos(qy); r.pz = dqpos(qz)
+  r.quat = uint32(takeBig(cur, 4))
+  r.vx = 0.0; r.vy = 0.0; r.vz = 0.0
+  if (flags and 2) != 0:
+    r.vx = float64(takeZ(cur)) / VelScale
+    r.vy = float64(takeZ(cur)) / VelScale
+    r.vz = float64(takeZ(cur)) / VelScale
+
+proc encodeRec*(c: var RplCodec; r: Rec): seq[byte] =
+  ## The frame of one record. Ticks must not go backwards (a smaller one is coded as "same tick").
+  var p: seq[byte] = @[]
+  let dt = max(0'i64, r.tick - c.lastTick)
+  c.lastTick = c.lastTick + dt
+  putVarint(p, dt)
+  if r.kind == RkBlocks:
+    putU8(p, r.dim)
+    putVarint(p, int64(r.changes.len))
+    var px = c.cx
+    var py = c.cy
+    var pz = c.cz
+    for ch in r.changes:
+      putZ(p, int64(ch.x) - int64(px))
+      putZ(p, int64(ch.y) - int64(py))
+      putZ(p, int64(ch.z) - int64(pz))
+      putVarint(p, int64(ch.state))
+      px = ch.x; py = ch.y; pz = ch.z
+  elif r.kind == RkBodyCreate:
+    putVarint(p, int64(r.bodyId))
+    putU8(p, r.dim)
+    putF32(p, r.comX); putF32(p, r.comY); putF32(p, r.comZ)
+    putF32(p, r.mass)
+    putPose(p, c, r)
+    var pal: seq[uint32] = @[]
+    var palIdx = initTable[uint32, int]()
+    for cell in r.cells:
+      if not palIdx.hasKey(cell.state):
+        palIdx[cell.state] = pal.len
+        pal.add cell.state
+    putVarint(p, int64(pal.len))
+    for s in pal: putVarint(p, int64(s))
+    putVarint(p, int64(r.cells.len))
+    var px = 0'i32
+    var py = 0'i32
+    var pz = 0'i32
+    for cell in r.cells:
+      putZ(p, int64(cell.x) - int64(px))
+      putZ(p, int64(cell.y) - int64(py))
+      putZ(p, int64(cell.z) - int64(pz))
+      putVarint(p, int64(palIdx.getOrDefault(cell.state, 0)))
+      px = cell.x; py = cell.y; pz = cell.z
+  elif r.kind == RkBodyState:
+    putVarint(p, int64(r.bodyId))
+    putPose(p, c, r)
+  elif r.kind == RkBodyDestroy:
+    putVarint(p, int64(r.bodyId))
+    putU8(p, r.reason)
+    c.lastBody.del(r.bodyId)
+  elif r.kind == RkEntities:
+    putVarint(p, int64(r.ents.len))
+    var nt = initTable[int32, (int32, int32, int32)]()
+    for e in r.ents:
+      putVarint(p, int64(e.id))
+      putVarint(p, int64(e.typ))
+      var prev = (0'i32, 0'i32, 0'i32)
+      if c.lastEnt.hasKey(e.id): prev = c.lastEnt.getOrDefault(e.id, (0'i32, 0'i32, 0'i32))
+      let q = (qpos(e.x), qpos(e.y), qpos(e.z))
+      putZ(p, int64(q[0]) - int64(prev[0]))
+      putZ(p, int64(q[1]) - int64(prev[1]))
+      putZ(p, int64(q[2]) - int64(prev[2]))
+      nt[e.id] = q
+      putU8(p, int(e.yaw))
+      putU8(p, int(e.pitch))
+    c.lastEnt = nt
+  elif r.kind == RkWeather:
+    putU8(p, r.rain)
+    putU8(p, r.thunder)
+  elif r.kind == RkFx:
+    putU8(p, r.fxKind)
+    putZ(p, int64(r.fxX) - int64(c.cx))
+    putZ(p, int64(r.fxY) - int64(c.cy))
+    putZ(p, int64(r.fxZ) - int64(c.cz))
+    putVarint(p, int64(r.fxState))
+    putVarint(p, int64(max(0.0'f32, r.impulse) / 4.0'f32))
+    putVarint(p, int64(r.bodyId))
+  elif r.kind == RkNote:
+    putStr(p, r.text)
+  frame(r.kind, p)
+
+proc encodeEnd*(c: var RplCodec; tick: int64): seq[byte] =
+  var p: seq[byte] = @[]
+  let dt = max(0'i64, tick - c.lastTick)
+  c.lastTick = c.lastTick + dt
+  putVarint(p, dt)
+  frame(FrEnd, p)
+
+# ---- decoding -----------------------------------------------------------------------------------------------------------------------
+
+proc decodeRecPayload(c: var RplCodec; kind: uint8; payload: seq[byte]; r: var Rec): bool =
+  var cur = newCursor(payload)
+  let dt = takeVarint(cur)
+  c.lastTick = c.lastTick + dt
+  r = newRec(kind, c.lastTick)
+  if kind == RkBlocks:
+    r.dim = takeU8(cur)
+    let n = int(takeVarint(cur))
+    if n < 0 or n > payload.len: return false
+    var px = int64(c.cx)
+    var py = int64(c.cy)
+    var pz = int64(c.cz)
+    for i in 0 ..< n:
+      px += takeZ(cur); py += takeZ(cur); pz += takeZ(cur)
+      let s = uint32(takeVarint(cur))
+      if cur.bad: return false
+      r.changes.add BlockChg(x: int32(px), y: int32(py), z: int32(pz), state: s)
+  elif kind == RkBodyCreate:
+    r.bodyId = int32(takeVarint(cur))
+    r.dim = takeU8(cur)
+    r.comX = takeF32(cur); r.comY = takeF32(cur); r.comZ = takeF32(cur)
+    r.mass = takeF32(cur)
+    takePose(cur, c, r)
+    let np = int(takeVarint(cur))
+    if np < 0 or np > payload.len: return false
+    var pal: seq[uint32] = @[]
+    for i in 0 ..< np: pal.add uint32(takeVarint(cur))
+    let n = int(takeVarint(cur))
+    if n < 0 or n > payload.len: return false
+    var px = 0'i64
+    var py = 0'i64
+    var pz = 0'i64
+    for i in 0 ..< n:
+      px += takeZ(cur); py += takeZ(cur); pz += takeZ(cur)
+      let k = int(takeVarint(cur))
+      if cur.bad or k < 0 or k >= pal.len: return false
+      r.cells.add RBodyCell(x: int32(px), y: int32(py), z: int32(pz), state: pal[k])
+  elif kind == RkBodyState:
+    r.bodyId = int32(takeVarint(cur))
+    takePose(cur, c, r)
+  elif kind == RkBodyDestroy:
+    r.bodyId = int32(takeVarint(cur))
+    r.reason = takeU8(cur)
+    c.lastBody.del(r.bodyId)
+  elif kind == RkEntities:
+    let n = int(takeVarint(cur))
+    if n < 0 or n > payload.len: return false
+    var nt = initTable[int32, (int32, int32, int32)]()
+    for i in 0 ..< n:
+      var e = EntRec(id: int32(takeVarint(cur)), typ: int32(takeVarint(cur)))
+      var prev = (0'i32, 0'i32, 0'i32)
+      if c.lastEnt.hasKey(e.id): prev = c.lastEnt.getOrDefault(e.id, (0'i32, 0'i32, 0'i32))
+      let q = (int32(int64(prev[0]) + takeZ(cur)), int32(int64(prev[1]) + takeZ(cur)), int32(int64(prev[2]) + takeZ(cur)))
+      nt[e.id] = q
+      e.x = dqpos(q[0]); e.y = dqpos(q[1]); e.z = dqpos(q[2])
+      e.yaw = uint8(takeU8(cur))
+      e.pitch = uint8(takeU8(cur))
+      if cur.bad: return false
+      r.ents.add e
+    c.lastEnt = nt
+  elif kind == RkWeather:
+    r.rain = takeU8(cur)
+    r.thunder = takeU8(cur)
+  elif kind == RkFx:
+    r.fxKind = takeU8(cur)
+    r.fxX = int32(int64(c.cx) + takeZ(cur))
+    r.fxY = int32(int64(c.cy) + takeZ(cur))
+    r.fxZ = int32(int64(c.cz) + takeZ(cur))
+    r.fxState = uint32(takeVarint(cur))
+    r.impulse = float32(takeVarint(cur)) * 4.0'f32
+    r.bodyId = int32(takeVarint(cur))
+  elif kind == RkNote:
+    r.text = takeStr(cur)
+  not cur.bad
+
+proc decodeReplay*(data: seq[byte]): ReplayFile =
+  result = ReplayFile(ok: false, error: "", recs: @[], clean: false, lastTick: 0'i64, bytes: data.len)
+  var cur = newCursor(data)
+  if data.len < 8:
+    result.error = "too short"
+    return
+  for i in 0 ..< 4:
+    if char(takeU8(cur)) != RplMagic[i]:
+      result.error = "not a replay file"
+      return
+  var h = RplHeader(dims: @[])
+  h.version = int(takeVarint(cur))
+  if h.version != RplVersion:
+    result.error = "unsupported version " & $h.version
+    return
+  h.seed = cast[int64](takeBig(cur, 8))
+  h.serverVersion = takeStr(cur)
+  h.startTick = takeZ(cur)
+  h.name = takeStr(cur)
+  let nd = int(takeVarint(cur))
+  if nd < 0 or nd > 64:
+    result.error = "bad header"
+    return
+  for i in 0 ..< nd: h.dims.add takeStr(cur)
+  h.dim = int(takeVarint(cur))
+  h.cx = int32(takeZ(cur)); h.cy = int32(takeZ(cur)); h.cz = int32(takeZ(cur))
+  h.radius = int32(takeVarint(cur))
+  h.entityEvery = int(takeVarint(cur))
+  if cur.bad:
+    result.error = "bad header"
+    return
+  result.header = h
+  var codec = newCodec(h.cx, h.cy, h.cz)
+  while cur.left() > 0:
+    let kind = uint8(takeU8(cur))
+    let len = int(takeVarint(cur))
+    if cur.bad or len < 0 or len > cur.left(): break      # truncated tail
+    let payload = takeBytes(cur, len)
+    if kind == FrBaseline:
+      var pc = newCursor(payload)
+      var b = RplBaseline(has: true, palette: @[], cells: @[])
+      b.minX = int32(takeZ(pc)); b.minY = int32(takeZ(pc)); b.minZ = int32(takeZ(pc))
+      b.maxX = int32(takeZ(pc)); b.maxY = int32(takeZ(pc)); b.maxZ = int32(takeZ(pc))
+      let np = int(takeVarint(pc))
+      if pc.bad or np < 0 or np > 65536:
+        result.error = "bad baseline"
+        return
+      for i in 0 ..< np: b.palette.add uint32(takeVarint(pc))
+      let nr = int(takeVarint(pc))
+      let total = (int64(b.maxX) - int64(b.minX) + 1'i64) * (int64(b.maxY) - int64(b.minY) + 1'i64) * (int64(b.maxZ) - int64(b.minZ) + 1'i64)
+      if pc.bad or nr < 0 or total < 0'i64 or total > int64(MaxBaselineCells):
+        result.error = "bad baseline"
+        return
+      b.cells = newSeq[uint16](int(total))
+      var at = 0
+      for i in 0 ..< nr:
+        let n = int(takeVarint(pc))
+        let idx = int(takeVarint(pc))
+        if pc.bad or n < 0 or at + n > b.cells.len:
+          result.error = "bad baseline runs"
+          return
+        for k in 0 ..< n: b.cells[at + k] = uint16(idx)
+        at += n
+      result.baseline = b
+    elif kind == FrEnd:
+      var pc = newCursor(payload)
+      codec.lastTick = codec.lastTick + takeVarint(pc)
+      result.clean = true
+      result.lastTick = codec.lastTick
+    elif kind >= RkBlocks and kind <= RkNote:
+      var r = newRec(kind, 0'i64)
+      if not decodeRecPayload(codec, kind, payload, r): break
+      result.recs.add r
+      result.lastTick = r.tick
+  result.ok = true
+
+# ---- baseline access --------------------------------------------------------------------------------------------------------------
+
+proc baselineDims*(b: RplBaseline): (int, int, int) =
+  (int(b.maxX - b.minX) + 1, int(b.maxY - b.minY) + 1, int(b.maxZ - b.minZ) + 1)
+
+proc baselineContains*(b: RplBaseline; x, y, z: int32): bool =
+  b.has and x >= b.minX and x <= b.maxX and y >= b.minY and y <= b.maxY and z >= b.minZ and z <= b.maxZ
+
+proc baselineAt*(b: RplBaseline; x, y, z: int32): uint32 =
+  ## The recorded state of a cell (0 outside the box).
+  if not baselineContains(b, x, y, z): return 0'u32
+  let d = baselineDims(b)
+  let i = ((int(y - b.minY) * d[2]) + int(z - b.minZ)) * d[0] + int(x - b.minX)
+  b.palette[int(b.cells[i])]
+
+proc baselineIndexPos*(b: RplBaseline; i: int): (int32, int32, int32) =
+  let d = baselineDims(b)
+  let x = i mod d[0]
+  let z = (i div d[0]) mod d[2]
+  let y = i div (d[0] * d[2])
+  (b.minX + int32(x), b.minY + int32(y), b.minZ + int32(z))
+
+# ---- scene: the state of the recorded world at one moment ---------------------------------------------------------------------------
+
+type
+  SceneBody* = object
+    id*: int32
+    gen*: int                  ## grows when the volume is replaced
+    dim*: int
+    comX*, comY*, comZ*: float32
+    mass*: float32
+    cells*: seq[RBodyCell]
+    px*, py*, pz*: float64     ## body-local origin
+    quat*: uint32
+    vx*, vy*, vz*: float64
+    sleeping*: bool
+
+  Scene* = object
+    bodies*: seq[SceneBody]
+    ents*: seq[EntRec]
+    entStamp*: int
+    overlay*: Table[int64, uint32]   ## block changes since the baseline (cell key -> state)
+    dirty*: Table[int64, bool]       ## cells touched since the last `sceneTakeDirty`
+    gone*: seq[int32]                ## bodies destroyed since the last `sceneTakeGone`
+    rain*, thunder*: int
+    applied*: int                    ## records applied
+
+proc cellKey*(x, y, z: int32): int64 =
+  ((int64(x) + 33554432'i64) shl 38) or ((int64(z) + 33554432'i64) shl 12) or (int64(y) + 2048'i64)
+
+proc cellKeyPos*(k: int64): (int32, int32, int32) =
+  let y = int32(k and 0xFFF'i64) - 2048'i32
+  let z = int32((k shr 12'i64) and 0x3FFFFFF'i64) - 33554432'i32
+  let x = int32((k shr 38'i64) and 0x3FFFFFF'i64) - 33554432'i32
+  (x, y, z)
+
+proc newScene*(): Scene =
+  Scene(bodies: @[], ents: @[], entStamp: 0, overlay: initTable[int64, uint32](), dirty: initTable[int64, bool](), gone: @[])
+
+proc sceneBodyIndex*(s: Scene; id: int32): int =
+  result = -1
+  for i in 0 ..< s.bodies.len:
+    if s.bodies[i].id == id: return i
+
+proc sceneApply*(s: var Scene; r: Rec) =
+  inc s.applied
+  if r.kind == RkBlocks:
+    for ch in r.changes:
+      let k = cellKey(ch.x, ch.y, ch.z)
+      s.overlay[k] = ch.state
+      s.dirty[k] = true
+  elif r.kind == RkBodyCreate:
+    var b = SceneBody(id: r.bodyId, gen: 1, dim: r.dim, comX: r.comX, comY: r.comY, comZ: r.comZ, mass: r.mass, cells: r.cells,
+      px: r.px, py: r.py, pz: r.pz, quat: r.quat, vx: r.vx, vy: r.vy, vz: r.vz, sleeping: r.sleeping)
+    let at = sceneBodyIndex(s, r.bodyId)
+    if at >= 0:
+      b.gen = s.bodies[at].gen + 1
+      s.bodies[at] = b
+    else:
+      s.bodies.add b
+  elif r.kind == RkBodyState:
+    let at = sceneBodyIndex(s, r.bodyId)
+    if at >= 0:
+      s.bodies[at].px = r.px; s.bodies[at].py = r.py; s.bodies[at].pz = r.pz
+      s.bodies[at].quat = r.quat
+      s.bodies[at].vx = r.vx; s.bodies[at].vy = r.vy; s.bodies[at].vz = r.vz
+      s.bodies[at].sleeping = r.sleeping
+  elif r.kind == RkBodyDestroy:
+    let at = sceneBodyIndex(s, r.bodyId)
+    if at >= 0:
+      s.bodies.delete(at)
+      s.gone.add r.bodyId
+  elif r.kind == RkEntities:
+    s.ents = r.ents
+    inc s.entStamp
+  elif r.kind == RkWeather:
+    s.rain = r.rain
+    s.thunder = r.thunder
+
+proc sceneReset*(s: var Scene) =
+  ## Back to the baseline: every cell that was changed is dirty (the viewer must put it back), bodies and entities are gone.
+  for k, v in s.overlay: s.dirty[k] = true
+  s.overlay = initTable[int64, uint32]()
+  for b in s.bodies: s.gone.add b.id
+  s.bodies = @[]
+  s.ents = @[]
+  inc s.entStamp
+  s.rain = 0
+  s.thunder = 0
+  s.applied = 0
+
+proc sceneState*(s: Scene; base: RplBaseline; x, y, z: int32; state: var uint32): bool =
+  ## The state the scene wants at a cell; false when the baseline does not cover it and nothing changed it (the real world shows through).
+  let k = cellKey(x, y, z)
+  if s.overlay.hasKey(k):
+    state = s.overlay.getOrDefault(k, 0'u32)
+    return true
+  if baselineContains(base, x, y, z):
+    state = baselineAt(base, x, y, z)
+    return true
+  false
+
+proc sceneTakeDirty*(s: var Scene): seq[int64] =
+  result = @[]
+  for k, v in s.dirty: result.add k
+  s.dirty = initTable[int64, bool]()
+
+proc sceneTakeGone*(s: var Scene): seq[int32] =
+  result = s.gone
+  s.gone = @[]
+
+# ---- transport: play / pause / speed / seek ---------------------------------------------------------------------------------------
+
+type
+  Transport* = object
+    idx*: int              ## the next record to apply
+    t*: float64            ## ticks since the recording started
+    speed*: float64
+    paused*: bool
+    endT*: float64
+    finished*: bool
+
+const
+  MinSpeed* = 0.05
+  MaxSpeed* = 32.0
+
+proc newTransport*(endT: float64): Transport =
+  Transport(idx: 0, t: 0.0, speed: 1.0, paused: false, endT: endT, finished: false)
+
+proc upperIdx*(recs: seq[Rec]; t: float64): int =
+  ## The first record later than `t` (binary search; the records are ordered by tick).
+  var lo = 0
+  var hi = recs.len
+  while lo < hi:
+    let mid = (lo + hi) div 2
+    if float64(recs[mid].tick) <= t: lo = mid + 1
+    else: hi = mid
+  lo
+
+proc setSpeed*(tr: var Transport; v: float64): bool =
+  if v < MinSpeed or v > MaxSpeed or v != v: return false
+  tr.speed = v
+  true
+
+proc transportAdvance*(tr: var Transport; recs: seq[Rec]; realTicks: float64): (int, int) =
+  ## One step of the clock. Returns the half-open range of records that became due.
+  let from0 = tr.idx
+  if tr.paused or tr.finished: return (from0, from0)
+  tr.t += tr.speed * realTicks
+  if tr.t >= tr.endT:
+    tr.t = tr.endT
+    tr.finished = true
+  let to0 = upperIdx(recs, tr.t)
+  tr.idx = max(tr.idx, to0)
+  (from0, tr.idx)
+
+proc transportSeek*(tr: var Transport; recs: seq[Rec]; secs: float64): (bool, int, int) =
+  ## Move to `secs` (clamped into the recording). Returns (rebuild, from, to): a backward seek needs the scene reset and the records
+  ## [0, to) applied again; a forward seek only applies [from, to) (nothing is sent for them one by one, the viewer is reconciled after).
+  var target = secs * 20.0
+  if target < 0.0: target = 0.0
+  if target > tr.endT: target = tr.endT
+  let newIdx = upperIdx(recs, target)
+  let back = target < tr.t or newIdx < tr.idx
+  let from0 = tr.idx
+  tr.t = target
+  tr.idx = newIdx
+  tr.finished = target >= tr.endT
+  if back: (true, 0, newIdx) else: (false, from0, newIdx)
+
+# ---- JSON summary (bug reports) ---------------------------------------------------------------------------------------------------
+
+proc jstr(s: string): string =
+  result = "\""
+  for ch in s:
+    if ch == '"': result.add "\\\""
+    elif ch == '\\': result.add "\\\\"
+    elif ch == '\n': result.add "\\n"
+    elif ord(ch) < 32: result.add " "
+    else: result.add ch
+  result.add "\""
+
+proc jnum(v: float64): string =
+  let r = floor(v * 1000.0 + 0.5) / 1000.0
+  var s = $r
+  if s.endsWith(".0"): s = s[0 ..< s.len - 2]
+  s
+
+const ImpactDeltaV = 0.12     ## blocks per tick of velocity change between two samples that counts as an impact
+
+proc summaryJson*(f: ReplayFile): string =
+  ## A timeline of the body events, impacts and block counts. `tick` values are ticks since the recording started (20 per second).
+  let h = f.header
+  var nBlocks = 0
+  var nBlockRecs = 0
+  var nStates = 0
+  var nEnt = 0
+  var maxEnts = 0
+  var nFx = 0
+  var nNotes = 0
+  var changed = initTable[uint32, int]()
+  var bodies: seq[string] = @[]
+  var impacts: seq[string] = @[]
+  var fxs: seq[string] = @[]
+  var notes: seq[string] = @[]
+  var weather: seq[string] = @[]
+  var entTypes = initTable[int32, int]()
+  # per body: create tick, cells, last velocity, min/max y, max speed, destroy
+  var ids: seq[int32] = @[]
+  var created: seq[int64] = @[]
+  var cellsN: seq[int] = @[]
+  var massOf: seq[float32] = @[]
+  var destroyed: seq[int64] = @[]
+  var reason: seq[int] = @[]
+  var lvx: seq[float64] = @[]
+  var lvy: seq[float64] = @[]
+  var lvz: seq[float64] = @[]
+  var maxSpeed: seq[float64] = @[]
+  var minY: seq[float64] = @[]
+  var maxY: seq[float64] = @[]
+  var startPos: seq[string] = @[]
+  var endPos: seq[string] = @[]
+  for r in f.recs:
+    if r.kind == RkBlocks:
+      inc nBlockRecs
+      nBlocks += r.changes.len
+      for ch in r.changes: changed[ch.state] = changed.getOrDefault(ch.state, 0) + 1
+    elif r.kind == RkBodyCreate:
+      ids.add r.bodyId; created.add r.tick; cellsN.add r.cells.len; massOf.add r.mass
+      destroyed.add -1'i64; reason.add 0
+      lvx.add r.vx; lvy.add r.vy; lvz.add r.vz
+      maxSpeed.add sqrt(r.vx * r.vx + r.vy * r.vy + r.vz * r.vz)
+      minY.add r.py; maxY.add r.py
+      startPos.add "[" & jnum(r.px) & "," & jnum(r.py) & "," & jnum(r.pz) & "]"
+      endPos.add "[" & jnum(r.px) & "," & jnum(r.py) & "," & jnum(r.pz) & "]"
+    elif r.kind == RkBodyState or r.kind == RkBodyDestroy:
+      var at = -1
+      var i = ids.len - 1
+      while i >= 0:
+        if ids[i] == r.bodyId and destroyed[i] < 0'i64:
+          at = i
+          break
+        dec i
+      if at >= 0:
+        if r.kind == RkBodyDestroy:
+          destroyed[at] = r.tick
+          reason[at] = r.reason
+        else:
+          inc nStates
+          let sp = sqrt(r.vx * r.vx + r.vy * r.vy + r.vz * r.vz)
+          if sp > maxSpeed[at]: maxSpeed[at] = sp
+          let dv = sqrt((r.vx - lvx[at]) * (r.vx - lvx[at]) + (r.vy - lvy[at]) * (r.vy - lvy[at]) + (r.vz - lvz[at]) * (r.vz - lvz[at]))
+          if dv > ImpactDeltaV and impacts.len < 200:
+            impacts.add "{\"tick\":" & $r.tick & ",\"body\":" & $r.bodyId & ",\"dv\":" & jnum(dv) & ",\"pos\":[" & jnum(r.px) & "," &
+              jnum(r.py) & "," & jnum(r.pz) & "]}"
+          lvx[at] = r.vx; lvy[at] = r.vy; lvz[at] = r.vz
+          if r.py < minY[at]: minY[at] = r.py
+          if r.py > maxY[at]: maxY[at] = r.py
+          endPos[at] = "[" & jnum(r.px) & "," & jnum(r.py) & "," & jnum(r.pz) & "]"
+    elif r.kind == RkEntities:
+      inc nEnt
+      if r.ents.len > maxEnts: maxEnts = r.ents.len
+      for e in r.ents: entTypes[e.typ] = entTypes.getOrDefault(e.typ, 0) + 1
+    elif r.kind == RkFx:
+      inc nFx
+      if fxs.len < 200:
+        fxs.add "{\"tick\":" & $r.tick & ",\"kind\":" & $r.fxKind & ",\"pos\":[" & $r.fxX & "," & $r.fxY & "," & $r.fxZ & "],\"impulse\":" &
+          jnum(float64(r.impulse)) & ",\"body\":" & $r.bodyId & "}"
+    elif r.kind == RkNote:
+      inc nNotes
+      if notes.len < 200: notes.add "{\"tick\":" & $r.tick & ",\"text\":" & jstr(r.text) & "}"
+    elif r.kind == RkWeather:
+      if weather.len < 200: weather.add "{\"tick\":" & $r.tick & ",\"rain\":" & $r.rain & ",\"thunder\":" & $r.thunder & "}"
+  for i in 0 ..< ids.len:
+    bodies.add "{\"id\":" & $ids[i] & ",\"createTick\":" & $created[i] & ",\"destroyTick\":" & $destroyed[i] & ",\"destroyReason\":" & $reason[i] &
+      ",\"cells\":" & $cellsN[i] & ",\"mass\":" & jnum(float64(massOf[i])) & ",\"maxSpeedBlocksPerTick\":" & jnum(maxSpeed[i]) &
+      ",\"minY\":" & jnum(minY[i]) & ",\"maxY\":" & jnum(maxY[i]) & ",\"start\":" & startPos[i] & ",\"end\":" & endPos[i] & "}"
+  var topStates = ""
+  var shown = 0
+  while shown < 12 and changed.len > 0:
+    var bestK = 0'u32
+    var bestN = -1
+    for k, n in changed:
+      if n > bestN or (n == bestN and k < bestK):
+        bestN = n
+        bestK = k
+    if topStates.len > 0: topStates.add ","
+    topStates.add "{\"state\":" & $bestK & ",\"count\":" & $bestN & "}"
+    changed.del(bestK)
+    inc shown
+  var types = ""
+  for k, n in entTypes:
+    if types.len > 0: types.add ","
+    types.add "{\"type\":" & $k & ",\"samples\":" & $n & "}"
+  proc join(a: seq[string]): string =
+    result = ""
+    for i in 0 ..< a.len:
+      if i > 0: result.add ","
+      result.add a[i]
+  result = "{\"name\":" & jstr(h.name) & ",\"format\":" & $h.version & ",\"serverVersion\":" & jstr(h.serverVersion) & ",\"seed\":" & $h.seed &
+    ",\"dimension\":" & jstr(if h.dim >= 0 and h.dim < h.dims.len: h.dims[h.dim] else: "") & ",\"centre\":[" & $h.cx & "," & $h.cy & "," & $h.cz &
+    "],\"radius\":" & $h.radius & ",\"startTick\":" & $h.startTick & ",\"durationTicks\":" & $f.lastTick & ",\"durationSeconds\":" &
+    jnum(float64(f.lastTick) / 20.0) & ",\"cleanStop\":" & (if f.clean: "true" else: "false") & ",\"bytes\":" & $f.bytes &
+    ",\"records\":" & $f.recs.len & ",\"baselineCells\":" & $f.baseline.cells.len & ",\"blockChanges\":" & $nBlocks &
+    ",\"blockRecords\":" & $nBlockRecs & ",\"bodyStates\":" & $nStates & ",\"entitySamples\":" & $nEnt & ",\"maxEntitiesInSample\":" & $maxEnts &
+    ",\"effects\":" & $nFx & ",\"notes\":" & $nNotes & ",\"topChangedStates\":[" & topStates & "],\"entityTypes\":[" & types &
+    "],\"bodies\":[" & join(bodies) & "],\"impacts\":[" & join(impacts) & "],\"effectEvents\":[" & join(fxs) & "],\"weather\":[" & join(weather) &
+    "],\"noteLines\":[" & join(notes) & "]}"

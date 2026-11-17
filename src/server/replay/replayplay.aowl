@@ -1,0 +1,416 @@
+## Replay PLAYBACK (goal item 22), a pure stream to ONE viewer. Nothing here writes to the real world:
+##   * blocks: the recorded baseline and block changes are sent to the viewer only, as fake `block_update` / `multi_block_update`
+##     packets (one multi-block packet per 16^3 section). The cells that were faked are remembered; when the playback stops (or the
+##     viewer leaves) the REAL state of each of them is sent again.
+##   * bodies: `block_display` entities (displayfallback: greedy cuboids, anchor, interpolation) driven by the recorded poses. They are
+##     deliberately NOT sent as jester:bodies: a second JesterViewer would send a RESET and wipe the live bodies the client knows.
+##   * entities: recorded mobs are spawned as fake entities of their type (players as armor stands), moved by teleport packets at the
+##     recorded 5 Hz, removed when they leave the sample; items and experience orbs are left out (they need metadata).
+##   * effects: recorded body effects become the vanilla block break particle event.
+##   * camera: the viewer is switched to spectator at the recording centre (free flight, no collisions); stop puts the game mode and
+##     the position back.
+## There is no scratch dimension on this server, so the stage is always this stream.
+##
+## One session at a time. The scene model, transport (pause, speed, seek) and codec are in replaycore.aowl and tested there.
+## `replayTick` (called by bodysync.tickBodySync with the manager's drained feed) runs the recorder and the playback.
+
+{.feature: "lenientnils".}
+
+import std/[syncio, tables, math, options, strutils]
+import replaycore, replay
+import ../serverbase
+import ../body/bodymanager
+import ../entity/player
+import ../net/java/javamod
+import ../net/jester/[displayfallback, codec, bodymsg]
+import ../world/worldmod
+import ../../data/block_ext
+from ../../data/block_state import newBlockStateIdUnchecked, asU16
+from ../../protocol/varint import VarInt, newVarInt
+import ../../protocol/java/client/play/[block_update, multi_block_update, spawn_entity, teleport_entity, remove_entities, worldevent]
+import ../../generated/[entity_type, world_event]
+import ../../util/[vector3, gamemode, uuid]
+import ../../util/math/position
+import ../../util/text/text
+import ../../world/worldfs
+
+const
+  LoadCellsPerTick = 120_000
+  DisplayPeriod = 2
+  MaxDisplayEntities = 512
+  MaxFakeEntities = 200
+  ReplayBodyIdBase = 0x100000'i32
+  ReplayEntUuidHi = 0x7265706c61790000'u64
+
+type
+  VBody = object
+    id: int32
+    gen: int
+    st: BodyDisplayState
+    cuboids: seq[Cuboid]
+    lastTick: int64
+
+  Session = object
+    active: bool
+    name: string
+    file: ReplayFile
+    scene: Scene
+    tr: Transport
+    viewer: string
+    world: World
+    origMode: GameMode
+    origPos: Vector3[float64]
+    origYaw, origPitch: float32
+    loading: bool
+    loadAt: int
+    shown: Table[int64, uint32]
+    vbodies: seq[VBody]
+    entFake: Table[int32, int32]
+    entStampSent: int
+    lastTick: int64
+    sentBlocks, sentDisplay, sentEnt, sentFx: int
+    pendingMsgs: seq[string]
+
+var gPlay* = Session(active: false)
+
+proc playActive*(): bool = gPlay.active
+
+# ---- sending -------------------------------------------------------------------------------------------------------------------------
+
+proc sendRaw(p: Player; dp: DisplayPacket) =
+  var buf: seq[byte] = @[]
+  putVarint(buf, int64(dp.packetId))
+  for b in dp.payload: buf.add b
+  p.client.sendPacketNowData(buf)
+  inc gPlay.sentDisplay
+
+proc sectionKey(x, y, z: int32): int64 =
+  (int64(x shr 4) shl 42) or (int64((z shr 4) and 0x3FFFFF'i32) shl 20) or int64((y shr 4) and 0xFFFFF'i32)
+
+proc sendBlocks(p: Player; changes: seq[(int64, uint32)]) =
+  ## Fake block states for the viewer alone: one packet per section.
+  var groups = initTable[int64, seq[(BlockPos, uint32)]]()
+  var order: seq[int64] = @[]
+  for c in changes:
+    let (x, y, z) = cellKeyPos(c[0])
+    let sk = sectionKey(x, y, z)
+    if not groups.hasKey(sk):
+      groups[sk] = @[]
+      order.add sk
+    var g = groups.getOrDefault(sk, @[])
+    g.add((newBlockPos(x, y, z), c[1]))
+    groups[sk] = g
+  for sk in order:
+    let g = groups.getOrDefault(sk, @[])
+    inc gPlay.sentBlocks, g.len
+    if g.len == 1:
+      p.client.writePacketFor(CBlockUpdate(location: g[0][0], stateId: newVarInt(int32(g[0][1]))))
+    else:
+      var wire: seq[(BlockPos, block_ext.BlockStateId)] = @[]
+      for u in g: wire.add((u[0], newBlockStateIdUnchecked(uint16(u[1]))))
+      p.client.writePacketFor(newCMultiBlockUpdate(wire))
+
+proc realState(world: World; key: int64; state: var uint32): bool =
+  let (x, y, z) = cellKeyPos(key)
+  let st = world.getBlockStateIdIfLoaded(newBlockPos(x, y, z))
+  if st.isSome:
+    state = st.unsafeGet
+    return true
+  false
+
+proc queueFake(world: World; key: int64; want: uint32; out0: var seq[(int64, uint32)]) =
+  ## Remembers what the viewer is shown at a cell and queues a packet when that changes.
+  var real = 0'u32
+  let known = realState(world, key, real)
+  var cur = real
+  if gPlay.shown.hasKey(key): cur = gPlay.shown.getOrDefault(key, real)
+  if want == cur and (known or gPlay.shown.hasKey(key)): return
+  out0.add((key, want))
+  if known and want == real:
+    gPlay.shown.del(key)
+  else:
+    gPlay.shown[key] = want
+
+proc findViewer(server: Server; name: string): nil Player =
+  for w in server.worlds:
+    for p in w.players:
+      if p.gameprofile.name == name and not p.client.gone and not p.client.closed:
+        return p
+  nil
+
+# ---- bodies --------------------------------------------------------------------------------------------------------------------------
+
+proc rotateV(q: (float64, float64, float64, float64); x, y, z: float64): (float64, float64, float64) =
+  let ux = q[0]
+  let uy = q[1]
+  let uz = q[2]
+  let w = q[3]
+  let cx = uy * z - uz * y
+  let cy = uz * x - ux * z
+  let cz = ux * y - uy * x
+  let dx = uy * cz - uz * cy
+  let dy = uz * cx - ux * cz
+  let dz = ux * cy - uy * cx
+  (x + 2.0 * (w * cx + dx), y + 2.0 * (w * cy + dy), z + 2.0 * (w * cz + dz))
+
+proc displayConfig(p: Player): DisplayConfig =
+  var cfg = defaultDisplayConfig()
+  cfg.version = p.client.version
+  cfg.updateHz = int32(20 div DisplayPeriod)
+  cfg
+
+proc vbIndex(id: int32): int =
+  result = -1
+  for i in 0 ..< gPlay.vbodies.len:
+    if gPlay.vbodies[i].id == id: return i
+
+proc syncBodies(server: Server; p: Player; tick: int64) =
+  let cfg = displayConfig(p)
+  var keep: seq[VBody] = @[]
+  for vb in gPlay.vbodies:
+    let at = sceneBodyIndex(gPlay.scene, vb.id)
+    if at < 0 or gPlay.scene.bodies[at].gen != vb.gen:
+      if vb.st.spawned: sendRaw(p, removeDisplayPacket(vb.st, cfg))
+    else:
+      keep.add vb
+  gPlay.vbodies = keep
+  var used = 0
+  for vb in gPlay.vbodies: used += max(1, vb.st.count)
+  for sb in gPlay.scene.bodies:
+    var k = vbIndex(sb.id)
+    if k < 0:
+      var cells: seq[displayfallback.Cell] = @[]
+      for c in sb.cells: cells.add displayfallback.Cell(x: c.x, y: c.y, z: c.z, state: c.state)
+      let r = mergeCuboids(cells, MaxBodyCuboids)
+      if r.cuboids.len == 0 or used + r.cuboids.len > MaxDisplayEntities: continue
+      let first = server.nextEntityId
+      server.nextEntityId = server.nextEntityId + int32(r.cuboids.len)
+      used += r.cuboids.len
+      gPlay.vbodies.add VBody(id: sb.id, gen: sb.gen, st: newBodyDisplayState(sb.id + ReplayBodyIdBase, first, r.cuboids.len),
+        cuboids: r.cuboids, lastTick: -1000'i64)
+      k = gPlay.vbodies.len - 1
+    if sb.sleeping and gPlay.vbodies[k].st.spawned and tick - gPlay.vbodies[k].lastTick < 40'i64: continue
+    if tick - gPlay.vbodies[k].lastTick < int64(DisplayPeriod): continue
+    gPlay.vbodies[k].lastTick = tick
+    let q = unpackQuat(sb.quat)
+    let c = rotateV(q, float64(sb.comX), float64(sb.comY), float64(sb.comZ))
+    let pose = BodyPose(pos: (sb.px + c[0], sb.py + c[1], sb.pz + c[2]), quat: (float32(q[0]), float32(q[1]), float32(q[2]), float32(q[3])),
+      com: (sb.comX, sb.comY, sb.comZ))
+    let pk = bodyDisplayPackets(gPlay.vbodies[k].st, pose, gPlay.vbodies[k].cuboids, cfg)
+    for dp in pk.spawns: sendRaw(p, dp)
+    for dp in pk.teleports: sendRaw(p, dp)
+    for dp in pk.metadata: sendRaw(p, dp)
+
+# ---- entities ------------------------------------------------------------------------------------------------------------------------
+
+proc entTypeId(typ: int32): int32 =
+  if typ == int32(PlayerTypeMark): int32(EntityType.ARMOR_STAND.id) else: typ
+
+proc skipEntType(typ: int32): bool =
+  typ == int32(EntityType.ITEM.id) or typ == int32(EntityType.EXPERIENCE_ORB.id)
+
+proc angleDeg(b: uint8): float32 = float32(int(b)) * 360.0'f32 / 256.0'f32
+
+proc syncEntities(server: Server; p: Player) =
+  if gPlay.entStampSent == gPlay.scene.entStamp: return
+  gPlay.entStampSent = gPlay.scene.entStamp
+  var present = initTable[int32, bool]()
+  for e in gPlay.scene.ents:
+    if skipEntType(e.typ): continue
+    present[e.id] = true
+    let pos = Vector3[float64](x: e.x, y: e.y, z: e.z)
+    if gPlay.entFake.hasKey(e.id):
+      let fid = gPlay.entFake.getOrDefault(e.id, 0'i32)
+      p.client.writePacketFor(CTeleportEntity(entityId: newVarInt(fid), position: pos, delta: Vector3[float64](x: 0.0, y: 0.0, z: 0.0),
+        yaw: angleDeg(e.yaw), pitch: angleDeg(e.pitch), relatives: @[], onGround: false))
+    else:
+      if gPlay.entFake.len >= MaxFakeEntities: continue
+      let fid = server.nextEntityId
+      server.nextEntityId = server.nextEntityId + 1'i32
+      gPlay.entFake[e.id] = fid
+      p.client.writePacketFor(newCSpawnEntity(newVarInt(fid), Uuid(hi: ReplayEntUuidHi, lo: 0x8000000000000000'u64 or uint64(uint32(fid))),
+        newVarInt(entTypeId(e.typ)), pos, angleDeg(e.pitch), angleDeg(e.yaw), angleDeg(e.yaw), newVarInt(0),
+        Vector3[float64](x: 0.0, y: 0.0, z: 0.0)))
+    inc gPlay.sentEnt
+  var gone: seq[VarInt] = @[]
+  var goneKeys: seq[int32] = @[]
+  for id, fid in gPlay.entFake:
+    if not present.hasKey(id):
+      gone.add newVarInt(fid)
+      goneKeys.add id
+  for id in goneKeys: gPlay.entFake.del(id)
+  if gone.len > 0: p.client.writePacketFor(CRemoveEntities(entityIds: gone))
+
+# ---- the session ---------------------------------------------------------------------------------------------------------------------
+
+proc playStatusLine*(): string =
+  if not gPlay.active: return "Not playing a replay."
+  let t = gPlay.tr.t / 20.0
+  let e = gPlay.tr.endT / 20.0
+  "Replay '" & gPlay.name & "' for " & gPlay.viewer & ": " & formatFloat(t, ffDecimal, 1) & " / " & formatFloat(e, ffDecimal, 1) & " s, speed " &
+    formatFloat(gPlay.tr.speed, ffDecimal, 2) & (if gPlay.loading: ", loading the baseline " & $(gPlay.loadAt * 100 div max(1, gPlay.file.baseline.cells.len)) & "%"
+    elif gPlay.tr.paused: ", paused" elif gPlay.tr.finished: ", finished (seek or stop)" else: ", playing") & "; sent " & $gPlay.sentBlocks &
+    " fake blocks, " & $gPlay.sentDisplay & " display packets, " & $gPlay.sentEnt & " entity packets."
+
+proc playCleanup(server: Server; p: nil Player; reason: string): string =
+  ## Puts the viewer's view back: displays and fake entities removed, every faked cell resent as it really is, game mode and position back.
+  let name = gPlay.name
+  if p != nil:
+    let cfg = displayConfig(p)
+    for vb in gPlay.vbodies:
+      if vb.st.spawned: sendRaw(p, removeDisplayPacket(vb.st, cfg))
+    var ids: seq[VarInt] = @[]
+    for id, fid in gPlay.entFake: ids.add newVarInt(fid)
+    if ids.len > 0: p.client.writePacketFor(CRemoveEntities(entityIds: ids))
+    var restore: seq[(int64, uint32)] = @[]
+    for key, st in gPlay.shown:
+      var real = 0'u32
+      if realState(gPlay.world, key, real): restore.add((key, real))
+    if restore.len > 0: sendBlocks(p, restore)
+    discard p.setGamemode(gPlay.origMode)
+    p.requestTeleport(gPlay.origPos, gPlay.origYaw, gPlay.origPitch)
+  let n = gPlay.shown.len
+  let line = "Replay '" & name & "' stopped (" & reason & "): " & $n & " block cell(s) restored to the real world."
+  gPlay = Session(active: false)
+  line
+
+proc playStop*(server: Server; reason: string): string =
+  if not gPlay.active: return "Not playing a replay."
+  let p = findViewer(server, gPlay.viewer)
+  playCleanup(server, p, reason)
+
+proc playStart*(world: World; p: Player; name: string; speed: float64): string =
+  ## "" on success, else the error line.
+  if gPlay.active: return "A replay is already playing for " & gPlay.viewer & "; /replay stop first."
+  if not safeReplayName(name): return "Replay names are letters, digits, _ and - (40 at most)."
+  let path = replayPath(world.server.levelFolder, name)
+  let (st, bytes) = readFileBytes(path)
+  if st != rsOk: return "No replay named '" & name & "'. /replay list shows them."
+  let f = decodeReplay(bytes)
+  if not f.ok: return "Cannot read '" & name & "': " & f.error
+  let dim = (if f.header.dim >= 0 and f.header.dim < f.header.dims.len: f.header.dims[f.header.dim] else: "")
+  if dim != world.dimension.minecraftName: return "This replay was recorded in " & dim & "; go there first."
+  var tr = newTransport(float64(f.lastTick))
+  if speed != 1.0 and not setSpeed(tr, speed): return "Speed is " & $MinSpeed & " to " & $MaxSpeed & "."
+  gPlay = Session(active: true, name: name, file: f, scene: newScene(), tr: tr, viewer: p.gameprofile.name, world: world,
+    origMode: p.gamemode, origPos: p.pos, origYaw: p.yaw, origPitch: p.pitch, loading: f.baseline.has, loadAt: 0,
+    shown: initTable[int64, uint32](), vbodies: @[], entFake: initTable[int32, int32](), entStampSent: -1, lastTick: world.server.tickCounter)
+  discard p.setGamemode(Spectator)
+  p.requestTeleport(Vector3[float64](x: float64(f.header.cx) + 0.5, y: float64(f.header.cy) + 2.0, z: float64(f.header.cz) + 0.5), p.yaw, p.pitch)
+  ""
+
+proc playApply(from0, to0: int; withFx: bool; p: Player) =
+  var i = from0
+  while i < to0:
+    let r = gPlay.file.recs[i]
+    sceneApply(gPlay.scene, r)
+    if withFx and r.kind == RkFx and r.fxKind != 2 and r.fxKind != 3:
+      p.client.writePacketFor(CWorldEvent(event: int32(ord(weParticlesDestroyBlock)), location: newBlockPos(r.fxX, r.fxY, r.fxZ),
+        data: int32(r.fxState), disableRelativeVolume: false))
+      inc gPlay.sentFx
+    inc i
+
+proc playPause*(): string =
+  if not gPlay.active: return "Not playing a replay."
+  gPlay.tr.paused = true
+  "Paused at " & formatFloat(gPlay.tr.t / 20.0, ffDecimal, 1) & " s."
+
+proc playResume*(): string =
+  if not gPlay.active: return "Not playing a replay."
+  gPlay.tr.paused = false
+  if gPlay.tr.finished and gPlay.tr.t >= gPlay.tr.endT:
+    return "The replay is at its end; /replay seek <seconds> first."
+  "Playing."
+
+proc playSpeed*(v: float64): string =
+  if not gPlay.active: return "Not playing a replay."
+  if not setSpeed(gPlay.tr, v): return "Speed is " & $MinSpeed & " to " & $MaxSpeed & "."
+  "Speed " & formatFloat(v, ffDecimal, 2) & "."
+
+proc playSeek*(secs: float64): string =
+  ## A backward seek resets the scene and applies the records again; the viewer is reconciled on the next tick.
+  if not gPlay.active: return "Not playing a replay."
+  if gPlay.loading: return "Still loading the baseline."
+  let (rebuild, a, b) = transportSeek(gPlay.tr, gPlay.file.recs, secs)
+  if rebuild: sceneReset(gPlay.scene)
+  var i = a
+  while i < b:
+    sceneApply(gPlay.scene, gPlay.file.recs[i])
+    inc i
+  "At " & formatFloat(gPlay.tr.t / 20.0, ffDecimal, 1) & " s."
+
+proc playTick(server: Server; tick: int64) =
+  let p = findViewer(server, gPlay.viewer)
+  if p == nil:
+    let line = playCleanup(server, nil, "the viewer left")
+    echo "[replay] " & line
+    return
+  if p.world.dimension.minecraftName != gPlay.world.dimension.minecraftName:
+    let line = playCleanup(server, nil, "the viewer changed dimension")
+    echo "[replay] " & line
+    return
+  if gPlay.loading:
+    let b = gPlay.file.baseline
+    var out0: seq[(int64, uint32)] = @[]
+    var n = 0
+    while gPlay.loadAt < b.cells.len and n < LoadCellsPerTick:
+      let (x, y, z) = baselineIndexPos(b, gPlay.loadAt)
+      queueFake(gPlay.world, cellKey(x, y, z), b.palette[int(b.cells[gPlay.loadAt])], out0)
+      inc gPlay.loadAt
+      inc n
+    if out0.len > 0: sendBlocks(p, out0)
+    if gPlay.loadAt >= b.cells.len:
+      gPlay.loading = false
+      p.sendSystemMessage(text("[replay] ready: " & $gPlay.shown.len & " cells differ from the recorded world and were faked. Playing."))
+    return
+  let (a, b) = transportAdvance(gPlay.tr, gPlay.file.recs, 1.0)
+  playApply(a, b, true, p)
+  # blocks
+  let dirty = sceneTakeDirty(gPlay.scene)
+  if dirty.len > 0:
+    var out0: seq[(int64, uint32)] = @[]
+    for key in dirty:
+      let (x, y, z) = cellKeyPos(key)
+      var want = 0'u32
+      if not sceneState(gPlay.scene, gPlay.file.baseline, x, y, z, want):
+        if not realState(gPlay.world, key, want): continue
+      queueFake(gPlay.world, key, want, out0)
+    if out0.len > 0: sendBlocks(p, out0)
+  discard sceneTakeGone(gPlay.scene)
+  syncBodies(server, p, tick)
+  syncEntities(server, p)
+
+# ---- export ------------------------------------------------------------------------------------------------------------------------
+
+proc exportReplay*(levelFolder, name: string): string =
+  ## Writes `<name>.json` beside the replay. Returns the path, or a line starting with "Error: ".
+  if not safeReplayName(name): return "Error: replay names are letters, digits, _ and - (40 at most)."
+  let (st, bytes) = readFileBytes(replayPath(levelFolder, name))
+  if st != rsOk: return "Error: no replay named '" & name & "'."
+  let f = decodeReplay(bytes)
+  if not f.ok: return "Error: cannot read '" & name & "': " & f.error
+  let json = summaryJson(f)
+  let outPath = replayFolder(levelFolder) & "/" & name & ".json"
+  var data: seq[byte] = @[]
+  for ch in json: data.add byte(ord(ch))
+  if not writeFileBytes(outPath, data): return "Error: cannot write " & outPath
+  outPath & " (" & $data.len & " bytes)"
+
+# ---- the tick entry ---------------------------------------------------------------------------------------------------------------
+
+proc deliverMessages(server: Server) =
+  if gRecMessages.len == 0: return
+  let p = findViewer(server, gRec.starter)
+  let p2 = (if p != nil: p else: findViewer(server, gLastFinished.starter))
+  for m in gRecMessages:
+    echo m
+    if p2 != nil: p2.sendSystemMessage(text(m))
+  gRecMessages = @[]
+
+proc replayTick*(server: Server; evs: seq[BodyEvent]; fx: seq[BodyFxEvent]) =
+  ## Once per server tick, from bodysync.tickBodySync with the events it drained: recorder first, then playback.
+  if gRecOn:
+    recFeed(evs, fx)
+    recTick(server, server.tickCounter)
+  if gRecMessages.len > 0: deliverMessages(server)
+  if gPlay.active: playTick(server, server.tickCounter)

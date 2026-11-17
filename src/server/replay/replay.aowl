@@ -1,0 +1,384 @@
+## The replay RECORDER (goal item 22): one session at a time writes `<world>/replays/<name>.rpl` (format: replaycore.aowl).
+##
+## What it records, for the area around the recording centre (a square of `radius` blocks, `-32 .. +48` blocks in y):
+##   * a baseline of the blocks (bulkedit.readVolume, one paletted section at a time, RLE coded) taken when the recording starts;
+##   * every block change, as it goes through the block log seam (blocklogcore.blockLogRecordChange: a hook that costs one bool test
+##     while nobody records), batched into one record per tick;
+##   * the body feed: CREATE (cells + palette + pose), STATE (pose, delta coded), DESTROY, and the body effects (break, impact, ...),
+##     handed over by bodysync.tickBodySync right after it drained the manager's feed (the feed itself is only read, never changed);
+##   * entity snapshots (players and mobs inside the radius: id, type, position, rotation) every 4 ticks (5 Hz);
+##   * weather levels when they change, and free text notes (`/replay note`).
+## Cost while OFF: `gRecOn` is one bool test per tick, the block hook is not installed. Cost while ON: the per tick work is proportional
+## to what happens inside the radius.
+##
+## Bounds: `maxBytes` (default 16 MiB) and `maxTicks`; hitting either stops the recording LOUDLY (console line + a message to the
+## player who started it) and keeps the file written so far (a clean end frame is appended).
+##
+## `recStart` / `recTickCore` / `recBodyEvent` / ... take plain values so the tests drive them with a fake feed; `recTick` is the glue.
+
+{.feature: "lenientnils".}
+
+import std/[syncio, tables, math, options, strutils]
+import replaycore
+import ../serverbase
+import ../body/bodymanager
+import ../blocklog/blocklogcore
+import ../entity/entitymod
+import ../world/[bulkedit, worldmod]
+import ../net/jester/bodymsg
+import ../../physics/body as physbody
+import ../../util/math/position
+import ../../util/vector3
+import ../../world/worldfs
+
+const
+  DefaultMaxBytes* = 16 * 1024 * 1024
+  DefaultMaxRadius* = 128
+  DefaultRadius* = 48
+  DefaultSeconds* = 120
+  MaxSeconds* = 1800
+  EntityEveryTicks* = 4
+  FlushEveryTicks* = 200
+  MaxEntitiesPerSample* = 300
+  BelowCentre* = 32
+  AboveCentre* = 48
+  ServerVersionText* = "minecraft-server (aowlmony) 1.21.11"
+
+type
+  Recorder* = object
+    active*: bool
+    name*: string
+    path*: string
+    header*: RplHeader
+    codec*: RplCodec
+    buf*: seq[byte]
+    flushedLen*: int
+    startTick*: int64
+    lastTick*: int64          ## relative
+    maxBytes*: int
+    maxTicks*: int64          ## relative, 0: none
+    dimName*: string
+    minX*, maxX*, minY*, maxY*, minZ*, maxZ*: int32
+    pending*: seq[BlockChg]
+    known*: Table[int32, bool]  ## bodies being recorded (created inside the radius)
+    lastRain*, lastThunder*: int
+    starter*: string
+    stopReason*: string
+    nBlocks*, nBodyStates*, nBodyCreates*, nEntSamples*, nFx*, nNotes*: int
+    records*: int
+    baselineBytes*: int
+
+var
+  gRec* = Recorder(active: false)
+  gRecOn* = false                 ## the single bool every caller tests first
+  gRecMessages*: seq[string] = @[]  ## lines for the player who started the recording, drained by the tick glue
+  gLastFinished*: Recorder = Recorder(active: false)
+
+proc recStatusLine*(): string =
+  if not gRec.active:
+    if gLastFinished.name.len > 0:
+      return "Not recording. Last: '" & gLastFinished.name & "' " & $gLastFinished.flushedLen & " bytes, " & $gLastFinished.records &
+        " records, " & (if gLastFinished.stopReason.len > 0: gLastFinished.stopReason else: "stopped") & "."
+    return "Not recording."
+  "Recording '" & gRec.name & "': " & $gRec.lastTick & " ticks (" & $(gRec.lastTick div 20'i64) & " s), " & $gRec.buf.len & " of " &
+    $gRec.maxBytes & " bytes, " & $gRec.records & " records, " & $gRec.nBlocks & " block changes, " & $gRec.nBodyStates &
+    " body states, " & $gRec.nEntSamples & " entity samples."
+
+proc safeReplayName*(s: string): bool =
+  if s.len == 0 or s.len > 40: return false
+  for c in s:
+    if not ((c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z') or (c >= '0' and c <= '9') or c == '_' or c == '-'):
+      return false
+  true
+
+proc replayFolder*(levelFolder: string): string = levelFolder & "/replays"
+proc replayPath*(levelFolder, name: string): string = replayFolder(levelFolder) & "/" & name & ".rpl"
+
+proc flushToDisk(force: bool) =
+  if gRec.path.len == 0: return
+  if not force and gRec.buf.len == gRec.flushedLen: return
+  if writeFileBytes(gRec.path, gRec.buf):
+    gRec.flushedLen = gRec.buf.len
+  else:
+    gRecMessages.add "[replay] cannot write " & gRec.path
+
+# ---- start / stop ----------------------------------------------------------------------------------------------------------------
+
+proc recInside(x, y, z: int): bool =
+  x >= int(gRec.minX) and x <= int(gRec.maxX) and z >= int(gRec.minZ) and z <= int(gRec.maxZ) and y >= int(gRec.minY) and y <= int(gRec.maxY)
+
+proc recAppend(r: Rec) =
+  let bytes = encodeRec(gRec.codec, r)
+  for b in bytes: gRec.buf.add b
+  inc gRec.records
+
+proc recFlushBlocks(tick: int64) =
+  if gRec.pending.len == 0: return
+  var r = newRec(RkBlocks, tick)
+  r.dim = 0
+  r.changes = gRec.pending
+  gRec.pending = @[]
+  gRec.nBlocks += r.changes.len
+  recAppend(r)
+
+proc recStop*(reason: string): string =
+  ## Ends the recording: the pending block changes, an end frame, the file. Returns a one line summary.
+  if not gRec.active: return "Not recording."
+  recFlushBlocks(gRec.lastTick)
+  let endBytes = encodeEnd(gRec.codec, gRec.lastTick)
+  for b in endBytes: gRec.buf.add b
+  flushToDisk(true)
+  gRec.active = false
+  gRecOn = false
+  gChangeHookOn = false
+  gRec.stopReason = reason
+  gRec.known = initTable[int32, bool]()
+  gRec.flushedLen = gRec.buf.len
+  gLastFinished = gRec
+  gLastFinished.buf = @[]
+  let secs = max(1'i64, gRec.lastTick div 20'i64)
+  result = "Replay '" & gRec.name & "' saved: " & $gRec.buf.len & " bytes, " & $(gRec.lastTick div 20'i64) & " s, " & $gRec.records &
+    " records (" & $(gRec.buf.len div int(secs)) & " bytes/s), " & reason & "."
+
+proc recLoudStop(reason: string) =
+  let line = recStop(reason)
+  echo "[replay] " & line
+  gRecMessages.add "[replay] RECORDING STOPPED: " & line
+
+proc recBlockHook(dimension: string; x, y, z: int; oldState, newState: int) {.closure.} =
+  if not gRec.active or dimension != gRec.dimName: return
+  if not recInside(x, y, z): return
+  if gRec.pending.len >= 200_000: return
+  gRec.pending.add BlockChg(x: int32(x), y: int32(y), z: int32(z), state: uint32(newState))
+
+proc recStart*(name, dimName: string; dims: seq[string]; cx, cy, cz, radius: int32; seed: int64; startTick: int64;
+    baseline: RplBaseline; path, starter: string; maxBytes: int; maxTicks: int64): string =
+  ## Starts a recording; "" or the reason it did not start. `baseline` is the box already read (see `captureBaseline`).
+  if gRec.active: return "A recording is already running ('" & gRec.name & "'); /replay stop first."
+  var dimIdx = 0
+  for i in 0 ..< dims.len:
+    if dims[i] == dimName: dimIdx = i
+  var h = RplHeader(version: RplVersion, seed: seed, serverVersion: ServerVersionText, startTick: startTick, name: name, dims: dims,
+    dim: dimIdx, cx: cx, cy: cy, cz: cz, radius: radius, entityEvery: EntityEveryTicks)
+  gRec = Recorder(active: true, name: name, path: path, header: h, codec: newCodec(cx, cy, cz), buf: @[], flushedLen: 0, startTick: startTick,
+    lastTick: 0'i64, maxBytes: maxBytes, maxTicks: maxTicks, dimName: dimName, pending: @[], known: initTable[int32, bool](),
+    lastRain: -1, lastThunder: -1, starter: starter, stopReason: "")
+  gRec.minX = cx - radius
+  gRec.maxX = cx + radius
+  gRec.minZ = cz - radius
+  gRec.maxZ = cz + radius
+  gRec.minY = (if baseline.has: baseline.minY else: cy - int32(BelowCentre))
+  gRec.maxY = (if baseline.has: baseline.maxY else: cy + int32(AboveCentre))
+  let hb = encodeHeader(h)
+  for b in hb: gRec.buf.add b
+  if baseline.has:
+    let bb = encodeBaseline(baseline)
+    gRec.baselineBytes = bb.len
+    for b in bb: gRec.buf.add b
+  gRecOn = true
+  gChangeHook = recBlockHook
+  gChangeHookOn = true
+  ""
+
+# ---- baseline ------------------------------------------------------------------------------------------------------------------------
+
+proc captureBaseline*(world: World; cx, cy, cz, radius: int32; baseline: var RplBaseline): string =
+  ## Reads the box around the centre into a baseline. "" or the reason it failed (unloaded chunks, out of range).
+  var topY = cy + int32(AboveCentre)
+  let botY = max(world.minY, cy - int32(BelowCentre))
+  var snap = readVolume(world, volumeBox(cx - radius, botY, cz - radius, cx + radius, topY, cz + radius))
+  var tries = 0
+  while snap.status == esOutOfRange and tries < 8:
+    topY -= 32'i32
+    inc tries
+    if topY <= botY: break
+    snap = readVolume(world, volumeBox(cx - radius, botY, cz - radius, cx + radius, topY, cz + radius))
+  if snap.status == esUnloaded:
+    return "chunks around the centre are not loaded (radius " & $radius & "): use a smaller radius, or stand where the chunks are loaded"
+  if snap.status != esOk:
+    return "cannot read the area (" & $snap.status & ")"
+  let box = snap.box
+  let sx = int(box.maxX - box.minX) + 1
+  let sy = int(box.maxY - box.minY) + 1
+  let sz = int(box.maxZ - box.minZ) + 1
+  var b = RplBaseline(has: true, minX: box.minX, minY: box.minY, minZ: box.minZ, maxX: box.maxX, maxY: box.maxY, maxZ: box.maxZ,
+    palette: @[], cells: newSeq[uint16](sx * sy * sz))
+  var palIdx = initTable[uint32, int]()
+  for sec in snap.sections:
+    for ly in sec.y0 .. sec.y1:
+      for lz in sec.z0 .. sec.z1:
+        for lx in sec.x0 .. sec.x1:
+          let st = sec.blocks.get(lx, ly, lz)
+          var k = 0
+          if palIdx.hasKey(st):
+            k = palIdx.getOrDefault(st, 0)
+          else:
+            k = b.palette.len
+            if k >= 65535: return "too many different block states in the area"
+            palIdx[st] = k
+            b.palette.add st
+          let wx = int(sec.cx) * 16 + lx - int(box.minX)
+          let wy = int(sec.baseY) + ly - int(box.minY)
+          let wz = int(sec.cz) * 16 + lz - int(box.minZ)
+          b.cells[(wy * sz + wz) * sx + wx] = uint16(k)
+  baseline = b
+  ""
+
+# ---- feeds -----------------------------------------------------------------------------------------------------------------------------
+
+proc relTick(tick: int64): int64 =
+  let t = tick - gRec.startTick
+  if t < 0'i64: 0'i64 else: t
+
+proc bodyRecFromEvent(kind: uint8; ev: BodyEvent): Rec =
+  var r = newRec(kind, relTick(ev.tick))
+  r.bodyId = ev.bodyId
+  r.px = ev.pos.x; r.py = ev.pos.y; r.pz = ev.pos.z
+  r.quat = packQuat(ev.orient.x, ev.orient.y, ev.orient.z, ev.orient.w)
+  r.vx = ev.vel.x; r.vy = ev.vel.y; r.vz = ev.vel.z
+  r.sleeping = ev.sleeping
+  r
+
+proc recBodyEvent*(ev: BodyEvent; dims: seq[string]) =
+  ## One event of the manager's feed.
+  if not gRec.active or ev.dim != gRec.dimName: return
+  let t = relTick(ev.tick)
+  if t > gRec.lastTick: gRec.lastTick = t
+  if ev.kind == bekCreate:
+    let c = ev.volume.com
+    let wx = ev.pos.x + c.x
+    let wz = ev.pos.z + c.z
+    if abs(wx - float64(gRec.header.cx)) > float64(gRec.header.radius) or abs(wz - float64(gRec.header.cz)) > float64(gRec.header.radius):
+      return
+    recFlushBlocks(t)
+    var r = bodyRecFromEvent(RkBodyCreate, ev)
+    r.dim = 0
+    r.comX = float32(c.x); r.comY = float32(c.y); r.comZ = float32(c.z)
+    r.mass = float32(ev.volume.mass)
+    let cells = cellList(ev.volume)
+    r.cells = @[]
+    for cell in cells: r.cells.add RBodyCell(x: cell.x, y: cell.y, z: cell.z, state: uint32(cell.state))
+    gRec.known[ev.bodyId] = true
+    inc gRec.nBodyCreates
+    recAppend(r)
+  elif ev.kind == bekState:
+    if not gRec.known.hasKey(ev.bodyId): return
+    inc gRec.nBodyStates
+    recAppend(bodyRecFromEvent(RkBodyState, ev))
+  else:
+    if not gRec.known.hasKey(ev.bodyId): return
+    recFlushBlocks(t)
+    var r = bodyRecFromEvent(RkBodyDestroy, ev)
+    r.reason = int(ord(ev.reason))
+    gRec.known.del(ev.bodyId)
+    recAppend(r)
+
+proc recFx*(ev: BodyFxEvent) =
+  if not gRec.active or ev.dim != gRec.dimName: return
+  if not recInside(int(ev.x), int(ev.y), int(ev.z)): return
+  var r = newRec(RkFx, relTick(ev.tick))
+  r.fxKind = ev.kind
+  r.fxX = ev.x; r.fxY = ev.y; r.fxZ = ev.z
+  r.fxState = ev.state
+  r.impulse = ev.impulse
+  r.bodyId = ev.bodyId
+  inc gRec.nFx
+  recAppend(r)
+
+proc recNote*(tick: int64; text: string) =
+  if not gRec.active: return
+  var r = newRec(RkNote, relTick(tick))
+  r.text = text
+  inc gRec.nNotes
+  recAppend(r)
+
+proc recWantsEntities*(tick: int64): bool =
+  gRec.active and relTick(tick) mod int64(EntityEveryTicks) == 0'i64
+
+proc recEntityInside*(x, z: float64): bool =
+  abs(x - float64(gRec.header.cx)) <= float64(gRec.header.radius) and abs(z - float64(gRec.header.cz)) <= float64(gRec.header.radius)
+
+proc recTickCore*(tick: int64; haveEnts: bool; ents: seq[EntRec]; rain, thunder: int) =
+  ## Once per server tick while recording: the tick's block changes, the entity sample, weather, the limits, a periodic flush.
+  if not gRec.active: return
+  let t = relTick(tick)
+  if t > gRec.lastTick: gRec.lastTick = t
+  recFlushBlocks(t)
+  if haveEnts:
+    var r = newRec(RkEntities, t)
+    r.ents = ents
+    inc gRec.nEntSamples
+    recAppend(r)
+  if rain != gRec.lastRain or thunder != gRec.lastThunder:
+    gRec.lastRain = rain
+    gRec.lastThunder = thunder
+    var r = newRec(RkWeather, t)
+    r.rain = rain
+    r.thunder = thunder
+    recAppend(r)
+  if gRec.buf.len >= gRec.maxBytes:
+    recLoudStop("size limit " & $gRec.maxBytes & " bytes reached")
+    return
+  if gRec.maxTicks > 0'i64 and t >= gRec.maxTicks:
+    recLoudStop("duration " & $(gRec.maxTicks div 20'i64) & " s reached")
+    return
+  if t mod int64(FlushEveryTicks) == 0'i64: flushToDisk(false)
+
+proc entAngle(v: float32): uint8 =
+  uint8(int(floor(float64(v) * 256.0 / 360.0)) and 255)
+
+proc recTick*(server: Server; tick: int64) =
+  ## The glue: samples the entities and the weather of the recorded dimension, then `recTickCore`.
+  if not gRec.active: return
+  var ents: seq[EntRec] = @[]
+  var rain = 0
+  var thunder = 0
+  let want = recWantsEntities(tick)
+  for world in server.worlds:
+    if world.dimension.minecraftName != gRec.dimName: continue
+    rain = int(floor(float64(world.weather.rainLevel) * 255.0 + 0.5))
+    thunder = int(floor(float64(world.weather.thunderLevel) * 255.0 + 0.5))
+    if want:
+      for p in world.players:
+        if p.client.gone or p.client.closed or ents.len >= MaxEntitiesPerSample: continue
+        if recEntityInside(p.pos.x, p.pos.z):
+          ents.add EntRec(id: p.entityId, typ: int32(PlayerTypeMark), x: p.pos.x, y: p.pos.y, z: p.pos.z, yaw: entAngle(p.yaw), pitch: entAngle(p.pitch))
+      for e in allEntities(world):
+        if ents.len >= MaxEntitiesPerSample: break
+        let en = e.entity
+        if recEntityInside(en.pos.x, en.pos.z):
+          ents.add EntRec(id: en.entityId, typ: int32(en.entityType.id), x: en.pos.x, y: en.pos.y, z: en.pos.z, yaw: entAngle(en.yaw),
+            pitch: entAngle(en.pitch))
+  recTickCore(tick, want, ents, rain, thunder)
+
+proc recFeed*(evs: seq[BodyEvent]; fx: seq[BodyFxEvent]) =
+  ## Called by bodysync with the events it just drained.
+  if not gRecOn: return
+  for ev in evs: recBodyEvent(ev, @[])
+  for f in fx: recFx(f)
+
+# ---- the commands' entry ----------------------------------------------------------------------------------------------------------------
+
+proc recordCommand*(world: World; name: string; cx, cy, cz, radius: int32; seconds: int; starter: string): string =
+  ## `/replay record`: "" on success, else the error line.
+  if not safeReplayName(name): return "Replay names are letters, digits, _ and - (40 at most)."
+  if gRec.active: return "A recording is already running ('" & gRec.name & "'); /replay stop first."
+  if radius < 4 or radius > int32(DefaultMaxRadius): return "Radius is 4 to " & $DefaultMaxRadius & "."
+  if seconds < 1 or seconds > MaxSeconds: return "Seconds is 1 to " & $MaxSeconds & "."
+  let server = world.server
+  var baseline = RplBaseline(has: false)
+  let err = captureBaseline(world, cx, cy, cz, radius, baseline)
+  if err.len > 0: return err
+  discard createDirAllW(replayFolder(server.levelFolder))
+  var dims: seq[string] = @[]
+  for w in server.worlds: dims.add w.dimension.minecraftName
+  let dimName = world.dimension.minecraftName
+  let e = recStart(name, dimName, dims, cx, cy, cz, radius, int64(world.level.seed), server.tickCounter, baseline,
+    replayPath(server.levelFolder, name), starter, DefaultMaxBytes, int64(seconds) * 20'i64)
+  if e.len > 0: return e
+  # bodies that already exist inside the radius
+  let live = bodyEventsSnapshot()
+  for ev in live:
+    recBodyEvent(ev, dims)
+  flushToDisk(true)
+  ""
