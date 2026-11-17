@@ -10,8 +10,6 @@
 
 {.feature: "lenientnils".}
 
-import std/tables
-import std/sets
 import std/heapqueue
 import std/assertions
 import std/times
@@ -19,9 +17,11 @@ import std/envvars
 import std/syncio
 import ../../config/lighting
 import ../chunkdata
+import ../chunkio
 import chunk_stage
 import channel
 import dag
+import keymap
 import chunk_listener
 import chunk_loading
 import generation_cache
@@ -46,7 +46,7 @@ type
     tasks*: array[StagedChunkCount, NodeKey]
 
   TaskHeapNode* = object
-    priority*: int8
+    priority*: int16  ## level * 16 + stage: a nearer chunk (lower level) always goes before a farther one
     key*: NodeKey
 
   GenerationSchedule* = ref object
@@ -55,9 +55,9 @@ type
     lastLevel*: ChunkLevel
     lastHighPriority*: seq[ChunkPos]
     sendLevel*: LevelChannel
-    chunkMap*: Table[ChunkPos, ChunkHolder]
-    unloadChunks*: HashSet[ChunkPos]
-    waitingForChunks*: HashSet[NodeKey]
+    chunkMap*: KeyMap[ChunkHolder]
+    unloadChunks*: ChunkSet
+    waitingForChunks*: NodeSet
       ## Tasks that are graph-ready (`in_degree` == 0) but cannot yet run because one or more of their required
       ## neighbor chunks haven't been delivered yet. Re-queued by `checkWaitingTasks` as chunk data arrives.
     runningTaskCount*: uint16
@@ -118,9 +118,9 @@ proc newChunkHolder*(): ChunkHolder =
 proc newGenerationSchedule*(host: ScheduleHost, levelChannel: LevelChannel, listener: ChunkListener,
                             maxInFlight: uint16): GenerationSchedule =
   ## `GenerationSchedule::create`, without the threads. `maxInFlight` bounds what `workOnce` runs in one pass.
-  GenerationSchedule(queue: initHeapQueue[TaskHeapNode](), graph: newDAG(), lastLevel: initTable[ChunkPos, int8](),
-    lastHighPriority: @[], sendLevel: levelChannel, chunkMap: initTable[ChunkPos, ChunkHolder](),
-    unloadChunks: initHashSet[ChunkPos](), waitingForChunks: initHashSet[NodeKey](), runningTaskCount: 0'u16,
+  GenerationSchedule(queue: initHeapQueue[TaskHeapNode](), graph: newDAG(), lastLevel: initKeyMap[int8](),
+    lastHighPriority: @[], sendLevel: levelChannel, chunkMap: initKeyMap[ChunkHolder](),
+    unloadChunks: initChunkSet(), waitingForChunks: initNodeSet(), runningTaskCount: 0'u16,
     maxInFlight: maxInFlight, queueDirty: false, recvChunk: @[], recvHead: 0, host: host, executor: sharedExecutor(), listener: listener,
     lightingConfig: host.lightingConfig, lastUnload: getTime())
 
@@ -143,16 +143,18 @@ proc applyLightingOverride(s: GenerationSchedule, chunk: ChunkData) =
   of lecDefault:
     discard
 
-proc calcPriority*(lastLevel: ChunkLevel, lastHighPriority: seq[ChunkPos], pos: ChunkPos, stage: StagedChunkEnum): int8 =
-  ## `GenerationSchedule::calc_priority`
+proc calcPriority*(lastLevel: ChunkLevel, lastHighPriority: seq[ChunkPos], pos: ChunkPos, stage: StagedChunkEnum): int16 =
+  ## `GenerationSchedule::calc_priority`, with the level weighed above the stage (upstream adds them): tasks of the
+  ## chunks nearest a player run first, whole, ahead of the early stages of far ones (and of pregeneration tickets, which
+  ## sit at the full level).
   let level = lastLevel.getOrDefault(pos, MaxLevel)
   if lastHighPriority.len == 0:
-    return level + int8(ord(stage))
+    return int16(level) * 16'i16 + int16(ord(stage))
   for i in 0 ..< lastHighPriority.len:
     let dst = max(abs(lastHighPriority[i].x - pos.x), abs(lastHighPriority[i].y - pos.y))
     if dst <= FullRadius and stage <= FullDependencies[int(dst)]:
-      return level + int8(ord(stage)) - 100'i8
-  level + int8(ord(stage))
+      return int16(level) * 16'i16 + int16(ord(stage)) - 1600'i16
+  int16(level) * 16'i16 + int16(ord(stage))
 
 proc sortQueue(s: GenerationSchedule) =
   if s.queue.len == 0:
@@ -378,7 +380,7 @@ proc resortWork*(s: GenerationSchedule, newData: LevelChannelValue): bool =
             inc dx
         if node(s.graph, task).inDegree == 0'u32 and not node(s.graph, task).inQueue:
           node(s.graph, task).inQueue = true
-          push(s.queue, TaskHeapNode(priority: 0'i8, key: task))
+          push(s.queue, TaskHeapNode(priority: 0'i16, key: task))
   s.lastLevel = newData.change.levels
   s.queueDirty = true
   true
@@ -424,7 +426,7 @@ proc processUnloadQueue(s: GenerationSchedule) =
   var unloadPositions = newSeq[ChunkPos](0)
   for pos in items(s.unloadChunks):
     unloadPositions.add(pos)
-  s.unloadChunks = initHashSet[ChunkPos]()
+  s.unloadChunks = initChunkSet()
   var chunks = newSeq[(ChunkPos, Chunk)](0)
   for ui in 0 ..< unloadPositions.len:
     let pos = unloadPositions[ui]
@@ -594,7 +596,7 @@ proc receiveChunk*(s: GenerationSchedule, pos: ChunkPos, data: RecvChunk) =
         let firstTask = holder.tasks[ord(StagedChunkEnum.None) + 1]
         if containsNode(s.graph, firstTask):
           node(s.graph, firstTask).inQueue = true
-        push(s.queue, TaskHeapNode(priority: calcPriority(s.lastLevel, s.lastHighPriority, pos, stageFromU8(1)) - 50'i8,
+        push(s.queue, TaskHeapNode(priority: calcPriority(s.lastLevel, s.lastHighPriority, pos, stageFromU8(1)) - 800'i16,
           key: firstTask))
   s.runningTaskCount -= 1'u16
 
@@ -611,7 +613,14 @@ proc drainReceived(s: GenerationSchedule): bool =
 
 proc flushIOBatch(s: GenerationSchedule, ioBatch: var seq[ChunkPos]) =
   if ioBatch.len > 0:
-    ioReadBatch(s.host, ioBatch, s.recvChunk)
+    if s.executor.workers > 0:
+      # The reads stay here (the region files belong to this thread); decoding what they returned goes to a worker.
+      var toDecode = newSeq[LoadedBytes](0)
+      ioFetchBatch(s.host, ioBatch, s.recvChunk, toDecode)
+      if toDecode.len > 0:
+        submitDecode(s.executor, s.host, toDecode)
+    else:
+      ioReadBatch(s.host, ioBatch, s.recvChunk)
     ioBatch = newSeq[ChunkPos](0)
 
 proc occupyForGeneration(s: GenerationSchedule, nodePos: ChunkPos, writeRadius: int32, occupy: NodeKey, cache: Cache) =
