@@ -3087,7 +3087,23 @@ def run(args):
             raise Fail('disconnected in configuration: %r' % r.take(r.left()))
         elif pid == CFG_PAYLOAD:
             channel = r.string()
-            CONFIG_PAYLOADS.append((channel, bytes(r.take(r.left()))))
+            body = bytes(r.take(r.left()))
+            CONFIG_PAYLOADS.append((channel, body))
+            if channel == 'jester:modsync' and body[:1] == b'' and getattr(args, 'scenario', None):
+                # answer the MANIFEST with a STATUS: the mod `test:present` is installed, every other one is missing
+                mr = Reader(body)
+                mr.u8()
+                mr.u8()
+                answers = []
+                for _ in range(mr.varint()):
+                    mod_id, version = mr.string(), mr.string()
+                    mr.u8()
+                    mr.take(32)
+                    mr.varint()
+                    mr.string()
+                    answers.append((mod_id, 0 if mod_id == 'test:present' else 1, version if mod_id == 'test:present' else ''))
+                status = bytes([2]) + varint(len(answers)) + b''.join(string(i) + bytes([st_]) + string(v) for i, st_, v in answers)
+                c.send(2, string('jester:modsync') + status)
         elif pid in (CFG_FEATURES, CFG_LINKS):
             r.take(r.left())
         else:

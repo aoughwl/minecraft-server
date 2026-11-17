@@ -27,6 +27,11 @@ import ../../util/math/position
 import ../pluginhooksevents
 import ../pluginhooksblock
 import ../payloads
+import "../../physics/materials" as physmat
+import "../../physics/solver" as physsolver
+import "../../physics/solveradapter" as physadapter
+import "../../physics/windfield" as physwind
+import ../../server/net/jester/modsyncstate
 from ../../data/block_state import newBlockStateIdUnchecked
 import ../api/events/player/[fish, egg_throw, custom_click_action]
 import ../../data/blocks
@@ -427,6 +432,119 @@ proc hostAdvertiseCapability(context: int64; args: seq[HostArg]; res: var HostAr
   advertiseCapabilityBit(bit)
   1
 
+proc hostPlayerModState(context: int64; args: seq[HostArg]; res: var HostArg): int32 =
+  ## player_mod_state(name, modId): what the client reported for the mod in modsync (0 ok, 1 missing, 2 hash mismatch, 3 version mismatch,
+  ## 4 disabled), -1 when it reported nothing.
+  res.kind = AoeVNumber
+  res.n = float64(modStateOf(textArg(args, 0), textArg(args, 1)))
+  1
+
+proc worldAgeOf(world: World): float64 = float64(world.levelTime.worldAge)
+
+proc materialText(m: physmat.Material): string =
+  ## class density fill stiffness damping tensile compressive dragArea breakThreshold flammability ignitability liquid indestructible
+  physmat.className(m.matClass) & " " & $m.density & " " & $m.fill & " " & $m.stiffness & " " & $m.damping & " " & $m.tensile & " " &
+    $m.compressive & " " & $m.dragArea & " " & $m.breakThreshold & " " & $m.flammability & " " & $m.ignitability & " " &
+    (if m.liquid: "1" else: "0") & " " & (if m.indestructible: "1" else: "0")
+
+proc hostPhysicsWindAt(context: int64; args: seq[HostArg]; res: var HostArg): int32 =
+  ## physics_wind_at(x, y, z): "vx vy vz speed" in blocks/second, the server's wind field at the overworld's game time.
+  res.kind = AoeVString
+  res.s = ""
+  let w = overworld()
+  if w.isNone: return 1
+  let v = physwind.windAtWorld(worldAgeOf(w.unsafeGet), numArg(args, 0), numArg(args, 1), numArg(args, 2))
+  res.s = $v.x & " " & $v.y & " " & $v.z & " " & $v.speed
+  1
+
+proc hostPhysicsMaterialByName(context: int64; args: seq[HostArg]; res: var HostArg): int32 =
+  ## physics_material_by_name(name): the material fields (see materialText), "" when the block is unknown.
+  res.kind = AoeVString
+  res.s = ""
+  let (found, m) = physmat.materialByName(textArg(args, 0))
+  if found: res.s = materialText(m)
+  1
+
+proc hostPhysicsMaterialAt(context: int64; args: seq[HostArg]; res: var HostArg): int32 =
+  ## physics_material_at(x, y, z): the material of the block state there, "" when the chunk is not loaded.
+  res.kind = AoeVString
+  res.s = ""
+  let w = overworld()
+  if w.isNone: return 1
+  let world: World = w.unsafeGet
+  let pos = newBlockPos(int32(numArg(args, 0)), int32(numArg(args, 1)), int32(numArg(args, 2)))
+  if world.isLoaded(pos): res.s = materialText(physmat.materialOf(int(world.getBlockStateId(pos))))
+  1
+
+proc wordNum(s: string; k: int): float64 =
+  ## The k-th space separated number of a text ("x y z"); 0 when it is missing.
+  var word = 0
+  var cur = ""
+  for ch in s:
+    if ch == ' ':
+      if cur.len > 0:
+        if word == k: return parseNumText(cur)
+        inc word
+        cur = ""
+    else:
+      cur.add ch
+  if cur.len > 0 and word == k: return parseNumText(cur)
+  0.0
+
+proc hostPhysicsSolve(context: int64; args: seq[HostArg]; res: var HostArg): int32 =
+  ## physics_solve("x y z", "nx ny nz", floorAnchor, wind): the structural solver over a box of the overworld, from its minimum corner.
+  ## The bottom layer is anchored when floorAnchor is 1 (otherwise only indestructible blocks anchor); wind 1 adds the field's drag loads.
+  ## Answer: a first line "maxRatio converged rounds brokenCount granularCount caveInCount componentCount", then one line per broken block
+  ## "x y z ratio kind" (at most 512), or "error: ..." when the box is not valid.
+  res.kind = AoeVString
+  res.s = ""
+  let w = overworld()
+  if w.isNone:
+    res.s = "error: no world"
+    return 1
+  let world: World = w.unsafeGet
+  let corner = textArg(args, 0)
+  let size = textArg(args, 1)
+  let x0 = int(wordNum(corner, 0))
+  let y0 = int(wordNum(corner, 1))
+  let z0 = int(wordNum(corner, 2))
+  let nx = int(wordNum(size, 0))
+  let ny = int(wordNum(size, 1))
+  let nz = int(wordNum(size, 2))
+  if nx < 1 or ny < 1 or nz < 1 or nx * ny * nz > 32768:
+    res.s = "error: the box must hold 1 to 32768 blocks"
+    return 1
+  var ids = newSeq[int](nx * ny * nz)
+  for ly in 0 ..< ny:
+    for lz in 0 ..< nz:
+      for lx in 0 ..< nx:
+        let pos = newBlockPos(int32(x0 + lx), int32(y0 + ly), int32(z0 + lz))
+        if world.isLoaded(pos): ids[lx + nx * (lz + nz * ly)] = int(world.getBlockStateId(pos))
+  let params = physadapter.defaultAdapterParams()
+  let floorAnchored = numArg(args, 2) > 0.5
+  let anchorFn: physadapter.AnchorFn = (if floorAnchored: physadapter.floorAnchor else: physadapter.neverAnchor)
+  var loads: seq[physsolver.ExtLoad] = @[]
+  if numArg(args, 3) > 0.5:
+    let age = worldAgeOf(world)
+    let sampler: physadapter.WindSampler = proc (x, y, z: int): (float64, float64) {.closure.} =
+      let v = physwind.windAtWorld(age, float64(x0 + x), float64(y0 + y), float64(z0 + z))
+      (v.x, v.z)
+    loads = physadapter.windLoadFromField(ids, nx, ny, nz, params, sampler)
+  let r = physadapter.solveSnapshot(ids, nx, ny, nz, params, anchorFn, loads)
+  var components = 0
+  for c in r.components: inc components
+  res.s = $r.maxRatio & " " & (if r.converged: "1" else: "0") & " " & $r.rounds & " " & $r.broken.len & " " & $r.granular.len & " " &
+    $r.caveIns.len & " " & $components
+  var shown = 0
+  for b in r.broken:
+    if shown >= 512: break
+    let lx = b.cell mod nx
+    let lz = (b.cell div nx) mod nz
+    let ly = b.cell div (nx * nz)
+    res.s.add "\n" & $(x0 + lx) & " " & $(y0 + ly) & " " & $(z0 + lz) & " " & $b.ratio & " " & $ord(b.kind)
+    inc shown
+  1
+
 proc hostPlayerKick(context: int64; args: seq[HostArg]; res: var HostArg): int32 =
   ## player_kick(name, reason)
   res.kind = AoeVBool
@@ -526,6 +644,11 @@ proc registerServerHost() =
   registerHost("probe_echo", hostProbeEcho)
   registerHost("player_message_to", hostPlayerMessageTo)
   registerHost("player_kick", hostPlayerKick)
+  registerHost("physics_wind_at", hostPhysicsWindAt)
+  registerHost("physics_material_by_name", hostPhysicsMaterialByName)
+  registerHost("physics_material_at", hostPhysicsMaterialAt)
+  registerHost("physics_solve", hostPhysicsSolve)
+  registerHost("player_mod_state", hostPlayerModState)
   registerHost("player_has_capability", hostPlayerHasCapability)
   registerHost("player_jester_version", hostPlayerJesterVersion)
   registerHost("server_advertise_capability", hostAdvertiseCapability)
@@ -1226,6 +1349,7 @@ proc installEngineEventHooks*(server: Server) =
     if before[0]: return before
     payloadForget(player.gameprofile.name)
     jesterForget(player.gameprofile.name)
+    modsyncForget(player.gameprofile.name)
     let o = fireEngine("on_player_leave", player, "")
     var answer: (bool, TextComponent) = before
     answer[0] = o[0]

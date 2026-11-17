@@ -168,8 +168,8 @@ def capability_handshake(s):
     at = 3 + wl[2]
     caps = struct.unpack('>Q', wl[at:at + 8])[0]
     # Offered by the server mods: physics2 (1), wind (2), body stream (4), fx (16) = 23. The showcase plugin adds wind; the body/fx/physics2 bits come from
-    # bodysync.aowl. modsync (8), materials (32) and cui (64, WorldEdit) were not granted in this run (measured: 23).
-    s.check(caps == 23, 'granted caps %d, wanted physics2+wind+bodystream+fx (23)' % caps)
+    # bodysync.aowl. modsync (8) is on because the scenario runner writes a jester-mods.json; materials (32) and cui (64, WorldEdit) were not granted in this run (measured: 31).
+    s.check(caps == 31, 'granted caps %d, wanted physics2+wind+modsync+bodystream+fx (31)' % caps)
     s.check(wl[at + 10:at + 14] == bytes([0x12, 0x34, 0x56, 0x78]), 'the nonce was not echoed')
     s.command('caps')
     s.expect('Jester: wind=true fx=true client=0.9.0', 'the capability report')
@@ -916,6 +916,48 @@ def datapack_live(s):
     s.command('datapack reload')
     s.expect('datapacks: 1 found, 1 loaded', 'reload summary', 20.0, since=n)
 
+
+
+@scenario('modsync', needs_plugin='showcase')
+def modsync(s):
+    """With a jester-mods.json the welcome announces modsync, the manifest arrives in the configuration phase, the join was held for the
+    STATUS and the server recorded it (the plugin reports it back)."""
+    s.require_plugin()
+    welcome = s.config_payloads('jester:welcome')
+    s.check(len(welcome) == 1, 'no welcome')
+    wl = welcome[0]
+    at = 3 + wl[2]
+    s.check(wl[at + 9] & 2, 'welcome flags %d: bit1 (modsync follows) is not set' % wl[at + 9])
+    manifest = s.config_payloads('jester:modsync')
+    s.check(len(manifest) == 1 and manifest[0][0] == 1, 'no MANIFEST in the configuration phase')
+    s.check(manifest[0][1] == 0, 'the scenario manifest is advisory, got policy %d' % manifest[0][1])
+    s.command('modstate test:present')
+    s.expect('Mod test:present: state 0', 'the reported state of the installed mod')
+    s.command('modstate test:absent')
+    s.expect('Mod test:absent: state 1', 'the reported state of the missing mod')
+    s.command('modstate test:nothing')
+    s.expect('Mod test:nothing: state -1', 'a mod nobody asked about')
+
+
+@scenario('physics_js')
+def physics_js(s):
+    """The same physics API from a JavaScript snippet: material table, wind field and solver over the host functions."""
+    s.command('script var m = server.materialByName("stone"); print("jsmat=" + m.known + " " + (m.density > 1000))')
+    s.expect('jsmat=true true', 'the material of stone from JS', 30.0)
+    s.command('script var w = server.windAt(0, 70, 0); print("jswind=" + (w.speed >= 0))')
+    s.expect('jswind=true', 'the wind field from JS', 30.0)
+    s.command('script var r = server.solveRegion(0, 200, 0, 4, 4, 4, {floorAnchored: true}); print("jssolve=" + r.ok + " " + r.broken.length)')
+    s.expect('jssolve=true 0', 'the solver from JS', 30.0)
+
+
+@scenario('physics_api', needs_plugin='showcase')
+def physics_api(s):
+    """A plugin reaches the material table, the wind field and the structural solver."""
+    s.require_plugin()
+    s.command('physapi')
+    s.expect('Physics material: stone known=true dense=true air=true', 'the material table', 30.0)
+    s.expect('Physics wind: ok=true massOfStone=true', 'the wind field and mass', 30.0)
+    s.expect('Physics solve: ok=true broken=0', 'the structural solver', 30.0)
 
 
 def run(m, c, st, w, biomes, ctx, args):
