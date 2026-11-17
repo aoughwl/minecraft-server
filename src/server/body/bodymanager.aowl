@@ -37,6 +37,7 @@ import ../../data/block_ext
 from ../../data/block_state import newBlockStateIdUnchecked, asU16
 import ../../nbt/tag as nbttag
 import ../../physics/[body, bodymass, integrator, materials, solver, solveradapter, windfield]
+from ../../physics/blast import applyBlastToSolverInput, BlastResult, CrackedCell
 import ../../util/math/position
 import ../../util/math/boundingbox
 import ../../util/vector3
@@ -129,7 +130,16 @@ type
     cells*: int
     dropped*: bool              ## no free spot: the cells became item drops
 
+  Crack* = object
+    ## A cell a blast cracked: its strength is multiplied by `mult` (0.3 .. 0.89) for the next check that covers it.
+    x*, y*, z*: int32
+    mult*: float64
+
   CollapseOpts* = object
+    onlyBuilt*: bool            ## automatic triggers: only cells (and free sets that are at least half) for which `builtFn` says "player built"
+                                ## may fail or fall; natural terrain and trees are left alone. Needs `builtFn`, none = nothing is built.
+    builtFn*: proc(dim: string; x, y, z: int32): bool {.nimcall.}
+    cracks*: seq[Crack]         ## blast cracks inside the box, applied to the solver input before it runs
     wind*: bool                 ## add wind loads from the wind field
     includeTerrain*: bool       ## free sets that are mostly rock class material (the solver's 'terrain': stone, ores, iron blocks too, there is no
                                 ## way to tell natural from built) become bodies; default true for an explicit check, the automatic
@@ -1077,6 +1087,12 @@ proc collapseStart*(world: World; box: VolumeBox; opts: CollapseOpts; tick: int6
   gAnchorNz = nz
   let p = defaultAdapterParams()
   var inp = snapshotToSolverInput(ids, nx, ny, nz, p, anchorShell)
+  if opts.cracks.len > 0:
+    var br = BlastResult(destroyed: @[], cracked: @[], debris: @[], impulses: @[])
+    for k in opts.cracks:
+      if k.x >= ebox.minX and k.x <= ebox.maxX and k.y >= ebox.minY and k.y <= ebox.maxY and k.z >= ebox.minZ and k.z <= ebox.maxZ:
+        br.cracked.add(CrackedCell(cell: int(k.x - ebox.minX) + nx * (int(k.z - ebox.minZ) + nz * int(k.y - ebox.minY)), mult: k.mult))
+    discard applyBlastToSolverInput(inp, br)
   if opts.wind:
     gWindBase = [float64(ebox.minX), float64(ebox.minY), float64(ebox.minZ)]
     gWindTick = float64(tick)
@@ -1113,9 +1129,15 @@ proc collapseApply*(job: CollapseJob; tick: int64) =
   # 1. the failed cells: removed, drops and particles
   var gone: seq[Cell] = @[]
   var pos: seq[BlockPos] = @[]
+  let dimName = world.dimension.minecraftName
   for b in res.broken:
-    gone.add(Cell(x: cellX(job.ebox, nx, b.cell), y: cellY(job.ebox, nx, nz, b.cell), z: cellZ(job.ebox, nx, nz, b.cell), state: int32(job.ids[b.cell])))
-    pos.add(newBlockPos(cellX(job.ebox, nx, b.cell), cellY(job.ebox, nx, nz, b.cell), cellZ(job.ebox, nx, nz, b.cell)))
+    let bx = cellX(job.ebox, nx, b.cell)
+    let by = cellY(job.ebox, nx, nz, b.cell)
+    let bz = cellZ(job.ebox, nx, nz, b.cell)
+    if job.opts.onlyBuilt and (job.opts.builtFn == nil or not job.opts.builtFn(dimName, bx, by, bz)):
+      continue
+    gone.add(Cell(x: bx, y: by, z: bz, state: int32(job.ids[b.cell])))
+    pos.add(newBlockPos(bx, by, bz))
   if gone.len > 0:
     var snap = readVolume(world, job.ebox)
     if snap.status == esOk:
@@ -1146,7 +1168,7 @@ proc collapseApply*(job: CollapseJob; tick: int64) =
     terrainSets[k] = true
   for ci in 0 ..< res.components.len:
     let comp = res.components[ci]
-    if terrainSets.hasKey(ci) and not job.opts.includeTerrain:
+    if terrainSets.hasKey(ci) and not job.opts.includeTerrain and not job.opts.onlyBuilt:
       inc rep.skipped
       continue
     var cells: seq[Cell] = @[]
@@ -1162,6 +1184,15 @@ proc collapseApply*(job: CollapseJob; tick: int64) =
     if touchesShell or cells.len == 0:
       inc rep.skipped
       continue
+    if job.opts.onlyBuilt:
+      var nBuilt = 0
+      if job.opts.builtFn != nil:
+        for c in cells:
+          if job.opts.builtFn(dimName, c.x, c.y, c.z):
+            inc nBuilt
+      if nBuilt * 2 < cells.len:
+        inc rep.skipped
+        continue
     let r = assembleCells(world, cells, tick)
     if r.ok:
       for be in r.bodies:
@@ -1211,6 +1242,28 @@ proc stepCollapseJobs(tick: int64) =
 
 # ----------------------------------------------------------------------------------------------------------------------
 # hooks for the trigger task
+
+proc collapseEnqueue*(world: World; box: VolumeBox; opts: CollapseOpts; tick: int64): CollapseReport =
+  ## Like `collapseCheck` but NEVER inline: the solver is always sliced over the next ticks by `tickBodies` (`collapseOps` per tick).
+  ## The automatic triggers use it so one check cannot spend a whole tick.
+  let job = collapseStart(world, box, opts, tick)
+  if job.report.done:
+    return job.report
+  job.report.queued = true
+  gJobs.add(job)
+  job.report
+
+proc collapseJobsQueued*(): int = gJobs.len
+
+proc spawnDebrisBody*(world: World; b: Body; tick: int64): BodyEntity =
+  ## A ready made small body (blast debris: mass, centre and inertia already set) joins the simulation and the event feed.
+  let (hi, lo) = newUuid()
+  b.idHi = hi
+  b.idLo = lo
+  let be = newBodyEntity(allocId(), world, world.dimension.minecraftName, b, tick)
+  registerBody(be, tick)
+  checkpoint(be, tick)
+  be
 
 proc onBlockChanged*(world: World; x, y, z: int32; oldState, newState: uint32) =
   ## STUB for the next task (the automatic triggers). Today it wakes the bodies near the cell (a block that disappeared under a

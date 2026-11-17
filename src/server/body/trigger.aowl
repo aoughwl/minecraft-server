@@ -1,0 +1,682 @@
+## Automatic structural collapse triggers: the world side (the pure queue/debounce/budget logic is triggerlogic.aowl).
+##
+## SAFETY. This changes how real survival worlds behave (a base can collapse), so everything is behind the per world setting
+## `physics_triggers` = off | structures | full, DEFAULT OFF. Where it is read from, in this order:
+##   1. `<world folder>/aowlmony/physics_triggers.txt` (one word; written by `/body triggers <mode>`, so a choice persists),
+##   2. the environment variable JESTER_PHYSICS_TRIGGERS (off|structures|full) for the launcher: the default of worlds without a file,
+##   3. off.
+## With OFF the hooks cost one bool test (`gTrigOn` in triggerhook.aowl) and change nothing; `tickTriggers` costs two int tests.
+##
+## WHAT RUNS
+##  structures  Every block change that adds or removes structural material (air <-> solid, solid <-> solid by a player, fire, explosion,
+##              /fill, a settling body...) becomes a dirty cell (`onChange`). Dirty cells cluster (triggerlogic), a cluster is checked after
+##              a debounce, then: the flood fill (within `reach` = 48 blocks of the cluster, 6-connected through PLAYER BUILT solid cells)
+##              finds the structure, too small ones (< 8 cells) are ignored, and a solver check of the structure's box (plus 2) is queued
+##              with `includeTerrain = false` and `onlyBuilt`. A heavy block placed (mass vs the structure's span, `heavyLoad`) is checked
+##              after 2 ticks instead of 8.
+##  full        everything above, plus
+##              - explosions: the vanilla explosion keeps its drops, particles, sounds and entity damage, but WHICH cells go comes from
+##                `blast.runBlast` (vanilla rays + energy criterion); survivors get a crack weakening for the following check, heavy
+##                fragments become small bodies (no item drop for those cells), bodies in range get impulses; the debris and removed
+##                cells then dirty the area so the remainder is collapse checked;
+##              - fire: cells that burn out go through setBlockState (air or fire replaces them) and so are dirty cells like any change;
+##              - wind: every 100 ticks per world, a gust above 14 blocks/s at a player triggers one scan of the player built blocks
+##                within 24 blocks; tall thin columns (12+ high, at most 3 side neighbours) queue a check with the wind loads.
+##
+## NATURAL OR BUILT. A cell is "player built" when its latest block log record is a place / command / mod / restore that left a block
+## there (CausePlace, CauseCommand, CauseMod, CauseRestore); a break, explosion, fire, fluid, natural change or rollback clears it.
+## The knowledge is a table kept live from the change hook (this session) plus the block log read lazily per 32 cell tile the first time
+## a check touches it (so it survives restarts when the log is on). With the log OFF only changes seen in this session count: blocks
+## from before the restart are natural, and so are never collapsed. Nothing is decided by block names.
+## The solver may still see natural terrain as support. Only built cells may fail and only free sets that are at least half built fall.
+##
+## BUDGET. At most 2 checks in flight, one start per tick, 3 checks burst then one per 40 ticks per dimension, 400k cells scanned per
+## tick, the solver sliced by the body manager (`collapseOps` per tick), at most 1.5M blast ops per tick (more explosions fall back to
+## the vanilla result), at most 12 debris bodies per blast, bounded cluster queue.
+
+{.feature: "lenientnils".}
+
+import std/[math, options, tables, strutils, envvars]
+import ../../data/block_ext
+from ../../data/block_state import newBlockStateIdUnchecked, asU16, isAir, isLiquid, BlockState
+import ../../physics/[body, materials, solveradapter, windfield, blast]
+import ../../util/math/position
+import ../../world/[level, worldfs]
+import ../blocklog/blocklogcore
+import ../serverbase
+import ../world/bulkedit
+import bodyentity, bodyworld, bodymanager, triggerhook, triggerlogic
+
+const
+  BlastOpsPerTick = 1500000
+  MaxDebrisBodies = 12
+  MaxBuilt = 4000000
+  MaxCracks = 20000
+  CrackTtl = 600'i64
+  WindEvery = 100'i64
+  WindMinSpeed = 14.0
+  WindRadius = 24
+  WindCooldown = 600'i64
+  TileShift = 5
+  SettingFile = "physics_triggers.txt"
+
+type
+  TrigStats* = object
+    dirty*, checks*, trivial*, noBuilt*, unloaded*, deferredScan*, failed*: int
+    blasts*, blastsOverBudget*, debrisBodies*, impulses*: int
+    windScans*, windChecks*: int
+    tilesLoaded*, logRecords*: int
+
+var gSt: TrigState = newTrigState(defaultTrigConfig())
+var gStats*: TrigStats = TrigStats()
+var gInit = false
+var gKnownWorlds = -1
+var gWorldMode = initTable[string, int]()      # world folder -> mode
+var gWorldSource = initTable[string, string]() # world folder -> where the mode came from
+var gDimMode = initTable[string, int]()        # dimension name -> mode
+var gBuilt = initTable[int64, bool]()
+var gTiles = initTable[int64, bool]()
+var gStruct: seq[uint8] = @[]                  # state id -> 0 unknown, 1 structural, 2 not
+var gBlastLeft = BlastOpsPerTick
+var gCracks: seq[Crack] = @[]
+var gCrackDim: seq[string] = @[]
+var gCrackTick: seq[int64] = @[]
+var gWindNext = initTable[string, int64]()
+var gLastTick = 0'i64
+var gMat = initTable[uint32, BlastMat]()
+var gLastReport* = ""
+
+# ----------------------------------------------------------------------------------------------------------------------
+# keys, structural classes, built knowledge
+
+proc dimCode(dim: string): int64 =
+  if dim == "minecraft:overworld": 0'i64
+  elif dim == "minecraft:the_nether": 1'i64
+  elif dim == "minecraft:the_end": 2'i64
+  else: 3'i64
+
+proc cellKey(dim: string; x, y, z: int32): int64 =
+  (dimCode(dim) shl 62) or ((int64(x) and 0x1FFFFFF'i64) shl 37) or ((int64(z) and 0x1FFFFFF'i64) shl 12) or ((int64(y) + 2048'i64) and 0xFFF'i64)
+
+proc tileKey(dim: string; x, y, z: int32): int64 =
+  cellKey(dim, x shr TileShift, y shr TileShift, z shr TileShift)
+
+proc structural(state: uint32): bool =
+  if state == 0'u32:
+    return false
+  if gStruct.len == 0:
+    gStruct = newSeq[uint8](65536)
+  let i = int(state and 0xFFFF'u32)
+  if gStruct[i] == 0'u8:
+    gStruct[i] = (if isStructural(materialOf(int(state))): 1'u8 else: 2'u8)
+  gStruct[i] == 1'u8
+
+proc placeLike(cause: uint8): bool =
+  cause == CausePlace or cause == CauseCommand or cause == CauseMod or cause == CauseRestore
+
+proc applyBuilt(dim: string; x, y, z: int32; newState: uint32; cause: uint8) =
+  ## The rule that decides "player built", from one change record.
+  let k = cellKey(dim, x, y, z)
+  if newState != 0'u32 and placeLike(cause):
+    if gBuilt.len < MaxBuilt:
+      gBuilt[k] = true
+  else:
+    if gBuilt.hasKey(k):
+      gBuilt.del(k)
+
+proc builtAt*(dim: string; x, y, z: int32): bool =
+  gBuilt.hasKey(cellKey(dim, x, y, z))
+
+proc builtFnImpl(dim: string; x, y, z: int32): bool {.nimcall.} =
+  gBuilt.hasKey(cellKey(dim, x, y, z))
+
+proc ensureTiles(dim: string; minX, minY, minZ, maxX, maxY, maxZ: int32) =
+  ## Reads the block log for the 32 cell tiles of the box that were never read this session (one query for all of them).
+  if not blockLogActive():
+    return
+  var need: seq[int64] = @[]
+  var lo = [high(int32), high(int32), high(int32)]
+  var hi = [low(int32), low(int32), low(int32)]
+  for tz in (minZ shr TileShift) .. (maxZ shr TileShift):
+    for ty in (minY shr TileShift) .. (maxY shr TileShift):
+      for tx in (minX shr TileShift) .. (maxX shr TileShift):
+        let k = cellKey(dim, tx, ty, tz)
+        if not gTiles.hasKey(k):
+          need.add(k)
+          if tx * 32'i32 < lo[0]: lo[0] = tx * 32'i32
+          if ty * 32'i32 < lo[1]: lo[1] = ty * 32'i32
+          if tz * 32'i32 < lo[2]: lo[2] = tz * 32'i32
+          if tx * 32'i32 + 31'i32 > hi[0]: hi[0] = tx * 32'i32 + 31'i32
+          if ty * 32'i32 + 31'i32 > hi[1]: hi[1] = ty * 32'i32 + 31'i32
+          if tz * 32'i32 + 31'i32 > hi[2]: hi[2] = tz * 32'i32 + 31'i32
+  if need.len == 0:
+    return
+  let di = findDim(dim)
+  if di >= 0:
+    let cx = lo[0] + (hi[0] - lo[0]) div 2
+    let cy = lo[1] + (hi[1] - lo[1]) div 2
+    let cz = lo[2] + (hi[2] - lo[2]) div 2
+    var r = max(hi[0] - cx, max(hi[1] - cy, hi[2] - cz))
+    r = r + 1
+    let recs = blockLogQuery(LogQuery(dim: di, x: cx, y: cy, z: cz, radius: r, sinceT: 0'i64, actor: -1, skipRollbacks: false))
+    for rec in recs:
+      let tk = tileKey(dim, rec.x, rec.y, rec.z)
+      if gTiles.hasKey(tk):
+        continue          # a tile read earlier: its live state is already right
+      var wanted = false
+      for n in need:
+        if n == tk:
+          wanted = true
+          break
+      if wanted:
+        applyBuilt(dim, rec.x, rec.y, rec.z, uint32(rec.newS), rec.cause)
+        inc gStats.logRecords
+  for n in need:
+    gTiles[n] = true
+    inc gStats.tilesLoaded
+
+# ----------------------------------------------------------------------------------------------------------------------
+# settings
+
+proc worldRoot(world: World): string =
+  world.level.levelFolder.rootFolder
+
+proc settingPath(world: World): string =
+  joinPathW(joinPathW(worldRoot(world), "aowlmony"), SettingFile)
+
+proc envMode(): int =
+  let v = getEnv("JESTER_PHYSICS_TRIGGERS")
+  if v.len == 0:
+    return ModeOff
+  let m = parseMode(v)
+  if m < 0:
+    return ModeOff
+  m
+
+proc readSetting(world: World; mode: var int; source: var string) =
+  let (st, bytes) = readFileBytes(settingPath(world))
+  if st == rsOk:
+    var t = ""
+    for b in bytes:
+      t.add(char(b))
+    let m = parseMode(t)
+    if m >= 0:
+      mode = m
+      source = "world file"
+      return
+  let e = envMode()
+  if e != ModeOff:
+    mode = e
+    source = "JESTER_PHYSICS_TRIGGERS"
+    return
+  mode = ModeOff
+  source = "default"
+
+proc recompute() =
+  gTrigOn = false
+  gTrigFull = false
+  for k, v in gDimMode:
+    if v != ModeOff:
+      gTrigOn = true
+    if v == ModeFull:
+      gTrigFull = true
+
+proc refreshSettings(server: Server) =
+  gKnownWorlds = server.worlds.len
+  gInit = true
+  for w in server.worlds:
+    let root = worldRoot(w)
+    var m = ModeOff
+    var src = ""
+    if gWorldMode.hasKey(root):
+      m = gWorldMode.getOrDefault(root, ModeOff)
+      src = gWorldSource.getOrDefault(root, "")
+    else:
+      readSetting(w, m, src)
+      gWorldMode[root] = m
+      gWorldSource[root] = src
+    gDimMode[w.dimension.minecraftName] = m
+  recompute()
+
+proc setWorldMode*(world: World; mode: int): bool =
+  ## Applies and persists the setting of the world's folder (all its dimensions).
+  let root = worldRoot(world)
+  gWorldMode[root] = mode
+  gWorldSource[root] = "world file"
+  if world.server != nil:
+    for w in world.server.worlds:
+      if worldRoot(w) == root:
+        gDimMode[w.dimension.minecraftName] = mode
+  else:
+    gDimMode[world.dimension.minecraftName] = mode
+  recompute()
+  var bytes: seq[byte] = @[]
+  for ch in modeName(mode):
+    bytes.add(byte(ord(ch)))
+  bytes.add(byte(10))
+  discard createDirAllW(joinPathW(root, "aowlmony"))
+  writeFileBytes(settingPath(world), bytes)
+
+proc modeOfDim(dim: string): int =
+  gDimMode.getOrDefault(dim, ModeOff)
+
+# ----------------------------------------------------------------------------------------------------------------------
+# the block change hook
+
+proc onChange(dim: string; x, y, z: int32; oldState, newState: uint32; bulk: bool) {.nimcall.} =
+  let mode = modeOfDim(dim)
+  if mode == ModeOff:
+    return
+  let ctx = blockLogCurrent()
+  applyBuilt(dim, x, y, z, newState, ctx.cause)
+  if bulk and ctx.cause == CauseMod:
+    return          # the body manager's own edits (collapse removal, settle): no feedback loop
+  if oldState == 0'u32 and newState == 0'u32:
+    return
+  if ctx.cause == CauseNatural and oldState != 0'u32 and newState != 0'u32:
+    return          # growth, spreading, shape updates: nothing structural changed
+  if not (structural(oldState) or structural(newState)):
+    return
+  inc gStats.dirty
+  var heavy = false
+  if newState != 0'u32 and placeLike(ctx.cause) and structural(newState):
+    heavy = heavyLoad(massOfState(int(newState)), 12)
+  trigAdd(gSt, dim, x, y, z, heavy, gLastTick)
+  # the body manager's wake-near logic and dirty feed
+  let w = worldByDim(dim)
+  if w.isSome:
+    onBlockChanged(w.get, x, y, z, oldState, newState)
+
+# ----------------------------------------------------------------------------------------------------------------------
+# a cluster becomes a check
+
+type
+  ClusterResult = enum crStarted, crTrivial, crUnloaded, crDeferred, crNoBuilt, crFailed
+
+proc cracksIn(dim: string; minX, minY, minZ, maxX, maxY, maxZ: int32): seq[Crack] =
+  result = @[]
+  for i in 0 ..< gCracks.len:
+    if gCrackDim[i] == dim:
+      let c = gCracks[i]
+      if c.x >= minX and c.x <= maxX and c.y >= minY and c.y <= maxY and c.z >= minZ and c.z <= maxZ:
+        result.add(c)
+
+proc submit(world: World; box: VolumeBox; tick: int64): bool =
+  let dim = world.dimension.minecraftName
+  var opts = defaultCollapseOpts()
+  opts.includeTerrain = false
+  opts.onlyBuilt = true
+  opts.builtFn = builtFnImpl
+  opts.cracks = cracksIn(dim, box.minX - 1'i32, box.minY - 1'i32, box.minZ - 1'i32, box.maxX + 1'i32, box.maxY + 1'i32, box.maxZ + 1'i32)
+  let rep = collapseEnqueue(world, box, opts, tick)
+  if rep.done and not rep.ok:
+    gLastReport = "trigger check not started: " & rep.reason
+    return false
+  inc gStats.checks
+  true
+
+proc readSolid(world: World; box: VolumeBox; builtOnly: bool; nx, ny, nz: var int; solid: var seq[bool]; snapOk: var bool; builtCount: var int) =
+  ## Dense `solid` (index x + nx*(z + nz*y), local to `box`) of the structural cells, only the player built ones when `builtOnly`.
+  let snap = readVolume(world, box)
+  snapOk = snap.status == esOk
+  builtCount = 0
+  nx = int(box.maxX - box.minX) + 1
+  ny = int(box.maxY - box.minY) + 1
+  nz = int(box.maxZ - box.minZ) + 1
+  if not snapOk:
+    solid = @[]
+    return
+  let dim = world.dimension.minecraftName
+  solid = newSeq[bool](nx * ny * nz)
+  for sec in snap.sections:
+    let vals = sec.blocks.cells()
+    for y in sec.y0 .. sec.y1:
+      for z in sec.z0 .. sec.z1:
+        for x in sec.x0 .. sec.x1:
+          let st = vals[y * 256 + z * 16 + x]
+          if st != 0'u32 and structural(st):
+            let wx = sec.cx * 16'i32 + int32(x)
+            let wy = sec.baseY + int32(y)
+            let wz = sec.cz * 16'i32 + int32(z)
+            let isBuilt = gBuilt.hasKey(cellKey(dim, wx, wy, wz))
+            if isBuilt:
+              inc builtCount
+            if isBuilt or not builtOnly:
+              solid[int(wx - box.minX) + nx * (int(wz - box.minZ) + nz * int(wy - box.minY))] = true
+
+proc yRange(world: World; lo, hi: var int32) =
+  let d = world.dimension
+  if lo < d.minY:
+    lo = d.minY
+  if hi > d.minY + d.height - 1'i32:
+    hi = d.minY + d.height - 1'i32
+
+proc processCluster(cl: Cluster; tick: int64): ClusterResult =
+  let ww = worldByDim(cl.dim)
+  if ww.isNone:
+    return crUnloaded
+  let world = ww.get
+  var bx = [0, 0, 0, 0, 0, 0]
+  var nx = 0
+  var ny = 0
+  var nz = 0
+  var solid: seq[bool] = @[]
+  var ok = false
+  var builtCount = 0
+  var tried = 0
+  var reach = int32(gSt.cfg.reach)
+  while true:
+    var lo = [cl.minX - reach, cl.minY - reach, cl.minZ - reach]
+    var hi = [cl.maxX + reach, cl.maxY + reach, cl.maxZ + reach]
+    yRange(world, lo[1], hi[1])
+    bx = [int(lo[0]), int(lo[1]), int(lo[2]), int(hi[0]), int(hi[1]), int(hi[2])]
+    let centre = [int((cl.minX + cl.maxX) div 2), int((cl.minY + cl.maxY) div 2), int((cl.minZ + cl.maxZ) div 2)]
+    clampBox(bx, centre, gSt.cfg.maxBoxCells)
+    let cells = (bx[3] - bx[0] + 1) * (bx[4] - bx[1] + 1) * (bx[5] - bx[2] + 1)
+    if tried == 0 and not trigScanSpend(gSt, cells):
+      inc gStats.deferredScan
+      return crDeferred
+    inc tried
+    ensureTiles(cl.dim, int32(bx[0]), int32(bx[1]), int32(bx[2]), int32(bx[3]), int32(bx[4]), int32(bx[5]))
+    if gBuilt.len == 0:
+      return crNoBuilt
+    let box = volumeBox(int32(bx[0]), int32(bx[1]), int32(bx[2]), int32(bx[3]), int32(bx[4]), int32(bx[5]))
+    readSolid(world, box, true, nx, ny, nz, solid, ok, builtCount)
+    if ok:
+      break
+    # part of the reach is not loaded: look less far (the structure itself must be loaded)
+    if reach <= 4'i32:
+      return crUnloaded
+    reach = reach div 2'i32
+  if builtCount == 0:
+    return crNoBuilt
+  # seeds: the solid built cells in the dirty box and one cell around it
+  var seeds: seq[int] = @[]
+  for z in max(int(cl.minZ) - 1, bx[2]) .. min(int(cl.maxZ) + 1, bx[5]):
+    for y in max(int(cl.minY) - 1, bx[1]) .. min(int(cl.maxY) + 1, bx[4]):
+      for x in max(int(cl.minX) - 1, bx[0]) .. min(int(cl.maxX) + 1, bx[3]):
+        let i = (x - bx[0]) + nx * ((z - bx[2]) + nz * (y - bx[1]))
+        if solid[i]:
+          seeds.add(i)
+  var comp: array[6, int]
+  var count = 0
+  if seeds.len == 0 or not componentBox(solid, nx, ny, nz, seeds, 1000000, comp, count):
+    return crNoBuilt
+  if count < gSt.cfg.minStructure:
+    return crTrivial
+  # the check box: the structure plus 2 (its supports and what it rests on)
+  var cb = [bx[0] + comp[0] - 2, bx[1] + comp[1] - 2, bx[2] + comp[2] - 2, bx[0] + comp[3] + 2, bx[1] + comp[4] + 2, bx[2] + comp[5] + 2]
+  var ylo = int32(cb[1])
+  var yhi = int32(cb[4])
+  yRange(world, ylo, yhi)
+  cb[1] = int(ylo)
+  cb[4] = int(yhi)
+  clampBox(cb, [bx[0] + (comp[0] + comp[3]) div 2, bx[1] + (comp[1] + comp[4]) div 2, bx[2] + (comp[2] + comp[5]) div 2], gSt.cfg.maxBoxCells)
+  if submit(world, volumeBox(int32(cb[0]), int32(cb[1]), int32(cb[2]), int32(cb[3]), int32(cb[4]), int32(cb[5])), tick):
+    return crStarted
+  crFailed
+
+# ----------------------------------------------------------------------------------------------------------------------
+# wind (full): a strong gust at a player checks the tall thin player built columns around
+
+proc windScan(server: Server; tick: int64) =
+  if tick mod WindEvery != 0'i64:
+    return
+  for w in server.worlds:
+    let dim = w.dimension.minecraftName
+    if modeOfDim(dim) != ModeFull or w.players.len == 0:
+      continue
+    if gWindNext.getOrDefault(dim, 0'i64) > tick:
+      continue
+    let pl = w.players[int((tick div WindEvery) mod int64(w.players.len))]
+    let wv = windAtWorld(float64(tick), pl.pos.x, pl.pos.y + 10.0, pl.pos.z)
+    if wv.speed < WindMinSpeed:
+      continue
+    inc gStats.windScans
+    gWindNext[dim] = tick + WindCooldown
+    let px = int32(floor(pl.pos.x))
+    let py = int32(floor(pl.pos.y))
+    let pz = int32(floor(pl.pos.z))
+    var lo = py - 12'i32
+    var hi = py + 60'i32
+    yRange(w, lo, hi)
+    let box = volumeBox(px - int32(WindRadius), lo, pz - int32(WindRadius), px + int32(WindRadius), hi, pz + int32(WindRadius))
+    if not trigScanSpend(gSt, volumeCells(box)):
+      continue
+    ensureTiles(dim, box.minX, box.minY, box.minZ, box.maxX, box.maxY, box.maxZ)
+    if gBuilt.len == 0:
+      continue
+    var nx = 0
+    var ny = 0
+    var nz = 0
+    var solid: seq[bool] = @[]
+    var ok = false
+    var builtCount = 0
+    readSolid(w, box, true, nx, ny, nz, solid, ok, builtCount)
+    if not ok or builtCount == 0:
+      continue
+    if tallColumns(solid, nx, ny, nz, 12, 3) == 0:
+      continue
+    if not trigTake(gSt, dim, tick):
+      continue
+    if submit(w, box, tick):
+      inc gStats.windChecks
+
+# ----------------------------------------------------------------------------------------------------------------------
+# explosions (full)
+
+proc blastMatOf(sid: uint32): BlastMat =
+  if sid == 0'u32:
+    return BlastMat(present: false, solid: false, liquid: false, resistance: 0.0, state: 0, mass: 0.0)
+  if gMat.hasKey(sid):
+    return gMat.getOrDefault(sid, BlastMat())
+  let dataId = newBlockStateIdUnchecked(uint16(sid))
+  let st = BlockState.fromId(dataId)
+  let blk = Block.fromStateId(dataId)
+  let liquid = st.isLiquid() or blk.isWaterlogged(dataId)
+  let present = (not st.isAir()) or liquid
+  var m = BlastMat(present: present, solid: isSolidState(sid) and not liquid, liquid: liquid, resistance: float64(blk.blastResistance),
+    state: int(sid), mass: massOfState(int(sid)))
+  if gMat.len < 70000:
+    gMat[sid] = m
+  m
+
+var gBlastWorlds: seq[World] = @[]
+var gBlastOx = 0
+var gBlastOy = 0
+var gBlastOz = 0
+
+proc blastCell(x, y, z: int): BlastMat =
+  blastMatOf(stateIdAt(gBlastWorlds[0], gBlastOx + x, gBlastOy + y, gBlastOz + z))
+
+proc explodeSelect(dim: string; cx, cy, cz: float64; power: float64; cells: var seq[int32]; noLoot: var seq[bool]): bool {.nimcall.} =
+  if modeOfDim(dim) != ModeFull or power <= 0.0:
+    return false
+  if gBlastLeft <= 0:
+    inc gStats.blastsOverBudget
+    return false
+  let ww = worldByDim(dim)
+  if ww.isNone:
+    return false
+  let world = ww.get
+  let (ox, oy, oz, size) = blastBox(cx, cy, cz, power)
+  gBlastWorlds.setLen(0)
+  gBlastWorlds.add(world)
+  gBlastOx = ox
+  gBlastOy = oy
+  gBlastOz = oz
+  var p = defaultBlastParams(cx, cy, cz, power, ox, oy, oz, size, size, size, uint64(gLastTick) * 2654435761'u64 + uint64(gStats.blasts))
+  p.maxDebris = 4000
+  var targets: seq[BlastTarget] = @[]
+  let live = bodyList()
+  for bi in 0 ..< live.len:
+    let be = live[bi]
+    if be.world != world:
+      continue
+    let ab = bodyAabb(be)
+    if ab.x1 < float64(ox) or ab.x0 > float64(ox + size) or ab.y1 < float64(oy) or ab.y0 > float64(oy + size) or ab.z1 < float64(oz) or
+        ab.z0 > float64(oz + size):
+      continue
+    targets.add(BlastTarget(kind: tkBody, idHi: be.body.idHi, idLo: be.body.idLo, body: be.body))
+  let r = runBlast(p, blastCell, targets)
+  gBlastLeft -= int(min(r.ops, int64(high(int32))))
+  inc gStats.blasts
+  # the removed cells
+  let nxz = size * size
+  var debrisAt = initTable[int, int]()
+  var spawned = 0
+  for k in 0 ..< r.debris.len:
+    let d = r.debris[k]
+    if d.kind == dkBody and spawned < MaxDebrisBodies:
+      let b = makeDebrisBody(d, 0'u64, 0'u64)
+      discard spawnDebrisBody(world, b, gLastTick)
+      debrisAt[d.cell] = 1
+      inc spawned
+  gStats.debrisBodies += spawned
+  for i in r.destroyed:
+    let y = i div nxz
+    let rem = i - y * nxz
+    let z = rem div size
+    let x = rem - z * size
+    cells.add(int32(ox + x))
+    cells.add(int32(oy + y))
+    cells.add(int32(oz + z))
+    noLoot.add(debrisAt.hasKey(i))
+  # cracks for the check that follows
+  for cc in r.cracked:
+    if gCracks.len >= MaxCracks:
+      break
+    let y = cc.cell div nxz
+    let rem = cc.cell - y * nxz
+    let z = rem div size
+    let x = rem - z * size
+    gCracks.add(Crack(x: int32(ox + x), y: int32(oy + y), z: int32(oz + z), mult: cc.mult))
+    gCrackDim.add(dim)
+    gCrackTick.add(gLastTick)
+  # impulses on the bodies
+  for ev in r.impulses:
+    if ev.target == tkBody:
+      for bi in 0 ..< live.len:
+        let be = live[bi]
+        if be.body.idHi == ev.idHi and be.body.idLo == ev.idLo:
+          applyImpulseEvent(be.body, ev)
+          wakeBody(be)
+          inc gStats.impulses
+          break
+  true
+
+# ----------------------------------------------------------------------------------------------------------------------
+# the tick
+
+proc expireCracks(tick: int64) =
+  if gCracks.len == 0:
+    return
+  var i = 0
+  while i < gCracks.len:
+    if tick - gCrackTick[i] > CrackTtl:
+      let lastCrack = gCracks[gCracks.len - 1]
+      let lastDim = gCrackDim[gCrackDim.len - 1]
+      let lastTick = gCrackTick[gCrackTick.len - 1]
+      gCracks[i] = lastCrack
+      gCrackDim[i] = lastDim
+      gCrackTick[i] = lastTick
+      gCracks.setLen(gCracks.len - 1)
+      gCrackDim.setLen(gCrackDim.len - 1)
+      gCrackTick.setLen(gCrackTick.len - 1)
+    else:
+      inc i
+
+proc tickTriggers*(server: Server) =
+  ## ONE call per server tick (servermod.tickWorlds, after tickBodies). With every world OFF this is two tests.
+  if not gInit or server.worlds.len != gKnownWorlds:
+    refreshSettings(server)
+    gTrigChange = onChange
+    gTrigExplode = explodeSelect
+  if not gTrigOn:
+    return
+  let tick = server.tickCounter
+  gLastTick = tick
+  trigBeginTick(gSt)
+  discard bodyDirtyDrain()    # `onChange` feeds it for the wake-near logic; nothing else reads it, keep it empty
+  gBlastLeft = BlastOpsPerTick
+  if tick mod 100'i64 == 0'i64:
+    expireCracks(tick)
+  var attempts = 0
+  while attempts < 4:
+    inc attempts
+    let ripe = trigPop(gSt, tick, collapseJobsQueued())
+    if ripe.len == 0:
+      break
+    var again = false
+    for cl in ripe:
+      let r = processCluster(cl, tick)
+      case r
+      of crStarted:
+        discard
+      of crDeferred:
+        trigRefund(gSt, cl.dim, tick)
+        trigPush(gSt, cl)
+      of crTrivial:
+        inc gStats.trivial
+        trigRefund(gSt, cl.dim, tick)
+        again = true
+      of crNoBuilt:
+        inc gStats.noBuilt
+        trigRefund(gSt, cl.dim, tick)
+        again = true
+      of crUnloaded:
+        inc gStats.unloaded
+        trigRefund(gSt, cl.dim, tick)
+        again = true
+      of crFailed:
+        inc gStats.failed
+        again = true
+    if not again:
+      break
+  windScan(server, tick)
+
+# ----------------------------------------------------------------------------------------------------------------------
+# /body triggers
+
+proc triggerStatusLines*(server: Server): seq[string] =
+  result = @[]
+  if server != nil:
+    for w in server.worlds:
+      let root = worldRoot(w)
+      result.add("physics_triggers " & w.dimension.minecraftName & ": " & modeName(gWorldMode.getOrDefault(root, ModeOff)) & " (" &
+        gWorldSource.getOrDefault(root, "default") & ")")
+  result.add("queue: " & $gSt.clusters.len & " clusters, " & $gSt.added & " dirty cells seen, " & $gSt.started & " checks started, " &
+    $collapseJobsQueued() & " solver jobs queued")
+  result.add("deferred: " & $gSt.deferredRate & " by the rate limit, " & $gSt.deferredBusy & " by checks in flight, " & $gStats.deferredScan &
+    " by the scan budget")
+  result.add("checks " & $gStats.checks & ", trivial structures " & $gStats.trivial & ", nothing built " & $gStats.noBuilt & ", unloaded " &
+    $gStats.unloaded & ", failed " & $gStats.failed)
+  result.add("built cells known " & $gBuilt.len & ", tiles read from the block log " & $gStats.tilesLoaded & " (" & $gStats.logRecords &
+    " records), block log " & (if blockLogActive(): "on" else: "OFF: only changes of this session count as built"))
+  result.add("blasts " & $gStats.blasts & " (over budget " & $gStats.blastsOverBudget & "), debris bodies " & $gStats.debrisBodies &
+    ", body impulses " & $gStats.impulses & ", cracks held " & $gCracks.len & ", wind scans " & $gStats.windScans & " (checks " & $gStats.windChecks & ")")
+  if gLastReport.len > 0:
+    result.add("last problem: " & gLastReport)
+
+proc triggerExec*(world: World; parts: seq[string]): seq[string] =
+  ## `/body triggers off|structures|full|status`: the words after `triggers`.
+  result = @[]
+  if parts.len == 0 or parts[0] == "status":
+    result.add("Physics triggers: " & modeName(modeOfDim(world.dimension.minecraftName)) & " in this world. Usage: /body triggers off|structures|full|status")
+    for l in triggerStatusLines(world.server):
+      result.add(l)
+    return
+  let m = parseMode(parts[0])
+  if m < 0:
+    result.add("Usage: /body triggers off|structures|full|status")
+    return
+  if setWorldMode(world, m):
+    result.add("physics_triggers is now " & modeName(m) & " for this world (saved in aowlmony/" & SettingFile & ").")
+  else:
+    result.add("physics_triggers is now " & modeName(m) & " for this session; the setting file could not be written.")
+  if m != ModeOff and not blockLogActive():
+    result.add("Note: the block log is off, so only blocks changed from now on count as player built.")
+  if m == ModeFull:
+    result.add("Full: explosions use the blast model, strong gusts check tall player built columns. Bases can collapse.")
+  elif m == ModeStructures:
+    result.add("Structures: overloaded player built structures can collapse when blocks change. Bases can collapse.")

@@ -1,0 +1,174 @@
+## Pure tests of the trigger logic (triggerlogic.aowl): modes, clustering, debounce, heavy fast path, maxWait, rate limit, in-flight
+## limit, starts per tick, flood bound, scan budget, flood fill reach, tall column scan, heavy load rule, box clamp.
+## Build: aowlmony c -p:src -p:src/physics src/server/body/triggertest.aowl ; exit 0 and "ALL PASS" when everything holds.
+
+import std/[syncio]
+import triggerlogic
+
+var failures = 0
+
+proc check(name: string; cond: bool) =
+  if cond:
+    echo "PASS ", name
+  else:
+    echo "FAIL ", name
+    inc failures
+
+proc solidBox(nx, ny, nz: int): seq[bool] =
+  newSeq[bool](nx * ny * nz)
+
+proc setS(s: var seq[bool]; nx, nz, x, y, z: int) =
+  s[x + nx * (z + nz * y)] = true
+
+proc main() =
+  # modes
+  check("parse off", parseMode("off") == ModeOff)
+  check("parse Structures", parseMode(" Structures ") == ModeStructures)
+  check("parse FULL", parseMode("FULL") == ModeFull)
+  check("parse junk", parseMode("maybe") == -1)
+  check("mode names", modeName(0) == "off" and modeName(1) == "structures" and modeName(2) == "full")
+
+  # clustering + debounce
+  var st = newTrigState(defaultTrigConfig())
+  trigAdd(st, "o", 10, 64, 10, false, 100)
+  trigAdd(st, "o", 12, 64, 11, false, 101)
+  trigAdd(st, "o", 300, 64, 300, false, 101)
+  check("two clusters (near merged, far apart)", st.clusters.len == 2 and st.clusters[0].cells == 2)
+  check("cluster box grows", st.clusters[0].maxX == 12 and st.clusters[0].minX == 10 and st.clusters[0].maxZ == 11)
+  trigBeginTick(st)
+  check("not ripe before the debounce", trigPop(st, 105, 0).len == 0)
+  var ripe = trigPop(st, 110, 0)
+  check("ripe after the quiet time, one start per tick", ripe.len == 1 and ripe[0].minX == 10)
+  trigBeginTick(st)
+  ripe = trigPop(st, 111, 0)
+  check("the second goes next tick", ripe.len == 1 and ripe[0].minX == 300)
+  check("queue empty", st.clusters.len == 0)
+
+  # a busy cell keeps postponing, maxWait forces it
+  st = newTrigState(defaultTrigConfig())
+  trigAdd(st, "o", 0, 0, 0, false, 0)
+  var forced = false
+  for t in 1 .. 100:
+    trigAdd(st, "o", 1, 0, 0, false, int64(t))
+    trigBeginTick(st)
+    let r = trigPop(st, int64(t), 0)
+    if r.len > 0:
+      forced = (t >= 80 and t < 90)
+      break
+  check("a long build is checked by maxWait (80 ticks)", forced)
+
+  # heavy fast path
+  st = newTrigState(defaultTrigConfig())
+  trigAdd(st, "o", 5, 5, 5, false, 10)
+  trigAdd(st, "o", 50, 5, 50, true, 10)
+  trigBeginTick(st)
+  ripe = trigPop(st, 12, 0)
+  check("a heavy block is ripe after 2 ticks, and first", ripe.len == 1 and ripe[0].heavy and ripe[0].minX == 50)
+
+  # rate limit: burst 3, then one per 40 ticks
+  st = newTrigState(defaultTrigConfig())
+  var started = 0
+  for k in 0 ..< 10:
+    trigAdd(st, "o", int32(k * 100), 0, 0, false, int64(k))
+  for t in 10 .. 60:
+    trigBeginTick(st)
+    started += trigPop(st, int64(t), 0).len
+  check("burst of 3 then limited (3 starts within 50 ticks, got " & $started & ")", started == 3 or started == 4)
+  check("rate deferrals were counted", st.deferredRate > 0)
+  trigBeginTick(st)
+  check("a token returns after rateEvery ticks", trigPop(st, 150, 0).len == 1)
+  # another dimension has its own bucket
+  trigAdd(st, "n", 0, 0, 0, false, 150)
+  trigBeginTick(st)
+  check("the nether has its own bucket", trigPop(st, 170, 0).len >= 1)
+
+  # in-flight limit
+  st = newTrigState(defaultTrigConfig())
+  trigAdd(st, "o", 0, 0, 0, false, 0)
+  trigBeginTick(st)
+  check("no start while 2 checks are in flight", trigPop(st, 50, 2).len == 0 and st.deferredBusy == 1)
+  trigBeginTick(st)
+  check("starts once one finished", trigPop(st, 51, 1).len == 1)
+
+  # flood bound: a TNT worth of scattered cells
+  st = newTrigState(defaultTrigConfig())
+  for i in 0 ..< 5000:
+    trigAdd(st, "o", int32((i * 37) mod 400), int32((i * 11) mod 90), int32((i * 53) mod 400), false, 5)
+  check("5000 dirty cells stay within maxClusters (" & $st.clusters.len & ")", st.clusters.len <= 32)
+  check("every dirty cell was counted", st.added == 5000)
+  var total = 0
+  for t in 20 .. 400:
+    trigBeginTick(st)
+    total += trigPop(st, int64(t), 0).len
+  check("a flood starts at most burst + refill checks in 380 ticks (" & $total & ")", total <= 3 + 380 div 40 + 1)
+
+  # refund / push / take
+  st = newTrigState(defaultTrigConfig())
+  for k in 0 ..< 3:
+    trigAdd(st, "o", int32(k * 100), 0, 0, false, 0)
+  for t in 10 .. 12:
+    trigBeginTick(st)
+    discard trigPop(st, int64(t), 0)
+  check("burst spent", trigTokens(st, "o", 12) < 1.0)
+  trigRefund(st, "o", 12)
+  check("refund returns a token", trigTake(st, "o", 12) and not trigTake(st, "o", 12))
+  trigPush(st, Cluster(dim: "o", minX: 1, minY: 1, minZ: 1, maxX: 1, maxY: 1, maxZ: 1, firstTick: 0, lastTick: 0, heavy: false, cells: 1, merged: false))
+  check("push puts a cluster back", st.clusters.len == 1)
+
+  # scan budget
+  st = newTrigState(defaultTrigConfig())
+  trigBeginTick(st)
+  check("first draw passes even when big", trigScanSpend(st, 900000))
+  check("then nothing is left this tick", not trigScanSpend(st, 10))
+  trigBeginTick(st)
+  check("budget back next tick", trigScanSpend(st, 100000) and trigScanSpend(st, 200000) and not trigScanSpend(st, 200000))
+
+  # flood fill reach
+  let nx = 12
+  let ny = 6
+  let nz = 5
+  var s = solidBox(nx, ny, nz)
+  for x in 0 ..< 10:
+    setS(s, nx, nz, x, 2, 2)           # a bridge along x
+  setS(s, nx, nz, 11, 5, 4)            # an unrelated block
+  var box: array[6, int]
+  var cnt = 0
+  let seeds = @[5 + nx * (2 + nz * 2)]
+  check("flood fill finds the bridge", componentBox(s, nx, ny, nz, seeds, 100000, box, cnt) and cnt == 10)
+  check("component box", box[0] == 0 and box[3] == 9 and box[1] == 2 and box[4] == 2 and box[2] == 2 and box[5] == 2)
+  check("an air seed finds nothing", not componentBox(s, nx, ny, nz, @[0], 100, box, cnt))
+  check("maxCells stops the fill", componentBox(s, nx, ny, nz, seeds, 4, box, cnt) and cnt == 4)
+
+  # tall column scan
+  var t2 = solidBox(9, 30, 9)
+  for y in 0 ..< 20:
+    setS(t2, 9, 9, 4, y, 4)
+  check("a 20 high pole is a tall column", tallColumns(t2, 9, 30, 9, 12, 2) == 1)
+  var wall = solidBox(9, 30, 9)
+  for y in 0 ..< 20:
+    for z in 0 ..< 9:
+      setS(wall, 9, 9, 4, y, z)
+      setS(wall, 9, 9, 3, y, z)
+  check("a thick wall is not thin", tallColumns(wall, 9, 30, 9, 12, 2) == 0)
+  var low = solidBox(9, 30, 9)
+  for y in 0 ..< 6:
+    setS(low, 9, 9, 4, y, 4)
+  check("a 6 high pole is not tall", tallColumns(low, 9, 30, 9, 12, 2) == 0)
+
+  # heavy load rule
+  check("iron (3300) is heavy on a short span", heavyLoad(3300.0, 4))
+  check("planks (650) never", not heavyLoad(650.0, 16))
+  check("stone (2880) heavy on a long span only", heavyLoad(2880.0, 12) and not heavyLoad(2880.0, 4))
+
+  # clamp
+  var cb = [0, 0, 0, 99, 99, 99]
+  clampBox(cb, [50, 50, 50], 200000)
+  check("box clamped under the cell cap", (cb[3] - cb[0] + 1) * (cb[4] - cb[1] + 1) * (cb[5] - cb[2] + 1) <= 200000)
+  check("clamp keeps the centre", cb[0] <= 50 and cb[3] >= 50 and cb[1] <= 50 and cb[4] >= 50)
+
+main()
+if failures == 0:
+  echo "ALL PASS"
+else:
+  echo "FAILED ", failures
+quit(if failures == 0: 0 else: 1)
