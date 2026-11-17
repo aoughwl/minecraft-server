@@ -52,6 +52,9 @@ import bodyentity, bodyworld, bodyjournal
 export bodyentity, bodyjournal
 
 const
+  MaxFxEvents = 4096
+  MaxImpactFxPerBody = 3         ## impact effects per body and tick
+  ImpactFxEveryTicks = 4'i64     ## and per body at most one tick in this many
   MaxProviderCells* = 6000       ## above this many surface cells a body answers with one body-wide box
   MaxAssembleCells* = 20000      ## largest component `assembleBox` turns into a body
   MaxEvents = 65536
@@ -98,6 +101,19 @@ type
     vel*, angVel*: Vec3         ## blocks per tick of the centre of mass, rad per tick (world frame)
     sleeping*: bool
     volume*: Body               ## shared, treat as read only; its cell set is final only on bekCreate
+
+  BodyFxEvent* = object
+    ## An effect the networking task turns into `jester:fx` EFFECT (fx viewers) or a vanilla level event (everybody else).
+    ## `kind` is the wire kind of PROTOCOL.md section 5: 0 break, 1 impact, 2 snap, 3 crumble, 4 land.
+    kind*: int
+    dim*: string
+    x*, y*, z*: int32
+    state*: uint32
+    impulse*: float32           ## N*s
+    bodyId*: int32              ## 0: none
+    hasNormal*: bool
+    nx*, ny*, nz*: int          ## the wire value, unit normal * 127
+    tick*: int64
 
   AssembleResult* = object
     ok*: bool
@@ -163,6 +179,8 @@ var gReplayed: seq[string] = @[]
 var gCursor = 0
 var gLastTick: int64 = 0'i64
 var gEvents: seq[BodyEvent] = @[]
+var gFx: seq[BodyFxEvent] = @[]
+var gLastImpactFx = initTable[int32, int64]()
 var gStatePending = initTable[int32, int]()
 var gEventsOverflow* = false
 var gDirty: seq[BlockDirty] = @[]
@@ -351,6 +369,15 @@ proc bodyEventsSnapshot*(): seq[BodyEvent] =
     if be.phase == bpFree:
       result.add(makeEvent(bekCreate, be, drNone, gLastTick))
 
+proc bodyFxDrain*(): seq[BodyFxEvent] =
+  ## The effects queued since the last call (break, impact, crumble, land), in order. Empties the queue.
+  result = gFx
+  gFx = @[]
+
+proc pushFx(ev: BodyFxEvent) =
+  if gFx.len < MaxFxEvents:
+    gFx.add(ev)
+
 proc bodyDirtyDrain*(): seq[BlockDirty] =
   result = gDirty
   gDirty = @[]
@@ -509,17 +536,16 @@ proc bodyReset*() =
 # ----------------------------------------------------------------------------------------------------------------------
 # effects of cells that break
 
-proc breakEffects(world: World; x, y, z: int32; state: uint32) =
-  ## Item drops of the block's loot table and the break particles for a cell that is destroyed.
+proc breakEffects(world: World; x, y, z: int32; state: uint32; bodyId: int32 = 0'i32) =
+  ## Item drops of the block's loot table and the break effect for a cell that is destroyed. The effect goes into the feed
+  ## (`bodyFxDrain`): the networking task sends jester:fx to fx viewers and the vanilla level event to the rest, never both.
   if state == 0'u32:
     return
   let sid = newBlockStateIdUnchecked(uint16(state))
   let pos = newBlockPos(x, y, z)
   blockDropLoot(world, pos, sid, nil)
-  let bw = world.blockWorld
-  if bw != nil:
-    let particles = bw.broadcastBlockBreakParticles0
-    particles(pos, sid, nil)
+  pushFx(BodyFxEvent(kind: 0, dim: world.dimension.minecraftName, x: x, y: y, z: z, state: state, impulse: 100.0'f32, bodyId: bodyId,
+    hasNormal: false, tick: gLastTick))
   inc gStats.cellsDropped
 
 # ----------------------------------------------------------------------------------------------------------------------
@@ -693,7 +719,7 @@ proc buildPlacement(cells: seq[Cell]; bes: seq[VolumeBlockEntity]; mnx, mny, mnz
 proc dropBodyAsItems(be: BodyEntity; tick: int64) =
   for c in cellList(be.body):
     let p = worldPointOf(be, float64(c.x) + 0.5, float64(c.y) + 0.5, float64(c.z) + 0.5)
-    breakEffects(be.world, int32(floor(p.x)), int32(floor(p.y)), int32(floor(p.z)), uint32(c.state))
+    breakEffects(be.world, int32(floor(p.x)), int32(floor(p.y)), int32(floor(p.z)), uint32(c.state), be.id)
   destroyBody(be, drDropped, tick)
 
 proc settleBody*(be: BodyEntity; strict: bool; tick: int64): SettleOutcome =
@@ -762,6 +788,9 @@ proc settleBody*(be: BodyEntity; strict: bool; tick: int64): SettleOutcome =
   result.ok = true
   result.cells = placed.len
   inc gStats.settled
+  if placed.len > 0:
+    pushFx(BodyFxEvent(kind: 4, dim: be.dim, x: placed[0].x, y: placed[0].y, z: placed[0].z, state: uint32(placed[0].state),
+      impulse: float32(be.body.mass), bodyId: be.id, hasNormal: false, tick: tick))
   destroyBody(be, drSettled, tick)
 
 proc removeBody*(be: BodyEntity; tick: int64): SettleOutcome =
@@ -807,7 +836,7 @@ proc applyShatter(be: BodyEntity; events: seq[ImpactEvent]; tick: int64) =
   inc gStats.shattered
   for c in res.broken:
     let p = worldPointOf(be, float64(c.x) + 0.5, float64(c.y) + 0.5, float64(c.z) + 0.5)
-    breakEffects(be.world, int32(floor(p.x)), int32(floor(p.y)), int32(floor(p.z)), uint32(c.state))
+    breakEffects(be.world, int32(floor(p.x)), int32(floor(p.y)), int32(floor(p.z)), uint32(c.state), be.id)
   if res.pieces.len == 0:
     destroyBody(be, drEmptied, tick)
     return
@@ -847,6 +876,40 @@ proc areaLoaded(be: BodyEntity): bool =
         return false
   true
 
+proc wireNormal(v: float64): int =
+  var r = int(floor(v * 127.0 + 0.5))
+  if r > 127: r = 127
+  if r < -127: r = -127
+  r
+
+proc pushImpactFx(be: BodyEntity; impacts: seq[ImpactEvent]; tick: int64) =
+  ## The strongest few impacts of a step as fx events (kind 1), at most one burst per body every few ticks.
+  if gLastImpactFx.hasKey(be.id) and tick - gLastImpactFx.getOrDefault(be.id, 0'i64) < ImpactFxEveryTicks:
+    return
+  gLastImpactFx[be.id] = tick
+  var order: seq[int] = @[]
+  for i in 0 ..< impacts.len:
+    order.add(i)
+  # strongest first (insertion sort: the list is short)
+  for i in 1 ..< order.len:
+    let cur = order[i]
+    var j = i
+    while j > 0 and impacts[cur].rawEnergy > impacts[order[j - 1]].rawEnergy:
+      let prev = order[j - 1]
+      order[j] = prev
+      dec j
+    order[j] = cur
+  let perCell = be.body.mass / float64(max(1, cellCount(be.body)))
+  var sent = 0
+  for k in order:
+    if sent >= MaxImpactFxPerBody:
+      break
+    let ie = impacts[k]
+    let p = worldPointOf(be, float64(ie.cell.x) + 0.5, float64(ie.cell.y) + 0.5, float64(ie.cell.z) + 0.5)
+    pushFx(BodyFxEvent(kind: 1, dim: be.dim, x: int32(floor(p.x)), y: int32(floor(p.y)), z: int32(floor(p.z)), state: uint32(ie.cell.state),
+      impulse: float32(perCell * ie.speed * 20.0), bodyId: be.id, hasNormal: true, nx: wireNormal(ie.nx), ny: wireNormal(ie.ny), nz: wireNormal(ie.nz), tick: tick))
+    inc sent
+
 proc stepOne(be: BodyEntity; tick: int64) =
   let w = be.world
   if not areaLoaded(be):
@@ -855,6 +918,8 @@ proc stepOne(be: BodyEntity; tick: int64) =
   let env = makeEnv(w)
   let impacts = stepBody(be.sim, env, int(tick))
   inc gStats.steps
+  if impacts.len > 0:
+    pushImpactFx(be, impacts, tick)
   let com = comWorld(be.body)
   if com.y < float64(w.getBottomY() - int32(gCfg.voidMargin)):
     inc gStats.voided
@@ -1067,6 +1132,10 @@ proc collapseApply*(job: CollapseJob; tick: int64) =
           inc gStats.collapseBroken, gone.len
           for c in gone:
             breakEffects(world, c.x, c.y, c.z, uint32(c.state))
+          if gone.len >= 8:
+            let mid = gone[gone.len div 2]
+            pushFx(BodyFxEvent(kind: 3, dim: world.dimension.minecraftName, x: mid.x, y: mid.y, z: mid.z, state: uint32(mid.state),
+              impulse: float32(gone.len) * 1000.0'f32, bodyId: 0'i32, hasNormal: false, tick: tick))
         else:
           rep.reason = "failed cells could not be removed: " & statusName(r.status)
       else:

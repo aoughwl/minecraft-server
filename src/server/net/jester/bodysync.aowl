@@ -1,0 +1,373 @@
+## The server end of `jester:bodies` and `jester:fx`, and the vanilla fallback (overnight/PROTOCOL.md sections 3, 5 and 6).
+##
+## `tickBodySync(server)` runs ONCE per server tick right after `tickBodies`. It drains the body manager's event feed once, keeps a model of
+## the live bodies (`bodyroute.BodyView`), and for every player decides how that player sees them:
+##   * the player's Jester handshake granted `bodystream` (and the client was not cut back to level 1): `jester:bodies` RESET / CREATE / STATE /
+##     DESTROY from bodyroute.jesterTick, RESYNC_REQ and ACK from the inbox (net/java/play.aowl pushes them there);
+##   * everybody else: `block_display` entities (displayfallback.bodyDisplayPackets: anchor + greedy cuboids, interpolation, re-anchor), shown
+##     and updated by bodyroute.fallbackTick, sent as raw packets of the player's protocol version. Switch it off with the environment
+##     variable JESTER_DISPLAY_FALLBACK=0 (then such players see no bodies at all).
+## Effects: body breaks, impacts, crumbles and landings (bodymanager.bodyFxDrain) go to players with `fx` as `jester:fx` EFFECT and to the others
+## as the vanilla level event 2001 (block break particles and sound), never both.
+##
+## Not here: interaction (hitbox) entities for the fallback, movement authority for vanilla clients (PROTOCOL.md open questions 5 and 6).
+
+import std/[options, syncio, envvars]
+import bodymsg, fxmsg, codec, bodyroute, bodyinbox, displayfallback
+import ../../serverbase
+import ../../body/bodymanager
+import ../../entity/playerextras
+import ../java/javamod
+import ../../../plugin/payloads
+import ../../../plugin/pluginhooksblock
+import ../../../physics/body as physbody
+import ../../../protocol/java/client/play/worldevent
+import ../../../generated/[world_event, block_state_remap]
+import ../../../util/[javaversion, vector3]
+import ../../../util/math/position
+
+const
+  FxRadius = 96.0
+  MaxJesterFxPerTick = 48
+  MaxVanillaFxPerTick = 24
+  PruneEvery = 200'i64
+
+type
+  SyncStats* = object
+    ticks*, jesterFrames*, jesterBytes*, fallbackPackets*, fxJester*, fxVanilla*, resets*, resyncReqs*: int
+
+  ModelBody = object
+    volume: Body
+    cuboids: seq[Cuboid]
+    cuboidsReady: bool
+    firstEntity: int32
+    heldUntil: int64
+    goneReason: int
+
+  FbState = object
+    bodyId: int32
+    st: BodyDisplayState
+
+  Slot = object
+    name: string
+    entityId: int32
+    mode: ViewMode
+    dim: string
+    seen: int64
+    jv: JesterViewer
+    fb: FbViewer
+    fbStates: seq[FbState]
+    fxSent: int
+    vanillaSent: int
+
+var
+  gInit = false
+  gSeed = 0'i64
+  gStarted = false
+  gTick = 0'i64
+  gModel: seq[ModelBody] = @[]
+  gViews: seq[BodyView] = @[]          ## parallel to gModel
+  gSlots: seq[Slot] = @[]
+  gFallbackEnabled* = true
+  gSyncStats = SyncStats()
+
+# ---- model ------------------------------------------------------------------------------------------------------------------------
+
+proc syncStats*(): SyncStats = gSyncStats
+
+proc modelIndex(id: int32): int =
+  result = -1
+  for i in 0 ..< gViews.len:
+    if gViews[i].id == id: return i
+
+proc srcCells(b: Body): seq[SrcCell] =
+  result = @[]
+  let list = cellList(b)
+  for c in list:
+    result.add SrcCell(x: int(c.x), y: int(c.y), z: int(c.z), state: int(c.state))
+
+proc applyPose(v: var BodyView; ev: BodyEvent) =
+  let c = rotate(ev.orient, ev.volume.com)
+  v.pos = (ev.pos.x + c.x, ev.pos.y + c.y, ev.pos.z + c.z)
+  v.quat = (ev.orient.x, ev.orient.y, ev.orient.z, ev.orient.w)
+  v.vel = (ev.vel.x, ev.vel.y, ev.vel.z)
+  v.angVel = (ev.angVel.x, ev.angVel.y, ev.angVel.z)
+  v.sleeping = ev.sleeping
+  v.dim = ev.dim
+  v.comLocal = (float32(ev.volume.com.x), float32(ev.volume.com.y), float32(ev.volume.com.z))
+
+proc rebuildParts(v: var BodyView; vol: Body) =
+  v.parts = buildParts(int(v.id), srcCells(vol), (vol.com.x, vol.com.y, vol.com.z), vol.mass)
+
+proc upsert(ev: BodyEvent) =
+  let at = modelIndex(ev.bodyId)
+  if at < 0:
+    var v = BodyView(id: ev.bodyId, dim: ev.dim, held: false, gen: 1, cuboids: 0)
+    applyPose(v, ev)
+    rebuildParts(v, ev.volume)
+    gViews.add v
+    gModel.add ModelBody(volume: ev.volume, cuboids: @[], cuboidsReady: false, firstEntity: 0'i32, heldUntil: 0'i64, goneReason: 0)
+    return
+  if gViews[at].held: return
+  applyPose(gViews[at], ev)
+  if gModel[at].volume != ev.volume:
+    # the volume was replaced (a shattered body): the clients get DESTROY + CREATE
+    gModel[at].volume = ev.volume
+    gModel[at].cuboids = @[]
+    gModel[at].cuboidsReady = false
+    inc gViews[at].gen
+    rebuildParts(gViews[at], ev.volume)
+
+proc goneReasonOf(r: DestroyReason): int =
+  case r
+  of drDropped, drEmptied: 1
+  else: 0
+
+proc markGone(ev: BodyEvent; tick: int64) =
+  let at = modelIndex(ev.bodyId)
+  if at < 0: return
+  gViews[at].held = true
+  gModel[at].goneReason = goneReasonOf(ev.reason)
+  # a settled body: its block updates leave first, the DESTROY a tick later (PROTOCOL.md 3.4)
+  gModel[at].heldUntil = (if ev.reason == drSettled or ev.reason == drRemoved: tick + 1'i64 else: tick)
+
+proc resnapshot(tick: int64) =
+  ## Rebuilds the model from the live bodies (first call, or the manager's feed overflowed and lost events).
+  let live = bodyEventsSnapshot()
+  for i in 0 ..< gViews.len:
+    var still = false
+    for ev in live:
+      if ev.bodyId == gViews[i].id: still = true
+    if not still and not gViews[i].held:
+      gViews[i].held = true
+      gModel[i].goneReason = 0
+      gModel[i].heldUntil = tick
+  for ev in live:
+    upsert(ev)
+
+proc releaseHeld(tick: int64): seq[GoneBody] =
+  result = @[]
+  var i = 0
+  while i < gViews.len:
+    if gViews[i].held and gModel[i].heldUntil <= tick:
+      result.add GoneBody(id: gViews[i].id, reason: gModel[i].goneReason)
+      gViews.delete(i)
+      gModel.delete(i)
+    else:
+      inc i
+
+# ---- slots ------------------------------------------------------------------------------------------------------------------------
+
+proc slotIndex(name: string): int =
+  result = -1
+  for i in 0 ..< gSlots.len:
+    if gSlots[i].name == name: return i
+
+proc newSlot(name: string; entityId: int32): Slot =
+  Slot(name: name, entityId: entityId, mode: vmNone, dim: "", seen: 0'i64, jv: newJesterViewer(0, 16000), fb: newFbViewer(), fbStates: @[])
+
+proc remapState(state, version: int): int =
+  if state <= 0: return 0
+  int(remapBlockStateForVersion(uint16(state), JavaMinecraftVersion(version)))
+
+# ---- vanilla fallback sending ------------------------------------------------------------------------------------------------------
+
+proc sendRaw(p: Player; dp: DisplayPacket) =
+  var buf: seq[byte] = @[]
+  putVarint(buf, int64(dp.packetId))
+  for b in dp.payload: buf.add b
+  p.client.sendPacketNowData(buf)
+  inc gSyncStats.fallbackPackets
+
+proc ensureCuboids(server: Server; i: int) =
+  ## The display cuboids of a body and its entity ids (shared by every viewer), computed once per volume.
+  if gModel[i].cuboidsReady: return
+  var cells: seq[displayfallback.Cell] = @[]
+  let list = cellList(gModel[i].volume)
+  for c in list:
+    cells.add displayfallback.Cell(x: c.x, y: c.y, z: c.z, state: uint32(c.state))
+  let r = mergeCuboids(cells, MaxBodyCuboids)
+  gModel[i].cuboids = r.cuboids
+  gModel[i].cuboidsReady = true
+  gViews[i].cuboids = r.cuboids.len
+  gModel[i].firstEntity = server.nextEntityId
+  server.nextEntityId = server.nextEntityId + int32(max(1, r.cuboids.len))
+  if r.leftover.len > 0:
+    echo "[body] display fallback: body " & $gViews[i].id & " needs " & $r.needed & " cuboids, " & $r.leftover.len & " cells are not drawn"
+
+proc fbStateIndex(s: Slot; id: int32): int =
+  result = -1
+  for i in 0 ..< s.fbStates.len:
+    if s.fbStates[i].bodyId == id: return i
+
+proc fbConfig(p: Player; period: int): DisplayConfig =
+  var cfg = defaultDisplayConfig()
+  cfg.version = p.client.version
+  cfg.updateHz = int32(20 div max(1, period))
+  cfg
+
+proc fbHideAll(p: Player; s: var Slot) =
+  let cfg = fbConfig(p, 2)
+  for k in 0 ..< s.fbStates.len:
+    if s.fbStates[k].st.spawned:
+      sendRaw(p, removeDisplayPacket(s.fbStates[k].st, cfg))
+  s.fbStates = @[]
+  fbForget(s.fb)
+
+proc tickFallback(server: Server; p: Player; s: var Slot; px, py, pz: float64) =
+  let dim = p.world.dimension.minecraftName
+  if s.dim != dim:
+    s.fbStates = @[]            # the client dropped its entities with the old world
+  let actions = fallbackTick(s.fb, gViews, dim, px, py, pz, gTick)
+  for a in actions:
+    let at = modelIndex(a.bodyId)
+    case a.kind
+    of fbHide:
+      let k = fbStateIndex(s, a.bodyId)
+      if k >= 0:
+        sendRaw(p, removeDisplayPacket(s.fbStates[k].st, fbConfig(p, a.period)))
+        s.fbStates.delete(k)
+    of fbShow, fbUpdate:
+      if at < 0: continue
+      ensureCuboids(server, at)
+      if gModel[at].cuboids.len == 0: continue
+      var k = fbStateIndex(s, a.bodyId)
+      if k < 0:
+        s.fbStates.add FbState(bodyId: a.bodyId, st: newBodyDisplayState(a.bodyId, gModel[at].firstEntity, gModel[at].cuboids.len))
+        k = s.fbStates.len - 1
+      let v = gViews[at]
+      let pose = BodyPose(pos: v.pos, quat: (float32(v.quat[0]), float32(v.quat[1]), float32(v.quat[2]), float32(v.quat[3])), com: v.comLocal)
+      let pk = bodyDisplayPackets(s.fbStates[k].st, pose, gModel[at].cuboids, fbConfig(p, a.period))
+      for dp in pk.spawns: sendRaw(p, dp)
+      for dp in pk.teleports: sendRaw(p, dp)
+      for dp in pk.metadata: sendRaw(p, dp)
+
+# ---- fx -----------------------------------------------------------------------------------------------------------------------------
+
+proc fxSeed(ev: BodyFxEvent): int =
+  int((int64(ev.x) * 73856093'i64) xor (int64(ev.y) * 19349663'i64) xor (int64(ev.z) * 83492791'i64) xor ev.tick) and 0xFFFF
+
+proc sendFx(server: Server; evs: seq[BodyFxEvent]) =
+  for ev in evs:
+    for world in server.worlds:
+      if world.dimension.minecraftName != ev.dim: continue
+      for p in world.players:
+        if p.client.gone or p.client.closed: continue
+        let dx = p.pos.x - (float64(ev.x) + 0.5)
+        let dy = p.pos.y - (float64(ev.y) + 0.5)
+        let dz = p.pos.z - (float64(ev.z) + 0.5)
+        if dx * dx + dy * dy + dz * dz > FxRadius * FxRadius: continue
+        let si = slotIndex(p.gameprofile.name)
+        if si < 0: continue
+        if playerHasCapability(p.gameprofile.name, "fx"):
+          if gSlots[si].fxSent >= MaxJesterFxPerTick: continue
+          inc gSlots[si].fxSent
+          let fe = FxEvent(kind: ev.kind, pos: (int(ev.x), int(ev.y), int(ev.z)), state: remapState(int(ev.state), int(p.client.version)),
+            material: 0, impulse: ev.impulse, seed: fxSeed(ev), hasBody: ev.bodyId != 0'i32, bodyId: int(ev.bodyId), hasNormal: ev.hasNormal,
+            normal: (ev.nx, ev.ny, ev.nz))
+          p.sendCustomPayload(FxChannel, encodeFx(fe))
+          inc gSyncStats.fxJester
+        elif ev.kind == FxBreak or ev.kind == FxImpact or ev.kind == FxLand:
+          if gSlots[si].vanillaSent >= MaxVanillaFxPerTick: continue
+          inc gSlots[si].vanillaSent
+          p.client.writePacketFor(CWorldEvent(event: int32(ord(weParticlesDestroyBlock)), location: newBlockPos(ev.x, ev.y, ev.z),
+            data: int32(ev.state), disableRelativeVolume: false))
+          inc gSyncStats.fxVanilla
+
+# ---- the tick ---------------------------------------------------------------------------------------------------------------------
+
+proc answerHello(player: string; data: seq[byte]): seq[byte] {.closure.} =
+  jesterHello(player, data, int(gTick), gSeed)
+
+proc bodySyncInit*() =
+  if gInit: return
+  gInit = true
+  # The handshake answer: the plugin host (engine) installs this hook when it runs; a server without it would never answer a hello, so
+  # the body stream installs the same answer. A host that installs its own later simply replaces it with the same behaviour.
+  gPluginJesterHook = answerHello
+  advertiseCapabilityBit(CapBodyStream)
+  advertiseCapabilityBit(CapFx)
+  advertiseCapabilityBit(CapPhysics2)
+  if getEnv("JESTER_DISPLAY_FALLBACK") == "0":
+    gFallbackEnabled = false
+
+proc handleInbox() =
+  let items = bodiesInboxDrain()
+  for item in items:
+    let name = item[0]
+    let data = item[1]
+    let si = slotIndex(name)
+    if si < 0 or data.len == 0: continue
+    if int(data[0]) == BodyResyncReq:
+      var lastSeq = 0
+      var reason = 0
+      if decodeBodyResyncReq(data, lastSeq, reason):
+        onResyncReq(gSlots[si].jv, gTick)
+        inc gSyncStats.resyncReqs
+    elif int(data[0]) == BodyAck:
+      var sq = 0
+      if decodeBodyAck(data, sq):
+        onAck(gSlots[si].jv, sq)
+
+proc tickBodySync*(server: Server) =
+  bodySyncInit()
+  gTick = server.tickCounter
+  if server.worlds.len > 0: gSeed = int64(server.worlds[0].level.seed)
+  inc gSyncStats.ticks
+  # the manager's feed, once
+  let overflowed = gEventsOverflow
+  let evs = bodyEventsDrain()
+  if not gStarted or overflowed:
+    gStarted = true
+    resnapshot(gTick)
+  for ev in evs:
+    case ev.kind
+    of bekCreate, bekState: upsert(ev)
+    of bekDestroy: markGone(ev, gTick)
+  let gone = releaseHeld(gTick)
+  let fx = bodyFxDrain()
+  handleInbox()
+  # players
+  for i in 0 ..< gSlots.len:
+    gSlots[i].fxSent = 0
+    gSlots[i].vanillaSent = 0
+  for world in server.worlds:
+    let dim = world.dimension.minecraftName
+    for p in world.players:
+      if p.client.gone or p.client.closed: continue
+      let name = p.gameprofile.name
+      var si = slotIndex(name)
+      if si < 0:
+        gSlots.add newSlot(name, p.entityId)
+        si = gSlots.len - 1
+      if gSlots[si].entityId != p.entityId:
+        # a new connection under the same name
+        gSlots[si] = newSlot(name, p.entityId)
+      gSlots[si].seen = gTick
+      let has = playerHasCapability(name, "bodystream")
+      let mode = selectMode(has, gSlots[si].jv.cut, gFallbackEnabled)
+      if mode != gSlots[si].mode:
+        if gSlots[si].mode == vmFallback:
+          fbHideAll(p, gSlots[si])
+        if mode == vmJester:
+          gSlots[si].jv = newJesterViewer(int(p.client.version), jesterClientOf(name).maxFrame)
+        gSlots[si].mode = mode
+      case mode
+      of vmJester:
+        let msgs = jesterTick(gSlots[si].jv, gViews, gone, dim, p.pos.x, p.pos.y, p.pos.z, gTick, remapState)
+        for m in msgs:
+          p.sendCustomPayload(BodiesChannel, m)
+          gSyncStats.jesterBytes += m.len
+          inc gSyncStats.jesterFrames
+          if int(m[0]) == BodyReset: inc gSyncStats.resets
+      of vmFallback:
+        tickFallback(server, p, gSlots[si], p.pos.x, p.pos.y, p.pos.z)
+      of vmNone:
+        discard
+      gSlots[si].dim = dim
+  sendFx(server, fx)
+  if gTick mod PruneEvery == 0'i64:
+    var kept: seq[Slot] = @[]
+    for s in gSlots:
+      if gTick - s.seen < PruneEvery * 2'i64: kept.add s
+    gSlots = kept

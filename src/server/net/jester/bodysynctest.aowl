@@ -1,0 +1,370 @@
+## Tests of the body stream routing and state machine (bodyroute.aowl): seq/base chain, delta state and keyframes, asleep, the view
+## radius with hysteresis, resync flow and its rate limit, frame splitting, wire parts of big bodies, jester versus fallback selection.
+## No network, no world: a tiny client decodes what the router produces.
+
+import std/[assertions, syncio, math]
+import codec, bodymsg, bodyroute
+
+proc identity(state, version: int): int = state
+
+proc oneCellBody(id: int32; x, y, z: float64): BodyView =
+  let cells = @[SrcCell(x: 0, y: 0, z: 0, state: 5)]
+  BodyView(id: id, dim: "minecraft:overworld", pos: (x, y, z), quat: (0.0, 0.0, 0.0, 1.0), vel: (0.0, 0.0, 0.0), angVel: (0.0, 0.0, 0.0),
+    sleeping: false, held: false, gen: 1, parts: buildParts(int(id), cells, (0.5, 0.5, 0.5), 100.0), cuboids: 1)
+
+# ---- a client ------------------------------------------------------------------------------------------------------------------------
+
+type
+  CBody = object
+    id: int
+    x, y, z: float64
+    rot: uint32
+    vel: (int, int, int)
+    asleep: bool
+
+  Client = object
+    lastSeq: int
+    bodies: seq[CBody]
+    resets: int
+    lastResetReason: int
+    gaps: int
+    stateFrames: int
+    destroyed: seq[(int, int)]     ## reason, id
+    absolute: int
+
+proc idx(c: Client; id: int): int =
+  result = -1
+  for i in 0 ..< c.bodies.len:
+    if c.bodies[i].id == id: return i
+
+proc feed(c: var Client; msgs: seq[seq[byte]]) =
+  for m in msgs:
+    case int(m[0])
+    of BodyReset:
+      var ok = false
+      let r = decodeBodyReset(m, ok)
+      assert ok
+      c.bodies = @[]
+      c.lastSeq = r.seqNo
+      c.lastResetReason = r.reason
+      inc c.resets
+    of BodyCreate:
+      var a = CreateAssembler()
+      assert feedBodyCreate(a, m)
+      if a.done:
+        c.bodies.add CBody(id: a.head.bodyId, x: a.head.pos[0], y: a.head.pos[1], z: a.head.pos[2], rot: a.head.quat, vel: a.head.vel, asleep: false)
+    of BodyDestroy:
+      var reason = 0
+      var ids: seq[int] = @[]
+      assert decodeBodyDestroy(m, reason, ids)
+      for id in ids:
+        c.destroyed.add (reason, id)
+        let at = idx(c, id)
+        if at >= 0: c.bodies.delete(at)
+    of BodyState:
+      var ok = false
+      let s = decodeBodyState(m, ok)
+      assert ok
+      if s.base != c.lastSeq: inc c.gaps
+      c.lastSeq = s.seqNo
+      inc c.stateFrames
+      for e in s.entries:
+        let at = idx(c, e.bodyId)
+        assert at >= 0         # never a STATE entry for a body that was not CREATEd
+        if (e.flags and StatePos) != 0:
+          if (e.flags and StateAbsolute) != 0:
+            c.bodies[at].x = e.absPos[0]
+            c.bodies[at].y = e.absPos[1]
+            c.bodies[at].z = e.absPos[2]
+            inc c.absolute
+          else:
+            c.bodies[at].x = c.bodies[at].x + float64(e.pos[0]) / 1024.0
+            c.bodies[at].y = c.bodies[at].y + float64(e.pos[1]) / 1024.0
+            c.bodies[at].z = c.bodies[at].z + float64(e.pos[2]) / 1024.0
+        if (e.flags and StateRot) != 0: c.bodies[at].rot = e.rot
+        if (e.flags and StateVel) != 0: c.bodies[at].vel = e.vel
+        c.bodies[at].asleep = (e.flags and StateAsleep) != 0
+    else:
+      assert false
+
+# ---- wire parts ---------------------------------------------------------------------------------------------------------------------
+
+block parts:
+  var cells: seq[SrcCell] = @[]
+  for x in 0 ..< 40:
+    cells.add SrcCell(x: x - 3, y: 7, z: 2, state: (if x < 20: 10 else: 11))
+  let ps = buildParts(3, cells, (16.5, 7.5, 2.5), 400.0)
+  assert ps.len == 2
+  assert ps[0].wireId == 3 * 1024 and ps[1].wireId == 3 * 1024 + 1
+  assert ps[0].size == (32, 1, 1) and ps[1].size == (8, 1, 1)
+  assert ps[0].palette == @[0, 10, 11] and ps[1].palette == @[0, 11]
+  # the body's centre of mass seen from each part's own minimum corner: the world position is pos + R * (p - com)
+  assert ps[0].com[0] == float32(16.5 - (-3.0)) and ps[1].com[0] == float32(16.5 - 29.0)
+  assert abs(float64(ps[0].mass) - 400.0 * 32.0 / 40.0) < 1e-3
+  # a 33 x 1 x 1 body, a single cell, an empty body
+  assert buildParts(1, @[SrcCell(x: 0, y: 0, z: 0, state: 1), SrcCell(x: 32, y: 0, z: 0, state: 1)], (0.0, 0.0, 0.0), 2.0).len == 2
+  assert buildParts(1, @[], (0.0, 0.0, 0.0), 2.0).len == 0
+  # cells index (y*sz + z)*sx + x
+  let two = buildParts(1, @[SrcCell(x: 1, y: 1, z: 0, state: 4), SrcCell(x: 0, y: 0, z: 0, state: 4)], (0.0, 0.0, 0.0), 2.0)
+  assert two[0].size == (2, 2, 1) and two[0].cells == @[1, 0, 0, 1]
+
+# ---- selection ----------------------------------------------------------------------------------------------------------------------
+
+block selection:
+  assert selectMode(true, false, true) == vmJester
+  assert selectMode(true, false, false) == vmJester
+  assert selectMode(false, false, true) == vmFallback          # vanilla client or Jester level 1: display entities
+  assert selectMode(false, false, false) == vmNone              # fallback switched off: nothing
+  assert selectMode(true, true, true) == vmFallback             # cut back to level 1
+  assert selectMode(true, true, false) == vmNone
+
+# ---- view radius --------------------------------------------------------------------------------------------------------------------
+
+block radius:
+  assert inView(false, 128.0) and not inView(false, 128.5)
+  assert inView(true, 144.0) and not inView(true, 144.5)         # hysteresis 16
+  assert statePeriod(10.0) == 1 and statePeriod(48.0) == 1 and statePeriod(60.0) == 2 and statePeriod(96.0) == 2 and statePeriod(97.0) == 4
+
+# ---- the state machine --------------------------------------------------------------------------------------------------------------
+
+block stream:
+  var v = newJesterViewer(0, 16000)
+  var c = Client()
+  var b = oneCellBody(1, 10.5, 70.5, 10.5)
+  # tick 1: RESET (seq 1) then the CREATE
+  let t1 = jesterTick(v, @[b], @[], "minecraft:overworld", 0.0, 70.0, 0.0, 1'i64, identity)
+  assert t1.len == 2
+  assert int(t1[0][0]) == BodyReset and int(t1[1][0]) == BodyCreate
+  feed(c, t1)
+  assert c.resets == 1 and c.lastResetReason == 0 and c.lastSeq == 1
+  assert c.bodies.len == 1 and c.bodies[0].id == 1024 and c.bodies[0].x == 10.5
+  # ticks 2..60: falling with a velocity that is not a multiple of the quantum; the client follows within 1/1024 and the base chain holds
+  var y = 70.5
+  var vy = 0.0
+  for tick in 2 .. 60:
+    vy = vy - 0.0017
+    y = y + vy
+    b.pos = (10.5 + 0.0123 * float64(tick), y, 10.5)
+    b.vel = (0.0123, vy, 0.0)
+    feed(c, jesterTick(v, @[b], @[], "minecraft:overworld", 0.0, 70.0, 0.0, int64(tick), identity))
+    assert abs(c.bodies[0].x - b.pos[0]) <= 1.0 / 1024.0
+    assert abs(c.bodies[0].y - b.pos[1]) <= 1.0 / 1024.0
+  assert c.gaps == 0 and c.stateFrames == 59
+  assert c.lastSeq == 60                                          # RESET 1 + 59 STATE frames, one seq each
+  assert c.bodies[0].vel[1] == int(floor(vy * 2048.0 + 0.5))
+  # tick 100 is a keyframe: absolute position, even for a body that has not moved
+  let before = c.absolute
+  for tick in 61 .. 100:
+    feed(c, jesterTick(v, @[b], @[], "minecraft:overworld", 0.0, 70.0, 0.0, int64(tick), identity))
+  assert c.absolute == before + 1
+  assert c.bodies[0].x == b.pos[0] and c.bodies[0].y == b.pos[1]
+  # asleep: one entry with the flag, then zero bytes
+  b.sleeping = true
+  b.vel = (0.0, 0.0, 0.0)
+  let sl = jesterTick(v, @[b], @[], "minecraft:overworld", 0.0, 70.0, 0.0, 101'i64, identity)
+  assert sl.len == 1
+  feed(c, sl)
+  assert c.bodies[0].asleep
+  for tick in 102 .. 140:
+    assert jesterTick(v, @[b], @[], "minecraft:overworld", 0.0, 70.0, 0.0, int64(tick), identity).len == 0
+  # wakes: it moves again
+  b.sleeping = false
+  b.pos = (b.pos[0], b.pos[1] + 0.5, b.pos[2])
+  b.vel = (0.0, 0.1, 0.0)
+  feed(c, jesterTick(v, @[b], @[], "minecraft:overworld", 0.0, 70.0, 0.0, 141'i64, identity))
+  assert not c.bodies[0].asleep and abs(c.bodies[0].y - b.pos[1]) <= 1.0 / 1024.0
+  assert c.gaps == 0
+
+block leaving:
+  var v = newJesterViewer(0, 16000)
+  var c = Client()
+  var b = oneCellBody(2, 100.0, 64.0, 0.0)
+  feed(c, jesterTick(v, @[b], @[], "minecraft:overworld", 0.0, 64.0, 0.0, 1'i64, identity))
+  assert c.bodies.len == 1
+  b.pos = (140.0, 64.0, 0.0)                                     # 140 from the viewer: inside 128 + 16
+  feed(c, jesterTick(v, @[b], @[], "minecraft:overworld", 0.0, 64.0, 0.0, 2'i64, identity))
+  assert c.bodies.len == 1
+  b.pos = (150.0, 64.0, 0.0)                                     # beyond: DESTROY reason 2
+  feed(c, jesterTick(v, @[b], @[], "minecraft:overworld", 0.0, 64.0, 0.0, 3'i64, identity))
+  assert c.bodies.len == 0 and c.destroyed == @[(2, 2048)]
+  b.pos = (135.0, 64.0, 0.0)                                     # back inside the hysteresis band but not the entry radius: nothing
+  assert jesterTick(v, @[b], @[], "minecraft:overworld", 0.0, 64.0, 0.0, 4'i64, identity).len == 0
+  b.pos = (120.0, 64.0, 0.0)                                     # enters again with a CREATE
+  let again = jesterTick(v, @[b], @[], "minecraft:overworld", 0.0, 64.0, 0.0, 5'i64, identity)
+  assert again.len == 1 and int(again[0][0]) == BodyCreate
+  feed(c, again)
+  # the body is destroyed by the world: DESTROY with the reason it had (1 = broke)
+  feed(c, jesterTick(v, @[], @[GoneBody(id: 2, reason: 1)], "minecraft:overworld", 0.0, 64.0, 0.0, 6'i64, identity))
+  assert c.bodies.len == 0 and c.destroyed[1] == (1, 2048)
+  # a held body (settled; its block updates go first) is neither updated nor destroyed yet
+  var h = oneCellBody(3, 5.0, 64.0, 0.0)
+  feed(c, jesterTick(v, @[h], @[], "minecraft:overworld", 0.0, 64.0, 0.0, 7'i64, identity))
+  assert c.bodies.len == 1
+  h.held = true
+  h.pos = (6.0, 64.0, 0.0)
+  assert jesterTick(v, @[h], @[], "minecraft:overworld", 0.0, 64.0, 0.0, 8'i64, identity).len == 0
+  feed(c, jesterTick(v, @[], @[GoneBody(id: 3, reason: 0)], "minecraft:overworld", 0.0, 64.0, 0.0, 9'i64, identity))
+  assert c.bodies.len == 0 and c.destroyed[2] == (0, 3072)
+
+block volumeChange:
+  var v = newJesterViewer(0, 16000)
+  var c = Client()
+  var b = oneCellBody(4, 5.0, 64.0, 5.0)
+  feed(c, jesterTick(v, @[b], @[], "minecraft:overworld", 0.0, 64.0, 0.0, 1'i64, identity))
+  b.gen = 2                                                       # shattered: another volume
+  let t = jesterTick(v, @[b], @[], "minecraft:overworld", 0.0, 64.0, 0.0, 2'i64, identity)
+  assert t.len == 2 and int(t[0][0]) == BodyDestroy and int(t[1][0]) == BodyCreate
+
+block dimension:
+  var v = newJesterViewer(0, 16000)
+  var c = Client()
+  let b = oneCellBody(5, 5.0, 64.0, 5.0)
+  feed(c, jesterTick(v, @[b], @[], "minecraft:overworld", 0.0, 64.0, 0.0, 1'i64, identity))
+  # the viewer goes to the nether: RESET reason 0 and the overworld body is not created there
+  let t = jesterTick(v, @[b], @[], "minecraft:the_nether", 0.0, 64.0, 0.0, 2'i64, identity)
+  assert t.len == 1 and int(t[0][0]) == BodyReset
+  feed(c, t)
+  assert c.resets == 2 and c.bodies.len == 0 and c.lastResetReason == 0
+
+block resync:
+  var v = newJesterViewer(0, 16000)
+  var c = Client()
+  let b = oneCellBody(6, 5.0, 64.0, 5.0)
+  feed(c, jesterTick(v, @[b], @[], "minecraft:overworld", 0.0, 64.0, 0.0, 1'i64, identity))
+  # a request: RESET reason 1 and every body again, seq continues
+  onResyncReq(v, 30'i64)
+  let t = jesterTick(v, @[b], @[], "minecraft:overworld", 0.0, 64.0, 0.0, 31'i64, identity)
+  assert t.len == 2 and int(t[0][0]) == BodyReset and int(t[1][0]) == BodyCreate
+  feed(c, t)
+  assert c.lastResetReason == 1 and c.lastSeq == 2 and c.bodies.len == 1
+  # a second one within a second is not answered with another RESET
+  onResyncReq(v, 40'i64)
+  assert jesterTick(v, @[b], @[], "minecraft:overworld", 0.0, 64.0, 0.0, 41'i64, identity).len == 0
+  # five in ten seconds are fine, the sixth cuts the client back to level 1
+  var v2 = newJesterViewer(0, 16000)
+  var c2 = Client()
+  feed(c2, jesterTick(v2, @[b], @[], "minecraft:overworld", 0.0, 64.0, 0.0, 1'i64, identity))
+  for i in 0 ..< 5:
+    onResyncReq(v2, int64(100 + i * 25))
+    assert not v2.cut
+  onResyncReq(v2, 225'i64)
+  assert v2.cut
+  let cutMsgs = jesterTick(v2, @[b], @[], "minecraft:overworld", 0.0, 64.0, 0.0, 226'i64, identity)
+  assert cutMsgs.len == 1
+  feed(c2, cutMsgs)
+  assert c2.lastResetReason == 2 and c2.bodies.len == 0
+  assert jesterTick(v2, @[b], @[], "minecraft:overworld", 0.0, 64.0, 0.0, 227'i64, identity).len == 0
+  assert selectMode(true, v2.cut, true) == vmFallback
+  # requests spread over time never cut
+  var v3 = newJesterViewer(0, 16000)
+  for i in 0 ..< 20:
+    onResyncReq(v3, int64(i * 60))
+  assert not v3.cut
+  # ack is only recorded
+  onAck(v3, 40)
+  assert v3.lastAck == 40
+
+block split:
+  # many bodies and a small max_frame: several STATE messages, each its own seq with the base chain
+  var v = newJesterViewer(0, 1200)
+  assert v.maxFrame == 1200
+  var c = Client()
+  var bodies: seq[BodyView] = @[]
+  for i in 1 .. 80:
+    bodies.add oneCellBody(int32(i), float64(i) * 0.5, 64.0, 0.0)
+  feed(c, jesterTick(v, bodies, @[], "minecraft:overworld", 0.0, 64.0, 0.0, 1'i64, identity))
+  assert c.bodies.len == 80
+  for i in 0 ..< bodies.len:
+    bodies[i].pos = (bodies[i].pos[0] + 0.25, 64.0, 0.0)
+    bodies[i].vel = (0.25, 0.0, 0.0)
+  let msgs = jesterTick(v, bodies, @[], "minecraft:overworld", 0.0, 64.0, 0.0, 2'i64, identity)
+  assert msgs.len > 1
+  for m in msgs: assert m.len <= 1200
+  feed(c, msgs)
+  assert c.gaps == 0 and c.stateFrames == msgs.len and c.lastSeq == 1 + msgs.len
+  for cb in c.bodies: assert abs(cb.x - (float64(cb.id div 1024) * 0.5 + 0.25)) <= 1.0 / 1024.0
+
+block farRate:
+  # a body 60 blocks away is updated every second tick
+  var v = newJesterViewer(0, 16000)
+  var c = Client()
+  var b = oneCellBody(7, 60.0, 64.0, 0.0)
+  feed(c, jesterTick(v, @[b], @[], "minecraft:overworld", 0.0, 64.0, 0.0, 1'i64, identity))
+  var sent = 0
+  for tick in 2 .. 41:
+    b.pos = (60.0 + 0.01 * float64(tick), 64.0, 0.0)
+    sent += jesterTick(v, @[b], @[], "minecraft:overworld", 0.0, 64.0, 0.0, int64(tick), identity).len
+  assert sent == 20
+
+block createParts:
+  # a big body is several CREATEs (several wire bodies sharing the pose), then one STATE entry per part
+  var cells: seq[SrcCell] = @[]
+  for x in 0 ..< 40:
+    cells.add SrcCell(x: x, y: 0, z: 0, state: 9)
+  var b = BodyView(id: 8, dim: "minecraft:overworld", pos: (20.0, 64.5, 0.5), quat: (0.0, 0.0, 0.0, 1.0), vel: (0.0, 0.0, 0.0), angVel: (0.0, 0.0, 0.0),
+    sleeping: false, held: false, gen: 1, parts: buildParts(8, cells, (20.0, 0.5, 0.5), 800.0), cuboids: 1)
+  var v = newJesterViewer(0, 16000)
+  var c = Client()
+  let t = jesterTick(v, @[b], @[], "minecraft:overworld", 20.0, 64.0, 0.0, 1'i64, identity)
+  assert t.len == 3
+  feed(c, t)
+  assert c.bodies.len == 2 and c.bodies[0].id == 8 * 1024 and c.bodies[1].id == 8 * 1024 + 1
+  b.pos = (21.0, 64.5, 0.5)
+  let st = jesterTick(v, @[b], @[], "minecraft:overworld", 20.0, 64.0, 0.0, 2'i64, identity)
+  assert st.len == 1
+  feed(c, st)
+  assert c.bodies[0].x == 21.0 and c.bodies[1].x == 21.0
+
+# ---- the fallback viewer ------------------------------------------------------------------------------------------------------------
+
+block fallback:
+  var f = newFbViewer()
+  var b = oneCellBody(1, 10.0, 64.0, 0.0)
+  b.cuboids = 3
+  let a1 = fallbackTick(f, @[b], "minecraft:overworld", 0.0, 64.0, 0.0, 1'i64)
+  assert a1.len == 1 and a1[0].kind == fbShow and a1[0].bodyId == 1
+  assert fbIsShown(f, 1) and fbShownCount(f) == 1
+  # translating: an update every second tick (10 Hz), nothing for a body that does not move
+  var ups = 0
+  for tick in 2 .. 21:
+    b.pos = (10.0 + 0.1 * float64(tick), 64.0, 0.0)
+    for a in fallbackTick(f, @[b], "minecraft:overworld", 0.0, 64.0, 0.0, int64(tick)):
+      assert a.kind == fbUpdate and a.period == 2
+      inc ups
+  assert ups == 10
+  var idle = 0
+  for tick in 22 .. 40:
+    idle += fallbackTick(f, @[b], "minecraft:overworld", 0.0, 64.0, 0.0, int64(tick)).len
+  assert idle == 0
+  # falls asleep: one last update, then silence
+  b.sleeping = true
+  var last = 0
+  for tick in 41 .. 50:
+    last += fallbackTick(f, @[b], "minecraft:overworld", 0.0, 64.0, 0.0, int64(tick)).len
+  assert last == 1
+  # leaves the view radius (hysteresis) and is hidden; comes back and is shown again
+  b.pos = (200.0, 64.0, 0.0)
+  let gone = fallbackTick(f, @[b], "minecraft:overworld", 0.0, 64.0, 0.0, 51'i64)
+  assert gone.len == 1 and gone[0].kind == fbHide and not fbIsShown(f, 1)
+  b.pos = (100.0, 64.0, 0.0)
+  assert fallbackTick(f, @[b], "minecraft:overworld", 0.0, 64.0, 0.0, 52'i64)[0].kind == fbShow
+  # destroyed: hidden
+  let h = fallbackTick(f, @[], "minecraft:overworld", 0.0, 64.0, 0.0, 53'i64)
+  assert h.len == 1 and h[0].kind == fbHide
+  # a rotating body with many children updates at 5 Hz
+  assert fbPeriod(100, true) == 4 and fbPeriod(100, false) == 2 and fbPeriod(10, true) == 2
+  # the entity budget: the nearest bodies are shown first, the rest wait
+  var many: seq[BodyView] = @[]
+  for i in 1 .. 20:
+    var m = oneCellBody(int32(i), float64(i) * 5.0, 64.0, 0.0)
+    m.cuboids = 64
+    many.add m
+  var f2 = newFbViewer()
+  let shown = fallbackTick(f2, many, "minecraft:overworld", 0.0, 64.0, 0.0, 1'i64)
+  assert shown.len == MaxFallbackEntities div 64
+  for i in 0 ..< shown.len: assert shown[i].bodyId == int32(i + 1)
+  # a dimension change forgets everything (the client dropped its entities) and shows what is in the new world
+  let other = fallbackTick(f2, many, "minecraft:the_nether", 0.0, 64.0, 0.0, 2'i64)
+  assert other.len == 0 and fbShownCount(f2) == 0
+
+echo "bodysynctest: ok"

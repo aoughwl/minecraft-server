@@ -1,0 +1,602 @@
+## Pure routing and state machine of the body stream (overnight/PROTOCOL.md sections 3 and 6). No world, player or connection imports:
+## bodysync.aowl feeds it the bodies (as `BodyView`) and the viewer's position and sends what it returns.
+##
+##   * `buildParts`: a body volume as wire parts. The wire volume is at most 32 cells per axis, so a bigger body is several wire bodies
+##     that share the pose (wire id = body id * 1024 + part index; each part's centre of mass is the body's, expressed in the part's frame).
+##   * `JesterViewer` / `jesterTick`: per viewer RESET, CREATE, STATE (delta against what the client reconstructed, keyframe every 100
+##     ticks, 20/10/5 Hz by distance), DESTROY, view radius with hysteresis, RESYNC_REQ rate limit, frame splitting at max_frame.
+##   * `FbViewer` / `fallbackTick`: the same view logic for clients shown `block_display` entities instead (show / update / hide).
+##   * `selectMode`: which of the two a viewer gets.
+
+import std/[math]
+import codec, bodymsg
+
+const
+  ViewRadius* = 128.0           ## a body is CREATEd inside this many blocks of the viewer
+  ViewHysteresis* = 16.0        ## and DESTROYed (reason 2) beyond ViewRadius + this
+  NearRadius* = 48.0            ## STATE every tick inside, every 2nd tick to FarRadius, every 4th beyond
+  FarRadius* = 96.0
+  KeyframeTicks* = 100
+  PartStride* = 1024            ## wire id = body id * PartStride + part index
+  MaxPartSize* = 32
+  ResyncMinTicks* = 20          ## a RESYNC_REQ is answered at most once a second
+  ResyncWindowTicks* = 200      ## more than ResyncMax requests inside this window cut the client back to level 1
+  ResyncMax* = 5
+  MaxFallbackEntities* = 512    ## display entities one fallback viewer is shown at most
+  StateHeaderMax = 26
+  StateEntryMax = 48
+
+type
+  ViewMode* = enum
+    vmNone, vmJester, vmFallback
+
+  RemapFn* = proc(state, version: int): int {.nimcall.}
+
+  PartDesc* = object
+    wireId*: int
+    size*: (int, int, int)
+    com*: (float32, float32, float32)     ## centre of mass in the part's frame
+    mass*: float32
+    palette*: seq[int]                    ## server block-state ids, entry 0 is air
+    cells*: seq[int]                      ## palette index per cell, (y*sz + z)*sx + x
+
+  PartRef* = ref PartDesc
+
+  BodyView* = object
+    id*: int32
+    dim*: string
+    pos*: (float64, float64, float64)     ## centre of mass, world
+    quat*: (float64, float64, float64, float64)  ## x, y, z, w
+    vel*: (float64, float64, float64)     ## blocks per tick
+    angVel*: (float64, float64, float64)  ## rad per tick, world axis-angle
+    sleeping*: bool
+    held*: bool                           ## gone, but its DESTROY waits a tick (the block updates go first)
+    gen*: int                             ## changes when the volume changes: the clients get DESTROY + CREATE
+    parts*: seq[PartRef]
+    cuboids*: int                         ## display entities the fallback needs (0 unknown)
+    comLocal*: (float32, float32, float32)  ## centre of mass in the body frame (cell units), for the fallback
+
+  GoneBody* = object
+    id*: int32
+    reason*: int                          ## the DESTROY reason byte: 0 gone, 1 broke
+
+  SrcCell* = object
+    x*, y*, z*: int
+    state*: int
+
+# ---- volume split -------------------------------------------------------------------------------------------------------------------
+
+proc tileLess(a, b: (int, int, int)): bool =
+  ## (y, z, x) order
+  if a[1] != b[1]: return a[1] < b[1]
+  if a[2] != b[2]: return a[2] < b[2]
+  a[0] < b[0]
+
+proc eq3(a, b: (int, int, int)): bool = a[0] == b[0] and a[1] == b[1] and a[2] == b[2]
+
+proc buildParts*(bodyId: int; cells: seq[SrcCell]; com: (float64, float64, float64); mass: float64): seq[PartRef] =
+  ## Splits the cells into wire parts of at most 32^3. Empty list for an empty volume.
+  result = @[]
+  if cells.len == 0: return
+  var mn = [cells[0].x, cells[0].y, cells[0].z]
+  for c in cells:
+    if c.x < mn[0]: mn[0] = c.x
+    if c.y < mn[1]: mn[1] = c.y
+    if c.z < mn[2]: mn[2] = c.z
+  # tile index of each cell, tiles in (y, z, x) order
+  var tiles: seq[(int, int, int)] = @[]
+  for c in cells:
+    let t = ((c.x - mn[0]) div MaxPartSize, (c.y - mn[1]) div MaxPartSize, (c.z - mn[2]) div MaxPartSize)
+    var have = false
+    for e in tiles:
+      if eq3(e, t):
+        have = true
+        break
+    if not have: tiles.add t
+  for i in 1 ..< tiles.len:
+    let cur = tiles[i]
+    var j = i
+    while j > 0 and tileLess(cur, tiles[j - 1]):
+      let prev = tiles[j - 1]
+      tiles[j] = prev
+      dec j
+    tiles[j] = cur
+  var part = 0
+  for t in tiles:
+    if part >= PartStride: break
+    var lo = [high(int), high(int), high(int)]
+    var hi = [low(int), low(int), low(int)]
+    var n = 0
+    for c in cells:
+      if (c.x - mn[0]) div MaxPartSize == t[0] and (c.y - mn[1]) div MaxPartSize == t[1] and (c.z - mn[2]) div MaxPartSize == t[2]:
+        inc n
+        if c.x < lo[0]: lo[0] = c.x
+        if c.y < lo[1]: lo[1] = c.y
+        if c.z < lo[2]: lo[2] = c.z
+        if c.x > hi[0]: hi[0] = c.x
+        if c.y > hi[1]: hi[1] = c.y
+        if c.z > hi[2]: hi[2] = c.z
+    let sx = hi[0] - lo[0] + 1
+    let sy = hi[1] - lo[1] + 1
+    let sz = hi[2] - lo[2] + 1
+    var pd = PartRef(wireId: bodyId * PartStride + part, size: (sx, sy, sz),
+      com: (float32(com[0] - float64(lo[0])), float32(com[1] - float64(lo[1])), float32(com[2] - float64(lo[2]))),
+      mass: float32(mass * float64(n) / float64(cells.len)), palette: @[0], cells: newSeq[int](sx * sy * sz))
+    for c in cells:
+      if (c.x - mn[0]) div MaxPartSize == t[0] and (c.y - mn[1]) div MaxPartSize == t[1] and (c.z - mn[2]) div MaxPartSize == t[2]:
+        var at = -1
+        for k in 1 ..< pd.palette.len:
+          if pd.palette[k] == c.state:
+            at = k
+            break
+        if at < 0:
+          if pd.palette.len < 4096:
+            pd.palette.add c.state
+            at = pd.palette.len - 1
+          else:
+            at = 0
+        pd.cells[((c.y - lo[1]) * sz + (c.z - lo[2])) * sx + (c.x - lo[0])] = at
+    result.add pd
+    inc part
+
+# ---- mode ---------------------------------------------------------------------------------------------------------------------------
+
+proc selectMode*(hasBodystream, cut, fallbackEnabled: bool): ViewMode =
+  ## A viewer with the bodystream capability (and not cut back to level 1) gets jester:bodies; everyone else gets display entities when the
+  ## fallback is on, nothing otherwise.
+  if hasBodystream and not cut: vmJester
+  elif fallbackEnabled: vmFallback
+  else: vmNone
+
+proc distanceTo*(b: BodyView; vx, vy, vz: float64): float64 =
+  let dx = b.pos[0] - vx
+  let dy = b.pos[1] - vy
+  let dz = b.pos[2] - vz
+  sqrt(dx * dx + dy * dy + dz * dz)
+
+proc inView*(wasIn: bool; dist: float64): bool =
+  ## Enter at ViewRadius, leave beyond ViewRadius + ViewHysteresis.
+  if wasIn: dist <= ViewRadius + ViewHysteresis else: dist <= ViewRadius
+
+proc statePeriod*(dist: float64): int =
+  if dist <= NearRadius: 1 elif dist <= FarRadius: 2 else: 4
+
+# ---- quantisation -------------------------------------------------------------------------------------------------------------------
+
+proc clampI16(v: float64): int =
+  var r = int(floor(v + 0.5))
+  if r > 32767: r = 32767
+  if r < -32768: r = -32768
+  r
+
+proc quantVel*(v: (float64, float64, float64)): (int, int, int) =
+  (clampI16(v[0] * 2048.0), clampI16(v[1] * 2048.0), clampI16(v[2] * 2048.0))
+
+proc quantAng*(v: (float64, float64, float64)): (int, int, int) =
+  (clampI16(v[0] * 4096.0), clampI16(v[1] * 4096.0), clampI16(v[2] * 4096.0))
+
+proc packBodyQuat*(q: (float64, float64, float64, float64)): uint32 =
+  let n = sqrt(q[0] * q[0] + q[1] * q[1] + q[2] * q[2] + q[3] * q[3])
+  if n < 1e-12: return packQuat(0.0, 0.0, 0.0, 1.0)
+  packQuat(q[0] / n, q[1] / n, q[2] / n, q[3] / n)
+
+# ---- the Jester viewer --------------------------------------------------------------------------------------------------------------
+
+type
+  KnownPart* = object
+    wireId*: int
+    px*, py*, pz*: float64               ## what the client reconstructed
+    rot*: uint32
+    vel*: (int, int, int)
+    ang*: (int, int, int)
+    asleep*: bool
+
+  KnownBody* = object
+    id*: int32
+    gen*: int
+    parts*: seq[KnownPart]
+
+  JesterViewer* = object
+    seqNo*: int                          ## last RESET/STATE seq sent: the next STATE's base
+    started*: bool                       ## a RESET went out
+    dim*: string
+    version*: int                        ## opaque, handed to the remap function
+    maxFrame*: int
+    known*: seq[KnownBody]
+    needReset*: bool
+    resetReason*: int
+    cut*: bool                           ## cut back to level 1 (RESET reason 2 sent or pending)
+    cutSent*: bool
+    lastResetTick*: int64
+    reqTicks*: seq[int64]
+    lastAck*: int
+    ackCount*: int
+    framesSent*: int
+    createsSent*: int
+    destroysSent*: int
+    stateEntriesSent*: int
+
+proc newJesterViewer*(version, maxFrame: int): JesterViewer =
+  JesterViewer(seqNo: 0, started: false, dim: "", version: version, maxFrame: (if maxFrame < 1000: 16000 else: maxFrame),
+    known: @[], needReset: false, resetReason: 0, cut: false, cutSent: false, lastResetTick: -1000'i64, reqTicks: @[], lastAck: 0)
+
+proc knownIndex(v: JesterViewer; id: int32): int =
+  result = -1
+  for i in 0 ..< v.known.len:
+    if v.known[i].id == id: return i
+
+proc isKnown*(v: JesterViewer; id: int32): bool = knownIndex(v, id) >= 0
+
+proc onAck*(v: var JesterViewer; seqNo: int) =
+  v.lastAck = seqNo
+  inc v.ackCount
+
+proc onResyncReq*(v: var JesterViewer; tick: int64) =
+  ## RESYNC_REQ arrived: answered with a RESET (reason 1) at the next tick, at most once a second; the sixth request inside ten seconds
+  ## cuts the client back to level 1 (RESET reason 2 next tick, display entities afterwards).
+  var kept: seq[int64] = @[]
+  for t in v.reqTicks:
+    if tick - t < int64(ResyncWindowTicks): kept.add t
+  kept.add tick
+  v.reqTicks = kept
+  if v.cut: return
+  if v.reqTicks.len > ResyncMax:
+    v.cut = true
+    v.cutSent = false
+    return
+  if tick - v.lastResetTick >= int64(ResyncMinTicks):
+    v.needReset = true
+    v.resetReason = 1
+
+proc requestReset*(v: var JesterViewer; reason: int) =
+  v.needReset = true
+  v.resetReason = reason
+
+proc createMessages(v: var JesterViewer; b: BodyView; remap: RemapFn): seq[seq[byte]] =
+  result = @[]
+  let q = packBodyQuat(b.quat)
+  let qv = if b.sleeping: (0, 0, 0) else: quantVel(b.vel)
+  for pd in b.parts:
+    var palette: seq[int] = @[]
+    for i in 0 ..< pd.palette.len:
+      palette.add(if i == 0: 0 else: remap(pd.palette[i], v.version))
+    let msg = BodyCreateMsg(bodyId: pd.wireId, seqAtCreate: v.seqNo + 1, size: pd.size, com: pd.com, mass: pd.mass, pos: b.pos, quat: q,
+      vel: qv, palette: palette, cells: pd.cells)
+    for m in encodeBodyCreate(msg, v.maxFrame): result.add m
+    inc v.createsSent
+
+proc knownFrom(b: BodyView): KnownBody =
+  result = KnownBody(id: b.id, gen: b.gen, parts: @[])
+  let q = packBodyQuat(b.quat)
+  let qv = if b.sleeping: (0, 0, 0) else: quantVel(b.vel)
+  for pd in b.parts:
+    result.parts.add KnownPart(wireId: pd.wireId, px: b.pos[0], py: b.pos[1], pz: b.pos[2], rot: q, vel: qv, ang: (0, 0, 0), asleep: b.sleeping)
+
+proc destroyMessages(v: var JesterViewer; reason: int; ids: seq[int]): seq[seq[byte]] =
+  result = @[]
+  if ids.len == 0: return
+  result.add encodeBodyDestroy(reason, ids)
+  v.destroysSent += ids.len
+
+proc partIds(k: KnownBody): seq[int] =
+  result = @[]
+  for p in k.parts: result.add p.wireId
+
+proc varintLen(x: int): int =
+  var n = 1
+  var y = x
+  while y >= 128:
+    y = y shr 7
+    inc n
+  n
+
+proc entrySize(e: StateEntry; prevId: int): int =
+  result = varintLen(e.bodyId - prevId) + 1
+  if (e.flags and StatePos) != 0:
+    if (e.flags and StateAbsolute) != 0: result += 24
+    elif (e.flags and StateWide) != 0: result += 12
+    else: result += 6
+  if (e.flags and StateRot) != 0: result += 4
+  if (e.flags and StateVel) != 0: result += 6
+  if (e.flags and StateAngVel) != 0: result += 6
+
+proc nextSeq(v: var JesterViewer): int =
+  inc v.seqNo
+  inc v.framesSent
+  v.seqNo
+
+proc stateEntry(kp: var KnownPart; b: BodyView; tick: int64; period: int; partIndex: int; keyframe: bool; entry: var StateEntry): bool =
+  ## The delta entry of one part against what the client has, updating the reconstruction. False when nothing changed (or not due).
+  if not keyframe and period > 1 and ((tick + int64(partIndex)) mod int64(period)) != 0'i64:
+    return false
+  var flags = 0
+  var e = StateEntry(bodyId: kp.wireId)
+  let tx = b.pos[0]
+  let ty = b.pos[1]
+  let tz = b.pos[2]
+  var dx = floor((tx - kp.px) * 1024.0 + 0.5)
+  var dy = floor((ty - kp.py) * 1024.0 + 0.5)
+  var dz = floor((tz - kp.pz) * 1024.0 + 0.5)
+  let limit = 2147483647.0
+  let beyond = abs(dx) > limit or abs(dy) > limit or abs(dz) > limit
+  if keyframe and not b.sleeping or beyond:
+    flags = flags or StatePos or StateAbsolute
+    e.absPos = (tx, ty, tz)
+    kp.px = tx
+    kp.py = ty
+    kp.pz = tz
+  elif dx != 0.0 or dy != 0.0 or dz != 0.0:
+    flags = flags or StatePos
+    if abs(dx) > 32767.0 or abs(dy) > 32767.0 or abs(dz) > 32767.0:
+      flags = flags or StateWide
+    e.pos = (int(dx), int(dy), int(dz))
+    kp.px = kp.px + dx / 1024.0
+    kp.py = kp.py + dy / 1024.0
+    kp.pz = kp.pz + dz / 1024.0
+  let q = packBodyQuat(b.quat)
+  if q != kp.rot:
+    flags = flags or StateRot
+    e.rot = q
+    kp.rot = q
+  let qv = if b.sleeping: (0, 0, 0) else: quantVel(b.vel)
+  if not eq3(qv, kp.vel):
+    flags = flags or StateVel
+    e.vel = qv
+    kp.vel = qv
+  let qa = if b.sleeping: (0, 0, 0) else: quantAng(b.angVel)
+  if not eq3(qa, kp.ang):
+    flags = flags or StateAngVel
+    e.angVel = qa
+    kp.ang = qa
+  if b.sleeping:
+    if not kp.asleep:
+      flags = flags or StateAsleep
+      kp.asleep = true
+    elif flags != 0:
+      flags = flags or StateAsleep
+  else:
+    kp.asleep = false
+  if flags == 0: return false
+  e.flags = flags
+  entry = e
+  true
+
+proc jesterTick*(v: var JesterViewer; bodies: seq[BodyView]; gone: seq[GoneBody]; dim: string; vx, vy, vz: float64; tick: int64;
+    remap: RemapFn): seq[seq[byte]] =
+  ## One tick for one jester:bodies viewer: the payloads to send, in order (RESET, DESTROY, CREATE, STATE).
+  ## `bodies`: every live body (any dimension), `gone`: bodies destroyed since the last call that this viewer may have been told about.
+  result = @[]
+  if v.cut:
+    if not v.cutSent:
+      v.cutSent = true
+      v.known = @[]
+      result.add encodeBodyReset(ResetMsg(seqNo: nextSeq(v), tick: tick, reason: 2))
+    return
+  var created: seq[int32] = @[]
+  # RESET: first sight, dimension change, requested resync
+  if not v.started or v.dim != dim or v.needReset:
+    let reason = (if v.started and v.dim == dim and v.needReset: v.resetReason else: 0)
+    v.known = @[]
+    v.dim = dim
+    v.started = true
+    v.needReset = false
+    v.lastResetTick = tick
+    result.add encodeBodyReset(ResetMsg(seqNo: nextSeq(v), tick: tick, reason: reason))
+  # DESTROY: bodies the client knows that are gone, out of range, or whose volume changed
+  var byReason: seq[seq[int]] = @[newSeq[int](), newSeq[int](), newSeq[int]()]
+  var keep: seq[KnownBody] = @[]
+  for k in v.known:
+    var at = -1
+    for i in 0 ..< bodies.len:
+      if bodies[i].id == k.id:
+        at = i
+        break
+    if at < 0:
+      var r = 0
+      for g in gone:
+        if g.id == k.id: r = g.reason
+      for pid in partIds(k): byReason[r].add pid
+      continue
+    let b = bodies[at]
+    if b.held:
+      keep.add k
+      continue
+    if b.dim != dim:
+      for pid in partIds(k): byReason[2].add pid
+      continue
+    let d = distanceTo(b, vx, vy, vz)
+    if not inView(true, d):
+      for pid in partIds(k): byReason[2].add pid
+      continue
+    if b.gen != k.gen:
+      for pid in partIds(k): byReason[0].add pid
+      continue
+    keep.add k
+  v.known = keep
+  for r in 0 .. 2:
+    for m in destroyMessages(v, r, byReason[r]): result.add m
+  # CREATE: bodies that came into view (or were re-created above)
+  for b in bodies:
+    if b.held or b.dim != dim or b.parts.len == 0: continue
+    if knownIndex(v, b.id) >= 0: continue
+    let d = distanceTo(b, vx, vy, vz)
+    if not inView(false, d): continue
+    for m in createMessages(v, b, remap): result.add m
+    v.known.add knownFrom(b)
+    created.add b.id
+  # STATE
+  var entries: seq[StateEntry] = @[]
+  let keyframe = (tick mod int64(KeyframeTicks)) == 0'i64
+  var ordered: seq[int] = @[]
+  for i in 0 ..< v.known.len: ordered.add i
+  # ascending wire id: known bodies are in creation order, which is ascending id except after re-creates; sort by id
+  for i in 1 ..< ordered.len:
+    let cur = ordered[i]
+    var j = i
+    while j > 0 and v.known[cur].id < v.known[ordered[j - 1]].id:
+      let prev = ordered[j - 1]
+      ordered[j] = prev
+      dec j
+    ordered[j] = cur
+  for oi in ordered:
+    let id = v.known[oi].id
+    var justMade = false
+    for c in created:
+      if c == id: justMade = true
+    if justMade: continue
+    var at = -1
+    for i in 0 ..< bodies.len:
+      if bodies[i].id == id:
+        at = i
+        break
+    if at < 0 or bodies[at].held: continue
+    let b = bodies[at]
+    let period = statePeriod(distanceTo(b, vx, vy, vz))
+    for pi in 0 ..< v.known[oi].parts.len:
+      var e = StateEntry()
+      if stateEntry(v.known[oi].parts[pi], b, tick, period, id + pi, keyframe, e):
+        entries.add e
+  # frames, split at max_frame
+  var start = 0
+  while start < entries.len:
+    var size = StateHeaderMax
+    var prev = 0
+    var stop = start
+    while stop < entries.len:
+      let es = entrySize(entries[stop], prev)
+      if stop > start and size + es > v.maxFrame: break
+      size += es
+      prev = entries[stop].bodyId
+      inc stop
+    var m = StateMsg(seqNo: 0, base: v.seqNo, tick: tick, entries: @[])
+    m.seqNo = nextSeq(v)
+    for i in start ..< stop: m.entries.add entries[i]
+    v.stateEntriesSent += m.entries.len
+    result.add encodeBodyState(m)
+    start = stop
+
+# ---- the fallback viewer ------------------------------------------------------------------------------------------------------------
+
+type
+  FbKind* = enum
+    fbShow, fbUpdate, fbHide
+
+  FbAction* = object
+    kind*: FbKind
+    bodyId*: int32
+    period*: int                          ## ticks between updates of this body: the display's interpolation is 2 * period ticks
+
+  FbBody = object
+    id: int32
+    gen: int
+    entities: int
+    lastTick: int64
+    px, py, pz: float64
+    qx, qy, qz, qw: float64
+    asleep: bool
+
+  FbViewer* = object
+    dim*: string
+    started*: bool
+    shown: seq[FbBody]
+
+proc newFbViewer*(): FbViewer = FbViewer(dim: "", started: false, shown: @[])
+
+proc fbShownCount*(v: FbViewer): int = v.shown.len
+
+proc fbIsShown*(v: FbViewer; id: int32): bool =
+  for s in v.shown:
+    if s.id == id: return true
+  false
+
+proc fbForget*(v: var FbViewer) =
+  ## The client dropped its entities (dimension change, respawn): no removal packets, just start over.
+  v.shown = @[]
+
+proc fbPeriod*(cuboids: int; rotating: bool): int =
+  ## Ticks between display updates: 10 Hz (2) for a translating body or a small rotating one, 5 Hz (4) for a rotating body with more than
+  ## 32 children (BODIES-DESIGN.md: rotating children are capped, every rotating child costs a metadata packet per update).
+  if rotating and cuboids > 32: 4 else: 2
+
+proc fbEntities(b: BodyView): int = (if b.cuboids > 0: b.cuboids else: 1)
+
+proc fallbackTick*(v: var FbViewer; bodies: seq[BodyView]; dim: string; vx, vy, vz: float64; tick: int64): seq[FbAction] =
+  ## One tick for one fallback viewer: which bodies to spawn, update, remove.
+  result = @[]
+  if v.started and v.dim != dim:
+    v.shown = @[]
+  v.dim = dim
+  v.started = true
+  # hide
+  var keep: seq[FbBody] = @[]
+  for s in v.shown:
+    var at = -1
+    for i in 0 ..< bodies.len:
+      if bodies[i].id == s.id:
+        at = i
+        break
+    var drop = at < 0
+    if not drop:
+      let b = bodies[at]
+      if b.held: drop = false
+      elif b.dim != dim or not inView(true, distanceTo(b, vx, vy, vz)) or b.gen != s.gen: drop = true
+    if drop:
+      result.add FbAction(kind: fbHide, bodyId: s.id, period: 1)
+    else:
+      keep.add s
+  v.shown = keep
+  var used = 0
+  for s in v.shown: used += s.entities
+  # show: nearest first, while the entity budget lasts
+  var cands: seq[int] = @[]
+  for i in 0 ..< bodies.len:
+    let b = bodies[i]
+    if b.held or b.dim != dim or b.parts.len == 0: continue
+    if fbIsShown(v, b.id): continue
+    if not inView(false, distanceTo(b, vx, vy, vz)): continue
+    cands.add i
+  for i in 1 ..< cands.len:
+    let cur = cands[i]
+    let curDist = distanceTo(bodies[cur], vx, vy, vz)
+    var j = i
+    while j > 0 and curDist < distanceTo(bodies[cands[j - 1]], vx, vy, vz):
+      let prev = cands[j - 1]
+      cands[j] = prev
+      dec j
+    cands[j] = cur
+  for ci in cands:
+    let b = bodies[ci]
+    let n = fbEntities(b)
+    if used + n > MaxFallbackEntities: continue
+    used += n
+    v.shown.add FbBody(id: b.id, gen: b.gen, entities: n, lastTick: tick, px: b.pos[0], py: b.pos[1], pz: b.pos[2], qx: b.quat[0], qy: b.quat[1],
+      qz: b.quat[2], qw: b.quat[3], asleep: b.sleeping)
+    result.add FbAction(kind: fbShow, bodyId: b.id, period: 2)
+  # update
+  for si in 0 ..< v.shown.len:
+    let s = v.shown[si]
+    if s.lastTick == tick: continue
+    var at = -1
+    for i in 0 ..< bodies.len:
+      if bodies[i].id == s.id:
+        at = i
+        break
+    if at < 0 or bodies[at].held: continue
+    let b = bodies[at]
+    let dot = s.qx * b.quat[0] + s.qy * b.quat[1] + s.qz * b.quat[2] + s.qw * b.quat[3]
+    let rotating = abs(dot) < 0.99999
+    let moved = abs(b.pos[0] - s.px) > 0.002 or abs(b.pos[1] - s.py) > 0.002 or abs(b.pos[2] - s.pz) > 0.002
+    if b.sleeping and s.asleep and not moved and not rotating: continue
+    if not b.sleeping and not moved and not rotating and not s.asleep: continue
+    let period = fbPeriod(s.entities, rotating or (abs(dot) < 0.9999999))
+    if not (b.sleeping and not s.asleep) and ((tick + int64(s.id)) mod int64(period)) != 0'i64: continue
+    v.shown[si].lastTick = tick
+    v.shown[si].px = b.pos[0]
+    v.shown[si].py = b.pos[1]
+    v.shown[si].pz = b.pos[2]
+    v.shown[si].qx = b.quat[0]
+    v.shown[si].qy = b.quat[1]
+    v.shown[si].qz = b.quat[2]
+    v.shown[si].qw = b.quat[3]
+    v.shown[si].asleep = b.sleeping
+    result.add FbAction(kind: fbUpdate, bodyId: s.id, period: period)
