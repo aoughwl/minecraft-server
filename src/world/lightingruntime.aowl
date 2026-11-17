@@ -7,7 +7,8 @@
 
 import std/deques
 import ../config/lighting
-import blockstates, chunkdata, lightingengine, tick
+import blockstates, chunkdata, lightingengine, palette, tick
+
 
 type
   LightLevelAccess* = ref object
@@ -132,6 +133,12 @@ proc setSkyLightLevel*(level: LightLevelAccess, position: BlockPos, lightLevel: 
   chunk.dirty = true
 
 proc propagateBlockLightIncrease(e: var DynamicLightEngine, level: LightLevelAccess, pos: BlockPos, lightLevel: uint8) =
+  # A queued entry can have gone stale: the cell was darkened (a decrease reached it, or a later check of a bulk sweep reset
+  # it) after the entry was queued. Spreading `lightLevel` from it would then relight the neighbours from a source that is
+  # gone. Only a cell that still holds at least the queued level is a source.
+  let (hasHere, here) = getBlockLightLevel(level, pos)
+  if hasHere and here < lightLevel:
+    return
   for dir in AllDirections:
     let neighbor = offsetPos(pos, dir)
     let (has, neighborLight) = getBlockLightLevel(level, neighbor)
@@ -219,6 +226,9 @@ proc checkBlockLightUpdates*(e: var DynamicLightEngine, level: LightLevelAccess,
     checkNeighborsLightUpdates(e, level, pos, expectedLight)
 
 proc propagateSkyLightIncrease(e: var DynamicLightEngine, level: LightLevelAccess, pos: BlockPos, lightLevel: uint8) =
+  # Stale entries are dropped, see propagateBlockLightIncrease. Positions that cannot hold sky light read 15 and always pass.
+  if loadedAt(level, divEuclid16(pos.x), divEuclid16(pos.z)) and getSkyLightLevel(level, pos) < lightLevel:
+    return
   for dir in AllDirections:
     let neighbor = offsetPos(pos, dir)
     # Never propagate into an unloaded chunk: the write is dropped, the "brighter" check stays true,
@@ -334,7 +344,9 @@ proc updateLightingAt*(e: var DynamicLightEngine, level: LightLevelAccess, pos: 
   checkSkyLightUpdates(e, level, pos)
   discard performSkyLightUpdates(e, level)
 
-proc updateLightingRegion*(e: var DynamicLightEngine, level: LightLevelAccess, lo, hi: BlockPos) =
+proc updateLightingRegionExhaustive*(e: var DynamicLightEngine, level: LightLevelAccess, lo, hi: BlockPos) =
+  ## The reference path of `updateLightingRegion`: every cell checked through the level access. Kept for tests and as the
+  ## fallback for the cases the dense path does not handle.
   ## `update_lighting_at` for every position of the box `lo..hi` (inclusive) and the one-block shell around it, with the
   ## block and the sky propagation each run once for the whole box instead of once per position. Bulk edits use this: a
   ## 32^3 volume is one pass, and the sky "open above" question is answered once per column instead of once per cell.
@@ -371,4 +383,382 @@ proc updateLightingRegion*(e: var DynamicLightEngine, level: LightLevelAccess, l
           open[int(yy - y0)] = true
       for yy in y0 .. y1:
         checkSkyLightUpdatesKnown(e, level, blockPos(x, yy, z), if open[int(yy - y0)]: 1 else: 0)
+  discard performSkyLightUpdates(e, level)
+
+# --- dense region path -------------------------------------------------------------------------------------------------
+# The box and its shell are copied into flat arrays (opacity, luminance, block light, sky light), the per-cell checks of
+# `updateLightingRegionExhaustive` run on the arrays in the same order with the same decisions, the changed cells are
+# written back, and only the queue entries that can still change something are handed to the propagation. Entries dropped:
+#  * a sky decrease whose six neighbours all hold no light (it would find nothing to darken), and
+#  * when no decrease survives, a sky increase none of whose neighbours it can brighten (values only rise from there on,
+#    so such an entry stays a no-op).
+# When a decrease survives, every increase is kept, as the exhaustive path does.
+
+let voidAirId = defaultStateByName("void_air")[1]
+
+type
+  RegionBuf = object
+    x0, y0, z0, nx, ny, nz: int
+    opac, lum, blk, sky: seq[uint8]
+    colChunk: seq[ChunkData]     ## per column z*nx+x, nil when unloaded
+
+proc cellIndex(b: RegionBuf, x, y, z: int32): int {.inline.} =
+  ((int(y) - b.y0) * b.nz + (int(z) - b.z0)) * b.nx + (int(x) - b.x0)
+
+proc inBuf(b: RegionBuf, x, y, z: int32): bool {.inline.} =
+  int(x) >= b.x0 and int(x) < b.x0 + b.nx and int(y) >= b.y0 and int(y) < b.y0 + b.ny and
+    int(z) >= b.z0 and int(z) < b.z0 + b.nz
+
+proc dirStep(dir: BlockDirection): (int32, int32, int32) {.inline.} =
+  case dir
+  of bdDown: (0'i32, -1'i32, 0'i32)
+  of bdUp: (0'i32, 1'i32, 0'i32)
+  of bdNorth: (0'i32, 0'i32, -1'i32)
+  of bdSouth: (0'i32, 0'i32, 1'i32)
+  of bdWest: (-1'i32, 0'i32, 0'i32)
+  of bdEast: (1'i32, 0'i32, 0'i32)
+
+proc gatherRegion(b: var RegionBuf, level: LightLevelAccess, x0, x1, y0, y1, z0, z1: int32): bool =
+  ## Fills `b`; false when the dense path cannot reproduce the exhaustive one (the caller then runs that).
+  if opacity(voidAirId) != 0'u8 or luminance(voidAirId) != 0'u8:
+    return false
+  b.x0 = int(x0)
+  b.y0 = int(y0)
+  b.z0 = int(z0)
+  b.nx = int(x1 - x0) + 1
+  b.ny = int(y1 - y0) + 1
+  b.nz = int(z1 - z0) + 1
+  let total = b.nx * b.ny * b.nz
+  b.opac = newSeq[uint8](total)
+  b.lum = newSeq[uint8](total)
+  b.blk = newSeq[uint8](total)
+  b.sky = newSeq[uint8](total)
+  b.colChunk = newSeq[ChunkData](b.nx * b.nz)
+  let cx0 = divEuclid16(x0)
+  let cx1 = divEuclid16(x1)
+  let cz0 = divEuclid16(z0)
+  let cz1 = divEuclid16(z1)
+  for cz in cz0 .. cz1:
+    for cx in cx0 .. cx1:
+      let c = chunkOf(level, cx, cz)
+      if c == nil:
+        continue
+      let count = c.section.blockSections.len
+      if int(y0 - c.section.minY) < 0 or int(y1 - c.section.minY) >= count * 16 or
+          c.lightEngine.blockLight.len < count or c.lightEngine.skyLight.len < count:
+        return false
+      let bx0 = max(x0, cx * 16'i32)
+      let bx1 = min(x1, cx * 16'i32 + 15'i32)
+      let bz0 = max(z0, cz * 16'i32)
+      let bz1 = min(z1, cz * 16'i32 + 15'i32)
+      for z in bz0 .. bz1:
+        for x in bx0 .. bx1:
+          b.colChunk[(int(z) - b.z0) * b.nx + (int(x) - b.x0)] = c
+      let minY = c.section.minY
+      let s0 = int(y0 - minY) div 16
+      let s1 = int(y1 - minY) div 16
+      for s in s0 .. s1:
+        let secBase = minY + int32(s * 16)
+        let by0 = max(y0, secBase)
+        let by1 = min(y1, secBase + 15'i32)
+        let sec = c.section.blockSections[s]
+        let homogeneous = isSingleValued(sec)
+        var cellVals: seq[uint32] = @[]
+        var hop = 0'u8
+        var hlum = 0'u8
+        if homogeneous:
+          let id = sec.get(0, 0, 0)
+          hop = opacity(id)
+          hlum = luminance(id)
+        else:
+          cellVals = cells(sec)
+        var lastId = 0xFFFFFFFF'u32
+        var lop = 0'u8
+        var llum = 0'u8
+        for y in by0 .. by1:
+          let ly = int(y - secBase)
+          for z in bz0 .. bz1:
+            let lz = int(z and 15'i32)
+            for x in bx0 .. bx1:
+              let lx = int(x and 15'i32)
+              let i = b.cellIndex(x, y, z)
+              if homogeneous:
+                b.opac[i] = hop
+                b.lum[i] = hlum
+              else:
+                let id = cellVals[ly * 256 + lz * 16 + lx]
+                if id != lastId:
+                  lastId = id
+                  lop = opacity(id)
+                  llum = luminance(id)
+                b.opac[i] = lop
+                b.lum[i] = llum
+              b.blk[i] = c.lightEngine.blockLight[s].get(lx, ly, lz)
+              b.sky[i] = c.lightEngine.skyLight[s].get(lx, ly, lz)
+  true
+
+proc readBlockLight(b: RegionBuf, level: LightLevelAccess, x, y, z: int32): (bool, uint8) {.inline.} =
+  if b.inBuf(x, y, z):
+    if b.colChunk[(int(z) - b.z0) * b.nx + (int(x) - b.x0)] == nil:
+      return (false, 0'u8)
+    return (true, b.blk[b.cellIndex(x, y, z)])
+  getBlockLightLevel(level, blockPos(x, y, z))
+
+proc readSkyLight(b: RegionBuf, level: LightLevelAccess, x, y, z: int32): uint8 {.inline.} =
+  if b.inBuf(x, y, z):
+    if b.colChunk[(int(z) - b.z0) * b.nx + (int(x) - b.x0)] == nil:
+      return 0'u8
+    return b.sky[b.cellIndex(x, y, z)]
+  getSkyLightLevel(level, blockPos(x, y, z))
+
+proc openAboveRegion(c: ChunkData, lx, lz: int, yAbove: int32): bool =
+  ## True when no block above `yAbove` (exclusive) up to the build limit is opaque, for the column (lx, lz) of chunk `c`.
+  let minY = c.section.minY
+  let topY = min(319'i32, minY + int32(c.section.blockSections.len * 16) - 1'i32)
+  if yAbove >= topY:
+    return true
+  var s = int(topY - minY) div 16
+  let sLow = int(yAbove + 1'i32 - minY) div 16
+  while s >= sLow:
+    let sec = c.section.blockSections[s]
+    let secBase = minY + int32(s * 16)
+    if isSingleValued(sec):
+      if opacity(sec.get(0, 0, 0)) > 0'u8:
+        return false
+    else:
+      var ly = int(min(topY, secBase + 15'i32) - secBase)
+      let lyLow = int(max(yAbove + 1'i32, secBase) - secBase)
+      while ly >= lyLow:
+        if opacity(sec.get(lx, ly, lz)) > 0'u8:
+          return false
+        dec ly
+    dec s
+  true
+
+proc writeBackLight(b: RegionBuf, orig, cur: seq[uint8], sky: bool) =
+  for z in 0 ..< b.nz:
+    for x in 0 ..< b.nx:
+      let c = b.colChunk[z * b.nx + x]
+      if c == nil:
+        continue
+      let minY = c.section.minY
+      let lx = (b.x0 + x) and 15
+      let lz = (b.z0 + z) and 15
+      var changed = false
+      for y in 0 ..< b.ny:
+        let i = (y * b.nz + z) * b.nx + x
+        if orig[i] != cur[i]:
+          changed = true
+          let rel = int(int32(b.y0 + y) - minY)
+          if sky:
+            c.lightEngine.skyLight[rel div 16].set(lx, rel mod 16, lz, cur[i])
+          else:
+            c.lightEngine.blockLight[rel div 16].set(lx, rel mod 16, lz, cur[i])
+      if changed:
+        c.dirty = true
+
+proc posOfCell(b: RegionBuf, i: int32): BlockPos =
+  let ii = int(i)
+  let x = ii mod b.nx
+  let z = (ii div b.nx) mod b.nz
+  let y = ii div (b.nx * b.nz)
+  blockPos(int32(b.x0 + x), int32(b.y0 + y), int32(b.z0 + z))
+
+proc updateLightingRegion*(e: var DynamicLightEngine, level: LightLevelAccess, lo, hi: BlockPos) =
+  ## The light of the whole box `lo..hi` (and its shell) in one pass; same result as `updateLightingRegionExhaustive`, see
+  ## the notes above.
+  let x0 = lo.x - 1'i32
+  let x1 = hi.x + 1'i32
+  let y0 = lo.y - 1'i32
+  let y1 = hi.y + 1'i32
+  let z0 = lo.z - 1'i32
+  let z1 = hi.z + 1'i32
+  if level.lightingConfig != lecDefault or y1 > 319'i32:
+    updateLightingRegionExhaustive(e, level, lo, hi)
+    return
+  var b = RegionBuf(opac: @[], lum: @[], blk: @[], sky: @[], colChunk: @[])
+  if not gatherRegion(b, level, x0, x1, y0, y1, z0, z1):
+    updateLightingRegionExhaustive(e, level, lo, hi)
+    return
+  # --- block light: the sweep of checkBlockLightUpdates over the arrays ---
+  let blkOrig = b.blk
+  # With no emitter and no light above 1 inside the region, an interior cell has nothing to say about its neighbours; only
+  # the shell looks outward at cells that were not copied.
+  var quiet = true
+  for v in b.blk:
+    if v > 1'u8:
+      quiet = false
+      break
+  if quiet:
+    for v in b.lum:
+      if v > 0'u8:
+        quiet = false
+        break
+  var bdec: seq[(int32, int32, int32, uint8)] = @[]
+  var binc: seq[(int32, int32, int32, uint8)] = @[]
+  for y in y0 .. y1:
+    for z in z0 .. z1:
+      for x in x0 .. x1:
+        let i = b.cellIndex(x, y, z)
+        let has = b.colChunk[(int(z) - b.z0) * b.nx + (int(x) - b.x0)] != nil
+        let cur = if has: b.blk[i] else: 0'u8
+        let exp = b.lum[i]
+        if exp < cur:
+          b.blk[i] = exp
+          bdec.add((x, y, z, cur))
+        elif exp > cur:
+          if has:
+            b.blk[i] = exp
+          binc.add((x, y, z, exp))
+        let shellCell = x == x0 or x == x1 or y == y0 or y == y1 or z == z0 or z == z1
+        if exp >= cur and (shellCell or not quiet):
+          for dir in AllDirections:
+            let (dx, dy, dz) = dirStep(dir)
+            let (nh, nl) = readBlockLight(b, level, x + dx, y + dy, z + dz)
+            if nh and nl > exp + 1'u8:
+              binc.add((x + dx, y + dy, z + dz, nl))
+  writeBackLight(b, blkOrig, b.blk, false)
+  for q in bdec:
+    queueBlockLightDecrease(e, blockPos(q[0], q[1], q[2]), q[3])
+  for q in binc:
+    queueBlockLightIncrease(e, blockPos(q[0], q[1], q[2]), q[3])
+  discard performBlockLightUpdates(e, level)
+  # --- sky light ---
+  let skyOrig = b.sky
+  var sdec: seq[(int32, uint8)] = @[]
+  var sinc: seq[(int32, uint8)] = @[]
+  var open = newSeq[bool](b.ny)
+  for z in z0 .. z1:
+    for x in x0 .. x1:
+      let c = b.colChunk[(int(z) - b.z0) * b.nx + (int(x) - b.x0)]
+      if c == nil:
+        continue
+      var seen = not openAboveRegion(c, int(x and 15'i32), int(z and 15'i32), y1)
+      var yy = y1
+      while yy >= y0:
+        open[int(yy) - b.y0] = not seen
+        if not seen and b.opac[b.cellIndex(x, yy, z)] > 0'u8:
+          seen = true
+        dec yy
+      for y in y0 .. y1:
+        let i = b.cellIndex(x, y, z)
+        let cur = b.sky[i]
+        let opac = b.opac[i]
+        var exp = 0'u8
+        if opac != 15'u8:
+          if open[int(y) - b.y0]:
+            exp = satSub(15'u8, opac)
+          else:
+            var best = 0'u8
+            for dir in AllDirections:
+              let (dx, dy, dz) = dirStep(dir)
+              let nl = readSkyLight(b, level, x + dx, y + dy, z + dz)
+              let potential = if nl == 15'u8 and dir == bdUp: 15'u8 else: satSub(nl, 1'u8)
+              best = max(best, potential)
+            exp = satSub(best, opac)
+        if exp < cur:
+          b.sky[i] = exp
+          sdec.add((int32(i), cur))
+        elif exp > cur:
+          b.sky[i] = exp
+        # One entry covers both queueSkyLightIncrease calls of the exhaustive path (the set and the neighbour check).
+        if exp >= cur and exp > 0'u8:
+          sinc.add((int32(i), exp))
+  writeBackLight(b, skyOrig, b.sky, true)
+  var decSurvives = false
+  for q in sdec:
+    let p = posOfCell(b, q[0])
+    let removed = q[1]
+    var keep = false
+    for dir in AllDirections:
+      let (dx, dy, dz) = dirStep(dir)
+      let px = p.x + dx
+      let py = p.y + dy
+      let pz = p.z + dz
+      var nl = 0'u8
+      var opac = 0'u8
+      if b.inBuf(px, py, pz):
+        if b.colChunk[(int(pz) - b.z0) * b.nx + (int(px) - b.x0)] == nil:
+          continue
+        let ni = b.cellIndex(px, py, pz)
+        nl = b.sky[ni]
+        opac = b.opac[ni]
+      else:
+        let np = blockPos(px, py, pz)
+        if not loadedAt(level, divEuclid16(px), divEuclid16(pz)) or not holdsSkyLight(level, np):
+          continue
+        nl = getSkyLightLevel(level, np)
+        opac = opacity(stateAt(level, np))
+      if nl == 0'u8:
+        continue
+      # What propagateSkyLightDecrease does with this neighbour: darken it (equal to the light this cell would have given,
+      # or lower than the removed light) or re-seed it (brighter). Equal to the removed light and not the expected one: nothing.
+      let expected =
+        if removed == 15'u8 and dir == bdDown and opac == 0'u8: 15'u8
+        else: satSub(satSub(removed, 1'u8), opac)
+      if nl != removed or nl == expected:
+        keep = true
+        break
+    if keep:
+      decSurvives = true
+      queueSkyLightDecrease(e, p, removed)
+  let plane = b.nx * b.nz
+  for q in sinc:
+    let i = int(q[0])
+    let lx = i mod b.nx
+    let lz = (i div b.nx) mod b.nz
+    let ly = i div plane
+    var keep = decSurvives
+    if not keep:
+      let lightLevel = q[1]
+      let spread = satSub(lightLevel, 1'u8)
+      for d in 0 ..< 6:
+        var ni = i
+        var edge = false
+        case d
+        of 0:   # down
+          edge = ly == 0
+          ni = i - plane
+        of 1:
+          edge = ly == b.ny - 1
+          ni = i + plane
+        of 2:
+          edge = lz == 0
+          ni = i - b.nx
+        of 3:
+          edge = lz == b.nz - 1
+          ni = i + b.nx
+        of 4:
+          edge = lx == 0
+          ni = i - 1
+        else:
+          edge = lx == b.nx - 1
+          ni = i + 1
+        var nl = 0'u8
+        var opac = 0'u8
+        if edge:
+          # The neighbour is outside the region: ask the level, as propagateSkyLightIncrease would.
+          let p = posOfCell(b, q[0])
+          let (dx, dy, dz) = dirStep(AllDirections[d])
+          let px = p.x + dx
+          let pz = p.z + dz
+          if not loadedAt(level, divEuclid16(px), divEuclid16(pz)):
+            continue
+          let np = blockPos(px, p.y + dy, pz)
+          nl = getSkyLightLevel(level, np)
+          opac = opacity(stateAt(level, np))
+        else:
+          if b.colChunk[ni mod plane] == nil:
+            continue
+          nl = b.sky[ni]
+          opac = b.opac[ni]
+        let cand =
+          if lightLevel == 15'u8 and d == 0 and opac == 0'u8: 15'u8
+          else: satSub(spread, opac)
+        if cand > nl:
+          keep = true
+          break
+    let p = posOfCell(b, q[0])
+    if keep:
+      queueSkyLightIncrease(e, p, q[1])
   discard performSkyLightUpdates(e, level)
