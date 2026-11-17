@@ -43,6 +43,7 @@ import ../../plugin/pluginhooksblock
 import ../blocklog/blocklogcore
 import ../serverbase
 import "../block/worldadapter"
+import ../net/winsock
 
 type
   VolumeBox* = object
@@ -118,6 +119,14 @@ type
     news: seq[uint32]
 
 var gBeMemo = initTable[uint32, bool]()
+var gBulkProfile*: bool = false
+var gBulkPhaseNs*: array[8, int64] = [0'i64, 0, 0, 0, 0, 0, 0, 0]  ## plan, veto, write, heightmaps, block entities, register+log, light, notify
+
+proc phaseMark(t0: var int64; slot: int) =
+  if gBulkProfile:
+    let t1 = nowNanos()
+    gBulkPhaseNs[slot] += t1 - t0
+    t0 = t1
 
 proc defaultBulkOptions*(): BulkOptions =
   BulkOptions(fireHooks: true, notifyEdge: true, logChanges: true)
@@ -256,11 +265,13 @@ proc commitTargets(world: World; targets: var seq[Target]; opts: BulkOptions;
   ## Plans every target, asks the plugin veto, writes all sections, then does the once-per-edit work.
   result = report(esOk, newBlockPos(0'i32, 0'i32, 0'i32))
   var total = 0
+  var tp = if gBulkProfile: nowNanos() else: 0'i64
   for k in 0 ..< targets.len:
     planTarget(targets[k])
     total += targets[k].idxs.len
   if total == 0:
     return
+  phaseMark(tp, 0)
   # Plugin veto before the first write: a refusal leaves the world as it was.
   if opts.fireHooks and pluginBlockChangeListened():
     for k in 0 ..< targets.len:
@@ -269,6 +280,7 @@ proc commitTargets(world: World; targets: var seq[Target]; opts: BulkOptions;
         if callPluginBlockChangeHook(int(pos.vec.x), int(pos.vec.y), int(pos.vec.z), int(targets[k].olds[j]),
             int(targets[k].news[j])):
           return report(esVetoed, pos)
+  phaseMark(tp, 1)
   # Writes.
   var columns = initTable[int64, seq[bool]]()
   var chunks = initTable[int64, ChunkData]()
@@ -301,12 +313,14 @@ proc commitTargets(world: World; targets: var seq[Target]; opts: BulkOptions;
         hi = newBlockPos(max(hi.vec.x, p.vec.x), max(hi.vec.y, p.vec.y), max(hi.vec.z, p.vec.z))
     columns[ckey] = cols
     result.changed += t.idxs.len
+  phaseMark(tp, 2)
   # Heightmaps: once per touched column.
   for ckey, cols in columns:
     let chunk = chunks.getOrDefault(ckey, nil)
     for c in 0 ..< 256:
       if cols[c]:
         recomputeColumnHeightmaps(chunk, c and 15, c shr 4)
+  phaseMark(tp, 3)
   # Block entities: the ones of replaced cells go (no spill), the saved ones of the snapshot come back.
   for k in 0 ..< targets.len:
     for j in 0 ..< targets[k].idxs.len:
@@ -314,18 +328,24 @@ proc commitTargets(world: World; targets: var seq[Target]; opts: BulkOptions;
         world.bulkDropBlockEntity(targetPos(targets[k], targets[k].idxs[j]))
   for be in bePuts:
     world.bulkPutBlockEntity(be.pos, be.nbt)
-  # Client changes, block log.
+  phaseMark(tp, 4)
+  # Client changes (one queued group per section), block log.
   let logging = opts.logChanges and blockLogActive()
   let dimName = world.dimension.minecraftName
   for k in 0 ..< targets.len:
-    for j in 0 ..< targets[k].idxs.len:
-      let pos = targetPos(targets[k], targets[k].idxs[j])
-      world.bulkRegisterChange(pos, targets[k].news[j])
-      if logging:
+    if targets[k].idxs.len == 0:
+      continue
+    world.bulkRegisterSection(targets[k].cx, targets[k].cz, (targets[k].chunk.section.minY shr 4) + int32(targets[k].sy),
+      targets[k].idxs, targets[k].news)
+    if logging:
+      for j in 0 ..< targets[k].idxs.len:
+        let pos = targetPos(targets[k], targets[k].idxs[j])
         blockLogRecordChange(dimName, int(pos.vec.x), int(pos.vec.y), int(pos.vec.z), int(targets[k].olds[j]),
           int(targets[k].news[j]))
+  phaseMark(tp, 5)
   # Light, once.
   world.bulkUpdateLighting(lo, hi)
+  phaseMark(tp, 6)
   # Neighbour updates for the changed cells on the outer surface of the edit only.
   if opts.notifyEdge:
     for k in 0 ..< targets.len:
@@ -333,7 +353,8 @@ proc commitTargets(world: World; targets: var seq[Target]; opts: BulkOptions;
         let pos = targetPos(targets[k], targets[k].idxs[j])
         if pos.vec.x == lo.vec.x or pos.vec.x == hi.vec.x or pos.vec.y == lo.vec.y or pos.vec.y == hi.vec.y or
             pos.vec.z == lo.vec.z or pos.vec.z == hi.vec.z:
-          world.bulkNotifyNeighbors(pos)
+          world.bulkNotifyEdge(pos, lo, hi)
+  phaseMark(tp, 7)
 
 proc newTarget(chunk: ChunkData; s: VolumeSection): Target =
   Target(chunk: chunk, cx: s.cx, cz: s.cz, sy: s.sy, hasFull: false, x0: s.x0, y0: s.y0, z0: s.z0, x1: s.x1, y1: s.y1,

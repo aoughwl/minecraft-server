@@ -1,0 +1,378 @@
+## Bulk volume edits (bulkedit.aowl) on an in-memory world: remove-then-restore equality, one multi-block group per section,
+## all-or-nothing on a stale snapshot or a plugin veto, placement, and throughput.
+import std/[assertions, syncio, cmdline, tables]
+import ../../config/lib as configlib
+import ../../world/[chunkdata, level, lightingruntime, palette, playerdata, worldfs, worldinfo]
+import ../../world/blockstates as states
+import ../../nbt/tag as nbttag
+import ../../plugin/pluginhooksblock
+import ../../util/math/position
+import ../data/datamod
+import ../recipe
+import ../scheduler
+import ../serverbase
+import ../tick_rate_manager
+import ../net/winsock
+import "../block/worldadapter"
+import bulkedit, worldmod
+
+var failures = 0
+var gCalls = 0
+var gVetoAt: array[3, int] = [20, 20, 20]
+
+proc check(name: string; cond: bool) =
+  if cond:
+    echo "PASS ", name
+  else:
+    echo "FAIL ", name
+    inc failures
+
+proc scratch(): string =
+  result = parentDirW(paramStr(0)) & "/bulkedit_scratch"
+  discard createDirAllW(result)
+
+const Sections = 8   # y 0..127
+
+let adv = defaultAdvancedConfiguration()
+let theLevel = fromRootFolder(adv.world, scratch(), 1'i64, OVERWORLD)
+let server = Server(basicConfig: defaultBasicConfiguration(), advancedConfig: adv, worlds: @[], dimensions: @[OVERWORLD],
+  tickCounter: 0'i64, nextEntityId: 1'i32, tickRateManager: newServerTickRateManager(20.0'f32), keyStore: nil,
+  recipeManager: newRecipeManager(), scheduler: newTaskScheduler(), data: ServerData(),
+  playerDataStorage: PlayerDataStorage(), levelFolder: "", playerIdleTimeout: 0'i32, mojangPublicKeys: @[],
+  stopRequested: false, stopAtMs: 0'i64)
+let bw = loadWorld(theLevel, defaultLevelData(1'u64), OVERWORLD, 63'i32, 0'i32, server)
+
+proc mkChunk(x, z: int32): ChunkData =
+  let c = newChunkData(x, z, newChunkSections(Sections, 0'i32))
+  c.lightEngine.skyLight = newSeq[LightContainer](Sections)
+  c.lightEngine.blockLight = newSeq[LightContainer](Sections)
+  for i in 0 ..< Sections:
+    c.lightEngine.skyLight[i] = newLightEmpty(0'u8)
+    c.lightEngine.blockLight[i] = newLightEmpty(0'u8)
+  c
+
+let (_, stone) = defaultStateByName("stone")
+let (_, dirt) = defaultStateByName("dirt")
+let (_, glow) = defaultStateByName("glowstone")
+let (_, chest) = defaultStateByName("chest")
+let (_, planks) = defaultStateByName("oak_planks")
+let (_, stairs) = defaultStateByName("oak_stairs")
+
+var chunks: seq[ChunkData] = @[]
+for cz in 0'i32 .. 1'i32:
+  for cx in 0'i32 .. 1'i32:
+    let c = mkChunk(cx, cz)
+    addLoadedChunk(theLevel, c)
+    chunks.add(c)
+
+proc fillBox(x0, y0, z0, x1, y1, z1: int32; id: uint32) =
+  for y in y0 .. y1:
+    for z in z0 .. z1:
+      for x in x0 .. x1:
+        discard setBlockState(theLevel, newBlockPos(x, y, z), id)
+
+proc stateAt(x, y, z: int32): uint32 = getBlockState(theLevel, newBlockPos(x, y, z))
+
+proc rebuildHeightmaps() =
+  for c in chunks:
+    c.heightmap = calculateHeightmap(c)
+
+# --- baseline world: ground y 0..19 (stone, dirt top), two lamps, a chest with contents ----------------------------------
+fillBox(0, 0, 0, 31, 17, 31, stone)
+fillBox(0, 18, 0, 31, 19, 31, dirt)
+discard setBlockState(theLevel, newBlockPos(16'i32, 21'i32, 16'i32), glow)
+discard setBlockState(theLevel, newBlockPos(2'i32, 25'i32, 2'i32), glow)
+discard setBlockState(theLevel, newBlockPos(8'i32, 12'i32, 8'i32), chest)
+var chestNbt = newCompound()
+put(chestNbt, "id", "minecraft:chest")
+put(chestNbt, "x", NbtTag(kind: ntkInt, intVal: 8'i32))
+put(chestNbt, "y", NbtTag(kind: ntkInt, intVal: 12'i32))
+put(chestNbt, "z", NbtTag(kind: ntkInt, intVal: 8'i32))
+put(chestNbt, "Lock", "secret")
+putBlockEntity(chunks[0], newBlockPos(8'i32, 12'i32, 8'i32), chestNbt)
+rebuildHeightmaps()
+bw.bulkUpdateLighting(newBlockPos(0'i32, 0'i32, 0'i32), newBlockPos(31'i32, 60'i32, 31'i32))
+
+type Baseline = object
+  blocks: seq[seq[uint32]]
+  hmWs, hmMb, hmNl: seq[seq[int64]]
+  sky, blockL: seq[seq[LightContainer]]
+
+proc takeBaseline(): Baseline =
+  result = Baseline(blocks: @[], hmWs: @[], hmMb: @[], hmNl: @[], sky: @[], blockL: @[])
+  for c in chunks:
+    result.blocks.add(dumpBlocks(c.section))
+    result.hmWs.add(c.heightmap.worldSurface)
+    result.hmMb.add(c.heightmap.motionBlocking)
+    result.hmNl.add(c.heightmap.motionBlockingNoLeaves)
+    result.sky.add(c.lightEngine.skyLight)
+    result.blockL.add(c.lightEngine.blockLight)
+
+proc lightEqual(a, b: seq[LightContainer]): bool =
+  ## By value: an all-zero container may be stored as "empty" or as 2048 zero bytes.
+  if a.len != b.len:
+    return false
+  for i in 0 ..< a.len:
+    for y in 0 ..< 16:
+      for z in 0 ..< 16:
+        for x in 0 ..< 16:
+          if a[i].get(x, y, z) != b[i].get(x, y, z):
+            return false
+  true
+
+proc sameAs(base: Baseline; what: string) =
+  var blocksOk = true
+  var hmOk = true
+  var skyOk = true
+  var blOk = true
+  for i in 0 ..< chunks.len:
+    if dumpBlocks(chunks[i].section) != base.blocks[i]: blocksOk = false
+    if chunks[i].heightmap.worldSurface != base.hmWs[i] or chunks[i].heightmap.motionBlocking != base.hmMb[i] or
+        chunks[i].heightmap.motionBlockingNoLeaves != base.hmNl[i]: hmOk = false
+    if not lightEqual(chunks[i].lightEngine.skyLight, base.sky[i]): skyOk = false
+    if not lightEqual(chunks[i].lightEngine.blockLight, base.blockL[i]): blOk = false
+  check(what & ": blocks identical", blocksOk)
+  check(what & ": heightmaps identical", hmOk)
+  check(what & ": sky light identical", skyOk)
+  check(what & ": block light identical", blOk)
+
+let base0 = takeBaseline()
+check("setup: chest state present", stateAt(8, 12, 8) == chest)
+check("setup: lamp lights its neighbour", getBlockLightLevel(theLevel.lightAccess, newBlockPos(17'i32, 21'i32, 16'i32)) == (true, 14'u8))
+
+# --- blockVersion ----------------------------------------------------------------------------------------------------------
+if true:
+  let v0 = sectionVersion(chunks[0].section, 0)
+  discard setBlockState(theLevel, newBlockPos(1'i32, 1'i32, 1'i32), stone)   # same value: no bump
+  check("blockVersion: writing the same state does not bump", sectionVersion(chunks[0].section, 0) == v0)
+  discard setBlockState(theLevel, newBlockPos(1'i32, 1'i32, 1'i32), dirt)
+  check("blockVersion: a changed cell bumps its section", sectionVersion(chunks[0].section, 0) == v0 + 1'u32)
+  check("blockVersion: other sections untouched", sectionVersion(chunks[0].section, 1) == sectionVersion(chunks[0].section, 1))
+  discard setBlockState(theLevel, newBlockPos(1'i32, 1'i32, 1'i32), stone)
+rebuildHeightmaps()
+let base = takeBaseline()
+
+# --- remove 24x12x24 then restore (partial sections everywhere) --------------------------------------------------------------
+if true:
+  let box = volumeBox(4'i32, 10'i32, 4'i32, 27'i32, 21'i32, 27'i32)
+  var snap = readVolume(bw, box)
+  check("readVolume: ok", snap.status == esOk)
+  check("readVolume: 4 chunks x 2 sections", snap.sections.len == 8)
+  check("readVolume: chest captured", snap.blockEntities.len == 1)
+  let pre = takeBaseline()
+  var expectChanged = 0
+  var secSet = initTable[int64, bool]()
+  for y in box.minY .. box.maxY:
+    for z in box.minZ .. box.maxZ:
+      for x in box.minX .. box.maxX:
+        if stateAt(x, y, z) != 0'u32:
+          inc expectChanged
+          secSet[(int64(x shr 4) shl 40) xor (int64(z shr 4) shl 20) xor int64(y shr 4)] = true
+  let r = removeVolume(bw, snap, defaultBulkOptions())
+  check("removeVolume: ok", r.status == esOk)
+  check("removeVolume: changed count == non-air cells", r.changed == expectChanged)
+  var allAir = true
+  for y in box.minY .. box.maxY:
+    for z in box.minZ .. box.maxZ:
+      for x in box.minX .. box.maxX:
+        if stateAt(x, y, z) != 0'u32: allAir = false
+  check("removeVolume: box is all air", allAir)
+  check("removeVolume: blocks outside the box untouched", stateAt(3, 12, 3) == stone and stateAt(28, 12, 28) == stone)
+  # One group per section, every entry of a group inside that section.
+  let groups = bw.unsentSectionGroups()
+  var groupsOk = true
+  var entries = 0
+  for g in groups:
+    entries += g.len
+    for e in g:
+      if (e[0].vec.x shr 4) != (g[0][0].vec.x shr 4) or (e[0].vec.y shr 4) != (g[0][0].vec.y shr 4) or
+          (e[0].vec.z shr 4) != (g[0][0].vec.z shr 4):
+        groupsOk = false
+  check("packets: one group per touched section", groups.len == secSet.len)
+  check("packets: groups never mix sections", groupsOk)
+  check("packets: every changed cell is queued exactly once", entries == expectChanged)
+  bw.flushBlockUpdates()
+  check("packets: flush empties the queue", bw.unsentBlockChanges.len == 0)
+  check("removeVolume: chest block entity dropped from the chunk", chunks[0].pendingBlockEntities.len == 0)
+  check("removeVolume: snapshot holds chest NBT", snap.blockEntities.len == 1)
+  let rr = restoreVolume(bw, snap, defaultBulkOptions())
+  check("restoreVolume: ok", rr.status == esOk)
+  check("restoreVolume: same cell count", rr.changed == expectChanged)
+  bw.flushBlockUpdates()
+  sameAs(pre, "remove+restore (partial sections)")
+  var chestBack = false
+  for e in chunks[0].pendingBlockEntities:
+    if e.pos == newBlockPos(8'i32, 12'i32, 8'i32) and e.nbt == chestNbt:
+      chestBack = true
+  check("restoreVolume: chest NBT identical", chestBack)
+
+# --- section-aligned: remove 32^3 and restore, full-section swap, 8 sections of 4096 -----------------------------------------
+fillBox(0, 0, 0, 31, 31, 31, stone)
+rebuildHeightmaps()
+bw.bulkUpdateLighting(newBlockPos(0'i32, 0'i32, 0'i32), newBlockPos(31'i32, 60'i32, 31'i32))
+if true:
+  let pre = takeBaseline()
+  let box = volumeBox(0'i32, 0'i32, 0'i32, 31'i32, 31'i32, 31'i32)
+  var snap = readVolume(bw, box)
+  check("aligned: 8 full sections", snap.sections.len == 8)
+  let r = removeVolume(bw, snap, defaultBulkOptions())
+  check("aligned: remove ok, 32768 cells", r.status == esOk and r.changed == 32768)
+  let groups = bw.unsentSectionGroups()
+  var full = true
+  for g in groups:
+    if g.len != 4096: full = false
+  check("aligned: exactly 8 multi-block groups of 4096", groups.len == 8 and full)
+  bw.flushBlockUpdates()
+  let rr = restoreVolume(bw, snap, defaultBulkOptions())
+  check("aligned: restore ok", rr.status == esOk and rr.changed == 32768)
+  bw.flushBlockUpdates()
+  sameAs(pre, "aligned remove+restore")
+  var palettesSame = true
+  for c in chunks:
+    for i in 0 ..< 2:
+      let a = c.section.blockSections[i].toPaletteAndPackedData(c.section.blockSections[i].bitsPerEntry())
+      if a[0].len == 0: palettesSame = false
+  check("aligned: palettes well formed", palettesSame)
+
+# --- stale snapshot: all or nothing -------------------------------------------------------------------------------------------
+if true:
+  let pre = takeBaseline()
+  let box = volumeBox(0'i32, 0'i32, 0'i32, 31'i32, 31'i32, 31'i32)
+  var snap = readVolume(bw, box)
+  # Change one cell in the LAST section the snapshot covers: a non-atomic edit would already have cleared the others.
+  discard setBlockState(theLevel, newBlockPos(31'i32, 31'i32, 31'i32), dirt)
+  let preAfter = takeBaseline()
+  let r = removeVolume(bw, snap, defaultBulkOptions())
+  check("stale remove: refused with esStale", r.status == esStale)
+  check("stale remove: reports the section", r.badPos.vec.x == 16 and r.badPos.vec.y == 16 and r.badPos.vec.z == 16)
+  var same = true
+  for i in 0 ..< chunks.len:
+    if dumpBlocks(chunks[i].section) != preAfter.blocks[i]: same = false
+  check("stale remove: nothing written", same and bw.unsentBlockChanges.len == 0)
+  discard setBlockState(theLevel, newBlockPos(31'i32, 31'i32, 31'i32), stone)
+  # Restore side: remove cleanly, then someone builds into the hole.
+  var snap2 = readVolume(bw, box)
+  let r2 = removeVolume(bw, snap2, defaultBulkOptions())
+  check("stale restore: remove ok", r2.status == esOk)
+  bw.flushBlockUpdates()
+  discard setBlockState(theLevel, newBlockPos(0'i32, 0'i32, 31'i32), planks)
+  bw.flushBlockUpdates()
+  let rr = restoreVolume(bw, snap2, defaultBulkOptions())
+  check("stale restore: refused with esStale", rr.status == esStale)
+  check("stale restore: the hole is still a hole", stateAt(5, 5, 5) == 0'u32 and stateAt(0, 0, 31) == planks)
+  # clean up: put stone back by hand
+  discard setBlockState(theLevel, newBlockPos(0'i32, 0'i32, 31'i32), 0'u32)
+  fillBox(0, 0, 0, 31, 31, 31, stone)
+  rebuildHeightmaps()
+
+# --- plugin veto: one hook call per changed cell, all or nothing --------------------------------------------------------------
+if true:
+  gCalls = 0
+  gVetoAt = [20, 20, 20]
+  gPluginBlockChangeListened = true
+  gPluginBlockChangeHook = proc(x, y, z: int; oldState, newState: int): bool {.closure.} =
+    inc gCalls
+    x == gVetoAt[0] and y == gVetoAt[1] and z == gVetoAt[2]
+  var snap = readVolume(bw, volumeBox(0'i32, 0'i32, 0'i32, 31'i32, 31'i32, 31'i32))
+  let r = removeVolume(bw, snap, defaultBulkOptions())
+  check("veto: refused with esVetoed at the cell", r.status == esVetoed and r.badPos == newBlockPos(20'i32, 20'i32, 20'i32))
+  check("veto: nothing written", stateAt(0, 0, 0) == stone and stateAt(31, 31, 31) == stone and bw.unsentBlockChanges.len == 0)
+  gVetoAt = [-1, -1, -1]
+  gCalls = 0
+  let r2 = removeVolume(bw, snap, defaultBulkOptions())
+  check("veto: no veto -> ok", r2.status == esOk)
+  check("veto: hook asked once per changed cell", gCalls == 32768)
+  var snapB = snap
+  let rr = restoreVolume(bw, snapB, BulkOptions(fireHooks: false, notifyEdge: true, logChanges: true))
+  check("veto: restore with fireHooks=false skips the hook", rr.status == esOk and gCalls == 32768)
+  gPluginBlockChangeListened = false
+  bw.flushBlockUpdates()
+
+# --- placement ----------------------------------------------------------------------------------------------------------------
+if true:
+  # A small asymmetric 3x2x2 piece: stone x-row at y0, a plank at (2,1,1).
+  fillBox(0, 40, 0, 2, 41, 1, 0'u32)
+  fillBox(0, 40, 0, 2, 40, 0, stone)
+  discard setBlockState(theLevel, newBlockPos(2'i32, 41'i32, 1'i32), planks)
+  let box = volumeBox(0'i32, 40'i32, 0'i32, 2'i32, 41'i32, 1'i32)
+  let snap = readVolume(bw, box)
+  var po = defaultPlaceOptions()
+  let r = bw.placeVolume(snap, newBlockPos(10'i32, 70'i32, 10'i32), po)
+  check("place: ok, 4 solid cells", r.status == esOk and r.changed == 4 and r.skipped == 8)
+  check("place: translated cells", stateAt(10, 70, 10) == stone and stateAt(12, 70, 10) == stone and stateAt(12, 71, 11) == planks)
+  check("place: air cells did not write", stateAt(11, 71, 10) == 0'u32)
+  po.quarterTurns = 1
+  let r1 = bw.placeVolume(snap, newBlockPos(20'i32, 70'i32, 10'i32), po)
+  # size x=3, z=2; one quarter turn: (dx,dz) -> (sizeZ-1-dz, dx) = (1-dz, dx): row along x becomes a row along z.
+  check("place: quarter turn ok", r1.status == esOk and r1.changed == 4)
+  check("place: quarter turn geometry", stateAt(21, 70, 10) == stone and stateAt(21, 70, 12) == stone and stateAt(20, 71, 12) == planks)
+  let pb = placedBox(snap, newBlockPos(20'i32, 70'i32, 10'i32), 1)
+  check("place: placedBox of a turned box swaps x and z extent", pb.maxX == 21 and pb.maxZ == 12)
+  # blocked placement is all or nothing
+  var po2 = defaultPlaceOptions()
+  po2.mode = pmFailIfBlocked
+  let before = stateAt(10, 70, 10)
+  let r2 = bw.placeVolume(snap, newBlockPos(9'i32, 70'i32, 10'i32), po2)   # overlaps the first piece
+  check("place: pmFailIfBlocked refuses", r2.status == esBlocked)
+  check("place: pmFailIfBlocked wrote nothing", stateAt(9, 70, 10) == 0'u32 and stateAt(10, 70, 10) == before)
+  var po3 = defaultPlaceOptions()
+  po3.mode = pmOnlyAir
+  let r3 = bw.placeVolume(snap, newBlockPos(9'i32, 70'i32, 10'i32), po3)
+  check("place: pmOnlyAir skips taken cells", r3.status == esOk and r3.changed == 2)
+  bw.flushBlockUpdates()
+
+# --- throughput ----------------------------------------------------------------------------------------------------------------
+if true:
+  fillBox(0, 0, 0, 31, 31, 31, stone)
+  fillBox(0, 64, 0, 31, 95, 31, 0'u32)
+  rebuildHeightmaps()
+  let box = volumeBox(0'i32, 0'i32, 0'i32, 31'i32, 31'i32, 31'i32)
+  gBulkProfile = true
+  var removeNs = 0'i64
+  var restoreNs = 0'i64
+  var placeNs = 0'i64
+  var readNs = 0'i64
+  const Rounds = 5
+  for i in 0 ..< Rounds:
+    let t0 = nowNanos()
+    var snap = readVolume(bw, box)
+    let t1 = nowNanos()
+    let r = removeVolume(bw, snap, defaultBulkOptions())
+    let t2 = nowNanos()
+    bw.flushBlockUpdates()
+    let rr = restoreVolume(bw, snap, defaultBulkOptions())
+    let t3 = nowNanos()
+    bw.flushBlockUpdates()
+    check("throughput round ok", r.status == esOk and rr.status == esOk)
+    readNs += t1 - t0
+    removeNs += t2 - t1
+    restoreNs += t3 - t2
+  # placement into air: 32^3 at y 64..95 (sections 4..5), through the general per-cell path
+  var snapP = readVolume(bw, box)
+  for i in 0 ..< Rounds:
+    var po = defaultPlaceOptions()
+    let t4 = nowNanos()
+    let rp = bw.placeVolume(snapP, newBlockPos(0'i32, 64'i32, 0'i32), po)
+    let t5 = nowNanos()
+    bw.flushBlockUpdates()
+    check("throughput place ok", rp.status == esOk and rp.changed == 32768)
+    placeNs += t5 - t4
+    # take it down again for the next round (not timed)
+    var down = readVolume(bw, volumeBox(0'i32, 64'i32, 0'i32, 31'i32, 95'i32, 31'i32))
+    discard removeVolume(bw, down, defaultBulkOptions())
+    bw.flushBlockUpdates()
+  proc rate(ns: int64): int64 =
+    if ns == 0'i64: 0'i64 else: (32768'i64 * int64(Rounds) * 1_000_000_000'i64) div ns
+  echo "THROUGHPUT 32x32x32 (32768 cells), mean of ", Rounds, " rounds"
+  echo "  readVolume   ", readNs div int64(Rounds) div 1000'i64, " us   ", rate(readNs), " blocks/s"
+  echo "  removeVolume ", removeNs div int64(Rounds) div 1000'i64, " us   ", rate(removeNs), " blocks/s"
+  echo "  restoreVolume", restoreNs div int64(Rounds) div 1000'i64, " us   ", rate(restoreNs), " blocks/s"
+  echo "  placeVolume  ", placeNs div int64(Rounds) div 1000'i64, " us   ", rate(placeNs), " blocks/s"
+  let phases = ["plan", "veto", "write", "heightmaps", "blockentities", "register+log", "light", "notify"]
+  for i in 0 ..< 8:
+    echo "  phase ", phases[i], " total over all edits: ", gBulkPhaseNs[i] div 1000'i64, " us"
+
+if failures > 0:
+  echo "bulkedit: ", failures, " FAILED"
+  quit(1)
+echo "bulkedit ok"
