@@ -219,6 +219,8 @@ type
     removed*: bool
     lastSentYaw*, lastSentPitch*, lastSentHeadYaw*: uint8
     lastSentPos*: Vector3[float64]
+    trackTick*: int32                  ## `ServerEntity.tickCount`: ticks since the tracker began on it (`sendChanges`).
+    lastSentVelocity*: Vector3[float64] ## `ServerEntity.lastSentMovement`.
 
   LivingEntity* = ref object
     ## `LivingEntity`.
@@ -1018,7 +1020,9 @@ template sendMetaData2*(self: Entity; index1: TrackedId; typ1: MetaDataType; val
       smPlayer.client.writePacketFor(CSetEntityMetadata(entityId: newVarInt(smEntity.entityId), metadata: smBuf.buf))
 
 proc sendVelocity*(self: Entity) =
-  ## `send_velocity`
+  ## `send_velocity`: at once, as vanilla does for `hurtMarked` and explicit launches. The tracker (`sendChanges`)
+  ## measures later changes from what this sent.
+  self.lastSentVelocity = self.velocity
   self.world.broadcastToChunk(self.chunkPos, newCEntityVelocity(newVarInt(self.entityId), self.velocity))
 
 proc setVelocity*(self: Entity; velocity: Vector3[float64]) =
@@ -1313,6 +1317,74 @@ proc sendPos*(self: Entity) =
   self.lastSentPos = new0
   self.world.broadcastToChunk(self.chunkPos, CUpdateEntityPos(entityId: newVarInt(self.entityId), delta: converted,
     onGround: self.onGround))
+
+# --- The entity tracker: vanilla `ServerEntity.sendChanges` ----------------------------------------------------------
+#
+# Before this, every mob sent its moves EVERY tick (`livingTick` -> `sendPosRot`) and, worse, every grounded entity sent
+# a `set_entity_motion` every tick: `Entity.move` calls the block's `updateEntityMovementAfterFallOn`, whose default
+# (`stopVerticalMovementAfterFall`) zeroes the vertical velocity through the block actor's setter, and that setter
+# broadcast. A pen of 60 cows measured ~1,870-3,400 `set_entity_motion` a second at a bot (2026-11-17), the Jester
+# client ~4,500. Vanilla sends both from the tracker only every `updateInterval` ticks (3 for most mobs), the motion
+# only for `trackDeltas` types (or after an impulse) and only when it moved by more than 1e-7 (squared) since the last
+# one it sent.
+
+proc trackerInterval*(t: EntityType): int32 =
+  ## `EntityType.updateInterval()` (the builder's `updateInterval`, 3 when not set).
+  case t.resourceName
+  of "player", "evoker_fangs": 2'i32
+  of "item", "experience_orb", "falling_block", "arrow", "spectral_arrow", "trident", "ominous_item_spawner": 20'i32
+  of "tnt", "snowball", "egg", "ender_pearl", "experience_bottle", "splash_potion", "lingering_potion", "potion",
+     "fireball", "small_fireball", "dragon_fireball", "wither_skull", "llama_spit", "wind_charge", "breeze_wind_charge",
+     "firework_rocket": 10'i32
+  of "eye_of_ender": 4'i32
+  of "fishing_bobber": 5'i32
+  of "block_display", "item_display", "text_display", "interaction": 1'i32
+  of "item_frame", "glow_item_frame", "painting", "leash_knot", "area_effect_cloud", "end_crystal", "lightning_bolt",
+     "marker": high(int32)
+  else: 3'i32
+
+proc trackDeltas*(t: EntityType): bool =
+  ## `EntityType.trackDeltas()`
+  case t.resourceName
+  of "player", "llama_spit", "wither", "bat", "item_frame", "glow_item_frame", "leash_knot", "painting", "end_crystal",
+     "evoker_fangs": false
+  else: true
+
+proc sendTrackedPos(self: Entity) =
+  ## The position half of `sendChanges`: a relative move while it fits in a short (8 blocks at 1/4096), else a sync
+  ## (vanilla's `ClientboundEntityPositionSyncPacket` when `positionCodec` cannot encode the delta).
+  let old = self.lastSentPos
+  let new0 = self.pos
+  let dx = new0.x * 4096.0'f64 - old.x * 4096.0'f64
+  let dy = new0.y * 4096.0'f64 - old.y * 4096.0'f64
+  let dz = new0.z * 4096.0'f64 - old.z * 4096.0'f64
+  if abs(dx) > 32767.0'f64 or abs(dy) > 32767.0'f64 or abs(dz) > 32767.0'f64:
+    self.lastSentPos = new0
+    self.lastSentYaw = angleToU8(self.yaw)
+    self.lastSentPitch = angleToU8(self.pitch)
+    self.world.broadcastToChunk(self.chunkPos, CEntityPositionSync(entityId: newVarInt(self.entityId), position: new0,
+      delta: self.velocity, yaw: self.yaw, pitch: self.pitch, onGround: self.onGround))
+    self.sendHeadRot(self.lastSentYaw)
+  else:
+    self.sendPosRot()
+
+proc sendChanges*(self: Entity; impulse = false) =
+  ## `ServerEntity.sendChanges` for one tick. `impulse` is vanilla's `hasImpulse` for the entities that keep it the
+  ## vanilla way (items in fluid, a falling block or TNT that was pushed): it sends this tick instead of waiting for the
+  ## interval. A mob's `velocityDirty` (pushes, a leash pull, a jump) only lets a type without `trackDeltas` send its
+  ## motion at the next interval: vanilla's `push` sets `hasImpulse`, which in a crowded pen meant a motion and a move
+  ## for every pushed mob every tick. Damage knockback still goes out at once (`sendVelocity`, vanilla's `hurtMarked`).
+  let t = self.entityType
+  let interval = trackerInterval(t)
+  if impulse or self.trackTick mod interval == 0'i32:
+    self.sendTrackedPos()
+    if (trackDeltas(t) or self.velocityDirty or impulse) and self.trackTick > 0'i32:
+      let v = self.velocity
+      let d = (v - self.lastSentVelocity).lengthSquared()
+      if d > 1.0e-7'f64 or (d > 0.0'f64 and v.lengthSquared() == 0.0'f64):
+        self.sendVelocity()
+    self.velocityDirty = false
+  self.trackTick = if self.trackTick == high(int32): 1'i32 else: self.trackTick + 1'i32
 
 proc pushByFluid(self: Entity; speed: float64; push0: Vector3[float64]; n: int) =
   ## `push_by_fluid`
@@ -3689,7 +3761,7 @@ proc livingTick*(self: LivingEntity; caller: EntityBase; server: Server) =
     self.entity.tickFrozen(caller)
   let player = caller.player
   if player == nil:
-    self.entity.sendPosRot()
+    self.entity.sendChanges()
   # Fetch supporting blocks for players or other entities
   let supportingPos = if player != nil: gPlayerHooks.getSupportingBlockPos(player) else: self.entity.getSupportingBlockPos()
   # Notify the block under the entity each tick if a supporting block position is found
