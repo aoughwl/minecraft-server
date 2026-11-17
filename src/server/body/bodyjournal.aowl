@@ -1,0 +1,197 @@
+## Write-ahead journal of the body manager: the one persistence of moving bodies.
+##
+## WHY. Blocks leave the saved chunk the moment a body is assembled, but a body is not part of any chunk (bodyentity.aowl). If the
+## process died then, both would be gone. So every body has a file `<world root>/aowlmony/bodies/<uuid hex>.nbt`:
+##   written (temp file + rename, so a reader sees the old or the new file, never half of one)
+##     * BEFORE the blocks are removed        (state pending)
+##     * when the body is registered          (state free), then every `checkpointEvery` ticks while it moves and when it falls asleep
+##     * BEFORE the blocks are placed back    (state settling, claims = the cells about to be written)
+##   deleted when the blocks are back, the body is removed on purpose, or it was lost to the void.
+## On start `journalList` gives every record of a dimension; the manager re-creates the bodies and applies the CLAIMS rule: a claim is
+## a world cell and the block state a record says belongs there (the cell the body took its block from, or will put it at). If the
+## world already holds that state, the saved chunk got that write, so the block wins and the cell leaves the body. Rules that follow:
+##   pending, blocks still there      -> all cells claimed, the record is deleted, nothing changes (the removal never reached disk)
+##   free, removal saved              -> no cell claimed, the body exists again (blocks and body are not duplicated)
+##   settling, placement saved        -> all claimed, deleted
+##   settling, placement not saved    -> none claimed, the body exists again and settles later
+##   mixed (one chunk saved, one not) -> cell by cell: the body keeps the cells whose block is absent
+## A claim can match by accident only if a player rebuilt exactly the source block while the body flies (one cell lost): accepted.
+##
+## FORMAT (gzip NBT): Version int, State int, Dim string, Tick long, Body compound (physics/bodynbt.aowl bodyToNbt), Claims and
+## PlaceClaims (source cells, and while settling the cells about to be written) int[] of 7-tuples (lx ly lz wx wy wz state), BlockEntities list of {X,Y,Z local cell, Nbt compound}.
+
+{.feature: "lenientnils".}
+
+import std/[options, paths, dirs]
+import ../../nbt/tag as nbttag
+import ../../nbt/nbt_compress
+import ../../physics/[body, bodymass, bodynbt]
+import ../../world/[level, worldfs]
+import ../serverbase
+import bodyentity
+
+const
+  JournalVersion* = 1'i32
+  StatePending* = 0'i32
+  StateFree* = 1'i32
+  StateSettling* = 2'i32
+
+type
+  JournalRecord* = object
+    ok*: bool
+    state*: int32
+    dim*: string
+    tick*: int64
+    body*: Body
+    claims*: seq[Claim]        ## source cells
+    placeClaims*: seq[Claim]   ## state settling: the cells about to be written
+    blockEntities*: seq[BodyBE]
+    file*: string
+
+proc hex16(v: uint64): string =
+  const digits = "0123456789abcdef"
+  result = newString(16)
+  for i in 0 ..< 16:
+    result[15 - i] = digits[int((v shr uint64(i * 4)) and 15'u64)]
+
+proc journalFolder*(world: World): string =
+  joinPathW(joinPathW(world.level.levelFolder.rootFolder, "aowlmony"), "bodies")
+
+proc journalPath*(world: World; hi, lo: uint64): string =
+  joinPathW(journalFolder(world), hex16(hi) & hex16(lo) & ".nbt")
+
+proc claimInts(list: seq[Claim]): seq[int32] =
+  result = @[]
+  for k in list:
+    result.add(k.lx)
+    result.add(k.ly)
+    result.add(k.lz)
+    result.add(k.wx)
+    result.add(k.wy)
+    result.add(k.wz)
+    result.add(k.state)
+
+proc recordNbt(be: BodyEntity; state: int32; tick: int64; placeClaims: seq[Claim]): NbtCompound =
+  var c = newCompound()
+  putInt(c, "Version", JournalVersion)
+  putInt(c, "State", state)
+  putString(c, "Dim", be.dim)
+  putLong(c, "Tick", tick)
+  put(c, "Body", NbtTag(kind: ntkCompound, compoundVal: bodyToNbt(be.body)))
+  put(c, "Claims", NbtTag(kind: ntkIntArray, intArrayVal: claimInts(be.claims)))
+  put(c, "PlaceClaims", NbtTag(kind: ntkIntArray, intArrayVal: claimInts(placeClaims)))
+  var bes: seq[NbtTag] = @[]
+  for e in be.blockEntities:
+    var ec = newCompound()
+    putInt(ec, "X", e.lx)
+    putInt(ec, "Y", e.ly)
+    putInt(ec, "Z", e.lz)
+    put(ec, "Nbt", NbtTag(kind: ntkCompound, compoundVal: e.nbt))
+    bes.add(NbtTag(kind: ntkCompound, compoundVal: ec))
+  putList(c, "BlockEntities", bes)
+  c
+
+proc journalWrite*(be: BodyEntity; state: int32; tick: int64; placeClaims: seq[Claim]): bool =
+  ## Atomic: temp file, then rename over the old record.
+  let path = journalPath(be.world, be.body.idHi, be.body.idLo)
+  discard createDirAllW(journalFolder(be.world))
+  var bytes: seq[byte] = @[]
+  let r = writeGzipCompoundTag(recordNbt(be, state, tick, placeClaims), bytes)
+  if not r.isOk:
+    return false
+  let tmp = path & ".tmp"
+  if not writeFileBytes(tmp, bytes):
+    return false
+  renameReplace(tmp, path)
+
+proc journalWrite*(be: BodyEntity; state: int32; tick: int64): bool =
+  journalWrite(be, state, tick, @[])
+
+proc journalDelete*(world: World; hi, lo: uint64) =
+  let path = journalPath(world, hi, lo)
+  if fileExistsW(path):
+    discard removeFileW(path)
+
+proc journalExists*(world: World; hi, lo: uint64): bool =
+  fileExistsW(journalPath(world, hi, lo))
+
+proc claimsOf(a: seq[int32]): seq[Claim] =
+  result = @[]
+  var i = 0
+  while i + 6 < a.len:
+    result.add(Claim(lx: a[i], ly: a[i + 1], lz: a[i + 2], wx: a[i + 3], wy: a[i + 4], wz: a[i + 5], state: a[i + 6]))
+    i += 7
+
+proc parseRecord(bytes: seq[byte]): JournalRecord =
+  result = JournalRecord(ok: false, state: 0'i32, dim: "", tick: 0'i64, body: newBody(0'u64, 0'u64), claims: @[],
+    placeClaims: @[], blockEntities: @[], file: "")
+  let r = readGzipCompoundTag(bytes)
+  if not r.isOk:
+    return
+  let c = r.value
+  let ver = getInt(c, "Version")
+  let st = getInt(c, "State")
+  let dim = getString(c, "Dim")
+  let bodyTag = getCompound(c, "Body")
+  if ver.isNone or ver.get != JournalVersion or st.isNone or dim.isNone or bodyTag.isNone:
+    return
+  let (ok, b) = bodyFromNbt(bodyTag.get, defaultProps)
+  if not ok:
+    return
+  result.body = b
+  result.state = st.get
+  result.dim = dim.get
+  let t = getLong(c, "Tick")
+  result.tick = (if t.isSome: t.get else: 0'i64)
+  let cl = getIntArray(c, "Claims")
+  if cl.isSome:
+    result.claims = claimsOf(cl.get)
+  let pc = getIntArray(c, "PlaceClaims")
+  if pc.isSome:
+    result.placeClaims = claimsOf(pc.get)
+  let bl = getList(c, "BlockEntities")
+  if bl.isSome:
+    for tag in bl.get:
+      let ec = extractCompound(tag)
+      if ec.isNone:
+        continue
+      let x = getInt(ec.get, "X")
+      let y = getInt(ec.get, "Y")
+      let z = getInt(ec.get, "Z")
+      let nb = getCompound(ec.get, "Nbt")
+      if x.isSome and y.isSome and z.isSome and nb.isSome:
+        result.blockEntities.add(BodyBE(lx: x.get, ly: y.get, lz: z.get, nbt: nb.get))
+  result.ok = true
+
+proc journalList*(world: World): seq[JournalRecord] =
+  ## Every readable record of this world's dimension, in directory order. An unreadable file is skipped and left alone.
+  result = @[]
+  let folder = journalFolder(world)
+  var names: seq[string] = @[]
+  try:
+    for kind, entry in walkDir(path(folder)):
+      if kind == pcFile:
+        let full = $entry
+        if full.len > 4 and full[full.len - 4 .. ^1] == ".nbt":
+          names.add(full)
+  except ErrorCode:
+    discard
+  let dimName = world.dimension.minecraftName
+  for n in names:
+    let (st, bytes) = readFileBytes(n)
+    if st != rsOk:
+      continue
+    var rec = parseRecord(bytes)
+    if rec.ok and rec.dim == dimName:
+      rec.file = n
+      result.add(rec)
+
+proc journalFileCount*(world: World): int =
+  var n = 0
+  try:
+    for kind, entry in walkDir(path(journalFolder(world))):
+      if kind == pcFile and ($entry).len > 4 and ($entry)[($entry).len - 4 .. ^1] == ".nbt":
+        inc n
+  except ErrorCode:
+    discard
+  n

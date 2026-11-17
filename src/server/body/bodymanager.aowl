@@ -1,0 +1,1351 @@
+## Body manager: turns pieces of the world into moving rigid bodies and back (BODIES-DESIGN.md sections 2 to 4, task T4).
+##
+## WHAT IT DOES
+##   assemble   `assembleBox` / `assembleCells`: read the blocks (bulkedit.readVolume), journal, take exactly the chosen cells out of the
+##              world in one all-or-nothing edit (bulkedit.removeCells, cause "mod" in the block log), create a `Body` (physics/body.aowl)
+##              with their states, register it.
+##   step       `tickBodies(server)`, ONE call per server tick (servermod.tickWorlds): runs `stepBody` for the awake bodies with the world
+##              as the integrator's SimEnv (solid cells and their collision sub-boxes, wind from windfield.windAtWorld), a per tick
+##              budget (`maxAwake` bodies, `maxCells` surface cells; the rest wait one tick, `bodyStats().skipped` counts them and a
+##              line is logged), sleeping bodies cost nothing, bodies that came to rest and are axis aligned settle back into blocks.
+##   settle     `settleBody`: integrator.settle (snap to one of the 24 axis rotations and the integer grid, free spot search), states mapped
+##              through the rotation (bodyworld.mapStateRot, best effort, documented there), written by bulkedit.placeVolume as ONE edit
+##              (a synthetic snapshot of the rotated cells; placeVolume only knows quarter turns about Y). No free spot: the cells become
+##              item drops (blockDropLoot) and the body is gone. A placement that cannot run now (chunk not loaded, plugin veto) keeps the body.
+##   collision  ONE collision provider (entity/collision_providers.aowl) for all bodies: per surface cell world AABBs (exact for an axis
+##              aligned body, the bounding box of the turned cube otherwise; one body-wide box above `MaxProviderCells` cells), surface
+##              velocity v + omega x r for carrying, a precise ray hook (body-local frame, per surface cell slab test) for projectiles.
+##              The provider registry is global and the query has no world: bodies answer for every dimension (documented limit).
+##   persistence bodyjournal.aowl (write-ahead, atomic files, replay on first sight of a world, claims rule). Bodies are NOT entities, so
+##              the chunk entity save never sees them.
+##   collapse   `collapseCheck` / `collapseStart`: snapshot a box one cell larger on every side, solveradapter.snapshotToSolverInput (anchors:
+##              indestructible blocks and the whole shell of the larger box except its top layer, i.e. anything that continues beyond the
+##              checked box counts as supported), wind loads (windLoadFromField), solver.solve in slices (`step` on a budget per tick when the
+##              box is big), then break the failed cells (drops + particles) and assemble every free component as a body.
+##   events     `bodyEventsDrain()`: the change feed for the networking task (see BodyEvent below).
+##
+## NOT HERE (next tasks): the automatic triggers (`onBlockChanged` and `onHeavyBlockPlaced` only wake bodies and queue a dirty box in
+## `bodyDirtyDrain`), networking, body-vs-body contact (the integrator treats other bodies as non-existent), entity pushing, a body
+## entering a different dimension. Block entities travel with their cell (chest items intact) but are not rotated.
+##
+## THREADING. Everything runs on the tick thread; module globals are fine.
+
+{.feature: "lenientnils".}
+
+import std/[math, options, tables, strutils, syncio]
+import ../../data/block_ext
+from ../../data/block_state import newBlockStateIdUnchecked, asU16
+import ../../nbt/tag as nbttag
+import ../../physics/[body, bodymass, integrator, materials, solver, solveradapter, windfield]
+import ../../util/math/position
+import ../../util/math/boundingbox
+import ../../util/vector3
+import ../../world/[chunkdata, level, palette]
+import ../blocklog/blocklogcore
+import ../entity/collision_providers
+import ../net/winsock
+import ../serverbase
+import ../world/[bulkedit, worldmod, lootbridge]
+import "../block/blockbehaviour"
+import bodyentity, bodyworld, bodyjournal
+
+export bodyentity, bodyjournal
+
+const
+  MaxProviderCells* = 6000       ## above this many surface cells a body answers with one body-wide box
+  MaxAssembleCells* = 20000      ## largest component `assembleBox` turns into a body
+  MaxEvents = 65536
+
+type
+  BodyConfig* = object
+    maxAwake*: int            ## awake bodies stepped per tick
+    maxCells*: int            ## surface cells stepped per tick (a body costs its surface cell count + 1)
+    checkpointEvery*: int     ## ticks between journal checkpoints of a moving body
+    autoSettle*: bool         ## a body that slept and is axis aligned turns back into blocks
+    settleAngle*: float64     ## radians, "axis aligned" for the automatic settle (2 degrees)
+    settleRadius*: int        ## free spot search radius of the settle
+    shatter*: bool            ## fragile fall: impacts above a cell's break threshold break cells (off by default)
+    journal*: bool            ## write the journal (tests of the pure parts switch it off)
+    voidMargin*: int          ## a body this far below the world's bottom is lost to the void
+    collapseOps*: int         ## solver budget per tick for queued collapse checks
+    collapseInline*: int      ## boxes up to this many cells run a collapse check to the end at once
+
+  BodyStats* = object
+    created*, destroyed*, settled*, shattered*, voided*: int
+    cellsDropped*: int        ## cells that became item drops (no free spot, fracture)
+    steps*, skipped*, frozen*: int
+    replayed*, claimedCells*: int
+    collapseRuns*, collapseBroken*, collapseBodies*: int
+    settleAttempts*, settleFailures*: int
+
+  BodyEventKind* = enum
+    bekCreate      ## a body appeared: `volume` holds its cells (palette sections), pose fields are its initial pose
+    bekDestroy     ## a body is gone: `reason` says why (the blocks are back, or items dropped, or the void took it)
+    bekState       ## the body moved or fell asleep: pose fields are current; at most ONE pending state event per body
+
+  DestroyReason* = enum
+    drNone, drSettled, drRemoved, drVoid, drDropped, drEmptied
+
+  BodyEvent* = object
+    kind*: BodyEventKind
+    bodyId*: int32              ## the manager's small id (valid until the server stops; the UUID is the stable one)
+    uuidHi*, uuidLo*: uint64
+    tick*: int64
+    dim*: string
+    reason*: DestroyReason      ## bekDestroy
+    pos*: Vec3                  ## world position of body-local (0,0,0)
+    orient*: Quat               ## body to world
+    vel*, angVel*: Vec3         ## blocks per tick of the centre of mass, rad per tick (world frame)
+    sleeping*: bool
+    volume*: Body               ## shared, treat as read only; its cell set is final only on bekCreate
+
+  AssembleResult* = object
+    ok*: bool
+    reason*: string
+    status*: EditStatus
+    bodies*: seq[BodyEntity]
+    crashed*: bool              ## test hook `gTestCrash` fired
+
+  SettleOutcome* = object
+    ok*: bool
+    reason*: string
+    edit*: EditStatus
+    cells*: int
+    dropped*: bool              ## no free spot: the cells became item drops
+
+  CollapseOpts* = object
+    wind*: bool                 ## add wind loads from the wind field
+    includeTerrain*: bool       ## free sets that are mostly rock class material (the solver's 'terrain': stone, ores, iron blocks too, there is no
+                                ## way to tell natural from built) become bodies; default true for an explicit check, the automatic
+                                ## trigger task should pass false and decide cave-ins by its own policy
+    budgetOps*: int             ## solver ops per slice
+
+  CollapseReport* = object
+    ok*, done*, queued*: bool
+    reason*: string
+    cells*: int                 ## structural cells in the checked box
+    rounds*: int
+    converged*: bool
+    maxRatio*: float64
+    broken*: int                ## cells that failed (removed, drops + particles)
+    components*: int            ## free sets the solver reported
+    bodies*: seq[int32]         ## ids of the bodies created
+    skipped*: int               ## free sets not turned into bodies (touch the box shell, terrain, granular, or stale)
+    jobId*: int
+
+  CollapseJob* = ref object
+    id*: int
+    world*: World
+    ebox: VolumeBox
+    ids: seq[int]
+    nx, ny, nz: int
+    job: SolverJob
+    opts: CollapseOpts
+    report*: CollapseReport
+
+  BlockDirty* = object
+    ## `onBlockChanged` record for the trigger task: a changed cell.
+    dim*: string
+    x*, y*, z*: int32
+    oldState*, newState*: uint32
+    heavy*: bool
+
+var gCfg* = BodyConfig(maxAwake: 32, maxCells: 8000, checkpointEvery: 100, autoSettle: true, settleAngle: 0.035,
+  settleRadius: 2, shatter: false, journal: true, voidMargin: 32, collapseOps: 20000, collapseInline: 70000)
+var gStats* = BodyStats()
+var gTestCrash* = 0     ## test hook: 1 = stop after the pending journal write, 2 = after the blocks were removed, 3 = after the settling write
+var gBodies*: seq[BodyEntity] = @[]
+var gNextId: int32 = 1'i32
+var gUuidCounter: uint64 = 0'u64
+var gProviderId: int32 = 0'i32
+var gServers: seq[Server] = @[]
+var gReplayed: seq[string] = @[]
+var gCursor = 0
+var gLastTick: int64 = 0'i64
+var gEvents: seq[BodyEvent] = @[]
+var gStatePending = initTable[int32, int]()
+var gEventsOverflow* = false
+var gDirty: seq[BlockDirty] = @[]
+var gJobs: seq[CollapseJob] = @[]
+var gNextJob = 1
+var gLastSkipLog: int64 = -1000'i64
+var gAnchorNx, gAnchorNy, gAnchorNz: int
+var gWindBase: array[3, float64]
+var gWindTick: float64
+
+# ----------------------------------------------------------------------------------------------------------------------
+# small helpers
+
+proc ckey(x, y, z: int32): int64 =
+  ((int64(x) + 33554432'i64) shl 38) or ((int64(z) + 33554432'i64) shl 12) or (int64(y) + 2048'i64)
+
+proc statusName*(s: EditStatus): string =
+  case s
+  of esOk: "ok"
+  of esStale: "the blocks changed (stale snapshot)"
+  of esUnloaded: "a chunk is not loaded"
+  of esOutOfRange: "outside the build height"
+  of esVetoed: "a plugin cancelled the block change"
+  of esBlocked: "the target is blocked"
+  of esWrongState: "wrong state"
+
+proc newUuid(): (uint64, uint64) =
+  inc gUuidCounter
+  let t = uint64(nowNanos())
+  (t xor (gUuidCounter * 0x9E3779B97F4A7C15'u64), (t shl 13) xor (gUuidCounter * 0xC2B2AE3D27D4EB4F'u64) xor 0x5851F42D4C957F2D'u64)
+
+proc allocId(): int32 =
+  result = gNextId
+  inc gNextId
+
+proc vec3Of(v: Vec3): Vector3[float64] =
+  Vector3[float64](x: v.x, y: v.y, z: v.z)
+
+proc hex16(v: uint64): string =
+  const digits = "0123456789abcdef"
+  result = newString(16)
+  for i in 0 ..< 16:
+    result[15 - i] = digits[int((v shr uint64(i * 4)) and 15'u64)]
+
+proc idText*(be: BodyEntity): string =
+  $be.id & " (" & hex16(be.body.idHi) & hex16(be.body.idLo) & ")"
+
+proc parseIntSafe(s: string; v: var int): bool =
+  ## Optional sign, then digits only (no exceptions in this dialect).
+  if s.len == 0 or s.len > 10:
+    return false
+  var i = 0
+  var neg = false
+  if s[0] == '-' or s[0] == '+':
+    neg = s[0] == '-'
+    i = 1
+  if i >= s.len:
+    return false
+  var n = 0
+  while i < s.len:
+    if s[i] < '0' or s[i] > '9':
+      return false
+    n = n * 10 + (ord(s[i]) - ord('0'))
+    inc i
+  v = (if neg: -n else: n)
+  true
+
+proc parseFloatSafe(s: string; v: var float64): bool =
+  ## [+-]digits[.digits]
+  if s.len == 0 or s.len > 24:
+    return false
+  var i = 0
+  var neg = false
+  if s[0] == '-' or s[0] == '+':
+    neg = s[0] == '-'
+    i = 1
+  if i >= s.len:
+    return false
+  var whole = 0.0
+  var any = false
+  while i < s.len and s[i] >= '0' and s[i] <= '9':
+    whole = whole * 10.0 + float64(ord(s[i]) - ord('0'))
+    any = true
+    inc i
+  var frac = 0.0
+  if i < s.len and s[i] == '.':
+    inc i
+    var scale = 0.1
+    while i < s.len and s[i] >= '0' and s[i] <= '9':
+      frac += scale * float64(ord(s[i]) - ord('0'))
+      scale *= 0.1
+      any = true
+      inc i
+  if not any or i != s.len:
+    return false
+  v = (if neg: -(whole + frac) else: whole + frac)
+  true
+
+proc f2(v: float64): string =
+  formatFloat(v, ffDecimal, 2)
+
+proc bodyCount*(): int = gBodies.len
+
+proc bodyById*(id: int32): Option[BodyEntity] =
+  for be in gBodies:
+    if be.id == id:
+      return some(be)
+  none[BodyEntity]()
+
+proc bodyList*(): seq[BodyEntity] = gBodies
+
+proc trackServer(server: Server) =
+  if gServers.len == 0:
+    gServers.add(server)
+  else:
+    gServers[0] = server
+
+proc worldByDim*(dim: string): Option[World] =
+  if gServers.len > 0:
+    for w in gServers[0].worlds:
+      if w.dimension.minecraftName == dim:
+        return some(w)
+  none[World]()
+
+proc bodyStats*(): BodyStats = gStats
+
+proc bodyLastTick*(): int64 = gLastTick
+
+# ----------------------------------------------------------------------------------------------------------------------
+# event feed
+
+proc makeEvent(kind: BodyEventKind; be: BodyEntity; reason: DestroyReason; tick: int64): BodyEvent =
+  BodyEvent(kind: kind, bodyId: be.id, uuidHi: be.body.idHi, uuidLo: be.body.idLo, tick: tick, dim: be.dim, reason: reason,
+    pos: be.body.pos, orient: be.body.orient, vel: be.body.vel, angVel: be.body.angVel, sleeping: be.body.sleeping,
+    volume: be.body)
+
+proc pushEvent(ev: BodyEvent) =
+  if gEvents.len >= MaxEvents:
+    gEvents.setLen(0)
+    gStatePending.clear()
+    gEventsOverflow = true
+  gEvents.add(ev)
+
+proc emitState(be: BodyEntity; tick: int64) =
+  let ev = makeEvent(bekState, be, drNone, tick)
+  if gStatePending.hasKey(be.id):
+    let at = gStatePending.getOrDefault(be.id, -1)
+    if at >= 0 and at < gEvents.len and gEvents[at].kind == bekState and gEvents[at].bodyId == be.id:
+      gEvents[at] = ev
+      return
+  pushEvent(ev)
+  gStatePending[be.id] = gEvents.len - 1
+
+proc emitCreate(be: BodyEntity; tick: int64) =
+  pushEvent(makeEvent(bekCreate, be, drNone, tick))
+
+proc emitDestroy(be: BodyEntity; reason: DestroyReason; tick: int64) =
+  if gStatePending.hasKey(be.id):
+    let at = gStatePending.getOrDefault(be.id, -1)
+    if at >= 0 and at < gEvents.len and gEvents[at].kind == bekState and gEvents[at].bodyId == be.id:
+      gEvents.delete(at)
+      # indices of later pending states moved down by one
+      var fix: seq[int32] = @[]
+      for k, v in gStatePending:
+        if v > at:
+          fix.add(k)
+      for k in fix:
+        gStatePending[k] = gStatePending.getOrDefault(k, 1) - 1
+    gStatePending.del(be.id)
+  pushEvent(makeEvent(bekDestroy, be, reason, tick))
+
+proc bodyEventsDrain*(): seq[BodyEvent] =
+  ## Everything queued since the last call, in order (create, then states, then destroy of each body). The state events are
+  ## coalesced: one per body, the latest. Empties the queue.
+  result = gEvents
+  gEvents = @[]
+  gStatePending.clear()
+  gEventsOverflow = false
+
+proc bodyEventsPending*(): int = gEvents.len
+
+proc bodyEventsSnapshot*(): seq[BodyEvent] =
+  ## One bekCreate per live body with its CURRENT pose: for a consumer that joined late or lost events (`gEventsOverflow`).
+  result = @[]
+  for be in gBodies:
+    if be.phase == bpFree:
+      result.add(makeEvent(bekCreate, be, drNone, gLastTick))
+
+proc bodyDirtyDrain*(): seq[BlockDirty] =
+  result = gDirty
+  gDirty = @[]
+
+# ----------------------------------------------------------------------------------------------------------------------
+# collision provider (one for all bodies)
+
+proc overlaps(a: Aabb; r: BoundingBox): bool =
+  a.x1 > r.min.x and a.x0 < r.max.x and a.y1 > r.min.y and a.y0 < r.max.y and a.z1 > r.min.z and a.z0 < r.max.z
+
+proc boxOf(a: Aabb): BoundingBox =
+  newBoundingBox(Vector3[float64](x: a.x0, y: a.y0, z: a.z0), Vector3[float64](x: a.x1, y: a.y1, z: a.z1))
+
+proc provQuery(handle: int; region: BoundingBox; moverId: int32; outBoxes: var seq[ProvidedBox]) {.nimcall.} =
+  for be in gBodies:
+    if be.phase != bpFree:
+      continue
+    let ab = bodyAabb(be)
+    if not overlaps(ab, region):
+      continue
+    if be.sim.cells.len > MaxProviderCells:
+      let c = vec3Of(surfaceVelocityAt(be, (ab.x0 + ab.x1) * 0.5, (ab.y0 + ab.y1) * 0.5, (ab.z0 + ab.z1) * 0.5))
+      outBoxes.add(ProvidedBox(box: boxOf(ab), surfaceVel: c))
+      continue
+    let r = quatToMat(be.body.orient)
+    for c in be.sim.cells:
+      let cb = cellAabb(be, r, c.x, c.y, c.z)
+      if overlaps(cb, region):
+        let v = surfaceVelocityAt(be, (cb.x0 + cb.x1) * 0.5, (cb.y0 + cb.y1) * 0.5, (cb.z0 + cb.z1) * 0.5)
+        outBoxes.add(ProvidedBox(box: boxOf(cb), surfaceVel: vec3Of(v)))
+
+proc provVelocity(handle: int; box: BoundingBox; vel: var Vector3[float64]): bool {.nimcall.} =
+  let region = box.expand(0.0'f64, 0.1'f64, 0.0'f64)
+  for be in gBodies:
+    if be.phase != bpFree:
+      continue
+    if not overlaps(bodyAabb(be), region):
+      continue
+    let r = quatToMat(be.body.orient)
+    for c in be.sim.cells:
+      let cb = cellAabb(be, r, c.x, c.y, c.z)
+      if overlaps(cb, region):
+        vel = vec3Of(surfaceVelocityAt(be, (cb.x0 + cb.x1) * 0.5, cb.y1, (cb.z0 + cb.z1) * 0.5))
+        return true
+  false
+
+proc slabHit(o, d: array[3, float64]; lo, hi: array[3, float64]; t: var float64): bool =
+  var tMin = 0.0
+  var tMax = 1.0
+  for a in 0 ..< 3:
+    if abs(d[a]) < 1e-12:
+      if o[a] < lo[a] or o[a] > hi[a]:
+        return false
+    else:
+      let t1 = (lo[a] - o[a]) / d[a]
+      let t2 = (hi[a] - o[a]) / d[a]
+      let a0 = (if t1 < t2: t1 else: t2)
+      let a1 = (if t1 < t2: t2 else: t1)
+      if a0 > tMin: tMin = a0
+      if a1 < tMax: tMax = a1
+  if tMin <= tMax:
+    t = tMin
+    return true
+  false
+
+proc provRay(handle: int; origin, delta: Vector3[float64]; tHit: var float64): bool {.nimcall.} =
+  var best = 2.0
+  var found = false
+  let sx0 = min(origin.x, origin.x + delta.x)
+  let sx1 = max(origin.x, origin.x + delta.x)
+  let sy0 = min(origin.y, origin.y + delta.y)
+  let sy1 = max(origin.y, origin.y + delta.y)
+  let sz0 = min(origin.z, origin.z + delta.z)
+  let sz1 = max(origin.z, origin.z + delta.z)
+  for be in gBodies:
+    if be.phase != bpFree:
+      continue
+    let ab = bodyAabb(be)
+    if ab.x1 < sx0 or ab.x0 > sx1 or ab.y1 < sy0 or ab.y0 > sy1 or ab.z1 < sz0 or ab.z0 > sz1:
+      continue
+    # into the body frame: R is orthonormal, so the inverse is the transpose
+    let r = quatToMat(be.body.orient)
+    let px = origin.x - be.body.pos.x
+    let py = origin.y - be.body.pos.y
+    let pz = origin.z - be.body.pos.z
+    let o = [r[0] * px + r[3] * py + r[6] * pz, r[1] * px + r[4] * py + r[7] * pz, r[2] * px + r[5] * py + r[8] * pz]
+    let d = [r[0] * delta.x + r[3] * delta.y + r[6] * delta.z, r[1] * delta.x + r[4] * delta.y + r[7] * delta.z,
+      r[2] * delta.x + r[5] * delta.y + r[8] * delta.z]
+    for c in be.sim.cells:
+      var t = 0.0
+      if slabHit(o, d, [float64(c.x), float64(c.y), float64(c.z)], [float64(c.x) + 1.0, float64(c.y) + 1.0, float64(c.z) + 1.0], t) and
+          t < best:
+        best = t
+        found = true
+  if found:
+    tHit = best
+  found
+
+proc ensureProvider() =
+  if gProviderId == 0'i32:
+    gProviderId = registerCollisionProvider(0, provQuery, provRay, provVelocity, 10'i32)
+
+# ----------------------------------------------------------------------------------------------------------------------
+# registry
+
+proc registerBody(be: BodyEntity; tick: int64) =
+  gBodies.add(be)
+  ensureProvider()
+  inc gStats.created
+  emitCreate(be, tick)
+
+proc destroyBody(be: BodyEntity; reason: DestroyReason; tick: int64; deleteJournal: bool = true) =
+  var at = -1
+  for i in 0 ..< gBodies.len:
+    if gBodies[i] == be:
+      at = i
+      break
+  if at < 0:
+    return
+  gBodies.delete(at)
+  if deleteJournal and gCfg.journal:
+    journalDelete(be.world, be.body.idHi, be.body.idLo)
+  inc gStats.destroyed
+  if be.phase == bpFree:
+    emitDestroy(be, reason, tick)
+
+proc claimsFor(be: BodyEntity): seq[Claim] = be.claims
+
+proc checkpoint(be: BodyEntity; tick: int64) =
+  if gCfg.journal:
+    discard journalWrite(be, StateFree, tick)
+  be.lastCheckpoint = tick
+
+proc wakeBody*(be: BodyEntity) =
+  be.body.sleeping = false
+  be.body.sleepTicks = 0
+  be.sleepAnnounced = false
+  be.settleFailedTick = -1'i64
+
+proc bodyReset*() =
+  ## Forget every body, event and job (tests; a "process restart" in the crash test). Journal files stay.
+  gBodies.setLen(0)
+  gEvents.setLen(0)
+  gStatePending.clear()
+  gEventsOverflow = false
+  gDirty.setLen(0)
+  gJobs.setLen(0)
+  gReplayed.setLen(0)
+  gCursor = 0
+  gStats = BodyStats()
+  gTestCrash = 0
+  if gProviderId != 0'i32:
+    discard unregisterCollisionProvider(gProviderId)
+    gProviderId = 0'i32
+
+# ----------------------------------------------------------------------------------------------------------------------
+# effects of cells that break
+
+proc breakEffects(world: World; x, y, z: int32; state: uint32) =
+  ## Item drops of the block's loot table and the break particles for a cell that is destroyed.
+  if state == 0'u32:
+    return
+  let sid = newBlockStateIdUnchecked(uint16(state))
+  let pos = newBlockPos(x, y, z)
+  blockDropLoot(world, pos, sid, nil)
+  let bw = world.blockWorld
+  if bw != nil:
+    let particles = bw.broadcastBlockBreakParticles0
+    particles(pos, sid, nil)
+  inc gStats.cellsDropped
+
+# ----------------------------------------------------------------------------------------------------------------------
+# assemble
+
+proc beFromSnapshot(snap: VolumeSnapshot; wanted: Table[int64, bool]; mnx, mny, mnz: int32): seq[BodyBE] =
+  result = @[]
+  for e in snap.blockEntities:
+    let p = e.pos.vec
+    if wanted.hasKey(ckey(p.x, p.y, p.z)):
+      result.add(BodyBE(lx: p.x - mnx, ly: p.y - mny, lz: p.z - mnz, nbt: e.nbt))
+
+proc assembleCells*(world: World; cells: seq[Cell]; tick: int64): AssembleResult =
+  ## Takes exactly `cells` (world coordinates and the block state each must still have) out of the world and makes ONE body of them.
+  ## The cells need not be connected (a body is rigid whatever the cells), `assembleBox` supplies connected sets.
+  result = AssembleResult(ok: false, reason: "", status: esOk, bodies: @[], crashed: false)
+  if cells.len == 0:
+    result.reason = "no cells"
+    return
+  var mnx = cells[0].x
+  var mny = cells[0].y
+  var mnz = cells[0].z
+  var mxx = mnx
+  var mxy = mny
+  var mxz = mnz
+  for c in cells:
+    if c.x < mnx: mnx = c.x
+    if c.y < mny: mny = c.y
+    if c.z < mnz: mnz = c.z
+    if c.x > mxx: mxx = c.x
+    if c.y > mxy: mxy = c.y
+    if c.z > mxz: mxz = c.z
+  var snap = readVolume(world, volumeBox(mnx, mny, mnz, mxx, mxy, mxz))
+  if snap.status != esOk:
+    result.status = snap.status
+    result.reason = "cannot read the blocks: " & statusName(snap.status)
+    return
+  var wanted = initTable[int64, bool]()
+  var positions: seq[BlockPos] = @[]
+  for c in cells:
+    if blockAtSnapshot(snap, c.x, c.y, c.z) != uint32(c.state):
+      result.status = esStale
+      result.reason = "a block changed since it was chosen"
+      return
+    wanted[ckey(c.x, c.y, c.z)] = true
+    positions.add(newBlockPos(c.x, c.y, c.z))
+  let (hi, lo) = newUuid()
+  var b = newBody(hi, lo)
+  var claims: seq[Claim] = @[]
+  for c in cells:
+    setCell(b, int(c.x - mnx), int(c.y - mny), int(c.z - mnz), int(c.state))
+    claims.add(Claim(lx: c.x - mnx, ly: c.y - mny, lz: c.z - mnz, wx: c.x, wy: c.y, wz: c.z, state: c.state))
+  recomputeMass(b, defaultProps)
+  b.pos = Vec3(x: float64(mnx), y: float64(mny), z: float64(mnz))
+  let be = newBodyEntity(allocId(), world, world.dimension.minecraftName, b, tick)
+  be.claims = claims
+  be.blockEntities = beFromSnapshot(snap, wanted, mnx, mny, mnz)
+  # 1. journal first: if we die after the blocks are gone the body still exists
+  if gCfg.journal:
+    if not journalWrite(be, StatePending, tick):
+      result.reason = "the journal could not be written"
+      return
+  if gTestCrash == 1:
+    result.crashed = true
+    result.reason = "test crash after the pending journal write"
+    return
+  # 2. one all-or-nothing edit
+  let ctx = blockLogPush(CauseMod, KindNone, "body")
+  let rep = removeCells(world, snap, positions, defaultBulkOptions())
+  blockLogPop(ctx)
+  if rep.status != esOk:
+    if gCfg.journal:
+      journalDelete(world, hi, lo)
+    result.status = rep.status
+    result.reason = "the blocks could not be removed: " & statusName(rep.status)
+    return
+  if gTestCrash == 2:
+    result.crashed = true
+    result.reason = "test crash after the blocks were removed"
+    return
+  # 3. register
+  be.blockEntities = beFromSnapshot(snap, wanted, mnx, mny, mnz)
+  registerBody(be, tick)
+  checkpoint(be, tick)
+  result.ok = true
+  result.bodies.add(be)
+
+proc isBodyCell(state: uint32): bool =
+  if state == 0'u32:
+    return false
+  let m = materialOf(int(state))
+  not (m.matClass == mcVoid or m.matClass == mcFluid or m.indestructible)
+
+proc assembleBox*(world: World; box: VolumeBox; tick: int64): AssembleResult =
+  ## Every connected set (6-neighbour) of movable blocks inside the box (air, fluids and indestructible blocks are not taken)
+  ## becomes its own body. A set larger than `MaxAssembleCells` is left in the world and reported.
+  result = AssembleResult(ok: false, reason: "", status: esOk, bodies: @[], crashed: false)
+  let snap = readVolume(world, box)
+  if snap.status != esOk:
+    result.status = snap.status
+    result.reason = "cannot read the blocks: " & statusName(snap.status)
+    return
+  var cells: seq[Cell] = @[]
+  for sec in snap.sections:
+    let vals = sec.blocks.cells()
+    for y in sec.y0 .. sec.y1:
+      for z in sec.z0 .. sec.z1:
+        for x in sec.x0 .. sec.x1:
+          let st = vals[y * 256 + z * 16 + x]
+          if isBodyCell(st):
+            cells.add(Cell(x: sec.cx * 16'i32 + int32(x), y: sec.baseY + int32(y), z: sec.cz * 16'i32 + int32(z), state: int32(st)))
+  if cells.len == 0:
+    result.reason = "no movable blocks in the box"
+    return
+  let comps = splitConnected(cells)
+  var skippedBig = 0
+  for comp in comps:
+    if comp.len > MaxAssembleCells:
+      inc skippedBig
+      continue
+    var part: seq[Cell] = @[]
+    for i in comp:
+      part.add(cells[i])
+    let r = assembleCells(world, part, tick)
+    if r.crashed:
+      result.crashed = true
+      result.reason = r.reason
+      return
+    if r.ok:
+      for be in r.bodies:
+        result.bodies.add(be)
+    else:
+      result.reason = r.reason
+      result.status = r.status
+  if result.bodies.len > 0:
+    result.ok = true
+    result.reason = ""
+  elif result.reason.len == 0 and skippedBig > 0:
+    result.reason = "every connected set is larger than " & $MaxAssembleCells & " cells"
+
+# ----------------------------------------------------------------------------------------------------------------------
+# settle
+
+proc buildPlacement(cells: seq[Cell]; bes: seq[VolumeBlockEntity]; mnx, mny, mnz, mxx, mxy, mxz: int32): VolumeSnapshot =
+  ## A synthetic snapshot: the rotated cells at their final world coordinates, cut into world aligned 16^3 tiles so
+  ## `placeVolume` (translation only, quarterTurns = 0) writes them where they are.
+  var snap = VolumeSnapshot(box: volumeBox(mnx, mny, mnz, mxx, mxy, mxz), status: esOk, badPos: newBlockPos(0'i32, 0'i32, 0'i32),
+    sections: @[], blockEntities: bes, removed: false)
+  var index = initTable[int64, int]()
+  var containers: seq[PalettedContainer] = @[]
+  for c in cells:
+    let tx = c.x shr 4
+    let ty = c.y shr 4
+    let tz = c.z shr 4
+    let key = (int64(tx) shl 40) xor (int64(tz and 0xFFFFF'i32) shl 12) xor int64(ty and 0xFFF'i32)
+    var at = index.getOrDefault(key, -1)
+    if at < 0:
+      containers.add(newPalettedContainer(16, 0'u32))
+      snap.sections.add(VolumeSection(cx: tx, cz: tz, sy: int(ty), baseY: ty * 16'i32, version: 0'u32, appliedVersion: 0'u32,
+        x0: int(max(mnx, tx * 16'i32) - tx * 16'i32), x1: int(min(mxx, tx * 16'i32 + 15'i32) - tx * 16'i32),
+        y0: int(max(mny, ty * 16'i32) - ty * 16'i32), y1: int(min(mxy, ty * 16'i32 + 15'i32) - ty * 16'i32),
+        z0: int(max(mnz, tz * 16'i32) - tz * 16'i32), z1: int(min(mxz, tz * 16'i32 + 15'i32) - tz * 16'i32),
+        blocks: containers[containers.len - 1]))
+      at = containers.len - 1
+      index[key] = at
+    discard containers[at].set(int(c.x and 15'i32), int(c.y and 15'i32), int(c.z and 15'i32), uint32(c.state))
+  for i in 0 ..< snap.sections.len:
+    snap.sections[i].blocks = containers[i]
+  snap
+
+proc dropBodyAsItems(be: BodyEntity; tick: int64) =
+  for c in cellList(be.body):
+    let p = worldPointOf(be, float64(c.x) + 0.5, float64(c.y) + 0.5, float64(c.z) + 0.5)
+    breakEffects(be.world, int32(floor(p.x)), int32(floor(p.y)), int32(floor(p.z)), uint32(c.state))
+  destroyBody(be, drDropped, tick)
+
+proc settleBody*(be: BodyEntity; strict: bool; tick: int64): SettleOutcome =
+  ## Put the body back as blocks. `strict` (the automatic settle): it must be asleep and within `settleAngle` of a grid rotation.
+  ## Not strict (`/body settle`, `remove`): the nearest of the 24 rotations whatever the angle, awake or not.
+  ## Result: ok and the body is gone; or a reason and the body is still there; `dropped` when it became items.
+  result = SettleOutcome(ok: false, reason: "", edit: esOk, cells: 0, dropped: false)
+  if be.phase != bpFree:
+    result.reason = "the body is not live yet"
+    return
+  inc gStats.settleAttempts
+  let world = be.world
+  useWorld(world)
+  let tol = (if strict: gCfg.settleAngle else: 7.0)
+  let radius = (if strict: gCfg.settleRadius else: gCfg.settleRadius + 2)
+  let r = settle(be.sim, envSolidAt, tol, radius, strict)
+  if not r.ok:
+    inc gStats.settleFailures
+    result.reason = r.reason
+    return
+  var placed: seq[Cell] = @[]
+  var claims: seq[Claim] = @[]
+  var mnx = high(int32)
+  var mny = high(int32)
+  var mnz = high(int32)
+  var mxx = low(int32)
+  var mxy = low(int32)
+  var mxz = low(int32)
+  var lookup = initTable[int64, int]()
+  for pc in r.cells:
+    let st = int32(mapStateRot(r.rot, uint32(pc.state)))
+    let x = int32(pc.x)
+    let y = int32(pc.y)
+    let z = int32(pc.z)
+    placed.add(Cell(x: x, y: y, z: z, state: st))
+    claims.add(Claim(lx: int32(pc.lx), ly: int32(pc.ly), lz: int32(pc.lz), wx: x, wy: y, wz: z, state: st))
+    lookup[ckey(int32(pc.lx), int32(pc.ly), int32(pc.lz))] = placed.len - 1
+    if x < mnx: mnx = x
+    if y < mny: mny = y
+    if z < mnz: mnz = z
+    if x > mxx: mxx = x
+    if y > mxy: mxy = y
+    if z > mxz: mxz = z
+  var bes: seq[VolumeBlockEntity] = @[]
+  for e in be.blockEntities:
+    let at = lookup.getOrDefault(ckey(e.lx, e.ly, e.lz), -1)
+    if at >= 0:
+      bes.add(VolumeBlockEntity(pos: newBlockPos(placed[at].x, placed[at].y, placed[at].z), nbt: e.nbt))
+  let snap = buildPlacement(placed, bes, mnx, mny, mnz, mxx, mxy, mxz)
+  if gCfg.journal:
+    discard journalWrite(be, StateSettling, tick, claims)
+  if gTestCrash == 3:
+    result.reason = "test crash after the settling journal write"
+    return
+  let ctx = blockLogPush(CauseMod, KindNone, "body")
+  var opts = defaultPlaceOptions()
+  opts.mode = pmReplace
+  let rep = placeVolume(world, snap, newBlockPos(mnx, mny, mnz), opts)
+  blockLogPop(ctx)
+  result.edit = rep.status
+  if rep.status != esOk:
+    inc gStats.settleFailures
+    result.reason = "the blocks could not be placed: " & statusName(rep.status)
+    checkpoint(be, tick)
+    return
+  result.ok = true
+  result.cells = placed.len
+  inc gStats.settled
+  destroyBody(be, drSettled, tick)
+
+proc removeBody*(be: BodyEntity; tick: int64): SettleOutcome =
+  ## `/body remove`: the blocks go back where the body is (nearest grid pose); no free spot: items. The body is gone either way,
+  ## unless the placement could not run (unloaded chunk, veto): then it is still there and the reason says so.
+  result = settleBody(be, false, tick)
+  if result.ok:
+    return
+  if result.edit == esOk:
+    # settle() found no spot (or the body is empty): drop the cells and finish the body
+    dropBodyAsItems(be, tick)
+    result.ok = true
+    result.dropped = true
+    result.reason = ""
+
+# ----------------------------------------------------------------------------------------------------------------------
+# impulse, shatter
+
+proc applyImpulse*(be: BodyEntity; vx, vy, vz: float64) =
+  ## Debug/gameplay kick: adds to the velocity of the centre of mass (blocks per tick) and wakes the body.
+  be.body.vel = be.body.vel + Vec3(x: vx, y: vy, z: vz)
+  wakeBody(be)
+
+proc spawnPiece(parent: BodyEntity; piece: Body; tick: int64): BodyEntity =
+  let be = newBodyEntity(allocId(), parent.world, parent.dim, piece, tick)
+  for k in parent.claims:
+    if getCell(piece, int(k.lx), int(k.ly), int(k.lz)) != 0:
+      be.claims.add(k)
+  for e in parent.blockEntities:
+    if getCell(piece, int(e.lx), int(e.ly), int(e.lz)) != 0:
+      be.blockEntities.add(e)
+  registerBody(be, tick)
+  checkpoint(be, tick)
+  be
+
+proc applyShatter(be: BodyEntity; events: seq[ImpactEvent]; tick: int64) =
+  ## Fragile fall: cells whose impact energy is above their break threshold break (drops + particles), the rest splits by
+  ## connectivity into pieces that keep flying (integrator.shatterOnImpact).
+  var rng = newRng(uint64(tick) * 2654435761'u64 + uint64(be.id))
+  let res = shatterOnImpact(be.body, events, defaultProps, defaultThreshold, rng, 0.05)
+  if res.broken.len == 0:
+    return
+  inc gStats.shattered
+  for c in res.broken:
+    let p = worldPointOf(be, float64(c.x) + 0.5, float64(c.y) + 0.5, float64(c.z) + 0.5)
+    breakEffects(be.world, int32(floor(p.x)), int32(floor(p.y)), int32(floor(p.z)), uint32(c.state))
+  if res.pieces.len == 0:
+    destroyBody(be, drEmptied, tick)
+    return
+  let first = res.pieces[0]
+  be.body = first
+  var keep: seq[Claim] = @[]
+  for k in be.claims:
+    if getCell(first, int(k.lx), int(k.ly), int(k.lz)) != 0:
+      keep.add(k)
+  var keepBe: seq[BodyBE] = @[]
+  for e in be.blockEntities:
+    if getCell(first, int(e.lx), int(e.ly), int(e.lz)) != 0:
+      keepBe.add(e)
+  let oldClaims = be.claims
+  let oldBes = be.blockEntities
+  be.claims = keep
+  be.blockEntities = keepBe
+  rebuildSim(be)
+  for i in 1 ..< res.pieces.len:
+    let parentView = BodyEntity(id: be.id, world: be.world, dim: be.dim, body: be.body, sim: be.sim, claims: oldClaims,
+      blockEntities: oldBes, phase: bpFree, bornTick: tick, lastCheckpoint: tick, sleepAnnounced: false, settleFailedTick: -1'i64)
+    discard spawnPiece(parentView, res.pieces[i], tick)
+  checkpoint(be, tick)
+
+# ----------------------------------------------------------------------------------------------------------------------
+# stepping
+
+proc areaLoaded(be: BodyEntity): bool =
+  let ab = bodyAabb(be)
+  let c0x = int32(floor(ab.x0 - 1.0)) shr 4
+  let c1x = int32(floor(ab.x1 + 1.0)) shr 4
+  let c0z = int32(floor(ab.z0 - 1.0)) shr 4
+  let c1z = int32(floor(ab.z1 + 1.0)) shr 4
+  for cz in c0z .. c1z:
+    for cx in c0x .. c1x:
+      if not isChunkLoaded(be.world.level, cx, cz):
+        return false
+  true
+
+proc stepOne(be: BodyEntity; tick: int64) =
+  let w = be.world
+  if not areaLoaded(be):
+    inc gStats.frozen
+    return
+  let env = makeEnv(w)
+  let impacts = stepBody(be.sim, env, int(tick))
+  inc gStats.steps
+  let com = comWorld(be.body)
+  if com.y < float64(w.getBottomY() - int32(gCfg.voidMargin)):
+    inc gStats.voided
+    destroyBody(be, drVoid, tick)
+    return
+  if gCfg.shatter and impacts.len > 0:
+    applyShatter(be, impacts, tick)
+    if not (be in gBodies):
+      return
+  if be.body.sleeping:
+    if not be.sleepAnnounced:
+      be.sleepAnnounced = true
+      emitState(be, tick)
+      checkpoint(be, tick)
+  else:
+    be.sleepAnnounced = false
+    be.settleFailedTick = -1'i64
+    emitState(be, tick)
+    if tick - be.lastCheckpoint >= int64(gCfg.checkpointEvery):
+      checkpoint(be, tick)
+
+proc trySettleAuto(be: BodyEntity; tick: int64) =
+  let r = settleBody(be, true, tick)
+  if r.ok:
+    return
+  if r.reason == "no free spot within the search radius":
+    dropBodyAsItems(be, tick)
+  elif r.reason == "not axis aligned":
+    be.settleFailedTick = high(int64)
+  else:
+    be.settleFailedTick = tick     # a placement that could not run: try again in a while
+
+# ----------------------------------------------------------------------------------------------------------------------
+# journal replay
+
+proc resolveReplayed(tick: int64) =
+  ## Finishes the bodies replayed from the journal whose claim cells are in loaded chunks (see bodyjournal.aowl, claims rule).
+  var i = 0
+  while i < gBodies.len:
+    let be = gBodies[i]
+    if be.phase != bpUnresolved:
+      inc i
+      continue
+    var all = true
+    var drops: seq[Claim] = @[]
+    for k in be.claims:
+      if not isChunkLoaded(be.world.level, k.wx shr 4, k.wz shr 4):
+        all = false
+        break
+    if all:
+      for k in be.claims:
+        if stateIdAt(be.world, int(k.wx), int(k.wy), int(k.wz)) == uint32(k.state):
+          drops.add(k)
+    if not all:
+      inc i
+      continue
+    for k in drops:
+      setCell(be.body, int(k.lx), int(k.ly), int(k.lz), 0)
+      inc gStats.claimedCells
+    if cellCount(be.body) == 0:
+      journalDelete(be.world, be.body.idHi, be.body.idLo)
+      gBodies.delete(i)
+      continue
+    var keep: seq[Claim] = @[]
+    for k in be.claims:
+      if getCell(be.body, int(k.lx), int(k.ly), int(k.lz)) != 0:
+        keep.add(k)
+    var keepBe: seq[BodyBE] = @[]
+    for e in be.blockEntities:
+      if getCell(be.body, int(e.lx), int(e.ly), int(e.lz)) != 0:
+        keepBe.add(e)
+    be.claims = keep
+    be.blockEntities = keepBe
+    rebuildSim(be)
+    be.phase = bpFree
+    be.bornTick = tick
+    ensureProvider()
+    inc gStats.created
+    emitCreate(be, tick)
+    checkpoint(be, tick)
+    inc i
+
+proc replayJournal*(world: World; tick: int64): int =
+  ## Re-creates the bodies of this world's journal as `bpUnresolved` (they finish in `resolveReplayed` when their chunks are loaded).
+  ## Called once per world by `tickBodies`; exposed for tests. Returns how many records were replayed.
+  result = 0
+  let recs = journalList(world)
+  for rec in recs:
+    var dup = false
+    for have in gBodies:
+      if have.body.idHi == rec.body.idHi and have.body.idLo == rec.body.idLo:
+        dup = true
+    if dup:
+      continue
+    recomputeMass(rec.body, defaultProps)
+    let be = newBodyEntity(allocId(), world, rec.dim, rec.body, tick)
+    be.claims = rec.claims
+    for k in rec.placeClaims:
+      be.claims.add(k)
+    be.blockEntities = rec.blockEntities
+    be.phase = bpUnresolved
+    gBodies.add(be)
+    inc result
+    inc gStats.replayed
+
+# ----------------------------------------------------------------------------------------------------------------------
+# collapse check (structural solver)
+
+proc anchorShell(x, y, z: int): bool =
+  ## The lateral and bottom layers of the checked volume are anchors: whatever leaves the checked box is assumed supported.
+  x == 0 or z == 0 or y == 0 or x == gAnchorNx - 1 or z == gAnchorNz - 1
+
+proc windSampler(x, y, z: int): (float64, float64) =
+  let w = windAtWorld(gWindTick, gWindBase[0] + float64(x) + 0.5, gWindBase[1] + float64(y) + 0.5, gWindBase[2] + float64(z) + 0.5)
+  (w.x, w.z)
+
+proc defaultCollapseOpts*(): CollapseOpts =
+  CollapseOpts(wind: true, includeTerrain: true, budgetOps: 20000)
+
+proc collapseStart*(world: World; box: VolumeBox; opts: CollapseOpts; tick: int64): CollapseJob =
+  ## Reads the box (plus a one cell shell) and prepares the solver job; `collapseStep` runs it, `collapseApply` acts on the result.
+  let ebox = volumeBox(box.minX - 1'i32, box.minY - 1'i32, box.minZ - 1'i32, box.maxX + 1'i32, box.maxY + 1'i32, box.maxZ + 1'i32)
+  result = CollapseJob(id: gNextJob, world: world, ebox: ebox, ids: @[], nx: 0, ny: 0, nz: 0, opts: opts,
+    report: CollapseReport(ok: false, done: false, queued: false, reason: "", bodies: @[], jobId: gNextJob))
+  inc gNextJob
+  let snap = readVolume(world, ebox)
+  if snap.status != esOk:
+    result.report.done = true
+    result.report.reason = "cannot read the blocks: " & statusName(snap.status)
+    return
+  let nx = int(ebox.maxX - ebox.minX) + 1
+  let ny = int(ebox.maxY - ebox.minY) + 1
+  let nz = int(ebox.maxZ - ebox.minZ) + 1
+  result.nx = nx
+  result.ny = ny
+  result.nz = nz
+  var ids = newSeq[int](nx * ny * nz)
+  var structural = 0
+  for sec in snap.sections:
+    let vals = sec.blocks.cells()
+    for y in sec.y0 .. sec.y1:
+      for z in sec.z0 .. sec.z1:
+        for x in sec.x0 .. sec.x1:
+          let st = vals[y * 256 + z * 16 + x]
+          if st != 0'u32:
+            let wx = sec.cx * 16'i32 + int32(x)
+            let wy = sec.baseY + int32(y)
+            let wz = sec.cz * 16'i32 + int32(z)
+            ids[int(wx - ebox.minX) + nx * (int(wz - ebox.minZ) + nz * int(wy - ebox.minY))] = int(st)
+            inc structural
+  result.ids = ids
+  result.report.cells = structural
+  gAnchorNx = nx
+  gAnchorNy = ny
+  gAnchorNz = nz
+  let p = defaultAdapterParams()
+  var inp = snapshotToSolverInput(ids, nx, ny, nz, p, anchorShell)
+  if opts.wind:
+    gWindBase = [float64(ebox.minX), float64(ebox.minY), float64(ebox.minZ)]
+    gWindTick = float64(tick)
+    let loads = windLoadFromField(ids, nx, ny, nz, p, windSampler)
+    for e in loads:
+      inp.loads.add(e)
+  result.job = newSolverJob(inp, adapterSolverParams())
+
+proc collapseStep*(job: CollapseJob; budgetOps: int): bool =
+  ## Advance the solver by about `budgetOps`; true when it finished (or the job never started).
+  if job.report.done:
+    return true
+  solver.step(job.job, budgetOps)
+
+proc cellX(ebox: VolumeBox; nx, c: int): int32 = ebox.minX + int32(c mod nx)
+proc cellZ(ebox: VolumeBox; nx, nz, c: int): int32 = ebox.minZ + int32((c div nx) mod nz)
+proc cellY(ebox: VolumeBox; nx, nz, c: int): int32 = ebox.minY + int32(c div (nx * nz))
+
+proc collapseApply*(job: CollapseJob; tick: int64) =
+  ## Acts on a finished solver job: failed cells break, free sets that lie inside the checked box become bodies.
+  if job.report.done:
+    return
+  let world = job.world
+  let res = job.job.res
+  let nx = job.nx
+  let nz = job.nz
+  let ny = job.ny
+  var rep = job.report
+  rep.rounds = res.rounds
+  rep.converged = res.converged
+  rep.maxRatio = res.maxRatio
+  rep.components = res.components.len
+  rep.ok = true
+  # 1. the failed cells: removed, drops and particles
+  var gone: seq[Cell] = @[]
+  var pos: seq[BlockPos] = @[]
+  for b in res.broken:
+    gone.add(Cell(x: cellX(job.ebox, nx, b.cell), y: cellY(job.ebox, nx, nz, b.cell), z: cellZ(job.ebox, nx, nz, b.cell), state: int32(job.ids[b.cell])))
+    pos.add(newBlockPos(cellX(job.ebox, nx, b.cell), cellY(job.ebox, nx, nz, b.cell), cellZ(job.ebox, nx, nz, b.cell)))
+  if gone.len > 0:
+    var snap = readVolume(world, job.ebox)
+    if snap.status == esOk:
+      var ok = true
+      for c in gone:
+        if blockAtSnapshot(snap, c.x, c.y, c.z) != uint32(c.state):
+          ok = false
+      if ok:
+        let ctx = blockLogPush(CauseMod, KindNone, "body-collapse")
+        let r = removeCells(world, snap, pos, defaultBulkOptions())
+        blockLogPop(ctx)
+        if r.status == esOk:
+          rep.broken = gone.len
+          inc gStats.collapseBroken, gone.len
+          for c in gone:
+            breakEffects(world, c.x, c.y, c.z, uint32(c.state))
+        else:
+          rep.reason = "failed cells could not be removed: " & statusName(r.status)
+      else:
+        rep.reason = "the world changed during the check"
+  # 2. the free sets
+  var terrainSets = initTable[int, bool]()
+  for k in res.caveIns:
+    terrainSets[k] = true
+  for ci in 0 ..< res.components.len:
+    let comp = res.components[ci]
+    if terrainSets.hasKey(ci) and not job.opts.includeTerrain:
+      inc rep.skipped
+      continue
+    var cells: seq[Cell] = @[]
+    var touchesShell = false
+    for c in comp.cells:
+      let x = int(c mod nx)
+      let z = int((c div nx) mod nz)
+      let y = int(c div (nx * nz))
+      if x == 0 or z == 0 or y == 0 or y == ny - 1 or x == nx - 1 or z == nz - 1:
+        touchesShell = true
+        break
+      cells.add(Cell(x: cellX(job.ebox, nx, c), y: cellY(job.ebox, nx, nz, c), z: cellZ(job.ebox, nx, nz, c), state: int32(job.ids[c])))
+    if touchesShell or cells.len == 0:
+      inc rep.skipped
+      continue
+    let r = assembleCells(world, cells, tick)
+    if r.ok:
+      for be in r.bodies:
+        rep.bodies.add(be.id)
+        inc gStats.collapseBodies
+    else:
+      inc rep.skipped
+      if rep.reason.len == 0:
+        rep.reason = r.reason
+  rep.done = true
+  inc gStats.collapseRuns
+  job.report = rep
+
+proc collapseCheck*(world: World; box: VolumeBox; opts: CollapseOpts; tick: int64): CollapseReport =
+  ## Structural check of a box. Small boxes (<= `collapseInline` cells) run to the end now; bigger ones are queued and sliced over the
+  ## following ticks by `tickBodies` (`queued` = true, `jobId`; the result goes to `collapseResult(jobId)`).
+  let job = collapseStart(world, box, opts, tick)
+  if job.report.done:
+    return job.report
+  if volumeCells(job.ebox) <= gCfg.collapseInline:
+    discard collapseStep(job, high(int) div 4)
+    collapseApply(job, tick)
+    return job.report
+  job.report.queued = true
+  gJobs.add(job)
+  job.report
+
+var gCollapseResults: seq[CollapseReport] = @[]
+
+proc collapseResult*(jobId: int): Option[CollapseReport] =
+  for r in gCollapseResults:
+    if r.jobId == jobId:
+      return some(r)
+  none[CollapseReport]()
+
+proc stepCollapseJobs(tick: int64) =
+  if gJobs.len == 0:
+    return
+  let job = gJobs[0]
+  if collapseStep(job, gCfg.collapseOps):
+    collapseApply(job, tick)
+    gCollapseResults.add(job.report)
+    if gCollapseResults.len > 32:
+      gCollapseResults.delete(0)
+    gJobs.delete(0)
+    echo "[body] collapse check " & $job.id & " finished: " & $job.report.broken & " broken, " & $job.report.bodies.len & " bodies"
+
+# ----------------------------------------------------------------------------------------------------------------------
+# hooks for the trigger task
+
+proc onBlockChanged*(world: World; x, y, z: int32; oldState, newState: uint32) =
+  ## STUB for the next task (the automatic triggers). Today it wakes the bodies near the cell (a block that disappeared under a
+  ## sleeping body, or appeared in its way) and queues the cell in `bodyDirtyDrain` so the trigger code can run `collapseCheck`.
+  if gBodies.len > 0:
+    for be in gBodies:
+      if be.world != world or be.phase != bpFree or not be.body.sleeping:
+        continue
+      let ab = bodyAabb(be)
+      if float64(x) + 1.0 >= ab.x0 - 1.5 and float64(x) <= ab.x1 + 1.5 and float64(y) + 1.0 >= ab.y0 - 1.5 and
+          float64(y) <= ab.y1 + 1.5 and float64(z) + 1.0 >= ab.z0 - 1.5 and float64(z) <= ab.z1 + 1.5:
+        wakeBody(be)
+  gDirty.add(BlockDirty(dim: world.dimension.minecraftName, x: x, y: y, z: z, oldState: oldState, newState: newState, heavy: false))
+
+proc onHeavyBlockPlaced*(world: World; x, y, z: int32; state: uint32) =
+  ## STUB: a heavy block was placed (the trigger task decides what heavy means from materials.aowl); same queue, `heavy` set.
+  onBlockChanged(world, x, y, z, 0'u32, state)
+  gDirty[gDirty.len - 1].heavy = true
+
+# ----------------------------------------------------------------------------------------------------------------------
+# the tick
+
+proc ensureJournal(world: World; tick: int64) =
+  let key = world.level.levelFolder.rootFolder & "|" & world.dimension.minecraftName
+  if key in gReplayed:
+    return
+  gReplayed.add(key)
+  if gCfg.journal:
+    let n = replayJournal(world, tick)
+    if n > 0:
+      echo "[body] replayed " & $n & " body journal record(s) for " & world.dimension.minecraftName
+
+proc tickBodies*(server: Server) =
+  ## ONE call per server tick. Replays the journals on first sight of a world, finishes replayed bodies, slices queued collapse
+  ## checks, steps the awake bodies inside the budget, settles bodies that came to rest.
+  trackServer(server)
+  let tick = server.tickCounter
+  gLastTick = tick
+  for w in server.worlds:
+    ensureJournal(w, tick)
+  if gBodies.len == 0 and gJobs.len == 0:
+    return
+  resolveReplayed(tick)
+  stepCollapseJobs(tick)
+  let snapshot = gBodies
+  let n = snapshot.len
+  var stepped = 0
+  var spent = 0
+  var skipped = 0
+  var firstSkipped = -1
+  var settleList: seq[BodyEntity] = @[]
+  for i in 0 ..< n:
+    let idx = (gCursor + i) mod n
+    let be = snapshot[idx]
+    if be.phase != bpFree:
+      continue
+    if be.body.sleeping:
+      if gCfg.autoSettle and (be.settleFailedTick < 0 or (be.settleFailedTick != high(int64) and tick - be.settleFailedTick >= 40)):
+        settleList.add(be)
+      continue
+    let cost = be.sim.cells.len + 1
+    if stepped >= gCfg.maxAwake or (stepped > 0 and spent + cost > gCfg.maxCells):
+      inc skipped
+      if firstSkipped < 0:
+        firstSkipped = idx
+      continue
+    stepOne(be, tick)
+    inc stepped
+    spent += cost
+  gCursor = (if firstSkipped >= 0: firstSkipped else: 0)
+  if skipped > 0:
+    gStats.skipped += skipped
+    if tick - gLastSkipLog >= 200'i64:
+      gLastSkipLog = tick
+      echo "[body] budget: " & $skipped & " awake bodies waited this tick (" & $stepped & " stepped, " & $spent & " cells)"
+  for be in settleList:
+    if be in gBodies and be.body.sleeping:
+      trySettleAuto(be, tick)
+
+# ----------------------------------------------------------------------------------------------------------------------
+# text commands (bodycmd.aowl is the thin wrapper)
+
+proc relCoord(tok: string; base: int32; v: var int32): bool =
+  if tok.len == 0:
+    return false
+  var s = tok
+  var rel = false
+  if s[0] == '~':
+    rel = true
+    s = s[1 .. ^1]
+  var n = 0
+  if s.len > 0 and not parseIntSafe(s, n):
+    return false
+  v = (if rel: base + int32(n) else: int32(n))
+  true
+
+proc parseBox(parts: seq[string]; first: int; ox, oy, oz: int32; box: var VolumeBox): bool =
+  if parts.len < first + 6:
+    return false
+  var v: array[6, int32] = [0'i32, 0'i32, 0'i32, 0'i32, 0'i32, 0'i32]
+  let bases = [ox, oy, oz, ox, oy, oz]
+  for i in 0 ..< 6:
+    if not relCoord(parts[first + i], bases[i], v[i]):
+      return false
+  box = volumeBox(v[0], v[1], v[2], v[3], v[4], v[5])
+  true
+
+proc bodyInfoLine*(be: BodyEntity): string =
+  let b = be.body
+  let c = comWorld(b)
+  idText(be) & ": " & $cellCount(b) & " cells, mass " & f2(b.mass) & " kg, com (" & f2(c.x) & " " & f2(c.y) & " " & f2(c.z) &
+    "), vel (" & f2(b.vel.x) & " " & f2(b.vel.y) & " " & f2(b.vel.z) & "), " & (if b.sleeping: "asleep" else: "awake") &
+    (if be.phase == bpUnresolved: ", waiting for chunks" else: "") & ", " & be.dim
+
+proc bodyExec*(world: World; ox, oy, oz: int32; parts: seq[string]; tick: int64): seq[string] =
+  ## `/body ...`: the words after `body`. Returns the reply lines.
+  result = @[]
+  if parts.len == 0:
+    result.add("/body assemble <x1 y1 z1 x2 y2 z2> | list | info <id> | settle <id> | remove <id> | impulse <id> <vx vy vz> | collapse <x1 y1 z1 x2 y2 z2> | status")
+    return
+  case parts[0]
+  of "assemble":
+    var box = volumeBox(0'i32, 0'i32, 0'i32, 0'i32, 0'i32, 0'i32)
+    if not parseBox(parts, 1, ox, oy, oz, box):
+      result.add("Usage: /body assemble <x1 y1 z1 x2 y2 z2>")
+      return
+    if volumeCells(box) > 262144:
+      result.add("The box is too big (262144 cells at most).")
+      return
+    let r = assembleBox(world, box, tick)
+    if r.ok:
+      for be in r.bodies:
+        result.add("Assembled body " & bodyInfoLine(be))
+    else:
+      result.add("Nothing assembled: " & r.reason)
+  of "list":
+    if gBodies.len == 0:
+      result.add("No bodies.")
+    for be in gBodies:
+      result.add(bodyInfoLine(be))
+  of "info", "settle", "remove", "impulse":
+    var id = 0
+    if parts.len < 2:
+      result.add("Usage: /body " & parts[0] & " <id>")
+      return
+    if not parseIntSafe(parts[1], id):
+      result.add("Not a body id: " & parts[1])
+      return
+    let found = bodyById(int32(id))
+    if found.isNone:
+      result.add("No body " & $id)
+      return
+    let be = found.get
+    case parts[0]
+    of "info":
+      result.add(bodyInfoLine(be))
+      let q = be.body.orient
+      result.add("  pos (" & f2(be.body.pos.x) & " " & f2(be.body.pos.y) & " " & f2(be.body.pos.z) & ") orient (" & f2(q.w) & " " & f2(q.x) &
+        " " & f2(q.y) & " " & f2(q.z) & ") angVel (" & f2(be.body.angVel.x) & " " & f2(be.body.angVel.y) & " " & f2(be.body.angVel.z) &
+        ") contacts " & $be.sim.lastContacts & " surface cells " & $be.sim.cells.len & " journal " &
+        (if journalExists(be.world, be.body.idHi, be.body.idLo): "yes" else: "no"))
+    of "settle":
+      let r = settleBody(be, false, tick)
+      if r.ok:
+        result.add("Body " & $id & " settled: " & $r.cells & " blocks placed.")
+      else:
+        result.add("Body " & $id & " not settled: " & r.reason)
+    of "remove":
+      let r = removeBody(be, tick)
+      if r.ok:
+        result.add(if r.dropped: "Body " & $id & " removed, no free spot: its blocks dropped as items."
+                   else: "Body " & $id & " removed: " & $r.cells & " blocks placed back.")
+      else:
+        result.add("Body " & $id & " not removed: " & r.reason)
+    else:
+      if parts.len < 5:
+        result.add("Usage: /body impulse <id> <vx> <vy> <vz>   (blocks per tick)")
+        return
+      var ix = 0.0
+      var iy = 0.0
+      var iz = 0.0
+      if parseFloatSafe(parts[2], ix) and parseFloatSafe(parts[3], iy) and parseFloatSafe(parts[4], iz):
+        applyImpulse(be, ix, iy, iz)
+        result.add("Impulse applied to " & $id)
+      else:
+        result.add("Not a number.")
+  of "collapse":
+    var box = volumeBox(0'i32, 0'i32, 0'i32, 0'i32, 0'i32, 0'i32)
+    if not parseBox(parts, 1, ox, oy, oz, box):
+      result.add("Usage: /body collapse <x1 y1 z1 x2 y2 z2>")
+      return
+    let r = collapseCheck(world, box, defaultCollapseOpts(), tick)
+    if r.queued:
+      result.add("Collapse check " & $r.jobId & " queued: " & $r.cells & " structural cells, sliced over the next ticks.")
+    elif r.ok:
+      result.add("Collapse check: " & $r.cells & " cells, " & $r.rounds & " solver rounds, peak ratio " & f2(r.maxRatio) & ", " &
+        $r.broken & " cells broke, " & $r.bodies.len & " bodies created, " & $r.skipped & " sets left alone." &
+        (if r.reason.len > 0: " (" & r.reason & ")" else: ""))
+    else:
+      result.add("Collapse check failed: " & r.reason)
+  of "status":
+    result.add("Bodies: " & $gBodies.len & " live, created " & $gStats.created & ", settled " & $gStats.settled & ", dropped cells " &
+      $gStats.cellsDropped & ", void " & $gStats.voided & ", steps " & $gStats.steps & ", skipped (over budget) " & $gStats.skipped &
+      ", frozen (chunk not loaded) " & $gStats.frozen & ", replayed " & $gStats.replayed & ", events queued " & $gEvents.len &
+      ", collapse jobs queued " & $gJobs.len)
+  else:
+    result.add("Unknown /body subcommand " & parts[0])

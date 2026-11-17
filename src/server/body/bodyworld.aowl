@@ -1,0 +1,233 @@
+## The world side of the body manager: block lookups for the integrator (solid cells, their collision sub-boxes, wind) and the
+## rotation of oriented block states for settling.
+##
+## CALLBACKS WITHOUT CLOSURES. The integrator (physics/integrator.aowl) takes `proc ... {.closure.}` fields in `SimEnv`. A capturing
+## closure created here and copied into another module's type loses its environment refcount (see collision_providers.aowl), so the
+## procs below are plain top level procs and the world they read is a module global set by `useWorld` before each step.
+##
+## SOLID. A world cell is solid for a body when its block state has at least one collision shape (liquids, plants, air and every
+## other shapeless block are walked through; a body that lands in water or grass keeps falling, as an item entity would). The sub-boxes
+## are exposed through `SimEnv.shapeFn`, so a slab under a body is a half-high floor. A cell in an unloaded chunk is a wall (the
+## manager also freezes bodies whose swept area is not loaded, this is the second line). Outside the chunk's build height reads as air (the void).
+##
+## STATE ROTATION (best effort, documented limits). `mapStateRot(R, state)` returns the block state a placed block must have after the
+## body was turned by the 24-element cube rotation `R` (body to world, the Mat3 of `SettleResult.rot`). Per property:
+##   facing     a direction name is rotated; the result must be a value that block accepts, else the whole state is kept unchanged
+##              (a stair never faces up)
+##   axis       x/y/z is rotated
+##   half/type  top/bottom (stairs, slabs, trapdoors) and upper/lower swap when `R` turns up into down; a quarter turn onto a horizontal
+##              axis cannot be expressed by these properties, they are kept
+##   rotation   0..15 (signs, banners, heads) advances by the yaw of `R` when `R` is a turn about Y, else kept
+##   north/east/south/west  connection properties (fences, panes, walls, vines, redstone) move to the side `R` turns them to, for turns
+##              that keep the horizontal plane horizontal (about Y, or a flip about a horizontal axis); other turns keep them
+##   everything else is copied. The mapping is memoised per (rotation, state). The identity rotation returns the state untouched.
+## Block ENTITY data moves with the cell; its own rotation fields (a banner's pattern) are not rewritten.
+
+{.feature: "lenientnils".}
+
+import std/[math, tables]
+import ../../data/block_ext
+from ../../data/block_state import newBlockStateIdUnchecked, asU16
+import ../../physics/[body, integrator, windfield]
+import ../../util/math/position
+import ../../world/level
+import ../serverbase
+
+var gEnvWorlds: seq[World] = @[]
+var gShapeMemo = initTable[uint32, seq[Box]]()
+var gRotMemo = initTable[int64, uint32]()
+
+proc useWorld*(world: World) =
+  gEnvWorlds.setLen(0)
+  gEnvWorlds.add(world)
+
+proc stateIdAt*(world: World; x, y, z: int): uint32 =
+  ## The block state id at a cell; 0 (air) for an unloaded chunk or a cell outside the build height.
+  if not isChunkLoaded(world.level, int32(x) shr 4, int32(z) shr 4):
+    return 0'u32
+  getBlockState(world.level, newBlockPos(int32(x), int32(y), int32(z)))
+
+proc cellLoaded*(world: World; x, z: int): bool =
+  isChunkLoaded(world.level, int32(x) shr 4, int32(z) shr 4)
+
+proc shapesOf*(id: uint32): seq[Box] =
+  ## Collision sub-boxes of a block state, cell-local 0..1. Memoised.
+  if id == 0'u32:
+    return @[]
+  if gShapeMemo.hasKey(id):
+    return gShapeMemo.getOrDefault(id, @[])
+  let st = BlockState.fromId(newBlockStateIdUnchecked(uint16(id)))
+  var res: seq[Box] = @[]
+  for s in getBlockCollisionShapes(st):
+    res.add(Box(x0: float64(s.minX), y0: float64(s.minY), z0: float64(s.minZ), x1: float64(s.maxX), y1: float64(s.maxY),
+      z1: float64(s.maxZ)))
+  gShapeMemo[id] = res
+  res
+
+proc isSolidState*(id: uint32): bool =
+  shapesOf(id).len > 0
+
+proc envSolidAt*(x, y, z: int): bool =
+  let w = gEnvWorlds[0]
+  if not isChunkLoaded(w.level, int32(x) shr 4, int32(z) shr 4):
+    return true
+  isSolidState(getBlockState(w.level, newBlockPos(int32(x), int32(y), int32(z))))
+
+proc envShape(x, y, z: int): seq[Box] =
+  shapesOf(stateIdAt(gEnvWorlds[0], x, y, z))
+
+proc envWind(tick: int; x, y, z: float64): Vec3 =
+  let v = windAtWorld(float64(tick), x, y, z)
+  Vec3(x: v.x, y: v.y, z: v.z)
+
+proc makeEnv*(world: World): SimEnv =
+  ## The environment `stepBody` and `settle` read; the world is remembered in a module global (single thread).
+  useWorld(world)
+  SimEnv(solidAt: envSolidAt, shapeFn: envShape, hasShape: true, wind: envWind, hasWind: true)
+
+# ----------------------------------------------------------------------------------------------------------------------
+# block state rotation
+
+proc dirOf(name: string; x, y, z: var float64): bool =
+  case name
+  of "north":
+    x = 0.0
+    y = 0.0
+    z = -1.0
+  of "south":
+    x = 0.0
+    y = 0.0
+    z = 1.0
+  of "east":
+    x = 1.0
+    y = 0.0
+    z = 0.0
+  of "west":
+    x = -1.0
+    y = 0.0
+    z = 0.0
+  of "up":
+    x = 0.0
+    y = 1.0
+    z = 0.0
+  of "down":
+    x = 0.0
+    y = -1.0
+    z = 0.0
+  else:
+    return false
+  true
+
+proc nameOfDir(x, y, z: float64): string =
+  if x > 0.5: "east"
+  elif x < -0.5: "west"
+  elif y > 0.5: "up"
+  elif y < -0.5: "down"
+  elif z > 0.5: "south"
+  else: "north"
+
+proc rotDir(r: Mat3; name: string): string =
+  var x = 0.0
+  var y = 0.0
+  var z = 0.0
+  if not dirOf(name, x, y, z):
+    return name
+  nameOfDir(r[0] * x + r[1] * y + r[2] * z, r[3] * x + r[4] * y + r[5] * z, r[6] * x + r[7] * y + r[8] * z)
+
+proc rotKey(r: Mat3): int64 =
+  var k = 0'i64
+  for i in 0 ..< 9:
+    k = k * 3'i64 + int64(int(round(r[i])) + 1)
+  k
+
+proc isIdentity(r: Mat3): bool =
+  r[0] > 0.5 and r[4] > 0.5 and r[8] > 0.5
+
+proc yawQuarter(name: string): int =
+  ## 0 for south, then 4 per quarter turn: the unit of a sign's `rotation` property.
+  case name
+  of "south": 0
+  of "west": 4
+  of "north": 8
+  of "east": 12
+  else: 0
+
+proc stateWithProps(b: Block; want: seq[(string, string)]): (bool, uint32) =
+  for i in 0 ..< b.states.len:
+    let sid = b.states[i].id
+    let (has, dp) = properties(b, sid)
+    if not has:
+      continue
+    if dp.toProps() == want:
+      return (true, uint32(asU16(sid)))
+  (false, 0'u32)
+
+proc mapStateRot*(r: Mat3; state: uint32): uint32 =
+  ## See the header. Never fails: when no accepted state exists the input is returned.
+  if state == 0'u32 or isIdentity(r):
+    return state
+  let key = (rotKey(r) shl 20) xor int64(state)
+  if gRotMemo.hasKey(key):
+    return gRotMemo.getOrDefault(key, state)
+  var res = state
+  let sid = newBlockStateIdUnchecked(uint16(state))
+  let b = Block.fromStateId(sid)
+  let (has, dp) = properties(b, sid)
+  if has:
+    let props = dp.toProps()
+    var want: seq[(string, string)] = @[]
+    let flipsY = r[4] < -0.5
+    let aboutY = abs(r[4]) > 0.5          # the up axis stays vertical: horizontal sides stay horizontal
+    let yawBase = yawQuarter(rotDir(r, "south"))
+    for p in props:
+      var name = p[0]
+      var value = p[1]
+      case name
+      of "facing":
+        value = rotDir(r, value)
+      of "axis":
+        let ax = (if value == "x": 0 elif value == "y": 1 else: 2)
+        var x = (if ax == 0: 1.0 else: 0.0)
+        var y = (if ax == 1: 1.0 else: 0.0)
+        var z = (if ax == 2: 1.0 else: 0.0)
+        let nx = abs(r[0] * x + r[1] * y + r[2] * z)
+        let ny = abs(r[3] * x + r[4] * y + r[5] * z)
+        value = (if nx > 0.5: "x" elif ny > 0.5: "y" else: "z")
+      of "half":
+        if flipsY:
+          if value == "top": value = "bottom"
+          elif value == "bottom": value = "top"
+          elif value == "upper": value = "lower"
+          elif value == "lower": value = "upper"
+      of "type":
+        if flipsY:
+          if value == "top": value = "bottom"
+          elif value == "bottom": value = "top"
+      of "rotation":
+        if aboutY and value.len > 0 and value[0] >= '0' and value[0] <= '9':
+          var n = 0
+          for ch in value:
+            if ch >= '0' and ch <= '9':
+              n = n * 10 + (ord(ch) - ord('0'))
+          value = $((n + yawBase) mod 16)
+      of "north", "south", "east", "west":
+        if aboutY:
+          # this property describes the side `name`; after the turn it describes `rotDir(name)`: write it there
+          name = rotDir(r, name)
+      else:
+        discard
+      want.add((name, value))
+    # property order of the block (a connection that moved to another side name must sit where that name is declared)
+    var ordered: seq[(string, string)] = @[]
+    for p in props:
+      var v = p[1]
+      for w in want:
+        if w[0] == p[0]:
+          v = w[1]
+          break
+      ordered.add((p[0], v))
+    let (found, ns) = stateWithProps(b, ordered)
+    if found:
+      res = ns
+  gRotMemo[key] = res
+  res

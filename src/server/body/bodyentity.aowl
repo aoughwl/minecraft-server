@@ -1,0 +1,138 @@
+## BodyEntity: one moving rigid block body of the world, as the manager (bodymanager.aowl) knows it.
+##
+## WHY A RECORD AND NOT AN `EntityBase`. BODIES-DESIGN.md 2.1 sketches a vtable entity so the body rides the chunk-based
+## tracking and the chunk entity save. This task keeps the body OUT of the entity list on purpose:
+##   * entities only save on chunk unload / shutdown and `saveEntity` appends duplicates (design section 0), so a body kept in the
+##     entity list would be saved twice or not at all; the write-ahead journal (bodyjournal.aowl) is the single persistence;
+##   * the entity list is scanned per tick per active chunk; bodies are few and big and are stepped by the manager's own budgeted loop;
+##   * nothing is sent to clients here (the networking task turns the manager's `bodyEvents` feed into jester:bodies messages and into
+##     vanilla block_display entities, which ARE entities and are owned by that task).
+## `id` is the small integer the commands and the event feed use; `body.idHi/idLo` is the UUID that is stable across saves.
+##
+## FRAME. Local cell coordinates are world cell minus the assembled box's minimum corner, so they are small and the body's
+## `pos` (world position of local (0,0,0)) starts at that corner with identity orientation.
+
+{.feature: "lenientnils".}
+
+import std/[math]
+import ../../nbt/tag as nbttag
+import ../../physics/[body, bodymass, integrator]
+import ../serverbase
+
+type
+  BodyPhase* = enum
+    bpFree         ## live: simulated, answers collision queries, announced in the event feed
+    bpUnresolved   ## replayed from the journal, waiting for the chunks of its claims to load (see bodymanager `resolveReplayed`)
+
+  Claim* = object
+    ## "If this world cell holds `state`, the BLOCK wins": the journal's way of never duplicating a body that was already
+    ## written back into the saved chunks. `l*` is the body-local cell, `w*` the world cell it came from (or will be placed at).
+    lx*, ly*, lz*: int32
+    wx*, wy*, wz*: int32
+    state*: int32
+
+  BodyBE* = object
+    ## A block entity (chest, sign) carried by a body cell; `l*` is the body-local cell.
+    lx*, ly*, lz*: int32
+    nbt*: NbtCompound
+
+  Aabb* = object
+    x0*, y0*, z0*, x1*, y1*, z1*: float64
+
+  BodyEntity* = ref object
+    id*: int32
+    world*: World
+    dim*: string                 ## minecraft name of the dimension, "minecraft:overworld"
+    body*: Body
+    sim*: Sim
+    claims*: seq[Claim]
+    blockEntities*: seq[BodyBE]
+    phase*: BodyPhase
+    bornTick*: int64
+    lastCheckpoint*: int64
+    sleepAnnounced*: bool        ## a STATE event with sleeping = true was queued since the body last moved
+    settleFailedTick*: int64     ## auto-settle gave up at this tick (-1: never); retried after the body moves again
+    lmin*, lmax*: array[3, int32]  ## local cell range, inclusive
+
+proc newAabb*(x0, y0, z0, x1, y1, z1: float64): Aabb =
+  Aabb(x0: x0, y0: y0, z0: z0, x1: x1, y1: y1, z1: z1)
+
+proc rot3(r: Mat3; x, y, z: float64): Vec3 =
+  Vec3(x: r[0] * x + r[1] * y + r[2] * z, y: r[3] * x + r[4] * y + r[5] * z, z: r[6] * x + r[7] * y + r[8] * z)
+
+proc refreshBounds*(be: BodyEntity) =
+  ## Local cell range of the current volume (after assemble, shatter, load).
+  var first = true
+  for c in cellList(be.body):
+    if first:
+      be.lmin = [c.x, c.y, c.z]
+      be.lmax = [c.x, c.y, c.z]
+      first = false
+    else:
+      if c.x < be.lmin[0]: be.lmin[0] = c.x
+      if c.y < be.lmin[1]: be.lmin[1] = c.y
+      if c.z < be.lmin[2]: be.lmin[2] = c.z
+      if c.x > be.lmax[0]: be.lmax[0] = c.x
+      if c.y > be.lmax[1]: be.lmax[1] = c.y
+      if c.z > be.lmax[2]: be.lmax[2] = c.z
+
+proc newBodyEntity*(id: int32; world: World; dim: string; b: Body; tick: int64): BodyEntity =
+  ## `b` must have its mass computed (recomputeMass). The simulation state is built here.
+  result = BodyEntity(id: id, world: world, dim: dim, body: b, sim: newSim(b), claims: @[], blockEntities: @[], phase: bpFree,
+    bornTick: tick, lastCheckpoint: tick, sleepAnnounced: false, settleFailedTick: -1'i64)
+  refreshBounds(result)
+
+proc rebuildSim*(be: BodyEntity) =
+  ## After the cell set changed (shatter): derived data and the simulation's surface cell list.
+  recomputeMass(be.body, defaultProps)
+  be.sim = newSim(be.body)
+  refreshBounds(be)
+
+proc bodyAabb*(be: BodyEntity): Aabb =
+  ## Conservative world AABB: the eight corners of the local cell range, rotated and moved.
+  let r = quatToMat(be.body.orient)
+  var res = Aabb(x0: 1e300, y0: 1e300, z0: 1e300, x1: -1e300, y1: -1e300, z1: -1e300)
+  for i in 0 ..< 8:
+    let lx = float64(if (i and 1) != 0: be.lmax[0] + 1'i32 else: be.lmin[0])
+    let ly = float64(if (i and 2) != 0: be.lmax[1] + 1'i32 else: be.lmin[1])
+    let lz = float64(if (i and 4) != 0: be.lmax[2] + 1'i32 else: be.lmin[2])
+    let w = rot3(r, lx, ly, lz)
+    let wx = w.x + be.body.pos.x
+    let wy = w.y + be.body.pos.y
+    let wz = w.z + be.body.pos.z
+    if wx < res.x0: res.x0 = wx
+    if wy < res.y0: res.y0 = wy
+    if wz < res.z0: res.z0 = wz
+    if wx > res.x1: res.x1 = wx
+    if wy > res.y1: res.y1 = wy
+    if wz > res.z1: res.z1 = wz
+  res
+
+proc cellAabb*(be: BodyEntity; r: Mat3; x, y, z: int32): Aabb =
+  ## Conservative world AABB of one cell (exact for an axis aligned body).
+  let c = rot3(r, float64(x) + 0.5, float64(y) + 0.5, float64(z) + 0.5)
+  let cx = c.x + be.body.pos.x
+  let cy = c.y + be.body.pos.y
+  let cz = c.z + be.body.pos.z
+  let ex = 0.5 * (abs(r[0]) + abs(r[1]) + abs(r[2]))
+  let ey = 0.5 * (abs(r[3]) + abs(r[4]) + abs(r[5]))
+  let ez = 0.5 * (abs(r[6]) + abs(r[7]) + abs(r[8]))
+  Aabb(x0: cx - ex, y0: cy - ey, z0: cz - ez, x1: cx + ex, y1: cy + ey, z1: cz + ez)
+
+proc surfaceVelocityAt*(be: BodyEntity; px, py, pz: float64): Vec3 =
+  ## v + omega x r for the point (px, py, pz), blocks per tick. A sleeping body has no velocity.
+  if be.body.sleeping:
+    return Vec3()
+  let com = comWorld(be.body)
+  let rr = Vec3(x: px - com.x, y: py - com.y, z: pz - com.z)
+  be.body.vel + cross(be.body.angVel, rr)
+
+proc worldPointOf*(be: BodyEntity; lx, ly, lz: float64): Vec3 =
+  ## The world position of a body-local point.
+  let r = quatToMat(be.body.orient)
+  let w = rot3(r, lx, ly, lz)
+  Vec3(x: w.x + be.body.pos.x, y: w.y + be.body.pos.y, z: w.z + be.body.pos.z)
+
+proc isAxisAligned*(be: BodyEntity; tolRad: float64): bool =
+  let (_, err) = nearestRotation(be.body.orient)
+  err <= tolRad

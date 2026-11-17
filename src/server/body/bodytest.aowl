@@ -1,0 +1,527 @@
+## The body manager (bodymanager.aowl) on an in-memory world with chunks: assemble a platform, let it fall onto a floor and settle back
+## into identical blocks, rotation of oriented block states, journal replay after a simulated crash (never lose both the blocks and the
+## body), the structural collapse of a 12 long oak bridge under 9 iron blocks, the collision provider (a dropped item and a zombie are
+## stopped, surface velocity, ray), the event feed, the per tick budget and the /body command text. Exit 0 and "ALL PASS" when everything holds.
+
+import std/[syncio, cmdline, tables, options, math, strutils]
+import ../../config/lib as configlib
+import ../../world/[chunkdata, level, lightingruntime, palette, playerdata, worldfs, worldinfo]
+import ../../world/blockstates as states
+import ../../nbt/tag as nbttag
+import ../../util/math/position
+import ../../util/math/boundingbox
+import ../../util/vector3
+import ../../data/block_ext
+from ../../data/block_state import newBlockStateIdUnchecked, asU16
+import "../../data/item_stack/mod"
+import ../../generated/item_full
+import ../data/datamod
+import ../recipe
+import ../scheduler
+import ../serverbase
+import ../tick_rate_manager
+import ../net/winsock
+import "../block/worldadapter"
+import ../world/[bulkedit, worldmod]
+import ../entity/[collision_providers, entitymod, entitytype, itementity]
+import ../entity/mob/zombie/zombie
+import ../../physics/[body, integrator]
+import bodymanager, bodyworld
+
+var failures = 0
+
+proc check(name: string; cond: bool) =
+  if cond:
+    echo "PASS ", name
+  else:
+    echo "FAIL ", name
+    inc failures
+
+proc scratch(): string =
+  result = parentDirW(paramStr(0)) & "/body_scratch"
+  discard createDirAllW(result)
+
+const Sections = 8   # y 0..127
+
+let adv = defaultAdvancedConfiguration()
+let theLevel = fromRootFolder(adv.world, scratch(), 1'i64, OVERWORLD)
+let server = Server(basicConfig: defaultBasicConfiguration(), advancedConfig: adv, worlds: @[], dimensions: @[OVERWORLD],
+  tickCounter: 0'i64, nextEntityId: 1'i32, tickRateManager: newServerTickRateManager(20.0'f32), keyStore: nil,
+  recipeManager: newRecipeManager(), scheduler: newTaskScheduler(), data: ServerData(),
+  playerDataStorage: PlayerDataStorage(), levelFolder: "", playerIdleTimeout: 0'i32, mojangPublicKeys: @[],
+  stopRequested: false, stopAtMs: 0'i64)
+let bw = loadWorld(theLevel, defaultLevelData(1'u64), OVERWORLD, 63'i32, 0'i32, server)
+server.worlds.add(bw)
+
+proc mkChunk(x, z: int32): ChunkData =
+  let c = newChunkData(x, z, newChunkSections(Sections, 0'i32))
+  c.lightEngine.skyLight = newSeq[LightContainer](Sections)
+  c.lightEngine.blockLight = newSeq[LightContainer](Sections)
+  for i in 0 ..< Sections:
+    c.lightEngine.skyLight[i] = newLightEmpty(0'u8)
+    c.lightEngine.blockLight[i] = newLightEmpty(0'u8)
+  c
+
+let (_, stone) = defaultStateByName("stone")
+let (_, dirt) = defaultStateByName("dirt")
+let (_, planks) = defaultStateByName("oak_planks")
+let (_, stairs) = defaultStateByName("oak_stairs")
+let (_, iron) = defaultStateByName("iron_block")
+let (_, chest) = defaultStateByName("chest")
+
+var chunks: seq[ChunkData] = @[]
+for cz in 0'i32 .. 1'i32:
+  for cx in 0'i32 .. 1'i32:
+    let c = mkChunk(cx, cz)
+    addLoadedChunk(theLevel, c)
+    chunks.add(c)
+
+proc fillBox(x0, y0, z0, x1, y1, z1: int32; id: uint32) =
+  for y in y0 .. y1:
+    for z in z0 .. z1:
+      for x in x0 .. x1:
+        discard setBlockState(theLevel, newBlockPos(x, y, z), id)
+
+proc stateAt(x, y, z: int32): uint32 = getBlockState(theLevel, newBlockPos(x, y, z))
+
+proc countNonAir(x0, y0, z0, x1, y1, z1: int32): int =
+  result = 0
+  for y in y0 .. y1:
+    for z in z0 .. z1:
+      for x in x0 .. x1:
+        if stateAt(x, y, z) != 0'u32:
+          inc result
+
+proc blockName(st: uint32): string =
+  Block.fromStateId(newBlockStateIdUnchecked(uint16(st))).name
+
+proc propOf(st: uint32; key: string): string =
+  let sid = newBlockStateIdUnchecked(uint16(st))
+  let b = Block.fromStateId(sid)
+  let (has, dp) = properties(b, sid)
+  if has:
+    for p in dp.toProps():
+      if p[0] == key:
+        return p[1]
+  ""
+
+proc has(s, sub: string): bool =
+  if sub.len == 0: return true
+  if s.len < sub.len: return false
+  for i in 0 .. s.len - sub.len:
+    if s[i ..< i + sub.len] == sub:
+      return true
+  false
+
+proc runTicks(n: int) =
+  for i in 0 ..< n:
+    inc server.tickCounter
+    tickBodies(server)
+
+proc tickNow(): int64 = server.tickCounter
+
+proc clearJournal() =
+  for rec in journalList(bw):
+    journalDelete(bw, rec.body.idHi, rec.body.idLo)
+
+# --- baseline world: ground y 0..19 (stone, dirt top) ------------------------------------------------------------------------
+fillBox(0, 0, 0, 31, 17, 31, stone)
+fillBox(0, 18, 0, 31, 19, 31, dirt)
+for c in chunks:
+  c.heightmap = calculateHeightmap(c)
+clearJournal()
+bodyReset()
+
+# ======================================================================================================================
+# A. a 3x1x3 platform falls onto the floor and settles back into identical blocks
+# ======================================================================================================================
+block platform:
+  fillBox(10, 40, 10, 12, 40, 12, planks)
+  check("platform: built", countNonAir(10, 40, 10, 12, 40, 12) == 9)
+  let r = assembleBox(bw, volumeBox(10'i32, 40'i32, 10'i32, 12'i32, 40'i32, 12'i32), tickNow())
+  check("platform: assembled one body", r.ok and r.bodies.len == 1)
+  let be = r.bodies[0]
+  check("platform: nine cells, mass > 0", cellCount(be.body) == 9 and be.body.mass > 1000.0)
+  check("platform: the blocks left the world", countNonAir(10, 40, 10, 12, 40, 12) == 0)
+  check("platform: journal file written", journalFileCount(bw) == 1 and journalExists(bw, be.body.idHi, be.body.idLo))
+  check("platform: one live body", bodyCount() == 1)
+  let ev0 = bodyEventsDrain()
+  check("platform: create event with the volume", ev0.len == 1 and ev0[0].kind == bekCreate and ev0[0].bodyId == be.id and
+    cellCount(ev0[0].volume) == 9 and ev0[0].dim == "minecraft:overworld")
+  var minY = 1e9
+  var ticks = 0
+  var sawAsleep = false
+  var stateCount = 0
+  var destroyed = 0
+  var reason = drNone
+  var lastKind = bekCreate
+  var maxPending = 0
+  while bodyCount() > 0 and ticks < 300:
+    runTicks(1)
+    inc ticks
+    if bodyCount() > 0:
+      if be.body.pos.y < minY: minY = be.body.pos.y
+      if be.body.sleeping: sawAsleep = true
+    if bodyEventsPending() > maxPending: maxPending = bodyEventsPending()
+    let allE = bodyEventsDrain()
+    for e in allE:
+      if e.kind == bekState: inc stateCount
+      if e.kind == bekDestroy:
+        inc destroyed
+        reason = e.reason
+      lastKind = e.kind
+  echo "     settled after ", ticks, " ticks, lowest origin y ", minY
+  check("platform: it fell and settled (body gone)", bodyCount() == 0 and ticks < 300 and ticks > 15)
+  var same = true
+  for z in 10'i32 .. 12'i32:
+    for x in 10'i32 .. 12'i32:
+      if stateAt(x, 20, z) != planks:
+        same = false
+  check("platform: identical blocks on the floor (y = 20)", same and countNonAir(10, 20, 10, 12, 20, 12) == 9)
+  check("platform: nothing left at the start", countNonAir(10, 21, 10, 12, 60, 12) == 0)
+  check("platform: journal file gone", journalFileCount(bw) == 0)
+  check("platform: it slept before it settled", sawAsleep)
+  check("platform: a state event per awake tick, then one destroy (settled)", stateCount >= 15 and destroyed == 1 and reason == drSettled and
+    lastKind == bekDestroy)
+  check("platform: at most one pending state event per body between drains", maxPending <= 2)
+  fillBox(10, 20, 10, 12, 20, 12, 0'u32)
+
+# ======================================================================================================================
+# B. rotation of oriented block states
+# ======================================================================================================================
+block rotate_states:
+  let ident: Mat3 = [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]
+  check("rotate: identity keeps the state", mapStateRot(ident, stairs) == stairs)
+  # +90 degrees about Y: (x, z) -> north (0,0,-1) becomes west (-1,0,0)
+  let yaw90 = quatToMat(quatAxisAngle(0.0, 1.0, 0.0, PI / 2.0))
+  var rr: Mat3 = yaw90
+  for i in 0 ..< 9:
+    rr[i] = float64(int(round(yaw90[i])))
+  let s1 = mapStateRot(rr, stairs)
+  check("rotate: stairs facing " & propOf(stairs, "facing") & " -> " & propOf(s1, "facing"),
+    propOf(stairs, "facing") == "north" and propOf(s1, "facing") == "west" and propOf(s1, "half") == "bottom")
+  let s2 = mapStateRot(rr, s1)
+  check("rotate: second quarter turn west -> south", propOf(s2, "facing") == "south")
+  # turned over: 180 degrees about X (up -> down, north <-> south)
+  let flip: Mat3 = [1.0, 0.0, 0.0, 0.0, -1.0, 0.0, 0.0, 0.0, -1.0]
+  let s3 = mapStateRot(flip, stairs)
+  check("rotate: stairs turned over: half bottom -> top, facing north -> south",
+    propOf(s3, "half") == "top" and propOf(s3, "facing") == "south")
+  check("rotate: a plain block is unchanged", mapStateRot(rr, planks) == planks)
+  let (_, logY) = defaultStateByName("oak_log")
+  let pitch: Mat3 = [1.0, 0.0, 0.0, 0.0, 0.0, -1.0, 0.0, 1.0, 0.0]
+  let lx = mapStateRot(pitch, logY)
+  check("rotate: a log turned onto its side changes axis (" & propOf(logY, "axis") & " -> " & propOf(lx, "axis") & ")",
+    propOf(logY, "axis") == "y" and propOf(lx, "axis") == "z")
+
+# ======================================================================================================================
+# C. settle with a quarter turn: the row of stairs lands turned and with mapped states
+# ======================================================================================================================
+block rotated_settle:
+  fillBox(20, 60, 20, 22, 60, 20, stairs)
+  let r = assembleBox(bw, volumeBox(20'i32, 60'i32, 20'i32, 22'i32, 60'i32, 20'i32), tickNow())
+  check("rotated settle: assembled", r.ok and r.bodies.len == 1)
+  let be = r.bodies[0]
+  be.body.orient = quatAxisAngle(0.0, 1.0, 0.0, PI / 2.0)
+  let o = settleBody(be, false, tickNow())
+  check("rotated settle: ok, 3 blocks placed", o.ok and o.cells == 3 and bodyCount() == 0)
+  var found = 0
+  var west = 0
+  var minX = 99'i32
+  var maxX = -99'i32
+  var minZ = 99'i32
+  var maxZ = -99'i32
+  for y in 55'i32 .. 65'i32:
+    for z in 10'i32 .. 31'i32:
+      for x in 10'i32 .. 31'i32:
+        let st = stateAt(x, y, z)
+        if st != 0'u32 and blockName(st) == "oak_stairs":
+          inc found
+          if propOf(st, "facing") == "west": inc west
+          if x < minX: minX = x
+          if x > maxX: maxX = x
+          if z < minZ: minZ = z
+          if z > maxZ: maxZ = z
+  check("rotated settle: three stairs, all facing west", found == 3 and west == 3)
+  check("rotated settle: the row now runs along z (was x)", minX == maxX and maxZ - minZ == 2)
+  fillBox(10, 55, 10, 31, 65, 31, 0'u32)
+  discard bodyEventsDrain()
+
+# ======================================================================================================================
+# D. journal: a crash must never lose both the blocks and the body
+# ======================================================================================================================
+block journal_crash_before_removal:
+  clearJournal()
+  fillBox(4, 30, 4, 6, 30, 6, planks)
+  gTestCrash = 1
+  let r = assembleBox(bw, volumeBox(4'i32, 30'i32, 4'i32, 6'i32, 30'i32, 6'i32), tickNow())
+  check("crash1: stopped after the pending write", r.crashed)
+  check("crash1: blocks untouched, journal pending", countNonAir(4, 30, 4, 6, 30, 6) == 9 and journalFileCount(bw) == 1)
+  bodyReset()      # the process died
+  runTicks(2)      # restart: replay + resolve
+  check("crash1: restart: the blocks win, no body, journal removed", bodyCount() == 0 and journalFileCount(bw) == 0 and
+    countNonAir(4, 30, 4, 6, 30, 6) == 9)
+  fillBox(4, 30, 4, 6, 30, 6, 0'u32)
+
+block journal_crash_after_removal:
+  clearJournal()
+  bodyReset()
+  gCfg.autoSettle = false
+  fillBox(4, 30, 4, 6, 30, 6, planks)
+  gTestCrash = 2
+  let r = assembleBox(bw, volumeBox(4'i32, 30'i32, 4'i32, 6'i32, 30'i32, 6'i32), tickNow())
+  check("crash2: stopped after the removal", r.crashed and countNonAir(4, 30, 4, 6, 30, 6) == 0)
+  bodyReset()      # the process died; the removal was saved with the chunk
+  runTicks(1)
+  check("crash2: restart: the body exists again with its 9 cells", bodyCount() == 1 and cellCount(bodyList()[0].body) == 9 and
+    bodyList()[0].phase == bpFree)
+  check("crash2: its journal is still there", journalFileCount(bw) == 1)
+  # now the other world of the same crash: the removal never reached the disk (the blocks are in the saved chunk)
+  fillBox(4, 30, 4, 6, 30, 6, planks)
+  bodyReset()
+  runTicks(1)
+  check("crash2b: removal not saved: the blocks win, no duplicate body", bodyCount() == 0 and journalFileCount(bw) == 0 and
+    countNonAir(4, 30, 4, 6, 30, 6) == 9)
+  fillBox(4, 30, 4, 6, 30, 6, 0'u32)
+  gCfg.autoSettle = true
+
+block journal_crash_settling:
+  clearJournal()
+  bodyReset()
+  gCfg.autoSettle = false
+  fillBox(4, 30, 4, 6, 30, 6, planks)
+  let r = assembleBox(bw, volumeBox(4'i32, 30'i32, 4'i32, 6'i32, 30'i32, 6'i32), tickNow())
+  let be = r.bodies[0]
+  be.body.pos.y = 25.0
+  gTestCrash = 3
+  let o = settleBody(be, false, tickNow())
+  gTestCrash = 0
+  check("crash3: stopped after the settling write, nothing placed", (not o.ok) and countNonAir(4, 25, 4, 6, 25, 6) == 0)
+  bodyReset()
+  runTicks(1)
+  check("crash3: placement not saved: the body exists again", bodyCount() == 1 and cellCount(bodyList()[0].body) == 9)
+  # the placement was saved but the journal was not deleted
+  fillBox(4, 25, 4, 6, 25, 6, planks)
+  bodyReset()
+  runTicks(1)
+  check("crash3b: placement saved: the blocks win, no duplicate body", bodyCount() == 0 and journalFileCount(bw) == 0 and
+    countNonAir(4, 25, 4, 6, 25, 6) == 9)
+  fillBox(4, 25, 4, 6, 25, 6, 0'u32)
+  gCfg.autoSettle = true
+  bodyReset()
+
+block journal_partial:
+  # one half of the placement saved: the body keeps only the cells whose block is absent
+  clearJournal()
+  bodyReset()
+  gCfg.autoSettle = false
+  fillBox(4, 30, 4, 6, 30, 6, planks)
+  gTestCrash = 2
+  let r = assembleBox(bw, volumeBox(4'i32, 30'i32, 4'i32, 6'i32, 30'i32, 6'i32), tickNow())
+  gTestCrash = 0
+  check("partial: removed", r.crashed and countNonAir(4, 30, 4, 6, 30, 6) == 0)
+  fillBox(4, 30, 4, 4, 30, 6, planks)    # the x = 4 column of cells is back in the world: 3 of 9
+  bodyReset()
+  runTicks(1)
+  check("partial: the body keeps the 6 absent cells", bodyCount() == 1 and cellCount(bodyList()[0].body) == 6)
+  fillBox(4, 30, 4, 4, 30, 6, 0'u32)
+  clearJournal()
+  bodyReset()
+  gCfg.autoSettle = true
+
+# ======================================================================================================================
+# E. collapse: a 12 long oak bridge under 9 iron blocks
+# ======================================================================================================================
+block bridge:
+  clearJournal()
+  bodyReset()
+  # inner box x 8..21, y 20..35, z 4..6; pillars at x = 8 and 21, deck x 9..20 at y = 24, iron stacked at x = 14
+  for y in 20'i32 .. 24'i32:
+    discard setBlockState(theLevel, newBlockPos(8'i32, y, 5'i32), stone)
+    discard setBlockState(theLevel, newBlockPos(21'i32, y, 5'i32), stone)
+  for x in 9'i32 .. 20'i32:
+    discard setBlockState(theLevel, newBlockPos(x, 24'i32, 5'i32), planks)
+  let before0 = countNonAir(8, 20, 4, 21, 35, 6)
+  var opts = defaultCollapseOpts()
+  opts.wind = false
+  var rep = collapseCheck(bw, volumeBox(8'i32, 20'i32, 4'i32, 21'i32, 35'i32, 6'i32), opts, tickNow())
+  check("bridge: the bare 12 long oak bridge holds", rep.ok and rep.broken == 0 and rep.bodies.len == 0 and rep.cells >= before0)
+  for k in 0'i32 .. 8'i32:
+    discard setBlockState(theLevel, newBlockPos(14'i32, 25'i32 + k, 5'i32), iron)
+  let before = countNonAir(8, 20, 4, 21, 35, 6)
+  rep = collapseCheck(bw, volumeBox(8'i32, 20'i32, 4'i32, 21'i32, 35'i32, 6'i32), opts, tickNow())
+  echo "     rounds=", rep.rounds, " broken=", rep.broken, " components=", rep.components, " bodies=", rep.bodies.len,
+    " skipped=", rep.skipped, " maxRatio=", rep.maxRatio, " reason=", rep.reason
+  check("bridge: with 9 iron blocks the check breaks cells", rep.ok and rep.broken > 0)
+  check("bridge: loose parts became bodies", rep.bodies.len > 0 and bodyCount() == rep.bodies.len)
+  let afterAssemble = countNonAir(8, 20, 4, 21, 35, 6)
+  var inBodies = 0
+  let allBe1 = bodyList()
+  for be in allBe1:
+    inBodies += cellCount(be.body)
+  check("bridge: cells are conserved (world + bodies + broken)", afterAssemble + inBodies + rep.broken == before)
+  let droppedBefore = bodyStats().cellsDropped
+  var startY = 1e9
+  let allBe2 = bodyList()
+  for be in allBe2:
+    if be.body.pos.y < startY: startY = be.body.pos.y
+  var ticks = 0
+  while ticks < 600:
+    runTicks(1)
+    inc ticks
+    var allAsleep = true
+    let allBe3 = bodyList()
+    for be in allBe3:
+      if not be.body.sleeping: allAsleep = false
+    if bodyCount() == 0 or allAsleep:
+      break
+  var fell = true
+  var cellsLeft = 0
+  let allBe4 = bodyList()
+  for be in allBe4:
+    cellsLeft += cellCount(be.body)
+    if be.body.pos.y > startY - 0.5 and not be.body.sleeping: fell = false
+  echo "     ", ticks, " ticks, ", bodyCount(), " bodies left, stats settled=", bodyStats().settled, " dropped=", bodyStats().cellsDropped
+  let worldAfter = countNonAir(0, 20, 0, 31, 60, 31)
+  check("bridge: after the fall the pieces rest (settled or asleep)", ticks < 600)
+  check("bridge: nothing is lost (world + bodies + dropped == the bridge)",
+    worldAfter + cellsLeft + bodyStats().cellsDropped == before)
+  check("bridge: the pieces came down", fell)
+  # clean up what is left
+  let allBe5 = bodyList()
+  for be in allBe5:
+    discard removeBody(be, tickNow())
+  fillBox(0, 20, 0, 31, 60, 31, 0'u32)
+  discard bodyEventsDrain()
+  bodyReset()
+
+# ======================================================================================================================
+# F. collision provider: a body stops a dropped item and a zombie; surface velocity; ray
+# ======================================================================================================================
+proc at(x, y, z: float64): Vector3[float64] = Vector3[float64](x: x, y: y, z: z)
+proc boxAt(x0, y0, z0, x1, y1, z1: float64): BoundingBox = newBoundingBox(at(x0, y0, z0), at(x1, y1, z1))
+
+block provider:
+  clearJournal()
+  bodyReset()
+  gCfg.autoSettle = false
+  fillBox(24, 50, 24, 26, 50, 26, stone)
+  fillBox(29, 51, 20, 29, 53, 28, stone)
+  let rp = assembleBox(bw, volumeBox(24'i32, 50'i32, 24'i32, 26'i32, 50'i32, 26'i32), tickNow())
+  let rw = assembleBox(bw, volumeBox(29'i32, 51'i32, 20'i32, 29'i32, 53'i32, 28'i32), tickNow())
+  check("provider: platform and wall assembled", rp.ok and rw.ok and bodyCount() == 2 and gCollisionProviders.len == 1)
+  let plat = rp.bodies[0]
+  let wall = rw.bodies[0]
+  plat.body.sleeping = true
+  wall.body.sleeping = true
+  check("provider: space inside the platform is blocked", not isSpaceEmpty(bw, boxAt(24.1, 50.2, 24.1, 24.9, 50.8, 24.9)))
+  check("provider: space above it is free (touching is not intersecting)", isSpaceEmpty(bw, boxAt(24.1, 51.0, 24.1, 24.9, 52.0, 24.9)))
+  check("provider: space beside it is free", isSpaceEmpty(bw, boxAt(20.0, 50.2, 20.0, 21.0, 50.8, 21.0)))
+  # a dropped item
+  let ie = newEntity(bw, at(25.5, 70.0, 25.5), EntityType.ITEM)
+  let item = newItemEntityWithVelocity(ie, newItemStack(1'u8, ITEM_DIRT), at(0.0, 0.0, 0.0), 0'u8)
+  let ibase: EntityBase = item
+  for i in 0 ..< 80:
+    ibase.tick(ibase, server)
+  check("provider: the item rests on the platform top (y = " & $item.entity.pos.y & ")", abs(item.entity.pos.y - 51.0) < 1e-6 and item.entity.onGround)
+  check("provider: its support is the provider", item.entity.supportingBlockPos.isSome and isProvidedPos(item.entity.supportingBlockPos.unsafeGet))
+  # an item beside the platform falls to the real floor
+  let ie2 = newEntity(bw, at(20.5, 70.0, 20.5), EntityType.ITEM)
+  let item2 = newItemEntityWithVelocity(ie2, newItemStack(1'u8, ITEM_DIRT), at(0.0, 0.0, 0.0), 0'u8)
+  let ibase2: EntityBase = item2
+  for i in 0 ..< 120:
+    ibase2.tick(ibase2, server)
+  check("provider: an item elsewhere falls to the ground (y = " & $item2.entity.pos.y & ")", abs(item2.entity.pos.y - 20.0) < 1e-6)
+  # surface velocity
+  var v = at(9.0, 9.0, 9.0)
+  check("provider: velocity under a standing box is 0 for a sleeping body", providerVelocityAt(boxAt(24.2, 51.0, 24.2, 24.8, 52.8, 24.8), v) and v.x == 0.0)
+  plat.body.sleeping = false
+  plat.body.vel = Vec3(x: 0.1, y: 0.0, z: 0.0)
+  check("provider: velocity of a moving body", providerVelocityAt(boxAt(24.2, 51.0, 24.2, 24.8, 52.8, 24.8), v) and abs(v.x - 0.1) < 1e-9)
+  check("provider: not on it elsewhere", not providerVelocityAt(boxAt(10.0, 21.0, 10.0, 10.6, 22.8, 10.6), v))
+  plat.body.sleeping = true
+  plat.body.vel = Vec3()
+  # a zombie walks into the wall (x = 29)
+  let z = newZombieEntity(newEntity(bw, at(24.5, 51.0, 24.5), EntityType.ZOMBIE))
+  let zbase: EntityBase = z
+  let zent = z.entity
+  for i in 0 ..< 60:
+    zent.moveEntity(zbase, at(0.1, 0.0, 0.0))
+  check("provider: the zombie is stopped by the wall body (max x = " & $zent.boundingBox.max.x & ")",
+    abs(zent.boundingBox.max.x - 29.0) < 1e-6 and zent.horizontalCollision)
+  # the ray hook
+  var t = 0.0'f64
+  var pid = 0'i32
+  check("provider: a ray at the wall hits it", providerRayHit(at(20.0, 52.5, 24.5), at(10.0, 0.0, 0.0), 1.0, t, pid) and abs(t - 0.9) < 1e-9 and
+    pid == gCollisionProviders[0].id)
+  check("provider: a ray above the wall passes", not providerRayHit(at(20.0, 55.5, 24.5), at(10.0, 0.0, 0.0), 1.0, t, pid))
+  # remove the bodies: the blocks are back where they were and no body answers any more
+  check("provider: remove puts the platform back", removeBody(plat, tickNow()).ok and stateAt(25'i32, 50'i32, 25'i32) == stone)
+  check("provider: remove puts the wall back", removeBody(wall, tickNow()).ok and stateAt(29'i32, 52'i32, 24'i32) == stone)
+  check("provider: no body left to collide with", bodyCount() == 0)
+  gCfg.autoSettle = true
+  fillBox(0, 20, 0, 31, 70, 31, 0'u32)
+  bodyReset()
+
+# ======================================================================================================================
+# G. per tick budget and the /body text commands
+# ======================================================================================================================
+block budget:
+  clearJournal()
+  bodyReset()
+  gCfg.maxAwake = 1
+  gCfg.autoSettle = false
+  fillBox(2, 40, 2, 3, 40, 3, planks)
+  fillBox(8, 40, 2, 9, 40, 3, planks)
+  let a = assembleBox(bw, volumeBox(2'i32, 40'i32, 2'i32, 3'i32, 40'i32, 3'i32), tickNow())
+  let b = assembleBox(bw, volumeBox(8'i32, 40'i32, 2'i32, 9'i32, 40'i32, 3'i32), tickNow())
+  check("budget: two bodies", a.ok and b.ok and bodyCount() == 2)
+  runTicks(3)
+  check("budget: only one body per tick is stepped, the other waits (skipped = " & $bodyStats().skipped & ")", bodyStats().skipped >= 3)
+  check("budget: pending events are coalesced (" & $bodyEventsPending() & ")", bodyEventsPending() >= 3 and bodyEventsPending() <= 4)
+  gCfg.maxAwake = 32
+  runTicks(3)
+  let s0 = bodyStats().skipped
+  runTicks(3)
+  check("budget: with room, nothing is skipped", bodyStats().skipped == s0)
+  gCfg.autoSettle = true
+  let allBe6 = bodyList()
+  for be in allBe6:
+    discard removeBody(be, tickNow())
+  fillBox(0, 20, 0, 31, 60, 31, 0'u32)
+  bodyReset()
+  discard bodyEventsDrain()
+
+block commands:
+  clearJournal()
+  bodyReset()
+  gCfg.autoSettle = false
+  fillBox(14, 40, 14, 16, 40, 14, planks)
+  var out1 = bodyExec(bw, 15'i32, 40'i32, 14'i32, @["assemble", "~-1", "~", "~", "~1", "~", "~"], tickNow())
+  check("cmd: assemble with relative coordinates: " & out1[0], out1.len == 1 and out1[0].startsWith("Assembled body"))
+  let lst = bodyExec(bw, 0'i32, 0'i32, 0'i32, @["list"], tickNow())
+  check("cmd: list shows the body", lst.len == 1 and has(lst[0], "3 cells"))
+  let id = $bodyList()[0].id
+  let info = bodyExec(bw, 0'i32, 0'i32, 0'i32, @["info", id], tickNow())
+  check("cmd: info", info.len == 2 and has(info[1], "journal yes"))
+  let imp = bodyExec(bw, 0'i32, 0'i32, 0'i32, @["impulse", id, "0.1", "0.0", "0.0"], tickNow())
+  check("cmd: impulse", imp[0].startsWith("Impulse applied") and bodyList()[0].body.vel.x > 0.09)
+  runTicks(2)
+  check("cmd: the pushed body moved (x = " & $bodyList()[0].body.pos.x & ")", bodyList()[0].body.pos.x > 14.0)
+  let rem = bodyExec(bw, 0'i32, 0'i32, 0'i32, @["remove", id], tickNow())
+  check("cmd: remove: " & rem[0], rem[0].startsWith("Body") and bodyCount() == 0)
+  check("cmd: the blocks are back in the air (3 planks somewhere)", countNonAir(0, 21, 0, 31, 60, 31) == 3)
+  let bad = bodyExec(bw, 0'i32, 0'i32, 0'i32, @["info", "999"], tickNow())
+  check("cmd: unknown id", bad[0] == "No body 999")
+  let st = bodyExec(bw, 0'i32, 0'i32, 0'i32, @["status"], tickNow())
+  check("cmd: status", st[0].startsWith("Bodies: 0 live"))
+  gCfg.autoSettle = true
+  fillBox(0, 20, 0, 31, 60, 31, 0'u32)
+  bodyReset()
+  clearJournal()
+
+if failures == 0:
+  echo "ALL PASS"
+else:
+  echo failures, " FAILED"
+  quit(1)
