@@ -1,0 +1,381 @@
+## The world side of the Create port: finds kinetic components in the world, solves the networks (kinetic.aowl), and turns rotating
+## contraptions (contraption.aowl) on the body system (server/body/bodymanager.aowl).
+##
+## STAND-IN BLOCKS. Custom blocks need the planned block registries (docs/REGISTRIES.md), which do not exist yet, so a component is a
+## VANILLA block chosen by this DATA TABLE (no name heuristics anywhere else):
+##     stripped_oak_log        shaft          (its `axis` property is the shaft axis)
+##     stripped_birch_log      small cogwheel (8 teeth)
+##     stripped_dark_oak_log   large cogwheel (16 teeth)
+##     copper_block            gearbox        (all six faces)
+## Motors and bearings carry numbers a block cannot (rpm, the contraption), so they are REGISTERED by the `/create` command at a
+## position; the block at that position is irrelevant. A registered bearing at (x,y,z) with a `facing` turns the blocks attached on that
+## side about the line through the bearing's centre along the facing axis; its shaft end is the opposite side.
+##
+## PIPELINE per tick (`createTick`, called once after `tickBodies`):
+##     every `ScanEvery` ticks (and after every command): flood the components from every registered source, solve, store the speeds;
+##     every tick, for every live bearing: speed -> radians per tick -> carry the entities standing on the contraption -> spin the body
+##     (`contraption.spinBody`, exact rotation) -> `bodyPoseChanged` (state event + checkpoint).
+##
+## RIDERS. Non-player entities that stand on the contraption (feet on a top surface, contraption.standsOn) are moved by the same exact
+## rotation through `moveEntity` (so walls still stop them) and turned by the yaw delta. PLAYERS are not moved from here: the player's
+## position is client authoritative; the Jester client carries itself (aoughwl.bodies/bodycollide.aowl) and a vanilla client is the open
+## "movement authority" item of BODIES-DESIGN.md (T6), see docs/CREATE_PORT.md.
+##
+## NOT PERSISTED. Sources, bearings and the kinematic flag live in memory. The body itself is journaled like any body, so after a restart
+## it comes back as an ordinary FREE body (it falls and settles). Persisting them is item 1 of the remaining work in docs/CREATE_PORT.md.
+
+{.feature: "lenientnils".}
+
+import std/[math, options, tables, strutils]
+import ../../data/block_ext
+from ../../data/block_state import newBlockStateIdUnchecked
+import ../../util/math/position
+import ../../util/vector3
+import ../../physics/[body, integrator]
+import ../../server/serverbase
+import ../../server/world/bulkedit
+import ../../server/body/[bodymanager, bodyentity, bodyworld]
+import ../../server/entity/entitymod
+import kinetic, contraption
+
+const
+  ScanEvery* = 10
+  MaxScanNodes* = 4096
+  StandInShaft* = "stripped_oak_log"
+  StandInCogSmall* = "stripped_birch_log"
+  StandInCogLarge* = "stripped_dark_oak_log"
+  StandInGearbox* = "copper_block"
+
+type
+  SourceReg* = object
+    world*: World
+    x*, y*, z*: int32
+    facing*: int
+    rpm*, capPerRpm*: float64
+
+  BearingReg* = object
+    world*: World
+    x*, y*, z*: int32
+    facing*: int                       ## the side the contraption is attached on (direction index)
+    bodyId*: int32
+    pivot*: Vec3
+    rpm*: float64                      ## last solved speed
+    state*: NetState
+    angle*: float64                    ## total turned so far, radians
+    carried*: int                      ## entities carried on the last tick
+    carriedTotal*: int
+
+  Stats* = object
+    scans*, spins*, carries*: int
+
+var gSources*: seq[SourceReg] = @[]
+var gBearings*: seq[BearingReg] = @[]
+var gGraph*: Graph = newGraph()
+var gSol*: KSolution = KSolution(speed: @[], netId: @[], nets: @[])
+var gCreateStats*: Stats = Stats()
+var gCarry* = true                     ## test switch: false leaves riders behind (proves the carry check is not vacuous)
+var gLastScanTick = -1000'i64
+
+proc createReset*() =
+  gSources = @[]
+  gBearings = @[]
+  gGraph = newGraph()
+  gSol = KSolution(speed: @[], netId: @[], nets: @[])
+  gCreateStats = Stats()
+  gCarry = true
+  gLastScanTick = -1000'i64
+
+# ----------------------------------------------------------------------------------------------------------------------
+# blocks
+
+proc bareName(n: string): string =
+  if n.startsWith("minecraft:"): n[10 .. ^1] else: n
+
+proc classify*(state: uint32; kind: var KKind; axis: var int): bool =
+  ## Is this block state a kinetic component (see the stand-in table in the header)?
+  if state == 0'u32:
+    return false
+  let sid = newBlockStateIdUnchecked(uint16(state))
+  let b = Block.fromStateId(sid)
+  let name = bareName(b.name)
+  if name == StandInShaft:
+    kind = kkShaft
+  elif name == StandInCogSmall:
+    kind = kkCogSmall
+  elif name == StandInCogLarge:
+    kind = kkCogLarge
+  elif name == StandInGearbox:
+    kind = kkGearbox
+    axis = 1
+    return true
+  else:
+    return false
+  axis = 1
+  let (has, dp) = properties(b, sid)
+  if has:
+    for p in dp.toProps():
+      if p[0] == "axis":
+        axis = (if p[1] == "x": 0 elif p[1] == "z": 2 else: 1)
+  true
+
+proc dirIndexOf*(name: string): int =
+  ## "+x" "east" "up" ... -> 0..5, -1 for nonsense.
+  case name.toLowerAscii()
+  of "+x", "east", "e": 0
+  of "-x", "west", "w": 1
+  of "+y", "up", "u": 2
+  of "-y", "down", "d": 3
+  of "+z", "south", "s": 4
+  of "-z", "north", "n": 5
+  else: -1
+
+proc dirName*(d: int): string =
+  ["+x", "-x", "+y", "-y", "+z", "-z"][d]
+
+# ----------------------------------------------------------------------------------------------------------------------
+# scan and solve
+
+proc key3(x, y, z: int32): int64 =
+  ((int64(x) + 2000000'i64) shl 42) xor ((int64(y) + 2000000'i64) shl 21) xor (int64(z) + 2000000'i64)
+
+proc sourceAt(world: World; x, y, z: int32): int =
+  for i in 0 ..< gSources.len:
+    if gSources[i].world == world and gSources[i].x == x and gSources[i].y == y and gSources[i].z == z:
+      return i
+  -1
+
+proc bearingAt(world: World; x, y, z: int32): int =
+  for i in 0 ..< gBearings.len:
+    if gBearings[i].world == world and gBearings[i].x == x and gBearings[i].y == y and gBearings[i].z == z:
+      return i
+  -1
+
+proc nodeFor(world: World; x, y, z: int32; n: var KNode): bool =
+  let si = sourceAt(world, x, y, z)
+  if si >= 0:
+    let s = gSources[si]
+    n = source(x, y, z, s.facing, s.rpm, s.capPerRpm)
+    return true
+  let bi = bearingAt(world, x, y, z)
+  if bi >= 0:
+    let b = gBearings[bi]
+    n = consumer(x, y, z, b.facing xor 1, 0, ImpactBearing)
+    n.tag = int32(bi + 1)
+    return true
+  var k = kkShaft
+  var ax = 1
+  if not classify(stateIdAt(world, int(x), int(y), int(z)), k, ax):
+    return false
+  case k
+  of kkShaft: n = shaft(x, y, z, ax)
+  of kkCogSmall: n = cogSmall(x, y, z, ax)
+  of kkCogLarge: n = cogLarge(x, y, z, ax)
+  else: n = gearbox(x, y, z)
+  true
+
+proc scanWorld*(world: World): Graph =
+  ## Flood from every registered source of `world` through the 18 neighbours (6 faces + 12 edges, the cog rims); components only.
+  result = newGraph()
+  var seen = initTable[int64, bool]()
+  var queue: seq[(int32, int32, int32)] = @[]
+  for s in gSources:
+    if s.world == world:
+      queue.add((s.x, s.y, s.z))
+      seen[key3(s.x, s.y, s.z)] = true
+  var qh = 0
+  while qh < queue.len and result.nodes.len < MaxScanNodes:
+    let (x, y, z) = queue[qh]
+    inc qh
+    var n = shaft(0, 0, 0, 0)
+    if not nodeFor(world, x, y, z, n):
+      continue
+    discard result.add(n)
+    for dx in -1 .. 1:
+      for dy in -1 .. 1:
+        for dz in -1 .. 1:
+          if (dx == 0 and dy == 0 and dz == 0) or abs(dx) + abs(dy) + abs(dz) > 2:
+            continue
+          let nx = x + int32(dx)
+          let ny = y + int32(dy)
+          let nz = z + int32(dz)
+          let k = key3(nx, ny, nz)
+          if not seen.hasKey(k):
+            seen[k] = true
+            queue.add((nx, ny, nz))
+
+proc rescan*(world: World) =
+  ## Solve the networks of one world and hand the bearings their speeds.
+  gGraph = scanWorld(world)
+  gSol = solve(gGraph)
+  inc gCreateStats.scans
+  for i in 0 ..< gBearings.len:
+    if gBearings[i].world != world:
+      continue
+    gBearings[i].rpm = 0.0
+    gBearings[i].state = nsIdle
+  for ni in 0 ..< gGraph.nodes.len:
+    let n = gGraph.nodes[ni]
+    if n.tag > 0 and n.kind == kkConsumer:
+      let bi = int(n.tag) - 1
+      if bi < gBearings.len:
+        gBearings[bi].rpm = gSol.speed[ni]
+        gBearings[bi].state = netOf(gSol, int32(ni)).state
+
+proc speedAt*(world: World; x, y, z: int32; rpm: var float64; net: var NetInfo): bool =
+  ## The solved speed of the component at a position (after the last scan).
+  for ni in 0 ..< gGraph.nodes.len:
+    let n = gGraph.nodes[ni]
+    if n.x == x and n.y == y and n.z == z:
+      rpm = gSol.speed[ni]
+      net = netOf(gSol, int32(ni))
+      return true
+  false
+
+# ----------------------------------------------------------------------------------------------------------------------
+# registration
+
+proc addSource*(world: World; x, y, z: int32; facing: int; rpm, capPerRpm: float64): int =
+  let at = sourceAt(world, x, y, z)
+  let reg = SourceReg(world: world, x: x, y: y, z: z, facing: facing, rpm: rpm, capPerRpm: capPerRpm)
+  if at >= 0:
+    gSources[at] = reg
+    return at
+  gSources.add reg
+  gSources.len - 1
+
+proc removeSource*(world: World; x, y, z: int32): bool =
+  let at = sourceAt(world, x, y, z)
+  if at < 0:
+    return false
+  gSources.delete(at)
+  true
+
+type
+  BearingResult* = object
+    ok*: bool
+    reason*: string
+    bodyId*: int32
+    cells*: int
+
+proc addBearing*(world: World; x, y, z: int32; facing: int; box: VolumeBox; tick: int64): BearingResult =
+  ## Registers a bearing and turns every movable block of `box` into ONE kinematic body that the bearing rotates. The box must contain
+  ## the block next to the bearing on its `facing` side and not the bearing's own cell.
+  result = BearingResult(ok: false, reason: "", bodyId: 0'i32, cells: 0)
+  if bearingAt(world, x, y, z) >= 0:
+    result.reason = "there is already a bearing there"
+    return
+  let ax = facing div 2
+  let fx = x + dirDx(facing)
+  let fy = y + dirDy(facing)
+  let fz = z + dirDz(facing)
+  if fx < box.minX or fx > box.maxX or fy < box.minY or fy > box.maxY or fz < box.minZ or fz > box.maxZ:
+    result.reason = "the box must contain the block on the bearing's " & dirName(facing) & " side"
+    return
+  var cells: seq[Cell] = @[]
+  for yy in box.minY .. box.maxY:
+    for zz in box.minZ .. box.maxZ:
+      for xx in box.minX .. box.maxX:
+        if xx == x and yy == y and zz == z:
+          continue
+        let st = stateIdAt(world, int(xx), int(yy), int(zz))
+        if isBodyCell(st):
+          cells.add Cell(x: xx, y: yy, z: zz, state: int32(st))
+  if cells.len == 0:
+    result.reason = "no movable block in the box"
+    return
+  let r = assembleCells(world, cells, tick)
+  if not r.ok:
+    result.reason = "assemble failed: " & r.reason
+    return
+  let be = r.bodies[0]
+  be.kinematic = true
+  be.body.sleeping = false
+  gBearings.add BearingReg(world: world, x: x, y: y, z: z, facing: facing, bodyId: be.id,
+    pivot: Vec3(x: float64(x) + 0.5, y: float64(y) + 0.5, z: float64(z) + 0.5), rpm: 0.0, state: nsIdle, angle: 0.0)
+  discard ax
+  result.ok = true
+  result.bodyId = be.id
+  result.cells = cells.len
+  rescan(world)
+
+proc releaseBearing*(world: World; x, y, z: int32; tick: int64): (bool, string) =
+  ## Stops the contraption and puts its blocks back at the nearest grid pose (bodymanager.removeBody), then forgets the bearing.
+  let bi = bearingAt(world, x, y, z)
+  if bi < 0:
+    return (false, "no bearing there")
+  let reg = gBearings[bi]
+  let found = bodyById(reg.bodyId)
+  if found.isSome:
+    let be = found.get
+    be.kinematic = false
+    stopBody(be.body)
+    let r = removeBody(be, tick)
+    if not r.ok:
+      be.kinematic = true
+      return (false, "could not put the blocks back: " & r.reason)
+  gBearings.delete(bi)
+  (true, "")
+
+# ----------------------------------------------------------------------------------------------------------------------
+# the tick
+
+proc carryRiders(be: BodyEntity; pivot, axis: Vec3; ang: float64): int =
+  ## Entities that stand on the body (at its current pose) move with it. Call BEFORE spinning the body.
+  result = 0
+  let ab = bodyAabb(be)
+  let yaw = yawDeltaDeg(axis, ang)
+  for e in entitiesOf(be.world).entities:
+    if e == nil or e.entity == nil or e.player != nil or e.entity.removed:
+      continue
+    let ent = e.entity
+    let bb = ent.boundingBox
+    if bb.min.x > ab.x1 + 1.0 or bb.max.x < ab.x0 - 1.0 or bb.min.z > ab.z1 + 1.0 or bb.max.z < ab.z0 - 1.0 or
+        bb.min.y > ab.y1 + 1.0 or bb.min.y < ab.y0 - 1.0:
+      continue
+    let feet = Vec3(x: ent.pos.x, y: bb.min.y, z: ent.pos.z)
+    if not standsOn(be.body, feet):
+      continue
+    let moved = carryPoint(feet, pivot, axis, ang)
+    # moveEntity leaves the motion behind as velocity (the entity would then travel it a second time on its own tick): keep the old one
+    let oldVel = ent.velocity
+    ent.moveEntity(e, Vector3[float64](x: moved.x - feet.x, y: moved.y - feet.y, z: moved.z - feet.z))
+    ent.velocity = oldVel
+    if abs(yaw) > 0.0:
+      ent.yaw = ent.yaw + float32(yaw)
+      ent.headYaw = ent.headYaw + float32(yaw)
+      ent.bodyYaw = ent.bodyYaw + float32(yaw)
+    inc result
+
+proc createTick*(server: Server) =
+  ## ONE call per server tick, after `tickBodies`.
+  if gSources.len == 0 and gBearings.len == 0:
+    return
+  let tick = server.tickCounter
+  if gBearings.len > 0 and tick - gLastScanTick >= int64(ScanEvery):
+    gLastScanTick = tick
+    for w in server.worlds:
+      rescan(w)
+  var i = 0
+  while i < gBearings.len:
+    let reg = gBearings[i]
+    let found = bodyById(reg.bodyId)
+    if found.isNone:
+      gBearings.delete(i)               # the body is gone (void, removed with /body remove)
+      continue
+    let be = found.get
+    let axis = unitAxis(reg.facing div 2)
+    let ang = rpmToRadPerTick(reg.rpm)
+    if ang != 0.0 and be.kinematic:
+      gBearings[i].carried = 0
+      if gCarry:
+        gBearings[i].carried = carryRiders(be, reg.pivot, axis, ang)
+        gBearings[i].carriedTotal += gBearings[i].carried
+        gCreateStats.carries += gBearings[i].carried
+      spinBody(be.body, reg.pivot, axis, ang)
+      gBearings[i].angle += ang
+      inc gCreateStats.spins
+      bodyPoseChanged(be, tick)
+    elif be.kinematic and (be.body.angVel.x != 0.0 or be.body.angVel.y != 0.0 or be.body.angVel.z != 0.0):
+      stopBody(be.body)
+      bodyPoseChanged(be, tick)
+    inc i

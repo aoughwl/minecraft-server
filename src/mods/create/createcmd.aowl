@@ -1,0 +1,177 @@
+## The `/create` debug command (op level 4): register motors and bearings, scan the kinetic networks, read speeds, release contraptions.
+## A thin wrapper around `createExec` (the reply lines), so tests drive the same code without a command source.
+##
+##   /create motor <x y z> <rpm> [facing]                 register a source: facing east|west|up|down|south|north (default up)
+##   /create bearing <x y z> <facing> <x1 y1 z1 x2 y2 z2>  turn every movable block of the box into one body this bearing rotates
+##   /create release <x y z>                              stop that bearing's contraption and put its blocks back
+##   /create scan                                         solve the networks of this world and list them
+##   /create speed <x y z>                                the solved speed and network of the component at a position
+##   /create status                                       sources, bearings (rpm, turned angle, riders carried), counters
+##   /create clear                                        forget every motor of this world and release every bearing
+##   ~ is relative to the player (or the world spawn from the console).
+
+import ../../util/closureset
+import std/[options, strutils, math]
+import ../../command/[cmderrors, cmdsource, fallbackdispatch, args]
+import ../../util/[vector3, permission]
+import ../../util/text/[textbase, text, color]
+import ../../server/serverbase
+import ../../server/world/bulkedit
+import ../../server/body/bodymanager
+import kinetic, createworld
+
+const
+  Names = ["create"]
+  Description = "Create-style kinetic debug: motors, bearings, networks."
+  ArgRest = "args"
+  Permission0* = "create:command.create"
+
+proc registerPermission*(registry: PermissionRegistry) =
+  registerPermissionOrPanic(registry, newPermission(Permission0, Description, permissionOp(Four)))
+
+proc fmt(v: float64): string =
+  f2(v)
+
+proc createExec*(world: World; ox, oy, oz: int32; parts: seq[string]; tick: int64): seq[string] =
+  ## `/create ...`: the words after `create`. Returns the reply lines.
+  result = @[]
+  if parts.len == 0:
+    result.add("/create motor <x y z> <rpm> [facing] | bearing <x y z> <facing> <x1 y1 z1 x2 y2 z2> | release <x y z> | scan | speed <x y z> | status | clear")
+    return
+  case parts[0]
+  of "motor":
+    var x = 0'i32
+    var y = 0'i32
+    var z = 0'i32
+    var rpm = 0.0
+    if parts.len < 5 or not relCoord(parts[1], ox, x) or not relCoord(parts[2], oy, y) or not relCoord(parts[3], oz, z) or
+        not parseFloatSafe(parts[4], rpm):
+      result.add("Usage: /create motor <x y z> <rpm> [facing]")
+      return
+    var facing = 2
+    if parts.len >= 6:
+      facing = dirIndexOf(parts[5])
+      if facing < 0:
+        result.add("Not a direction: " & parts[5])
+        return
+    if abs(rpm) > MaxRpm:
+      result.add("Speeds are capped at " & fmt(MaxRpm) & " rpm; using " & fmt(MaxRpm))
+      rpm = (if rpm < 0.0: -MaxRpm else: MaxRpm)
+    discard addSource(world, x, y, z, facing, rpm, CapPerRpmCreativeMotor)
+    rescan(world)
+    result.add("Motor at " & $x & " " & $y & " " & $z & " facing " & dirName(facing) & " forces " & fmt(rpm) & " rpm (capacity " &
+      fmt(CapPerRpmCreativeMotor * abs(rpm)) & " su).")
+  of "bearing":
+    var x = 0'i32
+    var y = 0'i32
+    var z = 0'i32
+    if parts.len < 11 or not relCoord(parts[1], ox, x) or not relCoord(parts[2], oy, y) or not relCoord(parts[3], oz, z):
+      result.add("Usage: /create bearing <x y z> <facing> <x1 y1 z1 x2 y2 z2>")
+      return
+    let facing = dirIndexOf(parts[4])
+    if facing < 0:
+      result.add("Not a direction: " & parts[4])
+      return
+    var box = volumeBox(0'i32, 0'i32, 0'i32, 0'i32, 0'i32, 0'i32)
+    if not parseBox(parts, 5, ox, oy, oz, box):
+      result.add("Usage: /create bearing <x y z> <facing> <x1 y1 z1 x2 y2 z2>")
+      return
+    if volumeCells(box) > 65536:
+      result.add("The box is too big (65536 cells at most).")
+      return
+    let r = addBearing(world, x, y, z, facing, box, tick)
+    if r.ok:
+      result.add("Bearing at " & $x & " " & $y & " " & $z & " turns body " & $r.bodyId & " (" & $r.cells & " blocks) about the " &
+        ["x", "y", "z"][facing div 2] & " axis. Its shaft end is on the " & dirName(facing xor 1) & " side.")
+    else:
+      result.add("No bearing: " & r.reason)
+  of "release":
+    var x = 0'i32
+    var y = 0'i32
+    var z = 0'i32
+    if parts.len < 4 or not relCoord(parts[1], ox, x) or not relCoord(parts[2], oy, y) or not relCoord(parts[3], oz, z):
+      result.add("Usage: /create release <x y z>")
+      return
+    let (ok, why) = releaseBearing(world, x, y, z, tick)
+    result.add(if ok: "Bearing released: the blocks are back." else: "Not released: " & why)
+  of "scan":
+    rescan(world)
+    if gSol.nets.len == 0:
+      result.add("No networks (register a motor with /create motor).")
+    for nt in gSol.nets:
+      result.add("Network " & $nt.id & ": " & stateName(nt.state) & ", " & $nt.nodes.len & " components, " & $nt.sources & " sources, " &
+        $nt.consumers & " consumers, capacity " & fmt(nt.capacity) & " su, demand " & fmt(nt.demand) & " su" &
+        (if nt.reason.len > 0: " (" & nt.reason & ")" else: ""))
+  of "speed":
+    var x = 0'i32
+    var y = 0'i32
+    var z = 0'i32
+    if parts.len < 4 or not relCoord(parts[1], ox, x) or not relCoord(parts[2], oy, y) or not relCoord(parts[3], oz, z):
+      result.add("Usage: /create speed <x y z>")
+      return
+    var rpm = 0.0
+    var net = NetInfo()
+    if speedAt(world, x, y, z, rpm, net):
+      result.add("Component at " & $x & " " & $y & " " & $z & ": " & fmt(rpm) & " rpm, network " & $net.id & " " & stateName(net.state))
+    else:
+      result.add("No kinetic component reached from a motor at " & $x & " " & $y & " " & $z & " (run /create scan after changes).")
+  of "status":
+    result.add("Motors: " & $gSources.len & ", bearings: " & $gBearings.len & ", scans " & $gCreateStats.scans & ", spins " & $gCreateStats.spins &
+      ", riders carried " & $gCreateStats.carries)
+    for s in gSources:
+      result.add("  motor " & $s.x & " " & $s.y & " " & $s.z & " facing " & dirName(s.facing) & " " & fmt(s.rpm) & " rpm")
+    for b in gBearings:
+      result.add("  bearing " & $b.x & " " & $b.y & " " & $b.z & " " & dirName(b.facing) & ": body " & $b.bodyId & ", " & fmt(b.rpm) &
+        " rpm (" & stateName(b.state) & "), turned " & fmt(b.angle * 180.0 / PI) & " degrees, riders carried last tick " & $b.carried)
+  of "clear":
+    var released = 0
+    while gBearings.len > 0:
+      let b = gBearings[0]
+      let (ok, _) = releaseBearing(b.world, b.x, b.y, b.z, tick)
+      if not ok:
+        gBearings.delete(0)
+      inc released
+    let n = gSources.len
+    gSources = @[]
+    result.add("Cleared " & $n & " motors, released " & $released & " bearings.")
+  else:
+    result.add("Unknown /create subcommand " & parts[0])
+
+proc worldOf(sender: CommandSender; server: nil CommandServer): nil CommandWorld =
+  if sender.kind == cskPlayer and sender.player.entity != nil and closureSet(sender.player.entity.getWorld):
+    return sender.player.entity.getWorld()
+  if server != nil and closureSet(server.getOverworld):
+    return server.getOverworld()
+  nil
+
+proc createCommand(sender: CommandSender; server: nil CommandServer; args: ConsumedArgs): CommandResult =
+  var line = ""
+  discard findMsg(args, ArgRest, line)
+  let parts = line.splitWhitespace()
+  let cw = worldOf(sender, server)
+  if cw == nil:
+    sendMessage(sender, colorNamed(text("No world"), ncRed))
+    return cmdSuccess(0'i32)
+  let found = worldByDim(cw.dimensionName)
+  if found.isNone:
+    sendMessage(sender, colorNamed(text("The body manager has not seen this world yet (no tick ran)."), ncRed))
+    return cmdSuccess(0'i32)
+  var ox = 0'i32
+  var oy = 0'i32
+  var oz = 0'i32
+  if sender.kind == cskPlayer and sender.player.entity != nil and closureSet(sender.player.entity.getPos):
+    let p = sender.player.entity.getPos()
+    ox = int32(floor(p.x))
+    oy = int32(floor(p.y))
+    oz = int32(floor(p.z))
+  elif closureSet(cw.getSpawnPoint):
+    let sp = cw.getSpawnPoint()
+    ox = sp.x
+    oy = sp.y
+    oz = sp.z
+  for l in createExec(found.get, ox, oy, oz, parts, bodyLastTick()):
+    sendMessage(sender, text(l))
+  cmdSuccess(1'i32)
+
+proc initCommandTree*(): CommandTree =
+  then(execute(newCommandTree(Names, Description), createCommand), execute(argument(ArgRest, newMsgArgConsumer()), createCommand))

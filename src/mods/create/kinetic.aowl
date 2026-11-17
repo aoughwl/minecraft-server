@@ -1,0 +1,371 @@
+## Create-style kinetic network model: PURE (no world, no entity, no body imports), so it compiles into tests, solver workers
+## and, later, a Jester client mod from the same source.
+##
+## MODEL
+##   A graph of components on an integer grid. Each component has PORTS; a port is a shaft end that points to one of the six
+##   neighbouring cells (direction index 0 +x, 1 -x, 2 +y, 3 -y, 4 +z, 5 -z, opposite = d xor 1, axis = d div 2) or the RIM
+##   (port 6, only cogwheels: the toothed edge that meshes with another cogwheel).
+##   Two ports are connected when
+##     * AXIAL: component A has port d and the component at A + dir(d) has port d xor 1. Same speed, same direction (ratio +1).
+##     * MESH: two cogwheels on the same axis whose rims touch (see `meshes`). speed_b = -speed_a * teeth_a / teeth_b.
+##   Inside a component, speed is carried from one port to another by `internalRatio` (shafts, cogwheels: +1; a gearbox is
+##   ENTRY RELATIVE: the port opposite the one the rotation entered through turns the same way, the others the opposite way;
+##   a clutch passes only while engaged; a gearshift reverses while engaged).
+##
+## UNITS (Create conventions, values are DEFAULTS in the descriptor table and meant to be data driven later)
+##   speed      rpm, signed: positive = counter-clockwise seen from the +axis end (right hand rule about the +axis direction of the
+##              component). Gears flip the sign across a mesh.
+##   stress     "su" (stress units). A consumer has an `impactPerRpm` (su at 1 rpm); its demand is impactPerRpm * |rpm|. A source has
+##              `capPerRpm` and offers capPerRpm * |rpm|. A network is OVERSTRESSED when the demand exceeds the capacity: it stops.
+##
+## SOLVER (`solve`)
+##   Breadth first search over (component, port) vertices, started at every source that is not already reached, in id order, so
+##   the result is deterministic. Every edge that closes a cycle, and every second source inside one network, is CHECKED against the
+##   speed that was already assigned: a mismatch (opposing rotation, a gear loop with an odd number of meshes, two motors at
+##   different speeds, a gear ratio that does not close) JAMS the whole network: speed 0, state `nsJammed`, a reason text.
+##   Then stress is summed and an overstressed network stops. Components no source reaches stay at 0 (`netId` -1).
+##
+## NOT HERE: belts and chains (a belt is a long edge with a ratio and a length), mechanical bearings' world side, fluids.
+
+import std/[math, tables]
+
+const
+  PortRim* = 6
+  PortCount* = 7
+  EpsRpm* = 1e-6
+  MaxRpm* = 256.0                     ## Create's speed cap
+
+type
+  KKind* = enum
+    kkShaft, kkCogSmall, kkCogLarge, kkGearbox, kkClutch, kkGearshift, kkSource, kkConsumer
+
+  KNode* = object
+    kind*: KKind
+    x*, y*, z*: int32
+    axis*: int                        ## 0 x, 1 y, 2 z: the axis of a shaft, cogwheel, clutch, gearshift; of a source or consumer
+                                      ## without `facing`
+    facing*: int                      ## source or consumer with ONE shaft end: its direction index (0..5); -1 = both ends of `axis`
+    genRpm*: float64                  ## source: the signed speed it forces on its port
+    capPerRpm*: float64               ## source: stress capacity per rpm
+    impactPerRpm*: float64            ## consumer: stress demand per rpm
+    engaged*: bool                    ## clutch: transmits; gearshift: reverses
+    tag*: int32                       ## caller's handle (a bearing's contraption id, a world position key); not used by the solver
+
+  NetState* = enum
+    nsIdle, nsRunning, nsJammed, nsOverstressed
+
+  NetInfo* = object
+    id*: int32
+    state*: NetState
+    reason*: string                   ## jam or overstress explanation
+    nodes*: seq[int32]
+    sources*, consumers*: int
+    capacity*, demand*: float64       ## su, computed at the speeds the network WOULD run at (also when overstressed)
+
+  KSolution* = object
+    speed*: seq[float64]              ## per node, rpm (0 when idle, jammed, overstressed); a gearbox reports its entry port speed
+    netId*: seq[int32]                ## per node, -1 = no source reaches it
+    nets*: seq[NetInfo]
+
+  Graph* = object
+    nodes*: seq[KNode]
+
+# ----------------------------------------------------------------------------------------------------------------------
+# descriptors and constructors
+
+proc dirDx*(d: int): int32 =
+  if d == 0: 1'i32 elif d == 1: -1'i32 else: 0'i32
+proc dirDy*(d: int): int32 =
+  if d == 2: 1'i32 elif d == 3: -1'i32 else: 0'i32
+proc dirDz*(d: int): int32 =
+  if d == 4: 1'i32 elif d == 5: -1'i32 else: 0'i32
+
+proc teeth*(k: KKind): int =
+  ## Gear teeth of a cogwheel (the mesh ratio); 0 for everything else. Create: small 8, large 16.
+  case k
+  of kkCogSmall: 8
+  of kkCogLarge: 16
+  else: 0
+
+proc mkNode(kind: KKind; x, y, z: int32; axis: int): KNode =
+  KNode(kind: kind, x: x, y: y, z: z, axis: axis, facing: -1, genRpm: 0.0, capPerRpm: 0.0, impactPerRpm: 0.0, engaged: true, tag: 0'i32)
+
+proc shaft*(x, y, z: int32; axis: int): KNode = mkNode(kkShaft, x, y, z, axis)
+proc cogSmall*(x, y, z: int32; axis: int): KNode = mkNode(kkCogSmall, x, y, z, axis)
+proc cogLarge*(x, y, z: int32; axis: int): KNode = mkNode(kkCogLarge, x, y, z, axis)
+proc gearbox*(x, y, z: int32): KNode = mkNode(kkGearbox, x, y, z, 1)
+proc clutch*(x, y, z: int32; axis: int; engaged: bool): KNode =
+  result = mkNode(kkClutch, x, y, z, axis)
+  result.engaged = engaged
+proc gearshift*(x, y, z: int32; axis: int; reversed: bool): KNode =
+  result = mkNode(kkGearshift, x, y, z, axis)
+  result.engaged = reversed
+
+proc source*(x, y, z: int32; facing: int; rpm, capPerRpm: float64): KNode =
+  ## A motor or wheel with one shaft end pointing at `facing`, forcing `rpm` (signed) on it.
+  result = mkNode(kkSource, x, y, z, facing div 2)
+  result.facing = facing
+  result.genRpm = rpm
+  result.capPerRpm = capPerRpm
+
+proc consumer*(x, y, z: int32; facing: int; axis: int; impactPerRpm: float64): KNode =
+  ## A machine. `facing` >= 0: one shaft end; -1: a through shaft along `axis`.
+  result = mkNode(kkConsumer, x, y, z, (if facing >= 0: facing div 2 else: axis))
+  result.facing = facing
+  result.impactPerRpm = impactPerRpm
+
+# Default Create-like numbers. From memory of the mod's config (UNVERIFIED against the jar, see docs/CREATE_PORT.md); every caller can
+# set the fields itself, these are only the defaults of the debug commands.
+const
+  CapPerRpmCreativeMotor* = 16384.0 / 256.0
+  CapPerRpmWaterWheel* = 32.0         ## a water wheel makes 8 rpm and about 256 su
+  ImpactMechanicalPress* = 8.0
+  ImpactMechanicalMixer* = 4.0
+  ImpactBearing* = 4.0
+  ImpactDrill* = 4.0
+
+proc newGraph*(): Graph = Graph(nodes: @[])
+
+proc add*(g: var Graph; n: KNode): int32 =
+  g.nodes.add n
+  int32(g.nodes.len - 1)
+
+# ----------------------------------------------------------------------------------------------------------------------
+# ports and connections
+
+proc hasPort*(n: KNode; p: int): bool =
+  ## Does the component expose a shaft end (or the rim) at port p?
+  if p == PortRim:
+    return n.kind == kkCogSmall or n.kind == kkCogLarge
+  if p < 0 or p > 5:
+    return false
+  case n.kind
+  of kkGearbox: true
+  of kkSource, kkConsumer:
+    if n.facing >= 0: p == n.facing else: p div 2 == n.axis
+  else: p div 2 == n.axis
+
+proc internalRatio*(n: KNode; entry, outp: int; ratio: var float64): bool =
+  ## Rotation entering at `entry` leaves at `outp` multiplied by `ratio`; false: the component does not connect the two.
+  if entry == outp:
+    ratio = 1.0
+    return true
+  case n.kind
+  of kkGearbox:
+    if outp == PortRim or entry == PortRim:
+      return false
+    ratio = (if outp == (entry xor 1): 1.0 else: -1.0)
+    return true
+  of kkClutch:
+    ratio = 1.0
+    return n.engaged
+  of kkGearshift:
+    ratio = (if n.engaged: -1.0 else: 1.0)
+    return true
+  else:
+    ratio = 1.0
+    return true
+
+proc meshes*(a, b: KNode; ratio: var float64): bool =
+  ## Rim to rim connection. `ratio` = speed_b / speed_a.
+  ## Small to small: same axis, orthogonally adjacent in the plane. Small to large: same axis, DIAGONALLY adjacent in the plane (Create's
+  ## `isLargeToSmallCog`). Large to large: not modelled (Create meshes those across perpendicular axes; UNVERIFIED, see CREATE_PORT.md).
+  let ta = teeth(a.kind)
+  let tb = teeth(b.kind)
+  if ta == 0 or tb == 0 or a.axis != b.axis:
+    return false
+  let d = [b.x - a.x, b.y - a.y, b.z - a.z]
+  if d[a.axis] != 0:
+    return false
+  var planar = 0
+  for i in 0 ..< 3:
+    if i != a.axis:
+      planar += abs(int(d[i]))
+  var ok = false
+  if ta == tb:
+    ok = ta == 8 and planar == 1
+  else:
+    # both non-axis components are +-1
+    ok = true
+    for i in 0 ..< 3:
+      if i != a.axis and abs(int(d[i])) != 1:
+        ok = false
+  if not ok:
+    return false
+  ratio = -float64(ta) / float64(tb)
+  true
+
+# ----------------------------------------------------------------------------------------------------------------------
+# solving
+
+type
+  Edge = object
+    toNode: int32
+    toPort: int
+    ratio: float64
+
+  Ctx = ref object
+    ## solver state, one record so no closure is needed
+    seen: seq[bool]
+    speed: seq[float64]
+    entry: seq[int]                   ## first port a rotation entered each node through
+    entrySpeed: seq[float64]
+    queue: seq[int]
+    netId: seq[int32]
+    members: seq[int32]
+    nid: int32
+
+proc eqRpm(a, b: float64): bool =
+  abs(a - b) <= EpsRpm * (1.0 + abs(a) + abs(b))
+
+proc posKey(x, y, z: int32): int64 =
+  ((int64(x) + 2000000'i64) shl 42) xor ((int64(y) + 2000000'i64) shl 21) xor (int64(z) + 2000000'i64)
+
+proc buildEdges(g: Graph): seq[seq[Edge]] =
+  ## adjacency per vertex (node * PortCount + port).
+  result = newSeq[seq[Edge]](g.nodes.len * PortCount)
+  var at = initTable[int64, int32]()
+  for i in 0 ..< g.nodes.len:
+    let k = posKey(g.nodes[i].x, g.nodes[i].y, g.nodes[i].z)
+    if not at.hasKey(k):
+      at[k] = int32(i)                # two nodes in one cell: the first wins
+  for ni in 0 ..< g.nodes.len:
+    let n = g.nodes[ni]
+    for p in 0 ..< 6:
+      if not hasPort(n, p):
+        continue
+      let o = at.getOrDefault(posKey(n.x + dirDx(p), n.y + dirDy(p), n.z + dirDz(p)), -1'i32)
+      if o >= 0 and hasPort(g.nodes[int(o)], p xor 1):
+        result[ni * PortCount + p].add Edge(toNode: o, toPort: p xor 1, ratio: 1.0)
+    if hasPort(n, PortRim):
+      var u = 0
+      var v = 1
+      if n.axis == 0:
+        u = 1
+        v = 2
+      elif n.axis == 1:
+        u = 0
+        v = 2
+      for du in -1 .. 1:
+        for dv in -1 .. 1:
+          if du == 0 and dv == 0:
+            continue
+          var d = [0'i32, 0'i32, 0'i32]
+          d[u] = int32(du)
+          d[v] = int32(dv)
+          let o = at.getOrDefault(posKey(n.x + d[0], n.y + d[1], n.z + d[2]), -1'i32)
+          if o >= 0:
+            var r = 0.0
+            if meshes(n, g.nodes[int(o)], r):
+              result[ni * PortCount + PortRim].add Edge(toNode: o, toPort: PortRim, ratio: r)
+
+proc visit(c: Ctx; node, port: int; speed: float64) =
+  c.seen[node * PortCount + port] = true
+  c.speed[node * PortCount + port] = speed
+  if c.entry[node] < 0:
+    c.entry[node] = port
+    c.entrySpeed[node] = speed
+    c.netId[node] = c.nid
+    c.members.add int32(node)
+  c.queue.add node * PortCount + port
+
+proc clampRpm(v: float64): float64 =
+  if v > MaxRpm: MaxRpm elif v < -MaxRpm: -MaxRpm else: v
+
+proc solve*(g: Graph): KSolution =
+  let nn = g.nodes.len
+  result = KSolution(speed: newSeq[float64](nn), netId: newSeq[int32](nn), nets: @[])
+  let edges = buildEdges(g)
+  let c = Ctx(seen: newSeq[bool](nn * PortCount), speed: newSeq[float64](nn * PortCount), entry: newSeq[int](nn),
+    entrySpeed: newSeq[float64](nn), queue: @[], netId: newSeq[int32](nn), members: @[], nid: 0'i32)
+  for i in 0 ..< nn:
+    c.entry[i] = -1
+    c.netId[i] = -1'i32
+  for si in 0 ..< nn:
+    let sn = g.nodes[si]
+    if sn.kind != kkSource:
+      continue
+    let sp = (if sn.facing >= 0: sn.facing else: sn.axis * 2)
+    if c.seen[si * PortCount + sp]:
+      continue
+    c.nid = int32(result.nets.len)
+    c.members = @[]
+    c.queue = @[]
+    var qh = 0
+    var jam = ""
+    visit(c, si, sp, clampRpm(sn.genRpm))
+    while qh < c.queue.len:
+      let vtx = c.queue[qh]
+      inc qh
+      let node = vtx div PortCount
+      let port = vtx mod PortCount
+      let s = c.speed[vtx]
+      let n = g.nodes[node]
+      if n.kind == kkSource and not eqRpm(clampRpm(n.genRpm), s) and jam.len == 0:
+        jam = "source at " & $n.x & " " & $n.y & " " & $n.z & " forces " & $clampRpm(n.genRpm) & " rpm but the network turns it at " & $s
+      # inside the component; a gearbox measures from the port the rotation entered first
+      let base = (if n.kind == kkGearbox: c.entry[node] else: port)
+      let baseSpeed = (if n.kind == kkGearbox: c.entrySpeed[node] else: s)
+      for q in 0 ..< PortCount:
+        if q == port or not hasPort(n, q):
+          continue
+        var r = 1.0
+        if not internalRatio(n, base, q, r):
+          continue
+        let s2 = baseSpeed * r
+        if c.seen[node * PortCount + q]:
+          if not eqRpm(c.speed[node * PortCount + q], s2) and jam.len == 0:
+            jam = "component at " & $n.x & " " & $n.y & " " & $n.z & " would turn two ways (" & $c.speed[node * PortCount + q] & " and " & $s2 & " rpm)"
+        else:
+          visit(c, node, q, s2)
+      # across the links
+      for e in edges[vtx]:
+        let s3 = s * e.ratio
+        let w = int(e.toNode) * PortCount + e.toPort
+        if c.seen[w]:
+          if not eqRpm(c.speed[w], s3) and jam.len == 0:
+            let o = g.nodes[int(e.toNode)]
+            jam = "links at " & $n.x & " " & $n.y & " " & $n.z & " and " & $o.x & " " & $o.y & " " & $o.z & " demand " & $c.speed[w] & " and " & $s3 & " rpm"
+        else:
+          visit(c, int(e.toNode), e.toPort, s3)
+    var net = NetInfo(id: c.nid, state: nsRunning, reason: "", nodes: c.members, sources: 0, consumers: 0)
+    for ni in net.nodes:
+      let nd = g.nodes[int(ni)]
+      let sp2 = abs(c.entrySpeed[int(ni)])
+      if nd.kind == kkSource:
+        inc net.sources
+        net.capacity += nd.capPerRpm * sp2
+      elif nd.kind == kkConsumer:
+        inc net.consumers
+        net.demand += nd.impactPerRpm * sp2
+    if jam.len > 0:
+      net.state = nsJammed
+      net.reason = jam
+    elif net.demand > net.capacity * (1.0 + 1e-9) + 1e-9:
+      net.state = nsOverstressed
+      net.reason = "stress " & $net.demand & " su exceeds capacity " & $net.capacity & " su"
+    if net.state == nsRunning:
+      for ni in net.nodes:
+        result.speed[int(ni)] = c.entrySpeed[int(ni)]
+    result.nets.add net
+  result.netId = c.netId
+
+proc netOf*(sol: KSolution; node: int32): NetInfo =
+  ## The network info of a node (a default `nsIdle` record with id -1 when no source reaches it).
+  let id = sol.netId[int(node)]
+  if id < 0:
+    return NetInfo(id: -1, state: nsIdle, reason: "no source", nodes: @[])
+  sol.nets[int(id)]
+
+proc stateName*(s: NetState): string =
+  case s
+  of nsIdle: "idle"
+  of nsRunning: "running"
+  of nsJammed: "jammed"
+  of nsOverstressed: "overstressed"
+
+const TwoPi* = 6.283185307179586
+
+proc rpmToRadPerTick*(rpm: float64): float64 =
+  ## 20 ticks per second: rpm * 2 pi / 60 / 20.
+  rpm * TwoPi / 1200.0
