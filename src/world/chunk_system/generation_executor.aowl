@@ -43,6 +43,7 @@ type
     pos: ChunkPos
     cache: Cache
     stage: StagedChunkEnum
+    owner: GenerationExecutor  ## The handle its result goes back to (see `pool`).
 
   WorkerThread = ref object
     t: RawThread
@@ -58,6 +59,9 @@ type
     stopping: bool
     threads: seq[WorkerThread]
     inFlight*: int           ## Submitted to a worker and not yet handed back by `pollCompleted`. Tick thread only.
+    pool: GenerationExecutor ## nil for the pool itself. Every level's schedule gets its own handle on the shared pool, with
+                             ## its own result queue and in-flight count: results must go back to the schedule (the
+                             ## dimension) whose chunks they hold, never to another one's.
     stageUs: array[16, int64]
     stageN: array[16, int64]
     inlineUs: array[16, int64]
@@ -91,6 +95,7 @@ proc workerMain(arg: pointer) {.nimcall.} =
       release(ex.lock)
       return
     job = ex.jobs[ex.jobHead]
+    let owner = job.owner
     ex.jobs[ex.jobHead] = GenJob()
     inc ex.jobHead
     if ex.jobHead == ex.jobs.len:
@@ -103,7 +108,7 @@ proc workerMain(arg: pointer) {.nimcall.} =
     let us = (getTime() - t0).inMicroseconds
     job = GenJob()
     acquire(ex.lock)
-    ex.done.add(r)
+    owner.done.add(r)
     ex.stageUs[stage] += us
     ex.stageN[stage] += 1
     release(ex.lock)
@@ -147,8 +152,9 @@ proc defaultAsyncMask(): int =
   m
 
 proc sharedExecutor*(): GenerationExecutor =
-  ## The process's one executor, made on first use from the environment; every level's schedule shares its workers. With
-  ## no workers configured it runs everything inline.
+  ## A handle on the process's one worker pool (made on first use from the environment); every level's schedule shares the
+  ## workers but has a handle of its own, so each gets back only its own results. With no workers configured it runs
+  ## everything inline.
   if gExec == nil:
     let n = envInt("MC_CHUNK_WORKERS", 0)
     let mask = envInt("MC_CHUNK_ASYNC_MASK", defaultAsyncMask())
@@ -157,7 +163,12 @@ proc sharedExecutor*(): GenerationExecutor =
       startWorkers(ex)
     else:
       gExec = ex
-  gExec
+  let pool = gExec
+  GenerationExecutor(workers: pool.workers, mask: pool.mask, jobs: @[], done: @[], inFlight: 0, pool: pool,
+    lastStats: pool.lastStats, stats: pool.stats)
+
+proc poolOf(ex: GenerationExecutor): GenerationExecutor =
+  if ex.pool != nil: ex.pool else: ex
 
 proc isAsync*(ex: GenerationExecutor, stage: StagedChunkEnum): bool =
   ex.workers > 0 and ((ex.mask shr ord(stage)) and 1) == 1
@@ -166,19 +177,21 @@ proc submit*(ex: GenerationExecutor, host: ScheduleHost, pos: ChunkPos, cache: C
              sink: var seq[RecvChunk]) =
   ## Inline stages append their result to `sink` (the schedule's `recvChunk`); offloaded ones to the done queue.
   if not isAsync(ex, stage):
-    if ex.stats:
+    let sp = poolOf(ex)
+    if sp.stats:
       let t0 = getTime()
       sink.add(runGeneration(host, pos, cache, stage))
-      ex.inlineUs[ord(stage)] += (getTime() - t0).inMicroseconds
-      ex.stageN[ord(stage)] += 1
+      sp.inlineUs[ord(stage)] += (getTime() - t0).inMicroseconds
+      sp.stageN[ord(stage)] += 1
     else:
       sink.add(runGeneration(host, pos, cache, stage))
     return
-  acquire(ex.lock)
-  ex.jobs.add(GenJob(host: host, pos: pos, cache: cache, stage: stage))
-  release(ex.lock)
+  let p = poolOf(ex)
+  acquire(p.lock)
+  p.jobs.add(GenJob(host: host, pos: pos, cache: cache, stage: stage, owner: ex))
+  release(p.lock)
   inc ex.inFlight
-  signal(ex.wake)
+  signal(p.wake)
 
 proc printStats(ex: GenerationExecutor) =
   acquire(ex.lock)
@@ -192,17 +205,18 @@ proc printStats(ex: GenerationExecutor) =
 
 proc pollCompleted*(ex: GenerationExecutor, sink: var seq[RecvChunk]): int =
   ## Moves every finished worker result into `sink`; how many.
-  if ex.stats and (getTime() - ex.lastStats).inSeconds >= 10:
-    ex.lastStats = getTime()
-    printStats(ex)
+  let p = poolOf(ex)
+  if p.stats and (getTime() - p.lastStats).inSeconds >= 10:
+    p.lastStats = getTime()
+    printStats(p)
   if ex.workers == 0 or ex.inFlight == 0:
     return 0
-  acquire(ex.lock)
+  acquire(p.lock)
   result = ex.done.len
   for i in 0 ..< ex.done.len:
     sink.add(ex.done[i])
   ex.done.setLen(0)
-  release(ex.lock)
+  release(p.lock)
   ex.inFlight -= result
 
 proc waitCompleted*(ex: GenerationExecutor, ms: int) =
@@ -210,8 +224,8 @@ proc waitCompleted*(ex: GenerationExecutor, ms: int) =
   sleepWin(uint32(ms))
 
 proc shutdown*(ex: GenerationExecutor) =
-  ## Stops the workers once their queue is empty. Joins them.
-  if ex.workers == 0 or ex.threads.len == 0:
+  ## Stops the workers once their queue is empty. Joins them. Only the pool itself (not a handle) can be shut down.
+  if ex.pool != nil or ex.workers == 0 or ex.threads.len == 0:
     return
   acquire(ex.lock)
   ex.stopping = true
