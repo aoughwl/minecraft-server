@@ -17,6 +17,7 @@ Every section starts with its status.
 | Mod sync (`jester-mods.json`, MANIFEST/STATUS, hold the join) | **real** |
 | Body stream and fx: the message encoders and decoders | **real** (`src/server/net/jester/{bodymsg,fxmsg}.aowl`); nothing sends them yet |
 | Bodies as entities, fx sending | **planned** |
+| Distant-terrain summaries (`jester:lod`, capability `lod`) | **real** (`src/server/net/jester/lodsync.aowl`, section 11) |
 | Custom blocks, items, entities, registries | **planned**, design in `docs/REGISTRIES.md` |
 | Threads and a job system for mods | **planned** |
 
@@ -80,7 +81,7 @@ registerEvent(windFor)
 
 JavaScript: `server.advertiseCapability("wind")`, `player.hasCapability("wind")`, `player.jesterVersion()`.
 
-Names: `physics2`, `wind`, `bodystream`, `modsync`, `fx`, `materials`, `cui`. `physics2` is dropped unless `bodystream` and `fx` are granted too;
+Names: `physics2`, `wind`, `bodystream`, `modsync`, `fx`, `materials`, `cui`, `lod`. `physics2` is dropped unless `bodystream` and `fx` are granted too;
 `bodystream` is dropped for a client whose frame limit is under 16 000. `hasCapability` is false for a player who never said hello. A
 `jester:hello` sent again in play re-negotiates (the result replaces the earlier one).
 
@@ -230,3 +231,27 @@ cause). Undo keeps the pre-edit section snapshot, so it restores block states an
 `src/physics/fluids.aowl` (pure conserved-volume model) + `src/server/fluids/` (host, `/fluids on|off|status`, op level 3): water and lava as a volume per
 cell, pressure-style flow, a per-tick cell budget, every change written through `bulkedit.writeCells`. Off = vanilla, untouched. See docs/FLUIDS.md
 (also the level 1, client-only visual version).
+
+## 11. Distant-terrain summaries: `jester:lod` (real, built in)
+
+A client that offers the `lod` capability (bit 7) gets, for every chunk column past its view distance out to a radius, a summary: per
+4 x 4 cell the top block's y and state, the water depth over the floor and the floor block, and the biome (wire format: overnight/PROTOCOL.md
+section 10, `src/server/net/jester/lodmsg.aowl`). Nearest ring first, packed under the client's `max_frame`. A vanilla client never sees it.
+
+Sources, cheapest data first: the shared cache; a chunk the level holds (exact, `summarizeChunk`); otherwise the noise stage only
+(`src/world/generation/lodsummary.aowl` `summarizeNoise`: corner densities, aquifer and cell caches walked top down to the first block, no
+surface rules, carvers or features; the dry-land top is guessed from the biome). Noise summaries run on the chunk worker pool's low-priority
+lane (`generation_executor.submitLod`: a worker takes one only when no generation job waits), or inline within `MC_LOD_INLINE_MS` a tick
+when there are no workers.
+
+The client's FLOW word (voxel's load gate: hold while the near terrain loads, go once it is drawn) pauses that client's summaries and is
+the pre-generator's go/hold word too, so `/pregen` is throttled by a remote client without the signal file.
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `MC_LOD_RADIUS` | 64 | chunks covered (at most 128; 0 turns the channel off and stops advertising `lod`) |
+| `MC_LOD_COLUMNS_PER_TICK` | 64 | columns sent to one player per tick |
+| `MC_LOD_INFLIGHT` | 2 per worker, at least 4 | noise jobs on the pool at once |
+| `MC_LOD_INLINE_MS` | 3 | tick-thread allowance for noise summaries when the pool has no workers |
+
+Test: `sh tools/run_scenarios.sh <exe> lod_summaries` (`LOD_TEST_RADIUS`, default 24).

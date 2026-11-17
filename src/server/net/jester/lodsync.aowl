@@ -1,0 +1,344 @@
+## The server end of `jester:lod` (overnight/PROTOCOL.md section 10, lodmsg.aowl): distant-terrain summaries for every column past a
+## player's view distance out to a radius, sent only to clients whose Jester handshake granted `lod`. A vanilla client never hears of it.
+##
+## Order and cost: per player a cursor walks the chunk offsets ring by ring (nearest first) from just inside the view distance. A column
+## is answered from the shared cache, else from the chunk if the level holds it (exact, on this thread, `summarizeChunk`), else from the
+## noise stage on the chunk worker pool's low-priority lane (`summarizeNoise`; a worker takes one only when the chunk system has
+## nothing waiting). Without workers the noise summaries run here, inside `MC_LOD_INLINE_MS` a tick. At most `MC_LOD_COLUMNS_PER_TICK`
+## columns a tick go to a player, packed into frames under the negotiated `max_frame`; at most `MC_LOD_INFLIGHT` jobs are out.
+##
+## Flow: the client's FLOW word (voxel's load gate: hold while the near terrain loads, go once it is drawn) holds its summaries, and is
+## handed to the pre-generator as its go/hold word (`setRemoteWord`) - the client throttling of the old Fabric setup, over the wire
+## instead of a file. A hold older than `HoldLimitTicks` is ignored (a client that never says go again does not starve itself).
+##
+## Configuration (environment): `MC_LOD_RADIUS` (chunks, default 64, at most 128; 0 turns the channel and the capability off),
+## `MC_LOD_COLUMNS_PER_TICK` (default 64), `MC_LOD_INFLIGHT` (default 2 per worker, at least 4), `MC_LOD_INLINE_MS` (default 3).
+## A client may ask for less (REQUEST radius, cell shift), never for more.
+
+import std/[envvars, tables, sets, math, times, syncio]
+import lodmsg
+import ../../serverbase
+import ../../entity/playerextras
+import ../../pregen/pregen
+import ../../../plugin/payloads
+import ../../../world/level
+import ../../../world/chunkdata
+import ../../../world/chunk_system/chunk_system
+import ../../../world/chunk_system/generation_executor
+import ../../../world/generation/lodsummary
+import ../../../world/generation/generator/generator
+import ../../../generated/chunk_status
+import ../../../generated/block_state_remap
+
+const
+  CapLod* = 7
+  ScanWindow = 2048         ## offsets past the cursor a tick may look at
+  HoldLimitTicks = 2400     ## 2 min
+  CacheLimit = 262144
+  StartTicks = 100          ## a capable client that never says REQUEST or FLOW gets summaries after 5 s
+
+type
+  LodPeer = object
+    name: string
+    dim: string
+    radius: int
+    shift: int
+    held: bool
+    heldAt: int64
+    seenAt: int64
+    started: bool
+    sent: HashSet[int64]
+    cursor: int
+    cx, cz: int32
+    vd: int
+    total: int
+
+  LodStats* = object
+    sent*, fromCache*, fromChunk*, fromNoise*, inline*, jobs*: int
+    jobMicros*: int64
+
+var
+  gLodInit = false
+  gLodRadius = 64
+  gLodPerTick = 64
+  gLodInflight = 8
+  gLodInlineMs = 3
+  gOffX: seq[int32] = @[]
+  gOffZ: seq[int32] = @[]
+  gRingStart: seq[int] = @[]          ## first offset of ring r (r = floor(sqrt(dx^2 + dz^2)))
+  gPeers: seq[LodPeer] = @[]
+  gCache = initTable[(int, int64), LodColumn]()   ## (dimension slot * 8 + shift, chunk key)
+  gPending = initHashSet[(int, int64)]()
+  gDims: seq[string] = @[]
+  gOut = 0                             ## jobs on the pool
+  gStats*: LodStats
+
+proc envNum(name: string; default: int): int =
+  let raw = getEnv(name)
+  if raw.len == 0: return default
+  var v = 0
+  for ch in raw:
+    if ch < '0' or ch > '9': return default
+    v = v * 10 + (ord(ch) - ord('0'))
+  v
+
+proc buildOffsets() =
+  ## Every offset within LodRadiusMax, grouped by ring.
+  let r = LodRadiusMax
+  var rings: seq[seq[(int32, int32)]] = newSeq[seq[(int32, int32)]](r + 2)
+  for dz in -r .. r:
+    for dx in -r .. r:
+      let ring = int(sqrt(float64(dx * dx + dz * dz)))
+      if ring <= r: rings[ring].add((int32(dx), int32(dz)))
+  gRingStart = newSeq[int](rings.len + 1)
+  for ring in 0 ..< rings.len:
+    gRingStart[ring] = gOffX.len
+    for o in rings[ring]:
+      gOffX.add o[0]
+      gOffZ.add o[1]
+  gRingStart[rings.len] = gOffX.len
+
+proc lodSyncInit*() =
+  ## Reads the configuration and advertises `lod` (once; the tick calls it).
+  if gLodInit: return
+  gLodInit = true
+  gLodRadius = max(0, min(envNum("MC_LOD_RADIUS", 64), LodRadiusMax))
+  gLodPerTick = max(1, envNum("MC_LOD_COLUMNS_PER_TICK", 64))
+  gLodInlineMs = envNum("MC_LOD_INLINE_MS", 3)
+  if gLodRadius > 0:
+    buildOffsets()
+    advertiseCapabilityBit(CapLod)
+    echo "[lod] distant-terrain summaries to radius ", gLodRadius, " chunks (jester:lod)"
+
+proc lodRadius*(): int = gLodRadius
+
+proc dimSlot(name: string): int =
+  for i in 0 ..< gDims.len:
+    if gDims[i] == name: return i
+  gDims.add name
+  gDims.len - 1
+
+proc peerIndex(name: string): int =
+  result = -1
+  for i in 0 ..< gPeers.len:
+    if gPeers[i].name == name: return i
+
+proc newPeer(name: string; tick: int64): LodPeer =
+  LodPeer(name: name, dim: "", radius: gLodRadius, shift: LodShiftDefault, held: false, heldAt: 0'i64, seenAt: tick,
+    started: false, sent: initHashSet[int64](), cursor: 0, cx: 0'i32, cz: 0'i32, vd: 0, total: 0)
+
+proc applyInbox(tick: int64) =
+  let items = lodInboxDrain()
+  for k in 0 ..< items.len:
+    let who = items[k][0]
+    let m = decodeLodClient(items[k][1])
+    if m.kind == 0: continue
+    var at = peerIndex(who)
+    if at < 0:
+      gPeers.add newPeer(who, tick)
+      at = gPeers.len - 1
+    if m.kind == LodRequest:
+      gPeers[at].radius = min(m.radius, gLodRadius)
+      if m.shift != gPeers[at].shift or m.resend:
+        gPeers[at].sent = initHashSet[int64]()
+      gPeers[at].shift = m.shift
+      gPeers[at].cursor = 0
+      gPeers[at].dim = ""          # the answer is an INIT
+      gPeers[at].started = true
+    else:
+      gPeers[at].held = not m.go
+      gPeers[at].heldAt = tick
+      gPeers[at].started = true
+      setRemoteWord(if m.go: "go" else: "hold")
+
+proc cacheKey(dim, shift: int): int = dim * 8 + shift
+
+proc remember(dim: int; c: LodColumn) =
+  if gCache.len >= CacheLimit: gCache.clear()
+  gCache[(cacheKey(dim, c.shift), chunkKey(c.cx, c.cz))] = c
+
+proc collect(world: serverbase.World) =
+  let l = world.level
+  if l == nil or l.schedule == nil: return
+  var done: seq[LodJob] = @[]
+  discard pollLodCompleted(l.schedule.executor, done)
+  for j in done:
+    dec gOut
+    gPending.excl((cacheKey(j.dim, j.shift), chunkKey(j.cx, j.cz)))
+    remember(j.dim, j.column)
+    inc gStats.fromNoise
+    gStats.jobMicros += j.micros
+
+proc fullChunk(l: level.Level; cx, cz: int32): ChunkData =
+  let c = l.loadedChunks.getOrDefault(chunkKey(cx, cz), nil)
+  if c != nil and c.status == csFull: c else: nil
+
+type Budget = object
+  start: Time
+  allowUs: int64
+  inlineOn: bool
+
+proc summaryFor(world: serverbase.World; dim, shift: int; cx, cz: int32; budget: var Budget; found: var bool): LodColumn =
+  ## The column's summary if it can be had now; otherwise a job may be started for it and `found` is false.
+  found = false
+  result = LodColumn(cx: cx, cz: cz, shift: shift, source: 0, cells: @[])
+  let key = (cacheKey(dim, shift), chunkKey(cx, cz))
+  let l = world.level
+  # a held chunk first (exact, and newer than a noise summary cached before it was generated); not cached: it may change
+  let held = fullChunk(l, cx, cz)
+  if held != nil:
+    result = summarizeChunk(held, shift)
+    found = true
+    inc gStats.fromChunk
+    return
+  if gCache.hasKey(key):
+    found = true
+    inc gStats.fromCache
+    return gCache.getOrDefault(key, result)
+  if l.isFlat:
+    result = summarizeFlat(l.flatLayers, int32(world.dimension.minY), 0, cx, cz, shift)
+    remember(dim, result)
+    found = true
+    return
+  if l.worldGen == nil or l.worldGen.kind != WorldGeneratorKind.Noise or l.schedule == nil: return
+  if gPending.contains(key): return
+  let job = LodJob(gen: l.worldGen.noise, dim: dim, cx: cx, cz: cz, shift: shift)
+  if lodWorkers(l.schedule.executor) > 0:
+    let cap = max(4, envNum("MC_LOD_INFLIGHT", 2 * lodWorkers(l.schedule.executor)))
+    if gOut >= cap: return
+    if submitLod(l.schedule.executor, job):
+      inc gOut
+      inc gStats.jobs
+      gPending.incl key
+    return
+  # no workers: the noise summary runs here, within the tick's allowance
+  if not budget.inlineOn or (getTime() - budget.start).inMicroseconds >= budget.allowUs: return
+  runLodJob(job)
+  inc gStats.inline
+  inc gStats.fromNoise
+  remember(dim, job.column)
+  found = true
+  job.column
+
+proc sendInit(p: serverbase.Player; world: serverbase.World; peer: LodPeer) =
+  var sea = 63
+  let l = world.level
+  if l.worldGen != nil and l.worldGen.kind == WorldGeneratorKind.Noise:
+    sea = int(l.worldGen.noise.settings.seaLevel)
+  let m = LodInitMsg(version: LodVersion, dimension: world.dimension.minecraftName, radius: peer.radius, shift: peer.shift,
+    minY: int(world.dimension.minY), height: int(world.dimension.height), seaLevel: sea)
+  p.sendCustomPayload(LodChannel, encodeLodInit(m))
+
+proc forClient(p: serverbase.Player; c: LodColumn): LodColumn =
+  ## The column with its states as this client's protocol version numbers them (what chunk packets do).
+  result = c
+  let v = p.client.version
+  for i in 0 ..< result.cells.len:
+    result.cells[i].state = uint32(remapBlockStateForVersion(uint16(result.cells[i].state), v))
+    if result.cells[i].depth > 0'i32:
+      result.cells[i].floor = uint32(remapBlockStateForVersion(uint16(result.cells[i].floor), v))
+
+proc flush(p: serverbase.Player; shift: int; bodies: var seq[seq[byte]]; size: var int) =
+  if bodies.len == 0: return
+  p.sendCustomPayload(LodChannel, encodeLodColumns(shift, bodies))
+  bodies = @[]
+  size = 0
+
+proc servePeer(p: serverbase.Player; world: serverbase.World; peer: var LodPeer; budget: var Budget) =
+  let dim = dimSlot(world.dimension.minecraftName)
+  let center = p.watchedSection.center
+  let vd = int(p.watchedSection.viewDistance)
+  if center.x != peer.cx or center.y != peer.cz or vd != peer.vd:
+    peer.cx = center.x
+    peer.cz = center.y
+    peer.vd = vd
+    peer.cursor = 0
+    # forget what was sent far away (a long walk would grow the set without bound)
+    if peer.sent.len > 4 * gRingStart[min(peer.radius + 1, gRingStart.len - 1)]:
+      var kept = initHashSet[int64]()
+      let lim = int64(peer.radius + 8) * int64(peer.radius + 8)
+      for k in peer.sent:
+        let dx = int64(int32(k shr 32)) - int64(peer.cx)
+        let dz = int64(cast[int32](uint32(cast[uint64](k) and 0xFFFFFFFF'u64))) - int64(peer.cz)
+        if dx * dx + dz * dz <= lim: kept.incl k
+      peer.sent = kept
+  if peer.radius <= 0 or vd >= peer.radius: return
+  let first = gRingStart[max(0, min(vd - 1, gRingStart.len - 1))]
+  let last = gRingStart[min(peer.radius + 1, gRingStart.len - 1)]
+  if peer.cursor < first: peer.cursor = first
+  let frame = max(JesterFrameFloor, jesterClientOf(peer.name).maxFrame) - 64
+  var bodies: seq[seq[byte]] = @[]
+  var size = 8
+  var sentNow = 0
+  var i = peer.cursor
+  var cursorFree = true
+  while i < last and i < peer.cursor + ScanWindow and sentNow < gLodPerTick:
+    let cx = peer.cx + gOffX[i]
+    let cz = peer.cz + gOffZ[i]
+    let key = chunkKey(cx, cz)
+    if peer.sent.contains(key):
+      if cursorFree: peer.cursor = i + 1
+      inc i
+      continue
+    var found = false
+    let col = summaryFor(world, dim, peer.shift, cx, cz, budget, found)
+    if found:
+      var body: seq[byte] = @[]
+      encodeLodColumn(body, forClient(p, col))
+      if size + body.len > frame: flush(p, peer.shift, bodies, size)
+      size += body.len
+      bodies.add body
+      peer.sent.incl key
+      inc sentNow
+      inc peer.total
+      inc gStats.sent
+      if cursorFree: peer.cursor = i + 1
+    else:
+      cursorFree = false
+    inc i
+  flush(p, peer.shift, bodies, size)
+
+proc tickLodSync*(server: Server; tick: int64) =
+  lodSyncInit()
+  if gLodRadius <= 0: return
+  applyInbox(tick)
+  for world in server.worlds:
+    collect(world)
+  var budget = Budget(inlineOn: gLodInlineMs > 0, start: getTime(), allowUs: int64(gLodInlineMs) * 1000'i64)
+  var seen: seq[string] = @[]
+  for world in server.worlds:
+    for p in world.players:
+      let name = p.gameprofile.name
+      if not playerHasCapability(name, "lod"): continue
+      seen.add name
+      var at = peerIndex(name)
+      if at < 0:
+        gPeers.add newPeer(name, tick)
+        at = gPeers.len - 1
+      if not gPeers[at].started:
+        if tick - gPeers[at].seenAt < int64(StartTicks): continue
+        gPeers[at].started = true
+      let dim = world.dimension.minecraftName
+      if gPeers[at].dim != dim:
+        gPeers[at].dim = dim
+        gPeers[at].sent = initHashSet[int64]()
+        gPeers[at].cursor = 0
+        gPeers[at].vd = -1
+        sendInit(p, world, gPeers[at])
+      if gPeers[at].held and tick - gPeers[at].heldAt < int64(HoldLimitTicks): continue
+      servePeer(p, world, gPeers[at], budget)
+  if tick mod 200'i64 == 0'i64:
+    var kept: seq[LodPeer] = @[]
+    for peer in gPeers:
+      var live = false
+      for s in seen:
+        if s == peer.name: live = true
+      # a peer made by a REQUEST before the capability showed stays a while
+      if live or tick - peer.seenAt < 600'i64: kept.add peer
+    gPeers = kept
+
+proc lodStatusLine*(): string =
+  "lod: radius=" & $gLodRadius & " peers=" & $gPeers.len & " sent=" & $gStats.sent & " cache=" & $gCache.len &
+    " fromCache=" & $gStats.fromCache & " fromChunk=" & $gStats.fromChunk & " fromNoise=" & $gStats.fromNoise &
+    " inline=" & $gStats.inline & " jobsOut=" & $gOut &
+    " meanJobMs=" & (if gStats.fromNoise - gStats.inline > 0: $(float64(gStats.jobMicros) / 1000.0 / float64(gStats.fromNoise - gStats.inline)) else: "-")
