@@ -219,6 +219,153 @@ def wind_init(s):
     s.check(init[j + 28] == 0 and len(init) == j + 29, 'INIT flags/length: %r' % init[j + 28:])
 
 
+# ---- WorldEdit (src/server/worldedit) -----------------------------------------------------------------------------------------------
+
+def _we(s, line, fragment, what, seconds=30.0):
+    """Runs a WorldEdit command and waits for the reply that contains `fragment`; returns the chat line."""
+    n = len(s.w.chat)
+    s.command('/' + line)          # typed as //line: the client strips one slash
+    try:
+        return s.expect(fragment, what, seconds, since=n)
+    except Exception:
+        print('  chat since the command: %r' % s.w.chat[n:])
+        raise
+
+
+def _state_ids(s, x, y, z, names):
+    """The block-state id a client sees for each block name (placed with /setblock at a probe cell, then cleared)."""
+    ids = {'air': 0}
+    for name in names:
+        s.command('setblock %d %d %d minecraft:%s' % (x, y, z, name))
+        s.wait(lambda: s.w.block(x, y, z) not in (None, 0) and s.w.block(x, y, z) not in ids.values(), 'the probe block ' + name)
+        ids[name] = s.w.block(x, y, z)
+    s.command('setblock %d %d %d minecraft:air' % (x, y, z))
+    s.wait(lambda: s.w.block(x, y, z) == 0, 'the probe cell to clear')
+    return ids
+
+
+def _cells(s, x0, y0, z0, x1, y1, z1):
+    return [s.w.block(x, y, z) for y in range(y0, y1 + 1) for z in range(z0, z1 + 1) for x in range(x0, x1 + 1)]
+
+
+def _cells_are(s, box, want, what, seconds=30.0):
+    s.wait(lambda: _cells(s, *box) == want, what, seconds)
+
+
+@scenario('worldedit')
+def worldedit(s):
+    """Selection, //set //replace //undo //redo, //copy //paste, //hollow, //stack, //sphere, //count through a bot (an operator): the
+    blocks are checked as the client learns them AND on the server (//count reads server storage), and //undo must restore every
+    cell exactly. Then the worldedit:cui channel: a client that registered it gets the selection."""
+    s.wait(lambda: s.position() is not None and s.chunks() >= 9, 'the spawn chunks', 60.0)
+    px, py, pz = s.position()[0], s.position()[1], s.position()[2]
+    bx, bz = int(px // 1) + 2, int(pz // 1) + 2
+    y0 = 200
+    s.command('gamemode creative')
+    ids = _state_ids(s, bx, y0 + 12, bz, ['stone', 'dirt', 'glowstone', 'oak_planks', 'glass'])
+    stone, dirt, glow, planks, glass = ids['stone'], ids['dirt'], ids['glowstone'], ids['oak_planks'], ids['glass']
+    box = (bx, y0, bz, bx + 4, y0 + 3, bz + 4)             # 5 x 4 x 5 = 100 cells of open air
+    _cells_are(s, box, [0] * 100, 'the build area to be air')
+
+    # selection
+    _we(s, 'pos1 %d,%d,%d' % (bx, y0, bz), 'Position 1 set', '//pos1')
+    _we(s, 'pos2 %d,%d,%d' % (bx + 4, y0 + 3, bz + 4), '(100 blocks)', '//pos2 and the volume')
+    _we(s, 'size', '5 x 4 x 5, 100 blocks', '//size')
+
+    # set, with the server's own count of what it stored
+    _we(s, 'set 50%stone,50%dirt', 'set: 100 block(s) changed', '//set a random pattern')
+    s.wait(lambda: 0 not in _cells(s, *box), 'every cell to arrive at the client')
+    base = _cells(s, *box)
+    s.check(set(base) <= {stone, dirt} and base.count(stone) > 25 and base.count(dirt) > 25, 'the pattern gave other blocks or a lopsided mix')
+    n_stone = base.count(stone)
+    line = _we(s, 'count stone', 'Counted', '//count stone (server side)')
+    s.check('Counted %d block(s)' % n_stone in line, 'server counted %r but the client saw %d stone' % (line, n_stone))
+
+    # replace with a mask, then overwrite, then undo both: every cell back, exactly
+    _we(s, 'replace stone glowstone', 'replace: %d block(s) changed' % n_stone, '//replace')
+    _cells_are(s, box, [glow if b == stone else b for b in base], 'stone to become glowstone, dirt untouched')
+    _we(s, 'set oak_planks', 'set: 100 block(s) changed', '//set over it')
+    _cells_are(s, box, [planks] * 100, 'all planks')
+    _we(s, 'undo 2', 'Undid 2 edit(s)', '//undo 2')
+    _cells_are(s, box, base, 'the first pattern restored cell for cell')
+    line = _we(s, 'count stone', 'Counted', '//count after undo')
+    s.check('Counted %d block(s)' % n_stone in line, 'server count after undo: %r' % line)
+    _we(s, 'redo', 'Redid 1 edit(s)', '//redo')
+    _cells_are(s, box, [glow if b == stone else b for b in base], 'the replace redone')
+    _we(s, 'undo 3', 'Undid', '//undo everything')
+    _cells_are(s, box, [0] * 100, 'back to air after undoing all')
+
+    # copy + paste (the copier stands where the paste happens: same cells), hollow
+    _we(s, 'set stone', 'set: 100 block(s) changed', 'a solid block to copy')
+    _we(s, 'copy', 'Copied 100 block(s)', '//copy')
+    _we(s, 'set air', 'set: 100 block(s) changed', 'clearing it')
+    _cells_are(s, box, [0] * 100, 'cleared')
+    _we(s, 'paste', 'paste: 100 block(s) changed', '//paste')
+    _cells_are(s, box, [stone] * 100, 'the paste put the stone back at the copier position')
+    _we(s, 'undo 2', 'Undid 2', 'undo the paste and the clear')
+    _cells_are(s, box, [stone] * 100, 'stone again after undoing paste and clear')
+    _we(s, 'hollow', 'hollow: %d block(s) changed' % (3 * 2 * 3), '//hollow')
+    want = []
+    for yy in range(4):
+        for zz in range(5):
+            for xx in range(5):
+                inner = 0 < xx < 4 and 0 < zz < 4 and 0 < yy < 3
+                want.append(0 if inner else stone)
+    _cells_are(s, box, want, 'a hollow shell of stone')
+    _we(s, 'undo 2', 'Undid 2', 'undo hollow and set')
+    _cells_are(s, box, [0] * 100, 'air once more')
+
+    # stack: 3 more copies of a single block along +x
+    _we(s, 'pos2 %d,%d,%d' % (bx, y0, bz), '(1 blocks)', 'a 1-block selection')
+    _we(s, 'set glowstone', 'set: 1 block(s) changed', 'a single block')
+    _we(s, 'stack 3 east', 'stack: 3 block(s) changed', '//stack 3 east')
+    _cells_are(s, (bx, y0, bz, bx + 3, y0, bz), [glow] * 4, 'a row of four')
+    _we(s, 'undo 2', 'Undid 2', 'undo stack and set')
+    _cells_are(s, (bx, y0, bz, bx + 3, y0, bz), [0] * 4, 'the row removed')
+
+    # a sphere centred on the player, then undone
+    _we(s, 'pos1 %d,%d,%d' % (bx - 5, y0 - 5, bz - 5), 'Position 1', 'big selection corner 1')
+    _we(s, 'pos2 %d,%d,%d' % (bx + 5, y0 + 5, bz + 5), 'Position 2', 'big selection corner 2')
+    _we(s, 'sphere glass 3', 'sphere:', '//sphere (centred on the player)')
+    _we(s, 'undo', 'Undid 1', 'undo the sphere')
+
+    # the cui channel: register, say hello, the selection arrives as text
+    s.register('worldedit:cui')
+    s.send_payload('worldedit:cui', b'v|4')
+    _we(s, 'pos1 %d,%d,%d' % (bx + 1, y0 + 1, bz + 1), 'Position 1', 'pos1 for the cui')
+    s.wait(lambda: any(b.startswith(b'p|0|') for b in s.payloads('worldedit:cui')), 'a p|0 point on worldedit:cui')
+    texts = [b.decode() for b in s.payloads('worldedit:cui')]
+    s.check('s|cuboid' in texts, 'no s|cuboid shape message: %r' % texts)
+    s.check(any(t.startswith('p|0|%d|%d|%d|' % (bx + 1, y0 + 1, bz + 1)) for t in texts), 'point 0 not at the pos1 cell: %r' % texts)
+    _we(s, 'pos2 %d,%d,%d' % (bx + 3, y0 + 2, bz + 3), 'Position 2', 'pos2 for the cui')
+    want = 'p|1|%d|%d|%d|%d' % (bx + 3, y0 + 2, bz + 3, 3 * 2 * 3)
+    s.wait(lambda: want.encode() in s.payloads('worldedit:cui'), 'the new p|1 point on worldedit:cui (%s)' % want)
+
+
+@scenario('worldedit_wand')
+def worldedit_wand(s):
+    """//wand puts the wooden axe in the bot's hand; digging a block (creative) with it sets position 1 and does not break the block,
+    and using a block with it sets position 2."""
+    s.wait(lambda: s.position() is not None and s.chunks() >= 9, 'the spawn chunks', 60.0)
+    s.command('gamemode creative')
+    _we(s, 'wand', 'wooden axe', '//wand')
+    px, py, pz = s.position()[0], s.position()[1], s.position()[2]
+    bx, by, bz = int(px // 1) + 1, int(py // 1) - 1, int(pz // 1)
+    s.wait(lambda: s.w.block(bx, by, bz) not in (None, 0), 'a block to click', 20.0)
+    before = s.w.block(bx, by, bz)
+    s.c.send(s.m.SB_CARRIED, struct.pack('>h', 0))
+    n = len(s.w.chat)
+    s.c.send(s.m.SB_ACTION, s.m.varint(0) + s.m.block_pos(bx, by, bz) + bytes([1]) + s.m.varint(31))
+    s.expect('Position 1 set to (%d, %d, %d)' % (bx, by, bz), 'the wand left click', 20.0, since=n)
+    time.sleep(0.5)
+    s.check(s.w.block(bx, by, bz) == before, 'the left click with the wand broke the block')
+    n = len(s.w.chat)
+    s.c.send(s.m.SB_USE_ON, s.m.varint(0) + s.m.block_pos(bx + 1, by, bz) + s.m.varint(1) + struct.pack('>fff', 0.5, 1.0, 0.5) +
+             bytes([0, 0]) + s.m.varint(32))
+    s.expect('Position 2 set to (%d, %d, %d)' % (bx + 1, by, bz), 'the wand right click', 20.0, since=n)
+    _we(s, 'size', '2 x 1 x 1, 2 blocks', '//size after the wand')
+
+
 def run(m, c, st, w, biomes, ctx, args):
     wanted = [n for n in (args.scenario or 'all').split(',') if n]
     known = [n for n, _, _ in SCENARIOS]

@@ -169,3 +169,18 @@ SCENARIO capability_handshake   INCONCLUSIVE   0.0s the showcase plugins are not
 (a precondition is missing); it never counts as a pass or a failure. Write a scenario in `tools/mcbot_scenarios.py` with the `@scenario`
 decorator; the helper `s` (see the header of that file) can run commands, read chat, blocks and chunks as a client knows them, send
 payloads and wait for the server's. The bot does not track entities yet. `WORLD=<folder>` starts from an existing world instead of a fresh one.
+
+## 9. WorldEdit (real, built into the server)
+
+`src/server/worldedit/` is a WorldEdit-style editor, op level 2. Commands are registered as `/set`, `/pos1`, ... so a client types `//set stone`;
+`/we <name> <args>` reaches the same code. Selection: `//pos1 [x,y,z]`, `//pos2`, `//sel`, `//size`, and `//wand` (wooden axe: left click
+a block for pos1, right click for pos2). Edits: `//set`, `//replace <mask> <pattern>`, `//walls`, `//hollow`, `//sphere [-h]`, `//cyl [-h]`,
+`//copy`, `//cut`, `//paste [-a] [-s]`, `//rotate`, `//flip`, `//stack`, `//move [-s]`, `//count`, `//distribution [-d]`, `//undo [n]`, `//redo [n]`.
+Patterns are `stone`, `50%stone,50%dirt`, `oak_stairs[facing=east]`; masks `stone,dirt`, `!air`, `*`.
+
+Every edit goes through `bulkedit` (one light pass, one client update per section, block entities kept, block log entries with the command
+cause). Undo keeps the pre-edit section snapshot, so it restores block states and block entities exactly. Limits: 4 000 000 cells per edit,
+64 undo entries and 24 M cells of history per player. Not done: `//rotate` about x or z, region shapes other than cuboid, schematics, biomes.
+
+`worldedit:cui`: a client that registered the channel, sent `v|<n>` on it, or holds the Jester `cui` capability receives `s|cuboid` and
+`p|<0|1>|x|y|z|volume` (UTF-8 text, one per packet) whenever its selection changes.
