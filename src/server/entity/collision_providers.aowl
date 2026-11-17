@@ -1,0 +1,194 @@
+## Collision providers: the seam through which things that are not blocks (moving block bodies, and later collidable
+## entities such as boats) contribute collision shapes to entity movement, space checks and projectile sweeps.
+##
+## Design: BODIES-DESIGN.md section 3.2. The registry is a plain `seq` of records of non-capturing procs plus an integer
+## `handle` the proc receives back. No capturing closure ever crosses a module (aowlhexer drops the environment's refcount
+## when a closure field of another module's type is copied, see world/chunk_system/worker_logic.aowl), so a provider owns
+## its state in a global of its own module and uses `handle` to find it.
+##
+## Cost with no provider registered: callers test `gCollisionProviders.len > 0` and nothing else runs.
+##
+## This module depends only on math types, so entitymod can import it.
+
+import std/[math, options]
+import ../../util/math/boundingbox
+import ../../util/math/position
+import ../../util/vector3
+
+type
+  ProvidedBox* = object
+    ## One world-space AABB a provider contributes. For a rotated body this is a conservative box around one oriented cell.
+    box*: BoundingBox
+    surfaceVel*: Vector3[float64]   ## velocity of the surface at that box, blocks per tick (carry, used by movement authority)
+
+  BoxQueryProc* = proc(handle: int; region: BoundingBox; moverId: int32; outBoxes: var seq[ProvidedBox]) {.nimcall.}
+    ## Appends every box that intersects `region`. `moverId` is the entity id of the mover (0 for none), so a body can
+    ## skip itself. A provider must only append; it must not clear `outBoxes`.
+
+  RayQueryProc* = proc(handle: int; origin, delta: Vector3[float64]; tHit: var float64): bool {.nimcall.}
+    ## Precise ray test for projectiles: the ray is `origin + delta * t`, t in [0, 1]. Sets `tHit` and returns true on a hit.
+    ## A provider that has one is skipped by the projectile box sweep (its boxes are only conservative).
+
+  VelocityQueryProc* = proc(handle: int; box: BoundingBox; vel: var Vector3[float64]): bool {.nimcall.}
+    ## Velocity (blocks per tick) of the provider's surface under a standing entity box. false: the box is not on it.
+
+  CollisionProvider* = object
+    id*: int32            ## handed back by `registerCollisionProvider`; unique, never reused
+    order*: int32         ## ascending; ties keep registration order
+    handle*: int
+    query*: BoxQueryProc
+    ray*: nil RayQueryProc    ## may be nil
+    velocityAt*: nil VelocityQueryProc  ## may be nil
+
+var gCollisionProviders*: seq[CollisionProvider] = @[]
+var gNextProviderId: int32 = 1'i32
+
+const ProvidedPosBase* = low(int32) + 1'i32
+  ## Synthetic `BlockPos.y` of a provider's supporting "block": `ProvidedPosBase + providerId`. Real worlds never reach it,
+  ## so block code can recognise and skip it with `isProvidedPos`.
+
+proc providedPos*(providerId: int32): BlockPos =
+  BlockPos(vec: Vector3[int32](x: 0'i32, y: ProvidedPosBase + providerId, z: 0'i32))
+
+proc isProvidedPos*(pos: BlockPos): bool =
+  pos.vec.y >= ProvidedPosBase and pos.vec.y < ProvidedPosBase + 1_000_000'i32
+
+proc providerIdOfPos*(pos: BlockPos): int32 =
+  pos.vec.y - ProvidedPosBase
+
+proc registerCollisionProvider*(handle: int; query: BoxQueryProc; ray: nil RayQueryProc = nil;
+    velocityAt: nil VelocityQueryProc = nil; order: int32 = 0'i32): int32 =
+  ## Adds a provider and returns its id (> 0). Providers are queried in ascending `order`, then registration order.
+  let id = gNextProviderId
+  inc gNextProviderId
+  let p = CollisionProvider(id: id, order: order, handle: handle, query: query, ray: ray, velocityAt: velocityAt)
+  var at = gCollisionProviders.len
+  while at > 0 and gCollisionProviders[at - 1].order > order:
+    dec at
+  gCollisionProviders.add(p)
+  var j = gCollisionProviders.len - 1
+  while j > at:
+    let prev = gCollisionProviders[j - 1]
+    gCollisionProviders[j] = prev
+    dec j
+  gCollisionProviders[at] = p
+  id
+
+proc unregisterCollisionProvider*(id: int32): bool =
+  for i in 0 ..< gCollisionProviders.len:
+    if gCollisionProviders[i].id == id:
+      for j in i ..< gCollisionProviders.len - 1:
+        let nxt = gCollisionProviders[j + 1]
+        gCollisionProviders[j] = nxt
+      gCollisionProviders.setLen(gCollisionProviders.len - 1)
+      return true
+  false
+
+proc clearCollisionProviders*() =
+  gCollisionProviders.setLen(0)
+
+proc appendProvidedCollisions*(region: BoundingBox; moverId: int32; collisions: var seq[BoundingBox];
+    positions: var seq[(int, BlockPos)]; forProjectile: bool = false) =
+  ## For `getBlockCollisions`: appends each provider's boxes to `collisions` and one `(endIndex, syntheticPos)` entry per
+  ## provider that hit (the same shape the block loop produces, so the Y pass sets `supportingBlockPos` to the synthetic
+  ## position). With `forProjectile`, providers that have a `ray` hook are skipped: they answer through `providerRayHit`.
+  var scratch: seq[ProvidedBox] = @[]
+  for i in 0 ..< gCollisionProviders.len:
+    let p = gCollisionProviders[i]
+    if forProjectile and p.ray != nil:
+      continue
+    scratch.setLen(0)
+    p.query(p.handle, region, moverId, scratch)
+    var any = false
+    for j in 0 ..< scratch.len:
+      if scratch[j].box.intersects(region):
+        collisions.add(scratch[j].box)
+        any = true
+    if any:
+      positions.add((collisions.len, providedPos(p.id)))
+
+proc providedSpaceBlocked*(region: BoundingBox; moverId: int32): bool =
+  ## For `isSpaceEmpty`: whether any provider box intersects `region`.
+  var scratch: seq[ProvidedBox] = @[]
+  for i in 0 ..< gCollisionProviders.len:
+    let p = gCollisionProviders[i]
+    scratch.setLen(0)
+    p.query(p.handle, region, moverId, scratch)
+    for j in 0 ..< scratch.len:
+      if scratch[j].box.intersects(region):
+        return true
+  false
+
+proc providerRayHit*(origin, delta: Vector3[float64]; tBest: float64; tHit: var float64; providerId: var int32): bool =
+  ## Closest precise provider hit with `t < tBest`, over providers that have a ray hook.
+  var best = tBest
+  var found = false
+  for i in 0 ..< gCollisionProviders.len:
+    let p = gCollisionProviders[i]
+    if p.ray == nil:
+      continue
+    var t = 0.0'f64
+    if p.ray(p.handle, origin, delta, t) and t < best:
+      best = t
+      providerId = p.id
+      found = true
+  if found:
+    tHit = best
+  found
+
+proc providerVelocityAt*(box: BoundingBox; vel: var Vector3[float64]): bool =
+  ## Surface velocity under `box` from the first provider (in order) that reports one. Used for carrying standing entities.
+  for i in 0 ..< gCollisionProviders.len:
+    let p = gCollisionProviders[i]
+    if p.velocityAt != nil and p.velocityAt(p.handle, box, vel):
+      return true
+  false
+
+proc rayBoxIntersect*(start, dir: Vector3[float64]; bb: BoundingBox; t: var float64): bool =
+  ## Slab test, t in [0, 1] (the same convention as `calculateRayIntersection` in projectile/thrown.aowl).
+  var tMin = 0.0'f64
+  var tMax = 1.0'f64
+  for axis in [axisX, axisY, axisZ]:
+    let d = dir.getAxis(axis)
+    let s = start.getAxis(axis)
+    let bMin = bb.min.getAxis(axis)
+    let bMax = bb.max.getAxis(axis)
+    if abs(d) < 1e-9'f64:
+      if s < bMin or s > bMax:
+        return false
+    else:
+      let t1 = (bMin - s) / d
+      let t2 = (bMax - s) / d
+      tMin = max(tMin, min(t1, t2))
+      tMax = min(tMax, max(t1, t2))
+  if tMin <= tMax and tMin >= 0.0'f64 and tMin <= 1.0'f64:
+    t = tMin
+    return true
+  false
+
+proc providerSweepHit*(searchBox: BoundingBox; moverId: int32; start, delta: Vector3[float64]; tBest: float64;
+    tHit: var float64; providerId: var int32): bool =
+  ## What a projectile sweep asks of the registry: the closest hit with `t < tBest`. Providers with a `ray` hook answer
+  ## precisely; the others by their boxes inside `searchBox`.
+  var best = tBest
+  var found = false
+  var scratch: seq[ProvidedBox] = @[]
+  for i in 0 ..< gCollisionProviders.len:
+    let p = gCollisionProviders[i]
+    var t = 0.0'f64
+    if p.ray != nil:
+      if p.ray(p.handle, start, delta, t) and t < best:
+        best = t
+        providerId = p.id
+        found = true
+    else:
+      scratch.setLen(0)
+      p.query(p.handle, searchBox, moverId, scratch)
+      for j in 0 ..< scratch.len:
+        if rayBoxIntersect(start, delta, scratch[j].box, t) and t < best:
+          best = t
+          providerId = p.id
+          found = true
+  if found:
+    tHit = best
+  found
