@@ -1,0 +1,1435 @@
+## Deterministic end-to-end physics scenes with GOLDEN numbers (overnight goal item 23). ONE regression suite over the pure physics modules:
+## materials, windcore/windfield/climate, body/bodymass/bodynbt, integrator, solver (+graph, adapter), fire, blast.
+##
+## scenes.aowl  = scene builders (voxel boxes of REAL vanilla block states through the generated block table), the drivers that chain
+##                the modules (solver -> bodies -> integrator -> settle, fire -> solver, blast -> solver, wind ramp), the golden table
+##                and the check machinery. scenetest.aowl = the runner (PASS/FAIL/INCONCLUSIVE per scene plus the golden table).
+##
+## WHAT A GOLDEN IS. Every interesting number a scene produces goes through goldI (exact integer) or goldF (relative tolerance)
+## and is compared with the table in `initGolden` below. A mismatch FAILS the scene and prints a `GOLDEN-UPDATE gd("key", value, tol)`
+## line that can be pasted over the old row once the change in physics is understood and intended. A number with no row also fails
+## (a new quantity must be pinned deliberately). Integers and hashes are exact (tol 0); floats use 1e-6 relative (the model is
+## deterministic float64 math with a fixed operation order; the slack only absorbs a different libm).
+##
+## ANCHOR RULE (as in the adapter tests): the y == 0 layer of every box is the world floor (anchor). A box is its own little world:
+## below y == 0 and nowhere else the world is solid for the falling bodies (y < 0 solid everywhere, the sides above the floor are void).
+##
+## FALLING (dropComponents). The solver's `components` are free sets. Each becomes a rigid Body (body-local cell = box cell, pos 0),
+## falls through integrator.stepBody against the box world (without its own cells and without the cells that broke) until it sleeps,
+## and settles back to blocks (integrator.settle); the placed cells join the world so later bodies land on them. Bodies do not
+## collide with each other (as in the server's body manager). Cell conservation: every cell of every component comes back as exactly
+## one block, and the structural cell count after = before - (cells that broke).
+##
+## HASHES. FNV-1a 64 over int64 words; floats are quantised to 1e-9 first (int64(f * 1e9)) so the hash is a function of the numbers
+## and not of the byte image of a NaN payload. The determinism scene compares the hashes of two full runs and solver slicings.
+
+{.feature: "untyped".}
+
+import std/[syncio, math, options]
+import "../generated/block_properties"
+import ../nbt/tag
+import ../nbt/nbtbase
+import ../nbt/serializer
+import ../nbt/deserializer
+import body
+import bodymass
+import bodynbt
+import materials
+import solver
+import solveradapter
+import integrator
+import fire
+import blast
+import erosion
+import windfield
+import climate
+
+# ---------------------------------------------------------------------------------------------------------------------
+# check machinery
+
+var gQuiet* = false           ## second runs of a scene (determinism) neither print nor count
+var gFailures* = 0
+var gChecks* = 0
+var gGoldMiss* = 0
+
+proc say*(a: string) =
+  if not gQuiet: echo a
+
+proc chk*(cond: bool, what: string) =
+  if gQuiet: return
+  inc gChecks
+  if cond:
+    echo "  ok   ", what
+  else:
+    echo "  FAIL ", what
+    inc gFailures
+
+proc note*(a: string) =
+  if not gQuiet: echo "     ", a
+
+# ---- golden table ---------------------------------------------------------------------------------------------------------
+const FloatTol* = 1.0e-6
+
+var gKeys: seq[string] = @[]
+var gVals: seq[float64] = @[]
+var gTols: seq[float64] = @[]
+
+# the final table: one row per checked key in the order checked
+var rowKey*: seq[string] = @[]
+var rowActual*: seq[float64] = @[]
+var rowExpected*: seq[float64] = @[]
+var rowStatus*: seq[int] = @[]       ## 0 ok, 1 drift, 2 no golden row
+
+proc gd(key: string; v, tol: float64) =
+  gKeys.add key
+  gVals.add v
+  gTols.add tol
+
+proc goldFind(key: string): int =
+  for i in 0 ..< gKeys.len:
+    if gKeys[i] == key: return i
+  return -1
+
+proc goldCheck(key: string; actual: float64; suggestTol: float64): bool =
+  if gQuiet: return true
+  inc gChecks
+  let k = goldFind(key)
+  if k < 0:
+    echo "  FAIL golden ", key, " = ", actual, " has no row in the golden table"
+    echo "GOLDEN-UPDATE gd(\"", key, "\", ", actual, ", ", suggestTol, ")"
+    inc gFailures
+    inc gGoldMiss
+    rowKey.add key
+    rowActual.add actual
+    rowExpected.add 0.0
+    rowStatus.add 2
+    return false
+  let e = gVals[k]
+  let tol = gTols[k]
+  var ok = false
+  if tol <= 0.0:
+    ok = actual == e
+  else:
+    var scale = abs(e)
+    if scale < 1.0e-9: scale = 1.0e-9
+    ok = abs(actual - e) <= tol * scale
+  rowKey.add key
+  rowActual.add actual
+  rowExpected.add e
+  if ok:
+    rowStatus.add 0
+    echo "  ok   golden ", key, " = ", actual
+  else:
+    rowStatus.add 1
+    echo "  FAIL golden ", key, " = ", actual, "   expected ", e, " (tol ", tol, ")"
+    echo "GOLDEN-UPDATE gd(\"", key, "\", ", actual, ", ", tol, ")"
+    inc gFailures
+  return ok
+
+proc goldI*(key: string; v: int) = discard goldCheck(key, float64(v), 0.0)
+proc goldF*(key: string; v: float64) = discard goldCheck(key, v, FloatTol)
+## a 64-bit hash as a golden: the top 53 bits are exact in a float64
+proc goldH*(key: string; h: uint64) = discard goldCheck(key, float64(h shr 11), 0.0)
+
+# ---------------------------------------------------------------------------------------------------------------------
+# hashing
+
+proc hInit*(): uint64 = 14695981039346656037'u64
+
+proc hm*(h: var uint64; v: int64) =
+  var x = cast[uint64](v)
+  for i in 0 ..< 8:
+    h = (h xor (x and 0xFF'u64)) * 1099511628211'u64
+    x = x shr 8
+
+proc hi*(h: var uint64; v: int) = hm(h, int64(v))
+
+proc hf*(h: var uint64; f: float64) =
+  if f != f:
+    hm(h, 0x7FF8'i64)
+  elif f > 9.0e9:
+    hm(h, 9000000000000000000'i64)
+  elif f < -9.0e9:
+    hm(h, -9000000000000000000'i64)
+  else:
+    hm(h, int64(f * 1.0e9))
+
+proc hSolver*(h: var uint64; r: SolverResult) =
+  hi(h, r.rounds)
+  hi(h, if r.converged: 1 else: 0)
+  hf(h, r.maxRatio)
+  hi(h, r.broken.len)
+  for b in r.broken:
+    hi(h, b.cell)
+    hi(h, b.round)
+    hi(h, ord(b.kind))
+    hf(h, b.ratio)
+  hi(h, r.components.len)
+  for c in r.components:
+    hi(h, c.cells.len)
+    for x in c.cells: hi(h, x)
+    hf(h, c.mass)
+    hi(h, if c.fromFailure: 1 else: 0)
+    hi(h, c.round)
+  hi(h, r.granular.len)
+  for g in r.granular: hi(h, g)
+  hi(h, r.caveIns.len)
+  for k in r.caveIns: hi(h, k)
+
+proc hVec*(h: var uint64; v: Vec3) =
+  hf(h, v.x)
+  hf(h, v.y)
+  hf(h, v.z)
+
+# ---------------------------------------------------------------------------------------------------------------------
+# scenes: voxel boxes of real block states
+
+proc sid*(name: string): int =
+  let b = Block.fromName(name)
+  if b == nil:
+    echo "FAIL unknown block ", name
+    inc gFailures
+    return 0
+  return int(asU16(b.defaultState.id))
+
+type Scene* = object
+  nx*, ny*, nz*: int
+  ids*: seq[int]
+
+proc newScene*(nx, ny, nz: int): Scene = Scene(nx: nx, ny: ny, nz: nz, ids: newSeq[int](nx * ny * nz))
+proc ci*(s: Scene; x, y, z: int): int = x + s.nx * (z + s.nz * y)
+proc put*(s: var Scene; x, y, z: int; name: string) = s.ids[ci(s, x, y, z)] = sid(name)
+proc putId*(s: var Scene; x, y, z, id: int) = s.ids[ci(s, x, y, z)] = id
+proc ground*(s: var Scene) =
+  for z in 0 ..< s.nz:
+    for x in 0 ..< s.nx: put(s, x, 0, z, "stone")
+proc cx*(s: Scene; c: int): int = (c mod (s.nx * s.nz)) mod s.nx
+proc cy*(s: Scene; c: int): int = c div (s.nx * s.nz)
+proc cz*(s: Scene; c: int): int = (c mod (s.nx * s.nz)) div s.nx
+
+## 12-long oak plank deck on two 5-high stone pillars (box 14 x 16 x 3), `n` blocks of `load` stacked on the middle of the deck.
+proc bridgeScene*(load: string; n: int): Scene =
+  var s = newScene(14, 16, 3)
+  ground(s)
+  for y in 1 .. 5:
+    put(s, 0, y, 1, "stone")
+    put(s, 13, y, 1, "stone")
+  for x in 1 .. 12: put(s, x, 5, 1, "oak_planks")
+  for k in 0 ..< n: put(s, 7, 6 + k, 1, load)
+  return s
+
+## oak plank cantilever of `len` planks out of a 4-high stone pillar, `n` blocks of `load` on its tip.
+proc cantileverScene*(len: int; load: string; n: int): Scene =
+  var s = newScene(10, 14, 3)
+  ground(s)
+  for y in 1 .. 4: put(s, 0, y, 1, "stone")
+  for x in 1 .. len: put(s, x, 4, 1, "oak_planks")
+  for k in 0 ..< n: put(s, len, 5 + k, 1, load)
+  return s
+
+## 5x5 stone roof at y = 3 on ONE pillar (cave-in), or on four corner pillars.
+proc roofScene*(corners: bool): Scene =
+  var s = newScene(7, 6, 7)
+  ground(s)
+  if corners:
+    for y in 1 .. 2:
+      put(s, 0, y, 0, "stone")
+      put(s, 4, y, 0, "stone")
+      put(s, 0, y, 4, "stone")
+      put(s, 4, y, 4, "stone")
+  else:
+    put(s, 0, 1, 0, "stone")
+    put(s, 0, 2, 0, "stone")
+  for z in 0 .. 4:
+    for x in 0 .. 4: put(s, x, 3, z, "stone")
+  return s
+
+## w x w column of `mat`, h high, on the floor (box w+2 wide)
+proc pillarScene*(w, h: int; mat: string): Scene =
+  var s = newScene(w + 2, h + 2, w + 2)
+  ground(s)
+  for y in 1 .. h:
+    for z in 1 .. w:
+      for x in 1 .. w: put(s, x, y, z, mat)
+  return s
+
+## A tree: a 1x1 oak log trunk `h` high at (4, 4) in a 9 x (h+3) x 9 box, a 5x5 leaf canopy on the top 3 layers (plus a 3x3 cap).
+const TreeX* = 4
+const TreeZ* = 4
+proc treeScene*(h: int): Scene =
+  var s = newScene(9, h + 3, 9)
+  ground(s)
+  for y in 1 .. h: put(s, TreeX, y, TreeZ, "oak_log")
+  for y in h - 2 .. h:
+    for dz in -2 .. 2:
+      for dx in -2 .. 2:
+        if dx == 0 and dz == 0: continue
+        if abs(dx) == 2 and abs(dz) == 2: continue
+        put(s, TreeX + dx, y, TreeZ + dz, "oak_leaves")
+  for dz in -1 .. 1:
+    for dx in -1 .. 1: put(s, TreeX + dx, h + 1, TreeZ + dz, "oak_leaves")
+  return s
+
+## 8-long stone deck on two stone abutments with a log pillar in the middle (the fire scene)
+proc fireBridgeScene*(deckLen: int; middle: bool): Scene =
+  var s = newScene(deckLen + 2, 8, 3)
+  ground(s)
+  for y in 1 .. 4:
+    put(s, 0, y, 1, "stone")
+    put(s, deckLen + 1, y, 1, "stone")
+  for x in 1 .. deckLen: put(s, x, 5, 1, "stone")
+  if middle:
+    for y in 1 .. 4: put(s, (deckLen + 1) div 2, y, 1, "oak_log")
+  return s
+
+## 16 planks on two 4-high plank posts (the blast scene, as in blasttest)
+const BlastBridgeLen* = 16
+proc blastBridgeScene*(): Scene =
+  var s = newScene(BlastBridgeLen + 2, 12, 5)
+  for z in 0 ..< 5:
+    for x in 0 ..< BlastBridgeLen + 2: put(s, x, 0, z, "stone")
+  for y in 1 .. 4:
+    put(s, 1, y, 2, "oak_planks")
+    put(s, BlastBridgeLen, y, 2, "oak_planks")
+  for x in 1 .. BlastBridgeLen: put(s, x, 5, 2, "oak_planks")
+  return s
+
+# ---------------------------------------------------------------------------------------------------------------------
+# solver drivers
+
+proc adapterP*(): AdapterParams = defaultAdapterParams()
+
+proc runSolver*(s: Scene; loads: seq[ExtLoad]): SolverResult =
+  solveSnapshot(s.ids, s.nx, s.ny, s.nz, adapterP(), floorAnchor, loads)
+
+proc runPlain*(s: Scene): SolverResult = runSolver(s, @[])
+
+proc anyGone*(r: SolverResult): bool = r.broken.len > 0 or r.components.len > 0
+
+proc compCellCount*(r: SolverResult): int =
+  var n = 0
+  for c in r.components: n += c.cells.len
+  return n
+
+proc uniformWind*(v: float64): WindSampler =
+  return proc (x, y, z: int): (float64, float64) {.closure.} = (v, 0.0)
+
+proc windBreaks*(s: Scene; v: float64): bool =
+  let loads = windLoadFromField(s.ids, s.nx, s.ny, s.nz, adapterP(), uniformWind(v))
+  return anyGone(runSolver(s, loads))
+
+## lowest uniform wind speed (b/s) at which the scene fails, to 0.1; 0 if it fails with no wind, -1 if it holds up to vmax.
+proc breakSpeed*(s: Scene; vmax: float64): float64 =
+  if windBreaks(s, 0.0): return 0.0
+  if not windBreaks(s, vmax): return -1.0
+  var lo = 0.0
+  var hi = vmax
+  while hi - lo > 0.1:
+    let mid = 0.5 * (lo + hi)
+    if windBreaks(s, mid): hi = mid
+    else: lo = mid
+  return hi
+
+proc solveSliced*(s: Scene; loads: seq[ExtLoad]; budget: int): SolverResult =
+  var inp = snapshotToSolverInput(s.ids, s.nx, s.ny, s.nz, adapterP(), floorAnchor)
+  for e in loads: inp.loads.add e
+  var job = newSolverJob(inp, adapterSolverParams())
+  var calls = 0
+  while not step(job, budget):
+    inc calls
+  return job.res
+
+# ---------------------------------------------------------------------------------------------------------------------
+# falling bodies: components -> integrator -> settle
+
+var gW: seq[int] = @[]
+var gS: seq[bool] = @[]
+var gNx = 0
+var gNy = 0
+var gNz = 0
+
+proc worldSolid(x, y, z: int): bool =
+  if y <= 0: return true      # the floor layer (box y = 0) extends beyond the box: a tall tree falls outside it
+  if x < 0 or z < 0 or x >= gNx or y >= gNy or z >= gNz: return false
+  return gS[x + gNx * (z + gNz * y)]
+
+proc structuralId(id: int): bool =
+  if id == 0: return false
+  return isStructural(materialOf(id))
+
+proc countStructural*(ids: seq[int]): int =
+  var n = 0
+  for id in ids:
+    if structuralId(id): inc n
+  return n
+
+type FallReport* = object
+  bodies*: int
+  settled*: int
+  cellsIn*: int            ## cells in all components
+  cellsPlaced*: int        ## cells that came back as blocks
+  outside*: int            ## placed blocks that landed outside the box
+  forced*: int             ## bodies that came to rest tilted and were snapped by the manual settle (any angle)
+  maxTicks*: int           ## longest time to sleep
+  minPlacedY*: int         ## lowest placed block (box y)
+  maxImpact*: float64      ## largest impact fracture energy kJ
+  impacts*: int
+  finalIds*: seq[int]      ## the box afterwards
+  structBefore*: int
+  structAfter*: int
+  hash*: uint64
+
+## `ids` the snapshot the solver ran on, `removed` cells that no longer exist (broken / destroyed), `comps` the free sets.
+proc dropComponents*(ids: seq[int]; nx, ny, nz: int; removed: seq[int]; comps: seq[Component]): FallReport =
+  var rep = FallReport(minPlacedY: 1000000, finalIds: @[], hash: hInit())
+  gNx = nx
+  gNy = ny
+  gNz = nz
+  gW = ids
+  rep.structBefore = countStructural(ids)
+  for c in removed: gW[c] = 0
+  for comp in comps:
+    for c in comp.cells: gW[c] = 0
+  gS = newSeq[bool](ids.len)
+  for i in 0 ..< ids.len: gS[i] = structuralId(gW[i])
+  let nxz = nx * nz
+  for k in 0 ..< comps.len:
+    let comp = comps[k]
+    var cells: seq[Cell] = @[]
+    for c in comp.cells:
+      let y = c div nxz
+      let r = c - y * nxz
+      let z = r div nx
+      let x = r - z * nx
+      cells.add Cell(x: int32(x), y: int32(y), z: int32(z), state: int32(ids[c]))
+    let b = bodyFromCells(uint64(k + 1), 1'u64, cells)
+    recomputeMass(b, defaultProps)
+    b.pos = vec3(0.0, 0.0, 0.0)
+    let sim = newSim(b)
+    let env = SimEnv(solidAt: worldSolid)
+    var ticks = 0
+    for t in 0 ..< 800:
+      let ev = stepBody(sim, env, t)
+      for e in ev:
+        inc rep.impacts
+        if e.energy > rep.maxImpact: rep.maxImpact = e.energy
+      ticks = t + 1
+      if b.sleeping: break
+    inc rep.bodies
+    rep.cellsIn += cells.len
+    if ticks > rep.maxTicks: rep.maxTicks = ticks
+    hi(rep.hash, ticks)
+    hVec(rep.hash, b.pos)
+    hf(rep.hash, b.orient.w)
+    hf(rep.hash, b.orient.x)
+    hf(rep.hash, b.orient.y)
+    hf(rep.hash, b.orient.z)
+    hVec(rep.hash, b.vel)
+    var sr = settle(sim, worldSolid, 0.1, 3, true)
+    if not sr.ok and sr.reason == "not axis aligned":
+      # a body that came to rest leaning on something: the manual `/body settle` path (any angle snaps to the nearest grid rotation)
+      sr = settle(sim, worldSolid, 7.0, 3, true)
+      if sr.ok: inc rep.forced
+    hi(rep.hash, if sr.ok: 1 else: 0)
+    if sr.ok:
+      inc rep.settled
+      hi(rep.hash, sr.rotIndex)
+      hi(rep.hash, sr.dx)
+      hi(rep.hash, sr.dy)
+      hi(rep.hash, sr.dz)
+      for pc in sr.cells:
+        inc rep.cellsPlaced
+        hi(rep.hash, pc.x)
+        hi(rep.hash, pc.y)
+        hi(rep.hash, pc.z)
+        hi(rep.hash, pc.state)
+        if pc.y < rep.minPlacedY: rep.minPlacedY = pc.y
+        if pc.x >= 0 and pc.z >= 0 and pc.x < nx and pc.z < nz and pc.y >= 0 and pc.y < ny:
+          let i = pc.x + nx * (pc.z + nz * pc.y)
+          gW[i] = pc.state
+          gS[i] = structuralId(pc.state)
+        else:
+          inc rep.outside
+    else:
+      note("body " & $k & " did not settle: " & sr.reason & " angleErr=" & $sr.angleErr & " pos=" & $b.pos.x & "," & $b.pos.y & "," & $b.pos.z & " ticks=" & $ticks & " sleeping=" & $b.sleeping)
+  rep.finalIds = gW
+  rep.structAfter = countStructural(gW) + rep.outside
+  hi(rep.hash, rep.cellsIn)
+  hi(rep.hash, rep.cellsPlaced)
+  return rep
+
+proc brokenCells*(r: SolverResult): seq[int] =
+  var res: seq[int] = @[]
+  for b in r.broken: res.add b.cell
+  return res
+
+proc fallChecks*(label: string; rep: FallReport; nBroken: int) =
+  chk(rep.bodies > 0, label & ": the solver produced free bodies")
+  chk(rep.settled == rep.bodies, label & ": every body settled back to blocks (" & $rep.settled & " of " & $rep.bodies & ")")
+  chk(rep.cellsPlaced == rep.cellsIn, label & ": cell conservation, " & $rep.cellsIn & " cells fell and " & $rep.cellsPlaced & " blocks came back")
+  chk(rep.structAfter == rep.structBefore - nBroken, label & ": structural cells " & $rep.structBefore & " -> " & $rep.structAfter &
+      " with " & $nBroken & " broken")
+
+# ---------------------------------------------------------------------------------------------------------------------
+# scene 1: bridge
+
+proc firstFailX(s: Scene; r: SolverResult): int =
+  if r.broken.len == 0: return -1
+  return cx(s, r.broken[0].cell)
+
+proc sceneBridge*(): uint64 =
+  var h = hInit()
+  let s0 = bridgeScene("air", 0)
+  let r0 = runPlain(s0)
+  chk(not anyGone(r0) and r0.converged, "12-long oak plank bridge between stone pillars holds")
+  goldF("bridge.intact.maxRatio", r0.maxRatio)
+  hSolver(h, r0)
+  let s1 = bridgeScene("cobblestone", 1)
+  let r1 = runPlain(s1)
+  chk(not anyGone(r1), "one cobblestone block on the middle holds")
+  goldF("bridge.cobble1.maxRatio", r1.maxRatio)
+  hSolver(h, r1)
+  let s = bridgeScene("iron_block", 9)
+  let r = runPlain(s)
+  note("9 iron: rounds=" & $r.rounds & " broken=" & $r.broken.len & " components=" & $r.components.len & " maxRatio=" & $r.maxRatio)
+  chk(r.broken.len > 0, "+ 9 iron blocks: the span breaks")
+  let fx = firstFailX(s, r)
+  chk(fx >= 5 and fx <= 9, "first failure in the middle of the span (x=" & $fx & ")")
+  chk(r.components.len > 0, "pieces detach as components")
+  hSolver(h, r)
+  goldI("bridge.iron9.rounds", r.rounds)
+  goldI("bridge.iron9.broken", r.broken.len)
+  goldI("bridge.iron9.firstFailX", fx)
+  goldF("bridge.iron9.firstFailRatio", (if r.broken.len > 0: r.broken[0].ratio else: 0.0))
+  goldI("bridge.iron9.components", r.components.len)
+  goldI("bridge.iron9.componentCells", compCellCount(r))
+  var fewest = 0
+  for n in 1 .. 9:
+    if anyGone(runPlain(bridgeScene("iron_block", n))):
+      fewest = n
+      break
+  goldI("bridge.fewestIron", fewest)
+  var fewestC = 0
+  for n in 1 .. 9:
+    if anyGone(runPlain(bridgeScene("cobblestone", n))):
+      fewestC = n
+      break
+  goldI("bridge.fewestCobble", fewestC)
+  hi(h, fewest)
+  hi(h, fewestC)
+  # the pieces fall: the integrator drops them, settle puts them back
+  let rep = dropComponents(s.ids, s.nx, s.ny, s.nz, brokenCells(r), r.components)
+  fallChecks("bridge", rep, r.broken.len)
+  note("fall: bodies=" & $rep.bodies & " ticks=" & $rep.maxTicks & " lowest placed y=" & $rep.minPlacedY & " impact=" & $rep.maxImpact & " kJ")
+  goldI("bridge.fall.bodies", rep.bodies)
+  goldI("bridge.fall.ticks", rep.maxTicks)
+  goldI("bridge.fall.minPlacedY", rep.minPlacedY)
+  goldI("bridge.fall.impacts", rep.impacts)
+  goldF("bridge.fall.maxImpactKJ", rep.maxImpact)
+  goldI("bridge.fall.structAfter", rep.structAfter)
+  hi(h, int(rep.hash and 0x7FFFFFFFFFFFFF'u64))
+  hm(h, cast[int64](rep.hash))
+  return h
+
+# ---------------------------------------------------------------------------------------------------------------------
+# scene 2: cantilever
+
+proc sceneCantilever*(): uint64 =
+  var h = hInit()
+  let s6 = cantileverScene(6, "air", 0)
+  let r6 = runPlain(s6)
+  chk(not anyGone(r6), "6-long cantilever holds under its own weight")
+  goldF("cantilever.6.self.maxRatio", r6.maxRatio)
+  hSolver(h, r6)
+  let s2 = cantileverScene(2, "iron_block", 1)
+  let r2 = runPlain(s2)
+  chk(not anyGone(r2), "2-long cantilever with one iron block at the tip holds")
+  goldF("cantilever.2.iron1.maxRatio", r2.maxRatio)
+  hSolver(h, r2)
+  let s = cantileverScene(6, "iron_block", 1)
+  let r = runPlain(s)
+  chk(r.broken.len > 0, "6-long cantilever with ONE iron block at the tip fails")
+  var rootOk = false
+  if r.broken.len > 0:
+    rootOk = cx(s, r.broken[0].cell) == 1 and cy(s, r.broken[0].cell) == 4
+    goldI("cantilever.6.iron1.firstX", cx(s, r.broken[0].cell))
+    goldI("cantilever.6.iron1.firstY", cy(s, r.broken[0].cell))
+    goldF("cantilever.6.iron1.firstRatio", r.broken[0].ratio)
+  chk(rootOk, "the worst cell is the root plank (x=1, y=4)")
+  goldI("cantilever.6.iron1.rounds", r.rounds)
+  goldI("cantilever.6.iron1.broken", r.broken.len)
+  goldI("cantilever.6.iron1.components", r.components.len)
+  goldI("cantilever.6.iron1.componentCells", compCellCount(r))
+  hSolver(h, r)
+  var f6 = 0
+  for n in 1 .. 9:
+    if anyGone(runPlain(cantileverScene(6, "iron_block", n))):
+      f6 = n
+      break
+  var f2 = 0
+  for n in 1 .. 9:
+    if anyGone(runPlain(cantileverScene(2, "iron_block", n))):
+      f2 = n
+      break
+  goldI("cantilever.6.fewestIron", f6)
+  goldI("cantilever.2.fewestIron", f2)
+  chk(f6 > 0 and (f2 == 0 or f2 > f6), "the short cantilever carries more iron than the long one")
+  hi(h, f6)
+  hi(h, f2)
+  let rep = dropComponents(s.ids, s.nx, s.ny, s.nz, brokenCells(r), r.components)
+  fallChecks("cantilever", rep, r.broken.len)
+  goldI("cantilever.fall.ticks", rep.maxTicks)
+  goldI("cantilever.fall.minPlacedY", rep.minPlacedY)
+  goldF("cantilever.fall.maxImpactKJ", rep.maxImpact)
+  hm(h, cast[int64](rep.hash))
+  return h
+
+# ---------------------------------------------------------------------------------------------------------------------
+# scene 3: cave-in
+
+proc sceneCaveIn*(): uint64 =
+  var h = hInit()
+  let r4 = runPlain(roofScene(true))
+  chk(not anyGone(r4), "5x5 stone roof on four corner pillars holds")
+  goldF("cavein.fourCorners.maxRatio", r4.maxRatio)
+  hSolver(h, r4)
+  let s = roofScene(false)
+  let r = runPlain(s)
+  chk(anyGone(r), "the same roof on ONE pillar breaks")
+  var gone = 0
+  for z in 0 .. 4:
+    for x in 0 .. 4:
+      let c = ci(s, x, 3, z)
+      var g = false
+      for b in r.broken:
+        if b.cell == c: g = true
+      for comp in r.components:
+        for q in comp.cells:
+          if q == c: g = true
+      if g: inc gone
+  chk(gone >= 20, "nearly the whole roof breaks away (" & $gone & " of 25)")
+  chk(r.caveIns.len > 0, "the free roof is a terrain set: reported as a cave-in")
+  note("roof: rounds=" & $r.rounds & " broken=" & $r.broken.len & " components=" & $r.components.len & " caveIns=" & $r.caveIns.len & " gone=" & $gone)
+  goldI("cavein.rounds", r.rounds)
+  goldI("cavein.broken", r.broken.len)
+  goldI("cavein.components", r.components.len)
+  goldI("cavein.componentCells", compCellCount(r))
+  goldI("cavein.caveIns", r.caveIns.len)
+  goldI("cavein.roofGone", gone)
+  goldF("cavein.firstRatio", (if r.broken.len > 0: r.broken[0].ratio else: 0.0))
+  var bigMass = 0.0
+  for comp in r.components:
+    if comp.mass > bigMass: bigMass = comp.mass
+  goldF("cavein.largestBodyMassKg", bigMass)
+  hSolver(h, r)
+  let rep = dropComponents(s.ids, s.nx, s.ny, s.nz, brokenCells(r), r.components)
+  fallChecks("cave-in", rep, r.broken.len)
+  note("fall: bodies=" & $rep.bodies & " ticks=" & $rep.maxTicks & " lowest placed y=" & $rep.minPlacedY & " impact=" & $rep.maxImpact & " kJ")
+  # the roof landed on the floor (floor top is y = 1) so its lowest block is at y = 1
+  chk(rep.minPlacedY == 1, "the roof came to rest on the floor (lowest block y=" & $rep.minPlacedY & ")")
+  goldI("cavein.fall.bodies", rep.bodies)
+  goldI("cavein.fall.ticks", rep.maxTicks)
+  goldI("cavein.fall.minPlacedY", rep.minPlacedY)
+  goldI("cavein.fall.impacts", rep.impacts)
+  goldF("cavein.fall.maxImpactKJ", rep.maxImpact)
+  hm(h, cast[int64](rep.hash))
+  return h
+
+# ---------------------------------------------------------------------------------------------------------------------
+# scene 4: tree in a storm
+
+## The storm field is the REAL windfield (windAtWorld) fed by a provider whose wind vector rises linearly: calm at tick 0, 40 b/s at
+## tick 1200 (60 s) and on to 70 b/s at tick 2100, so even the 2x2 trunk (steady limit ~49 b/s) fails in the end. The box floor
+## is sea level (world y 63 + box y: the altitude gain of windcore applies, the field also has gusts). RampStep = solver sampling.
+const RampSeed* = 424242
+const RampMax* = 70.0
+const RampTicks* = 2100.0
+const RampStep* = 10
+const WorldY0* = 63.0
+
+proc rampProvider(vmax, rampTicks: float64): WeatherProvider =
+  return proc (ticks: float): WeatherSample {.closure.} =
+    var f = ticks / rampTicks
+    if f < 0.0: f = 0.0
+    if f > 1.0: f = 1.0
+    WeatherSample(rain: 0.9 * f, thunder: 0.5 * f, hasWind: true, windX: vmax * f, windZ: 0.0)
+
+## wind (b/s toward +x) of the storm field at a box cell
+proc stormWindX(tick: float; x, y, z: int): float64 =
+  let v = windAtWorld(tick, float64(x) + 0.5, WorldY0 + float64(y) + 0.5, float64(z) + 0.5)
+  return v.x
+
+proc stormLoads(s: Scene; tick: float): seq[ExtLoad] =
+  let sampler = proc (x, y, z: int): (float64, float64) {.closure.} =
+    let v = windAtWorld(tick, float64(x) + 0.5, WorldY0 + float64(y) + 0.5, float64(z) + 0.5)
+    (v.x, v.z)
+  return windLoadFromField(s.ids, s.nx, s.ny, s.nz, adapterP(), sampler)
+
+## Leaves are foliage: the adapter drops them (no weight, no wind). A real tree's canopy catches the wind, so the scene adds the
+## canopy's DRAG and weight to the trunk by hand (stated approximation): per leaf cell with an open windward face,
+## fx = 0.5 rho Cd dragArea v|v| / g (the adapter's own k0) onto the trunk cell of its layer (the top trunk cell above the trunk),
+## and its weight density*fill as a downward point load fy on the same cell.
+proc leafLoads(s: Scene; trunkTop: int; sampler: WindSampler): seq[ExtLoad] =
+  let p = adapterP()
+  let k0 = 0.5 * p.airDensity * p.dragCoeff / 9.80665
+  var accX = newSeq[float64](s.ny)
+  var accY = newSeq[float64](s.ny)
+  for y in 0 ..< s.ny:
+    for z in 0 ..< s.nz:
+      for x in 0 ..< s.nx:
+        let id = s.ids[ci(s, x, y, z)]
+        if id == 0: continue
+        let m = materialOf(id)
+        if m.matClass != mcFoliage: continue
+        let (wx, wz) = sampler(x, y, z)
+        var open = true
+        if wx > 0.0 and x > 0:
+          if s.ids[ci(s, x - 1, y, z)] != 0 and materialOf(s.ids[ci(s, x - 1, y, z)]).matClass == mcFoliage: open = false
+        elif wx < 0.0 and x + 1 < s.nx:
+          if s.ids[ci(s, x + 1, y, z)] != 0 and materialOf(s.ids[ci(s, x + 1, y, z)]).matClass == mcFoliage: open = false
+        let layer = if y > trunkTop: trunkTop else: y
+        if open: accX[layer] += k0 * m.dragArea * wx * abs(wx)
+        accY[layer] += m.density * m.fill
+  var res: seq[ExtLoad] = @[]
+  for y in 1 .. trunkTop:
+    if accX[y] != 0.0 or accY[y] != 0.0:
+      res.add ExtLoad(cell: ci(s, TreeX, y, TreeZ), fx: accX[y], fy: accY[y], fz: 0.0)
+  return res
+
+proc treeLoads(s: Scene; trunkTop: int; tick: float): seq[ExtLoad] =
+  var l = stormLoads(s, tick)
+  let sampler = proc (x, y, z: int): (float64, float64) {.closure.} =
+    let v = windAtWorld(tick, float64(x) + 0.5, WorldY0 + float64(y) + 0.5, float64(z) + 0.5)
+    (v.x, v.z)
+  for e in leafLoads(s, trunkTop, sampler): l.add e
+  return l
+
+type RampResult* = object
+  tick*: int               ## first tick (multiple of RampStep) at which the structure fails, -1 = held through the whole ramp
+  speed*: float64          ## windAtWorld wind at the top of the structure at that tick
+  broken*: int
+  components*: int
+
+## which: 0 plain loads of the box, 1 tree (plus canopy loads)
+proc rampTest(s: Scene; which, trunkTop, topY: int): RampResult =
+  var t = 0
+  while float64(t) <= RampTicks:
+    let tick = float64(t)
+    var loads: seq[ExtLoad] = @[]
+    if which == 0: loads = stormLoads(s, tick)
+    else: loads = treeLoads(s, trunkTop, tick)
+    let r = runSolver(s, loads)
+    if anyGone(r):
+      return RampResult(tick: t, speed: stormWindX(tick, TreeX, topY, TreeZ), broken: r.broken.len, components: r.components.len)
+    t += RampStep
+  return RampResult(tick: -1, speed: stormWindX(RampTicks, TreeX, topY, TreeZ), broken: 0, components: 0)
+
+proc sceneStorm*(): uint64 =
+  var h = hInit()
+  setWindSeed(RampSeed)
+  clearWindTerrain()
+  setWeatherProvider(rampProvider(RampMax, RampTicks))
+  let calm = windAtWorld(0.0, 4.5, WorldY0 + 24.5, 4.5)
+  var peak = 0.0
+  var at1200 = 0.0
+  var tt = 0
+  while tt <= int(RampTicks):
+    let w = stormWindX(float64(tt), TreeX, 24, TreeZ)
+    if w > peak: peak = w
+    if tt == 1200: at1200 = w
+    tt += RampStep
+  note("storm field at the tree top: calm " & $calm.speed & " b/s, tick 1200 " & $at1200 & " b/s, peak over the ramp " & $peak & " b/s")
+  chk(calm.speed < 0.5, "the ramp starts calm")
+  chk(peak > 40.0, "the ramp reaches a gale of more than 40 b/s at the tree top")
+  goldF("storm.ramp.windTop1200", at1200)
+  goldF("storm.ramp.peakTop", peak)
+  # 1x1 and 2x2 oak log, 24 high; the wind sampled at each cell, from calm to the gale
+  let t1 = pillarScene(1, 24, "oak_log")
+  let t2 = pillarScene(2, 24, "oak_log")
+  let a1 = rampTest(t1, 0, 24, 24)
+  let a2 = rampTest(t2, 0, 24, 24)
+  note("1x1 log pillar snaps at tick " & $a1.tick & " (" & $a1.speed & " b/s), 2x2 at tick " & $a2.tick & " (" & $a2.speed & " b/s)")
+  chk(a1.tick >= 0, "the thin 1x1 log snaps during the ramp")
+  chk(a2.tick < 0 or a2.tick > a1.tick, "the thick 2x2 log snaps later or not at all")
+  goldI("storm.log1x1.snapTick", a1.tick)
+  goldF("storm.log1x1.snapWind", a1.speed)
+  goldI("storm.log1x1.broken", a1.broken)
+  goldI("storm.log2x2.snapTick", a2.tick)
+  goldF("storm.log2x2.snapWind", a2.speed)
+  hi(h, a1.tick)
+  hf(h, a1.speed)
+  hi(h, a1.broken)
+  hi(h, a2.tick)
+  hf(h, a2.speed)
+  # a tree: the same trunk with its leaf canopy dragging
+  let tr = treeScene(24)
+  let a3 = rampTest(tr, 1, 24, 24)
+  note("oak tree (1x1 trunk 24 high + canopy) snaps at tick " & $a3.tick & " (" & $a3.speed & " b/s)")
+  chk(a3.tick >= 0 and (a1.tick < 0 or a3.tick < a1.tick), "the canopy's drag snaps the tree earlier than the bare trunk")
+  goldI("storm.tree.snapTick", a3.tick)
+  goldF("storm.tree.snapWind", a3.speed)
+  goldI("storm.tree.broken", a3.broken)
+  hi(h, a3.tick)
+  hf(h, a3.speed)
+  # steady speeds (uniform wind) for the same structures: the thin one needs less
+  let v1 = breakSpeed(t1, 300.0)
+  let v2 = breakSpeed(t2, 600.0)
+  note("uniform wind: 1x1 snaps at " & $v1 & " b/s, 2x2 at " & $v2 & " b/s")
+  chk(v1 > 0.0 and (v2 < 0.0 or v2 > 1.3 * v1), "the 2x2 trunk needs a clearly stronger steady wind than the 1x1")
+  goldF("storm.uniform.log1x1", v1)
+  goldF("storm.uniform.log2x2", v2)
+  hf(h, v1)
+  hf(h, v2)
+  # the snapped trunk falls: the part above the break is a free set
+  let rb = runSolver(t1, stormLoads(t1, float64(a1.tick)))
+  if rb.components.len > 0:
+    let rep = dropComponents(t1.ids, t1.nx, t1.ny, t1.nz, brokenCells(rb), rb.components)
+    fallChecks("tree", rep, rb.broken.len)
+    goldI("storm.log1x1.fall.ticks", rep.maxTicks)
+    goldI("storm.log1x1.fall.minPlacedY", rep.minPlacedY)
+    hm(h, cast[int64](rep.hash))
+  else:
+    chk(false, "the snapped 1x1 trunk leaves a free piece to fall")
+  clearWeatherProvider()
+  setWindSeed(0)
+  return h
+
+# ---------------------------------------------------------------------------------------------------------------------
+# scene 5: fire
+
+var gAir = 0
+var gLog = 0
+
+proc fireMatOfState(state: int): FireMat =
+  let m = materialOf(state)
+  makeFireMat(m.flammability, m.ignitability, m.density, m.fill, m.matClass == mcVoid, isStructural(m))
+
+proc fireBurnt(state: int): int = gAir
+proc fireWet(x, y, z: int): float64 = 0.0
+proc fireWind(x, y, z: int): (float64, float64) = (0.0, 0.0)
+
+proc fireCallbacks(): FireCallbacks =
+  FireCallbacks(matOf: fireMatOfState, burntState: fireBurnt, wetAt: fireWet, windAt: fireWind)
+
+proc sceneFire*(): uint64 =
+  var h = hInit()
+  gAir = sid("air")
+  gLog = sid("oak_log")
+  let deck = 8
+  let withP = fireBridgeScene(deck, true)
+  let noP = fireBridgeScene(deck, false)
+  chk(not anyGone(runPlain(withP)), "the 8-long stone deck stands on its log pillar")
+  chk(anyGone(runPlain(noP)), "the same deck collapses without the pillar")
+  var sim = newFireSim(withP.nx, withP.ny, withP.nz, withP.ids, fireCallbacks(), 11'u64)
+  let mx = (deck + 1) div 2
+  for y in 1 .. 4: discard ignite(sim, mx, y, 1)
+  var t = 0
+  while sim.burning > 0 and t < 40000:
+    discard step(sim, 0)
+    inc t
+  let rem = takeRemoved(sim)
+  note("pillar burnt out in " & $t & " ticks, removed cells " & $rem.len & ", totalIgnited=" & $sim.totalIgnited & " totalBurnt=" & $sim.totalBurnt)
+  chk(rem.len == 4, "fire reports the 4 burnt pillar cells as removed")
+  chk(countState(sim, gLog) == 0, "every log cell burnt away")
+  goldI("fire.burnoutTicks", t)
+  goldI("fire.removedCells", rem.len)
+  goldI("fire.totalIgnited", sim.totalIgnited)
+  goldI("fire.totalBurnt", sim.totalBurnt)
+  hi(h, t)
+  hi(h, rem.len)
+  hi(h, sim.totalIgnited)
+  hi(h, sim.totalBurnt)
+  for c in rem: hi(h, c)
+  var after = newScene(withP.nx, withP.ny, withP.nz)
+  after.ids = sim.states
+  let r = runPlain(after)
+  note("re-solve after the fire: broken=" & $r.broken.len & " components=" & $r.components.len)
+  chk(anyGone(r), "the solver on the post-fire snapshot drops the deck")
+  goldI("fire.after.rounds", r.rounds)
+  goldI("fire.after.broken", r.broken.len)
+  goldI("fire.after.components", r.components.len)
+  goldI("fire.after.componentCells", compCellCount(r))
+  goldF("fire.after.maxRatio", r.maxRatio)
+  hSolver(h, r)
+  let rep = dropComponents(after.ids, after.nx, after.ny, after.nz, brokenCells(r), r.components)
+  fallChecks("fire deck", rep, r.broken.len)
+  note("fall: bodies=" & $rep.bodies & " ticks=" & $rep.maxTicks & " lowest placed y=" & $rep.minPlacedY & " impact=" & $rep.maxImpact & " kJ")
+  goldI("fire.fall.bodies", rep.bodies)
+  goldI("fire.fall.ticks", rep.maxTicks)
+  goldI("fire.fall.minPlacedY", rep.minPlacedY)
+  goldF("fire.fall.maxImpactKJ", rep.maxImpact)
+  hm(h, cast[int64](rep.hash))
+  return h
+
+# ---------------------------------------------------------------------------------------------------------------------
+# scene 6: blast
+
+var gBlastIds: seq[int] = @[]
+var gBlastNx = 0
+var gBlastNz = 0
+
+proc blastMatOf(id: int): BlastMat =
+  let m = materialOf(id)
+  let air = m.matClass == mcVoid
+  let solid = not (m.matClass == mcVoid or m.matClass == mcFluid or m.matClass == mcFoliage)
+  var mass = 0.0
+  if solid: mass = m.density * m.fill
+  return BlastMat(present: not air, solid: solid, liquid: m.liquid, resistance: resistanceFromBreakKJ(m.breakThreshold, m.liquid),
+                  state: id, mass: mass)
+
+proc blastCell(x, y, z: int): BlastMat = blastMatOf(gBlastIds[x + gBlastNx * (z + gBlastNz * y)])
+
+proc sceneBlast*(): uint64 =
+  var h = hInit()
+  let s = blastBridgeScene()
+  gBlastIds = s.ids
+  gBlastNx = s.nx
+  gBlastNz = s.nz
+  let before = runPlain(s)
+  chk(not anyGone(before), "control: the intact plank-post bridge stands")
+  var p = defaultBlastParams(2.5, 3.0, 2.5, 4.0, 0, 0, 0, s.nx, s.ny, s.nz, 2024'u64)
+  var targets: seq[BlastTarget] = @[]
+  let r = runBlast(p, blastCell, targets)
+  var planksGone = 0
+  let planks = sid("oak_planks")
+  for c in r.destroyed:
+    if s.ids[c] == planks: inc planksGone
+  note("TNT-sized blast (power 4): destroyed " & $r.destroyed.len & " cells (" & $planksGone & " planks), cracked " & $r.cracked.len & ", debris " & $r.debris.len)
+  chk(planksGone >= 4, "the blast removes the post and deck cells beside it")
+  goldI("blast.destroyed", r.destroyed.len)
+  goldI("blast.planksDestroyed", planksGone)
+  goldI("blast.cracked", r.cracked.len)
+  goldI("blast.debris", r.debris.len)
+  hi(h, r.destroyed.len)
+  for c in r.destroyed: hi(h, c)
+  hi(h, r.cracked.len)
+  for cc in r.cracked:
+    hi(h, cc.cell)
+    hf(h, cc.mult)
+  hi(h, r.debris.len)
+  for d in r.debris:
+    hi(h, d.cell)
+    hf(h, d.vx)
+    hf(h, d.vy)
+    hf(h, d.vz)
+  var inp = snapshotToSolverInput(s.ids, s.nx, s.ny, s.nz, adapterP(), floorAnchor)
+  let added = applyBlastToSolverInput(inp, r)
+  let after = solve(inp, adapterSolverParams())
+  note("solver on the remainder: rounds=" & $after.rounds & " broken=" & $after.broken.len & " components=" & $after.components.len & " weakened clones=" & $added)
+  chk(anyGone(after), "the damaged bridge fails in the solver")
+  goldI("blast.clones", added)
+  goldI("blast.after.rounds", after.rounds)
+  goldI("blast.after.broken", after.broken.len)
+  goldI("blast.after.components", after.components.len)
+  goldI("blast.after.componentCells", compCellCount(after))
+  goldF("blast.after.maxRatio", after.maxRatio)
+  hSolver(h, after)
+  var removed: seq[int] = @[]
+  for c in r.destroyed: removed.add c
+  for b in after.broken: removed.add b.cell
+  let rep = dropComponents(s.ids, s.nx, s.ny, s.nz, removed, after.components)
+  note("fall: bodies=" & $rep.bodies & " ticks=" & $rep.maxTicks & " lowest placed y=" & $rep.minPlacedY & " impact=" & $rep.maxImpact & " kJ")
+  if after.components.len > 0:
+    chk(rep.settled == rep.bodies, "blast: every fallen body settled (" & $rep.settled & " of " & $rep.bodies & ")")
+    chk(rep.cellsPlaced == rep.cellsIn, "blast: cell conservation, " & $rep.cellsIn & " fell, " & $rep.cellsPlaced & " came back")
+  var destroyedStruct = 0
+  for c in r.destroyed:
+    if structuralId(s.ids[c]): inc destroyedStruct
+  var brokenStruct = 0
+  for b in after.broken:
+    var dup = false
+    for c in r.destroyed:
+      if c == b.cell: dup = true
+    if not dup: inc brokenStruct
+  chk(rep.structAfter == rep.structBefore - destroyedStruct - brokenStruct, "blast: structural cells " & $rep.structBefore & " -> " & $rep.structAfter &
+      " (" & $destroyedStruct & " destroyed, " & $brokenStruct & " broken)")
+  goldI("blast.fall.bodies", rep.bodies)
+  goldI("blast.fall.ticks", rep.maxTicks)
+  goldI("blast.fall.minPlacedY", rep.minPlacedY)
+  goldI("blast.fall.structAfter", rep.structAfter)
+  hm(h, cast[int64](rep.hash))
+  return h
+
+# ---------------------------------------------------------------------------------------------------------------------
+# scene 7: climate
+
+proc sceneClimate*(): uint64 =
+  var h = hInit()
+  setYearDays(24.0)
+  let seed = 20240607
+  var n = 0
+  var rainAny = 0
+  var rainHeavy = 0
+  var thunderAny = 0
+  var thunderStrong = 0
+  var snowAny = 0
+  var winterSnow = 0
+  var summerSnow = 0
+  var summerThunder = 0
+  var winterThunder = 0
+  for place in 0 ..< 3:
+    let x = float64(place) * 7000.0 - 5000.0
+    let z = float64(place) * -4000.0 + 1500.0
+    var t = 0.0
+    while t < 100.0 * 24000.0:
+      let c = climateAt(seed, t, x, 63.0, z)
+      let sn = seasonOf(t)
+      inc n
+      if c.rain > 0.1: inc rainAny
+      if c.rain > 0.5: inc rainHeavy
+      if c.thunder > 0.1:
+        inc thunderAny
+        if sn == 1: inc summerThunder
+        if sn == 3: inc winterThunder
+      if c.thunder > 0.5: inc thunderStrong
+      if c.snow > 0.1:
+        inc snowAny
+        if sn == 3: inc winterSnow
+        if sn == 1: inc summerSnow
+      t += 120.0
+  let fr = float64(rainAny) / float64(n)
+  let fh = float64(rainHeavy) / float64(n)
+  let ft = float64(thunderAny) / float64(n)
+  let fs = float64(snowAny) / float64(n)
+  note("100 days x 3 places, " & $n & " samples: rain>0.1 " & $fr & " rain>0.5 " & $fh & " thunder>0.1 " & $ft & " snow>0.1 " & $fs)
+  chk(fr > 0.20 and fr < 0.45, "rain fraction inside its band 0.20..0.45")
+  chk(fh > 0.05 and fh < 0.25, "heavy rain fraction inside 0.05..0.25")
+  chk(ft > 0.02 and ft < 0.12, "thunder fraction inside 0.02..0.12")
+  chk(fs > 0.02 and fs < 0.12, "snow fraction inside 0.02..0.12")
+  chk(ft < fr, "thunder is rarer than rain")
+  chk(summerThunder >= winterThunder, "thunder at least as common in summer as in winter")
+  chk(winterSnow > summerSnow, "snow more common in winter than in summer")
+  goldI("climate.samples", n)
+  goldI("climate.rainAny", rainAny)
+  goldI("climate.rainHeavy", rainHeavy)
+  goldI("climate.thunderAny", thunderAny)
+  goldI("climate.thunderStrong", thunderStrong)
+  goldI("climate.snowAny", snowAny)
+  goldI("climate.summerThunder", summerThunder)
+  goldI("climate.winterSnow", winterSnow)
+  # one pinned sample of every field
+  let c = climateAt(seed, 123456.5, 77.25, 90.0, -1234.5)
+  goldF("climate.sample.temp", c.temp)
+  goldF("climate.sample.pressure", c.pressure)
+  goldF("climate.sample.windX", c.windX)
+  goldF("climate.sample.windZ", c.windZ)
+  hi(h, n)
+  hi(h, rainAny)
+  hi(h, rainHeavy)
+  hi(h, thunderAny)
+  hi(h, thunderStrong)
+  hi(h, snowAny)
+  hf(h, c.temp)
+  hf(h, c.pressure)
+  hf(h, c.windX)
+  hf(h, c.windZ)
+  # it feeds windfield: storms are windier than the calm field
+  setWindSeed(7)
+  clearWindTerrain()
+  clearWeatherProvider()
+  var calmSum = 0.0
+  var stormSum = 0.0
+  var k = 0
+  var t = 0.0
+  while t < 20.0 * 24000.0:
+    calmSum += windAtWorld(t, 10.5, 70.5, 10.5).speed
+    inc k
+    t += 600.0
+  setWeatherProvider(weatherProviderFor(seed, 10.5, 10.5))
+  t = 0.0
+  while t < 20.0 * 24000.0:
+    stormSum += windAtWorld(t, 10.5, 70.5, 10.5).speed
+    t += 600.0
+  clearWeatherProvider()
+  setWindSeed(0)
+  note("mean wind over 20 days: calm field " & $(calmSum / float64(k)) & " b/s, climate provider " & $(stormSum / float64(k)) & " b/s")
+  goldF("climate.windfield.meanCalm", calmSum / float64(k))
+  goldF("climate.windfield.meanProvider", stormSum / float64(k))
+  hf(h, calmSum)
+  hf(h, stormSum)
+  return h
+
+# ---------------------------------------------------------------------------------------------------------------------
+# scene 8: body mass, inertia, NBT
+
+proc sceneBodyMass*(): uint64 =
+  var h = hInit()
+  clearMaterialOverrides()
+  let stone = sid("stone")
+  let planks = sid("oak_planks")
+  let iron = sid("iron_block")
+  let slab = sid("oak_slab")
+  goldF("mat.stone.density", materialOf(stone).density)
+  goldF("mat.planks.density", materialOf(planks).density)
+  goldF("mat.iron.density", materialOf(iron).density)
+  goldF("mat.slab.fill", materialOf(slab).fill)
+  goldF("mat.stone.massOfState", massOfState(stone))
+  let b = newBody(0x0123456789ABCDEF'u64, 0xFEDCBA9876543210'u64)
+  for z in 0 .. 1:
+    for y in 0 .. 1:
+      for x in 0 .. 2:
+        var st = stone
+        if x == 1: st = planks
+        if x == 2 and y == 1: st = iron
+        if z == 1 and y == 1: st = slab
+        setCell(b, x, y, z, st)
+  setCell(b, -17, 20, 5, stone)
+  recomputeMass(b, defaultProps)
+  b.pos = vec3(10.5, 64.25, -3.0)
+  b.orient = qnormalize(Quat(w: 0.9, x: 0.1, y: -0.3, z: 0.2))
+  b.vel = vec3(0.01, -0.5, 0.0003)
+  b.angVel = vec3(0.001, 0.002, -0.003)
+  b.sleeping = true
+  b.sleepTicks = 12
+  goldI("body.cells", cellCount(b))
+  goldI("body.sections", b.sections.len)
+  goldF("body.mass", b.mass)
+  goldF("body.com.x", b.com.x)
+  goldF("body.com.y", b.com.y)
+  goldF("body.com.z", b.com.z)
+  goldF("body.inertia.xx", b.inertia[0])
+  goldF("body.inertia.yy", b.inertia[1])
+  goldF("body.inertia.zz", b.inertia[2])
+  goldF("body.inertia.xy", b.inertia[3])
+  goldF("body.inertia.xz", b.inertia[4])
+  goldF("body.inertia.yz", b.inertia[5])
+  hf(h, b.mass)
+  hVec(h, b.com)
+  for i in 0 ..< 6: hf(h, b.inertia[i])
+  # the mass is the sum of the table's cell masses
+  var sum = 0.0
+  for c in cellList(b): sum += massOfState(int(c.state))
+  chk(abs(sum - b.mass) < 1.0e-6 * b.mass, "body mass equals the sum of massOfState over its cells")
+  # NBT round trip, through the tag and through the byte codec
+  let tg = bodyToNbt(b)
+  let (ok1, back) = bodyFromNbt(tg, defaultProps)
+  chk(ok1 and sameVolumeAndPose(b, back), "NBT tag round trip: cells, pose, velocities, sleep")
+  chk(back.mass == b.mass and back.com.x == b.com.x and back.com.y == b.com.y and back.com.z == b.com.z, "mass and centre recomputed identically on load")
+  var inertiaSame = true
+  for i in 0 ..< 6: inertiaSame = inertiaSame and back.inertia[i] == b.inertia[i]
+  chk(inertiaSame, "inertia recomputed identically on load")
+  chk(NbtTag(kind: ntkCompound, compoundVal: bodyToNbt(back)) == NbtTag(kind: ntkCompound, compoundVal: tg), "save(load(save(b))) == save(b)")
+  var w = newNbtWriter(nwmJava)
+  chk(serialize(NbtTag(kind: ntkCompound, compoundVal: tg), w).isOk, "serialize to bytes")
+  var rd = newNbtReader(nrmJava, w.buf)
+  let dec = deserialize(rd)
+  chk(dec.isOk and dec.value.kind == ntkCompound, "deserialize from bytes")
+  let (ok2, back2) = bodyFromNbt(dec.value.compoundVal, defaultProps)
+  chk(ok2 and sameVolumeAndPose(b, back2), "byte round trip equal")
+  var bh = hInit()
+  for x in w.buf: hi(bh, int(x))
+  goldI("body.nbt.bytes", w.buf.len)
+  goldH("body.nbt.hash", bh)
+  hm(h, cast[int64](bh))
+  # break a cell and split: incremental mass equals a fresh recompute
+  let b2 = bodyFromCells(9'u64, 9'u64, cellList(b))
+  recomputeMass(b2, defaultProps)
+  let gone = [Cell(x: 1'i32, y: 0'i32, z: 0'i32, state: int32(planks)), Cell(x: 1'i32, y: 1'i32, z: 0'i32, state: int32(planks))]
+  let nGone = breakCells(b2, gone, defaultProps)
+  let fresh = bodyFromCells(9'u64, 9'u64, cellList(b2))
+  recomputeMass(fresh, defaultProps)
+  chk(nGone == 2 and abs(fresh.mass - b2.mass) < 1.0e-6 * b2.mass and abs(fresh.inertia[0] - b2.inertia[0]) < 1.0e-6 * fresh.inertia[0],
+      "incremental break equals a fresh recompute (mass and Ixx)")
+  let parts = splitBody(b2, defaultProps)
+  goldI("body.split.parts", parts.len)
+  goldF("body.afterBreak.mass", b2.mass)
+  goldF("body.afterBreak.inertia.xx", b2.inertia[0])
+  var pm = 0.0
+  for p in parts: pm += p.mass
+  chk(abs(pm - b2.mass) < 1.0e-6 * b2.mass, "the split pieces keep the total mass")
+  hi(h, parts.len)
+  hf(h, b2.mass)
+  return h
+
+# ---------------------------------------------------------------------------------------------------------------------
+# scene E: erosion (landslide volume conservation, earthquake cracks a bridge)
+
+proc hillScene(): Scene =
+  var s = newScene(14, 12, 14)
+  ground(s)
+  for y in 1 .. 6:
+    for z in 5 .. 7:
+      for x in 5 .. 7: put(s, x, y, z, "dirt")
+  return s
+
+proc sceneErosion*(): uint64 =
+  var h = hInit()
+  let dirt = sid("dirt")
+  # a 3x3x6 dirt tower on a stone floor slumps to its angle of repose, cell for cell
+  let hill = hillScene()
+  var sim = newErosionSim(hill.ids, hill.nx, hill.ny, hill.nz, 1234, defaultErosionParams())
+  let before = countState(sim, dirt)
+  let steps = relaxAll(sim, 4000, 400)
+  let after = countState(sim, dirt)
+  let slope = maxSpanSlope(sim)
+  let eout = drain(sim)
+  note("landslide: " & $steps & " steps, dirt " & $before & " -> " & $after & ", steepest span slope " & $slope & ", changes " & $eout.changes.len &
+       ", slab bodies " & $eout.bodies.len & ", moved " & $sim.movedCells)
+  var bodyCells = 0
+  for b in eout.bodies: bodyCells += b.cells.len
+  chk(before == after + bodyCells, "landslide conserves the dirt volume (" & $before & " = " & $after & " on the terrain + " & $bodyCells & " in slab bodies)")
+  let topH = columnHeight(sim, 6, 6)
+  chk(topH < 7 and eout.changes.len > 0, "the tower slumped (centre column " & $topH & " high, was 7)")
+  goldI("erosion.landslide.centreHeight", topH)
+  goldI("erosion.landslide.bodyCells", bodyCells)
+  goldI("erosion.landslide.dirtBefore", before)
+  goldI("erosion.landslide.dirtAfter", after)
+  goldI("erosion.landslide.steps", steps)
+  goldI("erosion.landslide.changes", eout.changes.len)
+  goldI("erosion.landslide.bodies", eout.bodies.len)
+  goldF("erosion.landslide.maxSpanSlope", slope)
+  goldI("erosion.landslide.movedCells", int(sim.movedCells))
+  hi(h, steps)
+  hi(h, after)
+  hf(h, slope)
+  hi(h, eout.changes.len)
+  for c in eout.changes:
+    hi(h, c.x)
+    hi(h, c.y)
+    hi(h, c.z)
+    hi(h, c.fromState)
+    hi(h, c.toState)
+  # a second sim with the same seed gives the same changes
+  var sim2 = newErosionSim(hill.ids, hill.nx, hill.ny, hill.nz, 1234, defaultErosionParams())
+  discard relaxAll(sim2, 4000, 400)
+  chk(sim2.ids == sim.ids, "the same seed gives the same relaxed terrain")
+  # an earthquake cracks the plank-post bridge, the solver re-runs on the weakened materials
+  let s = blastBridgeScene()
+  let intact = runPlain(s)
+  let q = Quake(x: 8.5, y: 1.0, z: 2.5, magnitude: 7.2, startTick: 0, duration: 300)
+  let qr = quakeCracks(s.ids, s.nx, s.ny, s.nz, q, 99)
+  var inp = snapshotToSolverInput(s.ids, s.nx, s.ny, s.nz, adapterP(), floorAnchor)
+  let added = applyBlastToSolverInput(inp, qr)
+  let res = solve(inp, adapterSolverParams())
+  note("M7.2 quake under the bridge: cracked " & $qr.cracked.len & " cells (" & $added & " weakened materials), maxRatio " & $intact.maxRatio & " -> " & $res.maxRatio &
+       ", broken " & $res.broken.len & ", components " & $res.components.len)
+  chk(qr.cracked.len > 0, "the quake cracks timber cells")
+  chk(not anyGone(intact) and anyGone(res), "the quake brings down a bridge that stood")
+  goldI("erosion.quake.cracked", qr.cracked.len)
+  goldI("erosion.quake.clones", added)
+  goldF("erosion.quake.maxRatioBefore", intact.maxRatio)
+  goldF("erosion.quake.maxRatioAfter", res.maxRatio)
+  goldI("erosion.quake.broken", res.broken.len)
+  goldI("erosion.quake.components", res.components.len)
+  hSolver(h, res)
+  hi(h, qr.cracked.len)
+  for cc in qr.cracked:
+    hi(h, cc.cell)
+    hf(h, cc.mult)
+  if res.components.len > 0:
+    let rep = dropComponents(s.ids, s.nx, s.ny, s.nz, brokenCells(res), res.components)
+    fallChecks("quake", rep, res.broken.len)
+    goldI("erosion.quake.fall.ticks", rep.maxTicks)
+    goldI("erosion.quake.fall.minPlacedY", rep.minPlacedY)
+    hm(h, cast[int64](rep.hash))
+  return h
+
+# ---------------------------------------------------------------------------------------------------------------------
+# scene 9 helpers: determinism
+
+## result hash of one solve of a scene, plain and sliced
+proc slicedHash*(s: Scene; loads: seq[ExtLoad]; budget: int): uint64 =
+  var h = hInit()
+  hSolver(h, solveSliced(s, loads, budget))
+  return h
+
+proc plainHash*(s: Scene; loads: seq[ExtLoad]): uint64 =
+  var h = hInit()
+  hSolver(h, runSolver(s, loads))
+  return h
+
+## blast result hash for a given slicing budget (<= 0 = in one go)
+proc blastHash*(budget: int): uint64 =
+  var h = hInit()
+  let s = blastBridgeScene()
+  gBlastIds = s.ids
+  gBlastNx = s.nx
+  gBlastNz = s.nz
+  let p = defaultBlastParams(2.5, 3.0, 2.5, 4.0, 0, 0, 0, s.nx, s.ny, s.nz, 2024'u64)
+  var targets: seq[BlastTarget] = @[]
+  var res: BlastResult
+  if budget <= 0:
+    res = runBlast(p, blastCell, targets)
+  else:
+    var j = newBlastJob(p, blastCell, targets)
+    while not stepBlast(j, budget): discard
+    res = j.res
+  hi(h, res.destroyed.len)
+  for c in res.destroyed: hi(h, c)
+  for cc in res.cracked:
+    hi(h, cc.cell)
+    hf(h, cc.mult)
+  for d in res.debris:
+    hi(h, d.cell)
+    hf(h, d.vx)
+    hf(h, d.vy)
+    hf(h, d.vz)
+  return h
+
+proc fireAfterScene*(): Scene =
+  gAir = sid("air")
+  let withP = fireBridgeScene(8, true)
+  var sim = newFireSim(withP.nx, withP.ny, withP.nz, withP.ids, fireCallbacks(), 11'u64)
+  for y in 1 .. 4: discard ignite(sim, 4, y, 1)
+  var t = 0
+  while sim.burning > 0 and t < 40000:
+    discard step(sim, 0)
+    inc t
+  var after = newScene(withP.nx, withP.ny, withP.nz)
+  after.ids = sim.states
+  return after
+
+# ---------------------------------------------------------------------------------------------------------------------
+# the golden table (measured on the first run of this suite; see GOLDEN-UPDATE)
+
+proc initGolden*() =
+  gKeys = @[]
+  gVals = @[]
+  gTols = @[]
+  gd("bridge.intact.maxRatio", 0.55775321875, 0.000001)
+  gd("bridge.cobble1.maxRatio", 0.9458702514423077, 0.000001)
+  gd("bridge.iron9.rounds", 2.0, 0.0)
+  gd("bridge.iron9.broken", 4.0, 0.0)
+  gd("bridge.iron9.firstFailX", 7.0, 0.0)
+  gd("bridge.iron9.firstFailRatio", 4.478527324519231, 0.000001)
+  gd("bridge.iron9.components", 1.0, 0.0)
+  gd("bridge.iron9.componentCells", 9.0, 0.0)
+  gd("bridge.fewestIron", 2.0, 0.0)
+  gd("bridge.fewestCobble", 2.0, 0.0)
+  gd("bridge.fall.bodies", 1.0, 0.0)
+  gd("bridge.fall.ticks", 83.0, 0.0)
+  gd("bridge.fall.minPlacedY", 1.0, 0.0)
+  gd("bridge.fall.impacts", 64.0, 0.0)
+  gd("bridge.fall.maxImpactKJ", 4388.492892538938, 0.000001)
+  gd("bridge.fall.structAfter", 69.0, 0.0)
+  gd("cantilever.6.self.maxRatio", 0.39839515625, 0.000001)
+  gd("cantilever.2.iron1.maxRatio", 0.16140111458333334, 0.000001)
+  gd("cantilever.6.iron1.firstX", 1.0, 0.0)
+  gd("cantilever.6.iron1.firstY", 4.0, 0.0)
+  gd("cantilever.6.iron1.firstRatio", 1.0726023437499999, 0.000001)
+  gd("cantilever.6.iron1.rounds", 2.0, 0.0)
+  gd("cantilever.6.iron1.broken", 1.0, 0.0)
+  gd("cantilever.6.iron1.components", 1.0, 0.0)
+  gd("cantilever.6.iron1.componentCells", 6.0, 0.0)
+  gd("cantilever.6.fewestIron", 1.0, 0.0)
+  gd("cantilever.2.fewestIron", 8.0, 0.0)
+  gd("cantilever.fall.ticks", 52.0, 0.0)
+  gd("cantilever.fall.minPlacedY", 1.0, 0.0)
+  gd("cantilever.fall.maxImpactKJ", 110.79697022763672, 0.000001)
+  gd("cavein.fourCorners.maxRatio", 0.17651969999999997, 0.000001)
+  gd("cavein.rounds", 2.0, 0.0)
+  gd("cavein.broken", 2.0, 0.0)
+  gd("cavein.components", 1.0, 0.0)
+  gd("cavein.componentCells", 23.0, 0.0)
+  gd("cavein.caveIns", 1.0, 0.0)
+  gd("cavein.roofGone", 25.0, 0.0)
+  gd("cavein.firstRatio", 1.765197, 0.000001)
+  gd("cavein.largestBodyMassKg", 66240.0, 0.000001)
+  gd("cavein.fall.bodies", 1.0, 0.0)
+  gd("cavein.fall.ticks", 31.0, 0.0)
+  gd("cavein.fall.minPlacedY", 1.0, 0.0)
+  gd("cavein.fall.impacts", 46.0, 0.0)
+  gd("cavein.fall.maxImpactKJ", 172.53321183770714, 0.000001)
+  gd("storm.ramp.windTop1200", 58.6690125358482, 0.000001)
+  gd("storm.ramp.peakTop", 105.19186778193456, 0.000001)
+  gd("storm.log1x1.snapTick", 950.0, 0.0)
+  gd("storm.log1x1.snapWind", 38.60929453244579, 0.000001)
+  gd("storm.log1x1.broken", 1.0, 0.0)
+  gd("storm.log2x2.snapTick", 1090.0, 0.0)
+  gd("storm.log2x2.snapWind", 49.45587456644368, 0.000001)
+  gd("storm.tree.snapTick", 740.0, 0.0)
+  gd("storm.tree.snapWind", 31.032083421398724, 0.000001)
+  gd("storm.tree.broken", 1.0, 0.0)
+  gd("storm.uniform.log1x1", 34.7900390625, 0.000001)
+  gd("storm.uniform.log2x2", 49.21875, 0.000001)
+  gd("storm.log1x1.fall.ticks", 203.0, 0.0)
+  gd("storm.log1x1.fall.minPlacedY", 1.0, 0.0)
+  gd("fire.burnoutTicks", 1494.0, 0.0)
+  gd("fire.removedCells", 4.0, 0.0)
+  gd("fire.totalIgnited", 4.0, 0.0)
+  gd("fire.totalBurnt", 4.0, 0.0)
+  gd("fire.after.rounds", 1.0, 0.0)
+  gd("fire.after.broken", 0.0, 0.0)
+  gd("fire.after.components", 1.0, 0.0)
+  gd("fire.after.componentCells", 8.0, 0.0)
+  gd("fire.after.maxRatio", 0.0018828768, 0.000001)
+  gd("fire.fall.bodies", 1.0, 0.0)
+  gd("fire.fall.ticks", 36.0, 0.0)
+  gd("fire.fall.minPlacedY", 1.0, 0.0)
+  gd("fire.fall.maxImpactKJ", 351.44144605745157, 0.000001)
+  gd("blast.destroyed", 32.0, 0.0)
+  gd("blast.planksDestroyed", 9.0, 0.0)
+  gd("blast.cracked", 9.0, 0.0)
+  gd("blast.debris", 21.0, 0.0)
+  gd("blast.clones", 8.0, 0.0)
+  gd("blast.after.rounds", 2.0, 0.0)
+  gd("blast.after.broken", 2.0, 0.0)
+  gd("blast.after.components", 1.0, 0.0)
+  gd("blast.after.componentCells", 9.0, 0.0)
+  gd("blast.after.maxRatio", 0.017706451388888888, 0.000001)
+  gd("blast.fall.bodies", 1.0, 0.0)
+  gd("blast.fall.ticks", 36.0, 0.0)
+  gd("blast.fall.minPlacedY", 1.0, 0.0)
+  gd("blast.fall.structAfter", 80.0, 0.0)
+  gd("climate.samples", 60000.0, 0.0)
+  gd("climate.rainAny", 19410.0, 0.0)
+  gd("climate.rainHeavy", 8815.0, 0.0)
+  gd("climate.thunderAny", 4349.0, 0.0)
+  gd("climate.thunderStrong", 1723.0, 0.0)
+  gd("climate.snowAny", 3543.0, 0.0)
+  gd("climate.summerThunder", 1986.0, 0.0)
+  gd("climate.winterSnow", 2579.0, 0.0)
+  gd("climate.sample.temp", 17.051457149261566, 0.000001)
+  gd("climate.sample.pressure", 1031.9235628190033, 0.000001)
+  gd("climate.sample.windX", 6.19430593665423, 0.000001)
+  gd("climate.sample.windZ", 1.0625010551617753, 0.000001)
+  gd("climate.windfield.meanCalm", 1.5261861069019893, 0.000001)
+  gd("climate.windfield.meanProvider", 5.338856851596302, 0.000001)
+  gd("mat.stone.density", 2880.0, 0.000001)
+  gd("mat.planks.density", 650.0, 0.000001)
+  gd("mat.iron.density", 3300.0, 0.000001)
+  gd("mat.slab.fill", 0.5, 0.000001)
+  gd("mat.stone.massOfState", 2880.0, 0.000001)
+  gd("body.cells", 13.0, 0.0)
+  gd("body.sections", 2.0, 0.0)
+  gd("body.mass", 23505.0, 0.000001)
+  gd("body.com.x", -0.6876196553924697, 0.000001)
+  gd("body.com.y", 3.282599446926186, 0.000001)
+  gd("body.com.z", 1.4268240799829823, 0.000001)
+  gd("body.inertia.xx", 1040920.7205913635, 0.000001)
+  gd("body.inertia.yy", 902094.23473729, 0.000001)
+  gd("body.inertia.zz", 1820709.180493512, 0.000001)
+  gd("body.inertia.xy", 893298.7364390555, 0.000001)
+  gd("body.inertia.xz", 211542.70580727505, 0.000001)
+  gd("body.inertia.yz", -228356.07104871306, 0.000001)
+  gd("body.nbt.bytes", 33138.0, 0.0)
+  gd("body.nbt.hash", 6624426914225000.0, 0.0)
+  gd("body.split.parts", 2.0, 0.0)
+  gd("body.afterBreak.mass", 22205.0, 0.000001)
+  gd("body.afterBreak.inertia.xx", 1032027.0864294828, 0.000001)
+  gd("determinism.bridge", 2977696732836831.0, 0.0)
+  gd("determinism.cavein", 3807423851573778.0, 0.0)
+  gd("determinism.fire", 6367510117543131.0, 0.0)
+  gd("determinism.all", 3372052622257393.0, 0.0)
+  gd("determinism.solve.bridge", 2216250547685305.0, 0.0)
+  gd("determinism.solve.cavein", 3529857759881693.0, 0.0)
+  gd("determinism.solve.postfire", 7500194537355089.0, 0.0)
+  gd("determinism.solve.windpillar", 5705763218851416.0, 0.0)
+  gd("determinism.blast", 3374700668195605.0, 0.0)
+  gd("erosion.landslide.centreHeight", 4.0, 0.0)
+  gd("erosion.landslide.bodyCells", 0.0, 0.0)
+  gd("erosion.landslide.dirtBefore", 54.0, 0.0)
+  gd("erosion.landslide.dirtAfter", 54.0, 0.0)
+  gd("erosion.landslide.steps", 1.0, 0.0)
+  gd("erosion.landslide.changes", 68.0, 0.0)
+  gd("erosion.landslide.bodies", 0.0, 0.0)
+  gd("erosion.landslide.maxSpanSlope", 2.0, 0.000001)
+  gd("erosion.landslide.movedCells", 34.0, 0.0)
+  gd("erosion.quake.cracked", 114.0, 0.0)
+  gd("erosion.quake.clones", 2.0, 0.0)
+  gd("erosion.quake.maxRatioBefore", 0.7436709583333333, 0.000001)
+  gd("erosion.quake.maxRatioAfter", 0.17706451388888889, 0.000001)
+  gd("erosion.quake.broken", 8.0, 0.0)
+  gd("erosion.quake.components", 2.0, 0.0)
+  gd("erosion.quake.fall.ticks", 36.0, 0.0)
+  gd("erosion.quake.fall.minPlacedY", 1.0, 0.0)
