@@ -125,6 +125,60 @@ proc propagate*(p: var LightPropagator, cache: LightCache) =
         if newLevel > 1'u8 and not containsOrIncl(p.visited, key):
           p.queue.addLast(PropagationEntry(pos: neighbor, hasSkip: true, skipDirection: opposite(dir)))
 
+type
+  GridSet = object
+    ## The positions of the cache's area as a bit set, for a generation pass: a hash set of packed positions was what most
+    ## of the time went on. Positions must be inside the cache (`inGrid`).
+    bits: seq[uint64]
+    baseX, baseZ, minY: int32
+    width, height: int32
+
+proc newGridSet(cache: LightCache): GridSet =
+  let w = cache.size * 16'i32
+  let h = height(cache)
+  GridSet(bits: newSeq[uint64](int((int64(w) * int64(w) * int64(h) + 63'i64) shr 6)), baseX: cache.x * 16'i32,
+    baseZ: cache.z * 16'i32, minY: bottomY(cache), width: w, height: h)
+
+proc containsOrInclGrid(g: var GridSet, x, y, z: int32): bool {.inline.} =
+  let i = (int64(x - g.baseX) * int64(g.width) + int64(z - g.baseZ)) * int64(g.height) + int64(y - g.minY)
+  let word = int(i shr 6)
+  let bit = 1'u64 shl uint64(i and 63'i64)
+  result = (g.bits[word] and bit) != 0'u64
+  g.bits[word] = g.bits[word] or bit
+
+proc propagateGrid(p: var LightPropagator, visited: var GridSet, cache: LightCache) =
+  ## `propagate` for a generation pass, with the visited set as a `GridSet`. Same visiting order and results.
+  let minY = bottomY(cache)
+  let maxY = minY + height(cache)
+  let loX = cache.x * 16'i32
+  let loZ = cache.z * 16'i32
+  let hiX = loX + cache.size * 16'i32
+  let hiZ = loZ + cache.size * 16'i32
+  while p.queue.len > 0:
+    let entry = p.queue.popFirst()
+    let pos = entry.pos
+    let currentLight = getLight(p.kind, cache, pos)
+    if currentLight <= 1'u8:
+      continue
+    for dir in AllDirections:
+      if entry.hasSkip and dir == entry.skipDirection:
+        continue
+      let neighbor = offsetPos(pos, dir)
+      if neighbor.y < minY or neighbor.y >= maxY or neighbor.x < loX or neighbor.x >= hiX or neighbor.z < loZ or
+          neighbor.z >= hiZ:
+        continue
+      let i = (int64(neighbor.x - visited.baseX) * int64(visited.width) + int64(neighbor.z - visited.baseZ)) *
+        int64(visited.height) + int64(neighbor.y - visited.minY)
+      if (visited.bits[int(i shr 6)] and (1'u64 shl uint64(i and 63'i64))) != 0'u64:
+        continue
+      let opac = opacity(blockStateAt(cache, neighbor.x, neighbor.y, neighbor.z))
+      let newLevel = propagateLevel(p.kind, currentLight, opac, dir)
+      let neighborLight = getLight(p.kind, cache, neighbor)
+      if newLevel > neighborLight:
+        setLight(p.kind, cache, neighbor, newLevel)
+        if newLevel > 1'u8 and not containsOrInclGrid(visited, neighbor.x, neighbor.y, neighbor.z):
+          p.queue.addLast(PropagationEntry(pos: neighbor, hasSkip: true, skipDirection: opposite(dir)))
+
 proc processDecreaseQueue*(p: var LightPropagator, cache: LightCache) =
   ## `LightPropagator::process_decrease_queue`
   while p.decreaseQueue.len > 0:
@@ -151,6 +205,7 @@ proc processDecreaseQueue*(p: var LightPropagator, cache: LightCache) =
 proc propagateBlockLight*(p: var LightPropagator, cache: LightCache) =
   ## `BlockLightPropagator::propagate_light`
   clear(p)
+  var visited = newGridSet(cache)
   let minY = bottomY(cache)
   let maxY = minY + height(cache)
   let centerX = cache.x + (cache.size div 2'i32)
@@ -169,12 +224,12 @@ proc propagateBlockLight*(p: var LightPropagator, cache: LightCache) =
         if emission > 0'u8:
           let pos = blockPos(x, y, z)
           setBlockLight(cache, pos, emission)
-          if not containsOrIncl(p.visited, posKey(pos)):
+          if not containsOrInclGrid(visited, x, y, z):
             p.queue.addLast(PropagationEntry(pos: pos, hasSkip: false, skipDirection: bdDown))
         inc x
       inc z
     inc y
-  propagate(p, cache)
+  propagateGrid(p, visited, cache)
 
 proc columnKey(x, z: int32): int64 {.inline.} =
   (int64(x) shl 32) xor (int64(z) and 0xFFFFFFFF'i64)
@@ -190,7 +245,8 @@ proc convertLight*(p: var LightPropagator, cache: LightCache) =
   let endZ = startZ + 18'i32
   let bottomYV = bottomY(cache)
   let maxY = bottomYV + height(cache)
-  var surfaceHeights = initTable[int64, int32]()
+  var visited = newGridSet(cache)
+  var surfaceHeights = newSeq[int32](18 * 18)
 
   var z = startZ
   while z < endZ:
@@ -201,7 +257,7 @@ proc convertLight*(p: var LightPropagator, cache: LightCache) =
       let chunkX = x shr 4
       let localX = int(x and 15'i32)
       let topY = topYAt(cache, x, z)
-      surfaceHeights[columnKey(x, z)] = topY
+      surfaceHeights[int((x - startX) * 18'i32 + (z - startZ))] = topY
       let relX = chunkX - cache.x
       let relZ = chunkZ - cache.z
       if relX < 0'i32 or relX >= cache.size or relZ < 0'i32 or relZ >= cache.size:
@@ -238,11 +294,11 @@ proc convertLight*(p: var LightPropagator, cache: LightCache) =
   while z < endZ:
     var x = startX
     while x < endX:
-      let topY = surfaceHeights.getOrDefault(columnKey(x, z), 0'i32)
-      let northTop = surfaceHeights.getOrDefault(columnKey(x, z - 1'i32), topY)
-      let southTop = surfaceHeights.getOrDefault(columnKey(x, z + 1'i32), topY)
-      let westTop = surfaceHeights.getOrDefault(columnKey(x - 1'i32, z), topY)
-      let eastTop = surfaceHeights.getOrDefault(columnKey(x + 1'i32, z), topY)
+      let topY = surfaceHeights[int((x - startX) * 18'i32 + (z - startZ))]
+      let northTop = if z - 1'i32 >= startZ: surfaceHeights[int((x - startX) * 18'i32 + (z - 1'i32 - startZ))] else: topY
+      let southTop = if z + 1'i32 < endZ: surfaceHeights[int((x - startX) * 18'i32 + (z + 1'i32 - startZ))] else: topY
+      let westTop = if x - 1'i32 >= startX: surfaceHeights[int((x - 1'i32 - startX) * 18'i32 + (z - startZ))] else: topY
+      let eastTop = if x + 1'i32 < endX: surfaceHeights[int((x + 1'i32 - startX) * 18'i32 + (z - startZ))] else: topY
       let maxCheckY = max(max(max(max(topY, northTop), southTop), westTop), eastTop)
       var y = maxCheckY
       while y >= bottomYV:
@@ -255,12 +311,12 @@ proc convertLight*(p: var LightPropagator, cache: LightCache) =
           continue
         let isAtSurface = y == topY
         let belowNeighbor = y < northTop or y < southTop or y < westTop or y < eastTop
-        if (isAtSurface or belowNeighbor) and not containsOrIncl(p.visited, posKey(pos)):
+        if (isAtSurface or belowNeighbor) and not containsOrInclGrid(visited, x, y, z):
           p.queue.addLast(PropagationEntry(pos: pos, hasSkip: y >= topY, skipDirection: bdUp))
         dec y
       inc x
     inc z
-  propagate(p, cache)
+  propagateGrid(p, visited, cache)
 
 proc newLightEngine*(): LightEngine =
   LightEngine(blockLight: newLightPropagator(lkBlock), skyLight: newLightPropagator(lkSky))
