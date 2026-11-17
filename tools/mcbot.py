@@ -2915,6 +2915,8 @@ def run(args):
     if args.engine_plugin:
         extra = list(extra) + {'actions': Stages.ENGINE_NAMES, 'kick': Stages.ENGINE_KICK_NAMES,
                                'events': Stages.ENGINE_EVENT_NAMES, 'showcase': Stages.ENGINE_SHOWCASE_NAMES}[args.engine_plugin]
+    if getattr(args, 'scenario', None):
+        extra = list(extra) + ['scenarios_done']
     if args.playa:
         extra = list(extra) + (Stages.PLAYA_LISTEN_NAMES if args.playa == 'listen' else Stages.PLAYA_NAMES)
     if args.c2_verify:
@@ -3036,7 +3038,7 @@ def run(args):
 
     # Configuration
     c.send(SB_CFG_INFO, client_information())
-    if getattr(args, 'engine_plugin', None) == 'showcase':
+    if getattr(args, 'engine_plugin', None) == 'showcase' or getattr(args, 'scenario', None):
         # the Jester handshake (overnight/PROTOCOL.md section 2): register, then hello offering every capability
         c.send(2, string('minecraft:register') + b'jester:welcome' + bytes([0]) + b'jester:wind' + bytes([0]))
         c.send(2, string('jester:hello') + bytes([1, 1, 1, 5]) + b'0.9.0' + struct.pack('>Q', 0x1F) + bytes([0xB0, 0xEA, 0x01]) +
@@ -3138,6 +3140,9 @@ def run(args):
         if args.playa:
             import mcbot_playa
             mcbot_playa.playa_session(sys.modules[__name__], c, st, w, biomes, ctx, args)
+        if args.scenario:
+            import mcbot_scenarios
+            mcbot_scenarios.run(sys.modules[__name__], c, st, w, biomes, ctx, args)
         if args.engine_plugin:
             import mcbot_engine
             mcbot_engine.engine_session(sys.modules[__name__], c, st, w, biomes, ctx, args)
@@ -3518,6 +3523,8 @@ def main():
     ap.add_argument('--assets', default=os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '..', 'ref', 'pumpkin-1.21.11', 'assets', 'blocks.json'), help='blocks.json of the pinned upstream, for --blocks')
     ap.add_argument('--playa', choices=['act', 'listen'], help='play packets as an operator: shift-click, drag split, tab completion and chat (act), or hear the actor chat (listen); see mcbot_playa.py')
     ap.add_argument('--engine-plugin', choices=['actions', 'kick', 'events', 'showcase'], help='a JavaScript plugin on the aoughwl engine acts on the player from chat (gamemode, teleport, position, cancel), or kicks it; see mcbot_engine.py')
+    ap.add_argument('--scenario', help='server-mod scenarios, comma separated or `all`: PASS / FAIL / INCONCLUSIVE per scenario; see mcbot_scenarios.py')
+    ap.add_argument('--scenario-plugins', action='store_true', help='with --scenario: the showcase plugins are loaded on the server (tools/run_scenarios.sh)')
     ap.add_argument('--c2', action='store_true', help='a sign with text, a bed slept in and a piston push; see mcbot_c2.py')
     ap.add_argument('--c2-verify', help='a file from --c2 --save: the sign, bed and piston are still there')
     ap.add_argument('--nbtfam', action='store_true', help='/data on storage and a chest and /execute store, over the wire; see mcbot_nbtfam.py')
