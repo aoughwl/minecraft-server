@@ -1,0 +1,194 @@
+## Invite codes (phase 3 #20): a short, typeable, checksummed string that carries where to connect and a join token.
+## Pure: bytes and strings only, no sockets, so `hostingtest.aowl` proves it on known answers. docs/DESIGN_20_HOSTING.md.
+##
+## Payload (before base32): byte0 = version<<4 | kind; kind 0 direct IPv4 (4 host bytes), 1 direct IPv6 (16), 2 relay room
+## (8 room bytes); direct kinds then carry the port u16 BE; every kind then a 4-byte token; finally CRC-16/CCITT-FALSE over
+## everything before it, big-endian. Text: Crockford base32 (no I L O U), groups of 5 separated by '-'. Decoding accepts
+## lower case, spaces and dashes, and reads O as 0 and I/L as 1.
+
+import std/strutils
+
+const
+  InviteVersion* = 1
+  KindDirect4* = 0
+  KindDirect6* = 1
+  KindRelay* = 2
+  Alphabet = "0123456789ABCDEFGHJKMNPQRSTVWXYZ"
+
+type
+  Invite* = object
+    kind*: int
+    host*: seq[byte]     ## 4 or 16 bytes for direct, 8 bytes (room id) for relay
+    port*: int           ## direct only
+    token*: seq[byte]    ## 4 bytes
+  InviteResult* = object
+    ok*: bool
+    error*: string
+    invite*: Invite
+
+proc crc16*(data: seq[byte]): int =
+  ## CRC-16/CCITT-FALSE: poly 0x1021, init 0xFFFF, no reflection, no final xor. "123456789" -> 0x29B1.
+  var crc = 0xFFFF
+  for b in data:
+    crc = crc xor (int(b) shl 8)
+    for i in 0 ..< 8:
+      if (crc and 0x8000) != 0:
+        crc = ((crc shl 1) xor 0x1021) and 0xFFFF
+      else:
+        crc = (crc shl 1) and 0xFFFF
+  crc
+
+proc base32Encode*(data: seq[byte]): string =
+  result = ""
+  var acc = 0
+  var bits = 0
+  for b in data:
+    acc = (acc shl 8) or int(b)
+    bits += 8
+    while bits >= 5:
+      result.add Alphabet[(acc shr (bits - 5)) and 31]
+      bits -= 5
+      acc = acc and ((1 shl bits) - 1)
+  if bits > 0:
+    result.add Alphabet[(acc shl (5 - bits)) and 31]
+
+proc base32Value(c: char): int =
+  var u = c
+  if u >= 'a' and u <= 'z':
+    u = char(int(u) - 32)
+  if u == 'O': u = '0'
+  if u == 'I' or u == 'L': u = '1'
+  for i in 0 ..< Alphabet.len:
+    if Alphabet[i] == u:
+      return i
+  -1
+
+proc base32Decode*(text: string; ok: var bool): seq[byte] =
+  ## Ignores '-' and spaces. ok = false on a bad character or non-zero pad bits (a non-canonical string).
+  result = @[]
+  ok = true
+  var acc = 0
+  var bits = 0
+  for c in text:
+    if c == '-' or c == ' ':
+      continue
+    let v = base32Value(c)
+    if v < 0:
+      ok = false
+      return @[]
+    acc = (acc shl 5) or v
+    bits += 5
+    if bits >= 8:
+      result.add byte((acc shr (bits - 8)) and 255)
+      bits -= 8
+      acc = acc and ((1 shl bits) - 1)
+  if acc != 0:
+    ok = false
+
+proc payloadOf(inv: Invite): seq[byte] =
+  result = @[]
+  result.add byte((InviteVersion shl 4) or inv.kind)
+  for b in inv.host: result.add b
+  if inv.kind != KindRelay:
+    result.add byte((inv.port shr 8) and 255)
+    result.add byte(inv.port and 255)
+  for b in inv.token: result.add b
+
+proc validate(inv: Invite): string =
+  if inv.kind < 0 or inv.kind > 2: return "unknown kind"
+  if inv.kind == KindDirect4 and inv.host.len != 4: return "IPv4 address must be 4 bytes"
+  if inv.kind == KindDirect6 and inv.host.len != 16: return "IPv6 address must be 16 bytes"
+  if inv.kind == KindRelay and inv.host.len != 8: return "relay room id must be 8 bytes"
+  if inv.kind != KindRelay and (inv.port < 1 or inv.port > 65535): return "port out of range"
+  if inv.token.len != 4: return "token must be 4 bytes"
+  ""
+
+proc groupBy5(s: string): string =
+  result = ""
+  for i in 0 ..< s.len:
+    if i > 0 and i mod 5 == 0:
+      result.add '-'
+    result.add s[i]
+
+proc encodeInvite*(inv: Invite): string =
+  ## "" when the invite is malformed (see `validate`).
+  if validate(inv).len > 0:
+    return ""
+  var p = payloadOf(inv)
+  let c = crc16(p)
+  p.add byte((c shr 8) and 255)
+  p.add byte(c and 255)
+  groupBy5(base32Encode(p))
+
+proc decodeInvite*(text: string): InviteResult =
+  var ok = false
+  let raw = base32Decode(text, ok)
+  if not ok:
+    return InviteResult(ok: false, error: "not a valid invite code (bad character)")
+  if raw.len < 3:
+    return InviteResult(ok: false, error: "invite code too short")
+  var chars = 0
+  for c in text:
+    if c != '-' and c != ' ': inc chars
+  if chars != (raw.len * 8 + 4) div 5:
+    return InviteResult(ok: false, error: "invite code has extra characters")
+  let body = raw[0 ..< raw.len - 2]
+  let want = (int(raw[raw.len - 2]) shl 8) or int(raw[raw.len - 1])
+  if crc16(body) != want:
+    return InviteResult(ok: false, error: "invite code checksum mismatch (typo?)")
+  if (int(body[0]) shr 4) != InviteVersion:
+    return InviteResult(ok: false, error: "unsupported invite version " & $(int(body[0]) shr 4))
+  let kind = int(body[0]) and 15
+  var addrLen = 0
+  if kind == KindDirect4: addrLen = 4
+  elif kind == KindDirect6: addrLen = 16
+  elif kind == KindRelay: addrLen = 8
+  else: return InviteResult(ok: false, error: "unknown invite kind " & $kind)
+  let portLen = if kind == KindRelay: 0 else: 2
+  if body.len != 1 + addrLen + portLen + 4:
+    return InviteResult(ok: false, error: "invite code has the wrong length")
+  var inv = Invite(kind: kind)
+  for i in 0 ..< addrLen: inv.host.add body[1 + i]
+  if portLen == 2:
+    inv.port = (int(body[1 + addrLen]) shl 8) or int(body[2 + addrLen])
+  for i in 0 ..< 4: inv.token.add body[1 + addrLen + portLen + i]
+  let bad = validate(inv)
+  if bad.len > 0:
+    return InviteResult(ok: false, error: bad)
+  InviteResult(ok: true, invite: inv)
+
+proc parseIPv4*(s: string; outAddr: var seq[byte]): bool =
+  outAddr.setLen(0)
+  let parts = s.split('.')
+  if parts.len != 4: return false
+  for p in parts:
+    if p.len == 0 or p.len > 3: return false
+    var v = 0
+    for c in p:
+      if c < '0' or c > '9': return false
+      v = v * 10 + (int(c) - int('0'))
+    if v > 255: return false
+    outAddr.add byte(v)
+  true
+
+proc hexLower*(v, width: int): string =
+  result = ""
+  const digits = "0123456789abcdef"
+  var i = width - 1
+  while i >= 0:
+    result.add digits[(v shr (4 * i)) and 15]
+    dec i
+
+proc formatInviteAddress*(inv: Invite): string =
+  ## "a.b.c.d:port" for IPv4; IPv6 as eight hex groups in brackets; "relay:<hex room>" for a relay.
+  if inv.kind == KindDirect4:
+    return $int(inv.host[0]) & "." & $int(inv.host[1]) & "." & $int(inv.host[2]) & "." & $int(inv.host[3]) & ":" & $inv.port
+  if inv.kind == KindDirect6:
+    var text = "["
+    for i in 0 ..< 8:
+      if i > 0: text.add ':'
+      text.add hexLower((int(inv.host[2 * i]) shl 8) or int(inv.host[2 * i + 1]), 4)
+    return text & "]:" & $inv.port
+  var h = ""
+  for b in inv.host: h.add hexLower(int(b), 2)
+  "relay:" & h

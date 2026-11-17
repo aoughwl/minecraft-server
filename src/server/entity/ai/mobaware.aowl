@@ -1,0 +1,147 @@
+## Mob awareness of block bodies and weather (phase 3 #15, increment 1).
+##
+## Two things, both reached through seams that already exist:
+##   * Bodies. pathfinder/pathfinding_context.aowl asks the collision-provider registry (entity/collision_providers.aowl)
+##     whether a body fills an air cell, so every navigator already walks around, onto or over bodies. This module reuses the
+##     same query for the shelter search: a body roof keeps rain off, a body deck is a floor.
+##   * Weather. `SeekShelterGoal` walks a mob out of the rain to the nearest covered, standable cell.
+##
+## Deterministic by construction (no random draws): ring order, then lowest dy, then lowest z, then lowest x.
+## Everything here runs on the tick thread. See docs/DESIGN_15_MOB_AI.md for what is not done (worker threads, flocking,
+## wind-aware paths).
+
+import std/[math, options]
+import ../../../data/block_ext
+from ../../../data/block_state import newBlockStateIdUnchecked, BlockState, collisionShapes
+import ../../../generated/[fluid, tag]
+import ../../world/worldmod
+import ../collision_providers
+import ../../../util/math/boundingbox
+import aibase
+
+const
+  ## How far above a cell a roof still counts. Rain-blocking terrain is nearly always within this; documented limit.
+  CoverScanHeight* = 32'i32
+  ShelterRadius* = 16'i32
+  ShelterRecheckTicks* = 40'i32
+
+type ShelterResult* = object
+  found*: bool
+  pos*: BlockPos   ## the standable feet cell
+  dist2*: int32    ## squared horizontal distance from the search origin
+
+proc bp(x, y, z: int32): BlockPos =
+  BlockPos(vec: Vector3[int32](x: x, y: y, z: z))
+
+proc cellBox(x, y, z: int32; height: int32 = 1'i32): BoundingBox =
+  newBoundingBox(Vector3[float64](x: float64(x), y: float64(y), z: float64(z)),
+    Vector3[float64](x: float64(x) + 1.0'f64, y: float64(y + height), z: float64(z) + 1.0'f64))
+
+proc blockStopsRain(world: World; x, y, z: int32): bool =
+  let stateId = newBlockStateIdUnchecked(uint16(world.getBlockStateId(bp(x, y, z))))
+  let state = BlockState.fromId(stateId)
+  if state.collisionShapes.len > 0:
+    return true
+  let fluid = Fluid.fromStateId(stateId)
+  fluid.isSome and (hasTag(fluid.unsafeGet.id, Fluid_MINECRAFT_WATER) or hasTag(fluid.unsafeGet.id, Fluid_MINECRAFT_LAVA))
+
+proc isCoveredFromRain*(world: World; x, y, z: int32): bool =
+  ## True when something above the cell (a block with collision, a fluid, or a collision-provider body) keeps rain off it.
+  let top = min(y + CoverScanHeight, world.getTopY())
+  var cy = y + 1'i32
+  while cy <= top:
+    if blockStopsRain(world, x, cy, z):
+      return true
+    inc cy
+  if gCollisionProviders.len > 0 and y < top:
+    return providedSpaceBlocked(newBoundingBox(Vector3[float64](x: float64(x), y: float64(y + 1), z: float64(z)),
+      Vector3[float64](x: float64(x) + 1.0'f64, y: float64(top + 1), z: float64(z) + 1.0'f64)), 0'i32)
+  false
+
+proc isFreeCell(world: World; x, y, z: int32): bool =
+  ## Passable for a 2-high mob: no collision block, no fluid, no body in the cell.
+  not blockStopsRain(world, x, y, z) and not (gCollisionProviders.len > 0 and providedSpaceBlocked(cellBox(x, y, z), 0'i32))
+
+proc hasFloor(world: World; x, y, z: int32): bool =
+  ## Something to stand on right under the feet cell: a collision block or a body box in the cell below.
+  let stateId = newBlockStateIdUnchecked(uint16(world.getBlockStateId(bp(x, y - 1'i32, z))))
+  if BlockState.fromId(stateId).collisionShapes.len > 0:
+    return true
+  gCollisionProviders.len > 0 and providedSpaceBlocked(cellBox(x, y - 1'i32, z), 0'i32)
+
+proc isStandable*(world: World; x, y, z: int32): bool =
+  isFreeCell(world, x, y, z) and isFreeCell(world, x, y + 1'i32, z) and hasFloor(world, x, y, z)
+
+proc findShelter*(world: World; fromPos: BlockPos; radius: int32 = ShelterRadius): ShelterResult =
+  ## Nearest standable, rain-covered cell within `radius` horizontally and two cells vertically. `found` false if none.
+  let fx = fromPos.vec.x
+  let fy = fromPos.vec.y
+  let fz = fromPos.vec.z
+  var best = ShelterResult(found: false, pos: fromPos, dist2: high(int32))
+  for dx in -radius .. radius:
+    for dz in -radius .. radius:
+      let d2 = dx * dx + dz * dz
+      if d2 > radius * radius or d2 > best.dist2:
+        continue
+      for dy in [0'i32, -1'i32, 1'i32, -2'i32, 2'i32]:
+        let x = fx + dx
+        let y = fy + dy
+        let z = fz + dz
+        if not isStandable(world, x, y, z):
+          continue
+        if not isCoveredFromRain(world, x, y, z):
+          continue
+        # Strictly nearer, or equal distance and earlier in (dy order, z, x): the loops already visit z then x ascending
+        # inside one dy, so only a strict improvement replaces the holder.
+        if d2 < best.dist2:
+          best = ShelterResult(found: true, pos: bp(x, y, z), dist2: d2)
+        break
+  best
+
+type
+  SeekShelterGoal* = ref object of Goal
+    speed: float64
+    target: Option[BlockPos]
+    lastCheck: int32
+
+proc mobCell(mob: Mob): BlockPos =
+  let e = mob.mobEntity.livingEntity.entity
+  bp(int32(floor(e.pos.x)), int32(floor(e.pos.y)), int32(floor(e.pos.z)))
+
+proc makeVt(): GoalVt =
+  result = newGoalVt()
+  result.canStart = proc(self: Goal; mob: Mob): bool {.closure.} =
+    let s = SeekShelterGoal(self)
+    let entity = mob.mobEntity.livingEntity.entity
+    if not entity.world.weather.raining or entity.touchingWater:
+      return false
+    if entity.age - s.lastCheck < ShelterRecheckTicks and s.lastCheck != 0'i32:
+      return false
+    s.lastCheck = entity.age
+    let cell = mobCell(mob)
+    if isCoveredFromRain(entity.world, cell.vec.x, cell.vec.y, cell.vec.z):
+      return false
+    let r = findShelter(entity.world, cell)
+    if not r.found:
+      return false
+    s.target = some(r.pos)
+    true
+  result.shouldContinue = proc(self: Goal; mob: Mob): bool {.closure.} =
+    mob.mobEntity.livingEntity.entity.world.weather.raining and not mob.mobEntity.navigator.isIdle()
+  result.start = proc(self: Goal; mob: Mob) {.closure.} =
+    let s = SeekShelterGoal(self)
+    if s.target.isSome:
+      let t = s.target.unsafeGet.vec
+      mob.mobEntity.navigator.setProgress(newNavigatorGoal(mob.mobEntity.livingEntity.entity.pos,
+        Vector3[float64](x: float64(t.x) + 0.5'f64, y: float64(t.y), z: float64(t.z) + 0.5'f64), s.speed))
+  result.stop = proc(self: Goal; mob: Mob) {.closure.} =
+    let s = SeekShelterGoal(self)
+    s.target = none[BlockPos]()
+  result.controls = proc(self: Goal): Controls {.closure.} = ControlsMove
+
+let seekShelterGoalVt* = makeVt()
+
+proc newSeekShelterGoal*(speed: float64): SeekShelterGoal =
+  SeekShelterGoal(vt: seekShelterGoalVt, speed: speed, target: none[BlockPos](), lastCheck: 0'i32)
+
+proc shelterTarget*(self: SeekShelterGoal): Option[BlockPos] = self.target

@@ -1,0 +1,125 @@
+## Region sharding planner (phase 3 #17, increment 1): pure, no threads, no world access.
+##
+## Given the set of active chunks and the interaction margin (how far, in chunks, something simulated in one chunk can read or
+## write), it answers "which chunks may be simulated at the same time without touching each other's data":
+##   * `planPhases`: square tiles of `tileSize` chunks, coloured by tile parity (4 colours). Tiles of one colour are separated by
+##     a whole tile, so with `tileSize > 2 * margin` no chunk of one tile is within `2 * margin` chunks (Chebyshev) of a chunk
+##     of another tile of the same colour: their read/write footprints cannot overlap. Run the 4 phases one after the other;
+##     inside a phase the tiles are independent shards. Deterministic order.
+##   * `connectedShards`: connected components under "within `margin` chunks", for worlds that are naturally islands of activity.
+## Nothing here is wired into the tick loop: the server's shared refcounted chunk data is not thread safe (see
+## server/pumpkinlib.aowl and docs/DESIGN_17_REGION_SHARDING.md).
+
+import std/tables
+
+type
+  ChunkCoord* = object
+    x*: int
+    z*: int
+  Shard* = object
+    tileX*: int
+    tileZ*: int
+    chunks*: seq[ChunkCoord]
+  Phase* = object
+    color*: int            ## 0..3
+    shards*: seq[Shard]
+
+proc floorDiv(a, b: int): int =
+  if a >= 0: a div b else: -((-a + b - 1) div b)
+
+proc tileColor*(tx, tz: int): int =
+  (tx and 1) or ((tz and 1) shl 1)
+
+proc validTileSize*(tileSize, margin: int): bool =
+  tileSize > 2 * margin and margin >= 0
+
+proc key(x, z: int): int64 = (int64(x) shl 32) xor (int64(z) and 0xFFFFFFFF'i64)
+
+proc planPhases*(active: seq[ChunkCoord]; tileSize, margin: int): seq[Phase] =
+  ## Empty when the parameters are unsafe (`validTileSize` false). Phases with no tiles are omitted. Shards are ordered by (tileZ,
+  ## tileX), chunks inside a shard by (z, x).
+  result = @[]
+  if not validTileSize(tileSize, margin):
+    return
+  var tiles = initTable[int64, Shard]()
+  var order: seq[(int, int)] = @[]
+  for c in active:
+    let tx = floorDiv(c.x, tileSize)
+    let tz = floorDiv(c.z, tileSize)
+    let k = key(tx, tz)
+    if not tiles.hasKey(k):
+      tiles[k] = Shard(tileX: tx, tileZ: tz, chunks: @[])
+      order.add (tx, tz)
+    var s = tiles.getOrDefault(k)
+    s.chunks.add c
+    tiles[k] = s
+  # insertion sort by (tz, tx): the tile count is small.
+  for i in 1 ..< order.len:
+    let v = order[i]
+    var j = i - 1
+    while j >= 0 and (order[j][1] > v[1] or (order[j][1] == v[1] and order[j][0] > v[0])):
+      let moved = order[j]
+      order[j + 1] = moved
+      dec j
+    order[j + 1] = v
+  for color in 0 ..< 4:
+    var ph = Phase(color: color, shards: @[])
+    for t in order:
+      if tileColor(t[0], t[1]) == color:
+        var s = tiles.getOrDefault(key(t[0], t[1]))
+        for i in 1 ..< s.chunks.len:
+          let v = s.chunks[i]
+          var j = i - 1
+          while j >= 0 and (s.chunks[j].z > v.z or (s.chunks[j].z == v.z and s.chunks[j].x > v.x)):
+            let moved = s.chunks[j]
+            s.chunks[j + 1] = moved
+            dec j
+          s.chunks[j + 1] = v
+        ph.shards.add s
+    if ph.shards.len > 0:
+      result.add ph
+
+proc find(parent: var seq[int]; i: int): int =
+  var r = i
+  while parent[r] != r:
+    r = parent[r]
+  var c = i
+  while parent[c] != r:
+    let nx = parent[c]
+    parent[c] = r
+    c = nx
+  r
+
+proc connectedShards*(active: seq[ChunkCoord]; margin: int): seq[seq[ChunkCoord]] =
+  ## Components of the "within `margin` chunks (Chebyshev)" graph; chunks in input order inside a component, components ordered
+  ## by their first chunk. Duplicates in `active` are kept as separate entries of the same component.
+  result = @[]
+  let n = active.len
+  var parent: seq[int] = @[]
+  for i in 0 ..< n: parent.add i
+  var grid = initTable[int64, seq[int]]()
+  for i in 0 ..< n:
+    let k = key(active[i].x, active[i].z)
+    if grid.hasKey(k):
+      var l = grid.getOrDefault(k)
+      l.add i
+      grid[k] = l
+    else:
+      grid[k] = @[i]
+  for i in 0 ..< n:
+    for dx in -margin .. margin:
+      for dz in -margin .. margin:
+        let k = key(active[i].x + dx, active[i].z + dz)
+        if grid.hasKey(k):
+          for j in grid.getOrDefault(k):
+            let a = find(parent, i)
+            let b = find(parent, j)
+            if a != b:
+              if a < b: parent[b] = a else: parent[a] = b
+  var slot = initTable[int, int]()
+  for i in 0 ..< n:
+    let r = find(parent, i)
+    if not slot.hasKey(r):
+      slot[r] = result.len
+      result.add(newSeq[ChunkCoord]())
+    result[slot.getOrDefault(r)].add active[i]
