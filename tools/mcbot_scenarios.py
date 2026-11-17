@@ -777,6 +777,145 @@ def phys_erosion(s):
     s.check(_num(st3, r'([0-9]+) cells changed') == 0, 'stone stays: %r' % st3)
 
 
+# ---- Fabric gaps (docs/FABRIC_GAPS.md): driven by tools/run_fabric_live.py, which sets the environment ----------------------------
+
+@scenario('world_flat')
+def world_flat(s):
+    """On a server whose world_type is "flat" the column under the player is bedrock, dirt, dirt, grass and then air only."""
+    import os
+    if os.environ.get('EXPECT_WORLD_TYPE') != 'flat':
+        s.inconclusive('the server is not a flat world (EXPECT_WORLD_TYPE=flat not set)')
+    s.wait(lambda: s.position() is not None and s.chunks() > 4, 'the world', 60.0)
+    x, z = int(s.position()[0]), int(s.position()[2])
+    s.wait(lambda: s.block(x, -64, z) is not None, 'the spawn column', 30.0)
+    col = [s.block(x, y, z) for y in range(-64, 40)]
+    solid = [i for i, b in enumerate(col) if b]
+    print('  flat column at %d,%d: solid cells %s (y %d..%d)' % (x, z, len(solid), -64 + solid[0] if solid else 0, -64 + solid[-1] if solid else 0), flush=True)
+    s.check(solid == [0, 1, 2, 3], 'a flat world has exactly 4 solid layers at y -64..-61, got solid indexes %s' % solid)
+    s.check(col[1] == col[2] and col[0] != col[1] and col[3] != col[2], 'layers are bedrock, dirt, dirt, grass (distinct states)')
+
+
+@scenario('terrain_world')
+def terrain_world(s):
+    """On a noise world (default, amplified, large_biomes) the spawn column is solid from the bottom to well above y=60."""
+    import os
+    if os.environ.get('EXPECT_WORLD_TYPE') not in ('default', 'amplified', 'large_biomes'):
+        s.inconclusive('EXPECT_WORLD_TYPE is not default/amplified/large_biomes')
+    s.wait(lambda: s.position() is not None and s.chunks() > 20, 'the world', 120.0)
+    x, z = int(s.position()[0]), int(s.position()[2])
+    col = [s.block(x, y, z) for y in range(-60, 100)]
+    solid = sum(1 for b in col if b)
+    print('  %s world: %d chunk columns, %d solid cells in the spawn column' % (os.environ.get('EXPECT_WORLD_TYPE'), s.chunks(), solid), flush=True)
+    s.check(solid > 60, 'a noise world has a deep solid column below the surface')
+
+
+@scenario('player_roundtrip_set')
+def player_roundtrip_set(s):
+    """Phase A: creative, 7 diamonds, an obsidian stack in the ender chest, moved to 12 90 -34."""
+    import os
+    if os.environ.get('PHASE') != 'set':
+        s.inconclusive('PHASE=set not given')
+    s.wait(lambda: s.position() is not None and s.chunks() > 4, 'the world', 60.0)
+    n = len(s.w.chat)
+    s.command('gamemode creative')
+    s.command('give %s minecraft:diamond 7' % os.environ.get('BOT', 'ScenBot'))
+    s.command('item replace entity %s enderchest.3 with minecraft:obsidian 5' % os.environ.get('BOT', 'ScenBot'))
+    s.command('tp %s 12 90 -34' % os.environ.get('BOT', 'ScenBot'))
+    s.wait(lambda: abs(s.position()[0] - 12.0) < 1.5 and abs(s.position()[2] + 34.0) < 1.5, 'the teleport', 20.0)
+    s.command('data get entity %s EnderItems' % os.environ.get('BOT', 'ScenBot'))
+    s.expect('obsidian', 'the ender chest holds obsidian before saving', 20.0, since=n)
+    s.command('save-all')
+    s.wait(lambda: True, 'a moment', 1.0)
+
+
+@scenario('player_roundtrip_check')
+def player_roundtrip_check(s):
+    """Phase B (after a stop and a restart): the same player rejoins at 12 90 -34, creative, with the diamonds and the ender chest."""
+    import os
+    if os.environ.get('PHASE') != 'check':
+        s.inconclusive('PHASE=check not given')
+    bot = os.environ.get('BOT', 'ScenBot')
+    s.wait(lambda: s.position() is not None, 'a position', 60.0)
+    p = s.position()
+    print('  rejoined at %.2f %.2f %.2f' % tuple(p[:3]), flush=True)
+    s.check(abs(p[0] - 12.0) < 2.0 and abs(p[2] + 34.0) < 2.0 and p[1] > 60.0, 'the saved position (12, 90, -34) was restored, got %s' % (p[:3],))
+    n = len(s.w.chat)
+    s.command('data get entity %s Inventory' % bot)
+    said = s.expect('diamond', 'the diamonds after the restart', 20.0, since=n)
+    s.check('7' in said, 'seven diamonds: %s' % said)
+    n = len(s.w.chat)
+    s.command('data get entity %s playerGameType' % bot)
+    s.wait(lambda: len(s.w.chat) > n, 'the game mode answer', 20.0)
+    said = s.w.chat[n]
+    print('  game mode answer: %r' % said, flush=True)
+    s.check(' %s 1 ' % bot in said or said.rstrip().endswith(' 1'), 'creative game mode (1): %s' % said)
+    n = len(s.w.chat)
+    s.command('data get entity %s EnderItems' % bot)
+    s.expect('obsidian', 'the ender chest kept its obsidian', 20.0, since=n)
+
+@scenario('stop_server')
+def stop_server(s):
+    """Stops the (scratch) server through its own /stop, the graceful path that saves everything; only when asked for."""
+    import os
+    if os.environ.get('STOP_SERVER') != '1':
+        s.inconclusive('STOP_SERVER=1 not given')
+    s.command('stop')
+    try:
+        s.wait(lambda: False, 'the server to stop', 4.0)
+    except Exception:
+        pass   # the connection ends with the server: that is the point
+
+@scenario('java_world_join')
+def java_world_join(s):
+    """A Java-format save (copied): the saved player rejoins where the save put him, with the saved inventory, and chunks load."""
+    import os
+    if os.environ.get('EXPECT_POS') is None:
+        s.inconclusive('EXPECT_POS=x,y,z not given')
+    bot = os.environ.get('BOT', 'ScenBot')
+    if os.environ['EXPECT_POS'] == 'any':
+        # a player the save does not know (the test bot cannot parse the saved player's item components): only the world is checked
+        s.wait(lambda: s.position() is not None and s.chunks() > 20, 'chunks of the Java world', 120.0)
+        p = s.position()
+        x, z = int(p[0]), int(p[2])
+        col = [s.block(x, y, z) for y in range(-60, 120)]
+        solid = sum(1 for v in col if v)
+        print('  joined at %.1f %.1f %.1f, %d chunk columns, %d solid cells in this column of the copied Java world' % (p[0], p[1], p[2], s.chunks(), solid), flush=True)
+        s.check(solid > 20, 'the copied Java world has terrain under the spawn')
+        return
+    ex, ey, ez = [float(v) for v in os.environ['EXPECT_POS'].split(',')]
+    s.wait(lambda: s.position() is not None and s.chunks() > 20, 'the saved position and chunks', 120.0)
+    p = s.position()
+    print('  joined at %.2f %.2f %.2f with %d chunk columns (save says %.2f %.2f %.2f)' % (p[0], p[1], p[2], s.chunks(), ex, ey, ez), flush=True)
+    s.check(abs(p[0] - ex) < 1.0 and abs(p[2] - ez) < 1.0, 'the saved position was restored')
+    n = len(s.w.chat)
+    s.command('data get entity %s Inventory' % bot)
+    s.expect(os.environ.get('EXPECT_ITEM', 'sand'), 'the saved inventory', 20.0, since=n)
+
+
+@scenario('datapack_live')
+def datapack_live(s):
+    """A pack in world/datapacks (made by run_fabric_live.py): listed, its function runs and its say reaches chat, reload works."""
+    import os
+    if os.environ.get('EXPECT_DATAPACK') != '1':
+        s.inconclusive('EXPECT_DATAPACK=1 not given')
+    s.wait(lambda: s.position() is not None, 'a position', 60.0)
+    n = len(s.w.chat)
+    s.command('datapack list')
+    s.expect('livepack', 'the pack in /datapack list', 20.0, since=n)
+    s.expect('2 functions, 2 tags, 2 recipes', 'its counts', 5.0, since=n)
+    n = len(s.w.chat)
+    s.command('function live:hello')
+    s.expect('Executed 2 command(s) from function live:hello', 'the function result', 20.0, since=n)
+    s.expect('commands.data.entity.query', 'the data command of the function answering the sender', 10.0, since=n)
+    n = len(s.w.chat)
+    s.command('function live:nothing')
+    s.expect('Unknown function', 'an unknown function is refused', 20.0, since=n)
+    n = len(s.w.chat)
+    s.command('datapack reload')
+    s.expect('datapacks: 1 found, 1 loaded', 'reload summary', 20.0, since=n)
+
+
+
 def run(m, c, st, w, biomes, ctx, args):
     wanted = [n for n in (args.scenario or 'all').split(',') if n]
     known = [n for n, _, _ in SCENARIOS]
