@@ -63,7 +63,7 @@ def prepare(world_type=None, copy_world=None):
     p.wait()
     if not copy_world:
         shutil.rmtree(os.path.join(RUN, 'world'), ignore_errors=True)   # the first start only made the config; the world is made by the real run
-    toml = os.path.join(RUN, 'pumpkin.toml')
+    toml = os.path.join(RUN, 'minecraft-server.toml')
     text = open(toml, encoding='utf-8').read()
     text = text.replace('0.0.0.0:25565', '0.0.0.0:%d' % PORT).replace('0.0.0.0:25575', '0.0.0.0:%d' % (PORT + 1)).replace('0.0.0.0:19132', '0.0.0.0:%d' % (PORT + 2))
     lines, out, sect = text.split('\n'), [], ''

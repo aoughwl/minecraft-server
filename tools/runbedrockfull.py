@@ -122,7 +122,7 @@ def main():
     env = dict(os.environ)
     env['PATH'] = r'C:\msys64\ucrt64\bin;' + env['PATH']
     cfg = os.path.join(run, 'cfg')
-    toml = os.path.join(cfg, 'pumpkin.toml')
+    toml = os.path.join(cfg, 'minecraft-server.toml')
     if not os.path.exists(toml):
         subprocess.run([args.exe, '--config:cfg', '--world:world', '--max-seconds:1'], cwd=run, env=env, capture_output=True,
                        text=True, timeout=180)

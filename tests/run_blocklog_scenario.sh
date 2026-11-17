@@ -13,8 +13,8 @@ rm -rf "$RUN"
 mkdir -p "$RUN/data"
 cd "$RUN"
 ( timeout 10 "$EXE" > first.txt 2>&1 || true )
-sed -i "s/^\(\s*address\s*=\s*\"[0-9.]*:\)25565\"/\1$PORT\"/" pumpkin.toml
-sed -i '/^\[networking.java\]/,/^\[/ { s/^encryption = true/encryption = false/; s/^online_mode = true/online_mode = false/ }' pumpkin.toml
+sed -i "s/^\(\s*address\s*=\s*\"[0-9.]*:\)25565\"/\1$PORT\"/" minecraft-server.toml
+sed -i '/^\[networking.java\]/,/^\[/ { s/^encryption = true/encryption = false/; s/^online_mode = true/online_mode = false/ }' minecraft-server.toml
 python - "$NAME" > data/ops.json <<'PY'
 import hashlib, sys, uuid, json
 name = sys.argv[1]

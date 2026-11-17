@@ -7,7 +7,7 @@
              must still answer a status ping.
 
 mcbot.py hands its own module in as `m`. Run it against a server started in a directory holding plugins/live/main.js and an
-online_mode = false pumpkin.toml.
+online_mode = false minecraft-server.toml.
 """
 import os
 import socket

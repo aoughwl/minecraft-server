@@ -16,7 +16,7 @@ code disagree, the code is right. Numbers are from the runs listed in `dev/overn
 
 ## 1. World types
 
-`pumpkin.toml` (top-level, only written when not the default):
+`minecraft-server.toml` (top-level, only written when not the default):
 
 ```toml
 world_type = "flat"          # default | flat | amplified | large_biomes
