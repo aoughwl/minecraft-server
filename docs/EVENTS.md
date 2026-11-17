@@ -102,11 +102,13 @@ Bukkit has well over 200 event classes. An event can only exist when the server 
 server (a port of Pumpkin) fires the events above; the rest below either need a firing site added in the server or describe a game
 system the server does not have.
 
-**Needs a firing site in the server (the system exists):** BlockCanBuildEvent, EntityChangeBlockEvent,
-PlayerResourcePackStatusEvent (happens before the player exists), InventoryMoveItemEvent,
-PrepareItemCraftEvent, FurnaceBurn/ExtractEvent, BrewEvent, WorldLoad/Unload/InitEvent, ChunkLoad/UnloadEvent
-(upstream declares chunk load and save but never fires them), PortalCreateEvent,
-VehicleEnter/Exit/Move/DamageEvent.
+**Needs a firing site in the server (the system exists):** BlockCanBuildEvent, EntityChangeBlockEvent, InventoryMoveItemEvent (hoppers),
+BrewEvent and FurnaceBurn/ExtractEvent (the block entities exist; the smelt is covered), PortalCreateEvent, VehicleEnter/Exit/Move/DamageEvent
+(boats and minecarts exist).
+
+**Not hookable the way Bukkit has it:** WorldLoad/Unload/InitEvent (the worlds load while the server starts, before any plugin is loaded),
+ChunkLoad/UnloadEvent (the chunk system is an asynchronous scheduler with no single place a chunk becomes loaded or unloaded; `ChunkSendEvent`
+tells when a player's client gets a chunk), PlayerResourcePackStatusEvent (the answer arrives before the player exists).
 
 **Covered by another event:** InventoryDragEvent (an `InventoryClickEvent` with the quick-craft click type), ProjectileLaunchEvent (the thrown or shot projectile appears as an `EntitySpawnEvent`), CraftItemEvent
 (`StatisticEvent`, crafted), the block events of fire, fluids, growth and decay (`BlockChangeEvent`), PlayerPortalEvent and
