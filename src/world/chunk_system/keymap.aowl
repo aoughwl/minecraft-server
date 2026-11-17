@@ -1,0 +1,168 @@
+## Open-addressing maps and sets for the chunk scheduler. No upstream counterpart.
+##
+## The toolchain's `Table` removes a key by shifting its entry list and rebuilding the whole hash index (linear in the
+## table's size, with a big allocation), and its `HashSet.excl` only stores `false`, so a set grows with every key it
+## ever held and `len` and iteration walk all of them. The scheduler removes chunk holders and waiting tasks all the
+## time; with a few thousand chunks loaded that made every unload and every `check_waiting_tasks` slower the longer the
+## server ran. Here removal is a backward shift in the probe run: constant time, no growth.
+
+{.feature: "lenientnils".}
+
+import dag
+
+type
+  KeyMap*[V] = object
+    ## Dense entries (`keys`, `vals`, in insertion order until a removal swaps the last one in) and an open-addressing
+    ## index of them: `slots[i]` is an entry's position plus one, 0 when empty.
+    keys: seq[uint64]
+    vals: seq[V]
+    slots: seq[int32]
+
+  ChunkSet* = object
+    ## A set of chunk positions.
+    m: KeyMap[bool]
+
+  NodeSet* = object
+    ## A set of task graph nodes.
+    m: KeyMap[bool]
+
+func packPos*(p: ChunkPos): uint64 {.inline.} =
+  (uint64(cast[uint32](p.x)) shl 32) or uint64(cast[uint32](p.y))
+
+func unpackPos*(k: uint64): ChunkPos {.inline.} =
+  ChunkPos(x: cast[int32](uint32(k shr 32)), y: cast[int32](uint32(k and 0xFFFFFFFF'u64)))
+
+func packNode*(k: NodeKey): uint64 {.inline.} =
+  (uint64(cast[uint32](k.index)) shl 32) or uint64(k.version)
+
+func unpackNode*(k: uint64): NodeKey {.inline.} =
+  NodeKey(index: cast[int32](uint32(k shr 32)), version: uint32(k and 0xFFFFFFFF'u64))
+
+func mixKey(k: uint64): uint64 {.inline.} =
+  let h = k * 0x9E3779B97F4A7C15'u64
+  h xor (h shr 29)
+
+proc initKeyMap*[V](): KeyMap[V] =
+  KeyMap[V](keys: @[], vals: @[], slots: newSeq[int32](16))
+
+proc len*[V](m: KeyMap[V]): int {.inline.} = m.keys.len
+
+proc slotOf[V](m: KeyMap[V], key: uint64): int =
+  ## The index slot holding `key`'s entry, or -1.
+  if m.slots.len == 0:
+    return -1
+  let mask = m.slots.len - 1
+  var i = int(mixKey(key) and uint64(mask))
+  while m.slots[i] != 0'i32:
+    if m.keys[int(m.slots[i]) - 1] == key:
+      return i
+    i = (i + 1) and mask
+  -1
+
+proc growIndex[V](m: var KeyMap[V]) =
+  let cap = m.slots.len * 2
+  m.slots = newSeq[int32](cap)
+  let mask = cap - 1
+  for e in 0 ..< m.keys.len:
+    var i = int(mixKey(m.keys[e]) and uint64(mask))
+    while m.slots[i] != 0'i32:
+      i = (i + 1) and mask
+    m.slots[i] = int32(e + 1)
+
+proc putKey*[V](m: var KeyMap[V], key: uint64, val: V) =
+  if m.slots.len == 0:
+    m.slots = newSeq[int32](16)
+  let slot = slotOf(m, key)
+  if slot >= 0:
+    m.vals[int(m.slots[slot]) - 1] = val
+    return
+  if (m.keys.len + 1) * 2 > m.slots.len:
+    growIndex(m)
+  m.keys.add(key)
+  m.vals.add(val)
+  let mask = m.slots.len - 1
+  var i = int(mixKey(key) and uint64(mask))
+  while m.slots[i] != 0'i32:
+    i = (i + 1) and mask
+  m.slots[i] = int32(m.keys.len)
+
+proc getKey*[V](m: KeyMap[V], key: uint64, fallback: V): V =
+  let slot = slotOf(m, key)
+  if slot >= 0: m.vals[int(m.slots[slot]) - 1] else: fallback
+
+proc hasKeyRaw*[V](m: KeyMap[V], key: uint64): bool = slotOf(m, key) >= 0
+
+proc clearSlot[V](m: var KeyMap[V], start: int) =
+  ## Empties index slot `start`, shifting later members of its probe run back so lookups still find them.
+  let mask = m.slots.len - 1
+  var i = start
+  var j = i
+  while true:
+    j = (j + 1) and mask
+    if m.slots[j] == 0'i32:
+      break
+    let home = int(mixKey(m.keys[int(m.slots[j]) - 1]) and uint64(mask))
+    # The entry at j may move into the hole at i only if its home is not in the cyclic range (i, j].
+    let inRange = if i <= j: (i < home and home <= j) else: (i < home or home <= j)
+    if inRange:
+      continue
+    let moved = m.slots[j]
+    m.slots[i] = moved
+    i = j
+  m.slots[i] = 0'i32
+
+proc delKey*[V](m: var KeyMap[V], key: uint64) =
+  let slot = slotOf(m, key)
+  if slot < 0:
+    return
+  let idx = int(m.slots[slot]) - 1
+  clearSlot(m, slot)
+  let last = m.keys.len - 1
+  if idx != last:
+    # Move the last entry into the hole and repoint its slot.
+    let lastKey = m.keys[last]
+    let lastSlot = slotOf(m, lastKey)
+    m.keys[idx] = lastKey
+    let lastVal = m.vals[last]
+    m.vals[idx] = lastVal
+    m.slots[lastSlot] = int32(idx + 1)
+  m.keys.shrink(last)
+  m.vals.shrink(last)
+
+# --- chunk position keys ---------------------------------------------------------------------------
+
+proc hasKey*[V](m: KeyMap[V], pos: ChunkPos): bool = hasKeyRaw(m, packPos(pos))
+
+proc getOrDefault*[V](m: KeyMap[V], pos: ChunkPos, fallback: V): V = getKey(m, packPos(pos), fallback)
+
+proc `[]=`*[V](m: var KeyMap[V], pos: ChunkPos, val: V) = putKey(m, packPos(pos), val)
+
+proc del*[V](m: var KeyMap[V], pos: ChunkPos) = delKey(m, packPos(pos))
+
+iterator pairs*[V](m: KeyMap[V]): (ChunkPos, V) =
+  for i in 0 ..< m.keys.len:
+    yield (unpackPos(m.keys[i]), m.vals[i])
+
+# --- ChunkSet --------------------------------------------------------------------------------------
+
+proc initChunkSet*(): ChunkSet = ChunkSet(m: initKeyMap[bool]())
+proc incl*(s: var ChunkSet, p: ChunkPos) = putKey(s.m, packPos(p), true)
+proc excl*(s: var ChunkSet, p: ChunkPos) = delKey(s.m, packPos(p))
+proc contains*(s: ChunkSet, p: ChunkPos): bool = hasKeyRaw(s.m, packPos(p))
+proc len*(s: ChunkSet): int = s.m.keys.len
+
+iterator items*(s: ChunkSet): ChunkPos =
+  for i in 0 ..< s.m.keys.len:
+    yield unpackPos(s.m.keys[i])
+
+# --- NodeSet ---------------------------------------------------------------------------------------
+
+proc initNodeSet*(): NodeSet = NodeSet(m: initKeyMap[bool]())
+proc incl*(s: var NodeSet, k: NodeKey) = putKey(s.m, packNode(k), true)
+proc excl*(s: var NodeSet, k: NodeKey) = delKey(s.m, packNode(k))
+proc contains*(s: NodeSet, k: NodeKey): bool = hasKeyRaw(s.m, packNode(k))
+proc len*(s: NodeSet): int = s.m.keys.len
+
+iterator items*(s: NodeSet): NodeKey =
+  for i in 0 ..< s.m.keys.len:
+    yield unpackNode(s.m.keys[i])
