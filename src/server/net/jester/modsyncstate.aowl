@@ -1,0 +1,201 @@
+## The server's side of `jester:modsync`: the manifest it reads from `jester-mods.json`, which clients are being held in the configuration
+## phase waiting for their STATUS, what each player reported, and whether to turn a player away. No sockets: config.aowl does the
+## sending and calls these.
+##
+## jester-mods.json:
+##   { "policy": "advisory" | "enforce", "kick_message": "text shown to a rejected client (optional)",
+##     "mods": [ { "id": "ns:mod", "version": "1.2.0", "role": "required" | "optional" | "server-only",
+##                 "sha256": "<64 hex digits>", "size": 12345, "url": "https://..." } ] }
+
+import std/[syncio]
+import modsyncmsg
+import ../../../auth/minijson
+
+const
+  ModsyncHoldMs* = 15000'i64    ## how long finish_configuration is held for the STATUS
+
+type
+  Pending = object
+    clientId: uint64
+    name: string
+    since: int64
+    heldFinish: bool
+
+  PlayerMods = object
+    name: string
+    statuses: seq[ModStatus]
+
+var
+  gPolicy: int = PolicyAdvisory
+  gKick: string = ""
+  gMods: seq[ModEntry] = @[]
+  gPending: seq[Pending] = @[]
+  gReported: seq[PlayerMods] = @[]
+
+proc modsyncActive*(): bool = gMods.len > 0
+proc modsyncPolicy*(): int = gPolicy
+proc modsyncMods*(): seq[ModEntry] = gMods
+proc modsyncKickMessage*(): string = gKick
+
+proc hexNibble(c: char): int =
+  if c >= '0' and c <= '9': ord(c) - 48
+  elif c >= 'a' and c <= 'f': ord(c) - 87
+  elif c >= 'A' and c <= 'F': ord(c) - 55
+  else: -1
+
+proc hexToBytes(s: string): seq[byte] =
+  result = @[]
+  var i = 0
+  while i + 1 < s.len:
+    let a = hexNibble(s[i])
+    let b = hexNibble(s[i + 1])
+    if a < 0 or b < 0: return @[]
+    result.add byte(a * 16 + b)
+    i += 2
+
+proc strOf(v: nil JsonValue; key: string): string =
+  let f = objGet(v, key)
+  if f != nil and f.kind == jkString: f.strVal else: ""
+
+proc parseModsync*(text: string): string =
+  ## Reads the manifest text into the server's state. "" when it was valid, else why not; a bad file leaves the state empty.
+  gMods = @[]
+  gPolicy = PolicyAdvisory
+  gKick = ""
+  let r = parseJson(text)
+  if not r.ok: return "jester-mods.json: " & r.error
+  let root = r.value
+  if root == nil or root.kind != jkObject: return "jester-mods.json: the top level must be an object"
+  let pol = strOf(root, "policy")
+  if pol == "enforce": gPolicy = PolicyEnforce
+  elif pol == "advisory" or pol == "": gPolicy = PolicyAdvisory
+  else: return "jester-mods.json: policy must be advisory or enforce, not " & pol
+  gKick = strOf(root, "kick_message")
+  let mods = objGet(root, "mods")
+  if mods == nil or mods.kind != jkArray: return "jester-mods.json: mods must be an array"
+  if mods.arrVal.len > ManifestMaxEntries: return "jester-mods.json: at most 256 mods"
+  var found: seq[ModEntry] = @[]
+  for m in mods.arrVal:
+    if m == nil or m.kind != jkObject: return "jester-mods.json: each mod must be an object"
+    var e = ModEntry()
+    e.id = strOf(m, "id")
+    e.version = strOf(m, "version")
+    if e.id.len == 0 or e.id.len > 255: return "jester-mods.json: a mod needs an id (1..255 characters)"
+    if e.version.len > 255: return "jester-mods.json: " & e.id & ": version too long"
+    let role = strOf(m, "role")
+    if role == "required" or role == "": e.role = RoleRequired
+    elif role == "optional": e.role = RoleOptional
+    elif role == "server-only": e.role = RoleServerOnly
+    else: return "jester-mods.json: " & e.id & ": role must be required, optional or server-only"
+    let sha = strOf(m, "sha256")
+    if sha.len > 0:
+      e.hash = hexToBytes(sha)
+      if e.hash.len != 32: return "jester-mods.json: " & e.id & ": sha256 must be 64 hex digits"
+    else:
+      e.hash = newSeq[byte](32)
+    let sz = objGet(m, "size")
+    if sz != nil and sz.kind == jkNumber: e.size = int(sz.numVal)
+    e.url = strOf(m, "url")
+    found.add e
+  gMods = found
+  ""
+
+proc loadModsyncFile*(file: string): string =
+  ## "" when the file is absent (no manifest) or valid, else the error.
+  var text = ""
+  try:
+    text = readFile(file)
+  except:
+    return ""
+  parseModsync(text)
+
+# ---- the clients being held ----------------------------------------------------------------------------------------------------
+
+proc pendingIndex(clientId: uint64): int =
+  result = -1
+  for i in 0 ..< gPending.len:
+    if gPending[i].clientId == clientId: result = i
+
+proc modsyncBegin*(clientId: uint64; name: string; now: int64) =
+  if pendingIndex(clientId) < 0:
+    gPending.add Pending(clientId: clientId, name: name, since: now, heldFinish: false)
+
+proc modsyncIsPending*(clientId: uint64): bool = pendingIndex(clientId) >= 0
+
+proc modsyncHoldFinish*(clientId: uint64) =
+  ## finish_configuration was due and is being held.
+  let i = pendingIndex(clientId)
+  if i >= 0: gPending[i].heldFinish = true
+
+proc modsyncRelease*(clientId: uint64): bool =
+  ## The client no longer needs holding. True when finish_configuration was waiting for it (the caller sends it now).
+  let i = pendingIndex(clientId)
+  if i < 0: return false
+  result = gPending[i].heldFinish
+  var kept: seq[Pending] = @[]
+  for k in 0 ..< gPending.len:
+    if k != i: kept.add gPending[k]
+  gPending = kept
+
+proc modsyncTimedOut*(clientId: uint64; now: int64): bool =
+  let i = pendingIndex(clientId)
+  i >= 0 and now - gPending[i].since >= ModsyncHoldMs
+
+proc rejectionText(): string =
+  if gKick.len > 0: return gKick
+  result = "This server requires these client mods:"
+  for m in gMods:
+    if m.role == RoleRequired: result.add " " & m.id & " " & m.version
+  result.add "."
+
+proc modsyncRecord*(player: string; statuses: seq[ModStatus]) =
+  var kept: seq[PlayerMods] = @[]
+  for p in gReported:
+    if p.name != player: kept.add p
+  kept.add PlayerMods(name: player, statuses: statuses)
+  gReported = kept
+
+proc modsyncForget*(player: string) =
+  var kept: seq[PlayerMods] = @[]
+  for p in gReported:
+    if p.name != player: kept.add p
+  gReported = kept
+
+proc modsyncVerdict*(statuses: seq[ModStatus]; kickText: var string): bool =
+  ## True when the client must be turned away: the policy is enforce and a required mod is missing or does not match. A mod the client did not
+  ## report counts as missing.
+  if gPolicy != PolicyEnforce: return false
+  for m in gMods:
+    if m.role != RoleRequired: continue
+    var state = StateMissing
+    for s in statuses:
+      if s.id == m.id: state = s.state
+    if state != StateOk:
+      kickText = rejectionText()
+      return true
+  false
+
+proc modsyncTimeoutVerdict*(kickText: var string): bool =
+  ## No STATUS came in time: under enforce a manifest with a required mod turns the client away, otherwise it proceeds.
+  var anyRequired = false
+  for m in gMods:
+    if m.role == RoleRequired: anyRequired = true
+  if gPolicy == PolicyEnforce and anyRequired:
+    kickText = rejectionText()
+    return true
+  false
+
+proc modStateOf*(player, modId: string): int =
+  ## What the player's client reported for a mod: 0 ok, 1 missing, 2 hash mismatch, 3 version mismatch, 4 disabled; -1 when it reported nothing.
+  result = -1
+  for p in gReported:
+    if p.name == player:
+      for s in p.statuses:
+        if s.id == modId: result = s.state
+
+proc modVersionOf*(player, modId: string): string =
+  result = ""
+  for p in gReported:
+    if p.name == player:
+      for s in p.statuses:
+        if s.id == modId: result = s.haveVersion
