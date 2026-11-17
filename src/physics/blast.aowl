@@ -1,0 +1,594 @@
+## Explosions on the physics system (phase 3 item 13): a PURE blast model. Imports only std/math, body.aowl (Vec3/Quat/Body)
+## and solver.aowl (SolverInput); the world is a callback, there is no server, entity or block-table import.
+##
+## COORDINATES. The caller hands a voxel SNAPSHOT: a dense box nx*ny*nz whose cell (0,0,0) is world cell (ox,oy,oz), index
+## i = x + nx*(z + nz*y) (the solver's layout, so a blast result applies to a SolverInput built from the same snapshot).
+## `cellFn(x, y, z)` (box-local) answers a BlastMat for the cell; it is called lazily, at most once per cell per blast.
+## The blast centre and every output position (debris, targets) are in WORLD coordinates; cell lists use box indices.
+##
+## (a) DESTRUCTION: the vanilla algorithm (src/server/world/explosion.aowl getBlocksToDestroy), same constants. 1352 rays from
+## the surface of a 16^3 grid, each with energy h = power * (0.7 + 0.6 u), u seeded-uniform. Stepping 0.3 blocks along the ray:
+## a non-air cell absorbs (resistance + 0.3) * 0.3 of h, it is destroyed when h is still > 0 after that; every step also costs
+## 0.225. Fluids use resistance max(100, own) as in the port. ENERGY CRITERION: the material table's breakThreshold is
+## 0.5 + blastResistance kJ, so `resistanceFromBreakKJ(kj, liquid)` = kj - 0.5 (fluids 100, indestructible 1e9) and the ray
+## energy h is "kJ-like": a cell fails exactly when the ray reaching it carries more than 0.3 * (breakKJ - 0.2) = 0.3 * resistance
+## + 0.09. That is vanilla's rule rewritten, so stone (res 6), dirt (0.5), obsidian (1200) and water (100) behave as in vanilla.
+##
+## (b) CRACKING: every touched cell keeps the largest ray energy that reached it. A survivor with f = maxIn / need
+## (need = 0.3 * resistance + 0.09, the energy that would have destroyed it) >= crackMin (0.4) is `cracked`; its strength
+## multiplier is 1 - 0.7 f^2 (0.89 at f = 0.4, 0.3 just below failure). applyBlastToSolverInput clears destroyed cells and gives
+## cracked cells a cloned solver material with tensile/compressive/shear scaled by that multiplier (mass unchanged).
+##
+## (c) DEBRIS: each destroyed non-fluid cell with mass becomes a fragment with probability debrisChance (a draw is consumed per
+## cell either way, so seeds replay). Impulse on a cell: J = impulseK * fall * shield * jitter along (cell - centre) with a small
+## upward bias, fall = 1 - d / (2 power) (vanilla's entity falloff radius), shield = clamp(maxIn / (1.3 power), 0.15, 1) (the
+## ray energy that survived the cells in front of it: solid cells in the way shield, an unobstructed cell gets 1), and
+## v = J / mass, so a heavy block flies slower (v clamped to maxSpeed 3 blocks/tick). Fragments lighter than bodyMassMin
+## (1200 kg) are free particles (dkParticle), heavier ones small rigid bodies (dkBody; makeDebrisBody builds a 1-cell Body).
+## impulseK = 400 kg*blocks/tick: wool (~340 kg) at the edge of a power-4 blast moves ~1 block/tick, stone (~2900 kg) ~0.14.
+##
+## (d) IMPULSES: for each BlastTarget (rigid Body, or entity) an ImpulseEvent{target, linear, angular}, linear impulse in
+## kg*blocks/tick (dv = linear / mass), angular impulse in kg*blocks^2/tick (dw = I^-1 angular; applyImpulseEvent does both).
+## A Body is sampled per cell: every cell whose centre sees the blast (segment centre -> cell not blocked by a SOLID snapshot cell)
+## receives the cell impulse (exposed area = number of seeing cells, each 1 face), applied at its centre, torque about the body's
+## centre of mass. An entity uses vanilla's rule: v = (1 - d / (2 power)) * exposure along (position - centre), exposure = the
+## fraction of a vanilla-style grid of bounding-box sample points that see the blast, J = v * 70 kg (the reference player mass)
+## * area factor (cross-section / 1.08, clamped 0.25..4); targets of other mass get dv = J / mass.
+##
+## (e) BUDGET: BlastJob + stepBlast(job, budgetOps) is a state machine (rays -> collect -> debris -> impulses -> done); one op
+## is a ray step, a cell visit, or a body cell sample. A ray (or a body, or a chunk of cells) is the indivisible unit, so a call
+## can overrun by that much. The result does not depend on how the work is sliced (the RNG is consumed in a fixed order).
+##
+## DETERMINISM: splitmix64 seeded by params.seed, ascending-index iteration, no hashing. Same inputs and seed -> same bytes.
+
+import std/math
+import body
+import solver
+
+const
+  RayGrid* = 16
+
+type
+  BlastMat* = object
+    ## What the world callback answers for one cell.
+    present*: bool        ## not air (a ray pays for it)
+    solid*: bool          ## blocks line of sight for impulses (collision shape, not fluid, not foliage)
+    liquid*: bool
+    resistance*: float64  ## vanilla blast resistance; liquid cells are raised to 100 by the model
+    state*: int           ## block state id, copied into debris
+    mass*: float64        ## kg of the cell (density * fill), 0 = no fragment
+
+  CellFn* = proc (x, y, z: int): BlastMat {.closure.}
+
+  BlastParams* = object
+    cx*, cy*, cz*: float64          ## centre, world coordinates
+    power*: float64                 ## vanilla explosion power (TNT 4)
+    seed*: uint64
+    ox*, oy*, oz*: int              ## world cell of box cell (0,0,0)
+    nx*, ny*, nz*: int
+    stepLen*: float64               ## 0.3
+    crackMin*: float64              ## 0.4
+    debrisChance*: float64          ## 0.6
+    bodyMassMin*: float64           ## 1200 kg
+    impulseK*: float64              ## 400
+    maxSpeed*: float64              ## 3.0 blocks/tick
+    maxDebris*: int                 ## cap on fragments
+    upBias*: float64                ## 0.35
+
+  DebrisKind* = enum dkParticle, dkBody
+
+  Debris* = object
+    cell*: int                      ## box index it came from
+    state*: int
+    kind*: DebrisKind
+    x*, y*, z*: float64             ## world position of the cell centre
+    vx*, vy*, vz*: float64          ## blocks/tick
+    mass*: float64
+
+  CrackedCell* = object
+    cell*: int
+    mult*: float64                  ## strength multiplier 0.3 .. 0.89
+
+  TargetKind* = enum tkBody, tkEntity
+
+  BlastTarget* = object
+    kind*: TargetKind
+    idHi*, idLo*: uint64
+    body*: Body                     ## tkBody: finalized mass/com/inertia, world pose
+    x*, y*, z*: float64             ## tkEntity: bounding box centre (world)
+    w*, h*: float64                 ## tkEntity: bounding box width and height
+    mass*: float64                  ## tkEntity: kg (<= 0 means 70)
+
+  ImpulseEvent* = object
+    target*: TargetKind
+    idHi*, idLo*: uint64
+    linear*: Vec3                   ## kg*blocks/tick
+    angular*: Vec3                  ## kg*blocks^2/tick about the centre of mass
+    exposed*: float64               ## body: cells that saw the blast; entity: exposure fraction
+
+  BlastResult* = object
+    destroyed*: seq[int]            ## ascending box indices
+    cracked*: seq[CrackedCell]      ## ascending
+    debris*: seq[Debris]
+    impulses*: seq[ImpulseEvent]
+    ops*: int64
+    done*: bool
+
+  BlastPhase = enum bpRays, bpCollect, bpDebris, bpImpulse, bpDone
+
+  BlastJob* = object
+    p*: BlastParams
+    cellFn: CellFn
+    targets: seq[BlastTarget]
+    phase: BlastPhase
+    rng: uint64
+    ray: int                        ## next index of the 16^3 grid
+    cur: int                        ## cursor for the later phases
+    known: seq[uint8]               ## 0 unknown, 1 known
+    present, solid, liquid: seq[bool]
+    resist: seq[float64]
+    cmass: seq[float64]
+    cstate: seq[int]
+    maxIn: seq[float64]             ## largest ray energy that reached the cell, 0 = untouched
+    dead: seq[bool]
+    res*: BlastResult
+
+# ---------------------------------------------------------------------------------------------------------------------
+# helpers
+
+proc nextU64(s: var uint64): uint64 =
+  s = s + 0x9E3779B97F4A7C15'u64
+  var z = s
+  z = (z xor (z shr 30)) * 0xBF58476D1CE4E5B9'u64
+  z = (z xor (z shr 27)) * 0x94D049BB133111EB'u64
+  return z xor (z shr 31)
+
+proc nextF(s: var uint64): float64 = float64(nextU64(s) shr 11) / 9007199254740992.0
+
+proc clampf(x, lo, hi: float64): float64 =
+  if x < lo: return lo
+  if x > hi: return hi
+  return x
+
+## Blast resistance recovered from the material table's break threshold (0.5 + resistance kJ). Fluids are 100.
+proc resistanceFromBreakKJ*(kj: float64; liquid: bool): float64 =
+  if liquid: return 100.0
+  if kj >= 1.0e8: return 1.0e9
+  if kj < 0.5: return 0.0
+  return kj - 0.5
+
+## Energy a ray needs to destroy a cell of this resistance (vanilla: h - (r + 0.3) * 0.3 > 0).
+proc needEnergy*(resistance: float64): float64 = (resistance + 0.3) * 0.3
+
+proc defaultBlastParams*(cx, cy, cz, power: float64; ox, oy, oz, nx, ny, nz: int; seed: uint64): BlastParams =
+  BlastParams(cx: cx, cy: cy, cz: cz, power: power, seed: seed, ox: ox, oy: oy, oz: oz, nx: nx, ny: ny, nz: nz,
+              stepLen: 0.3, crackMin: 0.4, debrisChance: 0.6, bodyMassMin: 1200.0, impulseK: 400.0, maxSpeed: 3.0,
+              maxDebris: 100000, upBias: 0.35)
+
+## A box that holds the whole blast: cells within ceil(1.3 power / 0.525) + 2 of the centre, clipped to y >= minY world.
+proc blastBox*(cx, cy, cz, power: float64): (int, int, int, int) =
+  ## (ox, oy, oz, size): a cube of `size` cells whose box origin is (ox, oy, oz).
+  let r = int(ceil(power * 1.3 / 0.525)) + 2
+  return (int(floor(cx)) - r, int(floor(cy)) - r, int(floor(cz)) - r, 2 * r + 1)
+
+proc newBlastJob*(p: BlastParams; cellFn: CellFn; targets: seq[BlastTarget]): BlastJob =
+  let n = p.nx * p.ny * p.nz
+  var j = BlastJob(p: p, cellFn: cellFn, targets: targets, phase: bpRays, rng: p.seed, ray: 0, cur: 0)
+  j.known = newSeq[uint8](n)
+  j.present = newSeq[bool](n)
+  j.solid = newSeq[bool](n)
+  j.liquid = newSeq[bool](n)
+  j.resist = newSeq[float64](n)
+  j.cmass = newSeq[float64](n)
+  j.cstate = newSeq[int](n)
+  j.maxIn = newSeq[float64](n)
+  j.dead = newSeq[bool](n)
+  j.res = BlastResult(destroyed: @[], cracked: @[], debris: @[], impulses: @[])
+  return j
+
+proc blastDone*(j: BlastJob): bool = j.phase == bpDone
+
+proc look(j: var BlastJob; i, x, y, z: int) =
+  if j.known[i] != 0'u8: return
+  j.known[i] = 1'u8
+  let m = j.cellFn(x, y, z)
+  j.present[i] = m.present or m.liquid
+  j.solid[i] = m.solid and not m.liquid
+  j.liquid[i] = m.liquid
+  var r = m.resistance
+  if m.liquid and r < 100.0: r = 100.0
+  j.resist[i] = r
+  j.cmass[i] = m.mass
+  j.cstate[i] = m.state
+
+proc solidAtWorld(j: var BlastJob; wx, wy, wz: float64): bool =
+  let x = int(floor(wx)) - j.p.ox
+  let y = int(floor(wy)) - j.p.oy
+  let z = int(floor(wz)) - j.p.oz
+  if x < 0 or y < 0 or z < 0 or x >= j.p.nx or y >= j.p.ny or z >= j.p.nz: return false
+  let i = x + j.p.nx * (z + j.p.nz * y)
+  look(j, i, x, y, z)
+  return j.solid[i]
+
+## Does the segment from the blast centre to (px,py,pz) cross a solid snapshot cell (the end cell itself excluded)?
+proc blockedTo(j: var BlastJob; px, py, pz: float64; ops: var int): bool =
+  let dx = px - j.p.cx
+  let dy = py - j.p.cy
+  let dz = pz - j.p.cz
+  let len = sqrt(dx * dx + dy * dy + dz * dz)
+  if len < 0.6: return false
+  let n = int(len / 0.25)
+  let endx = int(floor(px))
+  let endy = int(floor(py))
+  let endz = int(floor(pz))
+  let startx = int(floor(j.p.cx))
+  let starty = int(floor(j.p.cy))
+  let startz = int(floor(j.p.cz))
+  for k in 1 ..< n:
+    let t = float64(k) / float64(n)
+    let sx = j.p.cx + dx * t
+    let sy = j.p.cy + dy * t
+    let sz = j.p.cz + dz * t
+    let cx = int(floor(sx))
+    let cy = int(floor(sy))
+    let cz = int(floor(sz))
+    inc ops
+    if cx == endx and cy == endy and cz == endz: continue
+    if cx == startx and cy == starty and cz == startz: continue
+    if solidAtWorld(j, sx, sy, sz): return true
+  return false
+
+# ---------------------------------------------------------------------------------------------------------------------
+# phases
+
+proc castRay(j: var BlastJob; gx, gy, gz: int): int =
+  ## One vanilla ray; returns the steps used.
+  var dx = float64(gx) / 7.5 - 1.0
+  var dy = float64(gy) / 7.5 - 1.0
+  var dz = float64(gz) / 7.5 - 1.0
+  let ln = sqrt(dx * dx + dy * dy + dz * dz)
+  dx = dx / ln
+  dy = dy / ln
+  dz = dz / ln
+  var px = j.p.cx
+  var py = j.p.cy
+  var pz = j.p.cz
+  var h = j.p.power * (nextF(j.rng) * 0.6 + 0.7)
+  var steps = 0
+  while h > 0.0:
+    inc steps
+    let x = int(floor(px)) - j.p.ox
+    let y = int(floor(py)) - j.p.oy
+    let z = int(floor(pz)) - j.p.oz
+    if x < 0 or y < 0 or z < 0 or x >= j.p.nx or y >= j.p.ny or z >= j.p.nz: break
+    let i = x + j.p.nx * (z + j.p.nz * y)
+    look(j, i, x, y, z)
+    if j.present[i]:
+      if h > j.maxIn[i]: j.maxIn[i] = h
+      h -= needEnergy(j.resist[i])
+      if h > 0.0: j.dead[i] = true
+    px += dx * j.p.stepLen
+    py += dy * j.p.stepLen
+    pz += dz * j.p.stepLen
+    h -= 0.22500001
+  return steps
+
+proc inertiaApply(b: Body; lx, ly, lz: float64): Vec3 =
+  ## I^-1 L for the body-frame inertia tensor (b.inertia = Ixx Iyy Izz Ixy Ixz Iyz).
+  let a = b.inertia[0]
+  let e = b.inertia[1]
+  let i = b.inertia[2]
+  let bb = b.inertia[3]
+  let c = b.inertia[4]
+  let f = b.inertia[5]
+  # matrix [[a,bb,c],[bb,e,f],[c,f,i]]
+  let c00 = e * i - f * f
+  let c01 = c * f - bb * i
+  let c02 = bb * f - c * e
+  let det = a * c00 + bb * c01 + c * c02
+  if abs(det) < 1.0e-12: return Vec3()
+  let c11 = a * i - c * c
+  let c12 = bb * c - a * f
+  let c22 = a * e - bb * bb
+  let inv = 1.0 / det
+  return Vec3(x: (c00 * lx + c01 * ly + c02 * lz) * inv, y: (c01 * lx + c11 * ly + c12 * lz) * inv,
+              z: (c02 * lx + c12 * ly + c22 * lz) * inv)
+
+proc qconj(q: Quat): Quat = Quat(w: q.w, x: -q.x, y: -q.y, z: -q.z)
+
+## Apply an ImpulseEvent to a body: v += linear / m, w += world(I^-1 body(angular)). Wakes the body.
+proc applyImpulseEvent*(b: Body; ev: ImpulseEvent) =
+  if b.mass <= 0.0: return
+  b.vel = b.vel + scale(ev.linear, 1.0 / b.mass)
+  let lb = rotate(qconj(b.orient), ev.angular)
+  let wb = inertiaApply(b, lb.x, lb.y, lb.z)
+  b.angVel = b.angVel + rotate(b.orient, wb)
+  wake(b)
+
+proc fallOff(d, power: float64): float64 = clampf(1.0 - d / (2.0 * power), 0.0, 1.0)
+
+proc bodyImpulse(j: var BlastJob; t: BlastTarget; ops: var int): ImpulseEvent =
+  var ev = ImpulseEvent(target: tkBody, idHi: t.idHi, idLo: t.idLo)
+  let b = t.body
+  if b == nil or b.mass <= 0.0: return ev
+  let com = b.pos + rotate(b.orient, b.com)
+  var jx = 0.0
+  var jy = 0.0
+  var jz = 0.0
+  var tx = 0.0
+  var ty = 0.0
+  var tz = 0.0
+  var seen = 0.0
+  for c in cellList(b):
+    let w = b.pos + rotate(b.orient, vec3(float64(c.x) + 0.5, float64(c.y) + 0.5, float64(c.z) + 0.5))
+    var dx = w.x - j.p.cx
+    var dy = w.y - j.p.cy
+    var dz = w.z - j.p.cz
+    var d = sqrt(dx * dx + dy * dy + dz * dz)
+    inc ops
+    if d > 2.0 * j.p.power: continue
+    if blockedTo(j, w.x, w.y, w.z, ops): continue
+    if d < 0.5:
+      dx = 0.0
+      dy = 1.0
+      dz = 0.0
+      d = 0.5
+    else:
+      dx = dx / d
+      dy = dy / d
+      dz = dz / d
+    let mag = j.p.impulseK * fallOff(d, j.p.power)
+    let fx = dx * mag
+    let fy = dy * mag
+    let fz = dz * mag
+    jx += fx
+    jy += fy
+    jz += fz
+    let rx = w.x - com.x
+    let ry = w.y - com.y
+    let rz = w.z - com.z
+    tx += ry * fz - rz * fy
+    ty += rz * fx - rx * fz
+    tz += rx * fy - ry * fx
+    seen += 1.0
+  ev.linear = Vec3(x: jx, y: jy, z: jz)
+  ev.angular = Vec3(x: tx, y: ty, z: tz)
+  ev.exposed = seen
+  # clamp the resulting speed, as for debris
+  let sp = sqrt(jx * jx + jy * jy + jz * jz) / b.mass
+  if sp > j.p.maxSpeed:
+    let k = j.p.maxSpeed / sp
+    ev.linear = scale(ev.linear, k)
+    ev.angular = scale(ev.angular, k)
+  return ev
+
+proc entityImpulse(j: var BlastJob; t: BlastTarget; ops: var int): ImpulseEvent =
+  var ev = ImpulseEvent(target: tkEntity, idHi: t.idHi, idLo: t.idLo)
+  let dx0 = t.x - j.p.cx
+  let dy0 = t.y - j.p.cy
+  let dz0 = t.z - j.p.cz
+  let d = sqrt(dx0 * dx0 + dy0 * dy0 + dz0 * dz0)
+  let radius = 2.0 * j.p.power
+  if d > radius: return ev
+  # vanilla exposure grid over the bounding box (w x h x w)
+  let hw = t.w * 0.5
+  let sx = 1.0 / (t.w * 2.0 + 1.0)
+  let sy = 1.0 / (t.h * 2.0 + 1.0)
+  var vis = 0
+  var tot = 0
+  var k = 0.0
+  while k <= 1.0:
+    var l = 0.0
+    while l <= 1.0:
+      var m = 0.0
+      while m <= 1.0:
+        let px = t.x - hw + t.w * k
+        let py = t.y - t.h * 0.5 + t.h * l
+        let pz = t.z - hw + t.w * m
+        if not blockedTo(j, px, py, pz, ops): inc vis
+        inc tot
+        m += sx
+      l += sy
+    k += sx
+  if tot == 0: return ev
+  let exposure = float64(vis) / float64(tot)
+  ev.exposed = exposure
+  if exposure <= 0.0: return ev
+  let v = (1.0 - d / radius) * exposure
+  var dx = dx0
+  var dy = dy0
+  var dz = dz0
+  if d < 1.0e-6:
+    dx = 0.0
+    dy = 1.0
+    dz = 0.0
+  else:
+    dx = dx / d
+    dy = dy / d
+    dz = dz / d
+  let area = clampf(t.w * t.h / 1.08, 0.25, 4.0)
+  let refJ = 70.0 * area
+  ev.linear = Vec3(x: dx * v * refJ, y: dy * v * refJ, z: dz * v * refJ)
+  let m = (if t.mass > 0.0: t.mass else: 70.0)
+  let sp = sqrt(ev.linear.x * ev.linear.x + ev.linear.y * ev.linear.y + ev.linear.z * ev.linear.z) / m
+  if sp > j.p.maxSpeed: ev.linear = scale(ev.linear, j.p.maxSpeed / sp)
+  return ev
+
+proc makeDebrisFragment(j: var BlastJob; i: int; x, y, z: int): bool =
+  ## Draw the fragment of destroyed cell i (always consumes the same number of draws). Returns false when none.
+  let u = nextF(j.rng)
+  let a = nextF(j.rng)
+  let b = nextF(j.rng)
+  let c = nextF(j.rng)
+  if u >= j.p.debrisChance: return false
+  let m = j.cmass[i]
+  if m <= 0.0 or j.liquid[i]: return false
+  if j.res.debris.len >= j.p.maxDebris: return false
+  let wx = float64(j.p.ox + x) + 0.5
+  let wy = float64(j.p.oy + y) + 0.5
+  let wz = float64(j.p.oz + z) + 0.5
+  var dx = wx - j.p.cx
+  var dy = wy - j.p.cy
+  var dz = wz - j.p.cz
+  var d = sqrt(dx * dx + dy * dy + dz * dz)
+  if d < 0.5:
+    dx = 0.0
+    dy = 1.0
+    dz = 0.0
+    d = 0.5
+  else:
+    dx = dx / d
+    dy = dy / d
+    dz = dz / d
+  # jitter the direction, bias upward
+  dx += (a - 0.5) * 0.4
+  dy += (b - 0.5) * 0.4 + j.p.upBias
+  dz += (c - 0.5) * 0.4
+  let dl = sqrt(dx * dx + dy * dy + dz * dz)
+  dx = dx / dl
+  dy = dy / dl
+  dz = dz / dl
+  let shield = clampf(j.maxIn[i] / (1.3 * j.p.power), 0.15, 1.0)
+  let jitter = 0.7 + 0.6 * a
+  var sp = j.p.impulseK * fallOff(d, j.p.power) * shield * jitter / m
+  if sp > j.p.maxSpeed: sp = j.p.maxSpeed
+  let kind = (if m < j.p.bodyMassMin: dkParticle else: dkBody)
+  j.res.debris.add Debris(cell: i, state: j.cstate[i], kind: kind, x: wx, y: wy, z: wz,
+                          vx: dx * sp, vy: dy * sp, vz: dz * sp, mass: m)
+  return true
+
+## A 1-cell rigid body for a dkBody fragment (mass, com and inertia set directly: a solid unit cube).
+proc makeDebrisBody*(d: Debris; idHi, idLo: uint64): Body =
+  let b = newBody(idHi, idLo)
+  setCell(b, 0, 0, 0, d.state)
+  b.mass = d.mass
+  b.com = vec3(0.5, 0.5, 0.5)
+  let i = d.mass / 6.0
+  b.inertia = [i, i, i, 0.0, 0.0, 0.0]
+  b.pos = vec3(d.x - 0.5, d.y - 0.5, d.z - 0.5)
+  b.vel = vec3(d.vx, d.vy, d.vz)
+  return b
+
+## Advance the blast by about `budgetOps` units (at least one unit per call). Returns true when finished.
+proc stepBlast*(j: var BlastJob; budgetOps: int): bool =
+  var left = budgetOps
+  if left < 1: left = 1
+  let n = j.p.nx * j.p.ny * j.p.nz
+  let nxz = j.p.nx * j.p.nz
+  while j.phase != bpDone:
+    if left <= 0: return false
+    case j.phase
+    of bpRays:
+      if j.ray >= RayGrid * RayGrid * RayGrid:
+        j.phase = bpCollect
+        j.cur = 0
+      else:
+        let k = j.ray
+        inc j.ray
+        let gx = k div 256
+        let gy = (k div 16) mod 16
+        let gz = k mod 16
+        if gx > 0 and gx < 15 and gy > 0 and gy < 15 and gz > 0 and gz < 15: continue
+        let used = castRay(j, gx, gy, gz)
+        left -= used
+        j.res.ops += int64(used)
+    of bpCollect:
+      var cnt = 0
+      while j.cur < n and cnt < 4096:
+        let i = j.cur
+        inc j.cur
+        inc cnt
+        if j.maxIn[i] <= 0.0: continue
+        if j.dead[i]:
+          j.res.destroyed.add i
+        else:
+          let need = needEnergy(j.resist[i])
+          if need < 1.0e8:
+            let f = j.maxIn[i] / need
+            if f >= j.p.crackMin:
+              j.res.cracked.add CrackedCell(cell: i, mult: 1.0 - 0.7 * f * f)
+      left -= cnt
+      j.res.ops += int64(cnt)
+      if j.cur >= n:
+        j.phase = bpDebris
+        j.cur = 0
+    of bpDebris:
+      var cnt = 0
+      while j.cur < j.res.destroyed.len and cnt < 2048:
+        let i = j.res.destroyed[j.cur]
+        inc j.cur
+        inc cnt
+        let y = i div nxz
+        let r = i - y * nxz
+        let z = r div j.p.nx
+        let x = r - z * j.p.nx
+        discard makeDebrisFragment(j, i, x, y, z)
+      left -= cnt
+      j.res.ops += int64(cnt)
+      if j.cur >= j.res.destroyed.len:
+        j.phase = bpImpulse
+        j.cur = 0
+    of bpImpulse:
+      if j.cur >= j.targets.len:
+        j.phase = bpDone
+      else:
+        let t = j.targets[j.cur]
+        inc j.cur
+        var ops = 1
+        if t.kind == tkBody: j.res.impulses.add bodyImpulse(j, t, ops)
+        else: j.res.impulses.add entityImpulse(j, t, ops)
+        left -= ops
+        j.res.ops += int64(ops)
+    of bpDone:
+      discard
+  j.res.done = true
+  return true
+
+## Whole blast in one call.
+proc runBlast*(p: BlastParams; cellFn: CellFn; targets: seq[BlastTarget]): BlastResult =
+  var j = newBlastJob(p, cellFn, targets)
+  discard stepBlast(j, high(int) div 4)
+  return j.res
+
+# ---------------------------------------------------------------------------------------------------------------------
+# solver hookup
+
+## Apply a finished blast to a SolverInput built from the same snapshot (same box and cell order): destroyed cells become
+## empty (and stop being anchors); cracked cells get a cloned material whose strengths are scaled by the cell's multiplier
+## (quantized to steps of 0.05 so clones are shared). Returns the number of materials added.
+proc applyBlastToSolverInput*(inp: var SolverInput; r: BlastResult): int =
+  for c in r.destroyed:
+    if c >= 0 and c < inp.cells.len:
+      inp.cells[c] = 0'u16
+      if inp.anchor.len > c: inp.anchor[c] = false
+  var srcMat: seq[uint16] = @[]
+  var srcQ: seq[int] = @[]
+  var dst: seq[uint16] = @[]
+  var added = 0
+  for cc in r.cracked:
+    let c = cc.cell
+    if c < 0 or c >= inp.cells.len: continue
+    let m0 = inp.cells[c]
+    if m0 == 0'u16: continue
+    if inp.materials[int(m0)].indestructible: continue
+    let q = int(floor(cc.mult / 0.05 + 0.5))
+    var found = -1
+    for k in 0 ..< srcMat.len:
+      if srcMat[k] == m0 and srcQ[k] == q:
+        found = k
+        break
+    if found < 0:
+      if inp.materials.len >= 60000: continue
+      var m = inp.materials[int(m0)]
+      let f = float64(q) * 0.05
+      m.tensile = m.tensile * f
+      m.compressive = m.compressive * f
+      m.shear = m.shear * f
+      inp.materials.add m
+      srcMat.add m0
+      srcQ.add q
+      dst.add uint16(inp.materials.len - 1)
+      inc added
+      found = srcMat.len - 1
+    inp.cells[c] = dst[found]
+  return added
