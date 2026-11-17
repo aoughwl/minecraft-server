@@ -1,0 +1,356 @@
+## `jester:bodies` (overnight/PROTOCOL.md section 3): CREATE, DESTROY, STATE, RESET (server to client), RESYNC_REQ and ACK (client to server) as
+## pure encoders and decoders, no world or entity imports. The body entity work builds the records and calls these.
+
+import std/math
+import codec
+
+const
+  BodiesChannel* = "jester:bodies"
+  BodyCreate* = 1
+  BodyDestroy* = 2
+  BodyState* = 3
+  BodyReset* = 4
+  BodyResyncReq* = 5
+  BodyAck* = 6
+  CreateMore* = 1          ## CREATE flags bit0: more parts follow
+  CreateContinuation* = 2  ## CREATE flags bit1: this is a continuation part
+  StatePos* = 1
+  StateRot* = 2
+  StateVel* = 4
+  StateAngVel* = 8
+  StateAbsolute* = 16
+  StateAsleep* = 32
+  StateWide* = 64
+
+type
+  BodyCreateMsg* = object
+    bodyId*: int
+    seqAtCreate*: int
+    size*: (int, int, int)           ## sx, sy, sz, each 1..32
+    com*: (float32, float32, float32)
+    mass*: float32
+    pos*: (float64, float64, float64)
+    quat*: uint32
+    vel*: (int, int, int)            ## 1/2048 block per tick
+    palette*: seq[int]               ## block state ids, entry 0 is air
+    cells*: seq[int]                 ## palette index per cell, index (y*sz + z)*sx + x
+
+  StateEntry* = object
+    bodyId*: int
+    flags*: int
+    pos*: (int, int, int)            ## delta in 1/1024 block (i16, or i32 with StateWide); ignored when StateAbsolute
+    absPos*: (float64, float64, float64)
+    rot*: uint32
+    vel*: (int, int, int)            ## 1/2048 block per tick
+    angVel*: (int, int, int)         ## 1/4096 radian per tick
+
+  StateMsg* = object
+    seqNo*: int
+    base*: int
+    tick*: int64
+    entries*: seq[StateEntry]
+
+  ResetMsg* = object
+    seqNo*: int
+    tick*: int64
+    reason*: int
+
+  CreateAssembler* = object
+    ## Collects the parts of one CREATE. `done` once the last part is in.
+    head*: BodyCreateMsg
+    bits*: int
+    cellBytes*: seq[byte]
+    started*: bool
+    done*: bool
+
+# ---- quaternion, smallest three (3.8) -----------------------------------------------------------------------------------------------
+
+const QuatScale = 0.70710678
+
+proc packQuat*(x, y, z, w: float64): uint32 =
+  ## A unit quaternion as the 32-bit smallest-three.
+  let q = [x, y, z, w]
+  var big = 0
+  for i in 1 .. 3:
+    if abs(q[i]) > abs(q[big]): big = i
+  var sign = 1.0
+  if q[big] < 0.0: sign = -1.0
+  var packed = uint32(big) shl 30'u32
+  var shift = 20
+  for i in 0 .. 3:
+    if i == big: continue
+    var v = int(floor(((q[i] * sign / QuatScale + 1.0) / 2.0) * 1023.0 + 0.5))
+    if v < 0: v = 0
+    if v > 1023: v = 1023
+    packed = packed or (uint32(v) shl uint32(shift))
+    shift -= 10
+  packed
+
+proc unpackQuat*(p: uint32): (float64, float64, float64, float64) =
+  let big = int(p shr 30'u32)
+  var rest = [0.0, 0.0, 0.0]
+  var shift = 20
+  for k in 0 .. 2:
+    let v = int((p shr uint32(shift)) and 1023'u32)
+    rest[k] = (float64(v) / 1023.0 * 2.0 - 1.0) * QuatScale
+    shift -= 10
+  let sum = rest[0] * rest[0] + rest[1] * rest[1] + rest[2] * rest[2]
+  var dropped = 0.0
+  if sum < 1.0: dropped = sqrt(1.0 - sum)
+  var q = [0.0, 0.0, 0.0, 0.0]
+  var k = 0
+  for i in 0 .. 3:
+    if i == big:
+      q[i] = dropped
+    else:
+      q[i] = rest[k]
+      inc k
+  (q[0], q[1], q[2], q[3])
+
+# ---- palette cells ------------------------------------------------------------------------------------------------------------------
+
+proc bitsForPalette*(paletteLen: int): int =
+  ## max(1, ceil(log2(paletteLen)))
+  result = 1
+  while (1 shl result) < paletteLen: inc result
+
+proc packCells*(cells: seq[int]; bits: int): seq[byte] =
+  ## Packed little-endian bit stream, LSB first.
+  result = newSeq[byte]((cells.len * bits + 7) div 8)
+  var bit = 0
+  for v in cells:
+    for b in 0 ..< bits:
+      if ((v shr b) and 1) != 0:
+        result[bit shr 3] = result[bit shr 3] or byte(1 shl (bit and 7))
+      inc bit
+
+proc unpackCells*(data: seq[byte]; count, bits: int): seq[int] =
+  result = @[]
+  var bit = 0
+  for i in 0 ..< count:
+    var v = 0
+    for b in 0 ..< bits:
+      let byteAt = bit shr 3
+      if byteAt < data.len and ((int(data[byteAt]) shr (bit and 7)) and 1) != 0: v = v or (1 shl b)
+      inc bit
+    result.add v
+
+# ---- CREATE (3.3) -------------------------------------------------------------------------------------------------------------------
+
+proc createHead(m: BodyCreateMsg; flags: int; bits: int): seq[byte] =
+  result = @[]
+  putU8(result, BodyCreate)
+  putVarint(result, int64(m.bodyId))
+  putU8(result, flags)
+  putVarint(result, int64(m.seqAtCreate))
+  putU8(result, m.size[0])
+  putU8(result, m.size[1])
+  putU8(result, m.size[2])
+  putF32(result, m.com[0])
+  putF32(result, m.com[1])
+  putF32(result, m.com[2])
+  putF32(result, m.mass)
+  putF64(result, m.pos[0])
+  putF64(result, m.pos[1])
+  putF64(result, m.pos[2])
+  putBig(result, uint64(m.quat), 4)
+  putI16(result, m.vel[0])
+  putI16(result, m.vel[1])
+  putI16(result, m.vel[2])
+  putVarint(result, int64(m.palette.len))
+  for s in m.palette: putVarint(result, int64(s))
+  putU8(result, bits)
+
+proc encodeBodyCreate*(m: BodyCreateMsg; maxFrame: int): seq[seq[byte]] =
+  ## The CREATE as one message, or, when it does not fit `maxFrame` bytes, as a first part and continuation parts. The first part
+  ## holds everything up to and including `bits` and then as many cell bytes as fit; each continuation (flags bit1: type, body_id,
+  ## flags, varint part_index, cell bytes) carries the next cell bytes; the last message has bit0 clear.
+  let bits = bitsForPalette(m.palette.len)
+  let cells = packCells(m.cells, bits)
+  result = @[]
+  var whole = createHead(m, 0, bits)
+  if whole.len + cells.len <= maxFrame:
+    for b in cells: whole.add b
+    result.add whole
+    return
+  var first = createHead(m, CreateMore, bits)
+  var used = 0
+  while used < cells.len and first.len < maxFrame:
+    first.add cells[used]
+    inc used
+  result.add first
+  var part = 1
+  while used < cells.len:
+    var msg: seq[byte] = @[]
+    putU8(msg, BodyCreate)
+    putVarint(msg, int64(m.bodyId))
+    var take = cells.len - used
+    let room = maxFrame - 8
+    if take > room: take = room
+    putU8(msg, CreateContinuation or (if used + take < cells.len: CreateMore else: 0))
+    putVarint(msg, int64(part))
+    for i in 0 ..< take: msg.add cells[used + i]
+    used += take
+    inc part
+    result.add msg
+
+proc feedBodyCreate*(a: var CreateAssembler; data: seq[byte]): bool =
+  ## One CREATE message in; false when it is malformed. After the final part `a.head.cells` is filled and `a.done` is set.
+  var c = newCursor(data)
+  if takeU8(c) != BodyCreate: return false
+  let id = int(takeVarint(c))
+  let flags = takeU8(c)
+  if (flags and CreateContinuation) != 0:
+    if not a.started: return false
+    discard takeVarint(c)
+    for b in takeBytes(c, c.left()): a.cellBytes.add b
+    if c.bad: return false
+    if (flags and CreateMore) == 0: a.done = true
+  else:
+    a = CreateAssembler(started: true)
+    a.head.bodyId = id
+    a.head.seqAtCreate = int(takeVarint(c))
+    a.head.size = (takeU8(c), takeU8(c), takeU8(c))
+    a.head.com = (takeF32(c), takeF32(c), takeF32(c))
+    a.head.mass = takeF32(c)
+    a.head.pos = (takeF64(c), takeF64(c), takeF64(c))
+    a.head.quat = uint32(takeBig(c, 4))
+    a.head.vel = (takeI16(c), takeI16(c), takeI16(c))
+    let n = int(takeVarint(c))
+    if n < 1 or n > 4096: return false
+    for i in 0 ..< n: a.head.palette.add int(takeVarint(c))
+    a.bits = takeU8(c)
+    if c.bad: return false
+    for b in takeBytes(c, c.left()): a.cellBytes.add b
+    if (flags and CreateMore) == 0: a.done = true
+  if a.done:
+    a.head.cells = unpackCells(a.cellBytes, a.head.size[0] * a.head.size[1] * a.head.size[2], a.bits)
+  true
+
+# ---- DESTROY (3.4) ------------------------------------------------------------------------------------------------------------------
+
+proc encodeBodyDestroy*(reason: int; ids: seq[int]): seq[byte] =
+  result = @[]
+  putU8(result, BodyDestroy)
+  putU8(result, reason)
+  putVarint(result, int64(ids.len))
+  for id in ids: putVarint(result, int64(id))
+
+proc decodeBodyDestroy*(data: seq[byte]; reason: var int; ids: var seq[int]): bool =
+  var c = newCursor(data)
+  if takeU8(c) != BodyDestroy: return false
+  reason = takeU8(c)
+  let n = int(takeVarint(c))
+  ids = @[]
+  for i in 0 ..< n: ids.add int(takeVarint(c))
+  not c.bad
+
+# ---- STATE (3.5) --------------------------------------------------------------------------------------------------------------------
+
+proc encodeBodyState*(m: StateMsg): seq[byte] =
+  ## Entries must be in ascending body id order.
+  result = @[]
+  putU8(result, BodyState)
+  putVarint(result, int64(m.seqNo))
+  putVarint(result, int64(m.base))
+  putVarint(result, m.tick)
+  putVarint(result, int64(m.entries.len))
+  var prev = 0
+  for e in m.entries:
+    putVarint(result, int64(e.bodyId - prev))
+    prev = e.bodyId
+    putU8(result, e.flags)
+    if (e.flags and StatePos) != 0:
+      if (e.flags and StateAbsolute) != 0:
+        putF64(result, e.absPos[0])
+        putF64(result, e.absPos[1])
+        putF64(result, e.absPos[2])
+      elif (e.flags and StateWide) != 0:
+        putI32(result, e.pos[0])
+        putI32(result, e.pos[1])
+        putI32(result, e.pos[2])
+      else:
+        putI16(result, e.pos[0])
+        putI16(result, e.pos[1])
+        putI16(result, e.pos[2])
+    if (e.flags and StateRot) != 0: putBig(result, uint64(e.rot), 4)
+    if (e.flags and StateVel) != 0:
+      putI16(result, e.vel[0])
+      putI16(result, e.vel[1])
+      putI16(result, e.vel[2])
+    if (e.flags and StateAngVel) != 0:
+      putI16(result, e.angVel[0])
+      putI16(result, e.angVel[1])
+      putI16(result, e.angVel[2])
+
+proc decodeBodyState*(data: seq[byte]; ok: var bool): StateMsg =
+  var c = newCursor(data)
+  result = StateMsg()
+  ok = false
+  if takeU8(c) != BodyState: return
+  result.seqNo = int(takeVarint(c))
+  result.base = int(takeVarint(c))
+  result.tick = takeVarint(c)
+  let n = int(takeVarint(c))
+  var id = 0
+  for i in 0 ..< n:
+    if c.bad: return
+    var e = StateEntry()
+    id += int(takeVarint(c))
+    e.bodyId = id
+    e.flags = takeU8(c)
+    if (e.flags and StatePos) != 0:
+      if (e.flags and StateAbsolute) != 0:
+        e.absPos = (takeF64(c), takeF64(c), takeF64(c))
+      elif (e.flags and StateWide) != 0:
+        e.pos = (takeI32(c), takeI32(c), takeI32(c))
+      else:
+        e.pos = (takeI16(c), takeI16(c), takeI16(c))
+    if (e.flags and StateRot) != 0: e.rot = uint32(takeBig(c, 4))
+    if (e.flags and StateVel) != 0: e.vel = (takeI16(c), takeI16(c), takeI16(c))
+    if (e.flags and StateAngVel) != 0: e.angVel = (takeI16(c), takeI16(c), takeI16(c))
+    result.entries.add e
+  ok = not c.bad
+
+# ---- RESET (3.6), RESYNC_REQ and ACK (3.7) ------------------------------------------------------------------------------------------
+
+proc encodeBodyReset*(m: ResetMsg): seq[byte] =
+  result = @[]
+  putU8(result, BodyReset)
+  putVarint(result, int64(m.seqNo))
+  putVarint(result, m.tick)
+  putU8(result, m.reason)
+
+proc decodeBodyReset*(data: seq[byte]; ok: var bool): ResetMsg =
+  var c = newCursor(data)
+  result = ResetMsg()
+  ok = false
+  if takeU8(c) != BodyReset: return
+  result.seqNo = int(takeVarint(c))
+  result.tick = takeVarint(c)
+  result.reason = takeU8(c)
+  ok = not c.bad
+
+proc encodeBodyResyncReq*(lastSeq, reason: int): seq[byte] =
+  result = @[]
+  putU8(result, BodyResyncReq)
+  putVarint(result, int64(lastSeq))
+  putU8(result, reason)
+
+proc decodeBodyResyncReq*(data: seq[byte]; lastSeq, reason: var int): bool =
+  var c = newCursor(data)
+  if takeU8(c) != BodyResyncReq: return false
+  lastSeq = int(takeVarint(c))
+  reason = takeU8(c)
+  not c.bad
+
+proc encodeBodyAck*(seqNo: int): seq[byte] =
+  result = @[]
+  putU8(result, BodyAck)
+  putVarint(result, int64(seqNo))
+
+proc decodeBodyAck*(data: seq[byte]; seqNo: var int): bool =
+  var c = newCursor(data)
+  if takeU8(c) != BodyAck: return false
+  seqNo = int(takeVarint(c))
+  not c.bad
