@@ -1,0 +1,222 @@
+## Runs `runGeneration` on worker threads. No upstream file: pumpkin-world's `generation_work` runs on rayon threads and
+## sends `(pos, RecvChunk::Generation)` back over a channel; this is that pair, with a mutex-protected job queue and result
+## queue because aowlmony has no channel.
+##
+## Ownership: `occupyForGeneration` moves the Protos of a task's write square into its `Cache` and clears the holders'
+## `chunk`, so while a job is queued or running the schedule (tick thread) holds no reference to anything in that cache and
+## reads none of it; the cache comes back, whole, in a `RecvChunk`. Reference counts are atomic, so the refs a job shares
+## with the tick thread (`ScheduleHost`, the generator, the portal) are safe to hold from two threads; they are read-only
+## during generation (see the notes on each global in the commit that added this file).
+##
+## Which stages go to a worker is a bit mask over `StagedChunkEnum`; a stage outside it runs inline in `submit`, exactly
+## as before, and its result is available at the next `pollCompleted`. `Spawn` is never offloaded: it creates entities in
+## the world (`World.spawnEntity`, plugin hooks), which only the tick thread may touch.
+##
+## Configuration: `MC_CHUNK_WORKERS` (worker thread count, default 0 = everything inline, as the server always did) and
+## `MC_CHUNK_ASYNC_MASK` (a decimal bit mask of stage ordinals; default every stage but Spawn). `MC_GEN_STATS=1` prints
+## per-stage totals every ten seconds.
+
+{.feature: "lenientnils".}
+
+import std/locks
+import std/rawthreads
+import std/envvars
+import std/times
+import std/strutils
+import std/syncio
+import ../chunkdata
+import chunk_stage
+import dag
+import generation_cache
+import worker_logic
+from ../../generated/tag import getLatestMap, RegistryKey
+from ../generation/feature/decode import prewarmFeatureDefs
+from ../generation/feature/feature_order import prewarmFeatureOrder
+from ../generation/structure/structures/jigsaw_placement import prewarmStructureJson
+from ../generation/structure/protostructures import prewarmStructureSteps
+from "../generation/structure/template/processor" import prewarmBlockTags
+from "../generation/structure/template/cache" import prewarmTemplates
+
+type
+  GenJob = object
+    host: ScheduleHost
+    pos: ChunkPos
+    cache: Cache
+    stage: StagedChunkEnum
+
+  WorkerThread = ref object
+    t: RawThread
+
+  GenerationExecutor* = ref object
+    workers*: int
+    mask*: int
+    lock: Lock
+    wake: Cond
+    jobs: seq[GenJob]
+    jobHead: int
+    done: seq[RecvChunk]
+    stopping: bool
+    threads: seq[WorkerThread]
+    inFlight*: int           ## Submitted to a worker and not yet handed back by `pollCompleted`. Tick thread only.
+    stageUs: array[16, int64]
+    stageN: array[16, int64]
+    inlineUs: array[16, int64]
+    lastStats: Time
+    stats: bool
+
+var gExec: GenerationExecutor = nil
+  ## The one executor: the worker procs are plain `nimcall`s with a pointer argument and read it from here.
+
+proc sleepWin(ms: uint32) {.stdcall, importc: "Sleep", dynlib: "kernel32.dll".}
+
+proc envInt(name: string, default: int): int =
+  let raw = getEnv(name)
+  if raw.len == 0:
+    return default
+  var v = 0
+  for ch in raw:
+    if ch < '0' or ch > '9':
+      return default
+    v = v * 10 + (ord(ch) - ord('0'))
+  v
+
+proc workerMain(arg: pointer) {.nimcall.} =
+  let ex = gExec
+  while true:
+    var job: GenJob
+    acquire(ex.lock)
+    while ex.jobHead >= ex.jobs.len and not ex.stopping:
+      wait(ex.wake, ex.lock)
+    if ex.jobHead >= ex.jobs.len and ex.stopping:
+      release(ex.lock)
+      return
+    job = ex.jobs[ex.jobHead]
+    ex.jobs[ex.jobHead] = GenJob()
+    inc ex.jobHead
+    if ex.jobHead == ex.jobs.len:
+      ex.jobs.setLen(0)
+      ex.jobHead = 0
+    release(ex.lock)
+    let stage = ord(job.stage)
+    let t0 = getTime()
+    let r = runGeneration(job.host, job.pos, job.cache, job.stage)
+    let us = (getTime() - t0).inMicroseconds
+    job = GenJob()
+    acquire(ex.lock)
+    ex.done.add(r)
+    ex.stageUs[stage] += us
+    ex.stageN[stage] += 1
+    release(ex.lock)
+
+proc newGenerationExecutor*(workers: int, mask: int): GenerationExecutor =
+  result = GenerationExecutor(workers: workers, mask: mask, jobs: @[], jobHead: 0, done: @[], stopping: false,
+    threads: @[], inFlight: 0, lastStats: getTime(), stats: getEnv("MC_GEN_STATS") == "1")
+  initLock(result.lock)
+  initCond(result.wake)
+
+proc prewarmWorldgen*() =
+  ## Fills, on this thread, every table generation would otherwise fill on first use, so the workers only read them. The
+  ## ones filled per key as keys appear (template pools, templates, processor lists, replaceable-block tables, structure
+  ## starts) are guarded by `genlock` instead.
+  discard getLatestMap(RegistryKey(0))
+  prewarmFeatureDefs()
+  prewarmFeatureOrder()
+  prewarmStructureJson()
+  prewarmStructureSteps()
+  prewarmBlockTags()
+  prewarmTemplates()
+
+proc startWorkers*(ex: GenerationExecutor) =
+  prewarmWorldgen()
+  gExec = ex
+  for i in 0 ..< ex.workers:
+    let w = WorkerThread()
+    try:
+      create(w.t, workerMain, nil)
+      ex.threads.add(w)
+    except:
+      echo "chunk generation: could not start worker thread " & $i & "; continuing with " & $ex.threads.len
+      break
+  ex.workers = ex.threads.len
+
+proc defaultAsyncMask(): int =
+  var m = 0
+  for st in ord(StagedChunkEnum.Empty) .. ord(StagedChunkEnum.Full):
+    if st != ord(StagedChunkEnum.Spawn):
+      m = m or (1 shl st)
+  m
+
+proc sharedExecutor*(): GenerationExecutor =
+  ## The process's one executor, made on first use from the environment; every level's schedule shares its workers. With
+  ## no workers configured it runs everything inline.
+  if gExec == nil:
+    let n = envInt("MC_CHUNK_WORKERS", 0)
+    let mask = envInt("MC_CHUNK_ASYNC_MASK", defaultAsyncMask())
+    let ex = newGenerationExecutor(n, mask)
+    if n > 0:
+      startWorkers(ex)
+    else:
+      gExec = ex
+  gExec
+
+proc isAsync*(ex: GenerationExecutor, stage: StagedChunkEnum): bool =
+  ex.workers > 0 and ((ex.mask shr ord(stage)) and 1) == 1
+
+proc submit*(ex: GenerationExecutor, host: ScheduleHost, pos: ChunkPos, cache: Cache, stage: StagedChunkEnum,
+             sink: var seq[RecvChunk]) =
+  ## Inline stages append their result to `sink` (the schedule's `recvChunk`); offloaded ones to the done queue.
+  if not isAsync(ex, stage):
+    if ex.stats:
+      let t0 = getTime()
+      sink.add(runGeneration(host, pos, cache, stage))
+      ex.inlineUs[ord(stage)] += (getTime() - t0).inMicroseconds
+      ex.stageN[ord(stage)] += 1
+    else:
+      sink.add(runGeneration(host, pos, cache, stage))
+    return
+  acquire(ex.lock)
+  ex.jobs.add(GenJob(host: host, pos: pos, cache: cache, stage: stage))
+  release(ex.lock)
+  inc ex.inFlight
+  signal(ex.wake)
+
+proc printStats(ex: GenerationExecutor) =
+  acquire(ex.lock)
+  var line = "chunkgen stats (workers=" & $ex.workers & "):"
+  for st in 0 ..< 16:
+    if ex.stageN[st] > 0:
+      let total = ex.stageUs[st] + ex.inlineUs[st]
+      line.add(" " & $StagedChunkEnum(st) & "=" & $ex.stageN[st] & "x" & $(total div ex.stageN[st]) & "us")
+  release(ex.lock)
+  echo line
+
+proc pollCompleted*(ex: GenerationExecutor, sink: var seq[RecvChunk]): int =
+  ## Moves every finished worker result into `sink`; how many.
+  if ex.stats and (getTime() - ex.lastStats).inSeconds >= 10:
+    ex.lastStats = getTime()
+    printStats(ex)
+  if ex.workers == 0 or ex.inFlight == 0:
+    return 0
+  acquire(ex.lock)
+  result = ex.done.len
+  for i in 0 ..< ex.done.len:
+    sink.add(ex.done[i])
+  ex.done.setLen(0)
+  release(ex.lock)
+  ex.inFlight -= result
+
+proc waitCompleted*(ex: GenerationExecutor, ms: int) =
+  ## Sleeps a moment so a caller that has nothing else to do does not spin while workers run.
+  sleepWin(uint32(ms))
+
+proc shutdown*(ex: GenerationExecutor) =
+  ## Stops the workers once their queue is empty. Joins them.
+  if ex.workers == 0 or ex.threads.len == 0:
+    return
+  acquire(ex.lock)
+  ex.stopping = true
+  release(ex.lock)
+  broadcast(ex.wake)
+  for i in 0 ..< ex.threads.len:
+    join(ex.threads[i].t)
+  ex.threads.setLen(0)

@@ -24,8 +24,9 @@ import chunk_listener
 import chunk_loading
 import generation_cache
 import worker_logic
+import generation_executor
 
-export channel, dag, chunk_listener, chunk_loading, generation_cache, worker_logic
+export channel, dag, chunk_listener, chunk_loading, generation_cache, worker_logic, generation_executor
 
 type
   ChunkHolder* = ref object
@@ -63,6 +64,7 @@ type
     recvChunk*: seq[RecvChunk]
     recvHead: int
     host*: ScheduleHost
+    executor*: GenerationExecutor
     listener*: ChunkListener
     lightingConfig*: LightingEngineConfig
     lastUnload: Time
@@ -92,7 +94,7 @@ proc newGenerationSchedule*(host: ScheduleHost, levelChannel: LevelChannel, list
   GenerationSchedule(queue: initHeapQueue[TaskHeapNode](), graph: newDAG(), lastLevel: initTable[ChunkPos, int8](),
     lastHighPriority: @[], sendLevel: levelChannel, chunkMap: initTable[ChunkPos, ChunkHolder](),
     unloadChunks: initHashSet[ChunkPos](), waitingForChunks: initHashSet[NodeKey](), runningTaskCount: 0'u16,
-    maxInFlight: maxInFlight, queueDirty: false, recvChunk: @[], recvHead: 0, host: host, listener: listener,
+    maxInFlight: maxInFlight, queueDirty: false, recvChunk: @[], recvHead: 0, host: host, executor: sharedExecutor(), listener: listener,
     lightingConfig: host.lightingConfig, lastUnload: getTime())
 
 proc applyLightingOverride(s: GenerationSchedule, chunk: ChunkData) =
@@ -636,6 +638,12 @@ proc workOnce*(s: GenerationSchedule, maxGenerationTasks: int): bool =
     s.shouldSave = false
     saveAllChunk(s, false)
   if s.shutDownChunkSystem:
+    # A task on a worker owns its chunks until it comes back: wait for them before saving.
+    while s.executor.inFlight > 0:
+      discard pollCompleted(s.executor, s.recvChunk)
+      discard drainReceived(s)
+      if s.executor.inFlight > 0:
+        waitCompleted(s.executor, 1)
     garbageCollectDependencies(s)
     processUnloadQueue(s)
     saveAllChunk(s, true)
@@ -654,6 +662,7 @@ proc workOnce*(s: GenerationSchedule, maxGenerationTasks: int): bool =
     s.lastUnload = getTime()
 
   # 2. Process all pending chunk results from workers.
+  discard pollCompleted(s.executor, s.recvChunk)
   if drainReceived(s):
     didWork = true
 
@@ -666,7 +675,10 @@ proc workOnce*(s: GenerationSchedule, maxGenerationTasks: int): bool =
   var ioBatch = newSeq[ChunkPos](0)
   var generationTasks = 0
   while s.queue.len > 0:
-    if s.runningTaskCount >= s.maxInFlight or generationTasks >= maxGenerationTasks:
+    if s.runningTaskCount >= s.maxInFlight or generationTasks >= max(maxGenerationTasks, s.executor.workers * 2):
+      break
+    # With workers, keep about two tasks per worker queued: more would only fix the priorities earlier than needed.
+    if s.executor.workers > 0 and s.executor.inFlight >= s.executor.workers * 2:
       break
     let task = pop(s.queue)
     if containsNode(s.graph, task.key):
@@ -719,12 +731,13 @@ proc workOnce*(s: GenerationSchedule, maxGenerationTasks: int): bool =
             let occupy = insertNode(s.graph, newNode(chunkPos(int32.high, int32.high), StagedChunkEnum.None))
             occupyForGeneration(s, nodeCopy.pos, writeRadius, occupy, cache)
             s.runningTaskCount += 1'u16
-            s.recvChunk.add(runGeneration(s.host, nodeCopy.pos, cache, nodeCopy.stage))
+            submit(s.executor, s.host, nodeCopy.pos, cache, nodeCopy.stage, s.recvChunk)
             inc generationTasks
             didWork = true
 
   # Flush any remaining IO batch.
   flushIOBatch(s, ioBatch)
+  discard pollCompleted(s.executor, s.recvChunk)
   if drainReceived(s):
     didWork = true
 
@@ -747,5 +760,8 @@ proc pumpUntil*(s: GenerationSchedule, done: proc(): bool {.closure.}, maxGenera
     if not workOnce(s, maxGenerationTasksPerPass):
       if done():
         return true
+      if s.executor.inFlight > 0:
+        waitCompleted(s.executor, 1)  # workers still own chunks this waits on
+        continue
       return false
   true
