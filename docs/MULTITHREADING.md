@@ -136,4 +136,6 @@ Each phase lists what changes, who owns the files, how it is verified. "Gate" = 
 | `threads` / `reserved_cores` config + resolver (`sim/threadcfg.aowl`) + tests | done, tests pass (threadcfgtest, libtest) |
 | Wiring the resolved count into `generation_executor` | needs the chunk-system owner (change list sent) |
 | Stale "refcounts are not atomic" comments in docs and sim/regions | fixed (pumpkinlib header: with the chunk-system owner's batch) |
-| Everything else | waiting on the chunk-system owner's branches reaching main |
+| Phase 0: atomic stopFlag, prewarmAll, weather RNG per world, thread-local entity/block/durability RNGs, atomic item-stack ids; job pool and owner guard modules (sim/jobpool, sim/ownerguard) | done, built and scenario-run (worldedit_wand and create_live failed once in the full run and passed on rerun; no baseline to prove flaky) |
+| Loot/spawn/explosion RNG per world, materials prewarm after reload | not started (explosion.aowl has other sessions' edits) |
+| Wiring jobpool into generation_executor, phases 1 to 6 | waiting on the chunk-system owner's branches reaching main |
