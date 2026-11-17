@@ -150,8 +150,22 @@ def engine_session(m, c, st, w, biomes, ctx, args):
             wait(lambda: any(ch == 'showcase:reply' for ch, _ in got), 'the payload reply')
             reply = [d for ch, d in got if ch == 'showcase:reply'][0]
             m.check(reply == bytes([7, 0, 250, 3, 2, 1]), 'the payload reply was %r' % reply)
-            expect('Payload: 6 bytes, declared 2 channel(s), echo declared: true', 'the payload event data and channel registration')
+            expect('Payload: 6 bytes, declared 4 channel(s), echo declared: true', 'the payload event data and channel registration')
             st.hit('showcase_payload')
+            welcome = [d for ch, d in m.CONFIG_PAYLOADS if ch == 'jester:welcome']
+            m.check(len(welcome) == 1, 'no jester:welcome in the configuration phase (got %r)' % m.CONFIG_PAYLOADS)
+            wl = welcome[0]
+            m.check(wl[0] == 1 and wl[1] == 1, 'welcome format/proto: %r' % wl[:2])
+            n = wl[2]
+            at = 3 + n
+            caps = struct.unpack('>Q', wl[at:at + 8])[0]
+            m.check(caps == 2, 'granted caps should be wind only (2): %d' % caps)
+            m.check(wl[at + 8] == 20 and wl[at + 9] == 0, 'tick_hz/flags: %r' % wl[at + 8:at + 10])
+            m.check(wl[at + 10:at + 14] == bytes([0x12, 0x34, 0x56, 0x78]), 'the nonce was not echoed')
+            m.check(any(ch == 'minecraft:register' and b'jester:hello' in d for ch, d in m.CONFIG_PAYLOADS), 'the server sent no minecraft:register')
+            command('caps')
+            expect('Jester: wind=true fx=false client=0.9.0', 'the handshake capabilities')
+            st.hit('showcase_handshake')
             command('giveme minecraft:diamond 5')
             expect('You now carry 5 of minecraft:diamond', 'inventory: a plugin gives items and counts them')
             command('summon minecraft:cow 5 70 5')

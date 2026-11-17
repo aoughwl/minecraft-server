@@ -87,3 +87,171 @@ proc payloadFromHex*(s: string): seq[byte] =
     let b = hexNibble(s[i + 1])
     if a >= 0 and b >= 0: result.add byte(a * 16 + b)
     i += 2
+
+# ---- the Jester handshake (jester:hello / jester:welcome, overnight/PROTOCOL.md section 2) -------------------------------------------
+
+const
+  CapPhysics2* = 0
+  CapWind* = 1
+  CapBodyStream* = 2
+  CapModSync* = 3
+  CapFx* = 4
+  CapMaterials* = 5
+  CapCui* = 6
+  JesterProtocol* = 1
+  JesterFrameFloor* = 16000
+  JesterFrameCeiling* = 30000
+
+type
+  JesterClient* = object
+    player*: string
+    version*: string     ## the client's free-text build
+    offered*: uint64     ## what the client offered
+    granted*: uint64     ## what the server granted
+    proto*: int
+    maxFrame*: int
+
+var
+  gJesterClients: seq[JesterClient] = @[]
+  gServerCaps: uint64 = 0'u64    ## what the server mods offer (a plugin adds to it with advertiseCapability)
+
+proc capBit*(name: string): int =
+  ## The bit of a capability name, -1 for a name that is not one.
+  case name
+  of "physics2": 0
+  of "wind": 1
+  of "bodystream": 2
+  of "modsync": 3
+  of "fx": 4
+  of "materials": 5
+  of "cui": 6
+  else: -1
+
+proc advertiseCapabilityBit*(bit: int) =
+  if bit >= 0 and bit < 64: gServerCaps = gServerCaps or (1'u64 shl bit)
+
+proc serverCapabilities*(): uint64 = gServerCaps
+
+proc jesterClientOf*(player: string): JesterClient =
+  for c in gJesterClients:
+    if c.player == player: return c
+  JesterClient(player: player)
+
+proc jesterForget*(player: string) =
+  var kept: seq[JesterClient] = @[]
+  for c in gJesterClients:
+    if c.player != player: kept.add c
+  gJesterClients = kept
+
+proc playerHasCapability*(player, name: string): bool =
+  let bit = capBit(name)
+  if bit < 0: return false
+  (jesterClientOf(player).granted and (1'u64 shl bit)) != 0'u64
+
+type PayloadCursor = object
+  data: seq[byte]
+  at: int
+  bad: bool
+
+proc takeByte(c: var PayloadCursor): int =
+  if c.at >= c.data.len:
+    c.bad = true
+    return 0
+  result = int(c.data[c.at])
+  inc c.at
+
+proc takeVarint(c: var PayloadCursor): int =
+  var shift = 0
+  result = 0
+  while true:
+    let b = takeByte(c)
+    if c.bad: return 0
+    result = result or ((b and 127) shl shift)
+    if (b and 128) == 0: return
+    shift += 7
+    if shift > 28:
+      c.bad = true
+      return 0
+
+proc takeU64(c: var PayloadCursor): uint64 =
+  result = 0'u64
+  for i in 0 ..< 8:
+    result = (result shl 8'u64) or uint64(takeByte(c))
+
+proc takeString(c: var PayloadCursor): string =
+  let n = takeVarint(c)
+  result = ""
+  if c.bad or n < 0 or c.at + n > c.data.len:
+    c.bad = true
+    return
+  for i in 0 ..< n:
+    result.add char(c.data[c.at + i])
+  c.at += n
+
+proc putVarint(w: var seq[byte]; v: int) =
+  var x = v
+  while true:
+    if x >= 128:
+      w.add byte((x and 127) or 128)
+      x = x shr 7
+    else:
+      w.add byte(x)
+      break
+
+proc putString(w: var seq[byte]; s: string) =
+  putVarint(w, s.len)
+  for ch in s: w.add byte(ord(ch))
+
+proc putBig(w: var seq[byte]; v: uint64; bytes: int) =
+  var i = bytes - 1
+  while i >= 0:
+    w.add byte((v shr uint64(8 * i)) and 255'u64)
+    dec i
+
+proc jesterHello*(player: string; data: seq[byte]; serverTick: int; seed: int64): seq[byte] =
+  ## A `jester:hello` from the client: records it and answers with the bytes of the `jester:welcome` (empty when the hello was malformed).
+  var c = PayloadCursor(data: data, at: 0, bad: false)
+  let format = takeByte(c)
+  let protoMin = takeVarint(c)
+  let protoMax = takeVarint(c)
+  let version = takeString(c)
+  let offered = takeU64(c)
+  let clientFrame = takeVarint(c)
+  var nonce = 0'u64
+  for i in 0 ..< 4: nonce = (nonce shl 8'u64) or uint64(takeByte(c))
+  if c.bad or format != 1: return @[]
+  var granted = offered and gServerCaps
+  var frame = clientFrame
+  if frame > JesterFrameCeiling: frame = JesterFrameCeiling
+  if frame < JesterFrameFloor:
+    granted = granted and not (1'u64 shl CapBodyStream)
+  var proto = JesterProtocol
+  if protoMin > JesterProtocol or protoMax < JesterProtocol:
+    proto = 0
+    granted = 0'u64
+  let bodies = (1'u64 shl CapBodyStream)
+  let fx = (1'u64 shl CapFx)
+  if (granted and (1'u64 shl CapPhysics2)) != 0'u64 and ((granted and bodies) == 0'u64 or (granted and fx) == 0'u64):
+    granted = granted and not (1'u64 shl CapPhysics2)
+  if frame < JesterFrameFloor: frame = JesterFrameFloor
+  jesterForget(player)
+  gJesterClients.add JesterClient(player: player, version: version, offered: offered, granted: granted, proto: proto, maxFrame: frame)
+  var w: seq[byte] = @[]
+  w.add 1'u8
+  putVarint(w, proto)
+  putString(w, "pumpkin-aowl 0.1")
+  putBig(w, granted, 8)
+  w.add 20'u8
+  w.add (if (granted and bodies) != 0'u64: 1'u8 else: 0'u8)
+  putBig(w, nonce, 4)
+  putVarint(w, serverTick)
+  putBig(w, uint64(seed), 8)
+  putVarint(w, frame)
+  w
+
+proc jesterServerRegister*(): seq[byte] =
+  ## The server's own `minecraft:register` body: the channels it listens on.
+  result = @[]
+  for ch in ["jester:hello", "jester:modsync", "jester:bodies"]:
+    for c in ch: result.add byte(ord(c))
+    result.add 0'u8

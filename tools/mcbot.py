@@ -62,6 +62,7 @@ DEFAULT_SECTIONS = 24
 
 # Clientbound
 LOGIN_DISCONNECT, LOGIN_HELLO, LOGIN_FINISHED, LOGIN_COMPRESSION = 0, 1, 2, 3
+CONFIG_PAYLOADS = []   # (channel, data) of the plugin messages the server sent in the configuration phase
 CFG_PAYLOAD, CFG_DISCONNECT, CFG_FINISH, CFG_KEEP_ALIVE, CFG_REGISTRY, CFG_FEATURES, CFG_TAGS, CFG_KNOWN_PACKS, CFG_LINKS = (
     1, 2, 3, 4, 7, 12, 13, 14, 16)
 PLAY_BATCH_END, PLAY_BATCH_START, PLAY_DISCONNECT, PLAY_CHUNK, PLAY_KEEP_ALIVE, PLAY_LOGIN, PLAY_POSITION = (
@@ -1018,7 +1019,7 @@ class Stages:
     ENGINE_KICK_NAMES = ['engine_welcome', 'engine_kick', 'engine_server_alive_after_kick']
     ENGINE_EVENT_NAMES = ['engine_welcome', 'engine_move_event', 'engine_place_event', 'engine_broadcast']
     ENGINE_SHOWCASE_NAMES = ['showcase_join', 'showcase_commands', 'showcase_chat', 'showcase_actions',
-                             'showcase_tasks', 'showcase_payload', 'showcase_manager', 'showcase_kick']
+                             'showcase_tasks', 'showcase_payload', 'showcase_handshake', 'showcase_manager', 'showcase_kick']
 
     def __init__(self, extra=()):
         self.reached = []
@@ -3035,6 +3036,11 @@ def run(args):
 
     # Configuration
     c.send(SB_CFG_INFO, client_information())
+    if getattr(args, 'engine_plugin', None) == 'showcase':
+        # the Jester handshake (overnight/PROTOCOL.md section 2): register, then hello offering every capability
+        c.send(2, string('minecraft:register') + b'jester:welcome' + bytes([0]) + b'jester:wind' + bytes([0]))
+        c.send(2, string('jester:hello') + bytes([1, 1, 1, 5]) + b'0.9.0' + struct.pack('>Q', 0x1F) + bytes([0xB0, 0xEA, 0x01]) +
+               bytes([0x12, 0x34, 0x56, 0x78]))
     registries = {}
     while True:
         pid, r = c.recv()
@@ -3077,7 +3083,10 @@ def run(args):
             c.send(SB_CFG_KEEP_ALIVE, r.take(8))
         elif pid == CFG_DISCONNECT:
             raise Fail('disconnected in configuration: %r' % r.take(r.left()))
-        elif pid in (CFG_PAYLOAD, CFG_FEATURES, CFG_LINKS):
+        elif pid == CFG_PAYLOAD:
+            channel = r.string()
+            CONFIG_PAYLOADS.append((channel, bytes(r.take(r.left()))))
+        elif pid in (CFG_FEATURES, CFG_LINKS):
             r.take(r.left())
         else:
             print('  (not read)')
