@@ -1,0 +1,440 @@
+## Fire spread driven by materials and wind (phase 3 item 12). PURE: imports only std/math. The caller hands over a dense voxel
+## snapshot of block STATE ids and four callbacks (material lookup, burnt state, wetness, wind); the model never touches a world,
+## entity or server state, so it can run on a worker thread. Results come back as lists: events (smoke, ignition, ember, burnt,
+## extinguished) and `removedCells` (structural cells that burnt away: re-run the structural solver on those).
+##
+## SNAPSHOT: nx*ny*nz, index = x + nx*(z + nz*y) (the solver's layout). Outside the box counts as open air; embers that leave vanish.
+##
+## MODEL. A burning cell is a FUEL CELL that is on fire (vanilla puts a fire block in the neighbouring air; we burn the block
+## itself). Per burning cell: age 0..15 (vanilla), fuel (kg, starts density*fill), heat (last computed). A burning cell acts once
+## per FIRE TICK, scheduled 30 + rand(10) game ticks apart (vanilla FireBlock.getFireTickDelay, mean 34.5 ticks = 1.7 s). One
+## call of step() advances ONE game tick and processes the cells due then. Per fire tick of a cell c:
+##   1. wet = wetAt(x,y,z) in 0..1 (rain exposure, damp). wet >= 1 means submerged / touching water: the fire goes out now.
+##      Otherwise it goes out with probability wet * (0.2 + 0.03*age)  (vanilla: 0.2 + 0.03*age when rained on).
+##   2. age += 1 with probability 1/3 (vanilla rand(3) div 2), capped at 15.
+##   3. wind (wx,wz) = windAt(x,y,z) in blocks/s, v = |wind|.
+##      heat = (1 + 0.5*nb) * (1 + windHeat*v) * (1 - 0.6*wet),   nb = burning face neighbours (0..6, capped at 4),
+##      windHeat = 0.04: a 10 b/s gale burns 1.4x faster. FUEL: fuel -= flammability * burnC * heat (burnC = 230 kg per fire tick),
+##      so the burn time scales with mass: fuel0/(flam*230*heat) fire ticks. Oak planks (650 kg, flam 0.2) last 14 fire ticks with
+##      heat 1 and about 5 with heat 3 (a wall interior); a log (flam 0.05) lasts ~57 / ~19; leaves (about 160 kg, flam 0.6) 1-2.
+##      Vanilla's own figure: a block next to a fire block burns away with chance burnOdds/300 per fire tick, i.e. planks (20)
+##      survive ~15 fire ticks per adjacent fire; the numbers agree to within the heat factor.
+##   4. fuel <= 0: the cell becomes burntState(state) (air, charcoal, ash block...). If the old material was structural and the new
+##      one is not, the cell is appended to removedCells. Otherwise (still fuel) it keeps burning.
+##   5. IGNITION OF TARGETS. For each offset (dx,dy,dz) of the spread table (vanilla's [-1,1] x [-1,4] x [-1,1] box around fire)
+##      with a target that is fuel (flam > 0 and ign > 0, not burning), roll
+##          P = w(offset) * G * sqrt(flam_t * ign_t) * 30/(age + 30) * windFactor * (1 - wetAt(target)),   G = 1.6, capped at 1.
+##      sqrt(flam*ign) is the geometric mean of the two vanilla odds (spreadChance = ignite odds, burnChance = burn odds);
+##      30/(age+30) is vanilla's 1/(age+30) odds denominator. Offset weights w (vanilla uses rate 100 + (dy-1)*100 for the
+##      air above): same level face 1.0, same level diagonal 0.5, dy=+1: straight up 1.6 (flames climb), side 0.8, diagonal 0.4,
+##      dy=-1: straight down 0.5, side 0.2; dy=+2..+4: 0.5/dy at the centre column and 0.25/dy at the 8 around it.
+##      windFactor = clamp(exp(windSpread * v * cosA), 0.1, 8), cosA = cosine between the horizontal offset and the wind,
+##      windSpread = 0.18: at 10 b/s a downwind neighbour is 6.0x as likely, an upwind one 0.17x (clamped >= 0.1); vertical
+##      offsets get 1. Ignited targets get age min(15, age + rand(5) div 4).
+##   6. EMBERS. If v >= 1.5 and the cell's flammability counts, with probability
+##          pEmber = min(0.6, 0.06 * (v - 1.5)) * min(1, 4*flam) * (1 - wet)
+##      an ember launches along the wind: flight length D = min(emberRange, (1 + 0.8*v) * (0.35 + 0.65*rand)) blocks (so 3.2..9
+##      blocks at 10 b/s, range cap 10), direction jittered +-0.12 rad, flight arc y = y0 + 1 + 1.5*4f(1-f) - 0.15*s with f = s/D;
+##      after D it falls straight down up to 6 blocks. The first non-air cell it meets (after 0.75 blocks) is hit: it ignites with
+##      probability min(1, 4*sqrt(flam*ign)) * (1 - wetAt) if it is fuel (planks 0.4, leaves 0.9), otherwise the ember dies.
+##      An ember is one `feEmber` event (source -> landing cell).
+##   7. SMOKE. One `feSmoke` event per fire tick per burning cell, amount = kg burnt this tick (capped events, see maxEvents).
+##
+## `step(sim, budget)` processes at most `budget` due cells (budget <= 0 = unlimited); the rest roll to the next game tick, so a
+## tight budget slows the fire down but never loses a cell. DETERMINISM: one splitmix64 stream seeded by newFireSim, ascending
+## processing order per tick bucket (insertion order), no hashing, float64 math in a fixed order; same seed + same callbacks give
+## the same fire. The callbacks must be deterministic too.
+##
+## STRUCTURAL HOOK. removedCells (takeRemoved) lists cells that stopped being structural; hand the new state array to
+## solveradapter.solveSnapshot again. cellDamage(sim, x,y,z) = 1 - fuel/fuel0 of a burning cell (0..1) lets a caller scale strength
+## of a charring support before it is gone.
+
+import std/math
+
+const
+  FireRing = 40            # >= 30 + 10 delay slots
+  fkAir* = 0
+
+type
+  FireMat* = object
+    flammability*: float64   ## 0..1 burn rate (materials.Material.flammability)
+    ignitability*: float64   ## 0..1 catch-fire ease (materials.Material.ignitability)
+    density*: float64        ## kg/m3
+    fill*: float64           ## fill fraction of the cell
+    empty*: bool             ## air: nothing there (embers fly through, nothing to burn)
+    structural*: bool        ## carries load (solveradapter.isStructural): burnt-through cells of these go to removedCells
+
+  FireEventKind* = enum
+    feSmoke, feIgnite, feEmber, feBurnt, feExtinguish
+
+  FireEvent* = object
+    kind*: FireEventKind
+    x*, y*, z*: int          ## the cell (ember: the source cell)
+    x2*, y2*, z2*: int       ## ember: landing cell (same as x,y,z otherwise)
+    amount*: float64         ## smoke: kg burnt; ember: flight length; others 0
+    hit*: bool               ## ember: it ignited something
+
+  FireParams* = object
+    delayMin*, delayJitter*: int   ## fire tick spacing 30 + rand(10)
+    spreadG*: float64              ## G
+    burnC*: float64                ## kg per fire tick per unit flammability
+    windSpread*: float64
+    windHeat*: float64
+    emberMinWind*: float64
+    emberRange*: float64
+    maxEvents*: int
+
+  FireCallbacks* = object
+    matOf*: proc (state: int): FireMat {.closure.}
+    burntState*: proc (state: int): int {.closure.}
+    wetAt*: proc (x, y, z: int): float64 {.closure.}
+    windAt*: proc (x, y, z: int): (float64, float64) {.closure.}
+
+  FireSim* = object
+    nx*, ny*, nz*: int
+    states*: seq[int]
+    age: seq[int8]           ## -1 = not burning
+    fuel: seq[float64]
+    fuel0: seq[float64]
+    heat: seq[float64]
+    buckets: seq[seq[int]]
+    tick*: int
+    rngS: uint64
+    p*: FireParams
+    cb: FireCallbacks
+    events*: seq[FireEvent]
+    removed: seq[int]
+    burning*: int            ## cells currently on fire
+    totalIgnited*, totalBurnt*, totalEmbers*, totalEmberHits*, processed*: int
+    cacheState: seq[int]     ## state id -> index+1 into cacheMat, 0 = unknown
+    cacheMat: seq[FireMat]
+    offDx, offDy, offDz: seq[int]
+    offW: seq[float64]
+
+proc defaultFireParams*(): FireParams =
+  FireParams(delayMin: 30, delayJitter: 10, spreadG: 1.6, burnC: 230.0, windSpread: 0.18, windHeat: 0.04,
+             emberMinWind: 1.5, emberRange: 10.0, maxEvents: 8192)
+
+## Fire material from raw numbers (what materials.aowl gives): the caller passes Material fields.
+proc makeFireMat*(flammability, ignitability, density, fill: float64; empty, structural: bool): FireMat =
+  FireMat(flammability: flammability, ignitability: ignitability, density: density, fill: fill, empty: empty, structural: structural)
+
+# ---------------------------------------------------------------------------------------------------------------------
+# rng (splitmix64)
+
+proc nextU64(s: var FireSim): uint64 =
+  s.rngS = s.rngS + 0x9E3779B97F4A7C15'u64
+  var z = s.rngS
+  z = (z xor (z shr 30)) * 0xBF58476D1CE4E5B9'u64
+  z = (z xor (z shr 27)) * 0x94D049BB133111EB'u64
+  z xor (z shr 31)
+
+proc rnd(s: var FireSim): float64 =
+  float64(nextU64(s) shr 11) / 9007199254740992.0
+
+proc rndInt(s: var FireSim; n: int): int =
+  let v = int(rnd(s) * float64(n))
+  if v >= n: n - 1 else: v
+
+# ---------------------------------------------------------------------------------------------------------------------
+# construction
+
+proc addOff(s: var FireSim; dx, dy, dz: int; w: float64) =
+  s.offDx.add dx
+  s.offDy.add dy
+  s.offDz.add dz
+  s.offW.add w
+
+proc buildOffsets(s: var FireSim) =
+  for dy in -1 .. 4:
+    for dz in -1 .. 1:
+      for dx in -1 .. 1:
+        if dx == 0 and dy == 0 and dz == 0: continue
+        let ring = abs(dx) + abs(dz)      # 0 centre, 1 side, 2 diagonal
+        var w = 0.0
+        if dy == 0:
+          w = if ring == 1: 1.0 else: 0.5
+        elif dy == 1:
+          w = if ring == 0: 1.6 elif ring == 1: 0.8 else: 0.4
+        elif dy == -1:
+          w = if ring == 0: 0.5 elif ring == 1: 0.2 else: 0.0
+        else:
+          w = if ring == 0: 0.5 / float64(dy) else: 0.25 / float64(dy)
+        if w > 0.0: addOff(s, dx, dy, dz, w)
+
+proc newFireSim*(nx, ny, nz: int; states: seq[int]; cb: FireCallbacks; seed: uint64): FireSim =
+  var s = FireSim(nx: nx, ny: ny, nz: nz, states: states, p: defaultFireParams(), cb: cb, rngS: seed)
+  let n = nx * ny * nz
+  s.age = newSeq[int8](n)
+  for i in 0 ..< n: s.age[i] = -1'i8
+  s.fuel = newSeq[float64](n)
+  s.fuel0 = newSeq[float64](n)
+  s.heat = newSeq[float64](n)
+  s.buckets = newSeq[seq[int]](FireRing)
+  buildOffsets(s)
+  s
+
+proc cellIndex*(s: FireSim; x, y, z: int): int = x + s.nx * (z + s.nz * y)
+proc inBox*(s: FireSim; x, y, z: int): bool = x >= 0 and y >= 0 and z >= 0 and x < s.nx and y < s.ny and z < s.nz
+proc isBurning*(s: FireSim; x, y, z: int): bool = inBox(s, x, y, z) and s.age[cellIndex(s, x, y, z)] >= 0'i8
+proc stateAt*(s: FireSim; x, y, z: int): int = s.states[cellIndex(s, x, y, z)]
+proc burningHeat*(s: FireSim; x, y, z: int): float64 = s.heat[cellIndex(s, x, y, z)]
+proc cellDamage*(s: FireSim; x, y, z: int): float64 =
+  ## 1 - fuel/fuel0 of a burning cell, 0 when not burning.
+  if not isBurning(s, x, y, z): return 0.0
+  let c = cellIndex(s, x, y, z)
+  if s.fuel0[c] <= 0.0: return 1.0
+  1.0 - s.fuel[c] / s.fuel0[c]
+
+proc matOfState(s: var FireSim; st: int): FireMat =
+  let k = if st < 0: 0 else: st
+  if k >= s.cacheState.len:
+    let old = s.cacheState.len
+    s.cacheState.setLen(k + 1)
+    for i in old ..< k + 1: s.cacheState[i] = 0
+  let ix = s.cacheState[k]
+  if ix > 0: return s.cacheMat[ix - 1]
+  let m = s.cb.matOf(k)
+  s.cacheMat.add m
+  s.cacheState[k] = s.cacheMat.len
+  m
+
+proc isFuel(m: FireMat): bool = (not m.empty) and m.flammability > 0.0 and m.ignitability > 0.0 and m.density * m.fill > 0.0
+
+proc pushEvent(s: var FireSim; ev: FireEvent) =
+  if s.events.len < s.p.maxEvents: s.events.add ev
+
+proc schedule(s: var FireSim; c: int; delay: int) =
+  let b = (s.tick + delay) mod FireRing
+  s.buckets[b].add c
+
+## Set a cell on fire (initial age given). False when it is not fuel, already burning, or outside the box.
+proc igniteAge(s: var FireSim; x, y, z, age: int; viaEmber: bool): bool =
+  if not inBox(s, x, y, z): return false
+  let c = cellIndex(s, x, y, z)
+  if s.age[c] >= 0'i8: return false
+  let m = matOfState(s, s.states[c])
+  if not isFuel(m): return false
+  s.age[c] = int8(age)
+  s.fuel0[c] = m.density * m.fill
+  s.fuel[c] = s.fuel0[c]
+  s.heat[c] = 1.0
+  inc s.burning
+  inc s.totalIgnited
+  schedule(s, c, s.p.delayMin + rndInt(s, s.p.delayJitter))
+  pushEvent(s, FireEvent(kind: feIgnite, x: x, y: y, z: z, x2: x, y2: y, z2: z, amount: 0.0, hit: viaEmber))
+  true
+
+proc ignite*(s: var FireSim; x, y, z: int): bool = igniteAge(s, x, y, z, 0, false)
+
+proc takeEvents*(s: var FireSim): seq[FireEvent] =
+  result = s.events
+  s.events = @[]
+
+proc takeRemoved*(s: var FireSim): seq[int] =
+  ## Cell indices that burnt away and stopped being structural since the last call (ascending order of occurrence).
+  result = s.removed
+  s.removed = @[]
+
+proc removedCount*(s: FireSim): int = s.removed.len
+
+# ---------------------------------------------------------------------------------------------------------------------
+# embers
+
+proc clampf(x, lo, hi: float64): float64 =
+  if x < lo: lo elif x > hi: hi else: x
+
+proc launchEmber(s: var FireSim; x, y, z: int; wx, wz, v: float64) =
+  inc s.totalEmbers
+  let u = 0.35 + 0.65 * rnd(s)
+  var d = (1.0 + 0.8 * v) * u
+  if d > s.p.emberRange: d = s.p.emberRange
+  let ang = (rnd(s) * 2.0 - 1.0) * 0.12
+  let ca = cos(ang)
+  let sa = sin(ang)
+  var ux = wx / v
+  var uz = wz / v
+  let rx = ux * ca - uz * sa
+  let rz = ux * sa + uz * ca
+  ux = rx
+  uz = rz
+  let px = float64(x) + 0.5
+  let pz = float64(z) + 0.5
+  let y0 = float64(y)
+  var sdist = 0.5
+  var hx = -1
+  var hy = -1
+  var hz = -1
+  var landed = false
+  var lx = x
+  var ly = y
+  var lz = z
+  # horizontal flight
+  while sdist <= d + 1.0e-9:
+    let f = sdist / d
+    let yy = y0 + 1.0 + 1.5 * 4.0 * f * (1.0 - f) - 0.15 * sdist
+    let cx = int(floor(px + ux * sdist))
+    let cz = int(floor(pz + uz * sdist))
+    let cy = int(floor(yy))
+    lx = cx
+    ly = cy
+    lz = cz
+    if sdist >= 0.75 and inBox(s, cx, cy, cz):
+      let m = matOfState(s, s.states[cellIndex(s, cx, cy, cz)])
+      if not m.empty:
+        hx = cx
+        hy = cy
+        hz = cz
+        landed = true
+        break
+    elif not inBox(s, cx, cy, cz) and (cx < 0 or cz < 0 or cx >= s.nx or cz >= s.nz or cy >= s.ny):
+      pushEvent(s, FireEvent(kind: feEmber, x: x, y: y, z: z, x2: cx, y2: cy, z2: cz, amount: sdist, hit: false))
+      return
+    sdist += 0.5
+  if not landed:
+    # fall straight down from the end of the arc
+    var k = 0
+    var fy = ly
+    while k < 6 and fy >= 0:
+      if inBox(s, lx, fy, lz):
+        let m = matOfState(s, s.states[cellIndex(s, lx, fy, lz)])
+        if not m.empty:
+          hx = lx
+          hy = fy
+          hz = lz
+          landed = true
+          break
+      dec fy
+      inc k
+  var hit = false
+  if landed:
+    let c = cellIndex(s, hx, hy, hz)
+    let m = matOfState(s, s.states[c])
+    if isFuel(m) and s.age[c] < 0'i8:
+      var wet = s.cb.wetAt(hx, hy, hz)
+      if wet > 1.0: wet = 1.0
+      let pi = clampf(4.0 * sqrt(m.flammability * m.ignitability), 0.0, 1.0) * (1.0 - wet)
+      if rnd(s) < pi:
+        hit = igniteAge(s, hx, hy, hz, 0, true)
+        if hit: inc s.totalEmberHits
+  else:
+    hx = lx
+    hy = ly
+    hz = lz
+  pushEvent(s, FireEvent(kind: feEmber, x: x, y: y, z: z, x2: hx, y2: hy, z2: hz, amount: sdist, hit: hit))
+
+# ---------------------------------------------------------------------------------------------------------------------
+# one burning cell
+
+proc extinguish(s: var FireSim; c, x, y, z: int) =
+  s.age[c] = -1'i8
+  dec s.burning
+  pushEvent(s, FireEvent(kind: feExtinguish, x: x, y: y, z: z, x2: x, y2: y, z2: z, amount: 0.0, hit: false))
+
+proc actCell(s: var FireSim; c: int) =
+  if s.age[c] < 0'i8: return           # put out since it was scheduled
+  let x = c mod s.nx
+  let r = c div s.nx
+  let z = r mod s.nz
+  let y = r div s.nz
+  let st = s.states[c]
+  let m = matOfState(s, st)
+  var wet = s.cb.wetAt(x, y, z)
+  if wet < 0.0: wet = 0.0
+  if wet >= 1.0:
+    extinguish(s, c, x, y, z)
+    return
+  var age = int(s.age[c])
+  if wet > 0.0 and rnd(s) < wet * (0.2 + 0.03 * float64(age)):
+    extinguish(s, c, x, y, z)
+    return
+  if rndInt(s, 3) == 2 and age < 15: inc age
+  s.age[c] = int8(age)
+  let (wx, wz) = s.cb.windAt(x, y, z)
+  let v = sqrt(wx * wx + wz * wz)
+  # heat
+  var nb = 0
+  if x > 0 and s.age[c - 1] >= 0'i8: inc nb
+  if x + 1 < s.nx and s.age[c + 1] >= 0'i8: inc nb
+  if z > 0 and s.age[c - s.nx] >= 0'i8: inc nb
+  if z + 1 < s.nz and s.age[c + s.nx] >= 0'i8: inc nb
+  if y > 0 and s.age[c - s.nx * s.nz] >= 0'i8: inc nb
+  if y + 1 < s.ny and s.age[c + s.nx * s.nz] >= 0'i8: inc nb
+  if nb > 4: nb = 4
+  let heat = (1.0 + 0.5 * float64(nb)) * (1.0 + s.p.windHeat * v) * (1.0 - 0.6 * wet)
+  s.heat[c] = heat
+  var loss = m.flammability * s.p.burnC * heat
+  if loss > s.fuel[c]: loss = s.fuel[c]
+  s.fuel[c] = s.fuel[c] - loss
+  pushEvent(s, FireEvent(kind: feSmoke, x: x, y: y, z: z, x2: x, y2: y, z2: z, amount: loss, hit: false))
+  # embers first (a cell about to burn out still throws them)
+  if v >= s.p.emberMinWind:
+    let pe = min(0.6, 0.06 * (v - s.p.emberMinWind)) * min(1.0, 4.0 * m.flammability) * (1.0 - wet)
+    if pe > 0.0 and rnd(s) < pe: launchEmber(s, x, y, z, wx, wz, v)
+  # spread to targets
+  let ageDamp = 30.0 / (float64(age) + 30.0)
+  for k in 0 ..< s.offW.len:
+    let tx = x + s.offDx[k]
+    let ty = y + s.offDy[k]
+    let tz = z + s.offDz[k]
+    if not inBox(s, tx, ty, tz): continue
+    let t = cellIndex(s, tx, ty, tz)
+    if s.age[t] >= 0'i8: continue
+    let tm = matOfState(s, s.states[t])
+    if not isFuel(tm): continue
+    var wf = 1.0
+    if v > 0.0 and (s.offDx[k] != 0 or s.offDz[k] != 0):
+      let hl = sqrt(float64(s.offDx[k] * s.offDx[k] + s.offDz[k] * s.offDz[k]))
+      let cosA = (float64(s.offDx[k]) * wx + float64(s.offDz[k]) * wz) / (hl * v)
+      wf = clampf(exp(s.p.windSpread * v * cosA), 0.1, 8.0)
+    let pr = s.offW[k] * s.p.spreadG * sqrt(tm.flammability * tm.ignitability) * ageDamp * wf
+    if pr <= 0.0: continue
+    if rnd(s) < pr:
+      var twet = s.cb.wetAt(tx, ty, tz)
+      if twet > 1.0: twet = 1.0
+      if twet <= 0.0 or rnd(s) >= twet:
+        var na = age + rndInt(s, 5) div 4
+        if na > 15: na = 15
+        discard igniteAge(s, tx, ty, tz, na, false)
+  # burnt out?
+  if s.fuel[c] <= 0.0:
+    let ns = s.cb.burntState(st)
+    s.states[c] = ns
+    s.age[c] = -1'i8
+    dec s.burning
+    inc s.totalBurnt
+    pushEvent(s, FireEvent(kind: feBurnt, x: x, y: y, z: z, x2: x, y2: y, z2: z, amount: s.fuel0[c], hit: false))
+    if m.structural:
+      let nm = matOfState(s, ns)
+      if not nm.structural: s.removed.add c
+  else:
+    schedule(s, c, s.p.delayMin + rndInt(s, s.p.delayJitter))
+
+## Advance one game tick, processing at most `budget` due burning cells (<= 0: all). Returns the number processed.
+proc step*(s: var FireSim; budget: int): int =
+  let b = s.tick mod FireRing
+  let due = s.buckets[b]
+  s.buckets[b] = @[]
+  var done = 0
+  var i = 0
+  while i < due.len:
+    if budget > 0 and done >= budget:
+      let nb = (s.tick + 1) mod FireRing
+      while i < due.len:
+        s.buckets[nb].add due[i]
+        inc i
+      break
+    actCell(s, due[i])
+    inc done
+    inc i
+  s.processed += done
+  inc s.tick
+  done
+
+proc anyBurning*(s: FireSim): bool = s.burning > 0
+
+proc countState*(s: FireSim; st: int): int =
+  var n = 0
+  for i in 0 ..< s.states.len:
+    if s.states[i] == st: inc n
+  n
