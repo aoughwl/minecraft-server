@@ -1,0 +1,255 @@
+## `jester:lod`: distant-terrain summaries (overnight/PROTOCOL.md section 10). The record types, the message encoders and decoders and
+## the serverbound inbox. Pure (std only), so the network layer, the summary sampler (world/generation/lodsummary.aowl) and the sender
+## (lodsync.aowl) can all import it, and a test can run it anywhere.
+##
+## A summary describes one chunk column outside the client's view distance as a grid of cells (`16 shr shift` per side; shift 2 is a
+## 4 x 4 grid, one sample every 4 blocks at the cell's corner block). Per cell: the y of the topmost block a heightmap would see
+## (MOTION_BLOCKING: blocks movement or is a fluid), its state, how many fluid blocks go down from there and the block under them, and the
+## biome. Big-endian; varints are the Minecraft VarInt.
+##
+## Clientbound:
+##   0x01 INIT     u8 version (1), string dimension, varint radius (chunks the server will cover), u8 shift, i16 minY, i16 height,
+##                 i16 seaLevel. Sent when a client gets the capability, on a dimension change and as the answer to every REQUEST; it
+##                 means "forget the summaries of any other dimension".
+##   0x02 COLUMNS  u8 shift, varint count, count x column:
+##                   zigzag varint cx, zigzag varint cz, u8 source (0 noise estimate, 1 generated chunk, 2 superflat),
+##                   (16 shr shift)^2 cells, row-major (z outer, x inner):
+##                     i16 top (minY - 1 = nothing), varint state, u8 depth, [varint floor when depth > 0], u8 biome
+## Serverbound:
+##   0x10 REQUEST  varint radius (chunks; 0 = stop), u8 shift (1..4), u8 flags (bit0: forget what was sent, send everything again)
+##   0x11 FLOW     u8 word: 0 hold, 1 go (the voxel load gate; also the pre-generator's word, see lodsync)
+
+const
+  LodChannel* = "jester:lod"
+  LodVersion* = 1
+  LodInit* = 1
+  LodColumns* = 2
+  LodRequest* = 0x10
+  LodFlow* = 0x11
+  LodSourceNoise* = 0
+  LodSourceChunk* = 1
+  LodSourceFlat* = 2
+  LodShiftMin* = 1
+  LodShiftMax* = 4
+  LodShiftDefault* = 2
+  LodRadiusMax* = 128
+
+type
+  LodCell* = object
+    top*: int32       ## y of the top block (minY - 1 when the column is empty)
+    state*: uint32    ## its block state
+    depth*: int32     ## fluid blocks from the top down, the top included (0: the top is not a fluid)
+    floor*: uint32    ## the block under the fluid (depth > 0)
+    biome*: int32
+
+  LodColumn* = object
+    cx*, cz*: int32
+    shift*: int
+    source*: int
+    cells*: seq[LodCell]
+
+  LodInitMsg* = object
+    version*: int
+    dimension*: string
+    radius*: int
+    shift*: int
+    minY*, height*, seaLevel*: int
+
+  LodClientMsg* = object
+    kind*: int        ## LodRequest or LodFlow; 0 when the message was not understood
+    radius*: int
+    shift*: int
+    resend*: bool
+    go*: bool
+
+proc lodSide*(shift: int): int {.inline.} = 16 shr shift
+proc lodCellCount*(shift: int): int {.inline.} = lodSide(shift) * lodSide(shift)
+
+# ---- writing ------------------------------------------------------------------------------------------------------------------------
+
+proc putU8(w: var seq[byte]; v: int) {.inline.} = w.add byte(v and 255)
+
+proc putI16(w: var seq[byte]; v: int) =
+  let u = v and 0xFFFF
+  w.add byte(u shr 8)
+  w.add byte(u and 255)
+
+proc putVar(w: var seq[byte]; v: int) =
+  var x = uint32(v and 0xFFFFFFFF)
+  while true:
+    if x >= 128'u32:
+      w.add byte((x and 127'u32) or 128'u32)
+      x = x shr 7
+    else:
+      w.add byte(x)
+      break
+
+proc zigzag(v: int32): int = int((cast[uint32](v) shl 1) xor cast[uint32](v shr 31))
+proc unzigzag(u: int): int32 =
+  let x = uint32(u and 0xFFFFFFFF)
+  cast[int32](x shr 1) xor (-cast[int32](x and 1'u32))
+
+proc putStr(w: var seq[byte]; s: string) =
+  putVar(w, s.len)
+  for ch in s: w.add byte(ord(ch))
+
+proc encodeLodInit*(m: LodInitMsg): seq[byte] =
+  result = @[]
+  putU8(result, LodInit)
+  putU8(result, LodVersion)
+  putStr(result, m.dimension)
+  putVar(result, m.radius)
+  putU8(result, m.shift)
+  putI16(result, m.minY)
+  putI16(result, m.height)
+  putI16(result, m.seaLevel)
+
+proc encodeLodColumn*(w: var seq[byte]; c: LodColumn) =
+  ## One column's bytes, appended (the COLUMNS header is the caller's: `encodeLodColumns`).
+  putVar(w, zigzag(c.cx))
+  putVar(w, zigzag(c.cz))
+  putU8(w, c.source)
+  for cell in c.cells:
+    putI16(w, int(cell.top))
+    putVar(w, int(cell.state))
+    let d = if cell.depth > 255: 255 else: int(cell.depth)
+    putU8(w, d)
+    if d > 0: putVar(w, int(cell.floor))
+    putU8(w, int(cell.biome))
+
+proc encodeLodColumns*(shift: int; bodies: seq[seq[byte]]): seq[byte] =
+  ## A COLUMNS message from columns already encoded with `encodeLodColumn`.
+  result = @[]
+  putU8(result, LodColumns)
+  putU8(result, shift)
+  putVar(result, bodies.len)
+  for b in bodies:
+    for x in b: result.add x
+
+proc encodeLodRequest*(radius, shift: int; resend: bool): seq[byte] =
+  result = @[]
+  putU8(result, LodRequest)
+  putVar(result, radius)
+  putU8(result, shift)
+  putU8(result, if resend: 1 else: 0)
+
+proc encodeLodFlow*(go: bool): seq[byte] =
+  @[byte(LodFlow), byte(if go: 1 else: 0)]
+
+# ---- reading ------------------------------------------------------------------------------------------------------------------------
+
+type LodReader = object
+  data: seq[byte]
+  at: int
+  bad: bool
+
+proc u8(r: var LodReader): int =
+  if r.at >= r.data.len:
+    r.bad = true
+    return 0
+  result = int(r.data[r.at])
+  inc r.at
+
+proc i16(r: var LodReader): int =
+  let hi = u8(r)
+  let lo = u8(r)
+  let u = (hi shl 8) or lo
+  if u >= 32768: u - 65536 else: u
+
+proc varint(r: var LodReader): int =
+  var shift = 0
+  var v = 0'u32
+  while true:
+    let b = u8(r)
+    if r.bad: return 0
+    v = v or (uint32(b and 127) shl uint32(shift))
+    if (b and 128) == 0: break
+    shift += 7
+    if shift > 28:
+      r.bad = true
+      return 0
+  int(v)
+
+proc str(r: var LodReader): string =
+  let n = varint(r)
+  result = ""
+  if r.bad or n < 0 or r.at + n > r.data.len:
+    r.bad = true
+    return
+  for i in 0 ..< n: result.add char(r.data[r.at + i])
+  r.at += n
+
+proc decodeLodInit*(data: seq[byte]; ok: var bool): LodInitMsg =
+  result = LodInitMsg(version: 0, dimension: "", radius: 0, shift: 0, minY: 0, height: 0, seaLevel: 0)
+  var r = LodReader(data: data, at: 0, bad: false)
+  ok = false
+  if u8(r) != LodInit: return
+  result.version = u8(r)
+  result.dimension = str(r)
+  result.radius = varint(r)
+  result.shift = u8(r)
+  result.minY = i16(r)
+  result.height = i16(r)
+  result.seaLevel = i16(r)
+  ok = not r.bad
+
+proc decodeLodColumns*(data: seq[byte]; ok: var bool): seq[LodColumn] =
+  ## Every column of a COLUMNS message (nothing at all when any of it does not parse).
+  result = @[]
+  ok = false
+  var r = LodReader(data: data, at: 0, bad: false)
+  if u8(r) != LodColumns: return
+  let shift = u8(r)
+  let n = varint(r)
+  if r.bad or shift < LodShiftMin or shift > LodShiftMax or n < 0 or n > 65536: return
+  let cells = lodCellCount(shift)
+  var got: seq[LodColumn] = @[]
+  for k in 0 ..< n:
+    var c = LodColumn(shift: shift, cells: newSeq[LodCell](cells))
+    c.cx = unzigzag(varint(r))
+    c.cz = unzigzag(varint(r))
+    c.source = u8(r)
+    for i in 0 ..< cells:
+      c.cells[i].top = int32(i16(r))
+      c.cells[i].state = uint32(varint(r))
+      c.cells[i].depth = int32(u8(r))
+      if c.cells[i].depth > 0: c.cells[i].floor = uint32(varint(r))
+      c.cells[i].biome = int32(u8(r))
+    if r.bad: return
+    got.add c
+  ok = true
+  got
+
+proc decodeLodClient*(data: seq[byte]): LodClientMsg =
+  ## A serverbound message; `kind` 0 when it is not one this version knows or does not parse.
+  var r = LodReader(data: data, at: 0, bad: false)
+  let kind = u8(r)
+  result = LodClientMsg(kind: 0, radius: 0, shift: LodShiftDefault, resend: false, go: false)
+  if kind == LodRequest:
+    let radius = varint(r)
+    let shift = u8(r)
+    let flags = u8(r)
+    if r.bad: return
+    result.kind = LodRequest
+    result.radius = max(0, min(radius, LodRadiusMax))
+    result.shift = if shift < LodShiftMin or shift > LodShiftMax: LodShiftDefault else: shift
+    result.resend = (flags and 1) != 0
+  elif kind == LodFlow:
+    let word = u8(r)
+    if r.bad: return
+    result.kind = LodFlow
+    result.go = word != 0
+
+# ---- the serverbound inbox (the network layer pushes, lodsync drains) ------------------------------------------------------------------
+
+const MaxLodInbox = 256
+
+var gLodInbox: seq[(string, seq[byte])] = @[]
+
+proc lodInboxPush*(player: string; data: seq[byte]) =
+  if data.len > 0 and gLodInbox.len < MaxLodInbox:
+    gLodInbox.add (player, data)
+
+proc lodInboxDrain*(): seq[(string, seq[byte])] =
+  result = gLodInbox
+  gLodInbox = @[]
