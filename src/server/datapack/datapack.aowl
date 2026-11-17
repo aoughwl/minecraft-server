@@ -1,0 +1,667 @@
+## Data packs from `<world>/datapacks/` (Fabric gap "data packs"): functions, tags and recipes. Format: a folder per pack
+## with `pack.mcmeta` and `data/<namespace>/...`:
+##   function/ or functions/  <path>.mcfunction       id `ns:path`; one command per line, `#` comments, blank lines, a leading `/`
+##   tags/<registry>/<path>.json   {"replace":bool, "values":["ns:x","#ns:tag"]}; registries block, item (ids resolved), function
+##                                 (names only: `#minecraft:load` runs at load, `#minecraft:tick` every tick)
+##   recipe/ or recipes/  <path>.json   crafting_shaped, crafting_shapeless, smelting, blasting, smoking, campfire_cooking
+## Folder packs only (a .zip is reported, not read). Packs load in name order; a later pack wins a function id, a recipe id,
+## and a `replace` tag. level.dat's `DataPacks.Disabled` ("file/<folder>") is honoured by the caller through `disabled`.
+## PURE of the server: it edits the process-wide tag overlay (generated/tag.aowl `extraNames`) and the crafting lists
+## (generated/recipes.aowl), and restores both exactly on `resetDatapacks()` / the next `loadDatapacks`. Running functions
+## needs the command dispatcher: src/plugin/datapackcmd.aowl.
+
+import std/[syncio, strutils, dirs, paths, os, options]
+import "../../codecs/json_value"
+import "../../generated/tag"
+import "../../generated/recipes"
+import "../../data/item_stack/mod"
+import "../../generated/block_properties"
+import "../../data/block_state"
+import "../../data/blocks"
+
+type
+  McFunction* = object
+    id*: string
+    lines*: seq[string]
+    pack*: string
+
+  PackTag* = object
+    registry*: string      ## "block", "item", "function", ...
+    id*: string            ## "ns:path"
+    replace*: bool
+    values*: seq[string]   ## as written ("ns:x" or "#ns:tag")
+    pack*: string
+
+  DataPack* = object
+    name*, path*, description*: string
+    packFormat*: int
+    ok*: bool
+    errors*, warnings*: seq[string]
+    functions*: seq[McFunction]
+    tags*: seq[PackTag]
+    recipes*: seq[CraftingRecipeTypes]
+    cooking*: seq[CookingRecipe]
+
+  DatapackReport* = object
+    found*, loaded*: int
+    functions*, tagsApplied*, recipesApplied*: int
+    lines*: seq[string]
+
+  TagUndo = object
+    map: TagMap
+    name: string
+    values: seq[string]
+    ids: seq[uint16]
+
+var gPacks: seq[DataPack] = @[]
+var gFunctions: seq[McFunction] = @[]
+var gFunctionTags: seq[PackTag] = @[]
+var gBaseline = false
+var gBaseCrafting: seq[CraftingRecipeTypes] = @[]
+var gBaseShaped: seq[ShapedRecipe] = @[]
+var gBaseShapeless: seq[ShapelessRecipe] = @[]
+var gBaseCooking: seq[CookingRecipe] = @[]
+var gUndo: seq[TagUndo] = @[]
+
+proc slashed(p: string): string =
+  result = ""
+  for c in p:
+    result.add (if c == '\\': '/' else: c)
+
+proc lastPart(p: string): string =
+  var at = -1
+  for k in 0 ..< p.len:
+    if p[k] == '/': at = k
+  if at >= 0: p.substr(at + 1) else: p
+
+proc readText(path: string; text: var string): bool =
+  try:
+    text = readFile(path)
+    return true
+  except ErrorCode:
+    return false
+
+proc nsId(ns, rel: string): string = ns & ":" & rel
+
+proc fullName(s: string): string =
+  ## "stone" -> "minecraft:stone"
+  if s.find(':') >= 0: s else: "minecraft:" & s
+
+proc bareName(full: string): string =
+  ## the tag blobs keep minecraft names bare
+  if full.startsWith("minecraft:"): full.substr(10) else: full
+
+# --- walking ------------------------------------------------------------------------------------------------------------
+
+proc listFiles(dir, suffix: string; rels: var seq[string]; prefix: string) =
+  ## Every file under `dir` ending in `suffix`, as paths relative to the start without the suffix, '/'-separated, in name order.
+  var names: seq[(string, bool)] = @[]
+  try:
+    for kind, entry in walkDir(path(dir)):
+      let full = slashed($entry)
+      names.add (lastPart(full), kind == pcDir)
+  except ErrorCode:
+    return
+  for i in 1 ..< names.len:
+    var j = i
+    while j > 0 and names[j - 1][0] > names[j][0]:
+      swap(names[j - 1], names[j])
+      dec j
+  for n in names:
+    if n[1]:
+      listFiles(dir & "/" & n[0], suffix, rels, prefix & n[0] & "/")
+    elif n[0].endsWith(suffix):
+      rels.add prefix & n[0].substr(0, n[0].len - suffix.len - 1)
+
+# --- functions ------------------------------------------------------------------------------------------------------
+
+proc parseFunction*(text: string): seq[string] =
+  ## One command per entry: `\` joins a line with the next, `#` lines and blanks are dropped, a leading `/` is cut. Macro
+  ## lines (`$`) are not supported and dropped.
+  result = @[]
+  var pending = ""
+  for raw in text.replace("\r", "").split('\n'):
+    var line = raw
+    if pending.len > 0:
+      line = pending & line.strip(leading = true, trailing = false)
+      pending = ""
+    if line.endsWith("\\"):
+      pending = line.substr(0, line.len - 2)
+      continue
+    let t = line.strip()
+    if t.len == 0 or t[0] == '#' or t[0] == '$':
+      continue
+    result.add (if t[0] == '/': t.substr(1) else: t)
+  if pending.strip().len > 0:
+    result.add pending.strip()
+
+# --- recipes -----------------------------------------------------------------------------------------------------------
+
+proc strField(o: JsonValue; key: string; outv: var string): bool =
+  let (has, v) = o.get(key)
+  if has and v.kind == jvString:
+    outv = v.strVal
+    return true
+  false
+
+proc ingredientOf(v: JsonValue; ing: var RecipeIngredient): string =
+  ## "" on success. A string "ns:item" / "#ns:tag", {"item"}, {"tag"}, or an array of items (one of).
+  var s = ""
+  if v.kind == jvString:
+    if v.strVal.len > 0 and v.strVal[0] == '#':
+      ing = RecipeIngredient(kind: rikTagged, name: "#" & fullName(v.strVal.substr(1)))
+    else:
+      ing = RecipeIngredient(kind: rikSimple, name: fullName(v.strVal))
+    return ""
+  if v.kind == jvObject:
+    if strField(v, "item", s):
+      ing = RecipeIngredient(kind: rikSimple, name: fullName(s))
+      return ""
+    if strField(v, "tag", s):
+      ing = RecipeIngredient(kind: rikTagged, name: "#" & fullName(s))
+      return ""
+    return "ingredient object needs \"item\" or \"tag\""
+  if v.kind == jvArray:
+    var opts: seq[string] = @[]
+    for e in v.items:
+      if e.kind == jvString and e.strVal.len > 0 and e.strVal[0] != '#':
+        opts.add fullName(e.strVal)
+      elif e.kind == jvObject and strField(e, "item", s):
+        opts.add fullName(s)
+      else:
+        return "an ingredient list may hold items only"
+    if opts.len == 0:
+      return "empty ingredient list"
+    ing = RecipeIngredient(kind: rikOneOf, options: opts)
+    return ""
+  "ingredient must be a string, an object or a list"
+
+proc resultOf(v: JsonValue; res: var RecipeResult): string =
+  var s = ""
+  if v.kind == jvString:
+    res = RecipeResult(id: fullName(v.strVal), count: 1'u8)
+    return ""
+  if v.kind != jvObject:
+    return "result must be a string or an object"
+  if not (strField(v, "id", s) or strField(v, "item", s)):
+    return "result needs \"id\""
+  var count = 1'i64
+  let (hc, cv) = v.get("count")
+  if hc:
+    if cv.kind != jvInt or cv.intVal < 1 or cv.intVal > 64:
+      return "result count must be 1..64"
+    count = cv.intVal
+  res = RecipeResult(id: fullName(s), count: uint8(count))
+  ""
+
+proc categoryNamed(o: JsonValue): RecipeCategory =
+  var s = ""
+  if strField(o, "category", s):
+    case s
+    of "equipment": return rcEquipment
+    of "building": return rcBuilding
+    of "redstone": return rcRedstone
+    of "food": return rcFood
+    of "blocks": return rcBlocks
+    else: discard
+  rcMisc
+
+proc parseRecipe(id: string; doc: JsonValue; crafting: var seq[CraftingRecipeTypes]; cooking: var seq[CookingRecipe]): string =
+  ## "" on success.
+  if doc.kind != jvObject:
+    return "top level must be an object"
+  var ty = ""
+  if not strField(doc, "type", ty):
+    return "missing \"type\""
+  let kind = fullName(ty)
+  var group = ""
+  let hasGroup = strField(doc, "group", group)
+  let category = categoryNamed(doc)
+  var res = RecipeResult(id: "", count: 1'u8)
+  let (hr, rv) = doc.get("result")
+  if kind == "minecraft:crafting_shaped" or kind == "minecraft:crafting_shapeless" or hr:
+    if not hr:
+      return "missing \"result\""
+    let e = resultOf(rv, res)
+    if e.len > 0:
+      return e
+  if kind == "minecraft:crafting_shaped":
+    let (hp, pv) = doc.get("pattern")
+    let (hk, kv) = doc.get("key")
+    if not hp or pv.kind != jvArray or pv.items.len == 0 or pv.items.len > 3:
+      return "pattern must be 1 to 3 strings"
+    if not hk or kv.kind != jvObject:
+      return "missing \"key\""
+    var pattern: seq[string] = @[]
+    for row in pv.items:
+      if row.kind != jvString or row.strVal.len == 0 or row.strVal.len > 3:
+        return "pattern rows must be 1 to 3 characters"
+      if pattern.len > 0 and pattern[0].len != row.strVal.len:
+        return "pattern rows differ in width"
+      pattern.add row.strVal
+    var chars: seq[char] = @[]
+    var ings: seq[RecipeIngredient] = @[]
+    for i in 0 ..< kv.keys.len:
+      if kv.keys[i].len != 1:
+        return "key \"" & kv.keys[i] & "\" must be one character"
+      var ing = RecipeIngredient(kind: rikSimple, name: "")
+      let e = ingredientOf(kv.vals[i], ing)
+      if e.len > 0:
+        return "key " & kv.keys[i] & ": " & e
+      chars.add kv.keys[i][0]
+      ings.add ing
+    for row in pattern:
+      for c in row:
+        if c != ' ' and chars.find(c) < 0:
+          return "pattern uses '" & $c & "' with no key"
+    var show = true
+    let (hs, sv) = doc.get("show_notification")
+    if hs and sv.kind == jvBool:
+      show = sv.boolVal
+    let rc = ShapedRecipe(id: id, category: category, group: group, hasGroup: hasGroup, showNotification: show,
+      keyChars: chars, keyIngredients: ings, pattern: pattern, result: res)
+    crafting.add CraftingRecipeTypes(kind: crkCraftingShaped, shaped: rc)
+    return ""
+  if kind == "minecraft:crafting_shapeless":
+    let (hi, iv) = doc.get("ingredients")
+    if not hi or iv.kind != jvArray or iv.items.len == 0 or iv.items.len > 9:
+      return "ingredients must be 1 to 9 entries"
+    var ings: seq[RecipeIngredient] = @[]
+    for e in iv.items:
+      var ing = RecipeIngredient(kind: rikSimple, name: "")
+      let err = ingredientOf(e, ing)
+      if err.len > 0:
+        return "ingredient: " & err
+      ings.add ing
+    let rc = ShapelessRecipe(id: id, category: category, group: group, hasGroup: hasGroup, ingredients: ings, result: res)
+    crafting.add CraftingRecipeTypes(kind: crkCraftingShapeless, shapeless: rc)
+    return ""
+  var ck = crkSmelting
+  var isCooking = true
+  var defaultTime = 200'i64
+  case kind
+  of "minecraft:smelting": discard
+  of "minecraft:blasting":
+    ck = crkBlasting
+    defaultTime = 100
+  of "minecraft:smoking":
+    ck = crkSmoking
+    defaultTime = 100
+  of "minecraft:campfire_cooking":
+    ck = crkCampfireCooking
+    defaultTime = 600
+  else: isCooking = false
+  if isCooking:
+    let (hi, iv) = doc.get("ingredient")
+    if not hi:
+      return "missing \"ingredient\""
+    var ing = RecipeIngredient(kind: rikSimple, name: "")
+    let err = ingredientOf(iv, ing)
+    if err.len > 0:
+      return "ingredient: " & err
+    var time = defaultTime
+    let (ht, tv) = doc.get("cookingtime")
+    if ht and tv.kind == jvInt and tv.intVal > 0:
+      time = tv.intVal
+    var xp = 0.0
+    let (hx, xv) = doc.get("experience")
+    if hx:
+      if xv.kind == jvFloat: xp = xv.floatVal
+      elif xv.kind == jvInt: xp = float64(xv.intVal)
+    cooking.add CookingRecipe(id: id, kind: ck, category: category, group: group, hasGroup: hasGroup, ingredient: ing,
+      cookingTime: int32(time), experience: float32(xp), result: res)
+    return ""
+  "recipe type " & kind & " is not supported by this server"
+
+# --- loading one pack -----------------------------------------------------------------------------------------------
+
+proc loadPack*(dir: string): DataPack =
+  let base = lastPart(slashed(dir))
+  result = DataPack(name: base, path: dir, description: "", packFormat: 0, ok: false, errors: @[], warnings: @[],
+    functions: @[], tags: @[], recipes: @[], cooking: @[])
+  var meta = ""
+  if not readText(dir & "/pack.mcmeta", meta):
+    result.errors.add "no pack.mcmeta"
+    return
+  let parsed = parseJsonValue(meta)
+  if not parsed.ok:
+    result.errors.add "pack.mcmeta: invalid JSON: " & parsed.error
+    return
+  let (hp, pv) = parsed.value.get("pack")
+  if not hp or pv.kind != jvObject:
+    result.errors.add "pack.mcmeta: missing \"pack\" object"
+    return
+  let (hf, fv) = pv.get("pack_format")
+  if hf and fv.kind == jvInt:
+    result.packFormat = int(fv.intVal)
+  let (hd, dv) = pv.get("description")
+  if hd and dv.kind == jvString:
+    result.description = dv.strVal
+  result.ok = true
+  var namespaces: seq[string] = @[]
+  try:
+    for kind, entry in walkDir(path(dir & "/data")):
+      if kind == pcDir:
+        namespaces.add lastPart(slashed($entry))
+  except ErrorCode:
+    discard
+  for ns in namespaces:
+    let root = dir & "/data/" & ns
+    for sub in ["function", "functions"]:
+      var rels: seq[string] = @[]
+      listFiles(root & "/" & sub, ".mcfunction", rels, "")
+      for rel in rels:
+        var text = ""
+        if not readText(root & "/" & sub & "/" & rel & ".mcfunction", text):
+          result.warnings.add "cannot read function " & ns & ":" & rel
+          continue
+        result.functions.add McFunction(id: nsId(ns, rel), lines: parseFunction(text), pack: base)
+    for registry in ["block", "item", "function", "entity_type", "fluid", "game_event"]:
+      for sub in [registry, registry & "s"]:
+        var rels: seq[string] = @[]
+        listFiles(root & "/tags/" & sub, ".json", rels, "")
+        for rel in rels:
+          let file = root & "/tags/" & sub & "/" & rel & ".json"
+          var text = ""
+          if not readText(file, text):
+            result.warnings.add "cannot read tag " & file
+            continue
+          let tj = parseJsonValue(text)
+          if not tj.ok or tj.value.kind != jvObject:
+            result.warnings.add "tag " & ns & ":" & rel & ": invalid JSON"
+            continue
+          var tag = PackTag(registry: registry, id: nsId(ns, rel), replace: false, values: @[], pack: base)
+          let (hr, rv) = tj.value.get("replace")
+          if hr and rv.kind == jvBool:
+            tag.replace = rv.boolVal
+          let (hv, vv) = tj.value.get("values")
+          if hv and vv.kind == jvArray:
+            for e in vv.items:
+              if e.kind == jvString:
+                tag.values.add e.strVal
+              elif e.kind == jvObject:
+                var s = ""
+                if strField(e, "id", s):
+                  tag.values.add s
+          result.tags.add tag
+    for sub in ["recipe", "recipes"]:
+      var rels: seq[string] = @[]
+      listFiles(root & "/" & sub, ".json", rels, "")
+      for rel in rels:
+        let file = root & "/" & sub & "/" & rel & ".json"
+        var text = ""
+        if not readText(file, text):
+          result.warnings.add "cannot read recipe " & file
+          continue
+        let rj = parseJsonValue(text)
+        if not rj.ok:
+          result.warnings.add "recipe " & ns & ":" & rel & ": invalid JSON"
+          continue
+        let err = parseRecipe(nsId(ns, rel), rj.value, result.recipes, result.cooking)
+        if err.len > 0:
+          result.warnings.add "recipe " & ns & ":" & rel & ": " & err
+
+# --- applying ---------------------------------------------------------------------------------------------------------
+
+proc idOfValue(key: RegistryKey; full: string; id: var uint16): bool =
+  if not full.startsWith("minecraft:"):
+    return false
+  let bare = full.substr(10)
+  if key == rkItem:
+    let it = Item.fromRegistryKey(bare)
+    if it == nil:
+      return false
+    id = uint16(it.id)
+    return true
+  let b = Block.fromRegistryKey(bare)
+  if b == nil:
+    return false
+  id = asU16(b.id)
+  true
+
+proc expandTag(key: RegistryKey; tagId: string; values: var seq[string]; ids: var seq[uint16]; warn: var seq[string]) =
+  ## The members of an existing tag (built in, or applied from an earlier pack), appended without duplicates.
+  let found = find(getLatestMap(key), tagId)
+  if found == nil:
+    warn.add "tag #" & tagId & " is not defined"
+    return
+  for i in 0 ..< found.values.len:
+    if values.find(found.values[i]) < 0:
+      values.add found.values[i]
+      if i < found.ids.len:
+        ids.add found.ids[i]
+
+proc applyTag(t: PackTag; warn: var seq[string]): bool =
+  var key = rkBlock
+  if t.registry == "block":
+    key = rkBlock
+  elif t.registry == "item":
+    key = rkItem
+  else:
+    return false
+  let m = getLatestMap(key)
+  let existing = find(m, t.id)
+  var values: seq[string] = @[]
+  var ids: seq[uint16] = @[]
+  if existing != nil and not t.replace:
+    values = existing.values
+    ids = existing.ids
+  for raw in t.values:
+    if raw.len > 0 and raw[0] == '#':
+      expandTag(key, fullName(raw.substr(1)), values, ids, warn)
+      continue
+    let full = fullName(raw)
+    var id = 0'u16
+    if not idOfValue(key, full, id):
+      warn.add "tag " & t.id & ": unknown " & t.registry & " " & raw
+      continue
+    let name = bareName(full)
+    if values.find(name) < 0:
+      values.add name
+      ids.add id
+  if existing != nil:
+    gUndo.add TagUndo(map: m, name: t.id, values: existing.values, ids: existing.ids)
+    existing.values = values
+    existing.ids = ids
+  else:
+    m.extraNames.add t.id
+    m.extraTags.add Tag(values: values, ids: ids)
+    gUndo.add TagUndo(map: m, name: "+" & t.id, values: @[], ids: @[])
+  true
+
+proc resetDatapacks*() =
+  ## Back to exactly the built-in tags and recipes.
+  var i = gUndo.len - 1
+  while i >= 0:
+    let u = gUndo[i]
+    if u.name.len > 0 and u.name[0] == '+':
+      let nm = u.name.substr(1)
+      var k = 0
+      while k < u.map.extraNames.len:
+        if u.map.extraNames[k] == nm:
+          u.map.extraNames.delete(k)
+          u.map.extraTags.delete(k)
+        else:
+          inc k
+    else:
+      let t = find(u.map, u.name)
+      if t != nil:
+        t.values = u.values
+        t.ids = u.ids
+    dec i
+  gUndo = @[]
+  if gBaseline:
+    RECIPES_CRAFTING = gBaseCrafting
+    shapedRecipes = gBaseShaped
+    shapelessRecipes = gBaseShapeless
+    cookingRecipes = gBaseCooking
+  gPacks = @[]
+  gFunctions = @[]
+  gFunctionTags = @[]
+
+proc recipeId(r: CraftingRecipeTypes): string =
+  case r.kind
+  of crkCraftingShaped: r.shaped.id
+  of crkCraftingShapeless: r.shapeless.id
+  of crkCraftingTransmute: r.transmute.id
+  of crkCraftingDecoratedPot: r.decoratedPot.id
+
+proc dropCraftingId(id: string) =
+  var k = 0
+  while k < RECIPES_CRAFTING.len:
+    if recipeId(RECIPES_CRAFTING[k]) == id:
+      RECIPES_CRAFTING.delete(k)
+    else:
+      inc k
+  k = 0
+  while k < shapedRecipes.len:
+    if shapedRecipes[k].id == id:
+      shapedRecipes.delete(k)
+    else:
+      inc k
+  k = 0
+  while k < shapelessRecipes.len:
+    if shapelessRecipes[k].id == id:
+      shapelessRecipes.delete(k)
+    else:
+      inc k
+
+proc dropCookingId(id: string) =
+  var k = 0
+  while k < cookingRecipes.len:
+    if cookingRecipes[k].id == id:
+      cookingRecipes.delete(k)
+    else:
+      inc k
+
+proc loadDatapacks*(root: string; disabled: seq[string]): DatapackReport =
+  ## Scans `root` (a world's `datapacks/` folder), resets, and applies every enabled valid pack. Safe to call again.
+  resetDatapacks()
+  if not gBaseline:
+    gBaseCrafting = RECIPES_CRAFTING
+    gBaseShaped = shapedRecipes
+    gBaseShapeless = shapelessRecipes
+    gBaseCooking = cookingRecipes
+    gBaseline = true
+  result = DatapackReport(found: 0, loaded: 0, functions: 0, tagsApplied: 0, recipesApplied: 0, lines: @[])
+  var dirs: seq[string] = @[]
+  try:
+    for kind, entry in walkDir(path(root)):
+      let full = slashed($entry)
+      let base = lastPart(full)
+      if base.startsWith("."):
+        continue
+      if kind == pcDir:
+        dirs.add full
+      elif kind == pcFile and base.toLowerAscii.endsWith(".zip"):
+        result.found += 1
+        result.lines.add base & ": zip data packs are not supported (unpack it into a folder)"
+  except ErrorCode:
+    return
+  for i in 1 ..< dirs.len:
+    var j = i
+    while j > 0 and lastPart(dirs[j - 1]) > lastPart(dirs[j]):
+      swap(dirs[j - 1], dirs[j])
+      dec j
+  for d in dirs:
+    result.found += 1
+    let base = lastPart(d)
+    var off = false
+    for x in disabled:
+      if x == "file/" & base or x == base:
+        off = true
+    if off:
+      result.lines.add base & ": disabled in level.dat"
+      continue
+    var pack = loadPack(d)
+    if not pack.ok:
+      result.lines.add base & ": skipped: " & pack.errors[0]
+      gPacks.add pack
+      continue
+    var warn: seq[string] = @[]
+    for f in pack.functions:
+      var replaced = false
+      for k in 0 ..< gFunctions.len:
+        if gFunctions[k].id == f.id:
+          gFunctions[k] = f
+          replaced = true
+      if not replaced:
+        gFunctions.add f
+      result.functions += 1
+    for t in pack.tags:
+      if t.registry == "function":
+        if t.replace:
+          var k = 0
+          while k < gFunctionTags.len:
+            if gFunctionTags[k].id == t.id:
+              gFunctionTags.delete(k)
+            else:
+              inc k
+        gFunctionTags.add t
+        result.tagsApplied += 1
+      elif applyTag(t, warn):
+        result.tagsApplied += 1
+      else:
+        warn.add "tag " & t.id & ": registry " & t.registry & " is not supported (only block, item and function tags)"
+    for r in pack.recipes:
+      dropCraftingId(recipeId(r))
+      RECIPES_CRAFTING.add r
+      case r.kind
+      of crkCraftingShaped: shapedRecipes.add r.shaped
+      of crkCraftingShapeless: shapelessRecipes.add r.shapeless
+      else: discard
+      result.recipesApplied += 1
+    for c in pack.cooking:
+      dropCookingId(c.id)
+      cookingRecipes.add c
+      result.recipesApplied += 1
+    result.loaded += 1
+    for w in pack.warnings:
+      warn.add w
+    pack.warnings = warn
+    gPacks.add pack
+    result.lines.add base & ": " & $pack.functions.len & " functions, " & $pack.tags.len & " tags, " &
+      $(pack.recipes.len + pack.cooking.len) & " recipes" & (if warn.len > 0: ", " & $warn.len & " warning(s)" else: "")
+    for w in warn:
+      result.lines.add "  warning: " & w
+
+# --- queries --------------------------------------------------------------------------------------------------------
+
+proc datapackCount*(): int = gPacks.len
+proc datapackAt*(i: int): DataPack = gPacks[i]
+proc functionCount*(): int = gFunctions.len
+
+proc findFunction*(id: string; fn: var McFunction): bool =
+  let want = fullName(id)
+  for f in gFunctions:
+    if f.id == want:
+      fn = f
+      return true
+  false
+
+proc functionIds*(): seq[string] =
+  result = @[]
+  for f in gFunctions:
+    result.add f.id
+
+proc functionTagMembers*(tagId: string): seq[string] =
+  ## A tag of the "function" registry, nested tags expanded, in file order, duplicates removed. `tagId` without `#`.
+  result = @[]
+  var todo = @[fullName(tagId)]
+  var seen: seq[string] = @[]
+  var guard = 0
+  while todo.len > 0 and guard < 200:
+    inc guard
+    let cur = todo[0]
+    todo.delete(0)
+    if seen.find(cur) >= 0:
+      continue
+    seen.add cur
+    for t in gFunctionTags:
+      if t.id != cur:
+        continue
+      for v in t.values:
+        if v.len > 0 and v[0] == '#':
+          todo.add fullName(v.substr(1))
+        elif result.find(fullName(v)) < 0:
+          result.add fullName(v)

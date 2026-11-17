@@ -1,0 +1,184 @@
+## Java save import without Java (Fabric gap): a real vanilla/Fabric world folder is read and re-saved by this server's code
+## with nothing lost. Usage: `javaimporttest <world folder> [region file name] [max chunks]`; the folder is only READ, every
+## write goes to a scratch folder next to the executable. Without an argument it prints SKIPPED and succeeds (CI has no world).
+## Checks, against the real files:
+##   level.dat   read, written back, read again: every key of the original `Data` compound survives; only LastPlayed / Version
+##               style bookkeeping may differ
+##   playerdata  every <uuid>.dat read and written through PlayerDataStorage: compound equal, key for key
+##   a region    N chunks parsed (chunkformat), re-serialised, re-parsed, put in a new .mca, read again: every block of every
+##               section equal, block entities equal, heightmaps equal, all non-standard root keys (structures, ...) kept
+{.feature: "lenientnils".}
+
+import std/[assertions, syncio, cmdline, os, strutils, dirs, paths]
+import ../nbt/[tag, nbtbase, deserializer, serializer, nbtdoc]
+import chunkdata, chunkformat, anvilformat, chunkio, worldfs, worldinfo, worldinfoanvil, worldinfodatafiles, playerdata
+import ../config/chunk as chunkconfig
+
+proc rootOf(raw: seq[byte]): NbtCompound =
+  let isNamed = raw.len >= 3 and raw[0] == 0x0a'u8 and raw[1] == 0x00'u8 and raw[2] == 0x00'u8
+  var reader = newNbtReader(nrmJava, raw)
+  let res = if isNamed: read(reader) else: readUnnamed(reader)
+  assert res.isOk
+  res.value.rootTag
+
+proc getKey(c: NbtCompound; k: string): NbtTag =
+  let (has, v) = c.get(k)
+  assert has, "missing key " & k
+  v
+
+if paramCount() < 1:
+  echo "javaimporttest: SKIPPED (no world folder given)"
+  quit(0)
+
+let world = paramStr(1).replace('\\', '/')
+let regionName = if paramCount() >= 2: paramStr(2) else: "r.0.0.mca"
+var maxChunks = 24
+if paramCount() >= 3:
+  maxChunks = 0
+  for ch in paramStr(3):
+    maxChunks = maxChunks * 10 + (ord(ch) - ord('0'))
+let scratch = parentDirW(paramStr(0)) & "/javaimport_scratch"
+discard createDirAllW(scratch)
+
+# --- level.dat ---------------------------------------------------------------------------------------------------------
+let (lok, info, lerr) = readWorldInfo(world)
+assert lok, "readWorldInfo: " & $lerr
+echo "level.dat: name=", info.levelName, " seed=", info.worldGenSettings.seed, " dataVersion=", info.dataVersion
+assert info.worldGenSettings.seed != 0'i64, "a real world has a seed"
+let outFolder = scratch & "/level"
+discard createDirAllW(outFolder)
+let (wok, werr) = writeWorldInfo(info, outFolder)
+assert wok, $werr
+let (bok, info2, berr) = readWorldInfo(outFolder)
+assert bok, $berr
+assert info2.worldGenSettings.seed == info.worldGenSettings.seed and info2.levelName == info.levelName and
+  info2.spawnX == info.spawnX and info2.spawnY == info.spawnY and info2.spawnZ == info.spawnZ and
+  info2.dayTime == info.dayTime and info2.difficulty == info.difficulty, "level.dat fields survive a re-save"
+let (s0, b0) = readFileBytes(world & "/level.dat")
+let (s1, b1) = readFileBytes(outFolder & "/level.dat")
+assert s0 == rsOk and s1 == rsOk
+let (g0, c0, m0) = readGzipCompound(b0)
+let (g1, c1, m1) = readGzipCompound(b1)
+assert g0 and g1, m0 & m1
+let d0 = getKey(c0, "Data").compoundVal
+let d1 = getKey(c1, "Data").compoundVal
+var missing = 0
+var changed = ""
+for i in 0 ..< d0.names.len:
+  let k = d0.names[i]
+  let (has, v) = d1.get(k)
+  if not has:
+    missing += 1
+    echo "  level.dat key lost: ", k
+  elif not (v == d0.values[i]) and k != "LastPlayed" and k != "Version":
+    changed.add k & " "
+echo "level.dat: ", d0.names.len, " keys, lost ", missing, ", changed: ", (if changed.len > 0: changed else: "none")
+assert missing == 0, "no level.dat key is lost"
+assert changed.len == 0, "no level.dat value changes except bookkeeping: " & changed
+
+# --- player data -------------------------------------------------------------------------------------------------------
+let storage = newPlayerDataStorage(scratch & "/playerdata_out", true)
+var players = 0
+try:
+  for kind, entry in walkDir(path(world & "/playerdata")):
+    let name: string = ($entry).replace('\\', '/')
+    if not name.endsWith(".dat"):
+      continue
+    var slash = -1
+    for k in 0 ..< name.len:
+      if name[k] == '/':
+        slash = k
+    let uuid = name.substr(slash + 1, name.len - 5)
+    let (st, bytes) = readFileBytes(name)
+    assert st == rsOk
+    let (ok, nbt, msg) = readGzipCompound(bytes)
+    assert ok, msg
+    let (sok, serr) = savePlayerData(storage, uuid, nbt)
+    assert sok, serr.msg
+    let back = loadPlayerData(storage, uuid)
+    assert back.ok and back.found
+    assert back.nbt == nbt, "player data " & uuid & " survives load/save"
+    players += 1
+except ErrorCode:
+  assert false, "cannot list playerdata"
+echo "playerdata: ", players, " file(s) identical after a save"
+
+# --- region ------------------------------------------------------------------------------------------------------------
+let (rs, rbytes) = readFileBytes(world & "/region/" & regionName)
+assert rs == rsOk, "cannot read region " & regionName
+let (rok, regionFile, rerr) = readRegion(rbytes)
+assert rok, "readRegion failed"
+let cfg = chunkconfig.AnvilChunkConfig(compression: chunkconfig.ChunkCompression(algorithm: chunkconfig.compZLib, level: 6'u32), writeInPlace: false)
+var outRegion = newAnvilChunkFile()
+var checked = 0
+var blocks = 0'i64
+var keptExtra = 0
+var cx = 0
+for index in 0 ..< ChunkCount:
+  if checked >= maxChunks:
+    break
+  if not regionFile.chunksData[index].present:
+    continue
+  # the chunk's own coordinates are in its NBT
+  let (okRaw, raw, _) = toChunkBytes(regionFile.chunksData[index].serializedData)
+  assert okRaw
+  let root0 = rootOf(raw)
+  let x = getKey(root0, "xPos").intVal
+  let z = getKey(root0, "zPos").intVal
+  let parsedA = internalFromBytes(raw, x, z)
+  assert parsedA.ok, "parse " & $x & "," & $z & ": " & parsedA.error
+  let a = parsedA.chunk
+  let re = internalToBytes(a)
+  assert re.ok
+  let parsedB = internalFromBytes(re.bytes, x, z)
+  assert parsedB.ok, "re-parse " & $x & "," & $z & ": " & parsedB.error
+  let b = parsedB.chunk
+  assert a.section.count == b.section.count and a.section.minY == b.section.minY
+  let minY = a.section.minY
+  for xx in 0 ..< 16:
+    for zz in 0 ..< 16:
+      for y in minY ..< minY + int32(a.section.count) * 16'i32:
+        let (oa, ia) = getBlockAbsoluteY(a.section, xx, y, zz)
+        let (ob, ib) = getBlockAbsoluteY(b.section, xx, y, zz)
+        assert oa == ob and ia == ib, "block differs after re-save at chunk " & $x & "," & $z & " cell " & $xx & "," & $y & "," & $zz
+        blocks += 1
+  let r0 = toRootCompound(a)
+  let r1 = toRootCompound(b)
+  assert r0 == r1, "a second save of chunk " & $x & "," & $z & " is identical to the first"
+  # nothing of the original root is dropped, and the keys this port does not model are kept verbatim
+  for i in 0 ..< root0.names.len:
+    let k = root0.names[i]
+    let (has, v) = r1.get(k)
+    assert has, "root key lost on re-save: " & k & " (chunk " & $x & "," & $z & ")"
+    if k != "sections" and k != "Heightmaps" and k != "block_ticks" and k != "fluid_ticks" and k != "block_entities" and
+        k != "isLightOn" and k != "DataVersion" and k != "Status" and k != "InhabitedTime":
+      assert v == root0.values[i], "root key changed on re-save: " & k
+      keptExtra += 1
+  assert getKey(root0, "block_entities") == getKey(r1, "block_entities"), "block entities equal, chunk " & $x & "," & $z
+  assert getKey(root0, "Heightmaps") == getKey(r1, "Heightmaps"), "heightmaps equal, chunk " & $x & "," & $z
+  # into a new region file and back
+  let wst = updateChunkBytes(outRegion, x, z, re.bytes, cfg)
+  assert wst.ok, "updateChunkBytes"
+  checked += 1
+let outPath = scratch & "/" & regionName
+let wr = writeRegion(outRegion, outPath)
+assert wr.ok, "writeRegion"
+let (s2, rb2) = readFileBytes(outPath)
+assert s2 == rsOk
+let (rok2, back, _) = readRegion(rb2)
+assert rok2
+var again = 0
+for index in 0 ..< ChunkCount:
+  if not back.chunksData[index].present:
+    continue
+  let (o1, raw1, _) = toChunkBytes(back.chunksData[index].serializedData)
+  assert o1
+  let root = rootOf(raw1)
+  let x = getKey(root, "xPos").intVal
+  let z = getKey(root, "zPos").intVal
+  let parsed = internalFromBytes(raw1, x, z)
+  assert parsed.ok
+  again += 1
+assert again == checked, "the new .mca holds exactly the chunks written: " & $again & " vs " & $checked
+echo "region ", regionName, ": ", checked, " chunks, ", blocks, " block cells equal after re-save, ", keptExtra, " extra root keys kept verbatim, new .mca re-read: ", again, " chunks"
+echo "javaimporttest ok"

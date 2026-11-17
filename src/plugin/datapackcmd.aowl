@@ -1,0 +1,121 @@
+## Server glue for data packs (server/datapack/datapack.aowl): loads `<world>/datapacks/` at start-up, registers
+## `/function <id>` and `/datapack list|reload`, runs the `#minecraft:load` function tag once at load and `#minecraft:tick`
+## every server tick. Functions run each line through the server's command dispatcher as the sender (the console for
+## load and tick), so a line is any command the server has. Depth is capped at 16 (a function that calls itself).
+
+import std/[syncio, strutils]
+import engine/engineplugins
+import pluginhooksevents
+import ../server/serverbase
+import ../command/[cmdsource, fallbackdispatch, cmddispatch]
+import ../util/text/text
+import ../server/datapack/datapack
+import ../world/worldinfo
+
+const
+  DatapacksFolder = "datapacks"
+  MaxDepth = 16
+
+var gServer: nil Server = nil
+var gDepth = 0
+var gTickBusy = false
+
+proc sendLines(sender: CommandSender; lines: seq[string]) =
+  for l in lines:
+    sender.sendMessage(text(l))
+
+proc runFunction(server: Server; sender: CommandSender; id: string): int =
+  ## Runs `id`; the number of lines run, -1 when there is no such function.
+  result = 0
+  var fn = McFunction(id: "", lines: @[], pack: "")
+  if not findFunction(id, fn):
+    return -1
+  if gDepth >= MaxDepth:
+    echo "[datapack] ", fn.id, ": call depth ", MaxDepth, " reached, not run"
+    return 0
+  let dispatcher = server.commandDispatcher
+  let cs = server.commandServer
+  if dispatcher == nil or cs == nil:
+    return 0
+  gDepth += 1
+  let source = intoSource(sender, cs)
+  for line in fn.lines:
+    cmddispatch.handleCommand(dispatcher, source, line)
+    result += 1
+  gDepth -= 1
+
+proc runTag(server: Server; tag: string): int =
+  result = 0
+  for id in functionTagMembers(tag):
+    let n = runFunction(server, senderConsole(), id)
+    if n > 0:
+      result += n
+
+proc runFunctionCommand(sender: CommandSender; argText: string): CommandResult =
+  let id = argText.strip()
+  if id.len == 0:
+    return cmdFailed(text("usage: /function <namespace:path>"))
+  let server = gServer
+  if server == nil:
+    return cmdFailed(text("the server is not ready"))
+  let n = runFunction(server, sender, id)
+  if n < 0:
+    return cmdFailed(text("Unknown function " & id))
+  sender.sendMessage(text("Executed " & $n & " command(s) from function " & id))
+  cmdSuccess(int32(n))
+
+proc disabledPacks(server: Server): seq[string] =
+  if server.worlds.len > 0:
+    return server.worlds[0].levelInfo.dataPacks.disabled
+  @[]
+
+proc reload(server: Server): DatapackReport =
+  loadDatapacks(server.levelFolder & "/" & DatapacksFolder, disabledPacks(server))
+
+proc summary(rep: DatapackReport): seq[string] =
+  result = @["datapacks: " & $rep.found & " found, " & $rep.loaded & " loaded, " & $rep.functions & " function(s), " &
+    $rep.tagsApplied & " tag(s), " & $rep.recipesApplied & " recipe(s)"]
+  for l in rep.lines:
+    result.add l
+
+proc runDatapack(sender: CommandSender; argText: string): CommandResult =
+  let sub = argText.strip()
+  let server = gServer
+  if server == nil:
+    return cmdFailed(text("the server is not ready"))
+  if sub == "list":
+    var lines: seq[string] = @[]
+    for i in 0 ..< datapackCount():
+      let p = datapackAt(i)
+      lines.add "file/" & p.name & (if p.ok: ": " & $p.functions.len & " functions, " & $p.tags.len & " tags, " &
+        $(p.recipes.len + p.cooking.len) & " recipes" else: ": invalid (" & p.errors[0] & ")")
+    if lines.len == 0:
+      lines.add "no data packs loaded"
+    sendLines(sender, lines)
+  elif sub == "reload":
+    let rep = reload(server)
+    sendLines(sender, summary(rep))
+    discard runTag(server, "minecraft:load")
+  else:
+    return cmdFailed(text("usage: /datapack list | reload"))
+  cmdSuccess(1'i32)
+
+proc startDatapacks*(server: Server) =
+  ## Called once after the plugin manager started (it provides the command registration).
+  gServer = server
+  discard registerBuiltinCommand("function", "Run a data pack function: /function <namespace:path>", 2, runFunctionCommand)
+  discard registerBuiltinCommand("datapack", "Data packs: /datapack list | reload", 2, runDatapack)
+  let rep = reload(server)
+  if rep.found > 0:
+    for l in summary(rep):
+      echo "[datapack] ", l
+  let ran = runTag(server, "minecraft:load")
+  if ran > 0:
+    echo "[datapack] #minecraft:load ran ", ran, " command(s)"
+  let previous = gPluginTickStartHook
+  gPluginTickStartHook = proc(tick: int32) {.closure.} =
+    previous(tick)
+    if not gTickBusy and functionCount() > 0:
+      gTickBusy = true
+      discard runTag(server, "minecraft:tick")
+      gTickBusy = false
