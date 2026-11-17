@@ -1018,7 +1018,7 @@ class Stages:
     ENGINE_KICK_NAMES = ['engine_welcome', 'engine_kick', 'engine_server_alive_after_kick']
     ENGINE_EVENT_NAMES = ['engine_welcome', 'engine_move_event', 'engine_place_event', 'engine_broadcast']
     ENGINE_SHOWCASE_NAMES = ['showcase_join', 'showcase_commands', 'showcase_chat', 'showcase_actions',
-                             'showcase_tasks', 'showcase_manager', 'showcase_kick']
+                             'showcase_tasks', 'showcase_payload', 'showcase_manager', 'showcase_kick']
 
     def __init__(self, extra=()):
         self.reached = []

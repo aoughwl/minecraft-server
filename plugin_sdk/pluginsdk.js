@@ -30,6 +30,11 @@ var __sdk = (function () {
   Player.prototype.itemCount = function (item) { return hostv("player_item_count", this.name, item); };
   Player.prototype.setFood = function (level) { return hostv("player_set_food", this.name, level) == true; };
   Player.prototype.give = function (item, count) { return hostv("player_give", this.name, item, count) == true; };
+  function hexBytes(s) { var out = []; for (var i = 0; i + 1 < s.length; i += 2) out.push(parseInt(s.substr(i, 2), 16)); return out; }
+  function bytesHex(b) { var h = ""; for (var i = 0; i < b.length; i++) h += ("0" + (b[i] & 255).toString(16)).slice(-2); return h; }
+  Player.prototype.sendPayload = function (channel, bytes) { return hostv("player_send_payload", this.name, channel, typeof bytes === "string" ? bytesHex(Array.prototype.map.call(bytes, function (c) { return c.charCodeAt(0); })) : bytesHex(bytes)) == true; };
+  Player.prototype.hasChannel = function (channel) { return hostv("player_has_channel", this.name, channel) == true; };
+  Player.prototype.channels = function () { var s = hostv("player_channels", this.name); return s ? s.split("\n") : []; };
   Player.prototype.kick = function (reason) { return hostv("player_kick", this.name, reason); };
   Player.prototype.teleport = function (x, y, z) {
     if (typeof x === "object") { y = x.y; z = x.z; x = x.x; }
@@ -147,7 +152,7 @@ var __sdk = (function () {
       return { player: P(), pos: xyz(), yaw: num("yaw"), pitch: num("pitch") };
     }],
     MainHandChangeEvent: ["on_player_main_hand_change", function () { return { player: P(), hand: num("hand") }; }],
-    CustomPayloadEvent: ["on_player_custom_payload", function () { return { player: P(), channel: str("channel"), length: num("length") }; }],
+    CustomPayloadEvent: ["on_player_custom_payload", function () { return { player: P(), channel: str("channel"), length: num("length"), data: hexBytes(str("data")) }; }],
     CustomClickEvent: ["on_custom_click", function () { return { player: P(), id: str("id"), length: num("length") }; }],
     EntityDamageEvent: ["on_entity_damage", function () {
       return { entityId: num("entity_id"), entityType: str("entity_type"), damageType: str("damage_type"), amount: num("amount"),

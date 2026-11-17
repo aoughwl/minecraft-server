@@ -137,6 +137,21 @@ def engine_session(m, c, st, w, biomes, ctx, args):
             c.send(m.SB_CARRIED, struct.pack('>h', 0))
             c.send(m.SB_USE, m.varint(0) + m.varint(95) + struct.pack('>ff', 0.0, 90.0))
             expect('Food 6 -> 10', 'the food level event when eating an apple', 20.0)
+            got = []
+            prior = ctx.get('tap')
+            def tap(pid, data, prior=prior):
+                if prior: prior(pid, data)
+                if pid == 24:
+                    r = m.Reader(data)
+                    got.append((r.string(), bytes(data[r.at:])))
+            ctx['tap'] = tap
+            c.send(21, m.string('minecraft:register') + b'showcase:echo\x00showcase:other')
+            c.send(21, m.string('showcase:echo') + bytes([1, 2, 3, 250, 0, 7]))
+            wait(lambda: any(ch == 'showcase:reply' for ch, _ in got), 'the payload reply')
+            reply = [d for ch, d in got if ch == 'showcase:reply'][0]
+            m.check(reply == bytes([7, 0, 250, 3, 2, 1]), 'the payload reply was %r' % reply)
+            expect('Payload: 6 bytes, declared 2 channel(s), echo declared: true', 'the payload event data and channel registration')
+            st.hit('showcase_payload')
             command('giveme minecraft:diamond 5')
             expect('You now carry 5 of minecraft:diamond', 'inventory: a plugin gives items and counts them')
             command('summon minecraft:cow 5 70 5')
