@@ -1,0 +1,504 @@
+## Vanilla fallback for moving bodies (overnight/PROTOCOL.md section 6): a body is shown to a client without `bodystream` as
+## `block_display` entities. Everything here is a pure encoder: cuboid merging, the Display metadata entries, and the packet
+## bytes (spawn, metadata, teleport, remove) of the anchor entities. No world, entity or connection imports; a later task sends
+## the payloads.
+##
+## Pieces
+##   * `greedyCuboids` / `mergeCuboids`: the cells of a body (with block states) as at most 64 axis-aligned cuboids of one state.
+##   * the tracked-data lookups for the Display fields (`displayTracked`), per game version, from the generated tables, with
+##     the two entries the generated tables lack added here (see `DisplayBlockStateIndex`, `DisplayPosRotDurationIndex`).
+##   * `meta*` builders: one `Metadata` per Display field, and `setMetadataBytes` for the body of a set-entity-data packet.
+##   * `bodyDisplayPackets`: the packets of one tick for one body, anchor handling included.
+##
+## Placement (section 6): every cuboid is its own display entity parked at the body's anchor (a block corner). With local
+## minimum corner `m` (cell units), body orientation `R`, centre of mass `com` (cell units, same frame as the cells) and body
+## position `pos` (world position of `com`):
+##     translation   = (pos - anchor) + R * (centre - com) - R * (scale / 2),   centre = m + scale / 2
+##                   = (pos - anchor) + R * (m - com)
+##     left_rotation = R,  scale = cuboid size
+## Vanilla applies translation, then left rotation, then scale about the entity origin, so the unit cube's corner (not its
+## centre) sits at the origin and the centre offset folds into the translation as above.
+
+{.feature: "untyped".}
+
+import std/[algorithm, math]
+import ../../../protocol/[protobase, netcodec, varint]
+import ../../../protocol/java/client/play/[entity_metadata, spawn_entity, teleport_entity, remove_entities]
+import ../../../generated/[meta_data_type, tracked_data, entity_type]
+import ../../../util/[javaversion, uuid, vector3]
+
+const
+  MaxBodyCuboids* = 64          ## display entities per body (PROTOCOL.md section 6)
+  AnchorReanchorDistance* = 8   ## blocks a body may stray from its anchor before the anchor is moved
+  MaxBoundingCells = 1 shl 24   ## largest bounding box `mergeCuboids` will grid (bodies are at most 32^3)
+
+# --- cuboids -----------------------------------------------------------------------------------------------------------------
+
+type
+  Cell* = object
+    ## A body cell: local integer coordinates and the block state id (0 is air and is ignored).
+    x*, y*, z*: int32
+    state*: uint32
+
+  Cuboid* = object
+    ## `x, y, z`: minimum corner in cell coordinates; `sx, sy, sz`: size in cells (all >= 1).
+    x*, y*, z*: int32
+    sx*, sy*, sz*: int32
+    state*: uint32
+
+  CuboidResult* = object
+    cuboids*: seq[Cuboid]   ## at most `maxCuboids`, ordered by (y, z, x) of the minimum corner
+    leftover*: seq[Cell]    ## cells of the cuboids that did not fit, ordered (y, z, x); the caller may draw them with extra
+                            ## entities or leave them out, they are never silently merged into another state
+    needed*: int            ## how many cuboids the best merge needed before the limit was applied
+
+proc volume*(c: Cuboid): int {.inline.} = int(c.sx) * int(c.sy) * int(c.sz)
+
+proc lessPos(a, b: Cuboid): bool =
+  if a.y != b.y: return a.y < b.y
+  if a.z != b.z: return a.z < b.z
+  a.x < b.x
+
+proc cmpBySize(a, b: Cuboid): int =
+  ## Larger first, ties by position, so the choice of the kept cuboids is deterministic.
+  let va = volume(a)
+  let vb = volume(b)
+  if va != vb: return (if va > vb: -1 else: 1)
+  if lessPos(a, b): -1 elif lessPos(b, a): 1 else: 0
+
+proc cmpByPos(a, b: Cuboid): int =
+  if lessPos(a, b): -1 elif lessPos(b, a): 1 else: 0
+
+type Axes3 = array[3, int]
+
+proc greedyPass(grid: seq[uint32], dims: array[3, int], order: Axes3, mn: array[3, int32]): seq[Cuboid] =
+  ## Greedy meshing over the dense grid: scan with `order[2]` outermost and `order[0]` innermost; at each free cell grow along
+  ## `order[0]`, then `order[1]`, then `order[2]` while every cell of the new layer is free and of the same state.
+  result = @[]
+  var used = newSeq[bool](grid.len)
+  var p: array[3, int] = [0, 0, 0]
+  let a0 = order[0]
+  let a1 = order[1]
+  let a2 = order[2]
+  proc at(d: array[3, int], q: array[3, int]): int {.inline.} = (q[1] * d[2] + q[2]) * d[0] + q[0]
+  for i2 in 0 ..< dims[a2]:
+    for i1 in 0 ..< dims[a1]:
+      for i0 in 0 ..< dims[a0]:
+        p[a0] = i0
+        p[a1] = i1
+        p[a2] = i2
+        let start = at(dims, p)
+        if used[start] or grid[start] == 0'u32:
+          continue
+        let st = grid[start]
+        var len0 = 1
+        while i0 + len0 < dims[a0]:
+          p[a0] = i0 + len0
+          let k = at(dims, p)
+          if used[k] or grid[k] != st:
+            break
+          inc len0
+        var len1 = 1
+        block grow1:
+          while i1 + len1 < dims[a1]:
+            for t in 0 ..< len0:
+              p[a0] = i0 + t
+              p[a1] = i1 + len1
+              p[a2] = i2
+              let k = at(dims, p)
+              if used[k] or grid[k] != st:
+                break grow1
+            inc len1
+        var len2 = 1
+        block grow2:
+          while i2 + len2 < dims[a2]:
+            for u in 0 ..< len1:
+              for t in 0 ..< len0:
+                p[a0] = i0 + t
+                p[a1] = i1 + u
+                p[a2] = i2 + len2
+                let k = at(dims, p)
+                if used[k] or grid[k] != st:
+                  break grow2
+            inc len2
+        for w in 0 ..< len2:
+          for u in 0 ..< len1:
+            for t in 0 ..< len0:
+              p[a0] = i0 + t
+              p[a1] = i1 + u
+              p[a2] = i2 + w
+              used[at(dims, p)] = true
+        var lo: array[3, int] = [0, 0, 0]
+        lo[a0] = i0
+        lo[a1] = i1
+        lo[a2] = i2
+        var sz: array[3, int] = [0, 0, 0]
+        sz[a0] = len0
+        sz[a1] = len1
+        sz[a2] = len2
+        result.add(Cuboid(x: mn[0] + int32(lo[0]), y: mn[1] + int32(lo[1]), z: mn[2] + int32(lo[2]),
+          sx: int32(sz[0]), sy: int32(sz[1]), sz: int32(sz[2]), state: st))
+
+proc mergeCuboids*(cells: seq[Cell], maxCuboids: int = MaxBodyCuboids): CuboidResult =
+  ## Merges the non-air cells into cuboids of one state. Greedy meshing is run in all six axis orders and the order that needs
+  ## the fewest cuboids wins (first in the fixed order [x,y,z], [x,z,y], [y,x,z], [y,z,x], [z,x,y], [z,y,x] on a tie), which
+  ## is the coarser merge when one order stumbles on the shape. If more than `maxCuboids` are still needed, the `maxCuboids`
+  ## largest (ties by position) are kept and the cells of every other cuboid are returned as `leftover`; nothing is merged
+  ## across states and nothing is dropped without being reported. Cells repeated in the input count once (the last state wins).
+  result = CuboidResult(cuboids: @[], leftover: @[], needed: 0)
+  var mn: array[3, int32] = [0'i32, 0, 0]
+  var mx: array[3, int32] = [0'i32, 0, 0]
+  var any = false
+  for c in cells:
+    if c.state == 0'u32:
+      continue
+    if not any:
+      mn = [c.x, c.y, c.z]
+      mx = [c.x, c.y, c.z]
+      any = true
+    else:
+      mn = [min(mn[0], c.x), min(mn[1], c.y), min(mn[2], c.z)]
+      mx = [max(mx[0], c.x), max(mx[1], c.y), max(mx[2], c.z)]
+  if not any:
+    return
+  let dims = [int(mx[0] - mn[0]) + 1, int(mx[1] - mn[1]) + 1, int(mx[2] - mn[2]) + 1]
+  if dims[0] * dims[1] * dims[2] > MaxBoundingCells:
+    # Too sparse or too large to grid: everything is leftover, in (y, z, x) order.
+    var raw: seq[Cuboid] = @[]
+    for c in cells:
+      if c.state != 0'u32:
+        raw.add(Cuboid(x: c.x, y: c.y, z: c.z, sx: 1, sy: 1, sz: 1, state: c.state))
+    raw.sort(cmpByPos)
+    for r in raw:
+      result.leftover.add(Cell(x: r.x, y: r.y, z: r.z, state: r.state))
+    result.needed = raw.len
+    return
+  var grid = newSeq[uint32](dims[0] * dims[1] * dims[2])
+  for c in cells:
+    if c.state == 0'u32:
+      continue
+    grid[(int(c.y - mn[1]) * dims[2] + int(c.z - mn[2])) * dims[0] + int(c.x - mn[0])] = c.state
+  let orders: array[6, Axes3] = [[0, 1, 2], [0, 2, 1], [1, 0, 2], [1, 2, 0], [2, 0, 1], [2, 1, 0]]
+  var best: seq[Cuboid] = @[]
+  var haveBest = false
+  for o in orders:
+    let r = greedyPass(grid, dims, o, mn)
+    if not haveBest or r.len < best.len:
+      best = r
+      haveBest = true
+  result.needed = best.len
+  if best.len <= maxCuboids:
+    best.sort(cmpByPos)
+    result.cuboids = best
+    return
+  best.sort(cmpBySize)
+  var kept: seq[Cuboid] = @[]
+  var dropped: seq[Cuboid] = @[]
+  for i in 0 ..< best.len:
+    if i < maxCuboids: kept.add(best[i]) else: dropped.add(best[i])
+  kept.sort(cmpByPos)
+  result.cuboids = kept
+  var cellsOut: seq[Cell] = @[]
+  for d in dropped:
+    for y in d.y ..< d.y + d.sy:
+      for z in d.z ..< d.z + d.sz:
+        for x in d.x ..< d.x + d.sx:
+          cellsOut.add(Cell(x: x, y: y, z: z, state: d.state))
+  proc cmpCell(a, b: Cell): int =
+    if a.y != b.y: return (if a.y < b.y: -1 else: 1)
+    if a.z != b.z: return (if a.z < b.z: -1 else: 1)
+    if a.x != b.x: return (if a.x < b.x: -1 else: 1)
+    0
+  cellsOut.sort(cmpCell)
+  result.leftover = cellsOut
+
+proc greedyCuboids*(cells: seq[Cell]): seq[Cuboid] =
+  ## `mergeCuboids` with the 64-entity limit, cuboids only. Use `mergeCuboids` to see the `leftover` cells.
+  mergeCuboids(cells, MaxBodyCuboids).cuboids
+
+# --- tracked data of the Display entities ------------------------------------------------------------------------------------
+
+type
+  DisplayField* = enum
+    dfStartDelta         ## interpolation start delta ticks, VarInt
+    dfTransformDuration  ## transformation interpolation duration, VarInt
+    dfPosRotDuration     ## position/rotation interpolation duration, VarInt
+    dfTranslation        ## Vector3f
+    dfScale              ## Vector3f
+    dfLeftRotation       ## Quaternionf
+    dfRightRotation      ## Quaternionf
+    dfViewRange          ## float
+    dfShadowRadius       ## float
+    dfShadowStrength     ## float
+    dfGlowColor          ## glow color override, VarInt (-1 is none)
+    dfBlockState         ## BlockDisplay: displayed block state, VarInt
+
+const
+  DisplayPosRotDurationIndex* = 10'u8
+    ## Not in the generated table for 1.21.x (only `POS_ROT_INTERPOLATION_DURATION_ID` for 26.x). Source of truth: net.minecraft
+    ## .world.entity.Display of 1.21.11, field DATA_POS_ROT_INTERPOLATION_DURATION_ID, the third SynchedEntityData entry of
+    ## the class after Entity's own 0..7 (Entity: flags 0, air 1, custom name 2, name visible 3, silent 4, no gravity 5,
+    ## pose 6, ticks frozen 7). Display's entries are, in order: 8 start delta ticks, 9 transformation duration, 10 position
+    ## and rotation duration, 11 translation, 12 scale, 13 left rotation, 14 right rotation, 15 billboard, 16 brightness,
+    ## 17 view range, 18 shadow radius, 19 shadow strength, 20 width, 21 height, 22 glow color override; the generated table
+    ## agrees on every one of those it has (translation 11 ... glow 22). The entry has existed since 1.20.3, so every version
+    ## the table covers uses 10.
+  DisplayBlockStateIndex* = 23'u8
+    ## Not usable from the generated table: its `BLOCK_STATE` / `BLOCK_STATE_ID` rows (9, and 8 on 1.21.7) belong to other
+    ## entities (the table keys by field name, not by class) and collide with Display's own 9. Source of truth: Display
+    ## .BlockDisplay of 1.21.11, DATA_BLOCK_STATE_ID, the first entry after Display's last (22): 23. Unchanged on 26.x.
+
+proc constId(v: uint8): TrackedId =
+  TrackedId(v1_21: v, v1_21_2: v, v1_21_4: v, v1_21_5: v, v1_21_6: v, v1_21_7: v, v1_21_9: v, v1_21_11: v, v26_1: v, v26_2: v)
+
+proc firstPresent(a, b: uint8): uint8 {.inline.} =
+  if a != 255'u8: a else: b
+
+proc mergedId(a, b: TrackedId): TrackedId =
+  ## The generated tables name a field `X` up to 1.21.11 and `X_ID` on 26.x; the merged id answers for every version.
+  TrackedId(v1_21: firstPresent(a.v1_21, b.v1_21), v1_21_2: firstPresent(a.v1_21_2, b.v1_21_2),
+    v1_21_4: firstPresent(a.v1_21_4, b.v1_21_4), v1_21_5: firstPresent(a.v1_21_5, b.v1_21_5),
+    v1_21_6: firstPresent(a.v1_21_6, b.v1_21_6), v1_21_7: firstPresent(a.v1_21_7, b.v1_21_7),
+    v1_21_9: firstPresent(a.v1_21_9, b.v1_21_9), v1_21_11: firstPresent(a.v1_21_11, b.v1_21_11),
+    v26_1: firstPresent(a.v26_1, b.v26_1), v26_2: firstPresent(a.v26_2, b.v26_2))
+
+proc displayTrackedId*(f: DisplayField): TrackedId =
+  ## The tracked id of a Display field for every version: derived from the generated table where it has the entry, otherwise
+  ## the constants above.
+  case f
+  of dfStartDelta: mergedId(TrackedData_START_INTERPOLATION, TrackedData_TRANSFORMATION_INTERPOLATION_START_DELTA_TICKS_ID)
+  of dfTransformDuration: mergedId(TrackedData_INTERPOLATION_DURATION, TrackedData_TRANSFORMATION_INTERPOLATION_DURATION_ID)
+  of dfPosRotDuration: mergedId(constId(DisplayPosRotDurationIndex), TrackedData_POS_ROT_INTERPOLATION_DURATION_ID)
+  of dfTranslation: mergedId(TrackedData_TRANSLATION, TrackedData_TRANSLATION_ID)
+  of dfScale: mergedId(TrackedData_SCALE, TrackedData_SCALE_ID)
+  of dfLeftRotation: mergedId(TrackedData_LEFT_ROTATION, TrackedData_LEFT_ROTATION_ID)
+  of dfRightRotation: mergedId(TrackedData_RIGHT_ROTATION, TrackedData_RIGHT_ROTATION_ID)
+  of dfViewRange: mergedId(TrackedData_VIEW_RANGE, TrackedData_VIEW_RANGE_ID)
+  of dfShadowRadius: mergedId(TrackedData_SHADOW_RADIUS, TrackedData_SHADOW_RADIUS_ID)
+  of dfShadowStrength: mergedId(TrackedData_SHADOW_STRENGTH, TrackedData_SHADOW_STRENGTH_ID)
+  of dfGlowColor: mergedId(TrackedData_GLOW_COLOR_OVERRIDE, TrackedData_GLOW_COLOR_OVERRIDE_ID)
+  of dfBlockState: constId(DisplayBlockStateIndex)
+
+proc displayTracked*(f: DisplayField, version: JavaMinecraftVersion): uint8 =
+  ## The index byte written for `f` on `version`; 255 when the version has no such entry (the entry is then not written).
+  displayTrackedId(f).get(version)
+
+proc firstType(a, b: MetaDataType): MetaDataType =
+  MetaDataType(v1_21: (if a.v1_21 >= 0: a.v1_21 else: b.v1_21), v1_21_2: (if a.v1_21_2 >= 0: a.v1_21_2 else: b.v1_21_2),
+    v1_21_4: (if a.v1_21_4 >= 0: a.v1_21_4 else: b.v1_21_4), v1_21_5: (if a.v1_21_5 >= 0: a.v1_21_5 else: b.v1_21_5),
+    v1_21_6: (if a.v1_21_6 >= 0: a.v1_21_6 else: b.v1_21_6), v1_21_7: (if a.v1_21_7 >= 0: a.v1_21_7 else: b.v1_21_7),
+    v1_21_9: (if a.v1_21_9 >= 0: a.v1_21_9 else: b.v1_21_9), v1_21_11: (if a.v1_21_11 >= 0: a.v1_21_11 else: b.v1_21_11),
+    v26_1: (if a.v26_1 >= 0: a.v26_1 else: b.v26_1), v26_2: (if a.v26_2 >= 0: a.v26_2 else: b.v26_2))
+
+proc varIntType(): MetaDataType = firstType(INTEGER, INT)
+proc vector3Type(): MetaDataType = firstType(VECTOR_3F, VECTOR3)
+proc quaternionType(): MetaDataType = firstType(QUATERNION_F, QUATERNION)
+
+# --- metadata entries ---------------------------------------------------------------------------------------------------------
+
+proc metaVarInt*(f: DisplayField, value: int32): Metadata =
+  newMetadata(displayTrackedId(f), varIntType(), newVarInt(value))
+
+proc metaFloat*(f: DisplayField, value: float32): Metadata =
+  newMetadata(displayTrackedId(f), FLOAT, value)
+
+proc metaStartDelta*(ticks: int32): Metadata = metaVarInt(dfStartDelta, ticks)
+proc metaTransformDuration*(ticks: int32): Metadata = metaVarInt(dfTransformDuration, ticks)
+proc metaPosRotDuration*(ticks: int32): Metadata = metaVarInt(dfPosRotDuration, ticks)
+proc metaGlowColor*(argb: int32): Metadata = metaVarInt(dfGlowColor, argb)
+proc metaViewRange*(range: float32): Metadata = metaFloat(dfViewRange, range)
+proc metaShadowRadius*(radius: float32): Metadata = metaFloat(dfShadowRadius, radius)
+proc metaShadowStrength*(strength: float32): Metadata = metaFloat(dfShadowStrength, strength)
+
+proc metaTranslation*(x, y, z: float32): Metadata =
+  newMetadata(displayTrackedId(dfTranslation), vector3Type(), Vector3[float32](x: x, y: y, z: z))
+
+proc metaScale*(x, y, z: float32): Metadata =
+  newMetadata(displayTrackedId(dfScale), vector3Type(), Vector3[float32](x: x, y: y, z: z))
+
+proc metaLeftRotation*(x, y, z, w: float32): Metadata =
+  newMetadata(displayTrackedId(dfLeftRotation), quaternionType(), Quaternionf(x: x, y: y, z: z, w: w))
+
+proc metaRightRotation*(x, y, z, w: float32): Metadata =
+  newMetadata(displayTrackedId(dfRightRotation), quaternionType(), Quaternionf(x: x, y: y, z: z, w: w))
+
+proc metaBlockState*(stateId: int32): Metadata =
+  ## `stateId` is in the server's (latest) numbering; `Metadata.write` remaps it for the viewer's version.
+  newMetadata(displayTrackedId(dfBlockState), BLOCK_STATE, newVarInt(stateId))
+
+proc entriesBytes*(entries: seq[Metadata], version: JavaMinecraftVersion): seq[byte] =
+  ## The entries as set-entity-data carries them after the entity id: index, type, value for each, then the 0xFF end marker.
+  var w = newNetWriter()
+  for m in entries:
+    discard m.write(w, version)
+  writeU8(w, 0xFF'u8)
+  w.buf
+
+# --- packets --------------------------------------------------------------------------------------------------------------------
+
+type
+  DisplayPacketKind* = enum
+    dpSpawn, dpMetadata, dpTeleport, dpRemove
+
+  DisplayPacket* = object
+    kind*: DisplayPacketKind
+    entityId*: int32      ## the first entity for dpRemove
+    packetId*: int32      ## the clientbound play packet id for the viewer's version
+    payload*: seq[byte]   ## the packet body after the id
+
+  BodyPose* = object
+    ## `pos`: world position of the centre of mass; `quat`: orientation x, y, z, w; `com`: centre of mass in cell units.
+    pos*: (float64, float64, float64)
+    quat*: (float32, float32, float32, float32)
+    com*: (float32, float32, float32)
+
+  DisplayConfig* = object
+    version*: JavaMinecraftVersion
+    updateHz*: int32           ## 20, 10 or 5: the interpolation duration is 40 / updateHz ticks (2, 4, 8)
+    viewRange*: float32        ## written at spawn; PROTOCOL.md says 2.0
+    shadowRadius*: float32     ## written at spawn when not 0
+    glowColor*: int32          ## written at spawn when not -1
+
+  BodyDisplayState* = object
+    ## What the sender keeps between ticks for one body and one viewer version.
+    bodyId*: int32
+    firstEntityId*: int32      ## cuboid i is entity firstEntityId + i
+    count*: int
+    anchor*: (int32, int32, int32)
+    spawned*: bool
+
+  BodyDisplayPackets* = object
+    spawns*: seq[DisplayPacket]     ## send first
+    teleports*: seq[DisplayPacket]  ## then these (anchor moved past the limit)
+    metadata*: seq[DisplayPacket]   ## then the transformation updates
+
+proc defaultDisplayConfig*(): DisplayConfig =
+  DisplayConfig(version: jmvV1_21_11, updateHz: 20'i32, viewRange: 2.0'f32, shadowRadius: 0.0'f32, glowColor: -1'i32)
+
+proc interpolationTicks*(updateHz: int32): int32 =
+  ## 20 Hz: 2 ticks, 10 Hz: 4, 5 Hz: 8 (PROTOCOL.md section 6).
+  if updateHz <= 0'i32: 2'i32 else: max(1'i32, 40'i32 div updateHz)
+
+template packetBody(p, v: untyped): seq[byte] =
+  block:
+    var pbw = newNetWriter()
+    discard writePacket(p, pbw, v)
+    pbw.buf
+
+proc displayUuid*(bodyId: int32, index: int): Uuid =
+  ## A stable version 4 shaped id per (body, cuboid).
+  Uuid(hi: 0x6a65737465724000'u64 or uint64(uint32(bodyId) and 0xFFF'u32),
+    lo: 0x8000000000000000'u64 or (uint64(uint32(bodyId)) shl 16) or uint64(index and 0xFFFF))
+
+proc rotate(q: (float32, float32, float32, float32), v: (float64, float64, float64)): (float64, float64, float64) =
+  ## `q * v` for a unit quaternion (x, y, z, w): v + 2w (u x v) + 2 u x (u x v), u = (x, y, z).
+  let n = sqrt(float64(q[0]) * float64(q[0]) + float64(q[1]) * float64(q[1]) + float64(q[2]) * float64(q[2]) +
+    float64(q[3]) * float64(q[3]))
+  let s = if n == 0.0: 1.0 else: 1.0 / n
+  let ux = float64(q[0]) * s
+  let uy = float64(q[1]) * s
+  let uz = float64(q[2]) * s
+  let w = float64(q[3]) * s
+  let cx = uy * v[2] - uz * v[1]
+  let cy = uz * v[0] - ux * v[2]
+  let cz = ux * v[1] - uy * v[0]
+  let dx = uy * cz - uz * cy
+  let dy = uz * cx - ux * cz
+  let dz = ux * cy - uy * cx
+  (v[0] + 2.0 * (w * cx + dx), v[1] + 2.0 * (w * cy + dy), v[2] + 2.0 * (w * cz + dz))
+
+proc normalizedQuat(q: (float32, float32, float32, float32)): (float32, float32, float32, float32) =
+  let n = sqrt(float64(q[0]) * float64(q[0]) + float64(q[1]) * float64(q[1]) + float64(q[2]) * float64(q[2]) +
+    float64(q[3]) * float64(q[3]))
+  if n == 0.0:
+    return (0.0'f32, 0.0'f32, 0.0'f32, 1.0'f32)
+  (float32(float64(q[0]) / n), float32(float64(q[1]) / n), float32(float64(q[2]) / n), float32(float64(q[3]) / n))
+
+proc translationOf*(pose: BodyPose, anchor: (int32, int32, int32), c: Cuboid): (float32, float32, float32) =
+  ## `(pos - anchor) + R * (m - com)`, the folded form of the formula in the header.
+  let r = rotate(pose.quat, (float64(c.x) - float64(pose.com[0]), float64(c.y) - float64(pose.com[1]),
+    float64(c.z) - float64(pose.com[2])))
+  (float32(pose.pos[0] - float64(anchor[0]) + r[0]), float32(pose.pos[1] - float64(anchor[1]) + r[1]),
+    float32(pose.pos[2] - float64(anchor[2]) + r[2]))
+
+proc strayed(pose: BodyPose, anchor: (int32, int32, int32)): bool =
+  abs(pose.pos[0] - float64(anchor[0])) > float64(AnchorReanchorDistance) or
+    abs(pose.pos[1] - float64(anchor[1])) > float64(AnchorReanchorDistance) or
+    abs(pose.pos[2] - float64(anchor[2])) > float64(AnchorReanchorDistance)
+
+proc snapAnchor(pose: BodyPose): (int32, int32, int32) =
+  (int32(floor(pose.pos[0])), int32(floor(pose.pos[1])), int32(floor(pose.pos[2])))
+
+proc spawnPacket(st: BodyDisplayState, i: int, cfg: DisplayConfig): DisplayPacket =
+  let id = st.firstEntityId + int32(i)
+  let pkt = CSpawnEntity(entityId: newVarInt(id), entityUuid: displayUuid(st.bodyId, i),
+    typ: newVarInt(int32(EntityType.BLOCK_DISPLAY.id)),
+    position: Vector3[float64](x: float64(st.anchor[0]), y: float64(st.anchor[1]), z: float64(st.anchor[2])),
+    pitch: 0'u8, yaw: 0'u8, headYaw: 0'u8, data: newVarInt(0))
+  DisplayPacket(kind: dpSpawn, entityId: id, packetId: CSpawnEntity.toId(cfg.version), payload: packetBody(pkt, cfg.version))
+
+proc teleportPacket(st: BodyDisplayState, i: int, cfg: DisplayConfig): DisplayPacket =
+  let id = st.firstEntityId + int32(i)
+  let pkt = CTeleportEntity(entityId: newVarInt(id),
+    position: Vector3[float64](x: float64(st.anchor[0]), y: float64(st.anchor[1]), z: float64(st.anchor[2])),
+    delta: Vector3[float64](x: 0.0, y: 0.0, z: 0.0), yaw: 0.0'f32, pitch: 0.0'f32, relatives: @[], onGround: false)
+  DisplayPacket(kind: dpTeleport, entityId: id, packetId: CTeleportEntity.toId(cfg.version), payload: packetBody(pkt, cfg.version))
+
+proc metadataPacket(id: int32, entries: seq[Metadata], cfg: DisplayConfig): DisplayPacket =
+  let pkt = CSetEntityMetadata(entityId: newVarInt(id), metadata: entriesBytes(entries, cfg.version))
+  DisplayPacket(kind: dpMetadata, entityId: id, packetId: CSetEntityMetadata.toId(cfg.version),
+    payload: packetBody(pkt, cfg.version))
+
+proc newBodyDisplayState*(bodyId, firstEntityId: int32, cuboidCount: int): BodyDisplayState =
+  BodyDisplayState(bodyId: bodyId, firstEntityId: firstEntityId, count: cuboidCount, anchor: (0'i32, 0'i32, 0'i32), spawned: false)
+
+proc bodyDisplayPackets*(st: var BodyDisplayState, pose: BodyPose, cuboids: seq[Cuboid],
+    cfg: DisplayConfig = defaultDisplayConfig()): BodyDisplayPackets =
+  ## The packets for one body at this tick. The first call spawns the entities at the anchor (the block corner under the body)
+  ## and sends the full Display metadata; later calls send the transformation only (start delta 0, both durations the
+  ## interpolation length, translation, left rotation). When the body is more than 8 blocks from the anchor on any axis, the
+  ## anchor is moved to the body's block, every entity is teleported there and the new translations go in the same batch;
+  ## the position/rotation duration equals the transformation duration so the entity's glide to the new anchor and the
+  ## translation's glide to its new value are the same length and cancel. `cuboids` must be the same list on every call
+  ## (its length is `st.count`).
+  result = BodyDisplayPackets(spawns: @[], teleports: @[], metadata: @[])
+  let q = normalizedQuat(pose.quat)
+  let dur = interpolationTicks(cfg.updateHz)
+  let first = not st.spawned
+  if first:
+    st.anchor = snapAnchor(pose)
+    st.spawned = true
+  elif strayed(pose, st.anchor):
+    st.anchor = snapAnchor(pose)
+    for i in 0 ..< cuboids.len:
+      result.teleports.add(teleportPacket(st, i, cfg))
+  for i in 0 ..< cuboids.len:
+    let c = cuboids[i]
+    let t = translationOf(pose, st.anchor, c)
+    var entries: seq[Metadata] = @[]
+    entries.add(metaStartDelta(0'i32))
+    entries.add(metaTransformDuration(dur))
+    entries.add(metaPosRotDuration(dur))
+    entries.add(metaTranslation(t[0], t[1], t[2]))
+    if first:
+      entries.add(metaScale(float32(c.sx), float32(c.sy), float32(c.sz)))
+    entries.add(metaLeftRotation(q[0], q[1], q[2], q[3]))
+    if first:
+      entries.add(metaViewRange(cfg.viewRange))
+      if cfg.shadowRadius != 0.0'f32:
+        entries.add(metaShadowRadius(cfg.shadowRadius))
+      if cfg.glowColor != -1'i32:
+        entries.add(metaGlowColor(cfg.glowColor))
+      entries.add(metaBlockState(int32(c.state)))
+      result.spawns.add(spawnPacket(st, i, cfg))
+    result.metadata.add(metadataPacket(st.firstEntityId + int32(i), entries, cfg))
+
+proc removeDisplayPacket*(st: var BodyDisplayState, cfg: DisplayConfig = defaultDisplayConfig()): DisplayPacket =
+  ## One remove-entities packet for every entity of the body; the state goes back to "not spawned".
+  var ids: seq[VarInt] = @[]
+  for i in 0 ..< st.count:
+    ids.add(newVarInt(st.firstEntityId + int32(i)))
+  let pkt = CRemoveEntities(entityIds: ids)
+  st.spawned = false
+  DisplayPacket(kind: dpRemove, entityId: st.firstEntityId, packetId: CRemoveEntities.toId(cfg.version),
+    payload: packetBody(pkt, cfg.version))

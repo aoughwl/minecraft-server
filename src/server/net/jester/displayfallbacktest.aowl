@@ -1,0 +1,293 @@
+## Tests for displayfallback.aowl: cuboid merging, Display metadata byte layouts, and the packets of a body, against bytes worked
+## out by hand from the Minecraft protocol (VarInt, big-endian IEEE-754 floats and doubles, the entity metadata entry layout
+## `index u8, type VarInt, value`). Protocol 774 (1.21.11) unless a line says otherwise.
+{.feature: "untyped".}
+
+import std/[assertions, syncio]
+import ../../../protocol/java/client/play/playtestutil
+import ../../../protocol/java/client/play/entity_metadata
+import ../../../generated/[meta_data_type, tracked_data, entity_type, block_state_remap, entity_id_remap]
+import ../../../util/javaversion
+import displayfallback
+
+const V = jmvV1_21_11
+
+# --- cuboid merging ----------------------------------------------------------------------------------------------------------
+
+proc box(x0, y0, z0, sx, sy, sz: int32, state: uint32): seq[Cell] =
+  result = @[]
+  for y in y0 ..< y0 + sy:
+    for z in z0 ..< z0 + sz:
+      for x in x0 ..< x0 + sx:
+        result.add(Cell(x: x, y: y, z: z, state: state))
+
+# a solid 4x4x4 is one cuboid
+block:
+  let r = mergeCuboids(box(0, 0, 0, 4, 4, 4, 5'u32))
+  assert r.cuboids.len == 1 and r.leftover.len == 0 and r.needed == 1
+  assert r.cuboids[0] == Cuboid(x: 0, y: 0, z: 0, sx: 4, sy: 4, sz: 4, state: 5'u32)
+
+# two states side by side: two cuboids, never merged across the state boundary
+block:
+  var cells = box(0, 0, 0, 2, 2, 2, 1'u32)
+  for c in box(2, 0, 0, 2, 2, 2, 2'u32):
+    cells.add(c)
+  let r = mergeCuboids(cells)
+  assert r.cuboids.len == 2
+  assert r.cuboids[0] == Cuboid(x: 0, y: 0, z: 0, sx: 2, sy: 2, sz: 2, state: 1'u32)
+  assert r.cuboids[1] == Cuboid(x: 2, y: 0, z: 0, sx: 2, sy: 2, sz: 2, state: 2'u32)
+
+# an L (a row of three and one on top of the end): two cuboids, four cells
+block:
+  let cells = @[Cell(x: 0, y: 0, z: 0, state: 3'u32), Cell(x: 1, y: 0, z: 0, state: 3'u32), Cell(x: 2, y: 0, z: 0, state: 3'u32),
+    Cell(x: 2, y: 1, z: 0, state: 3'u32)]
+  let r = mergeCuboids(cells)
+  assert r.cuboids.len == 2
+  var total = 0
+  for c in r.cuboids:
+    total += volume(c)
+  assert total == 4
+
+# air is ignored, an empty body has nothing
+assert mergeCuboids(@[Cell(x: 1, y: 1, z: 1, state: 0'u32)]).cuboids.len == 0
+assert mergeCuboids(@[]).needed == 0
+
+# coordinates may be negative and offset
+block:
+  let r = mergeCuboids(box(-3, 10, -2, 2, 1, 3, 9'u32))
+  assert r.cuboids == @[Cuboid(x: -3, y: 10, z: -2, sx: 2, sy: 1, sz: 3, state: 9'u32)]
+
+# a 3-D checkerboard of 6^3 (108 cells of state 1) cannot be merged at all: 108 needed, 64 kept, 44 leftover
+block:
+  var cells: seq[Cell] = @[]
+  for y in 0'i32 ..< 6'i32:
+    for z in 0'i32 ..< 6'i32:
+      for x in 0'i32 ..< 6'i32:
+        if (x + y + z) mod 2 == 0:
+          cells.add(Cell(x: x, y: y, z: z, state: 1'u32))
+  let r = mergeCuboids(cells)
+  assert r.needed == 108
+  assert r.cuboids.len == 64 and r.leftover.len == 44
+  assert greedyCuboids(cells).len == 64
+  # the kept cuboids plus the leftover cells are exactly the input cells, once each
+  var count = newSeq[int](6 * 6 * 6)
+  for c in r.cuboids:
+    for y in c.y ..< c.y + c.sy:
+      for z in c.z ..< c.z + c.sz:
+        for x in c.x ..< c.x + c.sx:
+          inc count[int((y * 6 + z) * 6 + x)]
+  for c in r.leftover:
+    inc count[int((c.y * 6 + c.z) * 6 + c.x)]
+  var ok = true
+  for y in 0'i32 ..< 6'i32:
+    for z in 0'i32 ..< 6'i32:
+      for x in 0'i32 ..< 6'i32:
+        let want = if (x + y + z) mod 2 == 0: 1 else: 0
+        if count[int((y * 6 + z) * 6 + x)] != want:
+          ok = false
+  assert ok
+  # leftover is in (y, z, x) order
+  for i in 1 ..< r.leftover.len:
+    let a = r.leftover[i - 1]
+    let b = r.leftover[i]
+    assert a.y < b.y or (a.y == b.y and (a.z < b.z or (a.z == b.z and a.x < b.x)))
+
+# random 5^3 bodies of three states plus air: exact cover, one state per cuboid, never more cuboids than cells
+var rng = 0x1234ABCD'u32
+proc next(n: int): int =
+  rng = rng * 1664525'u32 + 1013904223'u32
+  int((rng shr 8) mod uint32(n))
+
+block:
+  for trial in 0 ..< 40:
+    var cells: seq[Cell] = @[]
+    var grid = newSeq[uint32](125)
+    for y in 0'i32 ..< 5'i32:
+      for z in 0'i32 ..< 5'i32:
+        for x in 0'i32 ..< 5'i32:
+          let s = uint32(next(4))   # 0 is air
+          grid[int((y * 5 + z) * 5 + x)] = s
+          if s != 0'u32:
+            cells.add(Cell(x: x, y: y, z: z, state: s))
+    let r = mergeCuboids(cells, 1000)
+    assert r.leftover.len == 0 and r.cuboids.len == r.needed and r.cuboids.len <= cells.len
+    var cover = newSeq[int](125)
+    var states = true
+    for c in r.cuboids:
+      for y in c.y ..< c.y + c.sy:
+        for z in c.z ..< c.z + c.sz:
+          for x in c.x ..< c.x + c.sx:
+            inc cover[int((y * 5 + z) * 5 + x)]
+            if grid[int((y * 5 + z) * 5 + x)] != c.state:
+              states = false
+    assert states
+    for i in 0 ..< 125:
+      assert cover[i] == (if grid[i] != 0'u32: 1 else: 0)
+
+# --- tracked ids come from the tables, per version ------------------------------------------------------------------------------
+
+# 1.21.11: the table has 8 start delta, 9 duration, 11 translation, 12 scale, 13 left, 14 right, 17 view range, 18 shadow radius,
+# 19 shadow strength, 22 glow color; the two entries it lacks are 10 and 23 (Display.java: 8..22, then BlockDisplay 23).
+assert displayTracked(dfStartDelta, V) == 8'u8
+assert displayTracked(dfTransformDuration, V) == 9'u8
+assert displayTracked(dfPosRotDuration, V) == 10'u8
+assert displayTracked(dfTranslation, V) == 11'u8
+assert displayTracked(dfScale, V) == 12'u8
+assert displayTracked(dfLeftRotation, V) == 13'u8
+assert displayTracked(dfRightRotation, V) == 14'u8
+assert displayTracked(dfViewRange, V) == 17'u8
+assert displayTracked(dfShadowRadius, V) == 18'u8
+assert displayTracked(dfShadowStrength, V) == 19'u8
+assert displayTracked(dfGlowColor, V) == 22'u8
+assert displayTracked(dfBlockState, V) == 23'u8
+# 26.x names the same fields `*_ID`; the same slots.
+assert displayTracked(dfStartDelta, jmvV26_2) == 8'u8
+assert displayTracked(dfPosRotDuration, jmvV26_2) == 10'u8
+assert displayTracked(dfTranslation, jmvV26_2) == 11'u8
+assert displayTracked(dfBlockState, jmvV26_2) == 23'u8
+# nothing is 255 (absent) for any version the table covers
+for v in [jmvV1_21, jmvV1_21_2, jmvV1_21_4, jmvV1_21_5, jmvV1_21_6, jmvV1_21_7, jmvV1_21_9, jmvV1_21_11, jmvV26_1, jmvV26_2]:
+  for f in [dfStartDelta, dfTransformDuration, dfPosRotDuration, dfTranslation, dfScale, dfLeftRotation, dfRightRotation,
+      dfViewRange, dfShadowRadius, dfShadowStrength, dfGlowColor, dfBlockState]:
+    assert displayTracked(f, v) != 255'u8
+
+# --- metadata entry byte layouts -------------------------------------------------------------------------------------------------
+# Entry: index u8, type id VarInt, value. 1.21.11 types: VarInt 1, Float 3, Block state 14 (0x0e), Vector3 35 (0x23),
+# Quaternion 36 (0x24).
+
+proc entry(m: Metadata, version: JavaMinecraftVersion = V): seq[byte] =
+  entriesBytes(@[m], version)
+
+# VarInt entries
+eqHex(entry(metaStartDelta(0)), "08 01 00 ff", "start delta 0")
+eqHex(entry(metaStartDelta(3)), "08 01 03 ff", "start delta 3")
+eqHex(entry(metaTransformDuration(2)), "09 01 02 ff", "transformation duration 2")
+eqHex(entry(metaPosRotDuration(2)), "0a 01 02 ff", "position/rotation duration 2")
+eqHex(entry(metaTransformDuration(300)), "09 01 ac02 ff", "VarInt with two bytes")
+# glow color 0xFF8800 = 16746496 = 7-bit groups 00, 10, 7e, 07 -> 80 90 fe 07
+eqHex(entry(metaGlowColor(0xFF8800'i32)), "16 01 8090fe07 ff", "glow color override")
+eqHex(entry(metaGlowColor(-1'i32)), "16 01 ffffffff0f ff", "glow color override none")
+
+# floats: 2.0 = 40000000, 0.5 = 3f000000, 1.0 = 3f800000
+eqHex(entry(metaViewRange(2.0'f32)), "11 03 40000000 ff", "view range")
+eqHex(entry(metaShadowRadius(0.5'f32)), "12 03 3f000000 ff", "shadow radius")
+eqHex(entry(metaShadowStrength(1.0'f32)), "13 03 3f800000 ff", "shadow strength")
+
+# Vector3f: three floats. 1.0 = 3f800000, -2.0 = c0000000, 0.5 = 3f000000
+eqHex(entry(metaTranslation(1.0'f32, -2.0'f32, 0.5'f32)), "0b 23 3f800000 c0000000 3f000000 ff", "translation")
+# 2.0 = 40000000, 3.0 = 40400000, 4.0 = 40800000
+eqHex(entry(metaScale(2.0'f32, 3.0'f32, 4.0'f32)), "0c 23 40000000 40400000 40800000 ff", "scale")
+
+# Quaternionf: x y z w. identity (0,0,0,1) and (0.5,0.5,0.5,0.5)
+eqHex(entry(metaLeftRotation(0.0'f32, 0.0'f32, 0.0'f32, 1.0'f32)), "0d 24 00000000 00000000 00000000 3f800000 ff",
+  "left rotation identity")
+eqHex(entry(metaLeftRotation(0.5'f32, 0.5'f32, 0.5'f32, 0.5'f32)), "0d 24 3f000000 3f000000 3f000000 3f000000 ff",
+  "left rotation half")
+eqHex(entry(metaRightRotation(0.0'f32, 0.0'f32, 0.0'f32, 1.0'f32)), "0e 24 00000000 00000000 00000000 3f800000 ff",
+  "right rotation identity")
+
+# block state: index 23, type 14, VarInt of the state id as the viewer's version numbers it (air is 0 on every version)
+eqHex(entry(metaBlockState(0)), "17 0e 00 ff", "block state air")
+block:
+  let stoneOn774 = int32(remapBlockStateForVersion(1'u16, V))
+  assert stoneOn774 == 1'i32  # stone's first state is id 1 on 1.21.11 as well
+  eqHex(entry(metaBlockState(1)), "17 0e 01 ff", "block state stone")
+
+# per version: the type ids come from the tables (1.21.5: Vector3 33, Quaternion 34; 26.2: Vector3 39, Quaternion 40)
+eqHex(entry(metaTranslation(1.0'f32, -2.0'f32, 0.5'f32), jmvV1_21_5), "0b 21 3f800000 c0000000 3f000000 ff", "translation 1.21.5")
+eqHex(entry(metaLeftRotation(0.0'f32, 0.0'f32, 0.0'f32, 1.0'f32), jmvV1_21_5), "0d 22 00000000 00000000 00000000 3f800000 ff",
+  "left rotation 1.21.5")
+eqHex(entry(metaTranslation(1.0'f32, -2.0'f32, 0.5'f32), jmvV26_2), "0b 27 3f800000 c0000000 3f000000 ff", "translation 26.2")
+eqHex(entry(metaLeftRotation(0.0'f32, 0.0'f32, 0.0'f32, 1.0'f32), jmvV26_2), "0d 28 00000000 00000000 00000000 3f800000 ff",
+  "left rotation 26.2")
+eqHex(entry(metaPosRotDuration(2), jmvV26_2), "0a 01 02 ff", "pos/rot duration 26.2")
+
+# the serializers on their own
+block:
+  var w = newNetWriter()
+  assert writeMetadata(Quaternionf(x: 1.0'f32, y: 0.0'f32, z: 0.0'f32, w: 0.0'f32), w).isOk
+  eqHex(w.buf, "3f800000 00000000 00000000 00000000", "Quaternionf writer")
+
+# --- the packets of a body -------------------------------------------------------------------------------------------------------
+# One cuboid: minimum corner (0,0,0), size 2 x 1 x 3, stone. Body id 7, first entity id 300 (VarInt ac 02).
+let cub = @[Cuboid(x: 0, y: 0, z: 0, sx: 2, sy: 1, sz: 3, state: 1'u32)]
+var st = newBodyDisplayState(7'i32, 300'i32, 1)
+let cfg = defaultDisplayConfig()
+let identity = (0.0'f32, 0.0'f32, 0.0'f32, 1.0'f32)
+let com = (1.0'f32, 0.5'f32, 1.5'f32)
+
+assert interpolationTicks(20) == 2 and interpolationTicks(10) == 4 and interpolationTicks(5) == 8
+
+# first tick: pos (10.5, 64.25, -3.0) -> anchor (10, 64, -3); translation = (0.5, 0.25, 0.0) + (0,0,0) - (1.0, 0.5, 1.5)
+#   = (-0.5, -0.25, -1.5) = bf000000 be800000 bfc00000
+block:
+  let pose = BodyPose(pos: (10.5, 64.25, -3.0), quat: identity, com: com)
+  let out1 = bodyDisplayPackets(st, pose, cub, cfg)
+  assert st.anchor == (10'i32, 64'i32, -3'i32) and st.spawned
+  assert out1.spawns.len == 1 and out1.metadata.len == 1 and out1.teleports.len == 0
+  # spawn: entity id ac02, uuid 6a65737465724007 8000000000070000, type, x y z doubles (10.0 64.0 -3.0), zero velocity, three
+  # zero angles, data 0
+  let typeByte = uint8(remapEntityIdForVersion(uint16(EntityType.BLOCK_DISPLAY.id), V))
+  assert typeByte < 0x80'u8  # a one-byte VarInt on this version
+  eqHex(out1.spawns[0].payload, "ac02" & "6a65737465724007" & "8000000000070000" & hexOf(@[typeByte]) &
+    "4024000000000000" & "4050000000000000" & "c008000000000000" & "00" & "000000" & "00", "spawn payload")
+  assert out1.spawns[0].kind == dpSpawn and out1.spawns[0].entityId == 300'i32
+  # metadata: start 0, durations 2, translation, scale (2,1,3), left rotation identity, view range 2.0, block state stone
+  eqHex(out1.metadata[0].payload, "ac02" & "080100" & "090102" & "0a0102" & "0b23" & "bf000000" & "be800000" & "bfc00000" &
+    "0c23" & "40000000" & "3f800000" & "40400000" & "0d24" & "00000000" & "00000000" & "00000000" & "3f800000" &
+    "110340000000" & "170e01" & "ff", "first metadata payload")
+  assert out1.metadata[0].kind == dpMetadata and out1.metadata[0].packetId > 0 and out1.spawns[0].packetId >= 0
+
+# second tick, same place: only the transformation fields; translation unchanged
+block:
+  let pose = BodyPose(pos: (10.5, 64.25, -3.0), quat: identity, com: com)
+  let out2 = bodyDisplayPackets(st, pose, cub, cfg)
+  assert out2.spawns.len == 0 and out2.teleports.len == 0 and out2.metadata.len == 1
+  eqHex(out2.metadata[0].payload, "ac02" & "080100" & "090102" & "0a0102" & "0b23" & "bf000000" & "be800000" & "bfc00000" &
+    "0d24" & "00000000" & "00000000" & "00000000" & "3f800000" & "ff", "update metadata payload")
+
+# the body turned 180 degrees about y: q = (0,1,0,0), R*(x,y,z) = (-x, y, -z); m - com = (-1.0, -0.5, -1.5) -> (1.0, -0.5, 1.5);
+# translation = (0.5, 0.25, 0.0) + (1.0, -0.5, 1.5) = (1.5, -0.25, 1.5) = 3fc00000 be800000 3fc00000
+block:
+  let pose = BodyPose(pos: (10.5, 64.25, -3.0), quat: (0.0'f32, 1.0'f32, 0.0'f32, 0.0'f32), com: com)
+  let out3 = bodyDisplayPackets(st, pose, cub, cfg)
+  eqHex(out3.metadata[0].payload, "ac02" & "080100" & "090102" & "0a0102" & "0b23" & "3fc00000" & "be800000" & "3fc00000" &
+    "0d24" & "00000000" & "3f800000" & "00000000" & "00000000" & "ff", "turned metadata payload")
+
+# a body 7 blocks from the anchor keeps it; one more block moves it: at x = 18.5 (8.5 away) the anchor goes to 18, the entity is
+# teleported there and the translation is relative to the new anchor: (0.5, 0.25, 0) + (-1.0, -0.5, -1.5) = (-0.5, -0.25, -1.5)
+block:
+  let near = BodyPose(pos: (17.0, 64.25, -3.0), quat: identity, com: com)
+  let o4 = bodyDisplayPackets(st, near, cub, cfg)
+  assert st.anchor == (10'i32, 64'i32, -3'i32) and o4.teleports.len == 0
+  let far = BodyPose(pos: (18.5, 64.25, -3.0), quat: identity, com: com)
+  let o5 = bodyDisplayPackets(st, far, cub, cfg)
+  assert st.anchor == (18'i32, 64'i32, -3'i32)
+  assert o5.teleports.len == 1 and o5.teleports[0].kind == dpTeleport and o5.teleports[0].entityId == 300'i32
+  # teleport: id ac02, position 18.0 64.0 -3.0, delta 0 0 0, yaw 0, pitch 0, relative flags i32 0, on ground false
+  eqHex(o5.teleports[0].payload, "ac02" & "4032000000000000" & "4050000000000000" & "c008000000000000" &
+    "0000000000000000" & "0000000000000000" & "0000000000000000" & "00000000" & "00000000" & "00000000" & "00", "teleport payload")
+  eqHex(o5.metadata[0].payload, "ac02" & "080100" & "090102" & "0a0102" & "0b23" & "bf000000" & "be800000" & "bfc00000" &
+    "0d24" & "00000000" & "00000000" & "00000000" & "3f800000" & "ff", "re-anchored metadata payload")
+
+# 10 Hz viewers get 4-tick interpolation
+block:
+  var st10 = newBodyDisplayState(7'i32, 300'i32, 1)
+  var cfg10 = defaultDisplayConfig()
+  cfg10.updateHz = 10'i32
+  let o = bodyDisplayPackets(st10, BodyPose(pos: (10.5, 64.25, -3.0), quat: identity, com: com), cub, cfg10)
+  eqHex(o.metadata[0].payload[0 ..< 11], "ac02" & "080100" & "090104" & "0a0104", "10 Hz durations")
+
+# two cuboids get consecutive entity ids and a removal lists them all
+block:
+  var st2 = newBodyDisplayState(7'i32, 300'i32, 2)
+  let two = @[Cuboid(x: 0, y: 0, z: 0, sx: 1, sy: 1, sz: 1, state: 1'u32), Cuboid(x: 1, y: 0, z: 0, sx: 1, sy: 1, sz: 1, state: 1'u32)]
+  let o = bodyDisplayPackets(st2, BodyPose(pos: (0.0, 0.0, 0.0), quat: identity, com: (0.0'f32, 0.0'f32, 0.0'f32)), two, cfg)
+  assert o.spawns.len == 2 and o.metadata.len == 2 and o.spawns[1].entityId == 301'i32
+  let rm = removeDisplayPacket(st2, cfg)
+  assert rm.kind == dpRemove and not st2.spawned
+  eqHex(rm.payload, "02" & "ac02" & "ad02", "remove payload")
+  # distinct uuids per cuboid
+  assert displayUuid(7'i32, 0) != displayUuid(7'i32, 1) and displayUuid(7'i32, 0) != displayUuid(8'i32, 0)
+
+echo "displayfallback: all checks passed"
