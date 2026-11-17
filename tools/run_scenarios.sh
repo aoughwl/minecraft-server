@@ -6,6 +6,7 @@
 #   PORT=25590          the Java port (RCON takes PORT+1 and Bedrock PORT+2); never the port of an instance somebody is playing on
 #   SCENARIO_DIR=...    the scratch directory (default ../scenario_run, wiped first)
 #   SCEN_SECONDS=120    how long the bot may run (the phys_* scenarios need 900)
+#   PACKS_FROM=<dir>    copy this folder to packs/ before the real start (content packs, docs/PACKS.md); DATAPACK_FROM=<dir> to world/datapacks/
 #   NO_PLUGINS=1        do not install the showcase plugins (their scenarios then report INCONCLUSIVE)
 #
 # Exits non-zero when a scenario FAILs; INCONCLUSIVE scenarios do not fail the run.
@@ -33,6 +34,8 @@ fi
 cd "$RUN"
 echo 'print("from the file");' > snippet.js
 ( timeout 8 "$EXE" > first.txt 2>&1 || true )
+if [ -n "$PACKS_FROM" ]; then mkdir -p packs && cp -r "$PACKS_FROM"/. packs/; fi
+if [ -n "$DATAPACK_FROM" ]; then mkdir -p world/datapacks && cp -r "$DATAPACK_FROM"/. world/datapacks/; fi
 sed -i '/^\[networking.java\]/,/^\[/ { s/^encryption = true/encryption = false/; s/^online_mode = true/online_mode = false/ }' pumpkin.toml
 sed -i "s/0.0.0.0:25565/0.0.0.0:$PORT/; s/0.0.0.0:25575/0.0.0.0:$RCON/; s/0.0.0.0:19132/0.0.0.0:$BEDROCK/" pumpkin.toml
 python - "$NAME" > data/ops.json <<'PY'

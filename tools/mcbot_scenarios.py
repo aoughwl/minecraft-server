@@ -945,3 +945,316 @@ def run(m, c, st, w, biomes, ctx, args):
     failed = [r[0] for r in results if r[1] == 'FAIL']
     if failed:
         raise m.Fail('scenarios failed: %s' % ', '.join(failed))
+
+
+# ---- live verification of features that were only unit tested (docs/PACKS.md, CREATE_PORT.md, DESIGN_20_HOSTING.md, FABRIC_GAPS.md) ----
+# Needs a server started with PACKS_FROM=examples/packs and DATAPACK_FROM=tools/live_fixtures/datapacks (tools/run_scenarios.sh).
+
+def _pause(s, seconds):
+    """Waits while still reading the connection (time.sleep would let the server's packets pile up unread)."""
+    until = time.time() + seconds
+    s.wait(lambda: time.time() >= until, 'a pause', seconds + 10.0)
+
+
+def _say(s, line, fragment, what, seconds=20.0):
+    """Runs a command and returns the chat line that holds `fragment` (only lines that arrived after the command)."""
+    n = len(s.w.chat)
+    s.command(line)
+    try:
+        return s.expect(fragment, what, seconds, since=n)
+    except Exception:
+        print('  chat since %r: %r' % (line, s.w.chat[n:]))
+        raise
+
+
+def _reply(s, line, wait=1.5):
+    """Runs a command, waits a moment and returns every chat line it produced."""
+    n = len(s.w.chat)
+    s.command(line)
+    _pause(s, wait)
+    return list(s.w.chat[n:])
+
+
+def _ready(s):
+    s.wait(lambda: s.position() is not None and s.chunks() >= 9, 'the spawn chunks', 60.0)
+    s.command('gamemode creative')
+    _pause(s, 0.5)
+
+
+def _body_mass(s, x, y, z):
+    """Builds a 2x2x2 stone cube at x y z (open air high up), makes it a body, returns (id, mass kg, info) from /body info."""
+    s.command('fill %d %d %d %d %d %d minecraft:stone' % (x, y, z, x + 1, y + 1, z + 1))
+    s.wait(lambda: s.w.block(x, y, z) not in (None, 0) and s.w.block(x + 1, y + 1, z + 1) not in (None, 0), 'the stone cube', 20.0)
+    line = _say(s, 'body assemble %d %d %d %d %d %d' % (x, y, z, x + 1, y + 1, z + 1), 'ody', 'body assemble')
+    n = len(s.w.chat)
+    s.command('body list')
+    _pause(s, 1.0)
+    out = ' | '.join(s.w.chat[n:])
+    ids = re.findall(r'(?:body|#)\s*(\d+)', line + ' | ' + out)
+    s.check(ids, 'no body id in %r / %r' % (line, out))
+    bid = ids[-1]
+    n = len(s.w.chat)
+    s.command('body info %s' % bid)
+    _pause(s, 1.2)
+    info = ' | '.join(s.w.chat[n:])
+    m_ = re.search(r'mass\D{0,12}([0-9]+(?:\.[0-9]+)?)', info)
+    s.check(m_ is not None, 'no mass in /body info: %r (assemble said %r, list %r)' % (info, line, out))
+    return bid, float(m_.group(1)), info
+
+
+@scenario('packs_live')
+def packs_live(s):
+    """examples/packs/example_pack is loaded at start (stone density 300, commands /rules and /echo2); /packs info shows it;
+    a body of 8 stone cells weighs 8 * 300 kg with the pack and 8 * 5000 after materials.json changed on disk and /packs reload ran; with
+    the pack removed and reloaded the stone is back at its default density; a pack with a bad number is refused and the rest still loads."""
+    _ready(s)
+    import os, shutil
+    lst = _reply(s, 'packs list')
+    print('  /packs list: %r' % lst)
+    s.check(any('example_pack' in l and 'active' in l for l in lst), '/packs list does not show example_pack active: %r' % lst)
+    info = _reply(s, 'packs info example_pack')
+    print('  /packs info: %r' % info)
+    s.check(any('example_pack' in l for l in info) and any('materials' in l for l in info), '/packs info lacks the pack or its materials: %r' % info)
+    bare_rules = _reply(s, 'rules', 2.0)           # a command with no arguments must be runnable, not only `/rules <text>`
+    print('  bare /rules: %r' % [l for l in bare_rules if 'scoreboard' not in l])
+    bare_ok = any('bridges' in l for l in bare_rules)
+    r = _say(s, 'rules now', 'Rules:', '/rules now from commands.json') if not bare_ok else ''
+    n = len(s.w.chat)
+    s.command('echo2 hello there')
+    s.wait(lambda: sum(1 for l in s.w.chat[n:] if 'hello there' in l) >= 2, '/echo2 answers the text twice', 15.0)
+    px, py, pz = s.position()[0], s.position()[1], s.position()[2]
+    x, z = int(px // 1) + 4, int(pz // 1) + 4
+    y = 220
+    s.command('fill %d %d %d %d %d %d minecraft:air' % (x - 1, y - 1, z - 1, x + 12, y + 4, z + 4))
+    _pause(s, 1.0)
+    bid1, m1, info1 = _body_mass(s, x, y, z)
+    print('  mass with the pack stone=300: %s kg (%s)' % (m1, info1))
+    s.check(abs(m1 - 8 * 300) < 1.0, 'stone density 300 from the pack should give 2400 kg for 8 cells, got %s' % m1)
+    s.command('body settle %s' % bid1)
+    _pause(s, 1.0)
+    mf = os.path.join('packs', 'example_pack', 'materials.json')
+    orig = open(mf).read()
+    off = '_example_off'          # outside packs/ (a folder in there would be discovered as a pack of the same id)
+    try:
+        open(mf, 'w').write(orig.replace('"density": 300', '"density": 5000'))
+        rep = _reply(s, 'packs reload', 2.5)
+        print('  /packs reload: %r' % rep)
+        s.check(any('1 active' in l for l in rep), 'reload did not report 1 active pack: %r' % rep)
+        bid2, m2, _ = _body_mass(s, x + 4, y, z)
+        print('  mass after density 5000 + reload: %s kg' % m2)
+        s.check(abs(m2 - 8 * 5000) < 1.0, 'reload should change stone to 5000 -> 40000 kg, got %s' % m2)
+        s.command('body settle %s' % bid2)
+        _pause(s, 1.0)
+        bad = os.path.join('packs', 'bad_pack')
+        os.makedirs(bad, exist_ok=True)
+        open(os.path.join(bad, 'pack.json'), 'w').write('{"format":1,"id":"bad_pack","name":"bad"}')
+        open(os.path.join(bad, 'materials.json'), 'w').write('{"blocks":{"minecraft:stone":{"damping":7}}}')
+        rep = _reply(s, 'packs reload', 2.5)
+        print('  reload with a bad pack: %r' % rep)
+        s.check(any('ERROR' in l and 'bad_pack' in l for l in rep), 'no ERROR line for bad_pack: %r' % rep)
+        s.check(any('1 active' in l for l in rep), 'the good pack is no longer the one active pack: %r' % rep)
+        shutil.rmtree(bad)
+        shutil.move(os.path.join('packs', 'example_pack'), off)
+        _reply(s, 'packs reload', 2.5)
+        bid3, m3, _ = _body_mass(s, x + 8, y, z)
+        print('  mass with no pack: %s kg' % m3)
+        s.check(m3 > 1000 and abs(m3 - 2400) > 1.0 and abs(m3 - 40000) > 1.0, 'default stone density expected, got %s' % m3)
+        s.command('body settle %s' % bid3)
+    finally:
+        if os.path.isdir(off):
+            shutil.move(off, os.path.join('packs', 'example_pack'))
+        open(mf, 'w').write(orig)
+        shutil.rmtree(os.path.join('packs', 'bad_pack'), ignore_errors=True)
+    rep = _reply(s, 'packs reload', 2.0)
+    s.check(any('1 active' in l for l in rep), 'restoring the pack did not make it active again: %r' % rep)
+    s.check(bare_ok, 'bare /rules (a pack command with no arguments) is "unknown argument"; only /rules <text> ran')
+
+
+@scenario('invite_live')
+def invite_live(s):
+    """/invite <ip> <port> prints a code and /invite decode <code> shows the same address back; several addresses and ports round trip;
+    garbage is refused with a message."""
+    _ready(s)
+    for ip, port in (('192.168.1.5', 25565), ('10.0.0.7', 1), ('203.0.113.250', 65535), ('8.8.4.4', 25690)):
+        line = _say(s, 'invite %s %d' % (ip, port), 'invite code for', '/invite %s %d' % (ip, port))
+        s.check('%s:%d' % (ip, port) in line, 'invite line names another address: %r' % line)
+        code = line.rsplit(': ', 1)[1].strip()
+        s.check(len(code) >= 8, 'code looks empty: %r' % line)
+        back = _say(s, 'invite decode %s' % code, 'invite points at', '/invite decode')
+        s.check('%s:%d' % (ip, port) in back, 'decode of %s gave %r' % (code, back))
+        print('  %s:%d -> %s -> %s' % (ip, port, code, back))
+    rep = _reply(s, 'invite decode notacode!!', 1.5)
+    s.check(any('invite' in l.lower() for l in rep) and not any('points at' in l for l in rep), 'garbage code not refused: %r' % rep)
+    rep = _reply(s, 'invite 999.1.1.1 25565', 1.5)
+    s.check(not any('invite code for' in l for l in rep), 'an invalid IPv4 produced a code: %r' % rep)
+    rep = _reply(s, 'invite 1.2.3.4 70000', 1.5)
+    s.check(not any('invite code for' in l for l in rep), 'port 70000 produced a code: %r' % rep)
+
+
+def _gametime(s):
+    n_ = len(s.w.chat)
+    s.command('time query gametime')
+    _pause(s, 0.8)
+    for l_ in s.w.chat[n_:]:
+        m_ = re.search(r'(\d+)\s*$', l_) if 'scoreboard' not in l_ else None
+        if m_:
+            return int(m_.group(1))
+    return None
+
+
+def _score(s, holder, obj, stamp=None):
+    n = len(s.w.chat)
+    if stamp is not None:
+        stamp.append(time.time())
+    s.command('scoreboard players get %s %s' % (holder, obj))
+    _pause(s, 0.8)
+    for l in s.w.chat[n:]:
+        m_ = re.search(r'has (-?\d+)', l)
+        if m_ and holder in l:
+            return int(m_.group(1))
+    return None
+
+
+@scenario('datapack_tick_live')
+def datapack_tick_live(s):
+    """tools/live_fixtures/datapacks/ticktest: #minecraft:load ran at start (score #loads = 1), #minecraft:tick adds 1 to #t every server
+    tick (about 20 per second of wall time), /function runs a function by hand, and /datapack reload runs #load again (a marker set by
+    hand is overwritten) while the tick function keeps running."""
+    _ready(s)
+    lst = _reply(s, 'datapack list')
+    print('  /datapack list: %r' % lst)
+    s.check(any('ticktest' in l for l in lst), 'ticktest pack not listed: %r' % lst)
+    loads = _score(s, '#loads', 'ticks')
+    s.check(loads == 1, '#minecraft:load did not run at start: #loads=%r' % loads)
+    # the score and the game clock are read by two commands: their growth must agree (the tick function runs once per tick)
+    t_a = _score(s, '#t', 'ticks')
+    g_a = _gametime(s)
+    _pause(s, 5.0)
+    t_b = _score(s, '#t', 'ticks')
+    g_b = _gametime(s)
+    s.check(None not in (t_a, t_b, g_a, g_b), 'no score or game time answer: %r' % [t_a, t_b, g_a, g_b])
+    print('  #t %d -> %d (+%d) while the game clock went %d -> %d (+%d ticks)' % (t_a, t_b, t_b - t_a, g_a, g_b, g_b - g_a))
+    s.check(abs((t_b - t_a) - (g_b - g_a)) <= 30 and (t_b - t_a) > 60, 'the tick function did not run once per tick')
+    _say(s, 'function ticktest:hello', 'Executed 2 command', '/function ticktest:hello')
+    s.check(_score(s, '#hello', 'ticks') == 1, '/function did not run the line that adds to #hello')
+    s.command('scoreboard players set #loads ticks 77')
+    _pause(s, 0.5)
+    s.check(_score(s, '#loads', 'ticks') == 77, 'could not set the marker')
+    rep = _reply(s, 'datapack reload', 2.0)
+    print('  /datapack reload: %r' % rep)
+    s.check(_score(s, '#loads', 'ticks') == 1, '/datapack reload did not run #minecraft:load again')
+    t_c = _score(s, '#t', 'ticks')
+    _pause(s, 1.0)
+    s.check(_score(s, '#t', 'ticks') > t_c, 'the tick function stopped after /datapack reload')
+
+
+_ITEM = {}
+
+
+def _item_pos(s):
+    """Position of the platform's rider item from `/data get entity` (the first call pins the nearest item by UUID), or None."""
+    n = len(s.w.chat)
+    sel = _ITEM.get('uuid') or '@e[type=item,limit=1,sort=nearest]'
+    s.command('data get entity %s Pos' % sel)
+    _pause(s, 0.7)
+    for l in s.w.chat[n:]:
+        if 'scoreboard' in l or '[' not in l:
+            continue
+        if 'uuid' not in _ITEM:
+            u = re.search(r'([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})', l)
+            if u:
+                _ITEM['uuid'] = u.group(1)
+        m_ = re.findall(r'(-?\d+(?:\.\d+)?(?:E-?\d+)?)\s*(?:gold )?d', l.split('[', 1)[1])
+        if len(m_) >= 3:
+            return tuple(float(v) for v in m_[:3])
+    print('  no item data in %r' % [l for l in s.w.chat[n:] if 'scoreboard' not in l])
+    return None
+
+
+@scenario('create_live')
+def create_live(s):
+    """/create on a real server: a motor beside a gearbox drives a bearing, the 5x5 platform above it becomes ONE body that turns
+    (`/create status` turned angle grows at the commanded rpm, the status line says 'running'), a dropped item standing on the platform is
+    carried round the pivot (its radius stays, its angle follows the platform), `/create scan|speed` report the network, and
+    `/create release` at the end puts the blocks back (25 again in the footprint, none left in the air)."""
+    _ready(s)
+    px, py, pz = s.position()[0], s.position()[1], s.position()[2]
+    cx, cz = int(px // 1) + 6, int(pz // 1) + 6
+    y = 220
+    s.command('fill %d %d %d %d %d %d minecraft:air' % (cx - 4, y - 2, cz - 4, cx + 4, y + 6, cz + 4))
+    _pause(s, 1.0)
+    s.command('fill %d %d %d %d %d %d minecraft:stone' % (cx - 2, y + 1, cz - 2, cx + 2, y + 1, cz + 2))
+    s.command('setblock %d %d %d minecraft:copper_block' % (cx, y - 1, cz))       # the gearbox stand-in
+    s.wait(lambda: s.w.block(cx, y + 1, cz) not in (None, 0) and s.w.block(cx, y - 1, cz) not in (None, 0), 'the rig', 20.0)
+    r = _say(s, 'create motor %d %d %d 12 east' % (cx - 1, y - 1, cz), 'Motor', '/create motor')
+    print('  ' + r)
+    r = _say(s, 'create bearing %d %d %d up %d %d %d %d %d %d' % (cx, y, cz, cx - 2, y + 1, cz - 2, cx + 2, y + 1, cz + 2), 'earing', '/create bearing')
+    print('  ' + r)
+    s.check('25 blocks' in r, 'the platform did not become one 25 block body: %r' % r)
+    sc = _reply(s, 'create scan', 1.0)
+    print('  scan: %r' % [l for l in sc if 'scoreboard' not in l])
+    s.check(any('running' in l for l in sc), 'scan does not report a running network: %r' % sc)
+    sp = _reply(s, 'create speed %d %d %d' % (cx, y - 1, cz), 1.0)
+    print('  speed: %r' % [l for l in sp if 'scoreboard' not in l])
+    speed_ok = any('12' in l and 'rpm' in l for l in sp)
+
+    def status():
+        lines = _reply(s, 'create status', 0.8)
+        for l in lines:
+            m_ = re.search(r'turned (-?[0-9.]+) degrees, riders carried last tick (\d+)', l)
+            if m_:
+                return float(m_.group(1)), int(m_.group(2)), l
+        return None, None, lines
+
+    a0, _, l0 = status()
+    s.check(a0 is not None, 'no bearing line in /create status: %r' % (l0,))
+    # an item on the platform (top surface y+2), 1.5 blocks from the pivot axis
+    ix, iz = cx + 0.5 + 1.5, cz + 0.5
+    _ITEM.clear()
+    s.command('kill @e[type=item]')
+    _pause(s, 0.4)
+    s.command('summon item %.2f %.2f %.2f {Item:{id:"minecraft:cobblestone",count:1},PickupDelay:32767}' % (ix, y + 2.0, iz))
+    _pause(s, 0.3)
+    # the server is frozen and stepped in exact blocks of 25 ticks (= 90 degrees at 12 rpm), so the numbers do not depend on wall time
+    s.command('tick freeze')
+    _pause(s, 0.8)
+    s.command('tick step 5')
+    _pause(s, 1.0)
+    samples = []
+    a_first, _, _ = status()
+    for k in range(7):
+        p = _item_pos(s)
+        a, carried, _l = status()
+        samples.append((k * 25, p, a, carried))
+        s.command('tick step 25')
+        _pause(s, 2.0)
+    s.command('tick unfreeze')
+    print('  samples (ticks stepped, item pos, turned deg, carried): %r' % samples)
+    s.check(all(sm[2] is not None for sm in samples), 'status unreadable')
+    per = [samples[k + 1][2] - samples[k][2] for k in range(len(samples) - 1)]
+    print('  turned per 25 ticks: %r (12 rpm = -90.0 each)' % per)
+    s.check(all(abs(p_ + 90.0) < 0.6 for p_ in per), 'the platform does not turn 90 degrees per 25 ticks at 12 rpm: %r' % per)
+    turned = samples[-1][2] - samples[0][2]
+    pts = [sm[1] for sm in samples if sm[1] is not None]
+    s.check(len(pts) >= 5, 'could not read the item position: %r' % [sm[1] for sm in samples])
+    import math
+    rad = [math.hypot(p[0] - (cx + 0.5), p[2] - (cz + 0.5)) for p in pts]
+    ang = [math.degrees(math.atan2(p[2] - (cz + 0.5), p[0] - (cx + 0.5))) for p in pts]
+    print('  item radius %r angle %r' % ([round(v, 2) for v in rad], [round(v, 1) for v in ang]))
+    swing = max(abs(((a - ang[0] + 180) % 360) - 180) for a in ang)
+    # the item's own angle against the platform's: both advance together (compare the change between the first and the last sample)
+    d_item = ((ang[-1] - ang[0] + 180) % 360) - 180
+    d_plat = -(samples[-1][2] - samples[0][2])           # (kept below)           # a negative yaw delta in Minecraft = counter clockwise seen from above
+    print('  item angle change %.1f (mod 360), platform %.1f (mod 360)' % (d_item, d_plat % 360))
+    s.check(abs((((d_item - d_plat) + 180) % 360) - 180) < 15.0, 'the item angle follows the platform: item %.1f platform %.1f' % (d_item, d_plat % 360))
+    s.check(swing > 40.0, 'the item was not carried round: its angle moved only %.1f degrees while the platform turned %.1f' % (swing, abs(turned)))
+    s.check(all(abs(r_ - 1.5) < 0.35 for r_ in rad), 'the item left its circle (radius %r)' % rad)
+    s.check(abs(pts[-1][1] - (y + 2.0)) < 0.6, 'the item fell off the platform: y=%.2f' % pts[-1][1])
+    # release: the blocks come back
+    _say(s, 'create release %d %d %d' % (cx, y, cz), 'released', '/create release')
+    _pause(s, 1.0)
+    s.wait(lambda: sum(1 for xx in range(cx - 3, cx + 4) for zz in range(cz - 3, cz + 4) if s.w.block(xx, y + 1, zz) not in (None, 0)) == 25,
+           'the 25 platform blocks to be back in the footprint', 20.0)
+    s.command('kill @e[type=item]')
+    s.command('create clear')
+    s.check(speed_ok, '/create speed on the gearbox gave %r instead of 12 rpm (the scan itself said running)' % [l for l in sp if 'scoreboard' not in l])
