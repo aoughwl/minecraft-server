@@ -1,0 +1,367 @@
+## climate: seeded, deterministic climate, weather and seasons that feed the wind field (phase 3 item 8).
+##
+## PURE. Imports std/math, and windfield only for the `WeatherSample` / `WeatherProvider` types (windfield imports only
+## windcore). No world, entity or server state: everything is a function of (seed, ticks, x, y, z). The only mutable state
+## is the year length (setYearDays), a configuration value. The hash is the 32-bit masked integer hash of windcore; noise is
+## trilinear value noise with a smoothstep fade, so every field below is C0 (mostly C1) in time AND space: no popping.
+## Coordinates are the game's (x east, y up, z SOUTH, so north is -z). `ticks` is a float game time counter, 24000 per day,
+## tick 0 = 06:00 on day 0 = the first day of spring.
+##
+## CLOCK
+##   YearDays (default 24, setYearDays), year = YearDays * 24000 ticks, phase = frac(ticks / year).
+##   seasonOf(ticks): 0 spring, 1 summer, 2 autumn, 3 winter = floor(phase * 4).
+##   seasonWave(ticks) in -1..1: cl(phase - 0.375) where cl(f) = 2*smoothstep(|2*frac(f) - 1|) - 1 is a smooth cosine-like
+##   wave (1 at f=0, -1 at f=0.5, no libm trig). +1 = midsummer (phase 0.375), -1 = midwinter (phase 0.875).
+##   Day wave dw(ticks) = cl(frac(ticks/24000) - 8000/24000): warmest 14:00, coldest 02:00.
+##
+## TEMPERATURE (degrees C)   tempAt(seed, ticks, x, y, z)
+##   T0 (sea level, no precipitation) = 10 + 7*latitude + 11*seasonWave + 4.5*dw + 3*weatherDrift
+##     latitude     = 2*noise3(ch1, x/9000, 0, z/4000) - 1          (slow, long bands along z, "latitude-like")
+##     weatherDrift = 2*noise3(ch2, x/2500, ticks/60000, z/2500) - 1 (a few degrees of slow, regional anomaly)
+##   T(y) = T0 - 0.05*(y - 63) - 2*precip          lapse 5 C per 100 blocks, rain/snow cools the air by up to 2 C.
+##
+## PRESSURE (hPa) and FRONTS   pressureSea(seed, ticks, x, z) -> {p, gx, gz}
+##   Pressure centres sit on a lattice of spacing 3000 blocks that DRIFTS as a whole with a seed-fixed velocity
+##   v = (0.10 + 0.15*u1, (u2-0.5)*0.12) blocks/tick (2400..6000 blocks per day, mostly eastward): the lattice cell (i,j)
+##   keeps its centre c_ij = ((i + 0.15 + 0.7*u)*3000, (j + 0.15 + 0.7*u')*3000) in the moving frame u = x - v*t.
+##   Strength s_ij(t) = clamp(1.6*(2*noise_t(i,j,t/48000) - 1), -1, 1) varies over ~2 days (highs fade into lows).
+##   P = 1013 + A * sum over the 5x5 neighbouring cells of s_ij * (1 - q)^2, q = |u - c_ij|^2 / R^2, R = 4200, A = 16 *
+##   (1 + 0.25*max(0,-seasonWave)) (deeper systems in winter). Compact, smooth. The analytic gradient (hPa/block) is
+##   returned with it: dP/dx = A s 2(1-q) (-2 dx / R^2).   Altitude: P(y) = P - 0.08*(y - 63).
+##   A front is a place where |grad P| is large: frontness = clamp(|grad|/0.0045, 0, 1).
+##
+## WIND (blocks/s, synoptic, no altitude gain: windfield applies its own)   windFromGradient
+##   G = -grad P (points to low pressure). Northern-hemisphere geostrophic flow keeps the low on the LEFT of the wind, i.e.
+##   a cyclone turns COUNTER-clockwise seen from above with north up (x east, north = -z): the rotation of G by -90 degrees
+##   on the map is (gx, gz) -> (-gz, gx). With 20 degrees of friction inflow toward the low:
+##       dir = 0.94 * (-gz, gx) + 0.34 * (gx, gz)           (the angle between the wind and G is 70 degrees)
+##       wind = dir * k / (1 + k|grad|/Vmax) * (1 + 0.5 rain + 0.4 thunder),   k = 1400, Vmax = 12
+##   i.e. speed -> Vmax * u/(1+u), u = k|grad|/Vmax: proportional to the gradient when weak, saturating at 12 b/s; it is
+##   linear in G so it is smooth and finite at a pressure centre (calm there). Anticyclones turn clockwise.
+##
+## HUMIDITY 0..1   humidityAt
+##   0.55 + 0.30*(2*noise3(ch3, x/1800, ticks/50000, z/1800) - 1) + 0.012*(1013 - P), clamped.
+##
+## STORM CELLS (rain, thunder)
+##   A second drifting lattice (spacing 800, same drift velocity) of cells; each cell has an independent life of
+##   L = 7000 ticks (random phase). Per epoch e = floor((t+phase)/L), u = frac: envelope b = smoothstep(clamp(5 min(u,1-u),
+##   0, 1)) (zero at the epoch ends, so a cell appears and fades without a jump even though its activation is a hash).
+##   The cell exists in epoch e with probability
+##       pAct = clamp(humid * (0.12 + 0.55 lowp + 0.30 front + 0.25 warm), 0, 0.95)
+##   where humid = clamp((H - 0.4)/0.4), lowp = clamp((1013 - P)/14), front = frontness, warm = clamp((T0 - 6)/14), all
+##   evaluated at the cell's centre at mid-life (so the cell's fate is settled for its whole life). The cell has radius
+##   300 + 400u, amplitude 0.6 + 0.4u, shape smoothstep(1 - q). Intensity I = amp * b * shape.
+##   precip = max(frontal rain, max over cells of I); frontal rain = 0.7 * clamp((H-0.65)/0.3) * clamp((1013-P)/14).
+##   thunder = max over cells of clamp((I - 0.5)/0.35) * sev, sev = clamp(1.2 warm * (0.4 + 0.6 front) + 0.25 lowp), then
+##   limited to precip and multiplied by (1 - snowFrac): cold, flat-pressure weather has no thunder.
+##
+## SNOW   snowFrac = clamp((0.5 - T)/1.5, 0, 1) with T the local temperature (including the cooling above), snow = precip *
+##   snowFrac, so snow > 0 only when T < 0.5 C. `rain` in the sample is the TOTAL precipitation level (vanilla's rain level);
+##   rain - snow is the liquid part.
+##
+## OTHER   snowLineAt: altitude where the no-weather temperature crosses 0 C = 63 + T0/0.05, clamped to -64..2000.
+##   foliageTint(season) / foliageTintAt(ticks): RGB ints (0xRRGGBB); anchors at mid-season, smooth blend.
+##
+## windfield glue: weatherProviderFor(seed, x, z) is a WeatherProvider (sea-level sample at (x, z), hasWind true).
+
+## MEASURED (climatetest, seed 20240607, 34 checks pass)
+##   max change per tick: temp 0.003 C, pressure 0.004 hPa, rain 0.001, thunder 0.003, wind 0.007 b/s; per block: temp 0.015 C,
+##   pressure 0.019 hPa, rain 0.007, thunder 0.010, wind 0.034 b/s. Midsummer mean 18.2 C, midwinter -4.0 C at sea level.
+##   100 days x 3 places (sampled every 120 ticks): rain>0.1 32.4 %, rain>0.5 14.7 %, thunder>0.1 7.2 %, thunder>0.5 2.9 %,
+##   snow>0.1 5.9 % (spring/summer/autumn/winter rain 31/40/35/25 %, thunder 6.7/13.8/7.8/0.8 %, snow 2/0/4/18 %).
+##   Pressure extremes 974..1053 hPa; wind 70.0 degrees from the pressure gradient everywhere (cos 0.340); synoptic wind <= 13.4 b/s;
+##   rings of 8 points at 500 blocks around lows/highs: 32/32 counter-clockwise / clockwise.
+##   Fed through windfield (storms, rain>0.6 thunder>0.3): mean 9.3 b/s vs 1.7 b/s for the calm (provider-less) field.
+
+import std/math
+import windfield
+
+const
+  ClimDayTicks* = 24000.0
+  ClimMask = 0xFFFFFFFF
+  PressDrift* = 3000.0
+  PressRadius* = 4200.0
+  PressAmp* = 16.0
+  StormSpacing* = 800.0
+  StormLife* = 7000.0
+  WindK* = 1400.0
+  WindVmax* = 12.0
+  TempLapse* = 0.05
+  SnowTemp* = 0.5
+
+type
+  ClimateSample* = object
+    temp*, humidity*, pressure*: float
+    rain*, thunder*, snow*: float
+    windX*, windZ*: float
+
+  PressureSample* = object
+    p*, gx*, gz*: float
+
+  StormSample* = object
+    precip*, thunder*: float
+
+var gYearDays: float = 24.0
+
+proc setYearDays*(days: float) =
+  if days >= 1.0: gYearDays = days
+
+proc yearDays*(): float = gYearDays
+
+# --- hashing and noise ---------------------------------------------------------------------------------------------
+
+proc climMix(value: int): int =
+  var h = value and ClimMask
+  h = (h xor (h shr 16)) and ClimMask
+  h = (h * 0x7feb352d) and ClimMask
+  h = (h xor (h shr 15)) and ClimMask
+  h = (h * 0x846ca68b) and ClimMask
+  h = (h xor (h shr 16)) and ClimMask
+  h
+
+proc climHash(seed, a, b, c: int): int =
+  let s = (seed xor (seed shr 32)) and ClimMask
+  climMix(((a * 0x27d4eb2d) and ClimMask) + ((b * 0x85ebca6b) and ClimMask) + ((c * 0x165667b1) and ClimMask) +
+          ((s * 0x9e3779b1) and ClimMask))
+
+proc climUnit(seed, a, b, c: int): float = float(climHash(seed, a, b, c)) / 4294967296.0
+
+proc cFloor(v: float): int =
+  let t = int(v)
+  if v < 0.0 and float(t) != v: return t - 1
+  t
+
+proc cClamp(v, lo, hi: float): float =
+  if v < lo: return lo
+  if v > hi: return hi
+  v
+
+proc cMax(a, b: float): float =
+  if a > b: a else: b
+
+proc cMin(a, b: float): float =
+  if a < b: a else: b
+
+proc cAbs(a: float): float =
+  if a < 0.0: -a else: a
+
+proc cSmooth(t: float): float = t * t * (3.0 - 2.0 * t)
+
+proc noise3(seed, channel: int; x, y, z: float): float =
+  let ix = cFloor(x)
+  let iy = cFloor(y)
+  let iz = cFloor(z)
+  let fx = cSmooth(x - float(ix))
+  let fy = cSmooth(y - float(iy))
+  let fz = cSmooth(z - float(iz))
+  let s = seed + channel * 7919
+  let c000 = climUnit(s, ix, iy, iz)
+  let c100 = climUnit(s, ix + 1, iy, iz)
+  let c010 = climUnit(s, ix, iy + 1, iz)
+  let c110 = climUnit(s, ix + 1, iy + 1, iz)
+  let c001 = climUnit(s, ix, iy, iz + 1)
+  let c101 = climUnit(s, ix + 1, iy, iz + 1)
+  let c011 = climUnit(s, ix, iy + 1, iz + 1)
+  let c111 = climUnit(s, ix + 1, iy + 1, iz + 1)
+  let x00 = c000 + (c100 - c000) * fx
+  let x10 = c010 + (c110 - c010) * fx
+  let x01 = c001 + (c101 - c001) * fx
+  let x11 = c011 + (c111 - c011) * fx
+  let y0 = x00 + (x10 - x00) * fy
+  let y1 = x01 + (x11 - x01) * fy
+  y0 + (y1 - y0) * fz
+
+## 1-D value noise in t for lattice cell (a, b).
+proc noiseT(seed, channel, a, b: int; t: float): float =
+  let k = cFloor(t)
+  let f = cSmooth(t - float(k))
+  let s = seed + channel * 7919
+  let v0 = climUnit(s, a, b, k)
+  let v1 = climUnit(s, a, b, k + 1)
+  v0 + (v1 - v0) * f
+
+# --- clock ---------------------------------------------------------------------------------------------------------
+
+proc clFrac(v: float): float = v - float(cFloor(v))
+
+proc cosLike(f: float): float =
+  let g = clFrac(f)
+  let tri = cAbs(2.0 * g - 1.0)
+  2.0 * cSmooth(tri) - 1.0
+
+proc yearPhase*(ticks: float): float = clFrac(ticks / (gYearDays * ClimDayTicks))
+
+proc seasonOf*(ticks: float): int =
+  let s = int(yearPhase(ticks) * 4.0)
+  if s > 3: 3 else: s
+
+proc seasonWave*(ticks: float): float = cosLike(yearPhase(ticks) - 0.375)
+
+proc dayWave*(ticks: float): float = cosLike(clFrac(ticks / ClimDayTicks) - 8000.0 / ClimDayTicks)
+
+proc seasonName*(season: int): string =
+  case season
+  of 0: "spring"
+  of 1: "summer"
+  of 2: "autumn"
+  else: "winter"
+
+proc foliageTint*(season: int): int =
+  case season
+  of 0: 0x79C05A
+  of 1: 0x4CA832
+  of 2: 0xD2872B
+  else: 0xA9B7A0
+
+proc tintChannel(a, b: int; shift: int; w: float): int =
+  let ca = float((a shr shift) and 255)
+  let cb = float((b shr shift) and 255)
+  int(ca + (cb - ca) * w + 0.5)
+
+## Smooth blend between the four season anchors (each at the middle of its season), wrapping around the year.
+proc foliageTintAt*(ticks: float): int =
+  let pos = yearPhase(ticks) * 4.0 - 0.5
+  let k = cFloor(pos)
+  let w = cSmooth(pos - float(k))
+  let a = foliageTint(((k mod 4) + 4) mod 4)
+  let b = foliageTint(((k + 1) mod 4 + 4) mod 4)
+  (tintChannel(a, b, 16, w) shl 16) or (tintChannel(a, b, 8, w) shl 8) or tintChannel(a, b, 0, w)
+
+# --- pressure, fronts, wind ----------------------------------------------------------------------------------------
+
+proc driftVelocity*(seed: int): (float, float) =
+  let vx = 0.10 + 0.15 * climUnit(seed, 1, 77, 5)
+  let vz = (climUnit(seed, 2, 77, 5) - 0.5) * 0.12
+  (vx, vz)
+
+proc pressureSea*(seed: int, ticks, x, z: float): PressureSample =
+  let (vx, vz) = driftVelocity(seed)
+  let ux = x - vx * ticks
+  let uz = z - vz * ticks
+  let pi = cFloor(ux / PressDrift)
+  let pj = cFloor(uz / PressDrift)
+  let amp = PressAmp * (1.0 + 0.25 * cMax(0.0, -seasonWave(ticks)))
+  let r2 = PressRadius * PressRadius
+  var p = 1013.0
+  var gx = 0.0
+  var gz = 0.0
+  for di in -2 .. 2:
+    for dj in -2 .. 2:
+      let ci = pi + di
+      let cj = pj + dj
+      let cx = (float(ci) + 0.15 + 0.7 * climUnit(seed, ci, cj, 11)) * PressDrift
+      let cz = (float(cj) + 0.15 + 0.7 * climUnit(seed, ci, cj, 12)) * PressDrift
+      let dx = ux - cx
+      let dz = uz - cz
+      let q = (dx * dx + dz * dz) / r2
+      if q < 1.0:
+        let s = cClamp(1.6 * (2.0 * noiseT(seed, 3, ci, cj, ticks / 48000.0) - 1.0), -1.0, 1.0)
+        let w = 1.0 - q
+        p += amp * s * w * w
+        let k = amp * s * 2.0 * w * (-2.0 / r2)
+        gx += k * dx
+        gz += k * dz
+  PressureSample(p: p, gx: gx, gz: gz)
+
+proc frontness*(g: PressureSample): float =
+  cClamp(sqrt(g.gx * g.gx + g.gz * g.gz) / 0.0045, 0.0, 1.0)
+
+## Wind vector (blocks/s) from a pressure gradient (see header). Weather factor applied by the caller.
+proc windFromGradient*(gx, gz: float): (float, float) =
+  let lx = -gx
+  let lz = -gz
+  let mag = sqrt(gx * gx + gz * gz)
+  let dirX = 0.94 * (-lz) + 0.34 * lx
+  let dirZ = 0.94 * lx + 0.34 * lz
+  let f = WindK / (1.0 + WindK * mag / WindVmax)
+  (dirX * f, dirZ * f)
+
+# --- temperature, humidity -----------------------------------------------------------------------------------------
+
+proc tempSea*(seed: int, ticks, x, z: float): float =
+  let lat = 2.0 * noise3(seed, 1, x / 9000.0, 0.5, z / 4000.0) - 1.0
+  let drift = 2.0 * noise3(seed, 2, x / 2500.0, ticks / 60000.0, z / 2500.0) - 1.0
+  10.0 + 7.0 * lat + 11.0 * seasonWave(ticks) + 4.5 * dayWave(ticks) + 3.0 * drift
+
+proc humiditySea*(seed: int, ticks, x, z, pressure: float): float =
+  let n = 2.0 * noise3(seed, 3, x / 1800.0, ticks / 50000.0, z / 1800.0) - 1.0
+  cClamp(0.55 + 0.30 * n + 0.012 * (1013.0 - pressure), 0.0, 1.0)
+
+# --- storms --------------------------------------------------------------------------------------------------------
+
+proc stormAt*(seed: int, ticks, x, z, pressure, humidity: float): StormSample =
+  ## precip and thunder levels at (x, z): frontal rain plus the storm cells.
+  let (vx, vz) = driftVelocity(seed)
+  let ux = x - vx * ticks
+  let uz = z - vz * ticks
+  let pi = cFloor(ux / StormSpacing)
+  let pj = cFloor(uz / StormSpacing)
+  let lowLocal = cClamp((1013.0 - pressure) / 14.0, 0.0, 1.0)
+  var precip = 0.7 * cClamp((humidity - 0.65) / 0.3, 0.0, 1.0) * lowLocal
+  var thunder = 0.0
+  for di in -1 .. 1:
+    for dj in -1 .. 1:
+      let ci = pi + di
+      let cj = pj + dj
+      let ph = climUnit(seed, ci, cj, 101) * StormLife
+      let tt = ticks + ph
+      let e = cFloor(tt / StormLife)
+      let u = tt / StormLife - float(e)
+      let ramp = cMin(u, 1.0 - u)
+      let b = cSmooth(cClamp(ramp * 5.0, 0.0, 1.0))
+      if b > 0.0:
+        let es = seed + e * 40503
+        let cux = (float(ci) + 0.1 + 0.8 * climUnit(es, ci, cj, 102)) * StormSpacing
+        let cuz = (float(cj) + 0.1 + 0.8 * climUnit(es, ci, cj, 103)) * StormSpacing
+        let rad = 300.0 + 400.0 * climUnit(es, ci, cj, 104)
+        let dx = ux - cux
+        let dz = uz - cuz
+        let q = (dx * dx + dz * dz) / (rad * rad)
+        if q < 1.0:
+          # conditions settled at the cell's centre at mid life
+          let tmid = (float(e) + 0.5) * StormLife - ph
+          let wx0 = cux + vx * tmid
+          let wz0 = cuz + vz * tmid
+          let pm = pressureSea(seed, tmid, wx0, wz0)
+          let hm = humiditySea(seed, tmid, wx0, wz0, pm.p)
+          let tm = tempSea(seed, tmid, wx0, wz0)
+          let humid = cClamp((hm - 0.4) / 0.4, 0.0, 1.0)
+          let lowp = cClamp((1013.0 - pm.p) / 14.0, 0.0, 1.0)
+          let front = frontness(pm)
+          let warm = cClamp((tm - 6.0) / 14.0, 0.0, 1.0)
+          let pAct = cClamp(humid * (0.12 + 0.55 * lowp + 0.30 * front + 0.25 * warm), 0.0, 0.95)
+          if climUnit(es, ci, cj, 105) < pAct:
+            let amp = 0.6 + 0.4 * climUnit(es, ci, cj, 106)
+            let inten = amp * b * cSmooth(1.0 - q)
+            if inten > precip: precip = inten
+            let sev = cClamp(1.2 * warm * (0.4 + 0.6 * front) + 0.25 * lowp, 0.0, 1.0)
+            let th = cClamp((inten - 0.5) / 0.35, 0.0, 1.0) * sev
+            if th > thunder: thunder = th
+  if thunder > precip: thunder = precip
+  StormSample(precip: precip, thunder: thunder)
+
+# --- the interface -------------------------------------------------------------------------------------------------
+
+proc climateAt*(seed: int, ticks, x, y, z: float): ClimateSample =
+  let ps = pressureSea(seed, ticks, x, z)
+  let t0 = tempSea(seed, ticks, x, z)
+  let h = humiditySea(seed, ticks, x, z, ps.p)
+  let st = stormAt(seed, ticks, x, z, ps.p, h)
+  let temp = t0 - TempLapse * (y - 63.0) - 2.0 * st.precip
+  let snowFrac = cClamp((SnowTemp - temp) / 1.5, 0.0, 1.0)
+  let (wx, wz) = windFromGradient(ps.gx, ps.gz)
+  let wf = 1.0 + 0.5 * st.precip + 0.4 * st.thunder
+  ClimateSample(temp: temp, humidity: h, pressure: ps.p - 0.08 * (y - 63.0), rain: st.precip,
+                thunder: st.thunder * (1.0 - snowFrac), snow: st.precip * snowFrac, windX: wx * wf, windZ: wz * wf)
+
+proc tempAt*(seed: int, ticks, x, y, z: float): float = climateAt(seed, ticks, x, y, z).temp
+
+## Altitude where the no-weather temperature crosses 0 C.
+proc snowLineAt*(seed: int, ticks, x, z: float): float =
+  cClamp(63.0 + tempSea(seed, ticks, x, z) / TempLapse, -64.0, 2000.0)
+
+## A windfield WeatherProvider: sea-level climate at (x, z) as rain, thunder and a wind override.
+proc weatherProviderFor*(seed: int, x, z: float): WeatherProvider =
+  result = proc (ticks: float): WeatherSample {.closure.} =
+    let c = climateAt(seed, ticks, x, 63.0, z)
+    WeatherSample(rain: c.rain, thunder: c.thunder, hasWind: true, windX: c.windX, windZ: c.windZ)
