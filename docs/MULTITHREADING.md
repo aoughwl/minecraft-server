@@ -68,7 +68,7 @@ threads = 0          # in minecraft-server.toml: 0 automatic, 1 everything on th
 reserved_cores = 2   # automatic leaves this many cores to the rest of the machine (the game's renderer, in singleplayer)
 ```
 
-* Automatic = `cores - reserved_cores`, at least 1, at most 16 for now; `cores` from `countProcessors()`. A dedicated server sets `reserved_cores = 0`. `threads` counts the tick thread too, so `threads = 1` is the inline configuration the determinism tests compare against.
+* Automatic = `cores - reserved_cores`, at least 1, at most 16 for now (chunk generation workers: at most 8, measured: 8 vs 4 gives about 10 % at 65x65 because the tick thread is the limit); `cores` from `countProcessors()`. A dedicated server sets `reserved_cores = 0`. `threads` counts the tick thread too, so `threads = 1` is the inline configuration the determinism tests compare against.
 * Precedence: env `MC_CHUNK_WORKERS` (kept; counts workers) > env `MC_THREADS` (counts threads, 0 = automatic) > config. The launcher keeps working unchanged.
 * One resolved number feeds the pool; per-phase shares (generation, io, sim) are derived from it, not separate knobs, until measurement says they need to be.
 * Optional later: `pin_threads`, worker priority below normal in singleplayer.
