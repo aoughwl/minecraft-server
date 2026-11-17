@@ -1,0 +1,163 @@
+## Generic worker job pool, independent of chunk generation (docs/MULTITHREADING.md phase 1).
+##
+## `newJobPool(threads)`: `threads` counts the tick thread, so there are `threads - 1` workers; with none, `submit` runs the
+## job inline (on the caller thread) and the result waits in the owner done queue exactly as a worker result would, so
+## callers have one code path. A job is a plain `nimcall` proc over a `pointer` argument returning an `int` (the argument is
+## the caller context, e.g. a pointer it keeps alive, or an index into a caller-owned table). Jobs never raise out of the
+## worker: every exception is caught and reported as `failed = true`, so the pending count cannot stick.
+## Results are only ever applied by the caller, on its own thread, via `drainDone`.
+##
+## One pool with workers is live per process (the worker proc is a `nimcall` with a nil argument and reads it from
+## `gJobPool`, the same idiom as generation_executor).
+
+{.feature: "lenientnils".}
+
+import std/locks
+import std/rawthreads
+
+type
+  Job* = proc(arg: pointer): int {.nimcall, raises.}
+
+  JobResult* = object
+    arg*: pointer
+    value*: int
+    failed*: bool
+
+  JobItem = object
+    job: Job
+    arg: pointer
+    owner: int
+
+  DoneItem = object
+    owner: int
+    res: JobResult
+
+  PoolThread = ref object
+    t: RawThread
+
+  JobPool* = ref object
+    workers*: int
+    lock: Lock
+    wake: Cond
+    jobs: seq[JobItem]
+    jobHead: int
+    done: seq[DoneItem]
+    pend: seq[int]          ## Per owner: submitted and not yet drained.
+    stopping: bool
+    threads: seq[PoolThread]
+    submitted*: int
+    completed*: int
+    failedCount*: int
+
+var gJobPool: JobPool = nil
+
+proc runJob(job: Job, arg: pointer): JobResult =
+  result = JobResult(arg: arg, value: 0, failed: false)
+  try:
+    result.value = job(arg)
+  except:
+    result.failed = true
+
+proc finish(p: JobPool, owner: int, r: JobResult) =
+  ## Caller holds the lock.
+  p.done.add(DoneItem(owner: owner, res: r))
+  inc p.completed
+  if r.failed:
+    inc p.failedCount
+
+proc workerMain(arg: pointer) {.nimcall.} =
+  let p = gJobPool
+  while true:
+    acquire(p.lock)
+    while p.jobHead >= p.jobs.len and not p.stopping:
+      wait(p.wake, p.lock)
+    if p.jobHead >= p.jobs.len and p.stopping:
+      release(p.lock)
+      return
+    let it = p.jobs[p.jobHead]
+    p.jobs[p.jobHead] = JobItem()
+    inc p.jobHead
+    if p.jobHead == p.jobs.len:
+      p.jobs.setLen(0)
+      p.jobHead = 0
+    release(p.lock)
+    let r = runJob(it.job, it.arg)
+    acquire(p.lock)
+    finish(p, it.owner, r)
+    release(p.lock)
+
+proc newJobPool*(threads: int): JobPool =
+  let n = if threads > 1: threads - 1 else: 0
+  result = JobPool(workers: 0, jobs: @[], done: @[], pend: @[], threads: @[])
+  initLock(result.lock)
+  initCond(result.wake)
+  if n > 0:
+    gJobPool = result
+    for i in 0 ..< n:
+      let w = PoolThread()
+      try:
+        create(w.t, workerMain, nil)
+        result.threads.add(w)
+      except:
+        break
+    result.workers = result.threads.len
+
+proc growPend(p: JobPool, owner: int) =
+  while p.pend.len <= owner:
+    p.pend.add(0)
+
+proc submit*(p: JobPool, owner: int, job: Job, arg: pointer) =
+  ## Queues the job for a worker (or runs it now when there are none). Owner thread only.
+  if owner < 0:
+    return
+  acquire(p.lock)
+  growPend(p, owner)
+  inc p.pend[owner]
+  inc p.submitted
+  if p.workers == 0:
+    release(p.lock)
+    let r = runJob(job, arg)
+    acquire(p.lock)
+    finish(p, owner, r)
+    release(p.lock)
+    return
+  p.jobs.add(JobItem(job: job, arg: arg, owner: owner))
+  release(p.lock)
+  signal(p.wake)
+
+proc drainDone*(p: JobPool, owner: int, sink: var seq[JobResult]): int =
+  ## Moves the finished results of `owner` (and only those) into `sink`, in completion order; how many.
+  result = 0
+  acquire(p.lock)
+  var keep: seq[DoneItem] = @[]
+  for i in 0 ..< p.done.len:
+    if p.done[i].owner == owner:
+      sink.add(p.done[i].res)
+      inc result
+    else:
+      keep.add(p.done[i])
+  p.done = keep
+  if owner >= 0 and owner < p.pend.len:
+    p.pend[owner] -= result
+  release(p.lock)
+
+proc pending*(p: JobPool, owner: int): int =
+  ## Submitted by `owner` and not yet drained.
+  acquire(p.lock)
+  result = if owner >= 0 and owner < p.pend.len: p.pend[owner] else: 0
+  release(p.lock)
+
+proc shutdown*(p: JobPool) =
+  ## Lets the workers finish every queued job, then joins them. Results stay in the done queues for a last `drainDone`.
+  if p.threads.len == 0:
+    return
+  acquire(p.lock)
+  p.stopping = true
+  release(p.lock)
+  broadcast(p.wake)
+  for i in 0 ..< p.threads.len:
+    join(p.threads[i].t)
+  p.threads.setLen(0)
+  p.workers = 0
+  if gJobPool == p:
+    gJobPool = nil
