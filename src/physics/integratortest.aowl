@@ -1,0 +1,404 @@
+## Scene tests for integrator.aowl (rigid body integrator, contacts, sleep, settle, impact events, shatter) with REAL vanilla
+## materials. Prints PASS/FAIL per scene and "ALL PASS" (exit 0) when everything holds. Gravity is the default 0.08 blocks/tick^2.
+
+{.feature: "untyped".}
+
+import std/[syncio, monotimes, math]
+import "../generated/block_properties"
+import body
+import bodymass
+import materials
+import integrator
+
+var failures = 0
+var checks = 0
+
+proc check(cond: bool, what: string) =
+  inc checks
+  if cond:
+    echo "  ok   ", what
+  else:
+    echo "  FAIL ", what
+    inc failures
+
+proc sid(name: string): int =
+  let b = Block.fromName(name)
+  if b == nil:
+    echo "FAIL unknown block ", name
+    inc failures
+    return 0
+  int(asU16(b.defaultState.id))
+
+# ---- worlds (module level so closures need no captures) ------------------------------------------------------------------
+proc floorSolid(x, y, z: int): bool = y < 0
+proc voidSolid(x, y, z: int): bool = false
+proc holeSolid(x, y, z: int): bool =
+  if y >= 0: return false
+  if x == 0 and z == 0 and y >= -3: return false
+  true
+proc wallSolid(x, y, z: int): bool =
+  if y < 0: return true
+  x == 3 and y == 0 and z == 5
+
+# gentle ramp: surface height -0.2 * x (descends toward +x), built from 4 strips of 0.25 per cell
+proc fclampT(x, lo, hi: float64): float64 = (if x < lo: lo elif x > hi: hi else: x)
+const RampSlope = 0.2
+const RampStrips = 8
+proc rampTop(xw: float64): float64 = -RampSlope * xw
+proc stripFill(x, y, i: int): float64 =
+  let top = rampTop(float64(x) + (float64(i) + 0.5) / float64(RampStrips))
+  fclampT(top - float64(y), 0.0, 1.0)
+proc rampSolid(x, y, z: int): bool =
+  if y < -8: return true
+  for i in 0 ..< RampStrips:
+    if stripFill(x, y, i) > 0.0: return true
+  false
+proc rampShape(x, y, z: int): seq[Box] =
+  result = @[]
+  for i in 0 ..< RampStrips:
+    let f = stripFill(x, y, i)
+    if f > 0.0:
+      result.add Box(x0: float64(i) / float64(RampStrips), y0: 0.0, z0: 0.0, x1: float64(i + 1) / float64(RampStrips), y1: f, z1: 1.0)
+
+proc windPlus(tick: int, x, y, z: float64): Vec3 = Vec3(x: 15.0, y: 0.0, z: 0.0)
+
+proc envFloor(): SimEnv = SimEnv(solidAt: floorSolid)
+
+# ---- helpers ---------------------------------------------------------------------------------------------------------------
+proc makeBody(id: int, cells: openArray[(int, int, int, int)]): Body =
+  var cl: seq[Cell] = @[]
+  for c in cells: cl.add Cell(x: int32(c[0]), y: int32(c[1]), z: int32(c[2]), state: int32(c[3]))
+  let b = bodyFromCells(uint64(id), 1'u64, cl)
+  recomputeMass(b, defaultProps)
+  b
+
+proc box(id, nx, ny, nz, state: int): Body =
+  var cl: seq[(int, int, int, int)] = @[]
+  for y in 0 ..< ny:
+    for z in 0 ..< nz:
+      for x in 0 ..< nx: cl.add (x, y, z, state)
+  makeBody(id, cl)
+
+type RunInfo = object
+  ticks: int
+  slept: bool
+  events: seq[ImpactEvent]
+
+proc run(sim: Sim, env: SimEnv, maxTicks: int, stopOnSleep: bool): RunInfo =
+  var info = RunInfo(events: @[])
+  for t in 0 ..< maxTicks:
+    let ev = stepBody(sim, env, t)
+    for e in ev: info.events.add e
+    info.ticks = t + 1
+    if stopOnSleep and sim.body.sleeping:
+      info.slept = true
+      break
+  info
+
+var failBefore = 0
+proc scene(name: string) =
+  echo "SCENE ", name
+  failBefore = failures
+proc endScene(name: string) =
+  if failures == failBefore: echo "PASS ", name else: echo "FAIL ", name
+
+let stone = sid("stone")
+let iron = sid("iron_block")
+let wool = sid("white_wool")
+
+# ---- 1. cube drop ---------------------------------------------------------------------------------------------------------
+proc s1() =
+  let b = box(1, 1, 1, 1, stone)
+  b.pos = vec3(0.0, 10.0, 0.0)
+  let sim = newSim(b)
+  let r = run(sim, envFloor(), 200, true)
+  echo "     ticks=", r.ticks, " pos.y=", b.pos.y, " vel.y=", b.vel.y, " events=", r.events.len
+  check(r.slept, "asleep within 200 ticks")
+  check(r.ticks < 120, "settled within 120 ticks")
+  check(abs(b.pos.y) < 0.02, "rests at floor height (pos.y within 0.02 of 0)")
+  check(abs(b.pos.x) < 0.02 and abs(b.pos.z) < 0.02, "no lateral drift")
+  let sr = settle(sim, floorSolid, 0.1, 2, true)
+  check(sr.ok, "settle ok")
+  check(sr.cells.len == 1 and sr.cells[0].x == 0 and sr.cells[0].y == 0 and sr.cells[0].z == 0, "settled cell is (0,0,0)")
+
+scene("cube dropped from 10 m lands, settles on the floor and sleeps")
+s1()
+endScene("cube dropped from 10 m lands, settles on the floor and sleeps")
+
+# ---- 2. plank flat --------------------------------------------------------------------------------------------------------
+proc s2() =
+  let b = box(2, 3, 1, 1, stone)
+  b.pos = vec3(0.3, 6.0, 0.2)
+  let sim = newSim(b)
+  let r = run(sim, envFloor(), 200, true)
+  let (ri, err) = nearestRotation(b.orient)
+  echo "     ticks=", r.ticks, " pos=", b.pos.x, ",", b.pos.y, ",", b.pos.z, " angleErr=", err
+  check(r.slept, "asleep")
+  check(err < 0.03, "orientation within 0.03 rad of axis aligned")
+  let sr = settle(sim, floorSolid, 0.1, 2, true)
+  check(sr.ok, "settle ok")
+  var allY0 = true
+  for c in sr.cells:
+    if c.y != 0: allY0 = false
+  check(sr.cells.len == 3 and allY0, "three cells on the floor layer")
+
+scene("3x1x1 plank dropped flat settles flat")
+s2()
+endScene("3x1x1 plank dropped flat settles flat")
+
+# ---- 3. plank tilted ------------------------------------------------------------------------------------------------------
+proc s3() =
+  let b = box(3, 3, 1, 1, stone)
+  b.orient = quatAxisAngle(0.0, 0.0, 1.0, 0.5)
+  b.pos = vec3(0.0, 3.0, 0.0)
+  let sim = newSim(b)
+  let r = run(sim, envFloor(), 400, true)
+  let (ri, err) = nearestRotation(b.orient)
+  echo "     ticks=", r.ticks, " pos=", b.pos.x, ",", b.pos.y, ",", b.pos.z, " angleErr=", err, " events=", r.events.len
+  check(r.slept, "asleep within 400 ticks")
+  let sr = settle(sim, floorSolid, 0.1, 2, true)
+  check(sr.ok, "settle ok (axis aligned within 0.1 rad)")
+  var maxY = -100
+  for c in sr.cells:
+    if c.y > maxY: maxY = c.y
+  check(sr.cells.len == 3 and maxY == 0, "lies flat: all three cells in the floor layer")
+
+scene("tilted plank topples and settles flat")
+s3()
+endScene("tilted plank topples and settles flat")
+
+# ---- 4. slope -------------------------------------------------------------------------------------------------------------
+proc slide(worldFriction: float64): (float64, bool, int) =
+  let b = box(4, 1, 1, 1, stone)
+  # lie flat on the slope plane (y = -0.2 x), moving down the slope at 0.35 blocks/tick
+  let th = arctan(RampSlope)
+  b.orient = quatAxisAngle(0.0, 0.0, 1.0, -th)
+  b.pos = vec3(1.0, rampTop(1.0) + 0.01, 0.0)
+  b.vel = vec3(0.35 * cos(th), -0.35 * sin(th), 0.0)
+  var p = defaultSimParams()
+  p.worldFriction = worldFriction
+  let sim = newSim(b, p, defaultSimMat, defaultProps)
+  let env = SimEnv(solidAt: rampSolid, shapeFn: rampShape, hasShape: true)
+  let r = run(sim, env, 400, true)
+  (b.pos.x - 1.0, r.slept, r.ticks)
+
+proc s4() =
+  let (dFric, sleptF, tF) = slide(0.6)
+  let (dFree, sleptN, tN) = slide(0.0)
+  echo "     friction 0.6: slid ", dFric, " blocks, asleep=", sleptF, " after ", tF, " ticks"
+  echo "     friction 0.0: slid ", dFree, " blocks, asleep=", sleptN, " after ", tN, " ticks"
+  check(dFric > 0.5, "slid down the slope first (> 0.5 blocks)")
+  check(sleptF, "came to rest and slept")
+  check(dFric < 6.0, "friction stopped it within 6 blocks")
+  check(dFree > dFric * 2.0, "without friction it travels more than twice as far")
+
+scene("body on a slope slides then stops (friction); frictionless slides farther")
+s4()
+endScene("body on a slope slides then stops (friction); frictionless slides farther")
+
+# ---- 5. wind --------------------------------------------------------------------------------------------------------------
+proc drift(state: int): float64 =
+  let b = box(5, 1, 1, 1, state)
+  b.pos = vec3(0.0, 300.0, 0.0)
+  let sim = newSim(b)
+  let env = SimEnv(solidAt: voidSolid, wind: windPlus, hasWind: true)
+  discard run(sim, env, 60, false)
+  b.pos.x
+
+proc s5() =
+  let di = drift(iron)
+  let dw = drift(wool)
+  echo "     drift after 60 ticks in 15 b/s wind: iron=", di, " wool=", dw
+  check(dw > 0.5, "wool drifts visibly (> 0.5 blocks)")
+  check(di >= 0.0 and di < dw, "iron drift is smaller than wool drift")
+  check(di < dw * 0.3, "iron drift is under 30% of wool drift")
+
+scene("heavy iron block drifts less in wind than a wool block")
+s5()
+endScene("heavy iron block drifts less in wind than a wool block")
+
+# ---- 6. settle placement --------------------------------------------------------------------------------------------------
+proc s6() =
+  let b = box(6, 2, 1, 1, stone)
+  b.pos = vec3(3.2, 0.01, 5.4)
+  b.orient = quatAxisAngle(0.0, 1.0, 0.0, 1.5707963 + 0.02)
+  b.sleeping = true
+  let sim = newSim(b)
+  let sr = settle(sim, floorSolid, 0.1, 2, true)
+  check(sr.ok, "ok")
+  check(sr.cells.len == 2, "two cells returned")
+  var okLayer = true
+  for c in sr.cells:
+    if c.y != 0: okLayer = false
+  check(okLayer, "on the floor layer")
+  check(sr.cells.len == 2 and sr.cells[0].x == sr.cells[1].x and abs(sr.cells[0].z - sr.cells[1].z) == 1,
+        "rotated 90 degrees about y: the two cells are adjacent along z")
+  check(b.pos.x == float64(int(b.pos.x)) and b.pos.y == float64(int(b.pos.y)) and b.pos.z == float64(int(b.pos.z)),
+        "body position is on the integer grid")
+  let (ri, err) = nearestRotation(b.orient)
+  check(err < 1e-6, "body orientation is exactly axis aligned")
+  echo "     cells: (", sr.cells[0].x, ",", sr.cells[0].y, ",", sr.cells[0].z, ") (", sr.cells[1].x, ",", sr.cells[1].y, ",",
+       sr.cells[1].z, ") rotIndex=", sr.rotIndex, " angleErr(before)=", sr.angleErr
+  # blocked: a solid cell sits where the snapped body goes
+  let b2 = box(7, 1, 1, 1, stone)
+  b2.pos = vec3(3.1, 0.02, 5.1)
+  b2.sleeping = true
+  let sim2 = newSim(b2)
+  let sr2 = settle(sim2, wallSolid, 0.1, 2, true)
+  check(sr2.ok and not (sr2.cells[0].x == 3 and sr2.cells[0].y == 0 and sr2.cells[0].z == 5), "nudged away from the solid cell")
+  check(sr2.ok and sr2.dy == 1, "nudge prefers up (dy = +1)")
+  let b3 = box(8, 1, 1, 1, stone)
+  b3.pos = vec3(3.1, 0.02, 5.1)
+  b3.sleeping = true
+  let sr3 = settle(newSim(b3), wallSolid, 0.1, 0, true)
+  check(not sr3.ok and sr3.reason.len > 0, "radius 0: reports failure")
+  check(b3.pos.x == 3.1, "failed settle leaves the body untouched")
+  let b4 = box(9, 3, 1, 1, stone)
+  b4.orient = quatAxisAngle(0.0, 0.0, 1.0, 0.6)
+  b4.sleeping = true
+  let sr4 = settle(newSim(b4), floorSolid, 0.1, 2, true)
+  check(not sr4.ok and sr4.reason == "not axis aligned", "tilted body: not axis aligned")
+  let b5 = box(10, 1, 1, 1, stone)
+  let sr5 = settle(newSim(b5), floorSolid, 0.1, 2, true)
+  check(not sr5.ok and sr5.reason == "not asleep", "awake body: not asleep")
+
+scene("settle snaps to the grid, returns rotated cells, nudges out of solid cells, fails when blocked")
+s6()
+endScene("settle snaps to the grid, returns rotated cells, nudges out of solid cells, fails when blocked")
+
+# ---- 7. hole --------------------------------------------------------------------------------------------------------------
+proc s7() =
+  let b = box(11, 1, 1, 1, stone)
+  b.pos = vec3(0.0, 6.0, 0.0)
+  let sim = newSim(b)
+  let r = run(sim, SimEnv(solidAt: holeSolid), 300, true)
+  echo "     ticks=", r.ticks, " pos=", b.pos.x, ",", b.pos.y, ",", b.pos.z
+  check(r.slept, "asleep")
+  let sr = settle(sim, holeSolid, 0.1, 1, true)
+  check(sr.ok and sr.cells.len == 1 and sr.cells[0].x == 0 and sr.cells[0].y == -3 and sr.cells[0].z == 0,
+        "settled cell is the bottom of the hole (0,-3,0)")
+  # 0.08 off centre it cannot enter (the hole is exactly one cube wide): it tips on the rim and wedges
+  let b2 = box(111, 1, 1, 1, stone)
+  b2.pos = vec3(0.08, 6.0, -0.05)
+  let r2 = run(newSim(b2), SimEnv(solidAt: holeSolid), 300, true)
+  echo "     off-centre: ticks=", r2.ticks, " pos.y=", b2.pos.y
+  check(r2.slept and b2.pos.y > -1.0, "off-centre cube does not drop into the hole (it tips and wedges on the rim)")
+
+scene("cube falls into a 1-wide hole and settles at the bottom")
+s7()
+endScene("cube falls into a 1-wide hole and settles at the bottom")
+
+# ---- 8. impact energy -----------------------------------------------------------------------------------------------------
+proc fall20(state: int): RunInfo =
+  let b = box(12, 2, 1, 2, state)
+  b.pos = vec3(0.0, 20.0, 0.0)
+  run(newSim(b), envFloor(), 200, false)
+
+proc s8() =
+  let rs = fall20(stone)
+  let rw = fall20(wool)
+  let thrS = materialOf(stone).breakThreshold
+  let thrW = materialOf(wool).breakThreshold
+  echo "     stone threshold=", thrS, " kJ  events=", rs.events.len
+  for e in rs.events:
+    echo "       stone cell (", e.cell.x, ",", e.cell.z, ") energy=", e.energy, " raw=", e.rawEnergy, " speed=", e.speed, " n=", e.nx, ",", e.ny, ",", e.nz
+  echo "     wool threshold=", thrW, " kJ  events=", rw.events.len
+  for e in rw.events:
+    echo "       wool cell (", e.cell.x, ",", e.cell.z, ") energy=", e.energy, " raw=", e.rawEnergy, " speed=", e.speed
+  check(rs.events.len >= 4, "stone: one event per bottom cell (at least 4)")
+  var allAbove = rs.events.len > 0
+  for cx in 0 .. 1:
+    for cz in 0 .. 1:
+      var best = 0.0
+      for e in rs.events:
+        if e.cell.x == int32(cx) and e.cell.z == int32(cz) and e.energy > best: best = e.energy
+      if best <= thrS: allAbove = false
+  check(allAbove, "stone: every bottom cell's peak impact energy exceeds its breakThreshold")
+  var allBelow = true
+  for e in rw.events:
+    if e.energy > thrW: allBelow = false
+  check(allBelow, "wool: no cell's fracture energy exceeds its breakThreshold (soft material absorbs the impact)")
+  var rawBig = false
+  for e in rw.events:
+    if e.rawEnergy > thrW: rawBig = true
+  check(rawBig, "wool: the raw kinetic share does exceed the threshold (absorption is what saves it)")
+  # shatter: a 5-cell stone row, only the middle cell takes a fracturing impact
+  let row = box(13, 5, 1, 1, stone)
+  row.pos = vec3(0.0, 0.0, 0.0)
+  let massBefore = row.mass
+  var rng = newRng(12345'u64)
+  let ev = [ImpactEvent(cell: Cell(x: 2, y: 0, z: 0, state: int32(stone)), energy: thrS * 3.0, rawEnergy: thrS * 3.0),
+            ImpactEvent(cell: Cell(x: 0, y: 0, z: 0, state: int32(stone)), energy: thrS * 0.5, rawEnergy: thrS * 0.5)]
+  let sh = shatterOnImpact(row, ev, defaultProps, defaultThreshold, rng, 0.05)
+  check(sh.broken.len == 1 and sh.broken[0].x == 2, "shatter removes only the cell above its threshold")
+  check(sh.pieces.len == 2, "the row splits into two pieces")
+  var msum = 0.0
+  for pc in sh.pieces: msum += pc.mass
+  check(abs(msum - (massBefore - materialOf(stone).density * materialOf(stone).fill)) < 1e-6, "piece masses sum to the mass left")
+  var moving = true
+  for pc in sh.pieces:
+    if abs(pc.vel.x) + abs(pc.vel.y) + abs(pc.vel.z) <= 0.0: moving = false
+  check(moving, "seeded kick gave both pieces a velocity")
+  let ev2 = [ImpactEvent(cell: Cell(x: 0, y: 0, z: 0, state: int32(stone)), energy: 0.1, rawEnergy: 0.1)]
+  let row2 = box(14, 3, 1, 1, stone)
+  let sh2 = shatterOnImpact(row2, ev2, defaultProps, defaultThreshold, rng, 0.0)
+  check(sh2.broken.len == 0 and sh2.pieces.len == 1, "below threshold: nothing breaks")
+
+scene("stone falling 20 m: impact energy per cell above breakThreshold; wool: below")
+s8()
+endScene("stone falling 20 m: impact energy per cell above breakThreshold; wool: below")
+
+# ---- 9. determinism -------------------------------------------------------------------------------------------------------
+proc tumble(): (Body, seq[ImpactEvent]) =
+  let b = box(15, 3, 1, 1, stone)
+  b.orient = quatAxisAngle(0.3, 0.1, 1.0, 0.7)
+  b.pos = vec3(0.4, 5.0, 0.2)
+  b.vel = vec3(0.02, 0.0, 0.01)
+  let r = run(newSim(b), SimEnv(solidAt: floorSolid, wind: windPlus, hasWind: true), 300, false)
+  (b, r.events)
+
+proc s9() =
+  let (a, ea) = tumble()
+  let (c, ec) = tumble()
+  check(a.pos.x == c.pos.x and a.pos.y == c.pos.y and a.pos.z == c.pos.z, "same position")
+  check(a.orient.w == c.orient.w and a.orient.x == c.orient.x and a.orient.y == c.orient.y and a.orient.z == c.orient.z,
+        "same orientation")
+  check(a.vel.x == c.vel.x and a.angVel.y == c.angVel.y and a.sleepTicks == c.sleepTicks, "same velocities and sleep counter")
+  var same = ea.len == ec.len
+  if same:
+    for i in 0 ..< ea.len:
+      if ea[i].energy != ec[i].energy or ea[i].cell.x != ec[i].cell.x: same = false
+  check(same, "same impact events")
+  echo "     final pos=", a.pos.x, ",", a.pos.y, ",", a.pos.z, " events=", ea.len
+
+scene("determinism: two runs are bit identical")
+s9()
+endScene("determinism: two runs are bit identical")
+
+# ---- 10. performance ------------------------------------------------------------------------------------------------------
+proc s10() =
+  let b = box(16, 10, 5, 10, stone)
+  b.orient = quatAxisAngle(1.0, 0.0, 0.3, 0.12)
+  b.pos = vec3(0.0, 4.0, 0.0)
+  var p = defaultSimParams()
+  p.allowSleep = false
+  let sim = newSim(b, p, defaultSimMat, defaultProps)
+  check(cellCount(b) == 500, "body has 500 cells")
+  let t0 = getMonoTime()
+  let r = run(sim, envFloor(), 1000, false)
+  let ms = (ticks(getMonoTime()) - ticks(t0)) div 1000000'i64
+  echo "     surface cells=", sim.cells.len, " 1000 ticks in ", ms, " ms (", float64(ms) / 1000.0, " ms/tick), events=", r.events.len,
+       " final pos.y=", b.pos.y
+  check(ms < 5000, "within the 5000 ms budget (awake, resting on the floor, all contacts live)")
+  check(abs(b.pos.y) < 0.05 and abs(b.vel.y) < 0.02, "rests on the floor without sinking or jitter")
+
+scene("1000 ticks of a 500-cell body within the time budget")
+s10()
+endScene("1000 ticks of a 500-cell body within the time budget")
+
+echo ""
+if failures == 0:
+  echo "ALL PASS (", checks, " checks)"
+else:
+  echo "FAILURES: ", failures, " of ", checks, " checks"
+  quit(1)

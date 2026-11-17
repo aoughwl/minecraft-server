@@ -1,0 +1,1171 @@
+## Rigid block body integrator, contacts, sleep and settle (design: overnight/BODIES-DESIGN.md section 3.1, task T5).
+##
+## PURE: imports only body.aowl, bodymass.aowl (and through it the materials table). No world, entity, server, time or
+## randomness (the only random source is the explicit seeded `Rng` handed to shatterOnImpact). The world is reached through
+## callbacks, so this runs on worker threads and can be compiled into a client mod:
+##   SimEnv.solidAt(x, y, z): bool           is the world cell (x,y,z) solid?
+##   SimEnv.shapeFn(x, y, z): seq[Box]       optional: the solid sub-boxes of that cell in cell-local 0..1 (default: one full cube)
+##   SimEnv.wind(tick, x, y, z): Vec3        optional: wind in BLOCKS PER SECOND (windcore/windfield `windAtWorld` x,y,z)
+## Same inputs, same outputs: fixed iteration orders, no hash-ordered loops, no clocks.
+##
+## UNITS. Positions in blocks (1 block = 1 m), time in ticks (1 tick = 1/20 s), so velocities are blocks/tick and angular
+## velocities rad/tick (body.aowl). Mass kg, inertia kg m^2 (bodymass.aowl). Forces are computed in SI (N, m/s) and converted:
+## an acceleration of a m/s^2 is a * 0.0025 blocks/tick^2. Gravity is a parameter in blocks/tick^2; the default 0.08 is Minecraft's
+## entity gravity (32 m/s^2): bodies fall like players and items do, not like physical objects.
+##
+## STEP (stepBody, once per tick, n = 2..maxSub substeps, h = 1/n tick each; n grows with speed so a fast body moves at most
+## about subSpeed blocks per substep, default 0.35, and cannot tunnel through a 1-block floor):
+##   1. collide: for every SURFACE cell of the body (a cell with an empty 6-neighbour) test its rotated unit-cube OBB against
+##      the solid world cells around it. Narrowphase = separating axis test over 15 axes (3 world, 3 body, 9 edge crosses);
+##      the contact normal is the axis of least penetration (an edge axis must beat the best face axis by 10%). Overlaps are
+##      TRUE overlaps; a pair that is separated on exactly one axis by less than `margin` is a speculative resting contact along
+##      that axis, any other separation is no contact. A normal pointing through a face shared with another solid world cell
+##      (any component > 0.01) is skipped (kills the "ghost edge" catch on a floor made of many cells). Contact points: every
+##      OBB vertex inside the world box (inflated by margin along the normal only), plus every world box corner inside the OBB;
+##      if none (edge-edge crossing) the closest point of the box to the cell centre. Point penetration
+##      depth is measured along the normal (negative = a gap smaller than `margin`: a speculative resting contact).
+##      The point set is reduced per normal to the deepest point plus the four diagonal extremes (a flat face keeps its corners).
+##   2. forces: gravity, then wind/air drag, then damping.
+##        F_k = 0.5 * rho * Cd * A_k * (v_rel . n_k)^2 along -n_k, for each of the 6 body-local face directions k whose outward
+##        normal n_k faces into the relative air flow (v_rel . n_k < 0); A_k = sum over exposed faces of the cell material's
+##        dragArea (materials.aowl: 1 = a solid cube face), applied at the area-weighted centre of pressure of that direction, so
+##        wind also makes torque about the centre of mass. v_rel = wind - (v + omega x r) at that point, so a falling body
+##        feels drag in still air too (params.airDrag). The change of velocity is clamped to the relative velocity (a stiff light
+##        body cannot be pushed past the wind speed). Heavy bodies barely move: dv = F/m.
+##        Damping per tick: linear = linDamp, angular = angDamp + angDampMat * (mass-weighted material damping of the cells).
+##   3. solve: sequential impulses, `iterations` Gauss-Seidel sweeps over the reduced contacts, normal impulse first then two
+##      Coulomb friction impulses clamped by mu * accumulated normal impulse. The effective mass uses the full world-frame
+##      inverse inertia tensor (R I^-1 R^T, no gyroscopic term). Normal target velocity: for a penetrating contact the
+##      restitution bounce e * approach speed if the approach speed exceeds restSpeed, else 0; for a speculative gap contact
+##      pd/h (it may close the gap but not pass through it) and only when the approach is slower than restSpeed (a fast body
+##      keeps its full impact energy).
+##   4. integrate velocity into the pose (position of the centre of mass, quaternion), then push the body out along the contact
+##      normals (position correction, beta * (penetration - slop), translation only, at most 0.15 per substep): positional
+##      correction never feeds velocity, which is what keeps a body at rest still.
+##   5. rest: contact damping of angular velocity; sleep through body.updateSleep when in contact (thresholds 0.01 blocks/tick,
+##      0.005 rad/tick, 20 ticks); a sleeping body is not integrated (stepBody returns at once) until wake().
+##
+## MATERIAL INPUTS (SimMat, from materials.aowl through MatFn, replaceable in tests). The material table has no friction or
+## restitution, so (documented, change only defaultSimMat when materials grows the fields):
+##   friction by material class: Rock 0.60, Wood 0.50, Granular 0.70, Soft 0.80, Generic 0.40, Foliage 0.50, other 0.50.
+##     Contact friction = sqrt(cellFriction * params.worldFriction) (worldFriction default 0.6, the world has no material callback).
+##   restitution = params.eMax * (1 - damping) (eMax 0.25): stone 0.245, wood 0.24, wool 0.125.
+##   brittle = 1 - min(1, damping / 0.5): fraction of the impact energy that reaches the cell as FRACTURE energy. Materials with
+##     damping >= 0.5 (wool, hay, moss: the Soft class) dissipate an impact by bulk deformation and never fracture, so a wool body
+##     reports energy 0; stone 0.96, wood 0.92, glass-like Generic 0.8, Granular 0.4.
+##   dragArea, breakThreshold (kJ): straight from the table.
+##
+## IMPACT EVENTS. Per tick, per body cell that took an impact above params.impactMin (kJ): the cell's share of the incoming
+## kinetic energy, 0.5 * (m / Nc) * (v_n * 20)^2 / 1000 kJ with v_n the pre-impact normal approach speed of that cell's contact
+## point, Nc the number of cells that took part (approach >= 25% of the fastest). `rawEnergy` is that number; `energy` is
+## rawEnergy * brittle and is what to compare with the cell's breakThreshold (shatterOnImpact does).
+##
+## SETTLE (settle): see the proc. FRAGILE FALL (shatterOnImpact): see the proc.
+
+import std/math
+import body
+import bodymass
+import materials
+
+const
+  Dirs6X = [1.0, -1.0, 0.0, 0.0, 0.0, 0.0]
+  Dirs6Y = [0.0, 0.0, 1.0, -1.0, 0.0, 0.0]
+  Dirs6Z = [0.0, 0.0, 0.0, 0.0, 1.0, -1.0]
+
+type
+  Mat3* = array[9, float64]            ## row-major
+
+  Box* = object
+    ## A solid box inside a world cell, cell-local coordinates 0..1.
+    x0*, y0*, z0*, x1*, y1*, z1*: float64
+
+  SolidFn* = proc (x, y, z: int): bool {.closure.}
+  ShapeFn* = proc (x, y, z: int): seq[Box] {.closure.}
+  WindFn* = proc (tick: int, x, y, z: float64): Vec3 {.closure.}   ## blocks per second
+  MatFn* = proc (state: int): SimMat {.closure.}
+
+  SimMat* = object
+    friction*, restitution*, damping*, dragArea*, breakThreshold*, brittle*: float64
+
+  SimEnv* = object
+    solidAt*: SolidFn
+    shapeFn*: ShapeFn
+    hasShape*: bool
+    wind*: WindFn
+    hasWind*: bool
+
+  SimParams* = object
+    gravity*: float64        ## blocks/tick^2 (0.08)
+    airDensity*: float64     ## kg/m^3 (1.2)
+    dragCd*: float64         ## drag coefficient of a cube (1.05)
+    airDrag*: bool           ## apply drag against still air too
+    linDamp*, angDamp*, angDampMat*: float64
+    minSub*, maxSub*: int
+    subSpeed*: float64       ## max blocks moved per substep
+    iterations*: int
+    margin*: float64         ## speculative contact distance (0.06)
+    slop*: float64           ## tolerated penetration (0.01)
+    beta*: float64           ## position correction fraction per substep (0.3)
+    restSpeed*: float64      ## below this approach speed (blocks/tick) there is no bounce (0.1 = 2 m/s)
+    eMax*: float64           ## restitution of an undamped material
+    worldFriction*: float64
+    impactMin*: float64      ## kJ, smallest reported impact
+    contactAngDamp*: float64 ## extra angular damping per tick while in contact
+    sleepLin*, sleepAng*: float64
+    sleepTicks*: int
+    allowSleep*: bool
+    maxSpeed*: float64       ## blocks/tick clamp
+    maxAngSpeed*: float64    ## rad/tick clamp
+
+  SimCell* = object
+    x*, y*, z*: int32
+    state*: int32
+    rx*, ry*, rz*: float64   ## cell centre relative to the centre of mass, body-local axes
+    mu*, e*, brittle*, thr*: float64
+
+  Contact* = object
+    px, py, pz, nx, ny, nz, pd: float64
+    mu, e: float64
+    cell: int32
+    rx, ry, rz: float64
+    t1x, t1y, t1z, t2x, t2y, t2z: float64
+    kn, k1, k2, target: float64
+    jn, j1, j2: float64
+    active: bool
+
+  ImpactEvent* = object
+    cell*: Cell              ## the body-local cell and its block state
+    energy*: float64         ## kJ of fracture energy (compare with the breakThreshold of `cell.state`)
+    rawEnergy*: float64      ## kJ of incoming kinetic energy share
+    speed*: float64          ## approach speed, blocks/tick
+    nx*, ny*, nz*: float64   ## world-frame contact normal (pointing out of the world, into the body)
+
+  Sim* = ref object
+    body*: Body
+    params*: SimParams
+    matFn*: MatFn
+    props*: PropsFn
+    cells*: seq[SimCell]     ## surface cells only
+    area*: array[6, float64]            ## exposed drag area per local face direction (+x -x +y -y +z -z)
+    cp*: array[6, Vec3]                 ## centre of pressure per direction, relative to com, body-local
+    avgDamping*: float64
+    radius*: float64                    ## max distance of a surface cell corner from the com
+    iinv*: Mat3                         ## inverse inertia, body-local
+    contacts: seq[Contact]
+    cellAp: seq[float64]
+    cellN: seq[Vec3]
+    evE: seq[float64]
+    evS: seq[float64]
+    evN: seq[Vec3]
+    touched: seq[int]
+    lastContacts*: int
+    margin: float64                     ## contact margin of the current substep
+
+  Rng* = object
+    s*: uint64
+
+  PlacedCell* = object
+    x*, y*, z*: int          ## world cell
+    state*: int
+    lx*, ly*, lz*: int       ## body-local cell it came from
+
+  SettleResult* = object
+    ok*: bool
+    reason*: string          ## "" on success
+    rotIndex*: int           ## 0..23, index into rotation24()
+    angleErr*: float64       ## radians between the pose and the snapped rotation
+    dx*, dy*, dz*: int       ## nudge applied to the integer position
+    pos*: Vec3               ## new body.pos (integer)
+    rot*: Mat3               ## the 90-degree rotation, body->world, row-major (rotate block states with it)
+    cells*: seq[PlacedCell]
+
+  ThresholdFn* = proc (state: int): float64 {.closure.}
+
+  ShatterResult* = object
+    broken*: seq[Cell]       ## cells removed (body-local coordinates and states)
+    pieces*: seq[Body]       ## the surviving connected pieces (splitBody); @[b] if nothing broke and one piece
+
+# ----------------------------------------------------------------------------------------------------------------------
+# small math
+
+proc fmin(a, b: float64): float64 = (if a < b: a else: b)
+proc fmax(a, b: float64): float64 = (if a > b: a else: b)
+proc fclamp(x, lo, hi: float64): float64 = (if x < lo: lo elif x > hi: hi else: x)
+
+proc quatToMat*(q: Quat): Mat3 =
+  let xx = q.x * q.x
+  let yy = q.y * q.y
+  let zz = q.z * q.z
+  let xy = q.x * q.y
+  let xz = q.x * q.z
+  let yz = q.y * q.z
+  let wx = q.w * q.x
+  let wy = q.w * q.y
+  let wz = q.w * q.z
+  [1.0 - 2.0 * (yy + zz), 2.0 * (xy - wz), 2.0 * (xz + wy),
+   2.0 * (xy + wz), 1.0 - 2.0 * (xx + zz), 2.0 * (yz - wx),
+   2.0 * (xz - wy), 2.0 * (yz + wx), 1.0 - 2.0 * (xx + yy)]
+
+proc matToQuat*(m: Mat3): Quat =
+  let tr = m[0] + m[4] + m[8]
+  var q = Quat()
+  if tr > 0.0:
+    let s = sqrt(tr + 1.0) * 2.0
+    q = Quat(w: 0.25 * s, x: (m[7] - m[5]) / s, y: (m[2] - m[6]) / s, z: (m[3] - m[1]) / s)
+  elif m[0] > m[4] and m[0] > m[8]:
+    let s = sqrt(1.0 + m[0] - m[4] - m[8]) * 2.0
+    q = Quat(w: (m[7] - m[5]) / s, x: 0.25 * s, y: (m[1] + m[3]) / s, z: (m[2] + m[6]) / s)
+  elif m[4] > m[8]:
+    let s = sqrt(1.0 + m[4] - m[0] - m[8]) * 2.0
+    q = Quat(w: (m[2] - m[6]) / s, x: (m[1] + m[3]) / s, y: 0.25 * s, z: (m[5] + m[7]) / s)
+  else:
+    let s = sqrt(1.0 + m[8] - m[0] - m[4]) * 2.0
+    q = Quat(w: (m[3] - m[1]) / s, x: (m[2] + m[6]) / s, y: (m[5] + m[7]) / s, z: 0.25 * s)
+  qnormalize(q)
+
+proc quatAxisAngle*(ax, ay, az, angle: float64): Quat =
+  let l = sqrt(ax * ax + ay * ay + az * az)
+  if l <= 0.0: return quatIdentity()
+  let s = sin(angle * 0.5) / l
+  Quat(w: cos(angle * 0.5), x: ax * s, y: ay * s, z: az * s)
+
+proc mulMV(m: Mat3, x, y, z: float64): Vec3 =
+  Vec3(x: m[0] * x + m[1] * y + m[2] * z, y: m[3] * x + m[4] * y + m[5] * z, z: m[6] * x + m[7] * y + m[8] * z)
+
+proc invSym(inertia: array[6, float64]): Mat3 =
+  ## Inverse of the symmetric tensor [[Ixx Ixy Ixz][Ixy Iyy Iyz][Ixz Iyz Izz]]; zeros when singular.
+  let a = inertia[0]
+  let d = inertia[1]
+  let f = inertia[2]
+  let b = inertia[3]
+  let c = inertia[4]
+  let e = inertia[5]
+  let c00 = d * f - e * e
+  let c01 = c * e - b * f
+  let c02 = b * e - c * d
+  let det = a * c00 + b * c01 + c * c02
+  if abs(det) < 1e-12: return [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+  let id = 1.0 / det
+  let c11 = a * f - c * c
+  let c12 = b * c - a * e
+  let c22 = a * d - b * b
+  [c00 * id, c01 * id, c02 * id, c01 * id, c11 * id, c12 * id, c02 * id, c12 * id, c22 * id]
+
+proc worldIinv(r: Mat3, il: Mat3): Mat3 =
+  ## R * il * R^T
+  var t: Mat3 = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+  for i in 0 ..< 3:
+    for j in 0 ..< 3:
+      t[i * 3 + j] = r[i * 3] * il[j] + r[i * 3 + 1] * il[3 + j] + r[i * 3 + 2] * il[6 + j]
+  # t = R il ; result = t * R^T
+  result = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+  for i in 0 ..< 3:
+    for j in 0 ..< 3:
+      result[i * 3 + j] = t[i * 3] * r[j * 3] + t[i * 3 + 1] * r[j * 3 + 1] + t[i * 3 + 2] * r[j * 3 + 2]
+
+# ----------------------------------------------------------------------------------------------------------------------
+# seeded generator (splitmix64)
+
+proc newRng*(seed: uint64): Rng = Rng(s: seed)
+
+proc nextU64*(r: var Rng): uint64 =
+  r.s = r.s + 0x9E3779B97F4A7C15'u64
+  var z = r.s
+  z = (z xor (z shr 30)) * 0xBF58476D1CE4E5B9'u64
+  z = (z xor (z shr 27)) * 0x94D049BB133111EB'u64
+  z xor (z shr 31)
+
+proc nextFloat*(r: var Rng): float64 =
+  ## uniform in [0, 1)
+  float64(nextU64(r) shr 11) / 9007199254740992.0
+
+# ----------------------------------------------------------------------------------------------------------------------
+# parameters and materials
+
+proc defaultSimParams*(): SimParams =
+  SimParams(gravity: 0.08, airDensity: 1.2, dragCd: 1.05, airDrag: true, linDamp: 0.0005, angDamp: 0.004, angDampMat: 0.02,
+            minSub: 2, maxSub: 8, subSpeed: 0.35, iterations: 10, margin: 0.06, slop: 0.01, beta: 0.3, restSpeed: 0.1,
+            eMax: 0.25, worldFriction: 0.6, impactMin: 0.25, contactAngDamp: 0.04, sleepLin: 0.01, sleepAng: 0.005,
+            sleepTicks: 20, allowSleep: true, maxSpeed: 3.0, maxAngSpeed: 0.6)
+
+proc classFriction(c: MatClass): float64 =
+  case c
+  of mcRock: 0.6
+  of mcWood: 0.5
+  of mcGranular: 0.7
+  of mcSoft: 0.8
+  of mcGeneric: 0.4
+  of mcFoliage: 0.5
+  else: 0.5
+
+proc defaultSimMat*(state: int): SimMat =
+  ## The seam to materials.aowl (see the header for the derived friction, restitution and brittleness).
+  let m = materialOf(state)
+  let eMax = 0.25
+  SimMat(friction: classFriction(m.matClass), restitution: eMax * (1.0 - fclamp(m.damping, 0.0, 1.0)),
+         damping: m.damping, dragArea: m.dragArea, breakThreshold: m.breakThreshold,
+         brittle: 1.0 - fmin(1.0, m.damping / 0.5))
+
+proc defaultThreshold*(state: int): float64 =
+  materialOf(state).breakThreshold
+
+# ----------------------------------------------------------------------------------------------------------------------
+# Sim construction
+
+proc refreshSim*(sim: Sim) =
+  ## Rebuild the caches (surface cells, exposed areas, centres of pressure, inverse inertia). Call after any cell change
+  ## (breakCells, setCellMass) and after body.mass was recomputed.
+  let b = sim.body
+  sim.cells = @[]
+  for i in 0 ..< 6:
+    sim.area[i] = 0.0
+    sim.cp[i] = Vec3()
+  var dmpSum = 0.0
+  var mSum = 0.0
+  var rad = 0.0
+  let all = cellList(b)
+  for c in all:
+    let sm = sim.matFn(int(c.state))
+    let mc = cellMassOf(sim.props, int(c.state))
+    dmpSum += sm.damping * mc
+    mSum += mc
+    var surface = false
+    for k in 0 ..< 6:
+      let nx = int(c.x) + int(Dirs6X[k])
+      let ny = int(c.y) + int(Dirs6Y[k])
+      let nz = int(c.z) + int(Dirs6Z[k])
+      if getCell(b, nx, ny, nz) == 0:
+        surface = true
+        let a = sm.dragArea
+        sim.area[k] += a
+        sim.cp[k] = sim.cp[k] + scale(vec3(float64(c.x) + 0.5 + 0.5 * Dirs6X[k], float64(c.y) + 0.5 + 0.5 * Dirs6Y[k],
+                                           float64(c.z) + 0.5 + 0.5 * Dirs6Z[k]), a)
+    if surface:
+      let rx = float64(c.x) + 0.5 - b.com.x
+      let ry = float64(c.y) + 0.5 - b.com.y
+      let rz = float64(c.z) + 0.5 - b.com.z
+      let d = sqrt(rx * rx + ry * ry + rz * rz) + 0.8660254
+      if d > rad: rad = d
+      sim.cells.add SimCell(x: c.x, y: c.y, z: c.z, state: c.state, rx: rx, ry: ry, rz: rz,
+                            mu: sm.friction, e: sm.restitution, brittle: sm.brittle, thr: sm.breakThreshold)
+  for k in 0 ..< 6:
+    if sim.area[k] > 0.0:
+      sim.cp[k] = scale(sim.cp[k], 1.0 / sim.area[k]) - b.com
+  sim.avgDamping = (if mSum > 0.0: dmpSum / mSum else: 0.0)
+  sim.radius = rad
+  sim.iinv = invSym(b.inertia)
+  sim.cellAp = newSeq[float64](sim.cells.len)
+  sim.cellN = newSeq[Vec3](sim.cells.len)
+  sim.evE = newSeq[float64](sim.cells.len)
+  sim.evS = newSeq[float64](sim.cells.len)
+  sim.evN = newSeq[Vec3](sim.cells.len)
+  sim.touched = @[]
+  sim.contacts = @[]
+
+proc newSim*(b: Body, params: SimParams, matFn: MatFn, props: PropsFn): Sim =
+  ## `b` must have its mass finalised (recomputeMass). `props` is the PropsFn used for bodymass (default `defaultProps`).
+  result = Sim(body: b, params: params, matFn: matFn, props: props)
+  refreshSim(result)
+
+proc newSim*(b: Body): Sim =
+  newSim(b, defaultSimParams(), defaultSimMat, defaultProps)
+
+proc comWorld*(b: Body): Vec3 =
+  b.pos + rotate(b.orient, b.com)
+
+proc wake*(sim: Sim) = body.wake(sim.body)
+
+# ----------------------------------------------------------------------------------------------------------------------
+# collision
+
+proc cellBoxes(env: SimEnv, x, y, z: int): seq[Box] =
+  if env.hasShape: return env.shapeFn(x, y, z)
+  @[Box(x0: 0.0, y0: 0.0, z0: 0.0, x1: 1.0, y1: 1.0, z1: 1.0)]
+
+proc collideCell(sim: Sim, env: SimEnv, ci: int, R: Mat3, cwx, cwy, cwz: float64) =
+  ## Append the contacts of surface cell `ci` (world centre cw, body axes R columns) against the world.
+  let margin = sim.margin
+  # half extents of the OBB along world axes
+  let ex = 0.5 * (abs(R[0]) + abs(R[1]) + abs(R[2]))
+  let ey = 0.5 * (abs(R[3]) + abs(R[4]) + abs(R[5]))
+  let ez = 0.5 * (abs(R[6]) + abs(R[7]) + abs(R[8]))
+  let ix0 = int(floor(cwx - ex - margin))
+  let ix1 = int(floor(cwx + ex + margin))
+  let iy0 = int(floor(cwy - ey - margin))
+  let iy1 = int(floor(cwy + ey + margin))
+  let iz0 = int(floor(cwz - ez - margin))
+  let iz1 = int(floor(cwz + ez + margin))
+  # body axes in world (columns)
+  let ax = [R[0], R[3], R[6]]
+  let ay = [R[1], R[4], R[7]]
+  let az = [R[2], R[5], R[8]]
+  # the 8 vertex offsets from the centre
+  var vox: array[8, float64] = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+  var voy: array[8, float64] = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+  var voz: array[8, float64] = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+  for k in 0 ..< 8:
+    let sx = (if (k and 1) != 0: 0.5 else: -0.5)
+    let sy = (if (k and 2) != 0: 0.5 else: -0.5)
+    let sz = (if (k and 4) != 0: 0.5 else: -0.5)
+    vox[k] = R[0] * sx + R[1] * sy + R[2] * sz
+    voy[k] = R[3] * sx + R[4] * sy + R[5] * sz
+    voz[k] = R[6] * sx + R[7] * sy + R[8] * sz
+  let cell = sim.cells[ci]
+  let cmu = sqrt(cell.mu * sim.params.worldFriction)
+  var gx = ix0
+  while gx <= ix1:
+    var gy = iy0
+    while gy <= iy1:
+      var gz = iz0
+      while gz <= iz1:
+        if env.solidAt(gx, gy, gz):
+          let boxes = cellBoxes(env, gx, gy, gz)
+          for bx in boxes:
+            let bminx = float64(gx) + bx.x0
+            let bminy = float64(gy) + bx.y0
+            let bminz = float64(gz) + bx.z0
+            let bmaxx = float64(gx) + bx.x1
+            let bmaxy = float64(gy) + bx.y1
+            let bmaxz = float64(gz) + bx.z1
+            let bcx = 0.5 * (bminx + bmaxx)
+            let bcy = 0.5 * (bminy + bmaxy)
+            let bcz = 0.5 * (bminz + bmaxz)
+            let hx = 0.5 * (bmaxx - bminx)
+            let hy = 0.5 * (bmaxy - bminy)
+            let hz = 0.5 * (bmaxz - bminz)
+            let tx = cwx - bcx
+            let ty = cwy - bcy
+            let tz = cwz - bcz
+            # --- SAT (true overlaps, no margin) ---
+            var ovA: array[15, float64] = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+            var lxA: array[15, float64] = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+            var lyA: array[15, float64] = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+            var lzA: array[15, float64] = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+            var okA: array[15, bool] = [false, false, false, false, false, false, false, false, false, false, false, false,
+                                        false, false, false]
+            var tooFar = false
+            var nonpos = 0
+            var npAxis = -1
+            for axis in 0 ..< 15:
+              var lx = 0.0
+              var ly = 0.0
+              var lz = 0.0
+              if axis < 3:
+                lx = (if axis == 0: 1.0 else: 0.0)
+                ly = (if axis == 1: 1.0 else: 0.0)
+                lz = (if axis == 2: 1.0 else: 0.0)
+              elif axis < 6:
+                let j = axis - 3
+                lx = (if j == 0: ax[0] elif j == 1: ay[0] else: az[0])
+                ly = (if j == 0: ax[1] elif j == 1: ay[1] else: az[1])
+                lz = (if j == 0: ax[2] elif j == 1: ay[2] else: az[2])
+              else:
+                let i = (axis - 6) div 3
+                let j = (axis - 6) mod 3
+                let jx = (if j == 0: ax[0] elif j == 1: ay[0] else: az[0])
+                let jy = (if j == 0: ax[1] elif j == 1: ay[1] else: az[1])
+                let jz = (if j == 0: ax[2] elif j == 1: ay[2] else: az[2])
+                # cross(e_i, a_j)
+                if i == 0:
+                  lx = 0.0
+                  ly = -jz
+                  lz = jy
+                elif i == 1:
+                  lx = jz
+                  ly = 0.0
+                  lz = -jx
+                else:
+                  lx = -jy
+                  ly = jx
+                  lz = 0.0
+                let l = sqrt(lx * lx + ly * ly + lz * lz)
+                if l < 1e-4: continue
+                lx = lx / l
+                ly = ly / l
+                lz = lz / l
+              let rA = 0.5 * (abs(ax[0] * lx + ax[1] * ly + ax[2] * lz) + abs(ay[0] * lx + ay[1] * ly + ay[2] * lz) +
+                              abs(az[0] * lx + az[1] * ly + az[2] * lz))
+              let rB = hx * abs(lx) + hy * abs(ly) + hz * abs(lz)
+              let d = tx * lx + ty * ly + tz * lz
+              let ov = rA + rB - abs(d)
+              let sgn = (if d >= 0.0: 1.0 else: -1.0)
+              okA[axis] = true
+              ovA[axis] = ov
+              lxA[axis] = lx * sgn
+              lyA[axis] = ly * sgn
+              lzA[axis] = lz * sgn
+              if ov <= -margin:
+                tooFar = true
+                break
+              if ov <= 0.0:
+                inc nonpos
+                npAxis = axis
+            if tooFar or nonpos >= 2: continue
+            var bestFace = 1e30
+            var bestEdge = 1e30
+            var fnx = 0.0
+            var fny = 0.0
+            var fnz = 0.0
+            var enx = 0.0
+            var eny = 0.0
+            var enz = 0.0
+            for axis in 0 ..< 15:
+              if not okA[axis]: continue
+              if nonpos == 1 and axis != npAxis: continue
+              let ov = ovA[axis]
+              let isFace = axis < 6
+              if (isFace and ov < bestFace) or ((not isFace) and ov < bestEdge):
+                # a normal that points through a box face shared with another solid world cell (any component > 0.01) is a ghost: skip
+                var skip = false
+                let mx = lxA[axis]
+                let my = lyA[axis]
+                let mz = lzA[axis]
+                if abs(mx) > 0.01:
+                  let sg = (if mx > 0.0: 1 else: -1)
+                  let atEdge = (if sg > 0: bx.x1 >= 1.0 else: bx.x0 <= 0.0)
+                  if atEdge and env.solidAt(gx + sg, gy, gz): skip = true
+                if not skip and abs(my) > 0.01:
+                  let sg = (if my > 0.0: 1 else: -1)
+                  let atEdge = (if sg > 0: bx.y1 >= 1.0 else: bx.y0 <= 0.0)
+                  if atEdge and env.solidAt(gx, gy + sg, gz): skip = true
+                if not skip and abs(mz) > 0.01:
+                  let sg = (if mz > 0.0: 1 else: -1)
+                  let atEdge = (if sg > 0: bx.z1 >= 1.0 else: bx.z0 <= 0.0)
+                  if atEdge and env.solidAt(gx, gy, gz + sg): skip = true
+                if not skip:
+                  if isFace:
+                    bestFace = ov
+                    fnx = mx
+                    fny = my
+                    fnz = mz
+                  else:
+                    bestEdge = ov
+                    enx = mx
+                    eny = my
+                    enz = mz
+            var nx = fnx
+            var ny = fny
+            var nz = fnz
+            if bestFace >= 1e29 and bestEdge >= 1e29: continue
+            if bestEdge < bestFace * 0.9:
+              nx = enx
+              ny = eny
+              nz = enz
+            let hiBox = bcx * nx + bcy * ny + bcz * nz + hx * abs(nx) + hy * abs(ny) + hz * abs(nz)
+            let loObb = cwx * nx + cwy * ny + cwz * nz - 0.5 * (abs(ax[0] * nx + ax[1] * ny + ax[2] * nz) +
+                        abs(ay[0] * nx + ay[1] * ny + ay[2] * nz) + abs(az[0] * nx + az[1] * ny + az[2] * nz))
+            var found = 0
+            # OBB vertices inside the box, inflated by the margin along the normal only
+            for k in 0 ..< 8:
+              let vx = cwx + vox[k]
+              let vy = cwy + voy[k]
+              let vz = cwz + voz[k]
+              if abs(vx - bcx) <= hx + margin * abs(nx) and abs(vy - bcy) <= hy + margin * abs(ny) and
+                 abs(vz - bcz) <= hz + margin * abs(nz):
+                let pd = hiBox - (vx * nx + vy * ny + vz * nz)
+                if pd > -margin:
+                  inc found
+                  sim.contacts.add Contact(px: vx, py: vy, pz: vz, nx: nx, ny: ny, nz: nz, pd: pd, mu: cmu, e: cell.e,
+                                           cell: int32(ci), active: true)
+            # box corners inside the OBB (same inflation in the body frame)
+            let bn0 = ax[0] * nx + ax[1] * ny + ax[2] * nz
+            let bn1 = ay[0] * nx + ay[1] * ny + ay[2] * nz
+            let bn2 = az[0] * nx + az[1] * ny + az[2] * nz
+            for k in 0 ..< 8:
+              let wx = (if (k and 1) != 0: bmaxx else: bminx)
+              let wy = (if (k and 2) != 0: bmaxy else: bminy)
+              let wz = (if (k and 4) != 0: bmaxz else: bminz)
+              let dx = wx - cwx
+              let dy = wy - cwy
+              let dz = wz - cwz
+              let u0 = ax[0] * dx + ax[1] * dy + ax[2] * dz
+              let u1 = ay[0] * dx + ay[1] * dy + ay[2] * dz
+              let u2 = az[0] * dx + az[1] * dy + az[2] * dz
+              if abs(u0) <= 0.5 + margin * abs(bn0) and abs(u1) <= 0.5 + margin * abs(bn1) and
+                 abs(u2) <= 0.5 + margin * abs(bn2):
+                let pd = (wx * nx + wy * ny + wz * nz) - loObb
+                if pd > -margin:
+                  inc found
+                  sim.contacts.add Contact(px: wx, py: wy, pz: wz, nx: nx, ny: ny, nz: nz, pd: pd, mu: cmu, e: cell.e,
+                                           cell: int32(ci), active: true)
+            if found == 0:
+              let pd = hiBox - loObb
+              if pd > -margin:
+                sim.contacts.add Contact(px: fclamp(cwx, bminx, bmaxx), py: fclamp(cwy, bminy, bmaxy),
+                                         pz: fclamp(cwz, bminz, bmaxz), nx: nx, ny: ny, nz: nz, pd: pd, mu: cmu,
+                                         e: cell.e, cell: int32(ci), active: true)
+        inc gz
+      inc gy
+    inc gx
+
+proc reduceContacts(sim: Sim) =
+  ## Per normal group keep the deepest point and the four diagonal extremes (<= 5 points).
+  let n = sim.contacts.len
+  if n <= 5: return
+  var grpOf = newSeq[int](n)
+  var gnx: seq[float64] = @[]
+  var gny: seq[float64] = @[]
+  var gnz: seq[float64] = @[]
+  for i in 0 ..< n:
+    let c = sim.contacts[i]
+    var g = -1
+    for k in 0 ..< gnx.len:
+      if c.nx * gnx[k] + c.ny * gny[k] + c.nz * gnz[k] > 0.97:
+        g = k
+        break
+    if g < 0:
+      gnx.add c.nx
+      gny.add c.ny
+      gnz.add c.nz
+      g = gnx.len - 1
+    grpOf[i] = g
+  var kept: seq[Contact] = @[]
+  for g in 0 ..< gnx.len:
+    var idx: seq[int] = @[]
+    for i in 0 ..< n:
+      if grpOf[i] == g: idx.add i
+    if idx.len <= 5:
+      for i in idx: kept.add sim.contacts[i]
+      continue
+    # tangents of the group normal
+    let nx = gnx[g]
+    let ny = gny[g]
+    let nz = gnz[g]
+    var ux = 0.0
+    var uy = 0.0
+    var uz = 0.0
+    if abs(nx) < 0.9:
+      ux = 1.0
+    else:
+      uy = 1.0
+    var t1x = ny * uz - nz * uy
+    var t1y = nz * ux - nx * uz
+    var t1z = nx * uy - ny * ux
+    let l1 = sqrt(t1x * t1x + t1y * t1y + t1z * t1z)
+    t1x = t1x / l1
+    t1y = t1y / l1
+    t1z = t1z / l1
+    let t2x = ny * t1z - nz * t1y
+    let t2y = nz * t1x - nx * t1z
+    let t2z = nx * t1y - ny * t1x
+    var pick: array[5, int] = [-1, -1, -1, -1, -1]
+    var best: array[5, float64] = [-1e30, -1e30, -1e30, -1e30, -1e30]
+    for s in 0 ..< 5:
+      pick[s] = -1
+      best[s] = -1e30
+    for i in idx:
+      let c = sim.contacts[i]
+      let a = c.px * t1x + c.py * t1y + c.pz * t1z
+      let b = c.px * t2x + c.py * t2y + c.pz * t2z
+      let v0 = c.pd
+      let v1 = a + b
+      let v2 = a - b
+      let v3 = -a + b
+      let v4 = -a - b
+      if v0 > best[0]:
+        best[0] = v0
+        pick[0] = i
+      if v1 > best[1]:
+        best[1] = v1
+        pick[1] = i
+      if v2 > best[2]:
+        best[2] = v2
+        pick[2] = i
+      if v3 > best[3]:
+        best[3] = v3
+        pick[3] = i
+      if v4 > best[4]:
+        best[4] = v4
+        pick[4] = i
+    for s in 0 ..< 5:
+      var dup = false
+      for q in 0 ..< s:
+        if pick[q] == pick[s]: dup = true
+      if not dup and pick[s] >= 0: kept.add sim.contacts[pick[s]]
+  sim.contacts = kept
+
+# ----------------------------------------------------------------------------------------------------------------------
+# one substep
+
+type
+  RB = object
+    vx, vy, vz, wx, wy, wz, invM: float64
+    iw: Mat3
+
+proc applyImp(rb: var RB, rx, ry, rz, ix, iy, iz: float64) =
+  rb.vx += rb.invM * ix
+  rb.vy += rb.invM * iy
+  rb.vz += rb.invM * iz
+  # torque = r x i
+  let tx = ry * iz - rz * iy
+  let ty = rz * ix - rx * iz
+  let tz = rx * iy - ry * ix
+  rb.wx += rb.iw[0] * tx + rb.iw[1] * ty + rb.iw[2] * tz
+  rb.wy += rb.iw[3] * tx + rb.iw[4] * ty + rb.iw[5] * tz
+  rb.wz += rb.iw[6] * tx + rb.iw[7] * ty + rb.iw[8] * tz
+
+proc effMass(rb: RB, rx, ry, rz, dx, dy, dz: float64): float64 =
+  ## 1/m + d . ((Iw (r x d)) x r)
+  let cx = ry * dz - rz * dy
+  let cy = rz * dx - rx * dz
+  let cz = rx * dy - ry * dx
+  let ax = rb.iw[0] * cx + rb.iw[1] * cy + rb.iw[2] * cz
+  let ay = rb.iw[3] * cx + rb.iw[4] * cy + rb.iw[5] * cz
+  let az = rb.iw[6] * cx + rb.iw[7] * cy + rb.iw[8] * cz
+  # (a x r) . d
+  let qx = ay * rz - az * ry
+  let qy = az * rx - ax * rz
+  let qz = ax * ry - ay * rx
+  rb.invM + qx * dx + qy * dy + qz * dz
+
+proc substep(sim: Sim, env: SimEnv, tick: int, h: float64): bool =
+  ## Returns true when the body has contacts this substep.
+  let b = sim.body
+  let p = sim.params
+  let R = quatToMat(b.orient)
+  let com = b.pos + rotate(b.orient, b.com)
+  var rb = RB(vx: b.vel.x, vy: b.vel.y, vz: b.vel.z, wx: b.angVel.x, wy: b.angVel.y, wz: b.angVel.z,
+              invM: 1.0 / b.mass, iw: worldIinv(R, sim.iinv))
+  # ---- 1. collide at the current pose; the margin grows with the distance moved this substep so slow approaches are caught
+  #      speculatively before they penetrate (no hop from the position correction)
+  let reach0 = (sqrt(b.vel.x * b.vel.x + b.vel.y * b.vel.y + b.vel.z * b.vel.z) + sqrt(dot(b.angVel, b.angVel)) * sim.radius +
+                p.gravity * h) * h * 1.25
+  sim.margin = fmin(0.25, fmax(p.margin, reach0))
+  sim.contacts.setLen(0)
+  for ci in 0 ..< sim.cells.len:
+    let c = sim.cells[ci]
+    let wc = mulMV(R, c.rx, c.ry, c.rz)
+    collideCell(sim, env, ci, R, com.x + wc.x, com.y + wc.y, com.z + wc.z)
+  let rawN = sim.contacts.len
+  # ---- 2. forces
+  rb.vy -= p.gravity * h
+  if p.airDrag or env.hasWind:
+    var wv = Vec3()
+    if env.hasWind: wv = env.wind(tick, com.x, com.y, com.z)
+    var fx = 0.0
+    var fy = 0.0
+    var fz = 0.0
+    var tqx = 0.0
+    var tqy = 0.0
+    var tqz = 0.0
+    for k in 0 ..< 6:
+      if sim.area[k] <= 0.0: continue
+      let nw = mulMV(R, Dirs6X[k], Dirs6Y[k], Dirs6Z[k])
+      let r = mulMV(R, sim.cp[k].x, sim.cp[k].y, sim.cp[k].z)
+      # point velocity in m/s
+      let pvx = (rb.vx + rb.wy * r.z - rb.wz * r.y) * 20.0
+      let pvy = (rb.vy + rb.wz * r.x - rb.wx * r.z) * 20.0
+      let pvz = (rb.vz + rb.wx * r.y - rb.wy * r.x) * 20.0
+      let rvx = wv.x - pvx
+      let rvy = wv.y - pvy
+      let rvz = wv.z - pvz
+      let vn = rvx * nw.x + rvy * nw.y + rvz * nw.z
+      if vn >= 0.0: continue
+      let mag = 0.5 * p.airDensity * p.dragCd * sim.area[k] * vn * vn
+      let ffx = -nw.x * mag
+      let ffy = -nw.y * mag
+      let ffz = -nw.z * mag
+      fx += ffx
+      fy += ffy
+      fz += ffz
+      tqx += r.y * ffz - r.z * ffy
+      tqy += r.z * ffx - r.x * ffz
+      tqz += r.x * ffy - r.y * ffx
+    # dv (blocks/tick) = F/m * 0.0025 * h, limited to the relative velocity of the centre of mass
+    var dvx = fx * rb.invM * 0.0025 * h
+    var dvy = fy * rb.invM * 0.0025 * h
+    var dvz = fz * rb.invM * 0.0025 * h
+    let dvl = sqrt(dvx * dvx + dvy * dvy + dvz * dvz)
+    let rx = wv.x / 20.0 - rb.vx
+    let ry = wv.y / 20.0 - rb.vy
+    let rz = wv.z / 20.0 - rb.vz
+    let rl = sqrt(rx * rx + ry * ry + rz * rz)
+    var lim = 1.0
+    if dvl > rl and dvl > 0.0: lim = rl / dvl
+    rb.vx += dvx * lim
+    rb.vy += dvy * lim
+    rb.vz += dvz * lim
+    let tx = tqx * lim * 0.0025 * h
+    let ty = tqy * lim * 0.0025 * h
+    let tz = tqz * lim * 0.0025 * h
+    rb.wx += rb.iw[0] * tx + rb.iw[1] * ty + rb.iw[2] * tz
+    rb.wy += rb.iw[3] * tx + rb.iw[4] * ty + rb.iw[5] * tz
+    rb.wz += rb.iw[6] * tx + rb.iw[7] * ty + rb.iw[8] * tz
+  let ld = fmax(0.0, 1.0 - p.linDamp * h)
+  let ad = fmax(0.0, 1.0 - (p.angDamp + p.angDampMat * sim.avgDamping) * h)
+  rb.vx *= ld
+  rb.vy *= ld
+  rb.vz *= ld
+  rb.wx *= ad
+  rb.wy *= ad
+  rb.wz *= ad
+  # ---- 3a. approach speeds per cell (impact energy), before reduction
+  if rawN > 0:
+    for i in 0 ..< rawN:
+      let c = sim.contacts[i]
+      if c.pd < 0.0: continue
+      let rx = c.px - com.x
+      let ry = c.py - com.y
+      let rz = c.pz - com.z
+      let vcx = rb.vx + rb.wy * rz - rb.wz * ry
+      let vcy = rb.vy + rb.wz * rx - rb.wx * rz
+      let vcz = rb.vz + rb.wx * ry - rb.wy * rx
+      let ap = -(vcx * c.nx + vcy * c.ny + vcz * c.nz) - p.gravity * h * fmax(0.0, c.ny)
+      let ci = int(c.cell)
+      if ap > sim.cellAp[ci]:
+        if sim.cellAp[ci] == 0.0: sim.touched.add ci
+        sim.cellAp[ci] = ap
+        sim.cellN[ci] = Vec3(x: c.nx, y: c.ny, z: c.nz)
+    var maxAp = 0.0
+    var nTouched = 0
+    for ci in sim.touched:
+      if sim.cellAp[ci] > maxAp: maxAp = sim.cellAp[ci]
+    for ci in sim.touched:
+      if sim.cellAp[ci] >= 0.25 * maxAp: inc nTouched
+    if nTouched > 0:
+      let share = b.mass / float64(nTouched)
+      for ci in sim.touched:
+        if sim.cellAp[ci] >= 0.25 * maxAp:
+          let v = sim.cellAp[ci] * 20.0
+          let e = 0.5 * share * v * v / 1000.0
+          if e > sim.evE[ci]:
+            sim.evE[ci] = e
+            sim.evS[ci] = sim.cellAp[ci]
+            sim.evN[ci] = sim.cellN[ci]
+    for ci in sim.touched: sim.cellAp[ci] = 0.0
+    sim.touched.setLen(0)
+  reduceContacts(sim)
+  # ---- 3b. prepare contacts
+  let nc = sim.contacts.len
+  let restSp = fmax(p.restSpeed, 2.0 * p.gravity * h)
+  for i in 0 ..< nc:
+    var c = sim.contacts[i]
+    c.rx = c.px - com.x
+    c.ry = c.py - com.y
+    c.rz = c.pz - com.z
+    var ux = 0.0
+    var uy = 0.0
+    var uz = 0.0
+    if abs(c.nx) < 0.9:
+      ux = 1.0
+    else:
+      uy = 1.0
+    var t1x = c.ny * uz - c.nz * uy
+    var t1y = c.nz * ux - c.nx * uz
+    var t1z = c.nx * uy - c.ny * ux
+    let l1 = sqrt(t1x * t1x + t1y * t1y + t1z * t1z)
+    t1x = t1x / l1
+    t1y = t1y / l1
+    t1z = t1z / l1
+    c.t1x = t1x
+    c.t1y = t1y
+    c.t1z = t1z
+    c.t2x = c.ny * t1z - c.nz * t1y
+    c.t2y = c.nz * t1x - c.nx * t1z
+    c.t2z = c.nx * t1y - c.ny * t1x
+    c.kn = effMass(rb, c.rx, c.ry, c.rz, c.nx, c.ny, c.nz)
+    c.k1 = effMass(rb, c.rx, c.ry, c.rz, c.t1x, c.t1y, c.t1z)
+    c.k2 = effMass(rb, c.rx, c.ry, c.rz, c.t2x, c.t2y, c.t2z)
+    let vcx = rb.vx + rb.wy * c.rz - rb.wz * c.ry
+    let vcy = rb.vy + rb.wz * c.rx - rb.wx * c.rz
+    let vcz = rb.vz + rb.wx * c.ry - rb.wy * c.rx
+    let vn = vcx * c.nx + vcy * c.ny + vcz * c.nz
+    let ap = -vn
+    c.jn = 0.0
+    c.j1 = 0.0
+    c.j2 = 0.0
+    c.active = true
+    if c.pd >= 0.0:
+      c.target = (if ap > restSp: c.e * ap else: 0.0)
+    else:
+      if ap > restSp:
+        c.active = false
+        c.target = 0.0
+      else:
+        c.target = c.pd / h
+    sim.contacts[i] = c
+  # ---- 3c. iterate
+  for it in 0 ..< p.iterations:
+    for i in 0 ..< nc:
+      let c = sim.contacts[i]
+      if not c.active: continue
+      var jn = c.jn
+      # normal
+      let vcx = rb.vx + rb.wy * c.rz - rb.wz * c.ry
+      let vcy = rb.vy + rb.wz * c.rx - rb.wx * c.rz
+      let vcz = rb.vz + rb.wx * c.ry - rb.wy * c.rx
+      let vn = vcx * c.nx + vcy * c.ny + vcz * c.nz
+      var dj = (c.target - vn) / c.kn
+      let nacc = fmax(0.0, jn + dj)
+      dj = nacc - jn
+      jn = nacc
+      if dj != 0.0: applyImp(rb, c.rx, c.ry, c.rz, c.nx * dj, c.ny * dj, c.nz * dj)
+      # friction
+      var j1 = c.j1
+      var j2 = c.j2
+      let lim = c.mu * jn
+      let wcx = rb.vx + rb.wy * c.rz - rb.wz * c.ry
+      let wcy = rb.vy + rb.wz * c.rx - rb.wx * c.rz
+      let wcz = rb.vz + rb.wx * c.ry - rb.wy * c.rx
+      let vt1 = wcx * c.t1x + wcy * c.t1y + wcz * c.t1z
+      var d1 = -vt1 / c.k1
+      let n1 = fclamp(j1 + d1, -lim, lim)
+      d1 = n1 - j1
+      j1 = n1
+      if d1 != 0.0: applyImp(rb, c.rx, c.ry, c.rz, c.t1x * d1, c.t1y * d1, c.t1z * d1)
+      let xcx = rb.vx + rb.wy * c.rz - rb.wz * c.ry
+      let xcy = rb.vy + rb.wz * c.rx - rb.wx * c.rz
+      let xcz = rb.vz + rb.wx * c.ry - rb.wy * c.rx
+      let vt2 = xcx * c.t2x + xcy * c.t2y + xcz * c.t2z
+      var d2 = -vt2 / c.k2
+      let n2 = fclamp(j2 + d2, -lim, lim)
+      d2 = n2 - j2
+      j2 = n2
+      if d2 != 0.0: applyImp(rb, c.rx, c.ry, c.rz, c.t2x * d2, c.t2y * d2, c.t2z * d2)
+      sim.contacts[i].jn = jn
+      sim.contacts[i].j1 = j1
+      sim.contacts[i].j2 = j2
+  # ---- 4. integrate
+  var sp = sqrt(rb.vx * rb.vx + rb.vy * rb.vy + rb.vz * rb.vz)
+  if sp > p.maxSpeed:
+    let k = p.maxSpeed / sp
+    rb.vx *= k
+    rb.vy *= k
+    rb.vz *= k
+  let aw = sqrt(rb.wx * rb.wx + rb.wy * rb.wy + rb.wz * rb.wz)
+  if aw > p.maxAngSpeed:
+    let k = p.maxAngSpeed / aw
+    rb.wx *= k
+    rb.wy *= k
+    rb.wz *= k
+  var cx = com.x + rb.vx * h
+  var cy = com.y + rb.vy * h
+  var cz = com.z + rb.vz * h
+  # position correction along the normals (translation only)
+  var sx = 0.0
+  var sy = 0.0
+  var sz = 0.0
+  for i in 0 ..< nc:
+    let c = sim.contacts[i]
+    if c.pd <= p.slop: continue
+    let vcx = rb.vx + rb.wy * c.rz - rb.wz * c.ry
+    let vcy = rb.vy + rb.wz * c.rx - rb.wx * c.rz
+    let vcz = rb.vz + rb.wx * c.ry - rb.wy * c.rx
+    let rem = c.pd - (vcx * c.nx + vcy * c.ny + vcz * c.nz) * h - (sx * c.nx + sy * c.ny + sz * c.nz)
+    if rem > p.slop:
+      let corr = fmin(0.15, p.beta * (rem - p.slop))
+      sx += corr * c.nx
+      sy += corr * c.ny
+      sz += corr * c.nz
+  cx += sx
+  cy += sy
+  cz += sz
+  let q = integrateOrient(b.orient, Vec3(x: rb.wx, y: rb.wy, z: rb.wz), h)
+  b.orient = q
+  b.vel = Vec3(x: rb.vx, y: rb.vy, z: rb.vz)
+  b.angVel = Vec3(x: rb.wx, y: rb.wy, z: rb.wz)
+  let cr = rotate(q, b.com)
+  b.pos = Vec3(x: cx - cr.x, y: cy - cr.y, z: cz - cr.z)
+  nc > 0
+
+# ----------------------------------------------------------------------------------------------------------------------
+# public step
+
+proc lastContactList*(sim: Sim): seq[array[8, float64]] =
+  ## Debug: the reduced contacts of the last substep as (px, py, pz, nx, ny, nz, penetration, jn).
+  result = @[]
+  for c in sim.contacts: result.add [c.px, c.py, c.pz, c.nx, c.ny, c.nz, c.pd, c.jn]
+
+proc stepBody*(sim: Sim, env: SimEnv, tick: int): seq[ImpactEvent] =
+  ## Advance the body one tick (2..maxSub substeps). Returns the impact events of this tick (cells whose energy share is
+  ## above params.impactMin), ordered by cell index. A sleeping body is not touched (returns @[]).
+  result = @[]
+  let b = sim.body
+  let p = sim.params
+  if b.mass <= 0.0 or sim.cells.len == 0 or b.sleeping: return
+  let lv = sqrt(dot(b.vel, b.vel))
+  let av = sqrt(dot(b.angVel, b.angVel))
+  let reach = lv + av * sim.radius
+  var n = int(ceil(reach / p.subSpeed))
+  if n < p.minSub: n = p.minSub
+  if n > p.maxSub: n = p.maxSub
+  let h = 1.0 / float64(n)
+  var contact = false
+  for s in 0 ..< n:
+    if substep(sim, env, tick, h): contact = true
+  if contact:
+    let cd = fmax(0.0, 1.0 - p.contactAngDamp)
+    b.angVel = scale(b.angVel, cd)
+  sim.lastContacts = sim.contacts.len
+  if p.allowSleep:
+    if contact:
+      updateSleep(b, p.sleepLin, p.sleepAng, p.sleepTicks)
+    else:
+      b.sleepTicks = 0
+      b.sleeping = false
+    if b.sleeping:
+      b.vel = Vec3()
+      b.angVel = Vec3()
+  recordPose(b, tick)
+  for ci in 0 ..< sim.cells.len:
+    let e = sim.evE[ci]
+    if e > 0.0:
+      sim.evE[ci] = 0.0
+      if e >= p.impactMin:
+        let c = sim.cells[ci]
+        result.add ImpactEvent(cell: Cell(x: c.x, y: c.y, z: c.z, state: c.state), energy: e * c.brittle, rawEnergy: e,
+                               speed: sim.evS[ci], nx: sim.evN[ci].x, ny: sim.evN[ci].y, nz: sim.evN[ci].z)
+
+# ----------------------------------------------------------------------------------------------------------------------
+# settle
+
+proc rotation24*(): seq[Mat3] =
+  ## The 24 proper rotations of the cube, deterministic order: permutation (6) major, sign pattern (8) minor, det = +1 only.
+  result = @[]
+  let perms = [[0, 1, 2], [0, 2, 1], [1, 0, 2], [1, 2, 0], [2, 0, 1], [2, 1, 0]]
+  let parity = [1.0, -1.0, -1.0, 1.0, 1.0, -1.0]
+  for pi in 0 ..< 6:
+    for s in 0 ..< 8:
+      let s0 = (if (s and 1) != 0: -1.0 else: 1.0)
+      let s1 = (if (s and 2) != 0: -1.0 else: 1.0)
+      let s2 = (if (s and 4) != 0: -1.0 else: 1.0)
+      if parity[pi] * s0 * s1 * s2 < 0.0: continue
+      var m: Mat3 = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+      m[0 * 3 + perms[pi][0]] = s0
+      m[1 * 3 + perms[pi][1]] = s1
+      m[2 * 3 + perms[pi][2]] = s2
+      result.add m
+
+proc nearestRotation*(q: Quat): (int, float64) =
+  ## Index into rotation24() of the rotation nearest to q, and the angle between them in radians.
+  let r = quatToMat(q)
+  let rots = rotation24()
+  var best = -1
+  var bestTr = -1e30
+  for i in 0 ..< rots.len:
+    var tr = 0.0
+    for k in 0 ..< 9: tr += rots[i][k] * r[k]
+    if tr > bestTr:
+      bestTr = tr
+      best = i
+  let c = fclamp((bestTr - 1.0) * 0.5, -1.0, 1.0)
+  (best, arccos(c))
+
+proc settle*(sim: Sim, solidAt: SolidFn, angleTol: float64, radius: int, requireSleep: bool): SettleResult =
+  ## Try to put a resting body back as blocks.
+  ##  1. The body must be asleep (unless requireSleep is false) and its orientation within angleTol radians of one of the 24
+  ##     axis-aligned rotations; else ok = false with a reason.
+  ##  2. Snap: rotate to that rotation about the centre of mass (kept in place), then round the origin to the integer grid.
+  ##     Because the snapped rotation is a signed permutation, every cell then lands exactly on a world cell:
+  ##     world cell = floor(pos + R * (x+.5, y+.5, z+.5)).
+  ##  3. If any target cell is solid in the world, search the integer offsets with |d| <= radius for a free spot, nearest
+  ##     first (Manhattan distance), ties: up before down, then lower dx, then lower dz. None free: ok = false, body untouched.
+  ##  4. On success the body is set to the snapped pose, velocities zero, asleep; result.cells lists the world cells (with
+  ##     the source local cell and state) and result.rot the rotation to apply to oriented block states.
+  var res = SettleResult(reason: "")
+  let b = sim.body
+  if requireSleep and not b.sleeping:
+    res.reason = "not asleep"
+    return res
+  if b.mass <= 0.0:
+    res.reason = "empty body"
+    return res
+  let (ri, err) = nearestRotation(b.orient)
+  res.rotIndex = ri
+  res.angleErr = err
+  if err > angleTol:
+    res.reason = "not axis aligned"
+    return res
+  let rots = rotation24()
+  let rot = rots[ri]
+  res.rot = rot
+  let comW = comWorld(b)
+  let rc = mulMV(rot, b.com.x, b.com.y, b.com.z)
+  let px = int(round(comW.x - rc.x))
+  let py = int(round(comW.y - rc.y))
+  let pz = int(round(comW.z - rc.z))
+  let all = cellList(b)
+  # candidate offsets, sorted
+  var ox: seq[int] = @[]
+  var oy: seq[int] = @[]
+  var oz: seq[int] = @[]
+  for l1 in 0 .. 3 * radius:
+    for dy in countdown(radius, -radius):
+      for dx in -radius .. radius:
+        for dz in -radius .. radius:
+          if abs(dx) + abs(dy) + abs(dz) == l1:
+            ox.add dx
+            oy.add dy
+            oz.add dz
+  for k in 0 ..< ox.len:
+    var free = true
+    var placed: seq[PlacedCell] = @[]
+    for c in all:
+      let cc = mulMV(rot, float64(c.x) + 0.5, float64(c.y) + 0.5, float64(c.z) + 0.5)
+      let wx = int(floor(float64(px + ox[k]) + cc.x))
+      let wy = int(floor(float64(py + oy[k]) + cc.y))
+      let wz = int(floor(float64(pz + oz[k]) + cc.z))
+      if solidAt(wx, wy, wz):
+        free = false
+        break
+      placed.add PlacedCell(x: wx, y: wy, z: wz, state: int(c.state), lx: int(c.x), ly: int(c.y), lz: int(c.z))
+    if free:
+      res.ok = true
+      res.dx = ox[k]
+      res.dy = oy[k]
+      res.dz = oz[k]
+      res.pos = vec3(float64(px + ox[k]), float64(py + oy[k]), float64(pz + oz[k]))
+      res.cells = placed
+      b.pos = res.pos
+      b.orient = matToQuat(rot)
+      b.vel = Vec3()
+      b.angVel = Vec3()
+      b.sleeping = true
+      return res
+  res.reason = "no free spot within the search radius"
+  res
+
+# ----------------------------------------------------------------------------------------------------------------------
+# fragile fall
+
+proc shatterOnImpact*(b: Body, events: openArray[ImpactEvent], props: PropsFn, thresholdOf: ThresholdFn, rng: var Rng,
+                      kick: float64): ShatterResult =
+  ## Remove every cell whose impact `energy` (kJ, fracture energy) exceeds thresholdOf(cell state) (materials: breakThreshold),
+  ## then split the rest by connectivity (bodymass.splitBody; pieces inherit the rigid-body velocity of their centre).
+  ## kick > 0 adds a scatter speed (blocks/tick) to each piece when the body split: away from the pieces' mean centre in world
+  ## space, scaled by 0.5 + 0.5 * rng.nextFloat() (the seeded generator is the only randomness).
+  ## Nothing breaks: broken is empty and pieces = @[b]. Every cell breaks: pieces is empty.
+  var broken: seq[Cell] = @[]
+  for e in events:
+    if e.energy > thresholdOf(int(e.cell.state)):
+      var dup = false
+      for c in broken:
+        if c.x == e.cell.x and c.y == e.cell.y and c.z == e.cell.z: dup = true
+      if not dup: broken.add e.cell
+  if broken.len == 0: return ShatterResult(broken: broken, pieces: @[b])
+  discard breakCells(b, broken, props)
+  var pieces: seq[Body] = @[]
+  if b.mass > 0.0 and cellCount(b) > 0:
+    pieces = splitBody(b, props)
+  if kick > 0.0 and pieces.len > 1:
+    var mx = 0.0
+    var my = 0.0
+    var mz = 0.0
+    for pc in pieces:
+      let w = comWorld(pc)
+      mx += w.x
+      my += w.y
+      mz += w.z
+    mx = mx / float64(pieces.len)
+    my = my / float64(pieces.len)
+    mz = mz / float64(pieces.len)
+    for pc in pieces:
+      let w = comWorld(pc)
+      var dx = w.x - mx
+      var dy = w.y - my
+      var dz = w.z - mz
+      let l = sqrt(dx * dx + dy * dy + dz * dz)
+      if l > 1e-9:
+        let k = kick * (0.5 + 0.5 * nextFloat(rng)) / l
+        pc.vel = pc.vel + Vec3(x: dx * k, y: dy * k, z: dz * k)
+  ShatterResult(broken: broken, pieces: pieces)
