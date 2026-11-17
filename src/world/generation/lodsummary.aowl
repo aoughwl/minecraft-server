@@ -1,0 +1,320 @@
+## Distant-terrain summaries for the `jester:lod` channel (src/server/net/jester/lodmsg.aowl has the record and the wire format).
+##
+## Three sources, cheapest data first:
+##   * `summarizeChunk`: a chunk the level holds (generated or read from disk). Exact: the MOTION_BLOCKING top, trees included. Tick
+##     thread only (it reads `ChunkData`).
+##   * `summarizeNoise`: ground nobody generated. The noise stage only - the chunk's corner densities, the aquifer and the per-cell
+##     caches, walked top down at the sample columns and stopped at the first block - with no surface rules, carvers, features or
+##     light. The height is the terrain's before features (trees, lakes, snow layers are not there); the top block of dry land is
+##     guessed from the biome (`landTop`). Pure apart from the generator, which generation already shares read-only between threads,
+##     so the chunk worker pool runs it (`LodJob`, generation_executor's low-priority lane).
+##   * `summarizeFlat`: a superflat level, from its layers.
+##
+## A sample is taken at the corner block of each cell (x, z multiples of 1 shl shift inside the chunk), which with shift >= 2 is a noise
+## cell corner, so no horizontal interpolation is involved.
+
+{.feature: "lenientnils".}
+
+import ../blockstates
+import ../chunkdata
+import ../../generated/biome
+import ../../generated/chunk_gen_settings
+import ../../generated/dimension as dimensiondata
+from ../../data/block_state import asU16
+import ../../util/math/block_box
+import ../../server/net/jester/lodmsg
+import generation
+import positions
+import noise/noise as chunknoise
+import noise/multi_noise_sampler
+import noise/surface_height_sampler
+import generator/generator
+import blender/blender
+
+export lodmsg
+
+type
+  LodJob* = ref object
+    ## One noise summary for a worker: filled in by `runLodJob`, read by the tick thread once the pool hands it back.
+    gen*: VanillaGenerator
+    dim*: int            ## the caller's dimension slot
+    cx*, cz*: int32
+    shift*: int
+    column*: LodColumn
+    micros*: int64
+
+proc stateOf(name: string): uint32 =
+  let (ok, s) = defaultStateByName(name)
+  if ok: s else: 0'u32
+
+let
+  sGrass = stateOf("grass_block")
+  sSand = stateOf("sand")
+  sRedSand = stateOf("red_sand")
+  sGravel = stateOf("gravel")
+  sSnow = stateOf("snow_block")
+  sMycelium = stateOf("mycelium")
+  sPodzol = stateOf("podzol")
+  sMud = stateOf("mud")
+  sStone = stateOf("stone")
+
+proc landTop*(biomeName: string; top: int32): uint32 =
+  ## The block surface rules would most likely put on dry land in this biome (the noise stage itself only knows stone).
+  case biomeName
+  of "desert", "beach", "snowy_beach": sSand
+  of "badlands", "eroded_badlands", "wooded_badlands": sRedSand
+  of "mushroom_fields": sMycelium
+  of "stony_peaks", "stony_shore": sStone
+  of "jagged_peaks", "frozen_peaks", "snowy_slopes", "ice_spikes", "snowy_plains", "snowy_taiga", "grove": sSnow
+  of "old_growth_pine_taiga", "old_growth_spruce_taiga": sPodzol
+  of "mangrove_swamp": sMud
+  of "windswept_gravelly_hills": (if top > 110: sGravel else: sGrass)
+  else: sGrass
+
+proc seaFloor*(biomeName: string): uint32 =
+  ## What lies under water in this biome.
+  case biomeName
+  of "warm_ocean", "lukewarm_ocean", "deep_lukewarm_ocean", "river", "beach", "desert", "snowy_beach": sSand
+  of "mangrove_swamp", "swamp": sMud
+  else: sGravel
+
+proc emptyColumn(cx, cz: int32; shift, source: int; minY: int32): LodColumn =
+  result = LodColumn(cx: cx, cz: cz, shift: shift, source: source, cells: newSeq[LodCell](lodCellCount(shift)))
+  for i in 0 ..< result.cells.len:
+    result.cells[i] = LodCell(top: minY - 1'i32, state: 0'u32, depth: 0'i32, floor: 0'u32, biome: 0'i32)
+
+# ---- a chunk the level holds -----------------------------------------------------------------------------------------------------------
+
+proc topTarget(state: uint32): bool {.inline.} =
+  blocksMovement(state) or isLiquid(state)
+
+proc summarizeChunk*(c: ChunkData; shift: int): LodColumn =
+  ## Exact summary of a held chunk: per sample, the highest block that blocks movement or is a fluid (MOTION_BLOCKING).
+  let minY = c.section.minY
+  let topY = minY + int32(c.section.blockSections.len * 16) - 1'i32
+  result = emptyColumn(c.x, c.z, shift, LodSourceChunk, minY)
+  let side = lodSide(shift)
+  let step = 1 shl shift
+  for sz in 0 ..< side:
+    for sx in 0 ..< side:
+      let lx = sx * step
+      let lz = sz * step
+      var cell = LodCell(top: minY - 1'i32, state: 0'u32, depth: 0'i32, floor: 0'u32, biome: 0'i32)
+      # the heightmap is a hint where to start (its exact convention does not matter: the walk finds the block)
+      var y = topY
+      let hm = getHeightmap(c.heightmap, chmMotionBlocking, int32(lx), int32(lz), minY)
+      if hm >= minY and hm + 2'i32 < topY: y = hm + 2'i32
+      while y >= minY:
+        let (ok, st) = getBlockAbsoluteY(c.section, lx, y, lz)
+        if ok and topTarget(st):
+          cell.top = y
+          cell.state = st
+          if isLiquid(st):
+            var d = 0'i32
+            var yy = y
+            var under = 0'u32
+            while yy >= minY:
+              let (ok2, s2) = getBlockAbsoluteY(c.section, lx, yy, lz)
+              if not ok2: break
+              if isLiquid(s2):
+                inc d
+                dec yy
+              else:
+                under = s2
+                break
+            cell.depth = d
+            cell.floor = under
+          break
+        dec y
+      let at = if cell.top >= minY: cell.top else: minY
+      let (bok, b) = getRoughBiomeAbsoluteY(c.section, lx, at, lz)
+      if bok: cell.biome = int32(b)
+      result.cells[sz * side + sx] = cell
+
+# ---- superflat ---------------------------------------------------------------------------------------------------------------------------
+
+proc summarizeFlat*(layers: seq[FlatLayer]; minY: int32; biomeId: int; cx, cz: int32; shift: int): LodColumn =
+  result = emptyColumn(cx, cz, shift, LodSourceFlat, minY)
+  var y = minY
+  var top = minY - 1'i32
+  var topState = 0'u32
+  var depth = 0'i32
+  var floor = 0'u32
+  for layer in layers:
+    if layer.height <= 0: continue
+    let st = stateOf(layer.block_name)
+    if isAir(st):
+      y += layer.height
+      continue
+    if isLiquid(st) and isLiquid(topState) and top == y - 1'i32:
+      depth += layer.height
+    elif isLiquid(st):
+      floor = topState
+      depth = layer.height
+    else:
+      depth = 0'i32
+    y += layer.height
+    top = y - 1'i32
+    topState = st
+  for i in 0 ..< result.cells.len:
+    result.cells[i] = LodCell(top: top, state: topState, depth: (if isLiquid(topState): depth else: 0'i32),
+      floor: floor, biome: int32(biomeId))
+
+# ---- ground nobody generated: the noise stage -------------------------------------------------------------------------------------------
+
+proc supplierKind(dimension: dimensiondata.Dimension): BiomeSupplierKind =
+  if dimension.minecraftName == dimensiondata.THE_END.minecraftName: BiomeSupplierKind.End
+  elif dimension.minecraftName == dimensiondata.THE_NETHER.minecraftName: BiomeSupplierKind.Nether
+  else: BiomeSupplierKind.Overworld
+
+type SampleCol = object
+  lx, lz: int32       ## block offset inside its noise cell
+  cell: int           ## index into the result
+  phase: int          ## 0 looking for the top, 1 counting fluid, 2 done
+  top: int32
+  state: uint32
+  depth: int32
+  floor: uint32
+
+proc summarizeNoise*(gen: VanillaGenerator; cx, cz: int32; shift: int): LodColumn =
+  ## The noise-stage summary of chunk (cx, cz). See the file comment for what it does and does not see.
+  let settings = gen.settings
+  let shape = settings.shape
+  let minY = int32(shape.minY)
+  result = emptyColumn(cx, cz, shift, LodSourceNoise, minY)
+  let hCount = int32(horizontalCellBlockCount(shape))
+  let vCount = int32(verticalCellBlockCount(shape))
+  let horizontalCells = 16'i32 div hCount
+  let startX = startBlockX(cx)
+  let startZ = startBlockZ(cz)
+  let fluidSampler = newStandardChunkFluidLevelSampler(
+    newFluidLevel(settings.seaLevel, blockIdOf(uint32(asU16(settings.defaultFluid)))),
+    newFluidLevel(-54'i32, LavaBlockId))
+  var noStructures = newSeq[BeardifierStructure](0)
+  var noJunctions = newSeq[BeardifierJunction](0)
+  let noiseGen = newChunkNoiseGenerator(gen.baseRouter.noise, gen.randomConfig, int(horizontalCells), startX, startZ, shape,
+    fluidSampler, settings.aquifersEnabled, false, noStructures, noJunctions, false, default(BlockBox))
+  let horizontalBiomeEnd = biomeFromBlock(horizontalCells * hCount)
+  let estimator = generateSurfaceHeightEstimateSampler(gen.baseRouter.surfaceEstimator,
+    newSurfaceHeightSamplerBuilderOptions(biomeFromBlock(startX), biomeFromBlock(startZ), int(horizontalBiomeEnd),
+      minY, int32(maxY(shape)), int(vCount)))
+  let minimumCellY = int32(chunknoise.minY(noiseGen)) div vCount
+  let cellHeight = int32(chunknoise.height(noiseGen)) div vCount
+  let deltaY = 1.0'f64 / float64(vCount)
+  let deltaXZ = 1.0'f64 / float64(hCount)
+  let startCellX = startX div hCount
+  let startCellZ = startZ div hCount
+  let side = int32(lodSide(shift))
+  let step = 1'i32 shl shift
+  let defaultBlock = gen.defaultBlock
+  var cols = newSeq[SampleCol](0)
+
+  sampleStartDensity(noiseGen)
+  var cellX = 0'i32
+  while cellX < horizontalCells:
+    sampleEndDensity(noiseGen, cellX)
+    let sampleStartX = (startCellX + cellX) * hCount
+    var cellZ = 0'i32
+    while cellZ < horizontalCells:
+      let sampleStartZ = (startCellZ + cellZ) * hCount
+      # the sample columns that fall in this noise cell
+      cols.setLen(0)
+      var sz = 0'i32
+      while sz < side:
+        let bz = sz * step
+        if bz div hCount == cellZ:
+          var sx = 0'i32
+          while sx < side:
+            let bx = sx * step
+            if bx div hCount == cellX:
+              cols.add SampleCol(lx: bx mod hCount, lz: bz mod hCount, cell: int(sz * side + sx), phase: 0,
+                top: minY - 1'i32, state: 0'u32, depth: 0'i32, floor: 0'u32)
+            inc sx
+        inc sz
+      if cols.len > 0:
+        # start the walk a little over the surface estimate (one cell's search, not the whole sky); if the start is already solid
+        # the estimate was too low, and the walk starts again from the top
+        var startCellY = cellHeight - 1'i32
+        let est = estimateHeight(estimator, startX + cellX * hCount, startZ + cellZ * hCount)
+        let guess = (est + 48'i32) div vCount - minimumCellY
+        if guess >= 0'i32 and guess < startCellY: startCellY = guess
+        var restart = true
+        while restart:
+          restart = false
+          var open = cols.len
+          var first = true
+          var cellY = startCellY
+          while cellY >= 0'i32 and open > 0:
+            onSampledCellCorners(noiseGen, cellX, cellY, cellZ)
+            let sampleStartY = (minimumCellY + cellY) * vCount
+            var localY = vCount - 1'i32
+            while localY >= 0'i32 and open > 0:
+              let y = sampleStartY + localY
+              interpolateY(noiseGen, float64(localY) * deltaY)
+              for k in 0 ..< cols.len:
+                if cols[k].phase == 2: continue
+                interpolateX(noiseGen, float64(cols[k].lx) * deltaXZ)
+                interpolateZ(noiseGen, float64(cols[k].lz) * deltaXZ)
+                let sampled = sampleBlockState(noiseGen, gen.randomConfig.oreRandomDeriver, sampleStartX, sampleStartY,
+                  sampleStartZ, cols[k].lx, localY, cols[k].lz, estimator)
+                let st = if sampled.hasState: sampled.state else: defaultBlock
+                if first and startCellY < cellHeight - 1'i32 and not isAir(st):
+                  restart = true
+                  break
+                if cols[k].phase == 0:
+                  if not isAir(st):
+                    cols[k].top = y
+                    cols[k].state = st
+                    if isLiquid(st):
+                      cols[k].phase = 1
+                      cols[k].depth = 1'i32
+                    else:
+                      cols[k].phase = 2
+                      dec open
+                elif cols[k].phase == 1:
+                  if isLiquid(st):
+                    inc cols[k].depth
+                  else:
+                    cols[k].floor = st
+                    cols[k].phase = 2
+                    dec open
+              if restart: break
+              first = false
+              dec localY
+            if restart: break
+            dec cellY
+          if restart:
+            startCellY = cellHeight - 1'i32
+            for k in 0 ..< cols.len:
+              cols[k].phase = 0
+              cols[k].top = minY - 1'i32
+              cols[k].depth = 0'i32
+        for k in 0 ..< cols.len:
+          result.cells[cols[k].cell] = LodCell(top: cols[k].top, state: cols[k].state, depth: cols[k].depth,
+            floor: cols[k].floor, biome: 0'i32)
+      inc cellZ
+    swapBuffers(noiseGen)
+    inc cellX
+
+  # biomes at the surface, and the top block surface rules would most likely put there
+  let multiNoise = generateMultiNoiseSampler(gen.baseRouter.multiNoise,
+    newMultiNoiseSamplerBuilderOptions(biomeFromBlock(startX), biomeFromBlock(startZ), int(biomeFromBlock(16'i32))))
+  let supplier = getBiomeSupplier(emptyBlender(), supplierKind(gen.dimension))
+  for sz in 0'i32 ..< side:
+    for sx in 0'i32 ..< side:
+      let i = int(sz * side + sx)
+      var cell = result.cells[i]
+      let at = if cell.top >= minY: cell.top else: int32(settings.seaLevel)
+      let b = biome(supplier, biomeFromBlock(startX + sx * step), biomeFromBlock(at), biomeFromBlock(startZ + sz * step), multiNoise)
+      if b != nil:
+        cell.biome = int32(b.id)
+        if cell.top >= minY:
+          if cell.depth > 0'i32:
+            if cell.floor == defaultBlock: cell.floor = seaFloor(b.registryId)
+          elif cell.state == defaultBlock:
+            cell.state = landTop(b.registryId, cell.top)
+      result.cells[i] = cell
+
+proc runLodJob*(job: LodJob) =
+  ## What a worker runs for a `LodJob`.
+  job.column = summarizeNoise(job.gen, job.cx, job.cz, job.shift)

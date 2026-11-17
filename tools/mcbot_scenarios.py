@@ -1300,3 +1300,245 @@ def create_live(s):
     s.command('kill @e[type=item]')
     s.command('create clear')
     s.check(speed_ok, '/create speed on the gearbox gave %r instead of 12 rpm (the scan itself said running)' % [l for l in sp if 'scoreboard' not in l])
+
+
+# ---- jester:lod: distant-terrain summaries (overnight/PROTOCOL.md section 10, src/server/net/jester/lodsync.aowl) ----------------------
+
+def _lod_varint(b, at):
+    v, shift = 0, 0
+    while True:
+        x = b[at]
+        at += 1
+        v |= (x & 127) << shift
+        if not x & 128:
+            return v, at
+        shift += 7
+
+
+def _lod_columns(data):
+    """A COLUMNS message -> [(cx, cz, source, [(top, state, depth, floor, biome)])]."""
+    if not data or data[0] != 2:
+        return []
+    shift = data[1]
+    n, at = _lod_varint(data, 2)
+    side = 16 >> shift
+    out = []
+    for _ in range(n):
+        zx, at = _lod_varint(data, at)
+        zz, at = _lod_varint(data, at)
+        cx = (zx >> 1) ^ -(zx & 1)
+        cz = (zz >> 1) ^ -(zz & 1)
+        source = data[at]
+        at += 1
+        cells = []
+        for _ in range(side * side):
+            top = struct.unpack('>h', data[at:at + 2])[0]
+            at += 2
+            state, at = _lod_varint(data, at)
+            depth = data[at]
+            at += 1
+            floor = 0
+            if depth:
+                floor, at = _lod_varint(data, at)
+            biome = data[at]
+            at += 1
+            cells.append((top, state, depth, floor, biome))
+        out.append((cx, cz, source, cells))
+    return out
+
+
+_LOD_NOT_BLOCKING = ('air', 'cave_air', 'void_air', 'short_grass', 'tall_grass', 'fern', 'large_fern', 'dead_bush', 'snow', 'vine',
+                     'dandelion', 'poppy', 'blue_orchid', 'allium', 'azure_bluet', 'red_tulip', 'orange_tulip', 'white_tulip', 'pink_tulip',
+                     'oxeye_daisy', 'cornflower', 'lily_of_the_valley', 'sunflower', 'lilac', 'rose_bush', 'peony', 'sugar_cane',
+                     'sweet_berry_bush', 'brown_mushroom', 'red_mushroom', 'pink_petals', 'wildflowers', 'leaf_litter', 'bush', 'firefly_bush',
+                     'short_dry_grass', 'tall_dry_grass', 'glow_lichen', 'cactus_flower', 'torch', 'pitcher_plant', 'torchflower')
+
+
+def _lod_plain(m, state):
+    name = m.block_name(state) or ''
+    return name[10:] if name.startswith('minecraft:') else name
+
+
+def _lod_motion_top(s, x, z):
+    """(y, state) of the highest block a MOTION_BLOCKING heightmap sees in the bot's copy of the world (plants and snow layers skipped)."""
+    for y in range(319, -65, -1):
+        st = s.w.block(x, y, z)
+        if st is None:
+            return None
+        name = _lod_plain(s.m, st)
+        if name in _LOD_NOT_BLOCKING or name.endswith('_sapling') or name.endswith('_carpet') or 'button' in name or \
+                name.endswith('_wall_torch') or name.endswith('_sign'):
+            continue
+        return y, st
+    return None
+
+
+def _lod_ground(s, x, z):
+    """y of the terrain under trees and plants (what the noise estimate describes): leaves, logs and plants skipped."""
+    for y in range(319, -65, -1):
+        st = s.w.block(x, y, z)
+        if st is None:
+            return None
+        name = _lod_plain(s.m, st)
+        if name in _LOD_NOT_BLOCKING or name.endswith('_leaves') or name.endswith('_log') or name.endswith('_wood') or \
+                name.endswith('_sapling') or name in ('mangrove_roots', 'muddy_mangrove_roots', 'bamboo', 'cactus', 'pumpkin',
+                                                     'melon', 'cocoa', 'bee_nest', 'moss_carpet', 'pale_moss_carpet', 'pale_hanging_moss',
+                                                     'hanging_roots', 'big_dripleaf', 'big_dripleaf_stem', 'small_dripleaf', 'lily_pad',
+                                                     'brown_mushroom_block', 'red_mushroom_block', 'mushroom_stem', 'seagrass',
+                                                     'tall_seagrass', 'kelp', 'kelp_plant', 'sea_pickle'):
+            continue
+        return y, name
+    return None
+
+
+@scenario('lod_summaries')
+def lod_summaries(s):
+    """A client offering `lod` gets jester:lod summaries for every column past its view distance out to the radius it asked for, nearest
+    first; summaries of chunks the server holds match those chunks exactly, and noise summaries match the terrain the server later
+    generates there (within a few blocks: the noise stage has no trees, lakes or carvers)."""
+    import os
+    radius = int(os.environ.get('LOD_TEST_RADIUS', '24'))
+    if 'ranges' not in s.m.BLOCK_TABLE:
+        s.m.load_block_table(s.args.assets)        # block names, for the comparisons
+    s.wait(lambda: s.position() is not None and s.chunks() >= 25, 'the spawn chunks', 90.0)
+    # let the whole view arrive first, so the ring just inside it is held by the server (source 1, compared exactly below)
+    settle = [s.chunks(), time.time()]
+
+    def settled():
+        if s.chunks() != settle[0]:
+            settle[0], settle[1] = s.chunks(), time.time()
+        return time.time() - settle[1] > 5.0
+    s.wait(settled, 'the view distance to finish loading', 120.0)
+    # re-negotiate in play, offering lod (bit 7) on top of the runner's 0x1F
+    n_w = len(s.payloads('jester:welcome'))
+    hello = bytes([1, 1, 1, 5]) + b'0.9.0' + struct.pack('>Q', 0x9F) + bytes([0xB0, 0xEA, 0x01]) + bytes([0, 0, 0, 9])
+    s.send_payload('jester:hello', hello)
+    got = s.wait_payload('jester:welcome', 'the welcome to the play-phase hello', since=n_w)
+    wl = got[0]
+    caps = struct.unpack('>Q', wl[3 + wl[2]:3 + wl[2] + 8])[0]
+    s.check(caps & 0x80, 'the server did not grant lod (granted %#x): MC_LOD_RADIUS=0 or the capability is not advertised' % caps)
+    n_l = len(s.payloads('jester:lod'))
+    s.send_payload('jester:lod', bytes([0x10]) + s.m.varint(radius) + bytes([2, 1]))     # REQUEST radius, 4-block cells, resend
+    s.send_payload('jester:lod', bytes([0x11, 1]))                                         # FLOW go
+    first = s.wait_payload('jester:lod', 'the INIT', 20.0, since=n_l)[0]
+    s.check(first[0] == 1, 'the first jester:lod message is not INIT (%d)' % first[0])
+    dlen = first[2]
+    dim = first[3:3 + dlen].decode()
+    granted, at = _lod_varint(first, 3 + dlen)
+    print('  INIT %s radius %d shift %d' % (dim, granted, first[at]), flush=True)
+    s.check(granted == radius, 'INIT radius %d, asked %d' % (granted, radius))
+    px, pz = int(s.position()[0]) >> 4, int(s.position()[2]) >> 4
+    vd = 8                                           # mcbot's client_information
+    want = set()
+    for dz in range(-radius, radius + 1):
+        for dx in range(-radius, radius + 1):
+            ring = int(math.sqrt(dx * dx + dz * dz))
+            if vd - 1 <= ring <= radius:
+                want.add((px + dx, pz + dz))
+    cols = {}
+    order = []
+    seen_msgs = [n_l]
+
+    def gather():
+        msgs = s.payloads('jester:lod')
+        for data in msgs[seen_msgs[0]:]:
+            for c in _lod_columns(data):
+                if (c[0], c[1]) not in cols:
+                    order.append((c[0], c[1]))
+                cols[(c[0], c[1])] = c
+        seen_msgs[0] = len(msgs)
+        return len(want & set(cols)) >= len(want)
+    t0 = time.time()
+    s.wait(gather, '%d summaries out to radius %d' % (len(want), radius), float(os.environ.get('LOD_TEST_SECONDS', '300')))
+    dt = time.time() - t0
+    rings = [int(math.sqrt((c[0] - px) ** 2 + (c[1] - pz) ** 2)) for c in order]
+    srcs = {}
+    for c in cols.values():
+        srcs[c[2]] = srcs.get(c[2], 0) + 1
+    print('  %d columns in %.1f s (%.0f/s), sources %r, max ring %d' % (len(cols), dt, len(cols) / max(dt, 0.001), srcs, max(rings)), flush=True)
+    s.check(max(rings) <= radius + 1, 'a summary past the radius (ring %d)' % max(rings))
+    s.check(not [k for k in cols if int(math.sqrt((k[0] - px) ** 2 + (k[1] - pz) ** 2)) < vd - 1], 'a summary inside the view distance')
+    half = len(rings) // 2
+    early, late = sum(rings[:half]) / max(half, 1), sum(rings[half:]) / max(len(rings) - half, 1)
+    print('  mean ring of the first half %.1f, second half %.1f' % (early, late), flush=True)
+    s.check(early < late, 'not nearest first: mean ring %.1f then %.1f' % (early, late))
+
+    # 1. summaries of chunks the server holds (source 1) that the bot also holds: exact
+    # (the bot's block-name table does not match every state id of this version, so this check uses no names: the summary's block must
+    # be in the chunk at the summary's y, and everything above it must be air or a state that is never anybody's top - plants, snow)
+    exact = total = 0
+    misses = []
+    tops = set(cell[1] for c in cols.values() if c[2] == 1 for cell in c[3])
+    for (cx, cz), c in cols.items():
+        if c[2] != 1 or (cx, cz) not in s.w.chunks:
+            continue
+        for i, cell in enumerate(c[3]):
+            x, z = cx * 16 + (i % 4) * 4, cz * 16 + (i // 4) * 4
+            total += 1
+            here = s.w.block(x, cell[0], z)
+            above = [s.w.block(x, y, z) for y in range(cell[0] + 1, 320)]
+            clear = all(st == 0 or st not in tops for st in above)
+            if here == cell[1] and clear:
+                exact += 1
+            elif len(misses) < 12:
+                bad = [(cell[0] + 1 + k, st) for k, st in enumerate(above) if st != 0 and st in tops][:2]
+                misses.append('%d,%d summary y=%d state %d, chunk has %r there, blocking above: %r' % (x, z, cell[0], cell[1], here, bad))
+    print('  held-chunk summaries: %d of %d samples exact (top y and state)' % (exact, total), flush=True)
+    for line in misses:
+        print('    differs: ' + line, flush=True)
+    if total:
+        s.check(exact >= 0.95 * total, 'held-chunk summaries: only %d of %d samples match the chunk' % (exact, total))
+
+    # 2. noise summaries against the terrain generated there later: teleport over a few of them
+    picks = []
+    for frac, ang in ((0.45, 30), (0.6, 150), (0.75, 260), (0.9, 330)):
+        r = vd + 2 + frac * (radius - vd - 2)
+        k = (px + int(round(r * math.cos(math.radians(ang)))), pz + int(round(r * math.sin(math.radians(ang)))))
+        if k in cols and cols[k][2] == 0:
+            picks.append(k)
+    if not picks:
+        s.inconclusive('no noise-sourced summaries at the sample points')
+    ground = set(cell[1] for c in cols.values() if c[2] == 0 for cell in c[3]) |         set(cell[3] for c in cols.values() if c[2] == 0 for cell in c[3] if cell[2] > 0)
+    water = set(cell[1] for c in cols.values() if c[2] == 0 for cell in c[3] if cell[2] > 0)
+    for st in range(0, 2000):                       # low state ids: the bot's names are right there
+        if _lod_plain(s.m, st) in ('stone', 'dirt', 'coarse_dirt', 'grass_block', 'podzol', 'sand', 'red_sand', 'gravel', 'sandstone',
+                                   'clay', 'snow_block', 'ice', 'packed_ice', 'mycelium', 'granite', 'diorite', 'andesite', 'water'):
+            ground.add(st)
+    near = within = water_ok = water_n = 0
+    errors = []
+    for (cx, cz) in picks:
+        cells = cols[(cx, cz)][3]
+        top = max(c[0] for c in cells)
+        tx, ty, tz = cx * 16 + 8, top + 4, cz * 16 + 8
+        s.command('tp @s %d %d %d' % (tx, ty, tz))
+        s.wait(lambda: s.position() is not None and abs(s.position()[0] - (tx + 0.5)) < 1.0, 'the teleport to %d %d' % (tx, tz), 30.0)
+        # the server moves the view when the client reports its position
+        s.c.send(s.m.SB_MOVE_POS, struct.pack('>ddd', tx + 0.5, ty, tz + 0.5) + s.m.move_flags(True))
+        s.wait(lambda: (cx, cz) in s.w.chunks and (cx + 1, cz) in s.w.chunks and (cx, cz + 1) in s.w.chunks,
+               'the generated chunk %d,%d' % (cx, cz), 90.0)
+        for i, cell in enumerate(cells):
+            x, z = cx * 16 + (i % 4) * 4, cz * 16 + (i // 4) * 4
+            g = None
+            for y in range(319, -65, -1):
+                st = s.w.block(x, y, z)
+                if st is None:
+                    break
+                if st in ground:
+                    g = (y, 'water' if st in water else 'ground')
+                    break
+            if g is None:
+                continue
+            near += 1
+            d = g[0] - cell[0]
+            errors.append(d)
+            if abs(d) <= 3:
+                within += 1
+            water_n += 1
+            if (cell[2] > 0) == (g[1] == 'water'):
+                water_ok += 1
+    errors.sort()
+    print('  noise summaries vs generated: %d of %d samples within 3 blocks, water agrees %d of %d, error median %d, range %d..%d' %
+          (within, near, water_ok, water_n, errors[len(errors) // 2], errors[0], errors[-1]), flush=True)
+    s.check(near >= 32, 'too few samples compared (%d)' % near)
+    s.check(within >= 0.75 * near, 'noise summaries: only %d of %d samples within 3 blocks of the generated ground' % (within, near))
+    s.check(water_ok >= 0.85 * water_n, 'noise summaries: water agrees for only %d of %d samples' % (water_ok, water_n))
