@@ -180,6 +180,17 @@ def capability_handshake(s):
     s.expect('Jester: wind=false fx=false client=0.9.1', 'the capability report after the second hello')
 
 
+@scenario('script_console')
+def script_console(s):
+    """/script runs a JavaScript snippet on the engine and answers with what it printed; errors come back too; @file runs a file."""
+    s.command('script print("sum=" + (1 + 2) + " online=" + server.onlineCount())')
+    s.expect('sum=3 online=1', 'the snippet output', 30.0)
+    s.command('script throw new Error("boom")')
+    s.expect('error: Error: boom', 'the thrown error', 30.0)
+    s.command('script @snippet.js')
+    s.expect('from the file', 'the output of a snippet file', 30.0)
+
+
 def run(m, c, st, w, biomes, ctx, args):
     wanted = [n for n in (args.scenario or 'all').split(',') if n]
     known = [n for n, _, _ in SCENARIOS]

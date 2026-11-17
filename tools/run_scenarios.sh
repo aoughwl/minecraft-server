@@ -30,6 +30,7 @@ if [ -z "$NO_PLUGINS" ]; then
 fi
 [ -n "$WORLD" ] && cp -r "$WORLD" "$RUN/world"
 cd "$RUN"
+echo 'print("from the file");' > snippet.js
 ( timeout 8 "$EXE" > first.txt 2>&1 || true )
 sed -i '/^\[networking.java\]/,/^\[/ { s/^encryption = true/encryption = false/; s/^online_mode = true/online_mode = false/ }' pumpkin.toml
 sed -i "s/0.0.0.0:25565/0.0.0.0:$PORT/; s/0.0.0.0:25575/0.0.0.0:$RCON/; s/0.0.0.0:19132/0.0.0.0:$BEDROCK/" pumpkin.toml
