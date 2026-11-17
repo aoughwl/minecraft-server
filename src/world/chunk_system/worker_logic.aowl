@@ -10,6 +10,7 @@
 import ../../config/lighting
 import ../chunkdata
 import ../chunkio
+import ../chunkformat
 import ../filemanager
 import ../world
 import ../generation/proto_chunk
@@ -90,39 +91,61 @@ proc needsRelighting(chunk: ChunkData, config: LightingEngineConfig): bool =
       return false
   true
 
-proc ioReadBatch*(host: ScheduleHost, batch: seq[ChunkPos], send: var seq[RecvChunk]) =
-  ## The body of `io_read_work`'s loop. The IO lock waited for writes of these positions to finish; writes here are
-  ## finished before this runs.
+proc ioPlaceChunk(host: ScheduleHost, pos: ChunkPos, chunk: ChunkData, send: var seq[RecvChunk]) =
+  ## What a decoded chunk becomes: a level chunk, or a proto chunk when it is not full or must be relit.
+  if chunk.status == csFull:
+    if needsRelighting(chunk, host.lightingConfig):
+      # Uniform lighting: downgrade to the Features stage for relighting.
+      let proto = fromChunkData(chunk, host.worldGen)
+      let sectionCount = proto.light.skyLight.len
+      for s in 0 ..< sectionCount:
+        proto.light.skyLight[s] = newLightEmpty(15'u8)
+        proto.light.blockLight[s] = newLightEmpty(0'u8)
+      proto.stage = StagedChunkEnum.Features
+      send.add(RecvChunk(kind: RecvChunkKind.IO, pos: pos, io: protoChunk(proto)))
+    else:
+      send.add(RecvChunk(kind: RecvChunkKind.IO, pos: pos, io: levelChunk(chunk)))
+  else:
+    send.add(RecvChunk(kind: RecvChunkKind.IO, pos: pos, io: protoChunk(fromChunkData(chunk, host.worldGen))))
+
+proc ioFetchBatch*(host: ScheduleHost, batch: seq[ChunkPos], send: var seq[RecvChunk], toDecode: var seq[LoadedBytes]) =
+  ## The first half of `io_read_work`'s loop, for the tick thread: the file reads, and the answers that need no decoding (a
+  ## chunk the level still holds, which is newer than the disk; a missing or unreadable one, which starts afresh). What is
+  ## left to decode comes back in `toDecode`, for `ioDecodeBatch`, which may run on a worker: the decoding and the
+  ## conversion to a proto chunk were two fifths of the tick thread's time when loading an existing world.
   var coords = newSeq[(int32, int32)](batch.len)
   for i in 0 ..< batch.len:
     coords[i] = (batch[i].x, batch[i].y)
-  let loaded = fetchChunks(host.chunkSaver, host.levelFolder, coords)
-  for li in 0 ..< loaded.len:
-    let pos = chunkPos(loaded[li].x, loaded[li].z)
+  let raws = fetchRaw(host.chunkSaver, host.levelFolder, coords)
+  for ri in 0 ..< raws.len:
+    let pos = chunkPos(raws[ri].x, raws[ri].z)
     # A chunk the level still has in memory, such as one fetched and kept, is newer than the disk.
     let held = host.publicGet(pos)
     if held != nil:
       send.add(RecvChunk(kind: RecvChunkKind.IO, pos: pos, io: levelChunk(held)))
     else:
-      case loaded[li].kind
+      case raws[ri].kind
       of ldLoaded:
-        let chunk = loaded[li].chunk
-        if chunk.status == csFull:
-          if needsRelighting(chunk, host.lightingConfig):
-            # Uniform lighting: downgrade to the Features stage for relighting.
-            let proto = fromChunkData(chunk, host.worldGen)
-            let sectionCount = proto.light.skyLight.len
-            for s in 0 ..< sectionCount:
-              proto.light.skyLight[s] = newLightEmpty(15'u8)
-              proto.light.blockLight[s] = newLightEmpty(0'u8)
-            proto.stage = StagedChunkEnum.Features
-            send.add(RecvChunk(kind: RecvChunkKind.IO, pos: pos, io: protoChunk(proto)))
-          else:
-            send.add(RecvChunk(kind: RecvChunkKind.IO, pos: pos, io: levelChunk(chunk)))
-        else:
-          send.add(RecvChunk(kind: RecvChunkKind.IO, pos: pos, io: protoChunk(fromChunkData(chunk, host.worldGen))))
+        toDecode.add(raws[ri])
       of ldMissing, ldError:
         send.add(RecvChunk(kind: RecvChunkKind.IO, pos: pos, io: protoChunk(newProtoChunk(pos.x, pos.y, host.worldGen))))
+
+proc ioDecodeBatch*(host: ScheduleHost, raws: seq[LoadedBytes], send: var seq[RecvChunk]) =
+  ## The second half: one result per entry of `raws`, in order. Touches nothing of the level's, so it is safe on a worker.
+  for ri in 0 ..< raws.len:
+    let pos = chunkPos(raws[ri].x, raws[ri].z)
+    let p = internalFromBytes(raws[ri].bytes, raws[ri].x, raws[ri].z)
+    if p.ok:
+      ioPlaceChunk(host, pos, p.chunk, send)
+    else:
+      send.add(RecvChunk(kind: RecvChunkKind.IO, pos: pos, io: protoChunk(newProtoChunk(pos.x, pos.y, host.worldGen))))
+
+proc ioReadBatch*(host: ScheduleHost, batch: seq[ChunkPos], send: var seq[RecvChunk]) =
+  ## The body of `io_read_work`'s loop. The IO lock waited for writes of these positions to finish; writes here are
+  ## finished before this runs.
+  var toDecode = newSeq[LoadedBytes](0)
+  ioFetchBatch(host, batch, send, toDecode)
+  ioDecodeBatch(host, toDecode, send)
 
 proc ioWriteBatch*(host: ScheduleHost, data: seq[(ChunkPos, Chunk)]) =
   ## The body of `io_write_work`'s loop.
