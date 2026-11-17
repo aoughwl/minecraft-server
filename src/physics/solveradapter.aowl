@@ -1,0 +1,261 @@
+## Adapter between the server's real material table (materials.aowl) and the structural solver (solver.aowl).
+## PURE: imports only materials, solver (and std/math). No world, entity or server state: a caller hands over a snapshot of
+## block STATE ids and gets a SolverInput back; wind loads come from a sampler closure (or arrays) the same way.
+##
+## SNAPSHOT: a dense box nx*ny*nz, index = x + nx*(z + nz*y) (the solver's layout, y slowest), ids[i] = global block state id.
+##
+## CLASSIFICATION (per distinct state id, from materialOf):
+##   mcVoid, mcFluid, mcFoliage   -> ignored (empty cell): air, water/lava, grass and flowers carry no load and are not loads.
+##   mcGranular                   -> SolverMaterial.granular (sand, gravel, dirt, clay, snow: the table's class, NOT only sand:
+##                                   the class comes from the mineable/shovel + sand tags, so a floating dirt cell is reported too)
+##   mcRock                       -> terrain flag (cave-in candidates when detached); granular cells are also terrain
+##   everything else (wood, soft, generic, rock) is a plain structural solid.
+##   Indestructible (hardness < 0: bedrock, barrier, ...) -> SolverMaterial.indestructible AND an anchor cell.
+##
+## MASS: kg per cell = density * fill (a slab is half a cube; slab THICKNESS is not modelled by the solver, a half block is a full
+## cell for strength).
+##
+## STRENGTH (the calibration, honest list). The table gives real MPa (stone 60 compressive / 4.8 tensile, oak planks 40 / 40, iron
+## block 120 / 9.6). Real MPa would make every 1 m block bridge carry hundreds of tonnes, so the game scaling is
+##     kgf/m2 = mpaToKgfPerM2(MPa) * strengthScale * classScale(matClass)
+## strengthScale is the one global knob (default 1.0 = real). classScale is the per-class calibration (this is where the
+## "exponents" the design allowed would go; a plain multiplier was enough): rock 1.0 (brittle stone is already weak in tension in
+## the table, 8% of compressive, and the scenes want it near real), wood 0.036 (a plank bridge must NOT be real timber: 28 times
+## weaker in the game than the table), generic/soft/foliage/granular 1.0 (not used by a scene, left at real). Shear strength is not in
+## the table: shear = shearFraction * compressive (0.2), granular shear = 0.03 * compressive.
+## BREAK THRESHOLD: the table's kJ is an impact/blast number, not a static one; by default every cell fails at ratio 1. With
+## breakExponent > 0 the solver threshold becomes clamp((kJ / breakRefKJ)^breakExponent, 0.25, 8) (off by default).
+##
+## ANCHORS: a cell is an anchor when it is indestructible, or when anchorFn(x, y, z) is true (box-local coordinates, the cell is
+## solid). The adapter never decides on its own what is "ground": pass `floorAnchor(ny)` style closures. Documented rule used by
+## the tests and recommended for the server: anchor = the bottom layer of the box (y == 0, the box was cut so that layer is the
+## world floor / undisturbed terrain) plus any cell on the lateral box boundary that is natural terrain (the caller knows). Cells
+## that touch only the world's void are the caller's business: the solver's groundBelow option is NOT used (anchors are explicit).
+##
+## WIND: windLoadFromField (see there) turns a sampler into per-cell lateral ExtLoads.
+
+import std/math
+import materials
+import solver
+
+type
+  AdapterParams* = object
+    strengthScale*: float64    ## the global game scaling, multiplies every strength (default 1.0)
+    rockScale*, woodScale*, genericScale*, softScale*, granularScale*, foliageScale*: float64   ## per-class calibration
+    shearFraction*: float64    ## shear strength as a fraction of compressive
+    breakExponent*: float64    ## 0 = break threshold 1 for everything
+    breakRefKJ*: float64
+    airDensity*: float64       ## kg/m3, for wind drag
+    dragCoeff*: float64        ## Cd of a cube
+    shareWindInLayer*: bool    ## spread the wind force of each 4-connected horizontal cluster over its cells (thick = stiffer)
+
+  AnchorFn* = proc (x, y, z: int): bool {.closure.}
+  WindSampler* = proc (x, y, z: int): (float64, float64) {.closure.}   ## blocks/second toward +x, +z at the cell
+
+proc defaultAdapterParams*(): AdapterParams =
+  AdapterParams(strengthScale: 1.0, rockScale: 1.0, woodScale: 0.036, genericScale: 1.0, softScale: 1.0, granularScale: 1.0,
+                foliageScale: 1.0, shearFraction: 0.2, breakExponent: 0.0, breakRefKJ: 6.5, airDensity: 1.225, dragCoeff: 1.05,
+                shareWindInLayer: true)
+
+proc classScaleOf(p: AdapterParams; c: MatClass): float64 =
+  case c
+  of mcRock: p.rockScale
+  of mcWood: p.woodScale
+  of mcGeneric: p.genericScale
+  of mcSoft: p.softScale
+  of mcGranular: p.granularScale
+  of mcFoliage: p.foliageScale
+  else: 1.0
+
+## Solver-side description of one material (index 0 is reserved for empty).
+proc solverMaterialOf*(m: Material; p: AdapterParams): SolverMaterial =
+  let sc = p.strengthScale * classScaleOf(p, m.matClass)
+  let comp = mpaToKgfPerM2(m.compressive) * sc
+  var shear = p.shearFraction * comp
+  if m.matClass == mcGranular: shear = 0.03 * comp
+  var bt = 1.0
+  if m.indestructible: bt = 1.0e9
+  elif p.breakExponent > 0.0 and m.breakThreshold > 0.0:
+    bt = pow(m.breakThreshold / p.breakRefKJ, p.breakExponent)
+    if bt < 0.25: bt = 0.25
+    if bt > 8.0: bt = 8.0
+  return SolverMaterial(mass: m.density * m.fill, tensile: mpaToKgfPerM2(m.tensile) * sc, compressive: comp, shear: shear,
+                        breakThreshold: bt, friction: 0.5, stiffness: m.stiffness,
+                        granular: m.matClass == mcGranular, terrain: m.matClass == mcRock or m.matClass == mcGranular,
+                        indestructible: m.indestructible)
+
+## Does this class take part in the structure (solid, weighs, blocks wind)?
+proc isStructural*(m: Material): bool =
+  not (m.matClass == mcVoid or m.matClass == mcFluid or m.matClass == mcFoliage)
+
+proc floorAnchor*(x, y, z: int): bool = y == 0
+
+## Build the solver input from a block-state snapshot. `anchorFn` may mark extra anchors (called only for solid cells).
+proc snapshotToSolverInput*(ids: seq[int]; nx, ny, nz: int; p: AdapterParams; anchorFn: AnchorFn): SolverInput =
+  var s = newSolverInput(nx, ny, nz)
+  var known: seq[int] = @[]       # distinct state ids
+  var idx: seq[int] = @[]         # their solver material index, 0 = ignored
+  var lastId = -1
+  var lastIdx = 0
+  let nxz = nx * nz
+  for c in 0 ..< nx * ny * nz:
+    let sid = ids[c]
+    var mi = 0
+    if sid == lastId:
+      mi = lastIdx
+    else:
+      var found = -1
+      for k in 0 ..< known.len:
+        if known[k] == sid:
+          found = k
+          break
+      if found < 0:
+        let m = materialOf(sid)
+        var ix = 0
+        if isStructural(m) and s.materials.len < 60000:
+          s.materials.add solverMaterialOf(m, p)
+          ix = s.materials.len - 1
+        known.add sid
+        idx.add ix
+        found = known.len - 1
+      mi = idx[found]
+      lastId = sid
+      lastIdx = mi
+    if mi == 0: continue
+    s.cells[c] = uint16(mi)
+    var anc = s.materials[mi].indestructible
+    if not anc:
+      let y = c div nxz
+      let r = c - y * nxz
+      let z = r div nx
+      anc = anchorFn(r - z * nx, y, z)
+    s.anchor[c] = anc
+  return s
+
+proc neverAnchor*(x, y, z: int): bool = false
+
+## Solver params that go with the adapter (strengths are already scaled in the materials, so the solver's own scale stays 1).
+proc adapterSolverParams*(): SolverParams = defaultSolverParams()
+
+## Convenience: adapt and solve.
+proc solveSnapshot*(ids: seq[int]; nx, ny, nz: int; p: AdapterParams; anchorFn: AnchorFn; loads: seq[ExtLoad]): SolverResult =
+  var s = snapshotToSolverInput(ids, nx, ny, nz, p, anchorFn)
+  for e in loads: s.loads.add e
+  return solve(s, adapterSolverParams())
+
+# ---------------------------------------------------------------------------------------------------------------------
+# wind
+
+## DRAG FORMULA. For every structural cell with the wind vector w = (wx, wz) (blocks/s = m/s) sampled at the cell:
+##     pressure force per axis   F_x = k * dragArea * wx * |wx|,   F_z = k * dragArea * wz * |wz|     [kgf]
+##     k = 0.5 * airDensity * dragCoeff / 9.80665            (0.5 rho Cd v^2 A in newtons, divided by g to get kgf)
+## i.e. components are independent (the solver adds |fx|+|fz| anyway). dragArea is the table's wind-facing area in faces (1 = a
+## full cube face). Only WINDWARD faces count: the F_x of a cell is zero when the neighbour on the side the wind comes from
+## (x-1 for wx > 0, x+1 for wx < 0) is also structural (same for z); outside the box counts as open. One cell of shelter only: no
+## wake behind a building.
+## SHARING (shareWindInLayer): the solver bends every column on its own and has no section modulus, so a 2x2 pillar would be as
+## fragile as a 1x1. Per layer (y) the 4-connected clusters of structural, non-granular cells get their SIGNED force sums
+## spread equally over their cells: a 2x2 pillar's two exposed cells carry 2q, spread over 4 cells = q/2 each (real bending stress
+## goes with 1/d^2 for depth d, this goes with 1/d: conservative). A 1x1 pillar, a 1-thick wall facing the wind and a plank are
+## unchanged or lighter in the along-wind case. Wind blowing along a long thin wall spreads one cell's force over the whole wall.
+proc windLoadFromField*(ids: seq[int]; nx, ny, nz: int; p: AdapterParams; sampler: WindSampler): seq[ExtLoad] =
+  let total = nx * ny * nz
+  let nxz = nx * nz
+  var res: seq[ExtLoad] = @[]
+  # per-cell structural flag and drag area, cached per state id
+  var known: seq[int] = @[]
+  var kStruct: seq[bool] = @[]
+  var kArea: seq[float64] = @[]
+  var kGran: seq[bool] = @[]
+  var st = newSeq[uint8](total)        # 0 none, 1 structural, 2 granular structural
+  var area = newSeq[float64](total)
+  for c in 0 ..< total:
+    let sid = ids[c]
+    var found = -1
+    for k in 0 ..< known.len:
+      if known[k] == sid:
+        found = k
+        break
+    if found < 0:
+      let m = materialOf(sid)
+      known.add sid
+      kStruct.add isStructural(m)
+      kArea.add m.dragArea
+      kGran.add m.matClass == mcGranular
+      found = known.len - 1
+    if kStruct[found]:
+      st[c] = if kGran[found]: 2'u8 else: 1'u8
+      area[c] = kArea[found]
+  let k0 = 0.5 * p.airDensity * p.dragCoeff / 9.80665
+  var fxs = newSeq[float64](total)
+  var fzs = newSeq[float64](total)
+  for c in 0 ..< total:
+    if st[c] == 0'u8: continue
+    let y = c div nxz
+    let r = c - y * nxz
+    let z = r div nx
+    let x = r - z * nx
+    let (wx, wz) = sampler(x, y, z)
+    if wx != 0.0:
+      let nxc = if wx > 0.0: x - 1 else: x + 1
+      let open = nxc < 0 or nxc >= nx or st[c + (nxc - x)] == 0'u8
+      if open:
+        fxs[c] = k0 * area[c] * wx * abs(wx)
+    if wz != 0.0:
+      let nzc = if wz > 0.0: z - 1 else: z + 1
+      let open = nzc < 0 or nzc >= nz or st[c + (nzc - z) * nx] == 0'u8
+      if open:
+        fzs[c] = k0 * area[c] * wz * abs(wz)
+  if not p.shareWindInLayer:
+    for c in 0 ..< total:
+      if fxs[c] != 0.0 or fzs[c] != 0.0: res.add ExtLoad(cell: c, fx: fxs[c], fy: 0.0, fz: fzs[c])
+    return res
+  var seen = newSeq[bool](total)
+  var stack: seq[int] = @[]
+  var members: seq[int] = @[]
+  for c0 in 0 ..< total:
+    if st[c0] != 1'u8 or seen[c0]: continue
+    let y = c0 div nxz
+    stack.setLen(0)
+    members.setLen(0)
+    stack.add c0
+    seen[c0] = true
+    var sx = 0.0
+    var sz = 0.0
+    while stack.len > 0:
+      let c = stack[stack.len - 1]
+      stack.setLen(stack.len - 1)
+      members.add c
+      sx += fxs[c]
+      sz += fzs[c]
+      let r = c - y * nxz
+      let z = r div nx
+      let x = r - z * nx
+      if x > 0 and st[c - 1] == 1'u8 and not seen[c - 1]:
+        seen[c - 1] = true
+        stack.add c - 1
+      if x + 1 < nx and st[c + 1] == 1'u8 and not seen[c + 1]:
+        seen[c + 1] = true
+        stack.add c + 1
+      if z > 0 and st[c - nx] == 1'u8 and not seen[c - nx]:
+        seen[c - nx] = true
+        stack.add c - nx
+      if z + 1 < nz and st[c + nx] == 1'u8 and not seen[c + nx]:
+        seen[c + nx] = true
+        stack.add c + nx
+    if sx != 0.0 or sz != 0.0:
+      let n = float64(members.len)
+      # members are in DFS order; emit ascending by sorting insertion is not needed for correctness, but keep output
+      # deterministic: the DFS order is deterministic.
+      for c in members: res.add ExtLoad(cell: c, fx: sx / n, fy: 0.0, fz: sz / n)
+  # granular cells keep their own (unshared) load
+  for c in 0 ..< total:
+    if st[c] == 2'u8 and (fxs[c] != 0.0 or fzs[c] != 0.0): res.add ExtLoad(cell: c, fx: fxs[c], fy: 0.0, fz: fzs[c])
+  return res
+
+## Array form: wxs/wzs hold one entry per cell (same layout as the snapshot).
+proc windLoadFromArrays*(ids: seq[int]; nx, ny, nz: int; p: AdapterParams; wxs, wzs: seq[float64]): seq[ExtLoad] =
+  let sampler = proc (x, y, z: int): (float64, float64) {.closure.} =
+    let c = x + nx * (z + nz * y)
+    return (wxs[c], wzs[c])
+  return windLoadFromField(ids, nx, ny, nz, p, sampler)
