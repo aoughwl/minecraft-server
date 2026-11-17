@@ -191,6 +191,34 @@ def script_console(s):
     s.expect('from the file', 'the output of a snippet file', 30.0)
 
 
+@scenario('wind_init')
+def wind_init(s):
+    """A client granted `wind` gets jester:wind INIT after joining: the world seed of its welcome, the default parameters, then TIME_SYNC later."""
+    welcome = s.config_payloads('jester:welcome')
+    s.check(len(welcome) == 1, 'no jester:welcome in the configuration phase')
+    wl = welcome[0]
+    at = 3 + wl[2]
+    caps = struct.unpack('>Q', wl[at:at + 8])[0]
+    s.check(caps & 2, 'wind was not granted (caps %d)' % caps)
+    # the welcome's server_tick varint and world seed
+    i = at + 14
+    while wl[i] & 0x80:
+        i += 1
+    seed = struct.unpack('>q', wl[i + 1:i + 9])[0]
+    got = s.wait_payload('jester:wind', 'the wind INIT after joining', 30.0)
+    init = got[0]
+    s.check(init[0] == 1 and init[1] == 1, 'INIT type/algo %r' % init[:2])
+    s.check(struct.unpack('>q', init[2:10])[0] == seed, 'INIT seed %r is not the welcome seed %d' % (init[2:10], seed))
+    j = 10
+    while init[j] & 0x80:
+        j += 1
+    j += 1
+    floats = struct.unpack('>7f', init[j:j + 28])
+    want = (3.2, 0.0, 0.5, 48.0, 200.0, 0.15, 0.6)
+    s.check(all(abs(a - b) < 1e-5 for a, b in zip(floats, want)), 'INIT parameters %r, wanted %r' % (floats, want))
+    s.check(init[j + 28] == 0 and len(init) == j + 29, 'INIT flags/length: %r' % init[j + 28:])
+
+
 def run(m, c, st, w, biomes, ctx, args):
     wanted = [n for n in (args.scenario or 'all').split(',') if n]
     known = [n for n, _, _ in SCENARIOS]
