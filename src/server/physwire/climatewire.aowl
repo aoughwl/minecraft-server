@@ -1,0 +1,162 @@
+## Server glue of the climate feed (phase 3 item 8): the real server's time of day / date (season), weather and a position feed the
+## climate model (physics/climate.aowl via physics/climatefeed.aowl), and the result goes into
+##   * the server's own wind field (windfield.setWeatherProvider), which bodies, fire and the collapse triggers read, and
+##   * the `jester:wind` stream: the base speed and direction of the parameters windsync sends (an UPDATE when they drift).
+##
+## SETTING `climate_feed` = off | on, DEFAULT OFF (file <world>/aowlmony/climate_feed.txt, env JESTER_CLIMATE_FEED, `/climate on|off`).
+## Off: one string compare every 20 ticks, nothing else changes (the wind stays the plain seeded field).
+## On, every 20 ticks: sample = feedAt(seed, timeOfDay, position, real rain, real thunder) with the position of the first player of
+## the overworld (the spawn when nobody is online); parameters = the pack / default parameters with baseSpeed and baseYaw replaced.
+## `/climate override <vx> <vz>` pins the synoptic wind (blocks/second toward +x / +z) for tests and events; `/climate override off`.
+
+import std/[math, options]
+import ../../physics/[windfield, climate, climatefeed]
+import ../net/jester/[windmsg, windsync]
+import ../serverbase
+import physsettings, physparse
+
+{.feature: "lenientnils".}
+
+const
+  SettingFile = "climate_feed.txt"
+  SettingEnv = "JESTER_CLIMATE_FEED"
+  FeedPeriod = 20'i64
+
+var
+  gActive = false
+  gOverride = false
+  gOvX = 0.0
+  gOvZ = 0.0
+  gBase: WindParams = defaultWindParams()
+  gPublished: WindParams = defaultWindParams()
+  gLast = FeedSample()
+  gLastX = 0.0
+  gLastZ = 0.0
+  gLastTime = 0.0
+  gLastRain = 0.0
+  gLastThunder = 0.0
+  gPublishes = 0
+  gSamples = 0
+
+proc climateFeedOn*(server: Server): bool =
+  server.worlds.len > 0 and settingGet(server.worlds[0], SettingFile, SettingEnv, "off") == "on"
+
+proc samplePlace(world: World; x, z: var float) =
+  x = float(world.levelInfo.spawnX)
+  z = float(world.levelInfo.spawnZ)
+  if world.players.len > 0:
+    x = world.players[0].pos.x
+    z = world.players[0].pos.z
+
+proc applyFeed(server: Server) =
+  let world = server.worlds[0]
+  var x = 0.0
+  var z = 0.0
+  samplePlace(world, x, z)
+  let td = float(world.levelTime.timeOfDay)
+  let rain = float(world.weather.rainLevel)
+  let thunder = float(world.weather.thunderLevel)
+  var f = feedAt(int(int64(world.level.seed)), td, x, 63.0, z, rain, thunder)
+  if gOverride:
+    let k = weatherFactor(rain, thunder)
+    f.synX = gOvX
+    f.synZ = gOvZ
+    f.windX = gOvX * k
+    f.windZ = gOvZ * k
+    f.speed = sqrt(gOvX * gOvX + gOvZ * gOvZ)
+  gLast = f
+  gLastX = x
+  gLastZ = z
+  gLastTime = td
+  gLastRain = rain
+  gLastThunder = thunder
+  inc gSamples
+  # someone else (a pack reload) changed the parameters: that is the new base
+  let cur = jesterWindParams()
+  if windChangedMask(cur, gPublished) != 0 or not gActive:
+    gBase = cur
+  let want = feedWindParams(gBase, f)
+  if not gActive or feedChanged(gPublished, want):
+    setJesterWindParams(want)
+    gPublished = want
+    inc gPublishes
+  # the server's own field: real rain / thunder and the feed wind
+  let ov = gOverride
+  let ovx = gOvX * weatherFactor(rain, thunder)
+  let ovz = gOvZ * weatherFactor(rain, thunder)
+  if ov:
+    setWeatherProvider(proc (ticks: float): WeatherSample {.closure.} =
+      WeatherSample(rain: rain, thunder: thunder, hasWind: true, windX: ovx, windZ: ovz))
+  else:
+    setWeatherProvider(feedProvider(int(int64(world.level.seed)), x, z, rain, thunder, td))
+  gActive = true
+
+proc refreshFeed(server: Server) =
+  if climateFeedOn(server):
+    applyFeed(server)
+  elif gActive:
+    gActive = false
+    clearWeatherProvider()
+    setJesterWindParams(gBase)
+    gPublished = gBase
+
+proc tickClimateFeed*(server: Server; tick: int64) =
+  ## Once per server tick (servermod.tickWorlds); works every FeedPeriod ticks.
+  if tick mod FeedPeriod != 0'i64 or server.worlds.len == 0:
+    return
+  refreshFeed(server)
+
+proc windKm(v: float): string =
+  $(round(v * 10.0) / 10.0)
+
+proc climateExec*(server: Server; world: World; parts: seq[string]): seq[string] =
+  ## `/climate on|off|status|at|override <vx> <vz>|override off`
+  result = @[]
+  let sub = if parts.len > 0: parts[0] else: "status"
+  if sub == "on" or sub == "off":
+    let ok = settingSet(server.worlds[0], SettingFile, sub)
+    result.add("climate_feed is now " & sub & " (" & (if ok: "saved in aowlmony/" & SettingFile else: "the setting file could not be written") & ").")
+    if sub == "on":
+      result.add("The wind field and the jester:wind base speed/direction now follow the climate model (date, real weather, position).")
+    refreshFeed(server)
+  elif sub == "override":
+    if parts.len >= 2 and parts[1] == "off":
+      gOverride = false
+      result.add("climate override cleared")
+    elif parts.len >= 3:
+      var a = 0.0
+      var b = 0.0
+      if parseNumFloat(parts[1], a) and parseNumFloat(parts[2], b):
+        gOvX = a
+        gOvZ = b
+        gOverride = true
+        result.add("climate override: synoptic wind " & windKm(gOvX) & ", " & windKm(gOvZ) & " blocks/s (toward +x, +z)")
+      else:
+        result.add("Usage: /climate override <vx> <vz> | off")
+    else:
+      result.add("Usage: /climate override <vx> <vz> | off")
+    if climateFeedOn(server):
+      applyFeed(server)
+  elif sub == "at" or sub == "status":
+    var x = 0.0
+    var z = 0.0
+    samplePlace(world, x, z)
+    let w0 = server.worlds[0]
+    let td = float(w0.levelTime.timeOfDay)
+    let rain = float(w0.weather.rainLevel)
+    let thunder = float(w0.weather.thunderLevel)
+    var f = feedAt(int(int64(w0.level.seed)), td, x, 63.0, z, rain, thunder)
+    if gOverride:
+      f.synX = gOvX
+      f.synZ = gOvZ
+      f.windX = gOvX * weatherFactor(rain, thunder)
+      f.windZ = gOvZ * weatherFactor(rain, thunder)
+    result.add("climate_feed " & (if climateFeedOn(server): "on" else: "off") & " (" &
+      settingSource(w0, SettingFile, SettingEnv) & ")" & (if gOverride: ", wind override " & windKm(gOvX) & "," & windKm(gOvZ) else: ""))
+    result.add("at " & windKm(x) & ", " & windKm(z) & " on day " & $(int(td / 24000.0)) & " (" & seasonName(f.season) & "): " & windKm(f.temp) &
+      " C, synoptic wind " & windKm(f.synX) & ", " & windKm(f.synZ) & " b/s, real rain " & windKm(rain) & " thunder " & windKm(thunder) &
+      ", wind with the real weather " & windKm(f.windX) & ", " & windKm(f.windZ))
+    result.add("published jester:wind base speed " & windKm(float(gPublished.baseSpeed)) & " b/s yaw " & windKm(float(gPublished.baseYaw)) &
+      " rad (" & $gPublishes & " publishes, " & $gSamples & " samples)")
+  else:
+    result.add("Usage: /climate on|off|status|at|override <vx> <vz>|override off")

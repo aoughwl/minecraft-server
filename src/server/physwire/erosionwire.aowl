@@ -1,0 +1,199 @@
+## Server glue of the erosion model (phase 3 item 14): an OPTIONAL, SEEDED, BUDGETED terrain relaxation job you start by hand. It is
+## never automatic: nothing happens until an operator runs `/erosion run`.
+##
+##   /erosion run [radius] [seed] [wet]   reads the terrain around you (radius 4..48 blocks, default 24; 64 blocks of height, 32 above
+##                                        and 32 below you) and relaxes it: loose soil, sand and gravel slump to their angle of repose
+##                                        (dry dirt about 34 degrees, saturated 18), steep slabs break off as falling bodies. `seed`
+##                                        (default: the world seed) makes the result repeatable; `wet` 0..1 (default: the real rain level)
+##                                        is how saturated the ground is.
+##   /erosion status                      the running job, or the last one: cells moved, bodies, ops, ticks
+##   /erosion cancel                      stops a running job without writing anything
+##
+## The job works on a snapshot of the blocks (the model never touches the world), at most 20000 operations per server tick, and applies
+## the result ONCE at the end through bulkedit (`writeCells`: block log cause "natural", collapse triggers see the cells as changed,
+## clients get one multi-block update per section). A cell the world changed while the job ran is skipped. Volume is conserved: the
+## model moves cells, it never creates or destroys them (slabs that leave as bodies keep their cells in the body). Only one job at a time.
+
+import std/[math, options]
+import ../../data/block_ext
+import ../../physics/[body, bodymass, erosion, materials, solveradapter]
+import ../../util/math/position
+import ../../world/[level, world as worldtraits]
+import ../blocklog/blocklogcore
+import ../serverbase
+import ../world/[bulkedit, worldmod]
+import ../body/[bodyworld, bodymanager]
+import physparse
+
+{.feature: "lenientnils".}
+
+const
+  OpsPerTick = 20000
+  MaxSteps = 40000
+  MinRadius = 4
+  MaxRadius = 48
+  HalfHeight = 32
+
+type
+  Job = ref object
+    world: World
+    ox, oy, oz, nx, ny, nz: int
+    sim: ErosionSim
+    startTick: int64
+    steps: int
+    ops: int64
+    done: bool
+    cancelled: bool
+    applied: bool
+    seed: int
+    wet: float64
+    cellsMoved: int
+    skipped: int
+    bodies: int
+    bodyCells: int
+    maxSlopeBefore: float64
+    maxSlopeAfter: float64
+    note: string
+
+var
+  gJob: Job = nil
+  gLast: Job = nil
+  gJobsRun = 0
+
+proc startJob*(world: World; cx, cy, cz, radius, seed: int; wet: float64; tick: int64; msg: var string): bool =
+  if gJob != nil:
+    msg = "an erosion job is already running (/erosion status, /erosion cancel)"
+    return false
+  let r = max(MinRadius, min(MaxRadius, radius))
+  let nx = 2 * r + 1
+  let nz = nx
+  let ny = 2 * HalfHeight
+  let ox = cx - r
+  let oz = cz - r
+  let oy = cy - HalfHeight
+  for px in [ox, ox + nx - 1]:
+    for pz in [oz, oz + nz - 1]:
+      if not cellLoaded(world, px, pz):
+        msg = "the area around you is not fully loaded"
+        return false
+  var ids = newSeq[int](nx * ny * nz)
+  for y in 0 ..< ny:
+    for z in 0 ..< nz:
+      for x in 0 ..< nx:
+        ids[x + nx * (z + nz * y)] = int(stateIdAt(world, ox + x, oy + y, oz + z))
+  var p = defaultErosionParams()
+  p.originX = float64(ox)
+  p.originY = float64(oy)
+  p.originZ = float64(oz)
+  let sim = newErosionSim(ids, nx, ny, nz, seed, p)
+  let rain = float64(world.weather.rainLevel)
+  sim.setUniformWeather(rain, 0.0, 10.0, wet)
+  let j = Job(world: world, ox: ox, oy: oy, oz: oz, nx: nx, ny: ny, nz: nz, sim: sim, startTick: tick, seed: seed, wet: wet,
+    maxSlopeBefore: maxSpanSlope(sim))
+  gJob = j
+  inc gJobsRun
+  msg = "erosion job started: " & $nx & " x " & $nz & " blocks, seed " & $seed & ", wetness " & $(round(wet * 100.0) / 100.0)
+  true
+
+proc applyJob(j: Job) =
+  let o = drain(j.sim)
+  j.maxSlopeAfter = maxSpanSlope(j.sim)
+  var xs: seq[int32] = @[]
+  var ys: seq[int32] = @[]
+  var zs: seq[int32] = @[]
+  var st: seq[uint32] = @[]
+  for c in o.changes:
+    let wx = j.ox + c.x
+    let wy = j.oy + c.y
+    let wz = j.oz + c.z
+    if int(stateIdAt(j.world, wx, wy, wz)) != c.fromState:
+      inc j.skipped
+      continue
+    xs.add int32(wx)
+    ys.add int32(wy)
+    zs.add int32(wz)
+    st.add uint32(c.toState)
+  if xs.len > 0:
+    let ctx = blockLogPush(CauseNatural, KindBlock, "")
+    var opts = defaultBulkOptions()
+    opts.logChanges = true
+    opts.notifyEdge = true
+    let rep = writeCells(j.world, xs, ys, zs, st, opts)
+    blockLogPop(ctx)
+    if rep.status == esOk:
+      j.cellsMoved = rep.changed
+    else:
+      j.note = "the edit was refused (" & $rep.status & "), nothing was written"
+      j.skipped += xs.len
+  for br in o.bodies:
+    if br.cells.len == 0:
+      continue
+    let b = bodyFromCells(0'u64, 0'u64, br.cells)
+    recomputeMass(b, defaultProps)
+    b.pos = vec3(float64(j.ox + br.ox), float64(j.oy + br.oy), float64(j.oz + br.oz))
+    b.vel = vec3(br.vx, br.vy, br.vz)
+    discard spawnDebrisBody(j.world, b, bodyLastTick())
+    inc j.bodies
+    j.bodyCells += br.cells.len
+  j.applied = true
+
+proc tickErosion*(server: Server) =
+  ## ONE call per server tick (servermod.tickWorlds): a single nil test while no job runs.
+  if gJob == nil:
+    return
+  let j = gJob
+  if j.cancelled:
+    gLast = j
+    gJob = nil
+    return
+  let info = j.sim.step(OpsPerTick)
+  j.ops += int64(info.ops)
+  inc j.steps
+  if info.done or j.steps >= MaxSteps:
+    j.done = true
+    applyJob(j)
+    gLast = j
+    gJob = nil
+
+proc describe(j: Job; state: string): string =
+  state & ": seed " & $j.seed & ", " & $j.nx & " x " & $j.nz & " blocks, " & $j.steps & " ticks, " & $j.ops & " ops, " & $j.cellsMoved &
+    " cells changed, " & $j.bodies & " bodies (" & $j.bodyCells & " cells), " & $j.skipped & " skipped" &
+    (if j.note.len > 0: " (" & j.note & ")" else: "")
+
+proc erosionExec*(server: Server; world: World; parts: seq[string]; px, py, pz: int): seq[string] =
+  ## `/erosion run [radius] [seed] [wet]|status|cancel`
+  result = @[]
+  let sub = if parts.len > 0: parts[0] else: "status"
+  if sub == "run":
+    var radius = 24
+    var seed = int(int64(world.level.seed) and 0x7FFFFFFF'i64)
+    var wet = clamp(float64(world.weather.rainLevel), 0.0, 1.0)
+    var okp = true
+    if parts.len > 1 and not parseNumInt(parts[1], radius): okp = false
+    if parts.len > 2 and not parseNumInt(parts[2], seed): okp = false
+    if parts.len > 3:
+      var wv = 0.0
+      if parseNumFloat(parts[3], wv): wet = clamp(wv, 0.0, 1.0)
+      else: okp = false
+    if not okp:
+      result.add("Usage: /erosion run [radius 4..48] [seed] [wet 0..1]")
+      return
+    var msg = ""
+    discard startJob(world, px, py, pz, radius, seed, wet, int64(server.tickCounter), msg)
+    result.add(msg)
+  elif sub == "cancel":
+    if gJob == nil:
+      result.add("no erosion job is running")
+    else:
+      gJob.cancelled = true
+      result.add("erosion job cancelled, nothing was written")
+  elif sub == "status":
+    if gJob != nil:
+      result.add(describe(gJob, "running"))
+    elif gLast != nil:
+      result.add(describe(gLast, if gLast.cancelled: "cancelled" else: "finished"))
+    else:
+      result.add("no erosion job has run yet. Usage: /erosion run [radius] [seed] [wet]|status|cancel")
+    result.add("jobs started " & $gJobsRun)
+  else:
+    result.add("Usage: /erosion run [radius 4..48] [seed] [wet 0..1]|status|cancel")

@@ -5,6 +5,7 @@
 #   WORLD=<folder>      start from an existing world folder instead of a fresh one
 #   PORT=25590          the Java port (RCON takes PORT+1 and Bedrock PORT+2); never the port of an instance somebody is playing on
 #   SCENARIO_DIR=...    the scratch directory (default ../scenario_run, wiped first)
+#   SCEN_SECONDS=120    how long the bot may run (the phys_* scenarios need 900)
 #   NO_PLUGINS=1        do not install the showcase plugins (their scenarios then report INCONCLUSIVE)
 #
 # Exits non-zero when a scenario FAILs; INCONCLUSIVE scenarios do not fail the run.
@@ -44,7 +45,7 @@ PY
 SERVER_PID=$!
 sleep 12
 set +e
-python "$HERE/tools/mcbot.py" --port "$PORT" --name "$NAME" --seconds 120 --scenario "$SELECT" $PLUGIN_FLAG
+python "$HERE/tools/mcbot.py" --port "$PORT" --name "$NAME" --seconds "${SCEN_SECONDS:-120}" --scenario "$SELECT" $PLUGIN_FLAG
 STATUS=$?
 kill $SERVER_PID > /dev/null 2>&1
 taskkill //PID $SERVER_PID //F > /dev/null 2>&1

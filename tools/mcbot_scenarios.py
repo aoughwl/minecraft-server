@@ -445,6 +445,338 @@ def fluids_finite(s):
     s.command('fill %d %d %d %d %d %d minecraft:air' % (cx - 2, y0, cz - 2, cx + 2, y0 + 6, cz + 2))
 
 
+# ---- physics wiring (src/server/physwire): climate feed, fire spread, explosions, erosion -------------------------------------------
+# These change settings of the scratch world and take minutes, so `all` skips them: name them (--scenario phys_climate,phys_fire,...).
+
+import math
+import re
+
+EXPLICIT_ONLY = set()
+
+
+def explicit(name):
+    EXPLICIT_ONLY.add(name)
+    return name
+
+
+def _idle(s, seconds):
+    """Waits while still answering the server (keep-alives): a plain sleep would get the bot kicked."""
+    end = time.time() + seconds
+    try:
+        s.wait(lambda: time.time() >= end, 'time', seconds + 10.0)
+    except Exception:
+        pass
+
+
+def _ask(s, line, fragment, what, seconds=20.0):
+    """Runs a command and waits for a reply line containing `fragment`; returns every reply line since the command."""
+    n = len(s.w.chat)
+    s.command(line)
+    try:
+        s.expect(fragment, what, seconds, since=n)
+    except Exception:
+        print('  chat since /%s: %r' % (line, s.w.chat[n:]), flush=True)
+        raise
+    return list(s.w.chat[n:])
+
+
+def _num(text, pattern):
+    mm = re.search(pattern, text)
+    return float(mm.group(1)) if mm else None
+
+
+def _wind_updates(s):
+    """The decoded jester:wind UPDATE messages so far: (mask, baseSpeed, baseYaw) (None for a field the message does not carry)."""
+    out = []
+    for d in s.payloads('jester:wind'):
+        if d[0] != 2:
+            continue
+        i = 1
+        while d[i] & 0x80:
+            i += 1
+        i += 1
+        mask = (d[i] << 8) | d[i + 1]
+        i += 2
+        speed = yaw = None
+        if mask & 1:
+            speed = struct.unpack('>f', d[i:i + 4])[0]
+            i += 4
+        if mask & 2:
+            yaw = struct.unpack('>f', d[i:i + 4])[0]
+            i += 4
+        out.append((mask, speed, yaw))
+    return out
+
+
+@scenario(explicit('phys_climate'))
+def phys_climate(s):
+    """Climate feed: with `climate_feed` ON the real date, weather and position drive the wind. Off by default (no UPDATE, status says off);
+    on + an override pushes baseSpeed/baseYaw to a client holding the wind capability; without the override the published base speed equals
+    the climate model's synoptic speed at the player; the season follows /time (half a year later the temperature differs by 10+ C);
+    real thunder raises the resulting wind; off restores the default parameters."""
+    s.wait(lambda: s.position() is not None and s.chunks() >= 9, 'the spawn chunks', 60.0)
+    welcome = s.config_payloads('jester:welcome')
+    if not welcome:
+        s.inconclusive('no jester:welcome: the wind capability was not offered')
+    s.wait_payload('jester:wind', 'the wind INIT after joining', 30.0)
+    s.command('gamemode creative')
+    lines = _ask(s, 'climate status', 'climate_feed', 'the climate status')
+    s.check(any('climate_feed off' in l for l in lines), 'default is off: %r' % lines)
+    _idle(s, 3.0)
+    s.check(not _wind_updates(s), 'with the feed off no UPDATE was sent: %r' % _wind_updates(s))
+    # on, pinned wind toward +x 8 b/s: base speed 8, yaw -pi/2
+    _ask(s, 'climate on', 'climate_feed is now on', 'climate on')
+    _ask(s, 'climate override 8 0', 'climate override: synoptic wind', 'the override')
+    s.wait(lambda: any(sp is not None and abs(sp - 8.0) < 0.01 for _, sp, _ in _wind_updates(s)), 'an UPDATE with baseSpeed 8', 25.0)
+    last = [u for u in _wind_updates(s) if u[1] is not None and abs(u[1] - 8.0) < 0.01][-1]
+    s.check(last[2] is not None and abs(last[2] + math.pi / 2) < 0.01, 'yaw for a +x wind is -pi/2, got %r' % (last,))
+    # pinned toward +z 6 b/s: yaw 0
+    _ask(s, 'climate override 0 6', 'climate override: synoptic wind', 'the second override')
+    s.wait(lambda: any(sp is not None and abs(sp - 6.0) < 0.01 and yw is not None and abs(yw) < 0.01 for _, sp, yw in _wind_updates(s)),
+           'an UPDATE with baseSpeed 6, yaw 0', 25.0)
+    # no override: the climate model's own wind; published speed == synoptic speed printed by status
+    _ask(s, 'climate override off', 'climate override cleared', 'override off')
+    _idle(s, 2.0)
+    lines = _ask(s, 'climate status', 'published jester:wind', 'status')
+    text = ' '.join(lines)
+    sx = _num(text, r'synoptic wind (-?[0-9.]+),')
+    sz = _num(text, r'synoptic wind -?[0-9.]+, (-?[0-9.]+) b/s')
+    pub = _num(text, r'base speed (-?[0-9.]+) b/s')
+    s.check(sx is not None and sz is not None and pub is not None, 'status fields: %r' % text)
+    syn = math.hypot(sx, sz)
+    s.check(abs(pub - min(syn, 20.0)) < 0.25, 'published base speed %.1f equals the synoptic speed %.1f (hysteresis 0.1)' % (pub, syn))
+    temp0 = _num(text, r'\): (-?[0-9.]+) C')
+    season0 = re.search(r'\((spring|summer|autumn|winter)\)', text)
+    s.check(temp0 is not None and season0 is not None, 'temperature and season in the status: %r' % text)
+    # half a year later (24 day year): the season and the temperature change
+    _ask(s, 'time add 288000', 'time', 'time add')
+    _idle(s, 1.5)
+    lines = _ask(s, 'climate at', 'synoptic wind', 'status after the time jump')
+    text2 = ' '.join(lines)
+    temp1 = _num(text2, r'\): (-?[0-9.]+) C')
+    season1 = re.search(r'\((spring|summer|autumn|winter)\)', text2)
+    s.check(temp1 is not None and season1 is not None and season1.group(1) != season0.group(1),
+            'season changed with the date: %s -> %s' % (season0.group(1), season1.group(1) if season1 else None))
+    s.check(abs(temp1 - temp0) >= 10.0, 'temperature moved by %.1f C half a year later (%.1f -> %.1f)' % (abs(temp1 - temp0), temp0, temp1))
+    # real thunder multiplies the wind the server field uses
+    _ask(s, 'time add 288000', 'time', 'time back')
+    _ask(s, 'weather clear', 'clear', 'weather clear')
+    _idle(s, 2.0)
+    l0 = ' '.join(_ask(s, 'climate at', 'with the real weather', 'calm status'))
+    calm = math.hypot(_num(l0, r'real weather (-?[0-9.]+),'), _num(l0, r'real weather -?[0-9.]+, (-?[0-9.]+)'))
+    _ask(s, 'weather thunder', 'thunder', 'weather thunder')
+    big = 0.0
+    for _ in range(40):
+        _idle(s, 1.5)
+        l1 = ' '.join(_ask(s, 'climate at', 'with the real weather', 'storm status'))
+        big = math.hypot(_num(l1, r'real weather (-?[0-9.]+),'), _num(l1, r'real weather -?[0-9.]+, (-?[0-9.]+)'))
+        if calm > 0.05 and big > calm * 1.15:
+            break
+    s.check(calm > 0.05 and big > calm * 1.15, 'real thunder raised the wind with the real weather: calm %.2f, storm %.2f' % (calm, big))
+    _ask(s, 'weather clear', 'clear', 'weather clear again')
+    # off restores the defaults
+    n = len(_wind_updates(s))
+    _ask(s, 'climate off', 'climate_feed is now off', 'climate off')
+    s.wait(lambda: any(sp is not None and abs(sp - 3.2) < 0.01 for _, sp, _ in _wind_updates(s)[n:]), 'an UPDATE back to the default 3.2 b/s', 25.0)
+
+
+def _plank_row_state(s, bx, y, bz, n):
+    return [s.block(bx + i, y, bz) for i in range(n)]
+
+
+@scenario(explicit('phys_fire'))
+def phys_fire(s):
+    """Fire spread by material, wind and rain, behind `physics_fire` (default off). Off: /fire ignite refuses. On with a pinned +x wind of
+    10 b/s: a 17 plank row lit in the middle burns downwind (+x) far faster than upwind, the burnt cells are real air on the client AND counted
+    by the model (`/fire status` burnt out > 0, fire ticks adopted > 0). In rain the same row burns far less."""
+    s.wait(lambda: s.position() is not None and s.chunks() >= 9, 'the spawn chunks', 60.0)
+    s.command('gamemode creative')
+    px, pz = int(s.position()[0] // 1), int(s.position()[2] // 1)
+    y0 = 200
+    bx = px + 2
+    ids = _state_ids(s, bx, y0 + 12, pz + 2, ['oak_planks'])
+    planks = ids['oak_planks']
+    lines = _ask(s, 'fire status', 'physics_fire', 'fire status')
+    s.check(any('physics_fire off' in l for l in lines), 'default is off: %r' % lines)
+    _ask(s, 'fire ignite %d %d %d' % (bx + 8, y0, pz + 2), 'physics_fire is off', 'ignite while off')
+    _ask(s, 'fire on', 'physics_fire is now on', 'fire on')
+    _ask(s, 'climate on', 'climate_feed is now on', 'climate on')
+    _ask(s, 'climate override 10 0', 'climate override: synoptic wind', 'wind +x')
+    _ask(s, 'weather clear', 'clear', 'weather clear')
+
+    def run_row(z, seconds, label):
+        s.command('fill %d %d %d %d %d %d minecraft:air' % (bx - 4, y0 - 2, z - 3, bx + 22, y0 + 6, z + 3))
+        s.command('fill %d %d %d %d %d %d minecraft:oak_planks' % (bx, y0, z, bx + 16, y0, z))
+        s.wait(lambda: all(b == planks for b in _plank_row_state(s, bx, y0, z, 17)), 'the plank row ' + label, 40.0)
+        _ask(s, 'fire ignite %d %d %d' % (bx + 8, y0, z), 'Ignited', 'ignite ' + label)
+        t0 = time.time()
+        while time.time() - t0 < seconds:
+            _idle(s, 2.0)
+            row = _plank_row_state(s, bx, y0, z, 17)
+            if row.count(planks) == 0:
+                break
+            if row[9:].count(planks) == 0 and row[:8].count(planks) == 8 and row[8] != planks:
+                break
+        row = _plank_row_state(s, bx, y0, z, 17)
+        up = sum(1 for b in row[:8] if b != planks)
+        down = sum(1 for b in row[9:] if b != planks)
+        print('  %s: planks upwind gone %d/8, downwind gone %d/8, centre %s after %.0fs' % (label, up, down, 'gone' if row[8] != planks else 'stands',
+                                                                                         time.time() - t0), flush=True)
+        return up, down, row[8] != planks
+
+    up, down, mid = run_row(pz + 2, 80.0, 'dry, wind +x')
+    st = ' '.join(_ask(s, 'fire status', 'world changed under the model', 'fire status after the dry row'))
+    burnt = _num(st, r'burnt out ([0-9]+)')
+    adopted = _num(st, r'adopted ([0-9]+)')
+    s.check(burnt is not None and burnt >= 3, 'the model burnt cells out (burnt out %s)' % burnt)
+    s.check(adopted is not None and adopted >= 1, 'vanilla fire ticks were handed to the model (adopted %s)' % adopted)
+    s.check(down >= 5, 'the fire went downwind: %d of 8 downwind planks gone' % down)
+    s.check(down >= up + 3, 'wind carries the fire: downwind gone %d, upwind gone %d' % (down, up))
+    # rain: the same row 60 blocks away puts itself out
+    _ask(s, 'weather rain', 'rain', 'weather rain')
+    _idle(s, 25.0)
+    up2, down2, mid2 = run_row(pz + 62, 80.0, 'rain, wind +x')
+    gone_dry = up + down + (1 if mid else 0)
+    gone_rain = up2 + down2 + (1 if mid2 else 0)
+    s.check(gone_rain + 6 <= gone_dry, 'rain limits the fire: %d planks gone in the rain vs %d dry' % (gone_rain, gone_dry))
+    _ask(s, 'weather clear', 'clear', 'weather clear')
+    _ask(s, 'climate off', 'climate_feed is now off', 'climate off')
+    _ask(s, 'fire off', 'physics_fire is now off', 'fire off')
+
+
+def _count_cells(s, box, state):
+    x0, y0, z0, x1, y1, z1 = box
+    return sum(1 for y in range(y0, y1 + 1) for z in range(z0, z1 + 1) for x in range(x0, x1 + 1) if s.block(x, y, z) == state)
+
+
+@scenario(explicit('phys_blast'))
+def phys_blast(s):
+    """Explosions through the blast model. Default (`physics_triggers` off): /explode is the vanilla blast, the model counts no blast. With
+    `/body triggers full`: the same blast goes through blast.aowl (`/body triggers status` counts blasts), makes a crater of real air on
+    the client and spawns debris bodies (`/body status` created > 0), and soft dirt loses far more than stone for the same power."""
+    s.wait(lambda: s.position() is not None and s.chunks() >= 9, 'the spawn chunks', 60.0)
+    s.command('gamemode creative')
+    px, pz = int(s.position()[0] // 1), int(s.position()[2] // 1)
+    gy = int(s.position()[1] // 1) - 1          # the block under the bot's feet: the cubes stand IN the ground so a collapse check keeps them
+    ids = _state_ids(s, px + 2, gy + 14, pz + 2, ['stone', 'dirt'])
+    stone, dirt = ids['stone'], ids['dirt']
+
+    def cube(x, z, name, state, label):
+        s.command('fill %d %d %d %d %d %d minecraft:air' % (x - 1, gy + 1, z - 1, x + 9, gy + 12, z + 9))
+        s.command('fill %d %d %d %d %d %d minecraft:%s' % (x, gy - 4, z, x + 8, gy + 4, z + 8, name))
+        box = (x, gy - 4, z, x + 8, gy + 4, z + 8)
+        try:
+            s.wait(lambda: _count_cells(s, box, state) == 729, 'the %s cube' % label, 40.0)
+        except Exception:
+            print('  cube %s: %d of 729, a sample column %r' % (label, _count_cells(s, box, state), [s.block(x + 4, yy, z + 4) for yy in range(gy - 4, gy + 5)]), flush=True)
+            raise
+        return box
+
+    def blast(box, state, label):
+        x, y, z = box[0], box[1], box[2]
+        before = _count_cells(s, box, state)
+        s.command('explode %d %d %d 4' % (x + 4, y + 8, z + 4))
+        s.wait(lambda: _count_cells(s, box, state) < before, 'the %s crater to reach the client' % label, 30.0)
+        _idle(s, 4.0)
+        return before - _count_cells(s, box, state)
+
+    try:
+        lines = ' '.join(_ask(s, 'body triggers status', 'blasts', 'trigger status'))
+        s.check('physics_triggers' in lines and ': off' in lines, 'default is off: %r' % lines)
+        b0 = _num(lines, r'blasts ([0-9]+)')
+        # every cube is built while the triggers are off (a built dirt tower would be collapse checked and could fall on its own)
+        sbox0 = cube(px + 3, pz + 3, 'stone', stone, 'stone')
+        sbox = cube(px + 3, pz - 13, 'stone', stone, 'stone')
+        dbox = cube(px - 13, pz + 3, 'dirt', dirt, 'dirt')
+        vanilla = blast(sbox0, stone, 'stone')
+        lines = ' '.join(_ask(s, 'body triggers status', 'blasts', 'trigger status after the vanilla blast'))
+        s.check(_num(lines, r'blasts ([0-9]+)') == b0, 'off: the blast model was not used (%r)' % lines)
+        s.check(vanilla > 0, 'off: the vanilla blast still made a crater (%d stone cells)' % vanilla)
+        _ask(s, 'body triggers full', 'now full', 'triggers full')
+        crater_stone = blast(sbox, stone, 'stone')
+        crater_dirt = blast(dbox, dirt, 'dirt')
+        lines = ' '.join(_ask(s, 'body triggers status', 'blasts', 'trigger status after the model blasts'))
+        nb = _num(lines, r'blasts ([0-9]+)')
+        debris = _num(lines, r'debris bodies ([0-9]+)')
+        print('  craters: vanilla stone %d, model stone %d, model dirt %d; %s' % (vanilla, crater_stone, crater_dirt, lines), flush=True)
+        s.check(nb is not None and b0 is not None and nb >= b0 + 2, 'full: both blasts went through the blast model (blasts %s)' % nb)
+        s.check(crater_stone > 0 and crater_dirt > 0, 'full: craters appeared on the client (%d stone, %d dirt)' % (crater_stone, crater_dirt))
+        s.check(crater_dirt > crater_stone, 'the model: dirt loses more than stone for the same power (%d vs %d cells)' % (crater_dirt, crater_stone))
+        s.check(debris is not None and debris >= 1, 'full: the blast spawned debris bodies (%s)' % debris)
+        st = ' '.join(_ask(s, 'body status', 'created', 'body status'))
+        s.check((_num(st, r'created ([0-9]+)') or 0) >= 1, 'bodies were created: %r' % st)
+    finally:
+        s.command('body triggers off')
+        _idle(s, 1.0)
+
+
+@scenario(explicit('phys_erosion'))
+def phys_erosion(s):
+    """The erosion job: nothing happens until `/erosion run`; a 45 degree dirt ramp (steeper than dirt can lie) slumps to a gentler slope with
+    the number of dirt blocks unchanged (volume conserved) and blocks that really moved on the client; a second run on the settled shape
+    changes nothing; a stone ramp does not move."""
+    s.wait(lambda: s.position() is not None and s.chunks() >= 9, 'the spawn chunks', 60.0)
+    s.command('gamemode creative')
+    px, pz = int(s.position()[0] // 1), int(s.position()[2] // 1)
+    y0 = 200
+    bx, bz = px + 2, pz + 2
+    ids = _state_ids(s, bx, y0 + 20, bz, ['dirt', 'stone'])
+    dirt, stone = ids['dirt'], ids['stone']
+    _ask(s, 'erosion status', 'no erosion job', 'status before any job')
+
+    N = 6           # a 45 degree dirt ramp: column i is i + 1 blocks high, 4 wide, on a stone platform wide enough to catch the slump
+
+    def build():
+        s.command('fill %d %d %d %d %d %d minecraft:air' % (bx - 9, y0 - 1, bz - 11, bx + 21, y0 + 20, bz + 11))
+        s.command('fill %d %d %d %d %d %d minecraft:stone' % (bx - 8, y0, bz - 10, bx + 20, y0, bz + 10))
+        for i in range(N):
+            s.command('fill %d %d %d %d %d %d minecraft:dirt' % (bx + i, y0 + 1, bz, bx + i, y0 + 1 + i, bz + 3))
+        box = (bx - 8, y0 + 1, bz - 10, bx + 20, y0 + 14, bz + 10)
+        s.wait(lambda: _count_cells(s, box, dirt) == sum((i + 1) * 4 for i in range(N)), 'the dirt ramp', 60.0)
+        return box
+
+    def tops():
+        return [max([y for y in range(y0 + 1, y0 + 14) if s.block(bx + i, y, bz + 1) == dirt] or [0]) for i in range(N)]
+
+    def run_job(args, what):
+        _ask(s, 'erosion run ' + args, 'erosion job started', what)
+        st = ''
+        for _ in range(60):
+            _idle(s, 1.0)
+            st = ' '.join(_ask(s, 'erosion status', 'jobs started', what + ' status'))
+            if 'finished' in st:
+                break
+        return st
+
+    box = build()
+    total = _count_cells(s, box, dirt)
+    top_before = tops()
+    s.command('tp @s %d %d %d' % (bx + 3, y0 + 10, bz + 2))
+    s.wait(lambda: s.position() is not None and abs(s.position()[1] - (y0 + 10)) < 6, 'the teleport', 20.0)
+    _idle(s, 1.0)
+    s.check(_count_cells(s, box, dirt) == total and tops() == top_before, 'nothing erodes by itself')
+    st = run_job('20 7 0', 'the job')
+    print('  job: %s' % st, flush=True)
+    s.check('finished' in st, 'the job finished: %r' % st)
+    changed = _num(st, r'([0-9]+) cells changed')
+    s.check(changed is not None and changed > 0, 'the job changed cells (%s)' % changed)
+    s.wait(lambda: tops() != top_before, 'the changes to reach the client', 20.0)
+    s.wait(lambda: _count_cells(s, box, dirt) == total, 'the dirt count to settle at the old total %d (volume conserved)' % total, 30.0)
+    after = tops()
+    print('  ramp top before %r' % top_before, flush=True)
+    print('  ramp top after  %r' % after, flush=True)
+    s.check(after[N - 1] < top_before[N - 1], 'the high end of the ramp lost height on the client (%d -> %d)' % (top_before[N - 1], after[N - 1]))
+    steep_before = max(top_before[i + 3] - top_before[i] for i in range(N - 3))
+    steep_after = max(after[i + 3] - after[i] for i in range(N - 3))
+    s.check(steep_after < steep_before, 'the steepest 3 column rise fell from %d to %d' % (steep_before, steep_after))
+    st2 = run_job('20 7 0', 'the second job')
+    s.check(_num(st2, r'([0-9]+) cells changed') == 0, 'a settled slope is stable: %r' % st2)
+    s.command('fill %d %d %d %d %d %d minecraft:stone replace minecraft:dirt' % (bx - 8, y0 + 1, bz - 10, bx + 20, y0 + 14, bz + 10))
+    s.wait(lambda: _count_cells(s, box, dirt) == 0, 'the ramp to turn to stone', 40.0)
+    st3 = run_job('20 7 0', 'the stone job')
+    s.check(_num(st3, r'([0-9]+) cells changed') == 0, 'stone stays: %r' % st3)
+
+
 def run(m, c, st, w, biomes, ctx, args):
     wanted = [n for n in (args.scenario or 'all').split(',') if n]
     known = [n for n, _, _ in SCENARIOS]
@@ -454,7 +786,7 @@ def run(m, c, st, w, biomes, ctx, args):
     s = Scn(m, c, st, w, biomes, ctx, args)
     results = []
     for name, needs, fn in SCENARIOS:
-        if 'all' not in wanted and name not in wanted:
+        if ('all' not in wanted or name in EXPLICIT_ONLY) and name not in wanted:
             continue
         t0 = time.time()
         try:

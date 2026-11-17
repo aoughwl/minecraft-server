@@ -1,0 +1,79 @@
+## climatefeed: the pure half of "the real server's weather, time of day and season feed the climate model and the wind field"
+## (phase 3 item 8). No world, player or network state: every proc is a function of its arguments, so the server glue
+## (src/server/body/climatewire.aowl) and the tests share the same code.
+##
+## INPUTS the glue reads from the real server: the world seed, the cumulative time of day counter (world.levelTime.timeOfDay,
+## 24000 per day: it carries the DAY NUMBER, so `/time set`, `/time add` and sleeping move the date and so the season), the
+## real rain and thunder levels (world.weather), and a position (the first player, else the world spawn).
+##
+## WHAT IT PRODUCES
+##   feedAt          the climate at that place and date: temperature, season, the synoptic wind (the pressure-gradient wind of
+##                   climate.aowl WITHOUT its own precipitation gust factor), and the wind that results when the REAL weather
+##                   supplies the gust factor (1 + 0.5 rain + 0.4 thunder, the same factor climate.aowl uses for its own storms).
+##   feedWindParams  the jester:wind parameters the clients should use: baseSpeed = synoptic speed, baseYaw = the direction it blows
+##                   TOWARD (0 = +Z, pi/2 = -X, PROTOCOL.md 4.1); everything else (turbulence, scales, gains, flags) is kept from
+##                   `base` (the pack / default parameters). The client applies its own weatherGain to the real weather.
+##   feedProvider    a windfield WeatherProvider: real rain and thunder plus the feed wind, so windAtWorld (bodies, fire, triggers)
+##                   follows the same wind the clients are told.
+##   feedChanged     hysteresis: the glue only republishes the parameters when the speed moved by >= 0.1 b/s or the direction by
+##                   >= 0.03 rad, so the slow drift does not make a stream of UPDATE messages.
+
+import std/math
+import windfield
+import climate
+import "../server/net/jester/windmsg"
+
+const
+  FeedMaxSpeed* = 20.0            ## the clients never get a base speed above this (b/s)
+  FeedMinDelta* = 0.1
+  FeedYawDelta* = 0.03
+
+type
+  FeedSample* = object
+    temp*: float                  ## degrees C at the sample altitude
+    season*: int                  ## 0 spring .. 3 winter
+    synX*, synZ*: float           ## synoptic wind, blocks/second toward +x / +z (no precipitation factor)
+    windX*, windZ*: float         ## synoptic wind times the real-weather gust factor
+    speed*: float                 ## |syn|
+    climRain*, climThunder*: float   ## what the climate model alone would rain (for /climate status)
+
+proc weatherFactor*(rain, thunder: float): float =
+  1.0 + 0.5 * windClamp(rain, 0.0, 1.0) + 0.4 * windClamp(thunder, 0.0, 1.0)
+
+proc feedAt*(seed: int; ticks, x, y, z, realRain, realThunder: float): FeedSample =
+  let c = climateAt(seed, ticks, x, y, z)
+  let wf = 1.0 + 0.5 * c.rain + 0.4 * c.thunder      # climate.aowl folded its own precipitation into windX/windZ
+  let sx = c.windX / wf
+  let sz = c.windZ / wf
+  let k = weatherFactor(realRain, realThunder)
+  FeedSample(temp: c.temp, season: seasonOf(ticks), synX: sx, synZ: sz, windX: sx * k, windZ: sz * k,
+             speed: sqrt(sx * sx + sz * sz), climRain: c.rain, climThunder: c.thunder)
+
+proc windYaw*(vx, vz: float): float =
+  ## The wire's yaw of a wind blowing TOWARD (vx, vz): 0 = +Z, pi/2 = -X.
+  arctan2(-vx, vz)
+
+proc feedWindParams*(base: WindParams; f: FeedSample): WindParams =
+  result = base
+  var sp = f.speed
+  if sp > FeedMaxSpeed: sp = FeedMaxSpeed
+  result.baseSpeed = float32(sp)
+  if f.speed > 0.0001:
+    result.baseYaw = float32(windYaw(f.synX, f.synZ))
+
+proc feedProvider*(seed: int; x, z, realRain, realThunder: float; timeOfDay: float): WeatherProvider =
+  ## The feed is dated by the time of day counter captured here (the glue rebuilds the provider as the clock moves); the sea level
+  ## climate is sampled at 63.
+  let rr = realRain
+  let rt = realThunder
+  let td = timeOfDay
+  result = proc (ticks: float): WeatherSample {.closure.} =
+    let f = feedAt(seed, td, x, 63.0, z, rr, rt)
+    WeatherSample(rain: rr, thunder: rt, hasWind: true, windX: f.windX, windZ: f.windZ)
+
+proc feedChanged*(a, b: WindParams): bool =
+  let ds = a.baseSpeed - b.baseSpeed
+  var dy = a.baseYaw - b.baseYaw
+  while dy > 3.14159265'f32: dy -= 6.2831853'f32
+  while dy < -3.14159265'f32: dy += 6.2831853'f32
+  (if ds < 0'f32: -ds else: ds) >= float32(FeedMinDelta) or (if dy < 0'f32: -dy else: dy) >= float32(FeedYawDelta)

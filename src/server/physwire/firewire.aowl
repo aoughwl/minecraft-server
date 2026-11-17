@@ -1,0 +1,372 @@
+## Server glue of the fire model (phase 3 item 12): the vanilla fire block hands its spreading to physics/fire.aowl, which spreads
+## fire by MATERIAL (flammability, ignitability, mass), WIND (the server's wind field, which the climate feed drives) and RAIN, and the
+## results become real block changes: burnt-out fuel is written through bulkedit (so the block log, the collapse triggers and the
+## clients see them as one edit), visual fire blocks follow the burning cells.
+##
+## SETTING `physics_fire` = off | on, DEFAULT OFF (file <world>/aowlmony/physics_fire.txt, env JESTER_PHYSICS_FIRE, `/fire on|off`).
+## Off: `gFirePhysOn` is false, the vanilla fire block behaves exactly as before and nothing here runs.
+## On: a vanilla fire block that took its fire tick (it survived the vanilla rain / fuel checks, which stay) skips the vanilla spreading
+## and instead hands the fuel next to it to a FireSim of its region:
+##   * region: a box of 41 x 40 x 41 blocks around the first fire block, read once from the world (at most 4 per dimension; a fire
+##     outside every region and over the limit keeps spreading the vanilla way);
+##   * each fire tick of the vanilla block ignites the fuel cells (material flammability > 0 and ignitability > 0) of its 6 neighbours;
+##   * every game tick the sim advances (<= 256 cells per tick): fuel cells burn for a time proportional to their mass, ignite
+##     neighbours by material and wind (windfield.windAtWorld, blocks/s), throw embers downwind in a gale, and go out in the rain
+##     (wet = real rain level on sky exposed cells, 1 next to water);
+##   * a cell that burns out becomes air (and the fire block beside it goes); a newly burning cell gets a fire block in a free
+##     neighbouring cell so the fire shows; embers and smoke are not shown.
+## A region is dropped 200 ticks after its last fire went out. The model works on its snapshot: a cell the world changed since (a
+## player broke it) is skipped, not overwritten. `removedCells` of the model are not needed: every real block change goes through the
+## collapse trigger hook, so with `/body triggers structures` a burnt support dirties its structure like any other change.
+
+import std/[math, options, tables]
+import ../../data/block_ext
+from ../../data/block_state import newBlockStateIdUnchecked, asU16
+import ../../physics/[fire, materials, windfield, solveradapter]
+import ../../util/math/position
+import ../../world/[level, world as worldtraits]
+import ../blocklog/blocklogcore
+import ../serverbase
+import ../world/[bulkedit, worldmod]
+import ../body/[bodyworld, bodymanager]
+import firehook, physsettings, physparse
+
+{.feature: "lenientnils".}
+
+const
+  SettingFile = "physics_fire.txt"
+  SettingEnv = "JESTER_PHYSICS_FIRE"
+  BoxXZ = 41
+  BoxY = 40
+  BelowFire = 12
+  MaxZones = 4
+  StepBudget = 256
+  IdleDrop = 200
+  Margin = 5
+  ReshowEvery = 60
+
+type
+  Zone = ref object
+    dim: string
+    world: World
+    ox, oy, oz: int
+    sim: FireSim
+    top: seq[int]            ## per column: highest non-air local y
+    rain: float64
+    tick: int64
+    idleSince: int64
+    burning: seq[int]        ## cells that burn (visual bookkeeping)
+    visual: Table[int, int]  ## burning cell -> cell index of the fire block we placed for it
+
+var
+  gZones: seq[Zone] = @[]
+  gInstalled = false
+  gFireId = -1
+  gKnown = -1
+  gStats = (zones: 0, adopted: 0, ignited: 0, burnt: 0, extinguished: 0, mismatches: 0, visualPlaced: 0, editsFailed: 0, vanillaFallbacks: 0)
+
+proc fireBlockId(): int =
+  if gFireId < 0:
+    let b = Block.fromName("fire")
+    gFireId = if b == nil: -2 else: int(b.id)
+  gFireId
+
+proc isFireState(sid: int): bool =
+  if sid == 0 or fireBlockId() < 0:
+    return false
+  let b = Block.fromStateId(newBlockStateIdUnchecked(uint16(sid)))
+  b != nil and int(b.id) == fireBlockId()
+
+proc fireStateId(): uint32 =
+  let b = Block.fromName("fire")
+  if b == nil: 0'u32 else: uint32(asU16(b.defaultState.id))
+
+proc matOfState(state: int): FireMat =
+  let m = materialOf(state)
+  makeFireMat(m.flammability, m.ignitability, m.density, m.fill, state == 0 or m.matClass == mcVoid, isStructural(m))
+
+proc burntOf(state: int): int = 0
+
+proc wetAtZone(z: Zone; x, y, zz: int): float64 =
+  var wet = 0.0
+  if z.rain > 0.05 and x >= 0 and zz >= 0 and x < BoxXZ and zz < BoxXZ and y >= z.top[x + BoxXZ * zz]:
+    wet = z.rain * 0.9
+  # next to water: out
+  let s = z.sim
+  for d in 0 ..< 6:
+    var nx = x
+    var ny = y
+    var nz = zz
+    case d
+    of 0: nx -= 1
+    of 1: nx += 1
+    of 2: nz -= 1
+    of 3: nz += 1
+    of 4: ny -= 1
+    else: ny += 1
+    if inBox(s, nx, ny, nz):
+      let st = stateAt(s, nx, ny, nz)
+      if st != 0 and materialOf(st).matClass == mcFluid:
+        return 1.0
+  wet
+
+proc newZone(world: World; fx, fy, fz: int): Zone =
+  let ox = fx - BoxXZ div 2
+  let oz = fz - BoxXZ div 2
+  let oy = max(-60, fy - BelowFire)
+  var states = newSeq[int](BoxXZ * BoxXZ * BoxY)
+  var top = newSeq[int](BoxXZ * BoxXZ)
+  for c in 0 ..< top.len: top[c] = -1
+  for y in 0 ..< BoxY:
+    for z in 0 ..< BoxXZ:
+      for x in 0 ..< BoxXZ:
+        let sid = int(stateIdAt(world, ox + x, oy + y, oz + z))
+        states[x + BoxXZ * (z + BoxXZ * y)] = sid
+        if sid != 0:
+          top[x + BoxXZ * z] = y
+  let zone = Zone(dim: world.dimension.minecraftName, world: world, ox: ox, oy: oy, oz: oz, top: top, rain: 0.0, tick: 0, idleSince: 0,
+    burning: @[], visual: initTable[int, int]())
+  let zref = zone
+  let cb = FireCallbacks(matOf: matOfState, burntState: burntOf,
+    wetAt: proc (x, y, z: int): float64 {.closure.} = wetAtZone(zref, x, y, z),
+    windAt: proc (x, y, z: int): (float64, float64) {.closure.} =
+      let v = windAtWorld(float64(zref.tick), float64(zref.ox + x) + 0.5, float64(zref.oy + y) + 0.5, float64(zref.oz + z) + 0.5)
+      (v.x, v.z))
+  let seed = uint64(int64(world.level.seed)) xor (uint64(gStats.zones + 1) * 0x9E3779B97F4A7C15'u64) xor uint64(fx * 73856093 + fz * 19349663)
+  zone.sim = newFireSim(BoxXZ, BoxY, BoxXZ, states, cb, seed)
+  inc gStats.zones
+  zone
+
+proc zoneFor(dim: string; world: World; x, y, z: int): Zone =
+  for zn in gZones:
+    if zn.dim == dim and x >= zn.ox + Margin and x < zn.ox + BoxXZ - Margin and z >= zn.oz + Margin and z < zn.oz + BoxXZ - Margin and
+        y >= zn.oy + 1 and y < zn.oy + BoxY - 2:
+      return zn
+  nil
+
+proc fireSpreadImpl(dim: string; x, y, z: int32; age: int): bool {.nimcall.} =
+  let ww = worldByDim(dim)
+  if ww.isNone:
+    return false
+  let world = ww.get
+  var zn = zoneFor(dim, world, int(x), int(y), int(z))
+  if zn == nil:
+    var inDim = 0
+    for q in gZones:
+      if q.dim == dim: inc inDim
+    if inDim >= MaxZones:
+      inc gStats.vanillaFallbacks
+      return false
+    for cx in [int(x) - BoxXZ div 2, int(x) + BoxXZ div 2]:
+      for cz in [int(z) - BoxXZ div 2, int(z) + BoxXZ div 2]:
+        if not cellLoaded(world, cx, cz):
+          inc gStats.vanillaFallbacks
+          return false
+    zn = newZone(world, int(x), int(y), int(z))
+    gZones.add(zn)
+  let lx = int(x) - zn.ox
+  let ly = int(y) - zn.oy
+  let lz = int(z) - zn.oz
+  inc gStats.adopted
+  var n = 0
+  for d in 0 ..< 6:
+    var tx = lx
+    var ty = ly
+    var tz = lz
+    case d
+    of 0: tx -= 1
+    of 1: tx += 1
+    of 2: tz -= 1
+    of 3: tz += 1
+    of 4: ty -= 1
+    else: ty += 1
+    if ignite(zn.sim, tx, ty, tz): inc n
+  true
+
+# ----------------------------------------------------------------------------------------------------------------------
+# applying the model's events to the world
+
+proc worldState(z: Zone; x, y, zz: int): int =
+  int(stateIdAt(z.world, z.ox + x, z.oy + y, z.oz + zz))
+
+proc showFire(z: Zone; x, y, zz, cell: int) =
+  ## A fire block in a free neighbouring cell of the burning cell (up first, then the sides, then down).
+  let fs = fireStateId()
+  if fs == 0'u32:
+    return
+  let offs = [(0, 1, 0), (1, 0, 0), (-1, 0, 0), (0, 0, 1), (0, 0, -1), (0, -1, 0)]
+  for o in offs:
+    let tx = x + o[0]
+    let ty = y + o[1]
+    let tz = zz + o[2]
+    if not inBox(z.sim, tx, ty, tz):
+      continue
+    if worldState(z, tx, ty, tz) == 0 and stateAt(z.sim, tx, ty, tz) == 0:
+      let pos = newBlockPos(int32(z.ox + tx), int32(z.oy + ty), int32(z.oz + tz))
+      discard z.world.setBlockState(pos, fs, BfNotifyAll)
+      z.visual[cell] = cellIndex(z.sim, tx, ty, tz)
+      inc gStats.visualPlaced
+      return
+
+proc hideFire(z: Zone; cell: int) =
+  if not z.visual.hasKey(cell):
+    return
+  let fc = z.visual.getOrDefault(cell, -1)
+  z.visual.del(cell)
+  if fc < 0:
+    return
+  let x = fc mod BoxXZ
+  let r = fc div BoxXZ
+  let zz = r mod BoxXZ
+  let y = r div BoxXZ
+  # keep it when another burning cell still uses it
+  for k, v in z.visual:
+    if v == fc:
+      return
+  if isFireState(worldState(z, x, y, zz)):
+    discard z.world.setBlockState(newBlockPos(int32(z.ox + x), int32(z.oy + y), int32(z.oz + zz)), 0'u32, BfNotifyAll)
+
+proc dropBurning(z: Zone; cell: int) =
+  for i in 0 ..< z.burning.len:
+    if z.burning[i] == cell:
+      let last = z.burning[z.burning.len - 1]
+      z.burning[i] = last
+      z.burning.setLen(z.burning.len - 1)
+      return
+
+proc applyEvents(z: Zone) =
+  let evs = takeEvents(z.sim)
+  if evs.len == 0:
+    discard takeRemoved(z.sim)
+    return
+  var xs: seq[int32] = @[]
+  var ys: seq[int32] = @[]
+  var zs: seq[int32] = @[]
+  var st: seq[uint32] = @[]
+  var burntCells: seq[int] = @[]
+  for ev in evs:
+    let cell = cellIndex(z.sim, ev.x, ev.y, ev.z)
+    case ev.kind
+    of feIgnite:
+      inc gStats.ignited
+      z.burning.add cell
+      showFire(z, ev.x, ev.y, ev.z, cell)
+    of feExtinguish:
+      inc gStats.extinguished
+      hideFire(z, cell)
+      dropBurning(z, cell)
+    of feBurnt:
+      dropBurning(z, cell)
+      hideFire(z, cell)
+      # only when the world still has what the model burnt (a player may have broken it)
+      let cur = worldState(z, ev.x, ev.y, ev.z)
+      if cur == 0 or isFireState(cur):
+        inc gStats.mismatches
+      else:
+        xs.add int32(z.ox + ev.x)
+        ys.add int32(z.oy + ev.y)
+        zs.add int32(z.oz + ev.z)
+        st.add uint32(stateAt(z.sim, ev.x, ev.y, ev.z))
+        burntCells.add cell
+    else:
+      discard
+  discard takeRemoved(z.sim)
+  if xs.len > 0:
+    let ctx = blockLogPush(CauseFire, KindBlock, "fire")
+    var opts = defaultBulkOptions()
+    opts.notifyEdge = true
+    opts.logChanges = true
+    let rep = writeCells(z.world, xs, ys, zs, st, opts)
+    blockLogPop(ctx)
+    if rep.status == esOk:
+      gStats.burnt += rep.changed
+    else:
+      inc gStats.editsFailed
+
+proc refreshModes(server: Server) =
+  gKnown = server.worlds.len
+  var any = false
+  for w in server.worlds:
+    if settingGet(w, SettingFile, SettingEnv, "off") == "on":
+      any = true
+  gFirePhysOn = any
+
+proc firePhysicsOn*(world: World): bool =
+  settingGet(world, SettingFile, SettingEnv, "off") == "on"
+
+proc tickFirePhysics*(server: Server) =
+  ## ONE call per server tick (servermod.tickWorlds). With the setting off and no region alive this is two tests.
+  if not gInstalled or server.worlds.len != gKnown:
+    gInstalled = true
+    gFireSpread = fireSpreadImpl
+    refreshModes(server)
+  if gZones.len == 0:
+    return
+  let tick = int64(server.tickCounter)
+  var i = 0
+  while i < gZones.len:
+    let z = gZones[i]
+    z.tick = tick
+    z.rain = float64(z.world.weather.rainLevel)
+    if anyBurning(z.sim):
+      z.idleSince = tick
+      discard step(z.sim, StepBudget)
+      applyEvents(z)
+      if tick mod int64(ReshowEvery) == 0'i64:
+        var shown = 0
+        for cell in z.burning:
+          if not z.visual.hasKey(cell) and shown < 16:
+            let x = cell mod BoxXZ
+            let r = cell div BoxXZ
+            showFire(z, x, r div BoxXZ, r mod BoxXZ, cell)
+            inc shown
+    else:
+      discard takeEvents(z.sim)
+      if tick - z.idleSince > int64(IdleDrop):
+        gZones.delete(i)
+        continue
+    inc i
+
+proc fireExec*(server: Server; world: World; parts: seq[string]; ox, oy, oz: int): seq[string] =
+  ## `/fire on|off|status|ignite [x y z]`
+  result = @[]
+  let sub = if parts.len > 0: parts[0] else: "status"
+  if sub == "on" or sub == "off":
+    let ok = settingSet(world, SettingFile, sub)
+    refreshModes(server)
+    result.add("physics_fire is now " & sub & " for this world (" & (if ok: "saved in aowlmony/" & SettingFile else: "the setting file could not be written") & ").")
+    if sub == "on":
+      result.add("Fire spreads by material, wind and rain; burnt-out blocks become air. Bases can burn down faster or slower than vanilla.")
+  elif sub == "ignite":
+    var x = ox
+    var y = oy
+    var z = oz
+    if parts.len >= 4:
+      if not (parseNumInt(parts[1], x) and parseNumInt(parts[2], y) and parseNumInt(parts[3], z)):
+        result.add("Usage: /fire ignite <x> <y> <z>")
+        return
+    if not firePhysicsOn(world):
+      result.add("physics_fire is off: /fire on first")
+      return
+    if not cellLoaded(world, x, z):
+      result.add("That position is not loaded")
+      return
+    var zn = zoneFor(world.dimension.minecraftName, world, x, y, z)
+    if zn == nil:
+      zn = newZone(world, x, y, z)
+      gZones.add(zn)
+    if ignite(zn.sim, x - zn.ox, y - zn.oy, z - zn.oz):
+      result.add("Ignited the block at " & $x & " " & $y & " " & $z)
+    else:
+      result.add("The block at " & $x & " " & $y & " " & $z & " is not fuel (or already burning)")
+  elif sub == "status":
+    result.add("physics_fire " & (if firePhysicsOn(world): "on" else: "off") & " (" & settingSource(world, SettingFile, SettingEnv) & ")")
+    var burning = 0
+    for z in gZones: burning += z.sim.burning
+    result.add("regions " & $gZones.len & " (made " & $gStats.zones & "), burning cells " & $burning & ", fire ticks adopted " & $gStats.adopted &
+      ", ignited " & $gStats.ignited & ", burnt out " & $gStats.burnt & ", put out " & $gStats.extinguished & ", fire blocks shown " &
+      $gStats.visualPlaced)
+    result.add("world changed under the model " & $gStats.mismatches & ", failed edits " & $gStats.editsFailed & ", vanilla fallbacks " &
+      $gStats.vanillaFallbacks)
+  else:
+    result.add("Usage: /fire on|off|status|ignite [x y z]")

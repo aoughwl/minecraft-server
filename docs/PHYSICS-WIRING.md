@@ -1,0 +1,61 @@
+# Physics wiring: climate, fire, explosions, erosion
+
+The pure models in `src/physics` (climate, fire, blast, erosion, windfield) are connected to the real server by the glue in
+`src/server/physwire` (and, for explosions, `src/server/body/trigger.aowl`). Every feature is **off by default**, opt-in per world,
+and costs one bool/string test per tick while off. Commands need op level 4.
+
+| Feature | Setting (file in `<world>/aowlmony/`) | Env default | Command |
+|---|---|---|---|
+| Climate feed | `climate_feed.txt` = off / on | `JESTER_CLIMATE_FEED` | `/climate on\|off\|status\|at\|override <vx> <vz>\|override off` |
+| Fire spread | `physics_fire.txt` = off / on | `JESTER_PHYSICS_FIRE` | `/fire on\|off\|status\|ignite [x y z]` |
+| Explosions | `physics_triggers.txt` = off / structures / full | `JESTER_PHYSICS_TRIGGERS` | `/body triggers off\|structures\|full\|status`, `/explode [x y z] [power]` |
+| Erosion | none: a job you start | none | `/erosion run [radius] [seed] [wet]\|status\|cancel` |
+
+A setting file wins over the environment variable; the environment variable is the default for worlds with no file.
+
+## Climate feed (phase 3 item 8)
+
+With `climate_feed = on`, every 20 ticks the server samples `climate.aowl` at the first player of the overworld (the spawn when nobody is
+online), dated by the world's time-of-day counter (so `/time set`, `/time add` and sleeping move the date and so the **season**), and with the
+**real** rain and thunder levels (`world.weather`):
+
+* the server's own wind field (`windfield.setWeatherProvider`) gets real rain/thunder plus the climate wind, so bodies, fire and the collapse
+  triggers see the same wind;
+* the `jester:wind` stream gets `baseSpeed` (the synoptic pressure-gradient wind, at most 20 b/s) and `baseYaw` (the direction it blows toward,
+  0 = +Z, pi/2 = -X) as an UPDATE whenever they move by 0.1 b/s or 0.03 rad; every other parameter stays what the packs / defaults say.
+
+`/climate override <vx> <vz>` pins the synoptic wind (blocks/second toward +x/+z) for tests and events. `off` restores the base parameters.
+Pure code and tests: `src/physics/climatefeed.aowl`, `climatefeedtest.aowl`.
+
+## Fire spread (phase 3 item 12)
+
+With `physics_fire = on` a vanilla fire block that took its fire tick skips vanilla spreading and hands the fuel next to it to a `FireSim` of its
+region (a 41 x 40 x 41 box, up to 4 per dimension; fires outside every region over the limit stay vanilla). The model spreads by material
+(`materials.aowl` flammability, ignitability, mass), wind (`windAtWorld`), rain (real rain level on sky exposed cells) and water. Burnt out
+fuel becomes air through `bulkedit.writeCells` (block log cause fire, collapse trigger hook, one client update per section); a fire block is shown
+next to burning cells. Vanilla's own rain/fuel survival checks of the fire block remain. `removedCells` need no special path: with
+`/body triggers structures` a burnt support is an ordinary block change that dirties its structure.
+
+Limits: burnt state is always air; TNT is not primed by the model; embers and smoke are not displayed; a region is a snapshot (a cell the world
+changed meanwhile is skipped); fire does not spread across a region edge.
+
+## Explosions (phase 3 item 13)
+
+Every explosion (TNT, creeper, end crystal, bed, wind charge, minecart, `/explode`) goes through `explosion.explodeBlocks`. With
+`/body triggers full` the cells that go come from `blast.runBlast` (vanilla's rays with an energy criterion by material), survivors are cracked
+for the following collapse check, heavy fragments become small bodies instead of item drops, nearby bodies get impulses, and the removed cells
+dirty the area so the remainder is structurally checked. Drops, particles, sounds and entity damage stay vanilla. Over the 1.5M ops/tick budget
+a blast falls back to the vanilla result. `/explode` is new.
+
+## Erosion (phase 3 item 14)
+
+`/erosion run [radius] [seed] [wet]` reads the terrain within `radius` (4..48) blocks and 32 blocks above/below the sender, relaxes it with
+`erosion.aowl` at 20000 ops per tick (landslides to the angle of repose, slabs that break off become falling bodies), and writes the result
+once through `writeCells` (block log cause natural). Seeded (default: the world seed), wetness defaults to the real rain level, volume is conserved,
+one job at a time, nothing automatic. `/erosion status` shows cells changed, bodies and skipped cells. A moved cell counts twice in `cells changed` (taken from one column, put on another); slumped soil can leave the job box over an unsupported edge, so catch it with a platform.
+
+## Tests
+
+* pure: `climatefeedtest` (20 checks); the model tests `climatetest`, `firetest`, `blasttest`, `erosiontest`, `sh src/physics/run_scenes.sh`.
+* live (a headless server and `tools/mcbot.py`): `SCEN_SECONDS=900 sh tools/run_scenarios.sh <server exe> phys_climate,phys_fire,phys_blast,phys_erosion`
+  (these four are skipped by `all`).
