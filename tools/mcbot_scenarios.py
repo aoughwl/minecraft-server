@@ -167,10 +167,12 @@ def capability_handshake(s):
     s.check(wl[0] == 1 and wl[1] == 1, 'welcome format/proto %r' % wl[:2])
     at = 3 + wl[2]
     caps = struct.unpack('>Q', wl[at:at + 8])[0]
-    s.check(caps == 2, 'granted caps %d, wanted wind (2): the plugin advertises only wind' % caps)
+    # Offered by the server mods: physics2 (1), wind (2), body stream (4), fx (16) = 23. The showcase plugin adds wind; the body/fx/physics2 bits come from
+    # bodysync.aowl. modsync (8), materials (32) and cui (64, WorldEdit) were not granted in this run (measured: 23).
+    s.check(caps == 23, 'granted caps %d, wanted physics2+wind+bodystream+fx (23)' % caps)
     s.check(wl[at + 10:at + 14] == bytes([0x12, 0x34, 0x56, 0x78]), 'the nonce was not echoed')
     s.command('caps')
-    s.expect('Jester: wind=true fx=false client=0.9.0', 'the capability report')
+    s.expect('Jester: wind=true fx=true client=0.9.0', 'the capability report')
     # a hello offering nothing in play: granted caps become 0
     hello = bytes([1, 1, 1, 5]) + b'0.9.1' + struct.pack('>Q', 0) + bytes([0xB0, 0xEA, 0x01]) + bytes([0, 0, 0, 7])
     s.send_payload('jester:hello', hello)
