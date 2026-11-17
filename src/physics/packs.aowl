@@ -1,0 +1,793 @@
+## Data-driven content packs (phase 3 item 19): a folder or a .zip with a `pack.json` and JSON data files that override and add
+## material properties, climate and wind parameters, and simple custom commands. Full format and worked example: docs/PACKS.md.
+##
+## PURE: no server, world or network state. This file reads packs from disk, validates them with error messages that name the
+## pack, the file and the JSON path, and applies them to the process-wide tables (materials.aowl, climate.aowl, windfield.aowl).
+## The server glue (src/server/packscmd.aowl) only registers `/packs` and the pack commands and forwards `packWindParams()`.
+##
+## LAYOUT   <root>/<anything>/pack.json   (a folder pack)   or   <root>/<anything>.zip with pack.json at the zip root
+##   pack.json    {"format":1, "id":"stone_pack", "name":"..", "version":"1.0.0", "description":"..", "priority":0,
+##                 "depends":["other_id"]}            id: [a-z0-9_]{1,40}; format must be 1; the rest is optional
+##   materials.json  the materials.aowl override document ({"tags":{..},"blocks":{..}})
+##   climate.json    {"yearDays":24, "field":{..shelter and draft knobs..}, "wind":{..jester:wind parameters..}}
+##   commands.json   {"commands":[{"name":"rules","description":"..","level":0,"reply":["line one","line {args}"]}]}
+##   recipes.json    validated and listed, NOT applied: the server has no recipe registry yet (reported as such)
+## <root>/enabled.json (optional)   {"default":["a","b"] | "all", "worlds":{"<world name>": ["a"] | "all"}}. Without the file or
+##   an entry every valid pack is enabled. Packs apply in (priority, id) order; a later pack wins a conflict per field.
+##   A pack whose `depends` are not all active is skipped with an error. An invalid pack is never applied, and never stops the others.
+
+import std/[syncio, strutils, dirs, paths, os, math]
+import "../codecs/json_value"
+import "../util/zlibcore"
+import materials
+import windfield
+import climate
+import "../server/net/jester/windmsg"
+
+const
+  PackFormat* = 1
+  MaxEntryBytes = 4 * 1024 * 1024
+  DefaultYearDays = 24.0
+  ReservedCommands = ["packs", "script", "plugin", "plugins", "op", "deop", "stop", "reload", "say", "tp", "give", "kill", "fill",
+                      "setblock", "gamemode", "time", "weather", "help", "kick", "ban", "whitelist", "save-all", "body", "profile"]
+
+type
+  PackCommand* = object
+    name*, description*: string
+    level*: int
+    reply*: seq[string]
+    pack*: string
+
+  PackClimate* = object
+    hasYearDays*: bool
+    yearDays*: float64
+    hasField*: array[8, bool]          ## useShelter useDrafts shelterSteps shelterStep shelterRise shelterMax draftRange draftSpeed
+    field*: FieldParams
+    hasWind*: array[10, bool]          ## baseSpeed baseYaw turbulence spatialScale temporalScale altitudeGain weatherGain shelter caveDraft draft
+    wind*: WindParams
+
+  PackInfo* = object
+    id*, name*, version*, description*, path*: string
+    priority*: int
+    depends*: seq[string]
+    isZip*: bool
+    ok*: bool                          ## valid (errors empty)
+    active*: bool                      ## applied by the last reload for the last world
+    errors*, warnings*: seq[string]
+    materialsText*: string
+    hasMaterials*, hasClimate*, hasCommands*, hasRecipes*: bool
+    climate*: PackClimate
+    commands*: seq[PackCommand]
+    recipeCount*: int
+
+  PackReport* = object
+    world*: string
+    found*, valid*, active*: int
+    lines*: seq[string]                ## human readable, one fact per line (errors, warnings, restart-only notes)
+    restartOnly*: seq[string]
+    newCommands*: seq[string]          ## command names the glue must register now
+
+  ZipEntry = object
+    name: string
+    methodId, crc, csize, usize, offset: int
+
+  PackSource = object
+    isZip: bool
+    path: string
+    blob: string
+    entries: seq[ZipEntry]
+    err: string
+
+var
+  gRoot = "packs"
+  gPacks: seq[PackInfo] = @[]
+  gCommands: seq[PackCommand] = @[]
+  gRegistered: seq[(string, int)] = @[]   ## command names the server already registered, with the level they got
+  gClimate: PackClimate = PackClimate()
+  gWorld = ""
+  gLastReport: PackReport = PackReport()
+
+# ---------------------------------------------------------------------------------------------------------------------
+# small helpers
+
+proc slashed(p: string): string =
+  result = ""
+  for c in p:
+    result.add (if c == '\\': '/' else: c)
+
+proc lastPart(p: string): string =
+  var at = -1
+  for k in 0 ..< p.len:
+    if p[k] == '/': at = k
+  if at >= 0: p.substr(at + 1) else: p
+
+proc validId(s: string): bool =
+  if s.len < 1 or s.len > 40: return false
+  for c in s:
+    if not ((c >= 'a' and c <= 'z') or (c >= '0' and c <= '9') or c == '_'): return false
+  true
+
+proc numOf(v: JsonValue): (bool, float64) =
+  case v.kind
+  of jvInt: (true, float64(v.intVal))
+  of jvFloat: (v.floatVal == v.floatVal, v.floatVal)
+  else: (false, 0.0)
+
+proc strOf(v: JsonValue, out1: var string): bool =
+  if v.kind == jvString:
+    out1 = v.strVal
+    return true
+  false
+
+proc readText(path: string, text: var string): bool =
+  try:
+    text = readFile(path)
+    return true
+  except ErrorCode:
+    return false
+
+proc joinStr(xs: openArray[string], sep: string): string =
+  result = ""
+  for i in 0 ..< xs.len:
+    if i > 0: result.add sep
+    result.add xs[i]
+
+proc listed(xs: seq[string], x: string): bool =
+  for y in xs:
+    if y == x: return true
+  false
+
+# ---------------------------------------------------------------------------------------------------------------------
+# sources: a folder or a zip
+
+proc u16le(s: string, at: int): int = int(uint8(s[at])) or (int(uint8(s[at + 1])) shl 8)
+proc u32le(s: string, at: int): int = u16le(s, at) or (u16le(s, at + 2) shl 16)
+
+proc openZip(path: string): PackSource =
+  result = PackSource(isZip: true, path: path, blob: "", entries: @[], err: "")
+  if not readText(path, result.blob):
+    result.err = "cannot read " & path
+    return
+  let b = result.blob
+  var eocd = -1
+  var i = b.len - 22
+  while i >= 0 and i >= b.len - 22 - 65535:
+    if u32le(b, i) == 0x06054b50:
+      eocd = i
+      break
+    dec i
+  if eocd < 0:
+    result.err = "not a zip file (no end-of-central-directory record)"
+    return
+  let count = u16le(b, eocd + 10)
+  var at = u32le(b, eocd + 16)
+  for k in 0 ..< count:
+    if at < 0 or at + 46 > b.len or u32le(b, at) != 0x02014b50:
+      result.err = "corrupt zip central directory"
+      return
+    let nlen = u16le(b, at + 28)
+    let elen = u16le(b, at + 30)
+    let clen = u16le(b, at + 32)
+    if at + 46 + nlen > b.len:
+      result.err = "corrupt zip central directory"
+      return
+    result.entries.add ZipEntry(name: slashed(b.substr(at + 46, at + 46 + nlen - 1)), methodId: u16le(b, at + 10), crc: u32le(b, at + 16),
+                                csize: u32le(b, at + 20), usize: u32le(b, at + 24), offset: u32le(b, at + 42))
+    at = at + 46 + nlen + elen + clen
+
+proc crc32Of(data: string): int =
+  var c = 0xFFFFFFFF
+  for ch in data:
+    c = c xor int(uint8(ch))
+    for k in 0 ..< 8:
+      if (c and 1) != 0: c = (c shr 1) xor 0xEDB88320
+      else: c = c shr 1
+  (c xor 0xFFFFFFFF) and 0xFFFFFFFF
+
+proc sourceHas(s: PackSource, name: string): bool =
+  if s.isZip:
+    for e in s.entries:
+      if e.name == name: return true
+    return false
+  fileExists(s.path & "/" & name)
+
+proc sourceRead(s: PackSource, name: string, text: var string): string =
+  ## "" on success, else the reason.
+  if not s.isZip:
+    if not readText(s.path & "/" & name, text): return "cannot read " & name
+    if text.len > MaxEntryBytes: return name & " is larger than 4 MB"
+    return ""
+  for e in s.entries:
+    if e.name != name: continue
+    if e.usize > MaxEntryBytes: return name & " is larger than 4 MB"
+    if e.offset < 0 or e.offset + 30 > s.blob.len or u32le(s.blob, e.offset) != 0x04034b50: return name & ": corrupt zip entry header"
+    let start = e.offset + 30 + u16le(s.blob, e.offset + 26) + u16le(s.blob, e.offset + 28)
+    if start + e.csize > s.blob.len: return name & ": zip entry is truncated"
+    let raw = s.blob.substr(start, start + e.csize - 1)
+    if e.methodId == 0:
+      text = raw
+    elif e.methodId == 8:
+      var bytes = newSeq[byte](raw.len)
+      for k in 0 ..< raw.len: bytes[k] = byte(uint8(raw[k]))
+      let r = zlibInflate(bytes, -15.cint, MaxEntryBytes, lmError)
+      if not r.ok: return name & ": cannot inflate zip entry (" & r.zmsg & ")"
+      text = ""
+      for x in r.data: text.add char(x)
+    else:
+      return name & ": unsupported zip compression method " & $e.methodId
+    if text.len != e.usize: return name & ": zip entry has the wrong size"
+    if crc32Of(text) != e.crc: return name & ": zip entry fails its CRC-32 check"
+    return ""
+  name & " is not in the zip"
+
+# ---------------------------------------------------------------------------------------------------------------------
+# validation of each data file
+
+proc unknownKeys(o: JsonValue, allowed: openArray[string], where: string): string =
+  for k in o.keys:
+    var known = false
+    for a in allowed:
+      if a == k: known = true
+    if not known: return where & ": unknown key \"" & k & "\" (allowed: " & joinStr(allowed, ", ") & ")"
+  ""
+
+proc numRange(o: JsonValue, key: string, lo, hi: float64, where: string, isInt: bool, has: var bool, x: var float64): string =
+  let (found, v) = o.get(key)
+  if not found: return ""
+  let (ok, n) = numOf(v)
+  if not ok: return where & "." & key & " must be a number"
+  if isInt and v.kind != jvInt: return where & "." & key & " must be a whole number"
+  if n < lo or n > hi: return where & "." & key & " must be between " & $lo & " and " & $hi
+  has = true
+  x = n
+  ""
+
+proc boolField(o: JsonValue, key: string, where: string, has: var bool, x: var bool): string =
+  let (found, v) = o.get(key)
+  if not found: return ""
+  if v.kind != jvBool: return where & "." & key & " must be true or false"
+  has = true
+  x = v.boolVal
+  ""
+
+proc parseClimate(text: string, c: var PackClimate): string =
+  let r = parseJsonValue(text)
+  if not r.ok: return "invalid JSON: " & r.error
+  let doc = r.value
+  if doc.kind != jvObject: return "top level must be an object"
+  var e = unknownKeys(doc, ["yearDays", "field", "wind"], "climate.json")
+  if e.len > 0: return e
+  c.field = defaultFieldParams()
+  c.wind = defaultWindParams()
+  var x = 0.0
+  e = numRange(doc, "yearDays", 1.0, 3650.0, "climate.json", false, c.hasYearDays, c.yearDays)
+  if e.len > 0: return e
+  let (hasF, f) = doc.get("field")
+  if hasF:
+    if f.kind != jvObject: return "climate.json.field must be an object"
+    e = unknownKeys(f, ["useShelter", "useDrafts", "shelterSteps", "shelterStep", "shelterRise", "shelterMax", "draftRange", "draftSpeed"],
+                    "climate.json.field")
+    if e.len > 0: return e
+    var b = false
+    e = boolField(f, "useShelter", "climate.json.field", c.hasField[0], b)
+    if e.len > 0: return e
+    if c.hasField[0]: c.field.useShelter = b
+    e = boolField(f, "useDrafts", "climate.json.field", c.hasField[1], b)
+    if e.len > 0: return e
+    if c.hasField[1]: c.field.useDrafts = b
+    e = numRange(f, "shelterSteps", 1.0, 64.0, "climate.json.field", true, c.hasField[2], x)
+    if e.len > 0: return e
+    if c.hasField[2]: c.field.shelterSteps = int(x)
+    e = numRange(f, "shelterStep", 0.1, 16.0, "climate.json.field", false, c.hasField[3], x)
+    if e.len > 0: return e
+    if c.hasField[3]: c.field.shelterStep = x
+    e = numRange(f, "shelterRise", 0.1, 64.0, "climate.json.field", false, c.hasField[4], x)
+    if e.len > 0: return e
+    if c.hasField[4]: c.field.shelterRise = x
+    e = numRange(f, "shelterMax", 0.0, 1.0, "climate.json.field", false, c.hasField[5], x)
+    if e.len > 0: return e
+    if c.hasField[5]: c.field.shelterMax = x
+    e = numRange(f, "draftRange", 0.0, 64.0, "climate.json.field", true, c.hasField[6], x)
+    if e.len > 0: return e
+    if c.hasField[6]: c.field.draftRange = int(x)
+    e = numRange(f, "draftSpeed", 0.0, 20.0, "climate.json.field", false, c.hasField[7], x)
+    if e.len > 0: return e
+    if c.hasField[7]: c.field.draftSpeed = x
+  let (hasW, w) = doc.get("wind")
+  if hasW:
+    if w.kind != jvObject: return "climate.json.wind must be an object"
+    e = unknownKeys(w, ["baseSpeed", "baseYaw", "turbulence", "spatialScale", "temporalScale", "altitudeGain", "weatherGain", "shelter",
+                        "caveDraft", "draft"], "climate.json.wind")
+    if e.len > 0: return e
+    e = numRange(w, "baseSpeed", 0.0, 100.0, "climate.json.wind", false, c.hasWind[0], x)
+    if e.len > 0: return e
+    if c.hasWind[0]: c.wind.baseSpeed = float32(x)
+    e = numRange(w, "baseYaw", -100.0, 100.0, "climate.json.wind", false, c.hasWind[1], x)
+    if e.len > 0: return e
+    if c.hasWind[1]: c.wind.baseYaw = float32(x)
+    e = numRange(w, "turbulence", 0.0, 10.0, "climate.json.wind", false, c.hasWind[2], x)
+    if e.len > 0: return e
+    if c.hasWind[2]: c.wind.turbulence = float32(x)
+    e = numRange(w, "spatialScale", 1.0, 100000.0, "climate.json.wind", false, c.hasWind[3], x)
+    if e.len > 0: return e
+    if c.hasWind[3]: c.wind.spatialScale = float32(x)
+    e = numRange(w, "temporalScale", 1.0, 1000000.0, "climate.json.wind", false, c.hasWind[4], x)
+    if e.len > 0: return e
+    if c.hasWind[4]: c.wind.temporalScale = float32(x)
+    e = numRange(w, "altitudeGain", 0.0, 10.0, "climate.json.wind", false, c.hasWind[5], x)
+    if e.len > 0: return e
+    if c.hasWind[5]: c.wind.altitudeGain = float32(x)
+    e = numRange(w, "weatherGain", 0.0, 10.0, "climate.json.wind", false, c.hasWind[6], x)
+    if e.len > 0: return e
+    if c.hasWind[6]: c.wind.weatherGain = float32(x)
+    var b = false
+    e = boolField(w, "shelter", "climate.json.wind", c.hasWind[7], b)
+    if e.len > 0: return e
+    if c.hasWind[7]:
+      if b: c.wind.flags = c.wind.flags or 1'u8
+      else: c.wind.flags = c.wind.flags and 254'u8
+    e = boolField(w, "caveDraft", "climate.json.wind", c.hasWind[8], b)
+    if e.len > 0: return e
+    if c.hasWind[8]:
+      if b: c.wind.flags = c.wind.flags or 2'u8
+      else: c.wind.flags = c.wind.flags and 253'u8
+    e = numRange(w, "draft", 0.0, 20.0, "climate.json.wind", false, c.hasWind[9], x)
+    if e.len > 0: return e
+    if c.hasWind[9]: c.wind.draft = float32(x)
+  ""
+
+proc validCommandName(s: string): bool =
+  if s.len < 1 or s.len > 32: return false
+  for c in s:
+    if not ((c >= 'a' and c <= 'z') or (c >= '0' and c <= '9') or c == '_' or c == '-'): return false
+  true
+
+proc parseCommands(text: string, packId: string, cmds: var seq[PackCommand]): string =
+  let r = parseJsonValue(text)
+  if not r.ok: return "invalid JSON: " & r.error
+  let doc = r.value
+  if doc.kind != jvObject: return "top level must be an object"
+  var e = unknownKeys(doc, ["commands"], "commands.json")
+  if e.len > 0: return e
+  let (has, arr) = doc.get("commands")
+  if not has: return "commands.json: missing \"commands\" array"
+  if arr.kind != jvArray: return "commands.json.commands must be an array"
+  if arr.items.len > 64: return "commands.json.commands has more than 64 entries"
+  for i in 0 ..< arr.items.len:
+    let c = arr.items[i]
+    let where = "commands.json.commands[" & $i & "]"
+    if c.kind != jvObject: return where & " must be an object"
+    e = unknownKeys(c, ["name", "description", "level", "reply"], where)
+    if e.len > 0: return e
+    var cmd = PackCommand(level: 0, reply: @[], pack: packId)
+    let (hn, nv) = c.get("name")
+    if not hn or not strOf(nv, cmd.name): return where & ".name is required and must be a string"
+    if not validCommandName(cmd.name): return where & ".name \"" & cmd.name & "\" must be 1..32 characters of a-z 0-9 _ -"
+    for rsv in ReservedCommands:
+      if rsv == cmd.name: return where & ".name \"" & cmd.name & "\" is a built-in command and cannot be provided by a pack"
+    for other in cmds:
+      if other.name == cmd.name: return where & ".name \"" & cmd.name & "\" appears twice in this pack"
+    let (hd, dv) = c.get("description")
+    if hd and not strOf(dv, cmd.description): return where & ".description must be a string"
+    if cmd.description.len == 0: cmd.description = "Provided by pack " & packId
+    var lv = 0.0
+    var hl = false
+    e = numRange(c, "level", 0.0, 4.0, where, true, hl, lv)
+    if e.len > 0: return e
+    cmd.level = int(lv)
+    let (hr, rv) = c.get("reply")
+    if not hr: return where & ".reply is required"
+    if rv.kind != jvArray or rv.items.len < 1 or rv.items.len > 20: return where & ".reply must be an array of 1..20 strings"
+    for k in 0 ..< rv.items.len:
+      var line = ""
+      if not strOf(rv.items[k], line): return where & ".reply[" & $k & "] must be a string"
+      if line.len > 256: return where & ".reply[" & $k & "] is longer than 256 characters"
+      cmd.reply.add line
+    cmds.add cmd
+  ""
+
+proc parseRecipes(text: string, count: var int): string =
+  let r = parseJsonValue(text)
+  if not r.ok: return "invalid JSON: " & r.error
+  let doc = r.value
+  if doc.kind != jvObject: return "top level must be an object"
+  let (has, arr) = doc.get("recipes")
+  if not has or arr.kind != jvArray: return "recipes.json: missing \"recipes\" array"
+  for i in 0 ..< arr.items.len:
+    let rc = arr.items[i]
+    let where = "recipes.json.recipes[" & $i & "]"
+    if rc.kind != jvObject: return where & " must be an object"
+    var s = ""
+    let (hi, iv) = rc.get("id")
+    if not hi or not strOf(iv, s): return where & ".id is required and must be a string"
+    let (ht, tv) = rc.get("type")
+    if not ht or not strOf(tv, s): return where & ".type is required and must be a string"
+    let (hr, rv) = rc.get("result")
+    if not hr or (rv.kind != jvObject and rv.kind != jvString): return where & ".result is required"
+  count = arr.items.len
+  ""
+
+# ---------------------------------------------------------------------------------------------------------------------
+# loading one pack
+
+proc loadPack(src: PackSource, fallbackName: string): PackInfo =
+  result = PackInfo(path: src.path, isZip: src.isZip, ok: false, errors: @[], warnings: @[], depends: @[], commands: @[])
+  result.id = fallbackName
+  result.name = fallbackName
+  if src.err.len > 0:
+    result.errors.add src.err
+    return
+  var text = ""
+  if not sourceHas(src, "pack.json"):
+    result.errors.add "no pack.json"
+    return
+  let err = sourceRead(src, "pack.json", text)
+  if err.len > 0:
+    result.errors.add err
+    return
+  let r = parseJsonValue(text)
+  if not r.ok:
+    result.errors.add "pack.json: invalid JSON: " & r.error
+    return
+  let doc = r.value
+  if doc.kind != jvObject:
+    result.errors.add "pack.json: top level must be an object"
+    return
+  let uk = unknownKeys(doc, ["format", "id", "name", "version", "description", "priority", "depends"], "pack.json")
+  if uk.len > 0: result.errors.add uk
+  let (hf, fv) = doc.get("format")
+  let (okf, fnum) = numOf(fv)
+  if not hf or not okf or int(fnum) != PackFormat:
+    result.errors.add "pack.json: \"format\" must be " & $PackFormat
+  var id = ""
+  let (hi, iv) = doc.get("id")
+  if not hi or not strOf(iv, id):
+    result.errors.add "pack.json: \"id\" is required and must be a string"
+  elif not validId(id):
+    result.errors.add "pack.json: id \"" & id & "\" must be 1..40 characters of a-z 0-9 _"
+  else:
+    result.id = id
+    result.name = id
+  var s = ""
+  let (hn, nv) = doc.get("name")
+  if hn:
+    if strOf(nv, s): result.name = s
+    else: result.errors.add "pack.json: \"name\" must be a string"
+  let (hv, vv) = doc.get("version")
+  if hv:
+    if strOf(vv, s): result.version = s
+    else: result.errors.add "pack.json: \"version\" must be a string"
+  let (hd, dv) = doc.get("description")
+  if hd:
+    if strOf(dv, s): result.description = s
+    else: result.errors.add "pack.json: \"description\" must be a string"
+  let (hp, pv) = doc.get("priority")
+  if hp:
+    let (okp, pn) = numOf(pv)
+    if not okp or pv.kind != jvInt or pn < -1000.0 or pn > 1000.0:
+      result.errors.add "pack.json: \"priority\" must be a whole number between -1000 and 1000"
+    else:
+      result.priority = int(pn)
+  let (hdep, depv) = doc.get("depends")
+  if hdep:
+    if depv.kind != jvArray:
+      result.errors.add "pack.json: \"depends\" must be an array of pack ids"
+    else:
+      for d in depv.items:
+        if strOf(d, s) and validId(s): result.depends.add s
+        else: result.errors.add "pack.json: \"depends\" entries must be pack ids"
+  # data files
+  if sourceHas(src, "materials.json"):
+    result.hasMaterials = true
+    let e = sourceRead(src, "materials.json", result.materialsText)
+    if e.len > 0:
+      result.errors.add e
+    else:
+      let (ok, msg) = checkMaterialOverrides(result.materialsText)
+      if not ok: result.errors.add "materials.json: " & msg
+      elif msg.len > 0: result.warnings.add "materials.json: " & msg.strip()
+  if sourceHas(src, "climate.json"):
+    result.hasClimate = true
+    var ct = ""
+    let e = sourceRead(src, "climate.json", ct)
+    if e.len > 0: result.errors.add e
+    else:
+      let pe = parseClimate(ct, result.climate)
+      if pe.len > 0: result.errors.add pe
+  if sourceHas(src, "commands.json"):
+    result.hasCommands = true
+    var ct = ""
+    let e = sourceRead(src, "commands.json", ct)
+    if e.len > 0: result.errors.add e
+    else:
+      let pe = parseCommands(ct, result.id, result.commands)
+      if pe.len > 0: result.errors.add pe
+  if sourceHas(src, "recipes.json"):
+    result.hasRecipes = true
+    var ct = ""
+    let e = sourceRead(src, "recipes.json", ct)
+    if e.len > 0: result.errors.add e
+    else:
+      let pe = parseRecipes(ct, result.recipeCount)
+      if pe.len > 0: result.errors.add pe
+      else: result.warnings.add "recipes.json: " & $result.recipeCount & " recipe(s) validated but NOT applied (the server has no recipe registry)"
+  result.ok = result.errors.len == 0
+
+proc discoverPacks(root: string): seq[PackInfo] =
+  result = @[]
+  var found: seq[(string, bool)] = @[]
+  try:
+    for kind, entry in walkDir(path(root)):
+      let full = slashed($entry)
+      let base = lastPart(full)
+      if base.startsWith("."): continue
+      if kind == pcDir and fileExists(full & "/pack.json"): found.add (full, false)
+      elif kind == pcFile and base.toLowerAscii.endsWith(".zip"): found.add (full, true)
+  except ErrorCode:
+    discard
+  for f in found:
+    var base = lastPart(f[0])
+    if f[1]: base = base.substr(0, base.len - 5)
+    let src = if f[1]: openZip(f[0]) else: PackSource(isZip: false, path: f[0], blob: "", entries: @[], err: "")
+    result.add loadPack(src, base)
+  # (priority, id) order; insertion sort (few packs)
+  for i in 1 ..< result.len:
+    var j = i
+    while j > 0 and (result[j - 1].priority > result[j].priority or
+                     (result[j - 1].priority == result[j].priority and result[j - 1].id > result[j].id)):
+      let t = result[j - 1]
+      let u = result[j]
+      result[j - 1] = u
+      result[j] = t
+      dec j
+  # duplicate ids: the later one is invalid
+  for i in 0 ..< result.len:
+    for j in 0 ..< i:
+      if result[j].ok and result[i].ok and result[j].id == result[i].id:
+        result[i].ok = false
+        result[i].errors.add "duplicate pack id \"" & result[i].id & "\" (also in " & result[j].path & ")"
+
+# ---------------------------------------------------------------------------------------------------------------------
+# enable list
+
+proc enabledList(root, world: string, ids: var seq[string], all: var bool, err: var string) =
+  ## Reads <root>/enabled.json. all = true when every valid pack is enabled.
+  all = true
+  ids = @[]
+  var text = ""
+  if not readText(root & "/enabled.json", text): return
+  let r = parseJsonValue(text)
+  if not r.ok:
+    err = "enabled.json: invalid JSON: " & r.error & " (all packs treated as enabled)"
+    return
+  let doc = r.value
+  if doc.kind != jvObject:
+    err = "enabled.json: top level must be an object (all packs treated as enabled)"
+    return
+  let uk = unknownKeys(doc, ["default", "worlds"], "enabled.json")
+  if uk.len > 0: err = uk
+  var pick = JsonValue(kind: jvNull)
+  var have = false
+  let (hw, wv) = doc.get("worlds")
+  if hw and wv.kind == jvObject:
+    let (hwn, wn) = wv.get(world)
+    if hwn:
+      pick = wn
+      have = true
+  elif hw:
+    err = "enabled.json.worlds must be an object"
+  if not have:
+    let (hd, dv) = doc.get("default")
+    if hd:
+      pick = dv
+      have = true
+  if not have: return
+  if pick.kind == jvString and pick.strVal == "all": return
+  if pick.kind != jvArray:
+    err = "enabled.json: an enable list must be \"all\" or an array of pack ids (all packs treated as enabled)"
+    return
+  all = false
+  for it in pick.items:
+    var s = ""
+    if strOf(it, s): ids.add s
+    else: err = "enabled.json: enable list entries must be strings"
+
+# ---------------------------------------------------------------------------------------------------------------------
+# applying
+
+proc applyClimate(c: PackClimate) =
+  gClimate = c
+
+proc mergeClimate(dst: var PackClimate, src: PackClimate) =
+  if src.hasYearDays:
+    dst.hasYearDays = true
+    dst.yearDays = src.yearDays
+  for i in 0 ..< 8:
+    if src.hasField[i]:
+      dst.hasField[i] = true
+      case i
+      of 0: dst.field.useShelter = src.field.useShelter
+      of 1: dst.field.useDrafts = src.field.useDrafts
+      of 2: dst.field.shelterSteps = src.field.shelterSteps
+      of 3: dst.field.shelterStep = src.field.shelterStep
+      of 4: dst.field.shelterRise = src.field.shelterRise
+      of 5: dst.field.shelterMax = src.field.shelterMax
+      of 6: dst.field.draftRange = src.field.draftRange
+      else: dst.field.draftSpeed = src.field.draftSpeed
+  for i in 0 ..< 10:
+    if src.hasWind[i]:
+      dst.hasWind[i] = true
+      case i
+      of 0: dst.wind.baseSpeed = src.wind.baseSpeed
+      of 1: dst.wind.baseYaw = src.wind.baseYaw
+      of 2: dst.wind.turbulence = src.wind.turbulence
+      of 3: dst.wind.spatialScale = src.wind.spatialScale
+      of 4: dst.wind.temporalScale = src.wind.temporalScale
+      of 5: dst.wind.altitudeGain = src.wind.altitudeGain
+      of 6: dst.wind.weatherGain = src.wind.weatherGain
+      of 7:
+        if (src.wind.flags and 1'u8) != 0: dst.wind.flags = dst.wind.flags or 1'u8
+        else: dst.wind.flags = dst.wind.flags and 254'u8
+      of 8:
+        if (src.wind.flags and 2'u8) != 0: dst.wind.flags = dst.wind.flags or 2'u8
+        else: dst.wind.flags = dst.wind.flags and 253'u8
+      else: dst.wind.draft = src.wind.draft
+
+proc registeredLevel(name: string): int =
+  for r in gRegistered:
+    if r[0] == name: return r[1]
+  -1
+
+proc markCommandRegistered*(name: string, level: int) =
+  ## The glue calls this after it registered `name` with the server (a command cannot be unregistered or re-levelled live).
+  if registeredLevel(name) < 0: gRegistered.add (name, level)
+
+proc reloadPacks*(root, world: string): PackReport =
+  ## Re-reads every pack under `root`, validates, and applies the ones enabled for `world`: material overrides, climate, wind and the
+  ## command table are replaced atomically per section (invalid packs are skipped and never partly applied). Safe at any time on the
+  ## server thread. Restart-only differences are listed in `restartOnly` and in the lines.
+  gRoot = root
+  gWorld = world
+  var rep = PackReport(world: world, lines: @[], restartOnly: @[], newCommands: @[])
+  var packs = discoverPacks(root)
+  rep.found = packs.len
+  var enabledIds: seq[string] = @[]
+  var all = true
+  var cfgErr = ""
+  enabledList(root, world, enabledIds, all, cfgErr)
+  if cfgErr.len > 0: rep.lines.add "WARN " & cfgErr
+  for p in packs:
+    if p.ok: inc rep.valid
+  # choose active packs: valid, enabled, dependencies active earlier (repeat until stable)
+  var order: seq[int] = @[]
+  var done = newSeq[bool](packs.len)
+  var progress = true
+  while progress:
+    progress = false
+    for i in 0 ..< packs.len:
+      if done[i] or not packs[i].ok: continue
+      if not all and not listed(enabledIds, packs[i].id): continue
+      var depsOk = true
+      for d in packs[i].depends:
+        var have = false
+        for k in order:
+          if packs[k].id == d: have = true
+        if not have: depsOk = false
+      if depsOk:
+        done[i] = true
+        order.add i
+        progress = true
+  # (order is activation order: a pack follows its dependencies, otherwise (priority, id))
+  for i in 0 ..< packs.len:
+    if packs[i].ok and not done[i] and (all or listed(enabledIds, packs[i].id)):
+      var miss = ""
+      for d in packs[i].depends:
+        var have = false
+        for k in order:
+          if packs[k].id == d: have = true
+        if not have: miss = miss & d & " "
+      packs[i].errors.add "skipped: dependency not active: " & miss.strip()
+  # apply
+  clearMaterialOverrides()
+  var climate = PackClimate()
+  climate.field = defaultFieldParams()
+  climate.wind = defaultWindParams()
+  var cmds: seq[PackCommand] = @[]
+  for k in order:
+    packs[k].active = true
+    if packs[k].hasMaterials:
+      let (ok, msg) = loadMaterialOverrides(packs[k].materialsText)
+      if not ok: packs[k].errors.add "materials.json: " & msg   # cannot happen after validation, kept as a guard
+    if packs[k].hasClimate: mergeClimate(climate, packs[k].climate)
+    for c in packs[k].commands:
+      var replaced = false
+      for j in 0 ..< cmds.len:
+        if cmds[j].name == c.name:
+          cmds[j] = c
+          replaced = true
+      if not replaced: cmds.add c
+  if climate.hasYearDays: setYearDays(climate.yearDays) else: setYearDays(DefaultYearDays)
+  setFieldParams(climate.field)
+  applyClimate(climate)
+  # commands: what needs the server to act
+  for c in cmds:
+    let lv = registeredLevel(c.name)
+    if lv < 0:
+      rep.newCommands.add c.name
+    elif lv != c.level:
+      rep.restartOnly.add "command /" & c.name & ": permission level " & $c.level & " needs a restart (registered with " & $lv & ")"
+  for r in gRegistered:
+    var still = false
+    for c in cmds:
+      if c.name == r[0]: still = true
+    if not still:
+      rep.restartOnly.add "command /" & r[0] & ": removal needs a restart (it stays registered and answers that it is disabled)"
+  gCommands = cmds
+  for p in packs:
+    if p.hasRecipes and p.active:
+      rep.restartOnly.add "pack " & p.id & ": recipes.json is not applied (no server recipe registry)"
+  gPacks = packs
+  for p in packs:
+    if p.active: inc rep.active
+    for e in p.errors: rep.lines.add "ERROR pack " & p.id & " (" & lastPart(p.path) & "): " & e
+    for w in p.warnings: rep.lines.add "WARN pack " & p.id & ": " & w
+  for r in rep.restartOnly: rep.lines.add "RESTART " & r
+  gLastReport = rep
+  rep
+
+# ---------------------------------------------------------------------------------------------------------------------
+# queries
+
+proc packCount*(): int = gPacks.len
+proc packAt*(i: int): PackInfo = gPacks[i]
+proc packRoot*(): string = gRoot
+proc packWorld*(): string = gWorld
+proc lastPackReport*(): PackReport = gLastReport
+
+proc findPack*(id: string): (bool, PackInfo) =
+  for p in gPacks:
+    if p.id == id: return (true, p)
+  (false, PackInfo())
+
+proc packCommands*(): seq[PackCommand] = gCommands
+
+proc findPackCommand*(name: string): (bool, PackCommand) =
+  for c in gCommands:
+    if c.name == name: return (true, c)
+  (false, PackCommand())
+
+proc packWindParams*(): WindParams =
+  ## The jester:wind parameters the active packs ask for (the defaults when none does).
+  gClimate.wind
+
+proc expandReply*(c: PackCommand, args: string): seq[string] =
+  ## The reply lines with {args} replaced by what the player typed.
+  result = @[]
+  for l in c.reply: result.add l.replace("{args}", args)
+
+proc listLines*(): seq[string] =
+  result = @[]
+  result.add "packs in " & gRoot & " for world \"" & gWorld & "\": " & $gPacks.len & " found"
+  for p in gPacks:
+    let state = if p.active: "active" elif p.ok: "disabled" else: "INVALID"
+    result.add "  " & p.id & " " & p.version & " [" & state & "] " & (if p.isZip: "zip " else: "folder ") & lastPart(p.path)
+
+proc infoLines*(id: string): seq[string] =
+  result = @[]
+  let (found, p) = findPack(id)
+  if not found:
+    result.add "no pack with id \"" & id & "\" (see /packs list)"
+    return
+  result.add p.id & " " & p.version & " - " & p.name & (if p.active: " [active]" elif p.ok: " [disabled]" else: " [INVALID]")
+  if p.description.len > 0: result.add "  " & p.description
+  result.add "  source: " & p.path & (if p.isZip: " (zip)" else: " (folder)") & ", priority " & $p.priority
+  if p.depends.len > 0: result.add "  depends: " & joinStr(p.depends, ", ")
+  var parts = ""
+  if p.hasMaterials: parts = parts & "materials "
+  if p.hasClimate: parts = parts & "climate "
+  if p.hasCommands: parts = parts & "commands(" & $p.commands.len & ") "
+  if p.hasRecipes: parts = parts & "recipes(" & $p.recipeCount & ", not applied) "
+  result.add "  provides: " & (if parts.len > 0: parts.strip() else: "nothing")
+  for c in p.commands: result.add "  command /" & c.name & " (level " & $c.level & "): " & c.description
+  for e in p.errors: result.add "  ERROR " & e
+  for w in p.warnings: result.add "  WARN " & w

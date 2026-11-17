@@ -1,0 +1,242 @@
+## Tests for packs.aowl: the worked example pack from disk (examples/packs/example_pack) changes the structural solver's result
+## through a density override, validation error messages, zip packs (stored and deflated), the per-world enable list, dependencies,
+## reload, climate/wind parameters and pack commands. Exit 0 and "ALL PASS" when everything holds. Run from the repo root.
+
+{.feature: "untyped".}
+
+import std/[syncio, os, strutils, envvars]
+from std/paths import path
+from std/dirs import tryCreateFinalDir
+import "../generated/block_properties"
+import "../util/zlibcore"
+import materials
+import solver
+import solveradapter
+import windfield
+import climate
+import packs
+
+var failures = 0
+var checks = 0
+
+proc check(cond: bool, what: string) =
+  inc checks
+  if cond:
+    echo "  PASS ", what
+  else:
+    echo "  FAIL ", what
+    inc failures
+
+proc sid(name: string): int =
+  let b = Block.fromName(name)
+  if b == nil: return 0
+  int(asU16(b.defaultState.id))
+
+# ---- solver scene: a 6-long plank cantilever with n stone blocks on its tip ----------------------------------------------------
+proc cellAt(nx, nz, x, y, z: int): int = x + nx * (z + nz * y)
+
+proc cantilever(n: int): (seq[int], int, int, int) =
+  let nx = 10
+  let ny = 14
+  let nz = 3
+  var ids = newSeq[int](nx * ny * nz)
+  for z in 0 ..< nz:
+    for x in 0 ..< nx: ids[cellAt(nx, nz, x, 0, z)] = sid("stone")
+  for y in 1 .. 4: ids[cellAt(nx, nz, 0, y, 1)] = sid("stone")
+  for x in 1 .. 6: ids[cellAt(nx, nz, x, 4, 1)] = sid("oak_planks")
+  for k in 0 ..< n: ids[cellAt(nx, nz, 6, 5 + k, 1)] = sid("stone")
+  (ids, nx, ny, nz)
+
+proc breaks(n: int): bool =
+  let (ids, nx, ny, nz) = cantilever(n)
+  let r = solveSnapshot(ids, nx, ny, nz, defaultAdapterParams(), floorAnchor, @[])
+  r.broken.len > 0 or r.components.len > 0
+
+proc fewestBreaking(): int =
+  for n in 0 .. 9:
+    if breaks(n): return n
+  99
+
+# ---- fixtures -------------------------------------------------------------------------------------------------------------------
+proc scratch(name: string): string =
+  var base = getEnv("PACKSTEST_DIR")
+  if base.len == 0: base = parentDir(getAppFilename())
+  discard tryCreateFinalDir(path(base & "/" & name))
+  base & "/" & name
+
+proc put(file, text: string) =
+  try:
+    writeFile(file, text)
+  except ErrorCode:
+    echo "FAIL cannot write ", file
+    quit(1)
+
+proc mkPack(root, folder, packJson: string, files: openArray[(string, string)]) =
+  discard tryCreateFinalDir(path(root & "/" & folder))
+  put(root & "/" & folder & "/pack.json", packJson)
+  for f in files: put(root & "/" & folder & "/" & f[0], f[1])
+
+proc le16(v: int): string = $char(v and 255) & $char((v shr 8) and 255)
+proc le32(v: int): string = le16(v and 0xFFFF) & le16((v shr 16) and 0xFFFF)
+
+proc crc32Of(data: string): int =
+  var c = 0xFFFFFFFF
+  for ch in data:
+    c = c xor int(uint8(ch))
+    for k in 0 ..< 8:
+      if (c and 1) != 0: c = (c shr 1) xor 0xEDB88320
+      else: c = c shr 1
+  (c xor 0xFFFFFFFF) and 0xFFFFFFFF
+
+proc makeZip(entries: openArray[(string, string, bool)]): string =
+  ## (name, content, deflate?)
+  var body = ""
+  var central = ""
+  for e in entries:
+    var data = e[1]
+    var methodId = 0
+    if e[2]:
+      var bytes = newSeq[byte](e[1].len)
+      for k in 0 ..< e[1].len: bytes[k] = byte(uint8(e[1][k]))
+      let z = zlibDeflate(bytes, 6.cint, -15.cint)
+      data = ""
+      for x in z.data: data.add char(x)
+      methodId = 8
+    let off = body.len
+    let crc = crc32Of(e[1])
+    body.add le32(0x04034b50) & le16(20) & le16(0) & le16(methodId) & le16(0) & le16(0) & le32(crc) & le32(data.len) & le32(e[1].len) &
+             le16(e[0].len) & le16(0) & e[0] & data
+    central.add le32(0x02014b50) & le16(20) & le16(20) & le16(0) & le16(methodId) & le16(0) & le16(0) & le32(crc) & le32(data.len) &
+                le32(e[1].len) & le16(e[0].len) & le16(0) & le16(0) & le16(0) & le16(0) & le32(0) & le32(off) & e[0]
+  body & central & le32(0x06054b50) & le16(0) & le16(0) & le16(entries.len) & le16(entries.len) & le32(central.len) & le32(body.len) & le16(0)
+
+proc hasLine(lines: seq[string], needle: string): bool =
+  for l in lines:
+    if l.contains(needle): return true
+  false
+
+# ---- 1. the worked example pack, from disk, changes the solver result ------------------------------------------------------------
+echo "SCENE example pack from examples/packs"
+clearMaterialOverrides()
+let baseDensity = materialByName("stone")[1].density
+let baseFewest = fewestBreaking()
+echo "  default: stone density ", baseDensity, ", fewest stone blocks that break the cantilever: ", baseFewest
+let rep = reloadPacks("examples/packs", "world")
+for l in rep.lines: echo "  report: ", l
+check(rep.found == 1 and rep.valid == 1 and rep.active == 1, "example pack found, valid and active")
+let packDensity = materialByName("stone")[1].density
+let packFewest = fewestBreaking()
+echo "  with pack: stone density ", packDensity, ", fewest stone blocks that break the cantilever: ", packFewest
+check(baseDensity > 2000.0 and packDensity == 300.0, "pack sets stone density 300 (default " & $baseDensity & ")")
+check(baseFewest >= 1 and baseFewest < 99, "default scene breaks at some load (" & $baseFewest & ")")
+check(packFewest > baseFewest, "lighter stone: more blocks needed to break the span (" & $baseFewest & " -> " & $packFewest & ")")
+check(materialByName("stone")[1].compressive == 45.0, "pack sets stone compressive 45")
+check(materialByName("oak_log")[1].density == 700.0 and materialByName("birch_log")[1].stiffness == 12.0, "tag override reaches every log")
+check(materialByName("oak_planks")[1].flammability == 0.1, "pack sets oak planks flammability")
+check(yearDays() == 16.0, "pack sets the year length")
+check(packWindParams().baseSpeed == 6.5'f32 and packWindParams().turbulence == 0.7'f32 and (packWindParams().flags and 1'u8) == 1'u8,
+      "pack sets wind parameters")
+check(packCommands().len == 2 and findPackCommand("rules")[0], "pack provides two commands")
+check(expandReply(findPackCommand("echo2")[1], "hi") == @["hi", "hi"], "{args} is expanded in command replies")
+check(rep.newCommands.len == 2, "both commands are new to the server")
+check(hasLine(rep.lines, "recipes.json") or hasLine(rep.restartOnly, "recipes.json"), "recipes are reported as not applied")
+check(infoLines("example_pack").len > 4 and hasLine(infoLines("example_pack"), "command /rules"), "/packs info lists the pack")
+check(hasLine(listLines(), "example_pack 1.0.0 [active]"), "/packs list shows it active")
+
+# ---- 2. reload without the pack restores the defaults exactly -----------------------------------------------------------------
+echo "SCENE reload and per-world enable list"
+let root = scratch("packroot")
+mkPack(root, "a", """{"format":1,"id":"a","version":"1"}""", [("materials.json", """{"blocks":{"stone":{"density":111}}}""")])
+mkPack(root, "b", """{"format":1,"id":"b","version":"2","priority":5}""", [("materials.json", """{"blocks":{"stone":{"density":222}}}""")])
+put(root & "/enabled.json", """{"default":["a"],"worlds":{"nether":["a","b"],"empty":[]}}""")
+var r2 = reloadPacks(root, "overworld")
+check(r2.found == 2 and r2.active == 1 and materialByName("stone")[1].density == 111.0, "overworld: only the default list (a) applies")
+r2 = reloadPacks(root, "nether")
+check(r2.active == 2 and materialByName("stone")[1].density == 222.0, "nether: a then b (higher priority last) wins")
+r2 = reloadPacks(root, "empty")
+check(r2.active == 0 and materialByName("stone")[1].density == baseDensity, "empty list: defaults restored exactly")
+check(fewestBreaking() == baseFewest, "solver result is back to the default after reload")
+put(root & "/enabled.json", """{"default":"all"}""")
+r2 = reloadPacks(root, "x")
+check(r2.active == 2 and materialByName("stone")[1].density == 222.0, "\"all\" enables everything")
+put(root & "/b/materials.json", """{"blocks":{"stone":{"density":333}}}""")
+r2 = reloadPacks(root, "x")
+check(materialByName("stone")[1].density == 333.0, "an edited data file is picked up by reload")
+
+# ---- 3. validation errors -----------------------------------------------------------------------------------------------------
+echo "SCENE validation"
+let bad = scratch("badroot")
+mkPack(bad, "p_json", """{"format":1,"id":"p_json"}""", [("materials.json", """{"blocks": {""")])
+mkPack(bad, "p_field", """{"format":1,"id":"p_field"}""", [("materials.json", """{"blocks":{"stone":{"densty":5}}}""")])
+mkPack(bad, "p_neg", """{"format":1,"id":"p_neg"}""", [("materials.json", """{"blocks":{"stone":{"damping":2}}}""")])
+mkPack(bad, "p_fmt", """{"format":2,"id":"p_fmt"}""", [])
+mkPack(bad, "p_id", """{"format":1,"id":"Bad Id"}""", [])
+mkPack(bad, "p_cmd", """{"format":1,"id":"p_cmd"}""", [("commands.json", """{"commands":[{"name":"op","reply":["x"]}]}""")])
+mkPack(bad, "p_cmd2", """{"format":1,"id":"p_cmd2"}""", [("commands.json", """{"commands":[{"name":"ok","level":9,"reply":["x"]}]}""")])
+mkPack(bad, "p_clim", """{"format":1,"id":"p_clim"}""", [("climate.json", """{"wind":{"baseSpeed":-1}}""")])
+mkPack(bad, "p_clim2", """{"format":1,"id":"p_clim2"}""", [("climate.json", """{"yearDays":"long"}""")])
+mkPack(bad, "p_dep", """{"format":1,"id":"p_dep","depends":["missing_pack"]}""", [("materials.json", """{"blocks":{"stone":{"density":9}}}""")])
+mkPack(bad, "p_good", """{"format":1,"id":"p_good"}""", [("materials.json", """{"blocks":{"stone":{"density":444},"mymod:nothing":{"density":1}}}""")])
+discard tryCreateFinalDir(path(bad & "/p_nopack"))
+var r3 = reloadPacks(bad, "w")
+for l in r3.lines: echo "  report: ", l
+check(r3.found == 11 and r3.valid == 2, "11 folders with pack.json, 2 valid before dependencies (" & $r3.found & ", " & $r3.valid & ")")
+check(hasLine(r3.lines, "pack p_json") and hasLine(r3.lines, "invalid JSON"), "malformed JSON names the pack")
+check(hasLine(r3.lines, "unknown field densty"), "unknown material field is named")
+check(hasLine(r3.lines, "field damping must be between 0 and 1"), "damping range checked")
+check(hasLine(r3.lines, "\"format\" must be 1"), "format version checked")
+check(hasLine(r3.lines, "must be 1..40 characters"), "pack id checked")
+check(hasLine(r3.lines, "is a built-in command"), "reserved command name refused")
+check(hasLine(r3.lines, "commands.json.commands[0].level must be between 0.0 and 4.0") or hasLine(r3.lines, "level must be between"), "command level checked with its JSON path")
+check(hasLine(r3.lines, "climate.json.wind.baseSpeed must be between"), "climate range checked with its JSON path")
+check(hasLine(r3.lines, "climate.json.yearDays must be a number"), "climate type checked")
+check(hasLine(r3.lines, "dependency not active: missing_pack"), "missing dependency reported")
+check(hasLine(r3.lines, "unknown block mymod:nothing"), "unknown block is a warning")
+check(r3.active == 1 and materialByName("stone")[1].density == 444.0, "invalid packs are skipped, the valid one still applies (density 444)")
+check(materialByName("stone")[1].density != 9.0, "the pack with a missing dependency changed nothing")
+
+# ---- 4. zip packs -------------------------------------------------------------------------------------------------------------
+echo "SCENE zip"
+let zroot = scratch("zroot")
+put(zroot & "/zipped.zip", makeZip([("pack.json", """{"format":1,"id":"zipped","version":"1"}""", false),
+                                     ("materials.json", """{"blocks":{"stone":{"density":555}}}""", true)]))
+let r4 = reloadPacks(zroot, "w")
+check(r4.found == 1 and r4.active == 1 and materialByName("stone")[1].density == 555.0, "a zip pack with a deflated entry applies")
+var zip = makeZip([("pack.json", """{"format":1,"id":"zipped","version":"1"}""", false),
+                   ("materials.json", """{"blocks":{"stone":{"density":666}}}""", false)])
+check(findPack("zipped")[1].isZip, "zip source is reported")
+# corrupt one data byte (inside the stored entry text): CRC must catch it
+let at = zip.find("666")
+zip[at] = '7'
+put(zroot & "/zipped.zip", zip)
+let r5 = reloadPacks(zroot, "w")
+check(r5.active == 0 and hasLine(r5.lines, "CRC-32"), "a corrupted zip entry is refused by its CRC")
+put(zroot & "/zipped.zip", "not a zip at all, but long enough to scan for a record....")
+let r6 = reloadPacks(zroot, "w")
+check(r6.active == 0 and hasLine(r6.lines, "not a zip file"), "garbage .zip reported")
+
+# ---- 5. restart-only reporting ------------------------------------------------------------------------------------------------
+echo "SCENE restart-only"
+let croot = scratch("croot")
+mkPack(croot, "c", """{"format":1,"id":"c"}""", [("commands.json", """{"commands":[{"name":"hello","level":0,"reply":["hi"]}]}""")])
+var r7 = reloadPacks(croot, "w")
+check(r7.newCommands == @["hello"], "a new command is handed to the glue")
+markCommandRegistered("hello", 0)
+put(croot & "/c/commands.json", """{"commands":[{"name":"hello","level":2,"reply":["hi 2"]}]}""")
+r7 = reloadPacks(croot, "w")
+check(r7.newCommands.len == 0 and hasLine(r7.restartOnly, "permission level 2 needs a restart"), "a level change is restart-only")
+check(findPackCommand("hello")[1].reply[0] == "hi 2", "but the reply text reloads live")
+put(croot & "/c/commands.json", """{"commands":[]}""")
+r7 = reloadPacks(croot, "w")
+check(hasLine(r7.restartOnly, "removal needs a restart"), "command removal is restart-only")
+
+# ---- cleanup of global state --------------------------------------------------------------------------------------------------
+discard reloadPacks(scratch("emptyroot"), "w")
+check(materialByName("stone")[1].density == baseDensity and yearDays() == 24.0, "no packs: defaults everywhere")
+
+echo ""
+if failures == 0:
+  echo "ALL PASS (", checks, " checks)"
+else:
+  echo failures, " FAILED of ", checks
+  quit(1)
