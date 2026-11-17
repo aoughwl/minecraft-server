@@ -1,0 +1,385 @@
+## Scene tests for fire.aowl with REAL vanilla blocks (materials.aowl on the generated block data).
+## Exit 0 and "ALL PASS" when everything holds.
+
+{.feature: "untyped".}
+
+import std/[syncio, monotimes, math]
+import "../generated/block_properties"
+import materials
+import solver
+import solveradapter
+import fire
+
+var failures = 0
+var checks = 0
+
+proc check(cond: bool, what: string) =
+  inc checks
+  if cond:
+    echo "PASS ", what
+  else:
+    echo "FAIL ", what
+    inc failures
+
+proc sid(name: string): int =
+  let b = Block.fromName(name)
+  if b == nil:
+    echo "FAIL unknown block ", name
+    inc failures
+    return 0
+  return int(asU16(b.defaultState.id))
+
+let AIR = sid("air")
+let PLANKS = sid("oak_planks")
+let LOG = sid("oak_log")
+let LEAVES = sid("oak_leaves")
+let STONE = sid("stone")
+let COAL = sid("blackstone")
+
+# ---- callbacks --------------------------------------------------------------------------------------------------------
+var gWet = 0.0
+var gWx = 0.0
+var gWz = 0.0
+var gLogToCoal = false
+
+proc fireMatOfState(state: int): FireMat =
+  let m = materialOf(state)
+  makeFireMat(m.flammability, m.ignitability, m.density, m.fill, m.matClass == mcVoid, isStructural(m))
+
+proc burntOf(state: int): int =
+  if gLogToCoal and state == LOG: return COAL
+  AIR
+
+proc wetFn(x, y, z: int): float64 = gWet
+proc windFn(x, y, z: int): (float64, float64) = (gWx, gWz)
+
+proc callbacks(): FireCallbacks =
+  FireCallbacks(matOf: fireMatOfState, burntState: burntOf, wetAt: wetFn, windAt: windFn)
+
+proc countOfIds(ids: seq[int]; st: int): int =
+  var n = 0
+  for i in 0 ..< ids.len:
+    if ids[i] == st: inc n
+  n
+
+proc setCoal(b: bool) = gLogToCoal = b
+
+proc setEnv(wet, wx, wz: float64) =
+  gWet = wet
+  gWx = wx
+  gWz = wz
+
+# ---- scene helpers ----------------------------------------------------------------------------------------------------
+type Scene = object
+  nx, ny, nz: int
+  ids: seq[int]
+
+proc newScene(nx, ny, nz: int): Scene = Scene(nx: nx, ny: ny, nz: nz, ids: newSeq[int](nx * ny * nz))
+proc ci(s: Scene; x, y, z: int): int = x + s.nx * (z + s.nz * y)
+proc put(s: var Scene; x, y, z, state: int) = s.ids[ci(s, x, y, z)] = state
+proc ground(s: var Scene) =
+  for z in 0 ..< s.nz:
+    for x in 0 ..< s.nx: put(s, x, 0, z, STONE)
+
+
+proc runUntilOut(sim: var FireSim; cap: int): int =
+  ## ticks until nothing burns (or cap)
+  var t = 0
+  while sim.burning > 0 and t < cap:
+    discard step(sim, 0)
+    inc t
+  t
+
+proc wall(nx, nz: int; len, h: int; mat: int): Scene =
+  var s = newScene(nx, 8, nz)
+  ground(s)
+  for y in 1 .. h:
+    for x in 1 .. len: put(s, x, y, 1, mat)
+  s
+
+# ---- 1. dry wall burns, stone does not --------------------------------------------------------------------------------
+echo "ids: air=", AIR, " planks=", PLANKS, " log=", LOG, " leaves=", LEAVES, " stone=", STONE, " coal=", COAL
+echo "material numbers: planks flam=", materialOf(PLANKS).flammability, " ign=", materialOf(PLANKS).ignitability,
+     " | log flam=", materialOf(LOG).flammability, " ign=", materialOf(LOG).ignitability,
+     " | leaves flam=", materialOf(LEAVES).flammability, " ign=", materialOf(LEAVES).ignitability,
+     " | stone flam=", materialOf(STONE).flammability
+setEnv(0.0, 0.0, 0.0)
+block:
+  var totalT = 0
+  var allGone = true
+  var anyLeft = 0
+  for seed in 1 .. 5:
+    let sc = wall(14, 3, 10, 5, PLANKS)
+    var sim = newFireSim(sc.nx, sc.ny, sc.nz, sc.ids, callbacks(), uint64(seed))
+    discard ignite(sim, 1, 1, 1)
+    let t = runUntilOut(sim, 20000)
+    totalT += t
+    let left = countState(sim, PLANKS)
+    if left > 0: allGone = false
+    anyLeft += left
+    echo "     seed ", seed, ": 10x5 dry plank wall burnt out in ", t, " ticks (", float64(t) / 20.0, " s), ignited=", sim.totalIgnited,
+         " burnt=", sim.totalBurnt, " planks left=", left, " stone floor intact=", countState(sim, STONE) == 14 * 3
+  let avg = totalT div 5
+  echo "     mean burnout ticks: ", avg
+  check(allGone, "dry oak-plank wall burns completely (all 5 seeds, 0 planks left)")
+  check(avg > 300 and avg < 6000, "burnout time plausible (300..6000 ticks, got mean " & $avg & ")")
+
+block:
+  var sc = wall(14, 3, 10, 5, STONE)
+  put(sc, 0, 1, 1, PLANKS)
+  put(sc, 0, 2, 1, PLANKS)
+  var sim = newFireSim(sc.nx, sc.ny, sc.nz, sc.ids, callbacks(), 7'u64)
+  check(not ignite(sim, 3, 3, 1), "a stone cell cannot be ignited")
+  discard ignite(sim, 0, 1, 1)
+  discard ignite(sim, 0, 2, 1)
+  let t = runUntilOut(sim, 20000)
+  check(countState(sim, STONE) == 10 * 5 + 14 * 3, "stone wall next to a burning plank column never burns (50 wall + 42 floor cells intact)")
+  check(countState(sim, PLANKS) == 0 and t < 3000, "the plank column beside it burns out alone (" & $t & " ticks)")
+
+# ---- 2. wind and the fire front ---------------------------------------------------------------------------------------
+proc frontSpeed(wx: float64; seeds, ticksRun: int): float64 =
+  ## mean front speed in blocks/s of a 2-high plank wall of length 58, ignited at x=1, wind (wx, 0)
+  var sum = 0.0
+  for seed in 1 .. seeds:
+    setEnv(0.0, wx, 0.0)
+    let sc = wall(60, 3, 58, 2, PLANKS)
+    var sim = newFireSim(sc.nx, sc.ny, sc.nz, sc.ids, callbacks(), uint64(100 + seed))
+    discard ignite(sim, 1, 1, 1)
+    discard ignite(sim, 1, 2, 1)
+    for t in 0 ..< ticksRun: discard step(sim, 0)
+    var front = 1
+    for x in 1 .. 58:
+      for y in 1 .. 2:
+        if isBurning(sim, x, y, 1) or stateAt(sim, x, y, 1) != PLANKS: front = x
+    sum += float64(front - 1) / (float64(ticksRun) / 20.0)
+  sum / float64(seeds)
+
+block:
+  let v0 = frontSpeed(0.0, 6, 800)
+  let vd = frontSpeed(10.0, 6, 800)
+  let vu = frontSpeed(-10.0, 6, 800)
+  echo "     front speed (blocks/s, 6 seeds, 800 ticks): wind 0 = ", v0, "  downwind 10 b/s = ", vd, "  upwind 10 b/s = ", vu
+  check(v0 > 0.02, "fire front moves without wind (" & $v0 & " b/s)")
+  check(vd > v0 * 1.3, "downwind wind pushes the front faster than no wind (" & $vd & " vs " & $v0 & ")")
+  check(vu < v0 * 0.7, "upwind wind slows the front (" & $vu & " vs " & $v0 & ")")
+  check(vd > vu * 3.0, "downwind front is more than 3x the upwind front (" & $vd & " vs " & $vu & ")")
+  setEnv(0.0, 0.0, 0.0)
+
+# ---- 3. rain -------------------------------------------------------------------------------------------------------------
+block:
+  var allOut = true
+  var allLeft = true
+  var maxTicks = 0
+  for seed in 1 .. 5:
+    setEnv(0.8, 0.0, 0.0)
+    let sc = wall(14, 3, 10, 5, PLANKS)
+    var sim = newFireSim(sc.nx, sc.ny, sc.nz, sc.ids, callbacks(), uint64(seed))
+    discard ignite(sim, 1, 1, 1)
+    let t = runUntilOut(sim, 20000)
+    let left = countState(sim, PLANKS)
+    if t >= 20000: allOut = false
+    if left < 40: allLeft = false
+    if t > maxTicks: maxTicks = t
+    echo "     seed ", seed, ": in rain (wet 0.8) the fire is out after ", t, " ticks with ", left, " of 50 planks left"
+  check(allOut and maxTicks < 3000, "rain puts the fire out (all 5 seeds, max " & $maxTicks & " ticks)")
+  check(allLeft, "in rain most of the wall (>= 40 of 50 planks) survives")
+  setEnv(1.0, 0.0, 0.0)
+  let sc = wall(14, 3, 10, 5, PLANKS)
+  var sim = newFireSim(sc.nx, sc.ny, sc.nz, sc.ids, callbacks(), 3'u64)
+  discard ignite(sim, 1, 1, 1)
+  let t = runUntilOut(sim, 20000)
+  check(t <= 40 and countState(sim, PLANKS) == 50, "submerged / touching water (wet 1.0): out at its first fire tick, " & $t & " ticks")
+  setEnv(0.0, 0.0, 0.0)
+
+# ---- 4. embers across a 3-block gap -------------------------------------------------------------------------------------
+proc emberRun(wx: float64; seed: int): bool =
+  ## leaf wall at x=2, 3 air cells (x=3..5), plank wall at x=6 (height 5): does the plank wall catch?
+  setEnv(0.0, wx, 0.0)
+  var sc = newScene(16, 8, 5)
+  ground(sc)
+  for y in 1 .. 3:
+    for z in 1 .. 3: put(sc, 2, y, z, LEAVES)
+  for y in 1 .. 5:
+    for z in 1 .. 3: put(sc, 6, y, z, PLANKS)
+  var sim = newFireSim(sc.nx, sc.ny, sc.nz, sc.ids, callbacks(), uint64(500 + seed))
+  for y in 1 .. 3: discard ignite(sim, 2, y, 2)
+  for t in 0 ..< 600: discard step(sim, 0)
+  var caught = false
+  for y in 1 .. 5:
+    for z in 1 .. 3:
+      if isBurning(sim, 6, y, z) or stateAt(sim, 6, y, z) != PLANKS: caught = true
+  caught
+
+block:
+  var down = 0
+  var up = 0
+  var calm = 0
+  for seed in 1 .. 30:
+    if emberRun(10.0, seed): inc down
+    if emberRun(-10.0, seed): inc up
+    if emberRun(0.0, seed): inc calm
+  echo "     embers over a 3-block gap, 30 seeds each: downwind(10 b/s) ", down, "/30, upwind ", up, "/30, no wind ", calm, "/30"
+  check(down >= 8, "ember hops the 3-block gap downwind in >= 8 of 30 runs (" & $down & ")")
+  check(up == 0, "no hop upwind (" & $up & " of 30)")
+  check(calm == 0, "no hop without wind (" & $calm & " of 30)")
+  setEnv(0.0, 0.0, 0.0)
+
+# ---- 5. burnt support triggers the structural solver --------------------------------------------------------------------
+proc bridgeScene(deckLen: int; middle: bool): Scene =
+  var s = newScene(deckLen + 2, 8, 3)
+  ground(s)
+  for y in 1 .. 4:
+    put(s, 0, y, 1, STONE)
+    put(s, deckLen + 1, y, 1, STONE)
+  for x in 1 .. deckLen: put(s, x, 5, 1, STONE)
+  if middle:
+    for y in 1 .. 4: put(s, (deckLen + 1) div 2, y, 1, LOG)
+  s
+
+proc gone(r: SolverResult): bool = r.broken.len > 0 or r.components.len > 0
+
+var AP = defaultAdapterParams()
+
+proc solves(s: Scene): SolverResult = solveSnapshot(s.ids, s.nx, s.ny, s.nz, AP, floorAnchor, @[])
+
+block:
+  # find the longest stone deck that stands on the pillar but not without it
+  var best = 0
+  for len in 3 .. 14:
+    let withP = gone(solves(bridgeScene(len, true)))
+    let without = gone(solves(bridgeScene(len, false)))
+    echo "     deck ", len, ": with pillar falls=", withP, "  without falls=", without
+    if (not withP) and without and len == 8: best = len
+  check(best > 0, "the 8-block deck stands on the middle log pillar but collapses without it (" & $best & ")")
+  if best > 0:
+    var sc = bridgeScene(best, true)
+    let before = solves(sc)
+    check(not gone(before), "bridge (deck " & $best & ") stands before the fire")
+    setCoal(false)
+    var sim = newFireSim(sc.nx, sc.ny, sc.nz, sc.ids, callbacks(), 11'u64)
+    let mx = (best + 1) div 2
+    for y in 1 .. 4: discard ignite(sim, mx, y, 1)
+    let t = runUntilOut(sim, 40000)
+    let rem = takeRemoved(sim)
+    echo "     pillar burnt out in ", t, " ticks, removedCells=", rem.len, ", logs left=", countState(sim, LOG)
+    check(rem.len == 4, "fire reports the 4 burnt pillar cells as removedCells (" & $rem.len & ")")
+    check(countState(sim, LOG) == 0, "all log cells burnt")
+    var after = newScene(sc.nx, sc.ny, sc.nz)
+    after.ids = sim.states
+    let r = solves(after)
+    echo "     re-solve after the fire: broken=", r.broken.len, " components=", r.components.len
+    check(gone(r), "the solver on the post-fire snapshot drops the bridge (broken or detached components)")
+    # charring: a log pillar replaced by charred blackstone keeps the bridge standing (burntState callback is honoured)
+    setCoal(true)
+    var sim2 = newFireSim(sc.nx, sc.ny, sc.nz, sc.ids, callbacks(), 11'u64)
+    for y in 1 .. 4: discard ignite(sim2, mx, y, 1)
+    discard runUntilOut(sim2, 40000)
+    var after2 = newScene(sc.nx, sc.ny, sc.nz)
+    after2.ids = sim2.states
+    echo "     char case: char=", countState(sim2, COAL), " removed=", sim2.removedCount, " logs=", countState(sim2, LOG), " solves gone=", gone(solves(after2))
+    check(countState(sim2, COAL) == 4 and sim2.removedCount == 0 and not gone(solves(after2)),
+          "burntState callback: pillar charred to charred blackstone reports no removed cells and the bridge still stands")
+    setCoal(false)
+
+# ---- 6. determinism -----------------------------------------------------------------------------------------------------
+proc forest(nx, ny, nz: int): Scene =
+  var s = newScene(nx, ny, nz)
+  ground(s)
+  var tx = 1
+  while tx < nx - 1:
+    var tz = 1
+    while tz < nz - 1:
+      for y in 1 .. 6: put(s, tx, y, tz, LOG)
+      for dy in 4 .. 8:
+        for dz in -2 .. 2:
+          for dx in -2 .. 2:
+            let x = tx + dx
+            let z = tz + dz
+            let y = 1 + dy
+            if x >= 0 and z >= 0 and x < nx and z < nz and y < ny and abs(dx) + abs(dz) + abs(dy - 6) <= 3 and s.ids[ci(s, x, y, z)] == AIR:
+              put(s, x, y, z, LEAVES)
+      tz += 4
+    tx += 4
+  s
+
+proc digest(sim: FireSim): int =
+  var h = 17
+  for i in 0 ..< sim.states.len: h = (h * 31 + sim.states[i] + i) and 0x3fffffff
+  h
+
+proc forestRun(seed: uint64; budget, ticksRun: int): (int, int, int) =
+  setEnv(0.0, 6.0, 2.0)
+  let sc = forest(20, 20, 20)
+  var sim = newFireSim(sc.nx, sc.ny, sc.nz, sc.ids, callbacks(), seed)
+  discard ignite(sim, 1, 6, 1)
+  discard ignite(sim, 1, 1, 1)
+  for t in 0 ..< ticksRun: discard step(sim, budget)
+  (digest(sim), sim.totalIgnited, sim.totalEmbers)
+
+block:
+  let a = forestRun(42'u64, 0, 1500)
+  let b = forestRun(42'u64, 0, 1500)
+  let c = forestRun(43'u64, 0, 1500)
+  echo "     forest run digests: ", a[0], " ", b[0], " other seed ", c[0], "; ignited ", a[1], " embers ", a[2]
+  check(a == b, "same seed and callbacks give an identical fire (digest, ignitions, embers)")
+  check(a[0] != c[0], "a different seed gives a different fire")
+  # budget: slicing work with a small budget never loses cells (everything still burns out eventually)
+  let sc = forest(20, 20, 20)
+  var sim = newFireSim(sc.nx, sc.ny, sc.nz, sc.ids, callbacks(), 42'u64)
+  discard ignite(sim, 1, 6, 1)
+  discard ignite(sim, 1, 1, 1)
+  var maxDone = 0
+  for t in 0 ..< 3000:
+    let d = step(sim, 5)
+    if d > maxDone: maxDone = d
+  check(maxDone <= 5, "step(budget 5) never processes more than 5 cells in a tick (max " & $maxDone & ")")
+  var eventsSeen = 0
+  var sawSmoke = false
+  var sawEmber = false
+  for e in sim.events:
+    inc eventsSeen
+    if e.kind == feSmoke: sawSmoke = true
+    if e.kind == feEmber: sawEmber = true
+  check(sawSmoke and eventsSeen <= 8192, "smoke events are produced and capped (" & $eventsSeen & " <= 8192)")
+  echo "     embers launched in the 3000-tick budgeted run: ", sim.totalEmbers, " hits ", sim.totalEmberHits, " sawEmberEvent=", sawEmber
+  setEnv(0.0, 0.0, 0.0)
+
+# ---- 7. performance -----------------------------------------------------------------------------------------------------
+block:
+  setEnv(0.0, 6.0, 2.0)
+  let sc = forest(20, 20, 20)
+  var cellsFuel = 0
+  for i in 0 ..< sc.ids.len:
+    if sc.ids[i] == LOG or sc.ids[i] == LEAVES: inc cellsFuel
+  var sim = newFireSim(sc.nx, sc.ny, sc.nz, sc.ids, callbacks(), 99'u64)
+  # ignite a spread of cells so the first 100 ticks are busy
+  var n = 0
+  for i in 0 ..< sc.ids.len:
+    if sc.ids[i] == LEAVES and i mod 17 == 0:
+      discard ignite(sim, i mod 20, i div 400, (i div 20) mod 20)
+      inc n
+  echo "     forest 20x20x20: ", cellsFuel, " fuel cells, ", n, " ignited at start"
+  var worst = 0
+  var total = 0
+  var peak = 0
+  for blockNo in 0 ..< 10:
+    let t0 = getMonoTime()
+    for t in 0 ..< 100:
+      discard step(sim, 0)
+      discard takeEvents(sim)
+    let us = int((ticks(getMonoTime()) - ticks(t0)) div 1000'i64)
+    let ms = (us + 999) div 1000
+    total += ms
+    if ms > worst: worst = ms
+    if sim.burning > peak: peak = sim.burning
+    echo "     ticks ", blockNo * 100, "..", blockNo * 100 + 99, ": ", us, " us (", ms, " ms), burning=", sim.burning, " burnt so far=", sim.totalBurnt
+  echo "     total ", total, " ms for 1000 ticks, worst 100-tick block ", worst, " ms, peak burning ", peak
+  check(worst <= 20, "performance: every 100-tick block of a 20x20x20 forest fire within 20 ms (worst " & $worst & " ms)")
+  setEnv(0.0, 0.0, 0.0)
+
+echo ""
+if failures == 0:
+  echo "ALL PASS (", checks, " checks)"
+else:
+  echo "FAILURES: ", failures, " of ", checks, " checks"
+  quit(1)
