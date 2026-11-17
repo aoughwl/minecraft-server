@@ -1,0 +1,462 @@
+## Scene tests for erosion.aowl with REAL vanilla blocks (materials.aowl on the generated block data). Prints PASS/FAIL per check
+## and "ALL PASS" (exit 0) when everything holds.
+
+{.feature: "untyped".}
+
+import std/[syncio, monotimes, math]
+import "../generated/block_properties"
+import body
+import materials
+import solver
+import solveradapter
+import blast
+import climate
+import erosion
+
+var failures = 0
+var checks = 0
+
+proc check(cond: bool, what: string) =
+  inc checks
+  if cond:
+    echo "  PASS ", what
+  else:
+    echo "  FAIL ", what
+    inc failures
+
+proc scene(name: string) = echo "SCENE ", name
+
+proc sid(name: string): int =
+  let b = Block.fromName(name)
+  if b == nil:
+    echo "FAIL unknown block ", name
+    inc failures
+    return 0
+  return int(asU16(b.defaultState.id))
+
+type Scene = object
+  nx, ny, nz: int
+  ids: seq[int]
+
+proc newScene(nx, ny, nz: int): Scene = Scene(nx: nx, ny: ny, nz: nz, ids: newSeq[int](nx * ny * nz))
+proc ci(s: Scene; x, y, z: int): int = x + s.nx * (z + s.nz * y)
+proc put(s: var Scene; x, y, z, st: int) = s.ids[ci(s, x, y, z)] = st
+
+let dirt = sid("dirt")
+let stone = sid("stone")
+let snow = sid("snow_block")
+let planks = sid("oak_planks")
+let water = sid("water")
+
+proc count(ids: seq[int]; st: int): int =
+  var n = 0
+  for v in ids:
+    if v == st: inc n
+  return n
+
+# a ramp along x: height(x) = max(1, top - x), material m, on a stone floor at y == 0. 45 degrees: one cell per column.
+proc ramp(m: int; top, nx, nz: int; slopeNum, slopeDen: int): Scene =
+  var s = newScene(nx, top + 6, nz)
+  for z in 0 ..< nz:
+    for x in 0 ..< nx:
+      put(s, x, 0, z, stone)
+      var h = top - (x * slopeNum) div slopeDen
+      if h < 1: h = 1
+      for y in 1 .. h: put(s, x, y, z, m)
+  return s
+
+proc colH(ids: seq[int]; nx, ny, nz, x, z: int): int =
+  var y = ny - 1
+  while y >= 0 and ids[x + nx * (z + nz * y)] == 0: dec y
+  return y + 1
+
+# steepest 3-column slope of the middle row, as an angle in degrees
+proc rampAngle(ids: seq[int]; nx, ny, nz: int): float64 =
+  var best = 0.0
+  let z = nz div 2
+  for x in 0 ..< nx - 3:
+    let d = float64(colH(ids, nx, ny, nz, x, z) - colH(ids, nx, ny, nz, x + 3, z)) / 3.0
+    if d > best: best = d
+  return arctan(best) * 180.0 / 3.14159265358979
+
+proc applyChanges(ids: seq[int]; nx, nz: int; ch: seq[CellChange]): seq[int] =
+  var r = ids
+  for c in ch:
+    r[c.x + nx * (c.z + nz * c.y)] = c.toState
+  return r
+
+proc runSim(sim: ErosionSim; ticks: int; budget: int): int =
+  var n = 0
+  for t in 0 ..< ticks:
+    advance(sim, 1)
+    let r = step(sim, budget)
+    inc n
+    if r.done and t > 8 and not quakeActive(sim): break
+  return n
+
+# ---- 1. dirt slumps, stone does not -----------------------------------------------------------------------------------------
+scene "1 a 45 degree dirt slope slumps below the angle of repose with exact volume conservation; stone does not"
+var dirtChanges = 0
+var dirtCells0 = 0
+block:
+  let s0 = ramp(dirt, 16, 40, 6, 1, 1)
+  dirtCells0 = count(s0.ids, dirt)
+  let a0 = rampAngle(s0.ids, s0.nx, s0.ny, s0.nz)
+  var sim = newErosionSim(s0.ids, s0.nx, s0.ny, s0.nz, 1234, defaultErosionParams())
+  let steps = relaxAll(sim, 4000, 400)
+  let o = drain(sim)
+  let a1 = rampAngle(sim.ids, s0.nx, s0.ny, s0.nz)
+  dirtChanges = o.changes.len
+  echo "     angle before ", a0, " after ", a1, " (repose 40.0), steps=", steps, " moved=", sim.movedCells, " changes=", o.changes.len,
+       " events=", o.events.len
+  check(a0 > 44.0 and a0 < 46.0, "the start slope is 45 degrees")
+  check(a1 < 40.0, "after slumping the steepest slope is below the dirt angle of repose (40 degrees)")
+  check(count(sim.ids, dirt) == dirtCells0, "dirt volume is conserved exactly")
+  check(count(sim.ids, stone) == count(s0.ids, stone), "the stone floor is untouched")
+  check(applyChanges(s0.ids, s0.nx, s0.nz, o.changes) == sim.ids, "the CellChange list reproduces the final box")
+  check(o.changes.len > 20 and o.events.len > 0, "cells moved and effect events were emitted")
+  check(sim.movedCells > 0 and steps < 400, "the relaxation terminates (done flag)")
+  let c0 = ramp(stone, 16, 40, 6, 1, 1)
+  var sim2 = newErosionSim(c0.ids, c0.nx, c0.ny, c0.nz, 1234, defaultErosionParams())
+  discard relaxAll(sim2, 4000, 50)
+  let o2 = drain(sim2)
+  check(o2.changes.len == 0 and sim2.ids == c0.ids, "a 45 degree stone slope does not move")
+
+# ---- 2. wet vs dry ------------------------------------------------------------------------------------------------------------
+scene "2 wet soil slumps more than dry soil"
+block:
+  let s0 = ramp(dirt, 16, 40, 6, 2, 3)           # 34 degrees: stable dry, unstable wet
+  var dry = newErosionSim(s0.ids, s0.nx, s0.ny, s0.nz, 7, defaultErosionParams())
+  discard relaxAll(dry, 4000, 400)
+  let od = drain(dry)
+  var wet = newErosionSim(s0.ids, s0.nx, s0.ny, s0.nz, 7, defaultErosionParams())
+  setUniformWeather(wet, 0.0, 0.0, 10.0, 1.0)
+  discard relaxAll(wet, 4000, 400)
+  let ow = drain(wet)
+  echo "     34 degree bank: dry changes=", od.changes.len, " moved=", dry.movedCells, " | wet changes=", ow.changes.len, " moved=", wet.movedCells,
+       " | final angle dry ", rampAngle(dry.ids, s0.nx, s0.ny, s0.nz), " wet ", rampAngle(wet.ids, s0.nx, s0.ny, s0.nz)
+  check(dry.movedCells == 0, "a 34 degree dry dirt bank is stable")
+  check(wet.movedCells > 10, "the same bank, saturated, slumps")
+  check(rampAngle(wet.ids, s0.nx, s0.ny, s0.nz) < 22.0, "wet dirt settles at a shallower angle (< 22 degrees)")
+  check(count(wet.ids, dirt) == count(s0.ids, dirt), "wet slump conserves volume")
+  # a 45 degree bank: wet moves more than dry
+  let s1 = ramp(dirt, 16, 40, 6, 1, 1)
+  var d1 = newErosionSim(s1.ids, s1.nx, s1.ny, s1.nz, 9, defaultErosionParams())
+  discard relaxAll(d1, 4000, 400)
+  var w1 = newErosionSim(s1.ids, s1.nx, s1.ny, s1.nz, 9, defaultErosionParams())
+  setUniformWeather(w1, 0.0, 0.0, 10.0, 1.0)
+  discard relaxAll(w1, 4000, 400)
+  let nd = drain(d1).changes.len
+  let nw = drain(w1).changes.len
+  echo "     45 degree bank: dry changes ", nd, " wet changes ", nw
+  check(nw > nd, "on a 45 degree bank the wet soil changes more cells than the dry one")
+
+# ---- 3. snow avalanche ---------------------------------------------------------------------------------------------------------
+scene "3 a snowfield avalanche triggers under a strong shake and not otherwise"
+proc snowField(num, den: int): Scene =
+  # 35 degree snow (tan 0.7: 7 cells per 10 columns), 3 deep on stone, 48 columns long
+  var s = newScene(48, 40, 6)
+  for z in 0 ..< 6:
+    for x in 0 ..< 48:
+      put(s, x, 0, z, stone)
+      var h = 34 - (x * num) div den
+      if h < 3: h = 3
+      for y in 1 .. h - 3: put(s, x, y, z, stone)
+      for y in h - 2 .. h: put(s, x, y, z, snow)
+  return s
+block:
+  let s0 = snowField(7, 10)
+  let snow0 = count(s0.ids, snow)
+  var p = defaultErosionParams()
+  p.snowStates = @[snow]
+  var calm = newErosionSim(s0.ids, s0.nx, s0.ny, s0.nz, 55, p)
+  setUniformWeather(calm, 0.0, 0.0, -8.0, 0.0)
+  discard runSim(calm, 200, 2000)
+  let oc = drain(calm)
+  echo "     calm: avalanches=", calm.avalanches, " changes=", oc.changes.len
+  check(calm.avalanches == 0 and oc.changes.len == 0, "no shake: the 35 degree snowfield stays")
+  var weak = newErosionSim(s0.ids, s0.nx, s0.ny, s0.nz, 55, p)
+  setUniformWeather(weak, 0.0, 0.0, -8.0, 0.0)
+  triggerExplosion(weak, 24.0, 20.0, 3.0, 0.06)
+  discard runSim(weak, 200, 2000)
+  echo "     weak shake (0.06 g): avalanches=", weak.avalanches
+  check(weak.avalanches == 0, "a weak shake (0.06 g) does not release it")
+  var strong = newErosionSim(s0.ids, s0.nx, s0.ny, s0.nz, 55, p)
+  setUniformWeather(strong, 0.0, 0.0, -8.0, 0.0)
+  triggerExplosion(strong, 24.0, 20.0, 3.0, 0.6)
+  discard runSim(strong, 400, 2000)
+  let os = drain(strong)
+  var bodiesCells = 0
+  for b in os.bodies: bodiesCells = bodiesCells + b.cells.len
+  echo "     strong shake (0.6 g): avalanches=", strong.avalanches, " changes=", os.changes.len, " snow cells ", snow0, " -> ", count(strong.ids, snow),
+       " (+", bodiesCells, " in bodies)"
+  check(strong.avalanches > 5, "a strong shake releases slabs")
+  check(count(strong.ids, snow) + bodiesCells == snow0, "the avalanche conserves snow exactly (flow, entrainment and deposition)")
+  var movedFar = 0
+  for c in os.changes:
+    if c.toState == snow and c.x > 30: inc movedFar
+  check(movedFar > 4, "snow was deposited downslope (x > 30)")
+  # the earthquake path: a quake close to a 37 degree field (tan 0.75: stable calm, 0.75 < 0.9)
+  let s8 = snowField(3, 4)
+  var qk = newErosionSim(s8.ids, s8.nx, s8.ny, s8.nz, 55, p)
+  setUniformWeather(qk, 0.0, 0.0, -8.0, 0.0)
+  startQuake(qk, Quake(x: 24.0, y: 10.0, z: 3.0, magnitude: 7.0, startTick: 0, duration: 300))
+  discard runSim(qk, 300, 2000)
+  echo "     M7 quake at the field: avalanches=", qk.avalanches
+  check(qk.avalanches > 5, "a magnitude 7 quake releases the 37 degree snowfield")
+  var far = newErosionSim(s8.ids, s8.nx, s8.ny, s8.nz, 55, p)
+  setUniformWeather(far, 0.0, 0.0, -8.0, 0.0)
+  startQuake(far, Quake(x: 2500.0, y: 10.0, z: 3.0, magnitude: 7.0, startTick: 0, duration: 300))
+  discard runSim(far, 300, 2000)
+  check(far.avalanches == 0, "the same quake 2500 blocks away does nothing")
+  # warm snow is less stable: a 30 degree field
+  var wp = defaultErosionParams()
+  wp.snowStates = @[snow]
+  var warmS = newErosionSim(s0.ids, s0.nx, s0.ny, s0.nz, 55, wp)
+  setUniformWeather(warmS, 0.0, 0.0, 2.0, 0.0)
+  triggerExplosion(warmS, 24.0, 20.0, 3.0, 0.08)
+  discard runSim(warmS, 200, 2000)
+  echo "     warm snow (+2 C) with the weak 0.08 g shake: avalanches=", warmS.avalanches
+  check(warmS.avalanches > 0, "warm, wet snow releases under the shake that cold snow survives")
+
+# ---- 4. earthquake vs plank bridge -------------------------------------------------------------------------------------------
+scene "4 a magnitude 7 quake cracks a plank bridge near the epicentre (the solver drops it); the same bridge far away stands"
+const BridgeLen = 16
+proc bridgeScene(): Scene =
+  var s = newScene(BridgeLen + 2, 12, 5)
+  for z in 0 ..< 5:
+    for x in 0 ..< BridgeLen + 2: put(s, x, 0, z, stone)
+  for y in 1 .. 4:
+    put(s, 1, y, 2, planks)
+    put(s, BridgeLen, y, 2, planks)
+  for x in 1 .. BridgeLen: put(s, x, 5, 2, planks)
+  return s
+
+proc fallen(s: Scene; q: Quake): (int, int) =
+  var P = defaultAdapterParams()
+  var inp = snapshotToSolverInput(s.ids, s.nx, s.ny, s.nz, P, floorAnchor)
+  let r = quakeCracks(s.ids, s.nx, s.ny, s.nz, q, 99)
+  let added = applyBlastToSolverInput(inp, r)
+  let after = solve(inp, adapterSolverParams())
+  var n = 0
+  for comp in after.components:
+    for c in comp.cells:
+      if s.ids[c] == planks: inc n
+  for b in after.broken:
+    if s.ids[b.cell] == planks: inc n
+  return (n, r.cracked.len)
+block:
+  let s = bridgeScene()
+  var P = defaultAdapterParams()
+  let before = solveSnapshot(s.ids, s.nx, s.ny, s.nz, P, floorAnchor, @[])
+  check(before.broken.len == 0 and before.components.len == 0, "control: the intact bridge stands")
+  let near = Quake(x: 9.0, y: -8.0, z: 2.0, magnitude: 7.0, startTick: 0, duration: 300)
+  let (nNear, crNear) = fallen(s, near)
+  echo "     M7 epicentre 8 blocks below the bridge: cracked cells=", crNear, " planks fallen/broken=", nNear
+  check(crNear > 10, "the quake cracks many bridge cells near the epicentre")
+  check(nNear >= 6, "the solver drops the span (>= 6 plank cells broken or detached)")
+  let farQ = Quake(x: 509.0, y: -8.0, z: 2.0, magnitude: 7.0, startTick: 0, duration: 300)
+  let (nFar, crFar) = fallen(s, farQ)
+  echo "     M7 epicentre 500 blocks away: cracked cells=", crFar, " planks fallen/broken=", nFar, "  (a(500) = ", quakeAccel(7.0, 500.0), " g)"
+  check(nFar == 0, "the same bridge 500 blocks from the epicentre stands")
+  let (nMid, crMid) = fallen(s, Quake(x: 9.0, y: -8.0, z: 2.0, magnitude: 5.0, startTick: 0, duration: 100))
+  echo "     M5 at the same spot: cracked=", crMid, " fallen=", nMid
+  check(nMid == 0, "a magnitude 5 quake at the same place does not drop it")
+  var P2 = defaultAdapterParams()
+  let rr = quakeCracks(s.ids, s.nx, s.ny, s.nz, near, 99)
+  var asc = true
+  var prev = -1
+  var ok = true
+  for cc in rr.cracked:
+    if cc.cell <= prev: asc = false
+    prev = cc.cell
+    if cc.mult < 0.05 or cc.mult > 0.95: ok = false
+  check(asc and ok, "cracked cells ascend and multipliers lie in 0.05..0.95 (blast.aowl convention)")
+  check(rr.destroyed.len == 0 and rr.done, "a BlastResult with only cracked cells")
+  check(quakeAccel(7.0, 0.0) > 0.17 and quakeAccel(7.0, 0.0) < 0.19, "a(M7, 0) = 0.18 g")
+
+# ---- 4b. quake triggers slumps -------------------------------------------------------------------------------------------------
+scene "4b a quake slumps a stable dry bank (34 degrees) near the epicentre only"
+block:
+  let s0 = ramp(dirt, 16, 40, 6, 2, 3)
+  var near = newErosionSim(s0.ids, s0.nx, s0.ny, s0.nz, 21, defaultErosionParams())
+  startQuake(near, Quake(x: 20.0, y: 0.0, z: 3.0, magnitude: 7.0, startTick: 0, duration: 300))
+  discard runSim(near, 300, 4000)
+  var far = newErosionSim(s0.ids, s0.nx, s0.ny, s0.nz, 21, defaultErosionParams())
+  startQuake(far, Quake(x: 3000.0, y: 0.0, z: 3.0, magnitude: 7.0, startTick: 0, duration: 300))
+  discard runSim(far, 300, 4000)
+  echo "     moved near=", near.movedCells, " far=", far.movedCells
+  check(near.movedCells > 20 and count(near.ids, dirt) == count(s0.ids, dirt), "the quake slumps the bank, volume conserved")
+  check(far.movedCells == 0, "the distant quake leaves it alone")
+
+# ---- 5. determinism -----------------------------------------------------------------------------------------------------------
+scene "5 deterministic for a seed"
+block:
+  let s0 = ramp(dirt, 16, 24, 8, 1, 1)
+  var a = newErosionSim(s0.ids, s0.nx, s0.ny, s0.nz, 31337, defaultErosionParams())
+  var b = newErosionSim(s0.ids, s0.nx, s0.ny, s0.nz, 31337, defaultErosionParams())
+  var c = newErosionSim(s0.ids, s0.nx, s0.ny, s0.nz, 31338, defaultErosionParams())
+  discard relaxAll(a, 500, 400)
+  discard relaxAll(b, 500, 400)
+  discard relaxAll(c, 500, 400)
+  let oa = drain(a)
+  let ob = drain(b)
+  check(a.ids == b.ids and oa.changes.len == ob.changes.len and a.movedCells == b.movedCells, "same seed: identical result")
+  var same = oa.changes.len == ob.changes.len
+  if same:
+    for i in 0 ..< oa.changes.len:
+      if oa.changes[i].x != ob.changes[i].x or oa.changes[i].y != ob.changes[i].y or oa.changes[i].z != ob.changes[i].z or
+         oa.changes[i].toState != ob.changes[i].toState: same = false
+  check(same, "same seed: identical CellChange lists")
+  check(a.ids != c.ids, "a different seed gives a different arrangement")
+  check(count(c.ids, dirt) == count(s0.ids, dirt), "and still conserves volume")
+  let q1 = quakesInWindow(5, 0, 2400000, 0.0, 0.0, 1000.0, 1000.0, 63.0, 0.1)
+  let q2 = quakesInWindow(5, 0, 2400000, 0.0, 0.0, 1000.0, 1000.0, 63.0, 0.1)
+  var qsame = q1.len == q2.len and q1.len > 3
+  var maxM = 0.0
+  if qsame:
+    for i in 0 ..< q1.len:
+      if q1[i].x != q2[i].x or q1[i].magnitude != q2[i].magnitude or q1[i].startTick != q2[i].startTick: qsame = false
+      if q1[i].magnitude > maxM: maxM = q1[i].magnitude
+  echo "     seeded schedule: ", q1.len, " quakes in 200 epochs at chance 0.1, strongest M", maxM
+  check(qsame, "the seeded quake schedule is reproducible")
+  check(quakesInWindow(5, 0, 2400000, 0.0, 0.0, 1000.0, 1000.0, 63.0, 0.0).len == 0, "chance 0 (the default off switch): no quakes")
+
+# ---- 6. slab -> body ----------------------------------------------------------------------------------------------------------
+scene "6 a large coherent slab leaves as a BodyRequest"
+block:
+  var s = newScene(24, 14, 14)
+  for z in 0 ..< 14:
+    for x in 0 ..< 24:
+      put(s, x, 0, z, stone)
+      if x < 12:
+        for y in 1 .. 7: put(s, x, y, z, dirt)
+      else:
+        put(s, x, 1, z, dirt)
+  let d0 = count(s.ids, dirt)
+  var sim = newErosionSim(s.ids, s.nx, s.ny, s.nz, 4, defaultErosionParams())
+  discard relaxAll(sim, 4000, 600)
+  let o = drain(sim)
+  var inBodies = 0
+  for b in o.bodies: inBodies = inBodies + b.cells.len
+  echo "     bodies=", o.bodies.len, " cells in bodies=", inBodies, " dirt ", d0, " -> ", count(sim.ids, dirt), " + ", inBodies
+  check(o.bodies.len >= 1 and inBodies >= 32, "a cliff edge produced a BodyRequest of >= 32 cells")
+  check(count(sim.ids, dirt) + inBodies == d0, "volume is conserved including the body cells")
+  if o.bodies.len > 0:
+    let b = o.bodies[0]
+    check(b.vx > 0.1 and abs(b.vz) < 0.01, "the slab moves downslope (+x) at about 0.15 blocks/tick")
+    let bd = bodyFromCells(1'u64, 2'u64, b.cells)
+    check(bd.cellCount() == b.cells.len, "body.aowl accepts the cell list")
+
+var gTk = 0.0
+proc climSample(wx, wz: float64): (float64, float64, float64) =
+  let c2 = climateAt(20240607, gTk, wx, 63.0, wz)
+  return (c2.rain, c2.snow, c2.temp)
+
+# ---- 7. rain erosion ----------------------------------------------------------------------------------------------------------
+scene "7 rain erosion is very slow by default and moves sediment downhill when raised"
+block:
+  let s0 = ramp(dirt, 14, 30, 6, 1, 2)         # 27 degree bank, stable against slumping
+  var slow = newErosionSim(s0.ids, s0.nx, s0.ny, s0.nz, 3, defaultErosionParams())
+  setUniformWeather(slow, 1.0, 0.0, 10.0, 0.0)
+  var t = 0
+  while t < 24000:
+    advance(slow, 200)
+    discard step(slow, 4000)
+    t = t + 200
+  let moved1 = slow.movedCells
+  echo "     default rate, one day of heavy rain: ", moved1, " cells of ", count(s0.ids, dirt), " moved"
+  check(moved1 < count(s0.ids, dirt) div 20, "default erosion over a rainy day moves < 5 percent of the dirt")
+  var p = defaultErosionParams()
+  p.erodeRate = 5.0e-4
+  var fast = newErosionSim(s0.ids, s0.nx, s0.ny, s0.nz, 3, p)
+  setUniformWeather(fast, 1.0, 0.0, 10.0, 0.0)
+  t = 0
+  while t < 24000:
+    advance(fast, 200)
+    discard step(fast, 4000)
+    t = t + 200
+  let o = drain(fast)
+  echo "     raised rate: moved=", fast.movedCells, " changes=", o.changes.len
+  check(fast.movedCells > moved1 * 10 and fast.movedCells > 50, "a raised rate erodes much more")
+  check(count(fast.ids, dirt) == count(s0.ids, dirt), "erosion conserves sediment")
+  # sediment goes down and lands: the bank top lowered, the toe raised
+  check(colH(fast.ids, s0.nx, s0.ny, s0.nz, 1, 3) < colH(s0.ids, s0.nx, s0.ny, s0.nz, 1, 3), "the bank top lost height")
+  check(colH(fast.ids, s0.nx, s0.ny, s0.nz, 29, 3) > colH(s0.ids, s0.nx, s0.ny, s0.nz, 29, 3), "the foot of the bank gained a deposit")
+  # a climate sampler (climate.aowl) feeds rain and wetness
+  var cs = newErosionSim(s0.ids, s0.nx, s0.ny, s0.nz, 3, defaultErosionParams())
+  var anyRain = 0.0
+  var tk = 0.0
+  var hit = false
+  while tk < 2400000.0 and not hit:
+    let cl = climateAt(20240607, tk, 0.0, 63.0, 0.0)
+    if cl.rain > 0.3:
+      hit = true
+      gTk = tk
+      fillClimate(cs, climSample, 4, 1200)
+      anyRain = cs.rain[0]
+    tk = tk + 1200.0
+  check(hit and anyRain > 0.3 and cs.wet[0] >= anyRain - 1e-9 and cs.wet[0] <= 1.0, "fillClimate takes rain and wetness from climate.aowl")
+
+# ---- 8. performance -----------------------------------------------------------------------------------------------------------
+scene "8 performance: a 64^3 box"
+proc hnoise(x, z: int): int =
+  # sum of a few sines, 12..44 high, bumpy enough to slump
+  let fx = float64(x)
+  let fz = float64(z)
+  let v = 28.0 + 9.0 * sin(fx * 0.21) * cos(fz * 0.17) + 6.0 * sin(fx * 0.53 + fz * 0.31) + 3.0 * cos(fx * 0.9 - fz * 1.1)
+  return int(v)
+block:
+  var s = newScene(64, 64, 64)
+  for z in 0 ..< 64:
+    for x in 0 ..< 64:
+      let h = hnoise(x, z)
+      for y in 0 ..< h:
+        if y < h - 6: put(s, x, y, z, stone)
+        else: put(s, x, y, z, dirt)
+  let d0 = count(s.ids, dirt)
+  var p = defaultErosionParams()
+  p.snowStates = @[snow]
+  let t0 = getMonoTime()
+  var sim = newErosionSim(s.ids, 64, 64, 64, 77, p)
+  let tBuild = (ticks(getMonoTime()) - ticks(t0)) div 1000'i64
+  setUniformWeather(sim, 0.2, 0.0, 10.0, 0.5)
+  var worst = 0'i64
+  var total = 0'i64
+  var nsteps = 0
+  var movedTotal = 0
+  while nsteps < 2000:
+    advance(sim, 1)
+    let t1 = getMonoTime()
+    let r = step(sim, 2000)
+    let us = (ticks(getMonoTime()) - ticks(t1)) div 1000'i64
+    if us > worst: worst = us
+    total = total + us
+    movedTotal = movedTotal + r.moved
+    inc nsteps
+    if r.done: break
+  let o = drain(sim)
+  echo "     build ", tBuild, " us; ", nsteps, " steps of budget 2000 ops: total ", total div 1000, " ms, worst step ", worst, " us, moved ", sim.movedCells,
+       " cells, changes ", o.changes.len, " bodies ", o.bodies.len
+  var inB = 0
+  for b in o.bodies: inB = inB + b.cells.len
+  check(count(sim.ids, dirt) + inB == d0, "64^3: conservation holds")
+  check(worst < 20000, "64^3: a 2000-op step takes < 20 ms")
+  check(tBuild < 500000, "64^3: building the sim (262144 cells) takes < 500 ms")
+  # idle step cost
+  var worstIdle = 0'i64
+  for i in 0 ..< 50:
+    advance(sim, 1)
+    let t2 = getMonoTime()
+    discard step(sim, 2000)
+    let us = (ticks(getMonoTime()) - ticks(t2)) div 1000'i64
+    if us > worstIdle: worstIdle = us
+  echo "     idle step (settled, rain on, no snow): worst ", worstIdle, " us"
+  check(worstIdle < 5000, "64^3: an idle step (settled terrain, environment pass only) takes < 5 ms")
+
+echo ""
+if failures == 0:
+  echo "ALL PASS (", checks, " checks)"
+else:
+  echo failures, " FAILED of ", checks
+  quit(1)

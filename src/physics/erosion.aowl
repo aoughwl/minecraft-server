@@ -1,0 +1,1048 @@
+## Erosion, landslides, avalanches and earthquakes (server physics goal item 14): an OPTIONAL, SEEDED, BUDGETED terrain-change model.
+## PURE: imports only std/math, body (Cell), materials (state classification), blast (BlastResult, the cracked-cell convention).
+## No world, entity or server state: the caller hands over a block-state SNAPSHOT (dense box, index = x + nx*(z + nz*y), y slowest,
+## the solver's layout) and gets lists back, so a sim can run on a worker thread. Column index c = x + nx*z, cell = c + nx*nz*y.
+##
+## OUTPUT (drain): CellChange{x,y,z,fromState,toState} (box-local, NET change since the last drain: a cell that moved away and was
+## refilled with the same state is not reported), BodyRequest (a coherent slab of >= bodyMinCells cells that left the terrain as one
+## rigid mass: spawn it with body.aowl bodyFromCells; the cells are already removed from the box) and EffectEvent (dust/rumble/quake).
+## VOLUME IS CONSERVED EXACTLY by landslides and avalanches: every move takes one cell from a column top and puts the same state on
+## another column top (or into a BodyRequest). Only snow melt/accumulation and erosion into a body request change the cell count,
+## and erosion/landslides themselves never do.
+##
+## MODEL (a column heightfield H[c] = 1 + y of the highest solid cell; fluid and foliage do not count; overhangs and caves are ignored)
+## CLASSES, per state id from materials.materialOf: mcGranular -> granular (dirt, sand, gravel, clay, ...); mcSoft -> soft (only when
+##   the run of soft cells on top rests on granular or rock: leaf canopies on logs never slump); the caller's `snowStates` -> snow
+##   (handled by the avalanche code only); mcRock -> rock; everything else solid; mcVoid and mcFoliage empty; mcFluid fluid.
+## 1 LANDSLIDE. Stability is judged over a span of K = 3 columns (an integer lattice cannot hold a 40 degree slope otherwise):
+##   column c is unstable toward a direction when H[c] - min(H[c+d], H[c+2d], H[c+3d]) >= max(2, floor(3 * tanEff) + 1).
+##   tanEff = tanRepose * (1 - wetK * wet) - shakeK * shake   (floor 0.05)
+##   tanRepose: granular 0.84 (40 deg), soft 1.40 (54 deg). wet 0..1 (per column, from rain: see fillClimate), wetK granular 0.55,
+##   soft 0.30 (saturated dirt: 0.38 -> a stable run of <= 1 cell per 3 columns, 18 deg; dry dirt <= 2 per 3: 34 deg).
+##   shake = ground acceleration in g (quake + explosion), shakeK 1.0 (the pseudo-static slope stability: tan(phi) - a).
+##   The top cell moves to the lowest column of the span (nearest wins). A move needs a drop >= 2, so sum(H^2) strictly falls and the
+##   relaxation terminates. Cells never leave the box. Work: a seeded-shuffled dirty-column queue; a move re-queues the 12 columns
+##   within 3 of the source and the target. One examination of one column = 1 op; step(sim, budget) stops at the budget.
+##   SLABS: before relaxing, mobile-topped columns standing >= slabDiff (3) above a neighbour start a breadth-first cluster of
+##   same-height columns up to slabDepth (3) columns inland; the top slabThick (2) cells of a cluster of >= bodyMinCells (32) cells
+##   leave as one BodyRequest with a downslope velocity of slabSpeed (0.15) blocks/tick instead of cell by cell.
+## 2 AVALANCHE. A snow column (top cells in snowStates, depth >= avalMinDepth 2) with slope tanS = (H[c] - H[c+4d]) / 4 (steepest of
+##   4 directions) releases a slab of slabDepth (2) cells when
+##       tanS >= avalMinTan (0.45) and tanS * (1 + 0.6 * snowfall) > snowTan * (1 - 0.4 * warm) - snowShakeK * shake   (snowShakeK 1.5)
+##   snowTan 0.90 (42 deg), warm = clamp((temp + 5) / 5, 0, 1), snowfall = climate snow 0..1, shake as above (earthquake, explosion
+##   triggerExplosion). The released mass is a PACKET walking down the steepest neighbour (with momentum over flats while v > 0.6):
+##   v += 0.5 * (drop - 0.30) per column (0.30 = flow friction tan 17 deg), v *= 0.95; it ENTRAINS one snow cell per column from the
+##   column it crosses while v >= 0.4 (leaving >= 1 cell, carry <= 96), drops one cell per step when v < 0.3 and the rest at stop
+##   (v <= 0, a local minimum, the box edge or 400 steps), each cell on the lowest of the column and its 4 neighbours.
+##   Slab steepening re-triggers upslope columns on later scans (retrogressive failure); at most 4096 live packets.
+## 3 EROSION (environment pass, ring cursor, `envPerStep` columns per step). Exposed granular tops with rain > 0.05 accumulate
+##   erodeRate * dt * rain * (0.2 + steepest drop) cells (default erodeRate 1e-5: 1 cell per ~4 game days of heavy rain on a 45
+##   degree bank, "very low"), at >= 1 the top cell is carried down steepest descent (<= 32 columns) and deposited at the first
+##   column with no lower neighbour (flats, pits, river beds: a cell may also land in water). Snow: climate snowfall at temp <
+##   0.5 adds one snow cell of snowStates[0] per 1/(snowRate*snowfall) ticks (default snowRate 2e-5), temp > 1 melts the top snow cell
+##   at meltRate (4e-5 per degree per tick). Both default ON only when snowStates is non-empty and a climate was filled.
+## 4 EARTHQUAKES. Quake{x,y,z world epicentre/hypocentre, magnitude, startTick, duration}. Peak ground acceleration in g at 3D
+##   distance r: a0(M) = 0.06 exp(0.55 (M - 5)) (M5 0.06, M7 0.18, M8 0.31), a(r) = a0 / (1 + (r / rc)^2), rc = 8 * 10^(0.3 (M - 5))
+##   blocks (M7 32). Envelope over the duration: ramp up 15 %, then (1-t)^0.8; +-25 % seeded noise per column per 3 ticks. advance()
+##   writes it to the shake field, step() relaxes columns it destabilises and the avalanche scan sees it.
+##   quakeCracks(ids, ..., quake, params) -> BlastResult (cracked only), the SAME convention as blast.aowl:
+##   applyBlastToSolverInput(inp, result) turns it into weaker solver materials; the caller then re-runs the structural solver.
+##   Per cell: a = a(r) * amp * jitter * durF, amp 1.5 when the cell below is empty (decks, overhangs, cantilevers), jitter 0.85..1.15
+##   per cell (seeded hash), durF = clamp(0.5 + duration / 400, 0.5, 1.2); fragility wood 1.0, generic 1.2, rock 0.9, others 0
+##   (granular and soft ground slump instead). D = frag * clamp((a - 0.05) / 0.10, 0, 1); mult = max(0.05, 1 - 0.9 D), reported when
+##   mult <= 0.95. Seeded schedule: quakesInWindow (12000-tick epochs, Gutenberg-Richter b = 1, M = 4.5 + log10(1/u)).
+## DETERMINISM: splitmix64 seeded by the seed; ascending iteration; same inputs and seed -> same outputs.
+
+import std/math
+import body
+import materials
+import blast
+
+const
+  PkEmpty* = 0
+  PkFluid* = 1
+  PkGran* = 2
+  PkSoft* = 3
+  PkSnow* = 4
+  PkRock* = 5
+  PkSolid* = 6
+  SpanK = 3
+  SnowSpan = 4
+
+type
+  CellChange* = object
+    x*, y*, z*: int
+    fromState*, toState*: int
+
+  BodyRequest* = object
+    ox*, oy*, oz*: int            ## box-local position of the body-local origin (min corner of the cells)
+    cells*: seq[Cell]             ## body.Cell, body-local coordinates
+    vx*, vy*, vz*: float64        ## initial velocity, blocks/tick
+    kind*: int                    ## 0 landslide slab
+
+  EffectKind* = enum efSlump, efAvalanche, efErosion, efQuake, efRumble
+
+  EffectEvent* = object
+    kind*: EffectKind
+    x*, y*, z*: float64           ## box-local
+    intensity*: float64
+    count*: int                   ## cells involved
+
+  Quake* = object
+    x*, y*, z*: float64           ## WORLD hypocentre
+    magnitude*: float64
+    startTick*, duration*: int
+
+  ErosionParams* = object
+    snowStates*: seq[int]         ## block-state ids that are snow cover (snowStates[0] is placed by accumulation)
+    tanGranular*, tanSoft*: float64
+    wetKGranular*, wetKSoft*: float64
+    shakeK*: float64
+    snowShakeK*: float64          ## snow slabs are more shake sensitive than soil
+    slabDiff*, slabDepth*, slabThick*, bodyMinCells*: int
+    slabSpeed*: float64
+    snowTan*, avalMinTan*: float64
+    avalMinDepth*, avalSlab*: int
+    flowMu*: float64
+    maxPackets*: int
+    scanPerStep*: int             ## avalanche scan columns per step
+    envPerStep*: int              ## environment (erosion, snow) columns per step
+    erodeRate*: float64
+    snowRate*, meltRate*: float64
+    wetDecayTicks*: float64       ## wetness e-folding time after rain stops
+    originX*, originY*, originZ*: float64   ## world position of box cell (0,0,0): quakes are in world coordinates
+
+  Packet = object
+    x, z, dx, dz: int
+    v: float64
+    carry: int
+    st: int
+    life: int
+
+  ErosionSim* = ref object
+    nx*, ny*, nz*, nxz*: int
+    ids*: seq[int]
+    base: seq[int]
+    touchedFlag: seq[bool]
+    touched: seq[int]
+    p*: ErosionParams
+    rng: uint64
+    seed: int
+    tick*: int
+    prof: seq[int8]
+    top: seq[int]
+    wet*, rain*, temp*, snowfall*: seq[float64]
+    qa*, ta*: seq[float64]
+    acc, sacc, macc: seq[float64]
+    lastEnv: seq[int]
+    queue: seq[int]
+    qhead: int
+    inQ: seq[bool]
+    quakes*: seq[Quake]
+    quakeLive: bool
+    scanCursor, envCursor: int
+    packets: seq[Packet]
+    bodies: seq[BodyRequest]
+    evKind: seq[int]
+    evCells: seq[int]
+    evPos: seq[int]
+    slabPending: bool
+    climateFilled: bool
+    movedCells*: int64
+    avalanches*: int
+    ops*: int64
+
+  ErosionOutput* = object
+    changes*: seq[CellChange]
+    bodies*: seq[BodyRequest]
+    events*: seq[EffectEvent]
+
+  StepInfo* = object
+    ops*: int
+    done*: bool          ## no queued work, no live packets (the environment pass is a standing duty and not counted)
+    moved*: int
+
+proc defaultErosionParams*(): ErosionParams =
+  ErosionParams(snowStates: @[], tanGranular: 0.84, tanSoft: 1.40, wetKGranular: 0.55, wetKSoft: 0.30, shakeK: 1.0, snowShakeK: 1.5,
+                slabDiff: 3, slabDepth: 3, slabThick: 2, bodyMinCells: 32, slabSpeed: 0.15,
+                snowTan: 0.90, avalMinTan: 0.45, avalMinDepth: 2, avalSlab: 2, flowMu: 0.30, maxPackets: 4096,
+                scanPerStep: 512, envPerStep: 256, erodeRate: 1.0e-5, snowRate: 2.0e-5, meltRate: 4.0e-5,
+                wetDecayTicks: 6000.0, originX: 0.0, originY: 0.0, originZ: 0.0)
+
+# ---------------------------------------------------------------------------------------------------------------------
+# helpers
+
+proc nextU64(s: var uint64): uint64 =
+  s = s + 0x9E3779B97F4A7C15'u64
+  var z = s
+  z = (z xor (z shr 30)) * 0xBF58476D1CE4E5B9'u64
+  z = (z xor (z shr 27)) * 0x94D049BB133111EB'u64
+  return z xor (z shr 31)
+
+proc nextF(s: var uint64): float64 = float64(nextU64(s) shr 11) / 9007199254740992.0
+
+proc hashU(seed: int, a, b, c: int): float64 =
+  var s = uint64(seed) * 0x9E3779B97F4A7C15'u64 + uint64(a) * 0xD1B54A32D192ED03'u64 + uint64(b) * 0x8CB92BA72F3D8DD7'u64 +
+          uint64(c) * 0xA0761D6478BD642F'u64
+  return nextF(s)
+
+proc clampf(x, lo, hi: float64): float64 =
+  if x < lo: return lo
+  if x > hi: return hi
+  return x
+
+proc kindOfClass(c: MatClass): int =
+  case c
+  of mcVoid, mcFoliage: PkEmpty
+  of mcFluid: PkFluid
+  of mcGranular: PkGran
+  of mcSoft: PkSoft
+  of mcRock: PkRock
+  else: PkSolid
+
+proc kindOf(s: ErosionSim, id: int): int =
+  if id < 0: return PkEmpty
+  if id >= s.prof.len:
+    let old = s.prof.len
+    s.prof.setLen(id + 1)
+    for i in old ..< s.prof.len: s.prof[i] = int8(-1)
+  let k = int(s.prof[id])
+  if k >= 0: return k
+  var r = kindOfClass(materialOf(id).matClass)
+  for sn in s.p.snowStates:
+    if sn == id: r = PkSnow
+  s.prof[id] = int8(r)
+  return r
+
+proc cellIdx(s: ErosionSim, c, y: int): int = c + s.nxz * y
+
+proc kindAt(s: ErosionSim, c, y: int): int = kindOf(s, s.ids[c + s.nxz * y])
+
+proc recomputeTop(s: ErosionSim, c: int, fromY: int) =
+  var y = fromY
+  if y >= s.ny: y = s.ny - 1
+  while y >= 0:
+    let k = kindAt(s, c, y)
+    if k != PkEmpty and k != PkFluid: break
+    dec y
+  s.top[c] = y + 1
+
+proc touch(s: ErosionSim, i: int) =
+  if not s.touchedFlag[i]:
+    s.touchedFlag[i] = true
+    s.touched.add i
+
+proc putCell(s: ErosionSim, c, y, st: int) =
+  let i = c + s.nxz * y
+  touch(s, i)
+  s.ids[i] = st
+
+proc removeTop(s: ErosionSim, c: int): int =
+  let y = s.top[c] - 1
+  let st = s.ids[c + s.nxz * y]
+  putCell(s, c, y, 0)
+  recomputeTop(s, c, y)
+  return st
+
+proc placeOn(s: ErosionSim, c, st: int): bool =
+  let y = s.top[c]
+  if y >= s.ny: return false
+  let k = kindAt(s, c, y)
+  if k != PkEmpty and k != PkFluid: return false
+  putCell(s, c, y, st)
+  s.top[c] = y + 1
+  return true
+
+proc enqueue(s: ErosionSim, c: int) =
+  if c >= 0 and c < s.nxz and not s.inQ[c]:
+    s.inQ[c] = true
+    s.queue.add c
+
+proc enqueueAround(s: ErosionSim, c: int) =
+  let x = c mod s.nx
+  let z = c div s.nx
+  enqueue(s, c)
+  for k in 1 .. SpanK:
+    if x - k >= 0: enqueue(s, c - k)
+    if x + k < s.nx: enqueue(s, c + k)
+    if z - k >= 0: enqueue(s, c - k * s.nx)
+    if z + k < s.nz: enqueue(s, c + k * s.nx)
+
+proc evAdd(s: ErosionSim, kind, c, cells: int) =
+  # aggregate per 8x8 patch and kind
+  let patch = (c mod s.nx) div 8 + ((c div s.nx) div 8) * 1000
+  for i in 0 ..< s.evKind.len:
+    if s.evKind[i] == kind and s.evPos[i] == patch:
+      s.evCells[i] = s.evCells[i] + cells
+      return
+  s.evKind.add kind
+  s.evPos.add patch
+  s.evCells.add cells
+
+# ---------------------------------------------------------------------------------------------------------------------
+# construction
+
+proc newErosionSim*(ids: seq[int], nx, ny, nz: int, seed: int, p: ErosionParams): ErosionSim =
+  var s = ErosionSim(nx: nx, ny: ny, nz: nz, nxz: nx * nz, ids: ids, base: ids, p: p, seed: seed, rng: uint64(seed) xor 0x5DEECE66D'u64)
+  let n = nx * nz
+  s.touchedFlag = newSeq[bool](nx * ny * nz)
+  s.touched = @[]
+  s.top = newSeq[int](n)
+  s.wet = newSeq[float64](n)
+  s.rain = newSeq[float64](n)
+  s.temp = newSeq[float64](n)
+  s.snowfall = newSeq[float64](n)
+  s.qa = newSeq[float64](n)
+  s.ta = newSeq[float64](n)
+  s.acc = newSeq[float64](n)
+  s.sacc = newSeq[float64](n)
+  s.macc = newSeq[float64](n)
+  s.lastEnv = newSeq[int](n)
+  s.inQ = newSeq[bool](n)
+  s.queue = @[]
+  s.prof = @[]
+  s.quakes = @[]
+  s.packets = @[]
+  s.bodies = @[]
+  s.slabPending = true
+  for c in 0 ..< n:
+    s.temp[c] = -5.0
+    recomputeTop(s, c, ny - 1)
+  # seeded shuffle of the initial dirty list
+  var order = newSeq[int](n)
+  for c in 0 ..< n: order[c] = c
+  var i = n - 1
+  while i > 0:
+    let j = int(nextU64(s.rng) mod uint64(i + 1))
+    let t = order[i]
+    let tj = order[j]
+    order[i] = tj
+    order[j] = t
+    dec i
+  for c in order: enqueue(s, c)
+  return s
+
+proc topKind(s: ErosionSim, c: int): int =
+  let h = s.top[c]
+  if h <= 0: return PkEmpty
+  return kindAt(s, c, h - 1)
+
+proc shakeAt*(s: ErosionSim, c: int): float64 = s.qa[c] + s.ta[c]
+
+## True while a quake is still shaking (the caller keeps stepping).
+proc quakeActive*(s: ErosionSim): bool = s.quakeLive
+
+## Is the top cell of column c free to slide, and with which repose tangent.
+proc mobileTan(s: ErosionSim, c: int): float64 =
+  let h = s.top[c]
+  if h <= 0: return -1.0
+  let k = kindAt(s, c, h - 1)
+  var tn = -1.0
+  if k == PkGran:
+    tn = s.p.tanGranular * (1.0 - s.p.wetKGranular * s.wet[c])
+  elif k == PkSoft:
+    var y = h - 1
+    var n = 0
+    while y >= 0 and kindAt(s, c, y) == PkSoft and n < 8:
+      dec y
+      inc n
+    if y < 0: return -1.0
+    let bk = kindAt(s, c, y)
+    if bk != PkGran and bk != PkRock: return -1.0
+    tn = s.p.tanSoft * (1.0 - s.p.wetKSoft * s.wet[c])
+  else:
+    return -1.0
+  tn = tn - s.p.shakeK * shakeAt(s, c)
+  if tn < 0.05: tn = 0.05
+  return tn
+
+# ---------------------------------------------------------------------------------------------------------------------
+# slabs (BodyRequest)
+
+proc dirX(d: int): int =
+  if d == 0: return 1
+  if d == 1: return -1
+  return 0
+proc dirZ(d: int): int =
+  if d == 2: return 1
+  if d == 3: return -1
+  return 0
+
+proc neighbour(s: ErosionSim, c, d: int): int =
+  let x = c mod s.nx + dirX(d)
+  let z = c div s.nx + dirZ(d)
+  if x < 0 or x >= s.nx or z < 0 or z >= s.nz: return -1
+  return x + s.nx * z
+
+proc cliffAt(s: ErosionSim, c: int): int =
+  var best = 0
+  for d in 0 .. 3:
+    let n = neighbour(s, c, d)
+    if n >= 0:
+      let df = s.top[c] - s.top[n]
+      if df > best: best = df
+  return best
+
+proc scanSlabs(s: ErosionSim) =
+  if s.p.bodyMinCells <= 0: return
+  var seen = newSeq[bool](s.nxz)
+  for c0 in 0 ..< s.nxz:
+    if seen[c0]: continue
+    if mobileTan(s, c0) < 0.0: continue
+    if cliffAt(s, c0) < s.p.slabDiff: continue
+    # phase 1: the connected run of edge columns (mobile top, cliff >= slabDiff, similar height); phase 2: breadth-first inland
+    var cl: seq[int] = @[c0]
+    var dist: seq[int] = @[0]
+    seen[c0] = true
+    var qi = 0
+    while qi < cl.len:
+      let c = cl[qi]
+      inc qi
+      for d in 0 .. 3:
+        let n = neighbour(s, c, d)
+        if n < 0 or seen[n]: continue
+        if mobileTan(s, n) < 0.0 or cliffAt(s, n) < s.p.slabDiff: continue
+        let dh = s.top[n] - s.top[c0]
+        if dh > 1 or dh < -1: continue
+        seen[n] = true
+        cl.add n
+        dist.add 0
+    qi = 0
+    while qi < cl.len:
+      let c = cl[qi]
+      let dd = dist[qi]
+      inc qi
+      if dd >= s.p.slabDepth: continue
+      for d in 0 .. 3:
+        let n = neighbour(s, c, d)
+        if n < 0 or seen[n]: continue
+        if mobileTan(s, n) < 0.0: continue
+        let dh = s.top[n] - s.top[c0]
+        if dh > 1 or dh < -1: continue
+        seen[n] = true
+        cl.add n
+        dist.add dd + 1
+    var cellsN = 0
+    for c in cl:
+      var t = 0
+      var y = s.top[c] - 1
+      while y >= 0 and t < s.p.slabThick:
+        let k = kindAt(s, c, y)
+        if k != PkGran and k != PkSoft: break
+        inc t
+        dec y
+      cellsN = cellsN + t
+    if cellsN < s.p.bodyMinCells: continue
+    # downslope direction: toward the lowest neighbour of the edge columns
+    var vx = 0.0
+    var vz = 0.0
+    var minx = s.nx
+    var minz = s.nz
+    var miny = s.ny
+    for c in cl:
+      let x = c mod s.nx
+      let z = c div s.nx
+      if x < minx: minx = x
+      if z < minz: minz = z
+      for d in 0 .. 3:
+        let n = neighbour(s, c, d)
+        if n >= 0 and s.top[c] - s.top[n] >= s.p.slabDiff:
+          vx = vx + float64(dirX(d))
+          vz = vz + float64(dirZ(d))
+      var t2 = 0
+      var y2 = s.top[c] - 1
+      while y2 >= 0 and t2 < s.p.slabThick:
+        let k = kindAt(s, c, y2)
+        if k != PkGran and k != PkSoft: break
+        inc t2
+        dec y2
+      if t2 > 0 and y2 + 1 < miny: miny = y2 + 1
+    let vl = sqrt(vx * vx + vz * vz)
+    if vl > 0.0:
+      vx = vx / vl * s.p.slabSpeed
+      vz = vz / vl * s.p.slabSpeed
+    var br = BodyRequest(ox: minx, oy: miny, oz: minz, cells: @[], vx: vx, vy: 0.0, vz: vz, kind: 0)
+    for c in cl:
+      var t = 0
+      while t < s.p.slabThick:
+        let y = s.top[c] - 1
+        if y < 0: break
+        let k = kindAt(s, c, y)
+        if k != PkGran and k != PkSoft: break
+        let st = s.ids[c + s.nxz * y]
+        br.cells.add Cell(x: int32(c mod s.nx - minx), y: int32(y - miny), z: int32(c div s.nx - minz), state: int32(st))
+        discard removeTop(s, c)
+        inc t
+      enqueueAround(s, c)
+    evAdd(s, int(efSlump), c0, br.cells.len)
+    s.movedCells = s.movedCells + int64(br.cells.len)
+    s.bodies.add br
+
+# ---------------------------------------------------------------------------------------------------------------------
+# landslide relaxation
+
+proc examine(s: ErosionSim, c: int): bool =
+  let tn = mobileTan(s, c)
+  if tn < 0.0: return false
+  let h = s.top[c]
+  var limit = int(floor(tn * float64(SpanK))) + 1
+  if limit < 2: limit = 2
+  var bestDiff = 0
+  var bestT = -1
+  var nties = 0
+  for d in 0 .. 3:
+    let dx = dirX(d)
+    let dz = dirZ(d)
+    var x = c mod s.nx
+    var z = c div s.nx
+    var minH = h
+    var minC = -1
+    for k in 1 .. SpanK:
+      x = x + dx
+      z = z + dz
+      if x < 0 or x >= s.nx or z < 0 or z >= s.nz: break
+      let n = x + s.nx * z
+      if s.top[n] < minH:
+        minH = s.top[n]
+        minC = n
+    if minC >= 0:
+      let df = h - minH
+      if df >= limit:
+        if df > bestDiff:
+          bestDiff = df
+          bestT = minC
+          nties = 1
+        elif df == bestDiff:
+          inc nties
+          if int(nextU64(s.rng) mod uint64(nties)) == 0: bestT = minC
+  if bestT < 0: return false
+  # the landing cell must be free
+  let ly = s.top[bestT]
+  if ly >= s.ny: return false
+  let lk = kindAt(s, bestT, ly)
+  if lk != PkEmpty and lk != PkFluid: return false
+  let st = removeTop(s, c)
+  discard placeOn(s, bestT, st)
+  inc s.movedCells
+  evAdd(s, int(efSlump), c, 1)
+  enqueueAround(s, c)
+  enqueue(s, bestT)
+  return true
+
+# ---------------------------------------------------------------------------------------------------------------------
+# avalanche
+
+proc snowDepth(s: ErosionSim, c: int): int =
+  var y = s.top[c] - 1
+  var n = 0
+  while y >= 0 and kindAt(s, c, y) == PkSnow:
+    inc n
+    dec y
+  return n
+
+proc snowSlope(s: ErosionSim, c: int): (float64, int) =
+  # steepest tan over SnowSpan columns in 4 directions and its direction
+  let h = s.top[c]
+  var best = 0.0
+  var bd = -1
+  for d in 0 .. 3:
+    var x = c mod s.nx
+    var z = c div s.nx
+    var k = 0
+    var last = -1
+    while k < SnowSpan:
+      let nx2 = x + dirX(d)
+      let nz2 = z + dirZ(d)
+      if nx2 < 0 or nx2 >= s.nx or nz2 < 0 or nz2 >= s.nz: break
+      x = nx2
+      z = nz2
+      inc k
+      last = x + s.nx * z
+    if k >= 2:
+      let t = float64(h - s.top[last]) / float64(k)
+      if t > best:
+        best = t
+        bd = d
+  return (best, bd)
+
+proc scanAvalanche(s: ErosionSim, budget: int): int =
+  var used = 0
+  var n = budget
+  if n > s.nxz: n = s.nxz
+  for i in 0 ..< n:
+    let c = s.scanCursor
+    s.scanCursor = s.scanCursor + 1
+    if s.scanCursor >= s.nxz: s.scanCursor = 0
+    inc used
+    if s.top[c] <= 0 or kindAt(s, c, s.top[c] - 1) != PkSnow: continue
+    if s.packets.len >= s.p.maxPackets: continue
+    let depth = snowDepth(s, c)
+    if depth < s.p.avalMinDepth: continue
+    let (tanS, d) = snowSlope(s, c)
+    if d < 0 or tanS < s.p.avalMinTan: continue
+    let warm = clampf((s.temp[c] + 5.0) / 5.0, 0.0, 1.0)
+    let crit = s.p.snowTan * (1.0 - 0.4 * warm) - s.p.snowShakeK * shakeAt(s, c)
+    if tanS * (1.0 + 0.6 * s.snowfall[c]) <= crit: continue
+    var take = s.p.avalSlab
+    if take > depth - 0: take = depth
+    var carry = 0
+    var st = 0
+    for t in 0 ..< take:
+      st = removeTop(s, c)
+      inc carry
+    s.packets.add Packet(x: c mod s.nx, z: c div s.nx, dx: dirX(d), dz: dirZ(d), v: 0.5, carry: carry, st: st, life: 0)
+    inc s.avalanches
+    evAdd(s, int(efAvalanche), c, carry)
+  return used
+
+proc depositOne(s: ErosionSim, c0, st: int) =
+  var best = c0
+  var bh = s.top[c0]
+  for d in 0 .. 3:
+    let n = neighbour(s, c0, d)
+    if n >= 0 and s.top[n] < bh:
+      bh = s.top[n]
+      best = n
+  if not placeOn(s, best, st):
+    if not placeOn(s, c0, st):
+      # nowhere to put it: the column is full; drop it on any neighbour that takes it
+      for d in 0 .. 3:
+        let n = neighbour(s, c0, d)
+        if n >= 0 and placeOn(s, n, st): return
+
+proc stepPacket(s: ErosionSim, pk: var Packet): bool =
+  ## returns false when the packet is finished (all cells deposited)
+  let c = pk.x + s.nx * pk.z
+  inc pk.life
+  # entrain
+  if pk.v >= 0.4 and pk.carry < 96 and s.top[c] > 1 and kindAt(s, c, s.top[c] - 1) == PkSnow and snowDepth(s, c) >= 2:
+    let st = removeTop(s, c)
+    pk.st = st
+    inc pk.carry
+  # choose the next column: steepest lower neighbour, or straight on over flats while fast
+  var bestD = -1
+  var bestDrop = 0
+  for d in 0 .. 3:
+    let n = neighbour(s, c, d)
+    if n < 0: continue
+    let drop = s.top[c] - s.top[n]
+    if drop > bestDrop:
+      bestDrop = drop
+      bestD = d
+  var sd = -1
+  if pk.dx == 1: sd = 0
+  elif pk.dx == -1: sd = 1
+  elif pk.dz == 1: sd = 2
+  else: sd = 3
+  if pk.v > 0.6:
+    let n = neighbour(s, c, sd)
+    if n >= 0 and s.top[n] <= s.top[c] and bestDrop <= 1:
+      bestD = sd
+      bestDrop = s.top[c] - s.top[n]
+  if bestD < 0 or (bestDrop <= 0 and pk.v <= 0.6):
+    for i in 0 ..< pk.carry: depositOne(s, c, pk.st)
+    evAdd(s, int(efAvalanche), c, pk.carry)
+    pk.carry = 0
+    return false
+  pk.v = (pk.v + 0.5 * (float64(bestDrop) - s.p.flowMu)) * 0.95
+  if pk.v <= 0.0 or pk.life > 400:
+    for i in 0 ..< pk.carry: depositOne(s, c, pk.st)
+    pk.carry = 0
+    return false
+  if pk.v < 0.3 and pk.carry > 0:
+    depositOne(s, c, pk.st)
+    dec pk.carry
+  pk.dx = dirX(bestD)
+  pk.dz = dirZ(bestD)
+  pk.x = pk.x + pk.dx
+  pk.z = pk.z + pk.dz
+  s.movedCells = s.movedCells + 1
+  return true
+
+# ---------------------------------------------------------------------------------------------------------------------
+# environment: rain erosion, snow accumulation and melt, wetness
+
+proc lowestNeighbourDrop(s: ErosionSim, c: int): (int, int) =
+  var bd = -1
+  var bdrop = 0
+  for d in 0 .. 3:
+    let n = neighbour(s, c, d)
+    if n < 0: continue
+    let drop = s.top[c] - s.top[n]
+    if drop > bdrop:
+      bdrop = drop
+      bd = d
+  return (bd, bdrop)
+
+proc envColumn(s: ErosionSim, c: int) =
+  var dt = s.tick - s.lastEnv[c]
+  s.lastEnv[c] = s.tick
+  if dt <= 0 or s.top[c] <= 0: return
+  let k = kindAt(s, c, s.top[c] - 1)
+  let fdt = float64(dt)
+  if s.rain[c] > 0.05 and k == PkGran and s.p.erodeRate > 0.0:
+    let (bd, drop) = lowestNeighbourDrop(s, c)
+    s.acc[c] = s.acc[c] + s.p.erodeRate * fdt * s.rain[c] * (0.2 + float64(drop))
+    if s.acc[c] >= 1.0:
+      s.acc[c] = s.acc[c] - 1.0
+      # carry the top cell down steepest descent to the first column without a lower neighbour
+      var cur = c
+      var steps = 0
+      while steps < 32:
+        let (d2, dr2) = lowestNeighbourDrop(s, cur)
+        if d2 < 0 or dr2 <= 0: break
+        cur = neighbour(s, cur, d2)
+        inc steps
+      if cur != c and s.top[cur] < s.ny:
+        let lk = kindAt(s, cur, s.top[cur])
+        if lk == PkEmpty or lk == PkFluid:
+          let st = removeTop(s, c)
+          discard placeOn(s, cur, st)
+          inc s.movedCells
+          evAdd(s, int(efErosion), c, 1)
+          enqueueAround(s, c)
+          enqueue(s, cur)
+  if s.p.snowStates.len > 0 and s.climateFilled:
+    if s.snowfall[c] > 0.02 and s.temp[c] < 0.5 and s.p.snowRate > 0.0 and k != PkFluid:
+      s.sacc[c] = s.sacc[c] + s.p.snowRate * fdt * s.snowfall[c]
+      if s.sacc[c] >= 1.0:
+        s.sacc[c] = s.sacc[c] - 1.0
+        discard placeOn(s, c, s.p.snowStates[0])
+    elif s.temp[c] > 1.0 and k == PkSnow and s.p.meltRate > 0.0:
+      s.macc[c] = s.macc[c] + s.p.meltRate * fdt * (s.temp[c] - 1.0)
+      if s.macc[c] >= 1.0:
+        s.macc[c] = s.macc[c] - 1.0
+        discard removeTop(s, c)
+
+# ---------------------------------------------------------------------------------------------------------------------
+# earthquakes
+
+proc quakePeak*(magnitude: float64): float64 = 0.06 * exp(0.55 * (magnitude - 5.0))
+proc quakeRadius*(magnitude: float64): float64 = 8.0 * pow(10.0, 0.3 * (magnitude - 5.0))
+
+## Peak ground acceleration (g) at 3D distance r (blocks).
+proc quakeAccel*(magnitude, r: float64): float64 =
+  let rc = quakeRadius(magnitude)
+  return quakePeak(magnitude) / (1.0 + (r / rc) * (r / rc))
+
+proc quakeEnvelope(t: float64): float64 =
+  if t <= 0.0 or t >= 1.0: return 0.0
+  if t < 0.15: return t / 0.15
+  return pow(1.0 - t, 0.8) / pow(0.85, 0.8)
+
+proc startQuake*(s: ErosionSim, q: Quake) =
+  s.quakes.add q
+  s.quakeLive = true
+  s.slabPending = true
+  let c = clampf(q.x - s.p.originX, 0.0, float64(s.nx - 1))
+  let cz = clampf(q.z - s.p.originZ, 0.0, float64(s.nz - 1))
+  evAdd(s, int(efQuake), int(c) + s.nx * int(cz), 1)
+
+## Explosion or other impulsive trigger: adds a decaying ground acceleration (g) around a box-local point.
+proc triggerExplosion*(s: ErosionSim, x, y, z, strength: float64) =
+  for c in 0 ..< s.nxz:
+    let dx = float64(c mod s.nx) + 0.5 - x
+    let dz = float64(c div s.nx) + 0.5 - z
+    let a = strength / (1.0 + (dx * dx + dz * dz) / 64.0)
+    if a > 0.002: s.ta[c] = s.ta[c] + a
+  s.slabPending = true
+  for c in 0 ..< s.nxz: enqueue(s, c)
+
+proc advance*(s: ErosionSim, dtTicks: int) =
+  s.tick = s.tick + dtTicks
+  # decay of impulses
+  var anyTa = false
+  for c in 0 ..< s.nxz:
+    if s.ta[c] > 0.0:
+      s.ta[c] = s.ta[c] * pow(0.96, float64(dtTicks))
+      if s.ta[c] < 0.002: s.ta[c] = 0.0
+      else: anyTa = true
+  if s.quakeLive:
+    var live = false
+    for c in 0 ..< s.nxz: s.qa[c] = 0.0
+    for q in s.quakes:
+      let t = float64(s.tick - q.startTick) / float64(q.duration)
+      if t >= 1.0: continue
+      live = true
+      let env = quakeEnvelope(t)
+      if env <= 0.0: continue
+      for c in 0 ..< s.nxz:
+        let dx = float64(c mod s.nx) + 0.5 + s.p.originX - q.x
+        let dz = float64(c div s.nx) + 0.5 + s.p.originZ - q.z
+        let dy = float64(s.top[c]) + s.p.originY - q.y
+        let a = quakeAccel(q.magnitude, sqrt(dx * dx + dy * dy + dz * dz)) * env
+        let nz2 = hashU(s.seed, c, s.tick div 3, 77)
+        let v = a * (0.75 + 0.5 * nz2)
+        if v > s.qa[c]: s.qa[c] = v
+    if live:
+      if s.tick mod 4 == 0:
+        for c in 0 ..< s.nxz:
+          if s.qa[c] > 0.02: enqueue(s, c)
+    else:
+      s.quakeLive = false
+      s.quakes = @[]
+  if anyTa and s.tick mod 4 == 0:
+    for c in 0 ..< s.nxz:
+      if s.ta[c] > 0.02: enqueue(s, c)
+
+# ---------------------------------------------------------------------------------------------------------------------
+# climate coupling
+
+## Fill the per-column weather fields from climate.aowl samples: `sample(wx, wz)` returns (rain, snow, temp) at WORLD column
+## (wx, wz) at the surface (the caller wraps climateAt; coarse: every `stride` columns, the others copy the nearest sample).
+## Wetness follows rain: wet = max(rain, wet * exp(-dt / wetDecayTicks)).
+type ClimateFn* = proc (wx, wz: float64): (float64, float64, float64) {.closure.}
+
+proc fillClimate*(s: ErosionSim, sample: ClimateFn, stride: int, dtTicks: int) =
+  var st = stride
+  if st < 1: st = 1
+  let decay = exp(-float64(dtTicks) / s.p.wetDecayTicks)
+  var z = 0
+  while z < s.nz:
+    var x = 0
+    while x < s.nx:
+      let (r, sn, t) = sample(float64(x) + 0.5 + s.p.originX, float64(z) + 0.5 + s.p.originZ)
+      for zz in z ..< min(z + st, s.nz):
+        for xx in x ..< min(x + st, s.nx):
+          let c = xx + s.nx * zz
+          s.rain[c] = r
+          s.snowfall[c] = sn
+          s.temp[c] = t
+          let w = s.wet[c] * decay
+          s.wet[c] = if r > w: r else: w
+      x = x + st
+    z = z + st
+  s.climateFilled = true
+
+proc setUniformWeather*(s: ErosionSim, rain, snowfall, temp, wet: float64) =
+  for c in 0 ..< s.nxz:
+    s.rain[c] = rain
+    s.snowfall[c] = snowfall
+    s.temp[c] = temp
+    s.wet[c] = wet
+  s.climateFilled = true
+
+# ---------------------------------------------------------------------------------------------------------------------
+# the budgeted step
+
+## Do up to `budget` ops (column examinations, avalanche scan columns, packet steps). Standing environment work (rain erosion,
+## snow) costs envPerStep columns per call on top of the budget and does not count toward `done`.
+proc step*(s: ErosionSim, budget: int): StepInfo =
+  var used = 0
+  let moved0 = s.movedCells
+  if s.slabPending:
+    s.slabPending = false
+    scanSlabs(s)
+    used = used + s.nxz div 4
+  # avalanche scan (only when there is snow)
+  if s.p.snowStates.len > 0:
+    var sb = s.p.scanPerStep
+    if sb > budget: sb = budget
+    used = used + scanAvalanche(s, sb)
+  # packets, one step each per call (a packet in flight advances one column per step: ~20 columns/s)
+  if s.packets.len > 0:
+    var keep: seq[Packet] = @[]
+    for i in 0 ..< s.packets.len:
+      var pk = s.packets[i]
+      inc used
+      if stepPacket(s, pk): keep.add pk
+    s.packets = keep
+  # landslide relaxation
+  while used < budget and s.qhead < s.queue.len:
+    let c = s.queue[s.qhead]
+    inc s.qhead
+    s.inQ[c] = false
+    inc used
+    discard examine(s, c)
+  if s.qhead > 4096 and s.qhead * 2 > s.queue.len:
+    var nq: seq[int] = @[]
+    for i in s.qhead ..< s.queue.len: nq.add s.queue[i]
+    s.queue = nq
+    s.qhead = 0
+  elif s.qhead >= s.queue.len:
+    s.queue.setLen(0)
+    s.qhead = 0
+  # environment ring
+  if s.climateFilled:
+    var n = s.p.envPerStep
+    if n > s.nxz: n = s.nxz
+    for i in 0 ..< n:
+      envColumn(s, s.envCursor)
+      s.envCursor = s.envCursor + 1
+      if s.envCursor >= s.nxz: s.envCursor = 0
+  s.ops = s.ops + int64(used)
+  let done = s.qhead >= s.queue.len and s.packets.len == 0 and not s.slabPending
+  return StepInfo(ops: used, done: done, moved: int(s.movedCells - moved0))
+
+## Run steps until nothing is queued (or maxSteps). Returns the number of steps.
+proc relaxAll*(s: ErosionSim, budget, maxSteps: int): int =
+  var n = 0
+  while n < maxSteps:
+    let r = step(s, budget)
+    inc n
+    if r.done: break
+  return n
+
+proc msort(a: var seq[int]) =
+  if a.len < 2: return
+  var buf = newSeq[int](a.len)
+  var w = 1
+  while w < a.len:
+    var i = 0
+    while i < a.len:
+      let mid = min(i + w, a.len)
+      let hi = min(i + 2 * w, a.len)
+      var l = i
+      var r = mid
+      var k = i
+      while l < mid and r < hi:
+        if a[l] <= a[r]:
+          buf[k] = a[l]
+          inc l
+        else:
+          buf[k] = a[r]
+          inc r
+        inc k
+      while l < mid:
+        buf[k] = a[l]
+        inc l
+        inc k
+      while r < hi:
+        buf[k] = a[r]
+        inc r
+        inc k
+      i = i + 2 * w
+    for j in 0 ..< a.len: a[j] = buf[j]
+    w = w * 2
+
+proc drain*(s: ErosionSim): ErosionOutput =
+  var o = ErosionOutput(changes: @[], bodies: s.bodies, events: @[])
+  s.bodies = @[]
+  # touched cells ascending for determinism
+  var t = s.touched
+  msort(t)
+  for i in t:
+    s.touchedFlag[i] = false
+    if s.ids[i] != s.base[i]:
+      let c = i mod s.nxz
+      let y = i div s.nxz
+      o.changes.add CellChange(x: c mod s.nx, y: y, z: c div s.nx, fromState: s.base[i], toState: s.ids[i])
+      s.base[i] = s.ids[i]
+  s.touched = @[]
+  for i in 0 ..< s.evKind.len:
+    let patch = s.evPos[i]
+    let px = (patch mod 1000) * 8 + 4
+    let pz = (patch div 1000) * 8 + 4
+    var kind = efSlump
+    if s.evKind[i] == int(efAvalanche): kind = efAvalanche
+    elif s.evKind[i] == int(efErosion): kind = efErosion
+    elif s.evKind[i] == int(efQuake): kind = efQuake
+    let cx = clampf(float64(px), 0.0, float64(s.nx - 1))
+    let cz = clampf(float64(pz), 0.0, float64(s.nz - 1))
+    let col = int(cx) + s.nx * int(cz)
+    o.events.add EffectEvent(kind: kind, x: cx, y: float64(s.top[col]), z: cz, intensity: float64(s.evCells[i]), count: s.evCells[i])
+  s.evKind = @[]
+  s.evPos = @[]
+  s.evCells = @[]
+  return o
+
+## Count cells of one state (conservation checks) and the steepest span-3 tangent of the surface (a slope measure for tests).
+proc countState*(s: ErosionSim, st: int): int =
+  var n = 0
+  for v in s.ids:
+    if v == st: inc n
+  return n
+
+proc columnHeight*(s: ErosionSim, x, z: int): int = s.top[x + s.nx * z]
+
+proc maxSpanSlope*(s: ErosionSim): float64 =
+  var best = 0.0
+  for c in 0 ..< s.nxz:
+    for d in 0 .. 3:
+      var x = c mod s.nx
+      var z = c div s.nx
+      for k in 1 .. SpanK:
+        x = x + dirX(d)
+        z = z + dirZ(d)
+        if x < 0 or x >= s.nx or z < 0 or z >= s.nz: break
+        let t = float64(s.top[c] - s.top[x + s.nx * z]) / float64(k)
+        if t > best: best = t
+  return best
+
+# ---------------------------------------------------------------------------------------------------------------------
+# earthquake damage: strength multipliers for the structural solver
+
+proc fragilityOf(c: MatClass): float64 =
+  case c
+  of mcWood: 1.0
+  of mcGeneric: 1.2
+  of mcRock: 0.9
+  else: 0.0
+
+## ids: snapshot box nx*ny*nz (solver layout). q is in the box's own coordinates here (the caller subtracts the box origin), so
+## the same call works for any box. Returns a BlastResult holding only `cracked` (ascending cell index), directly usable with
+## applyBlastToSolverInput. `seed` varies the per-cell jitter.
+proc quakeCracks*(ids: seq[int], nx, ny, nz: int, q: Quake, seed: int): BlastResult =
+  var r = BlastResult(destroyed: @[], cracked: @[], debris: @[], impulses: @[], ops: 0, done: true)
+  let durF = clampf(0.5 + float64(q.duration) / 400.0, 0.5, 1.2)
+  # early out: nearest point of the box
+  let nxp = clampf(q.x, 0.0, float64(nx))
+  let nyp = clampf(q.y, 0.0, float64(ny))
+  let nzp = clampf(q.z, 0.0, float64(nz))
+  let dmin = sqrt((nxp - q.x) * (nxp - q.x) + (nyp - q.y) * (nyp - q.y) + (nzp - q.z) * (nzp - q.z))
+  if quakeAccel(q.magnitude, dmin) * 1.5 * 1.15 * durF <= 0.05: return r
+  var known: seq[int] = @[]
+  var fr: seq[float64] = @[]
+  let nxz = nx * nz
+  for i in 0 ..< nx * ny * nz:
+    let sid = ids[i]
+    if sid == 0: continue
+    var f = -1.0
+    for k in 0 ..< known.len:
+      if known[k] == sid:
+        f = fr[k]
+        break
+    if f < 0.0:
+      f = fragilityOf(materialOf(sid).matClass)
+      known.add sid
+      fr.add f
+    if f <= 0.0: continue
+    let c = i mod nxz
+    let y = i div nxz
+    let x = c mod nx
+    let z = c div nx
+    let dx = float64(x) + 0.5 - q.x
+    let dy = float64(y) + 0.5 - q.y
+    let dz = float64(z) + 0.5 - q.z
+    var amp = 1.0
+    if y > 0 and ids[i - nxz] == 0: amp = 1.5
+    let jit = 0.85 + 0.30 * hashU(seed, i, 5, 9)
+    let a = quakeAccel(q.magnitude, sqrt(dx * dx + dy * dy + dz * dz)) * amp * jit * durF
+    if a <= 0.05: continue
+    let d = f * clampf((a - 0.05) / 0.10, 0.0, 1.0)
+    var mult = 1.0 - 0.9 * d
+    if mult < 0.05: mult = 0.05
+    if mult <= 0.95:
+      r.cracked.add CrackedCell(cell: i, mult: mult)
+  return r
+
+## Seeded quake schedule: epochs of 12000 ticks, each holds a quake with probability `chance` (default use 0.02; 0 = none).
+## Epicentre uniform in [wx0, wx1) x [wz0, wz1), hypocentre `depth` blocks below baseY, M = 4.5 + log10(1/u) (b = 1, >= 7 in 0.3 %).
+proc quakesInWindow*(seed: int, tick0, tick1: int, wx0, wz0, wx1, wz1, baseY, chance: float64): seq[Quake] =
+  var res: seq[Quake] = @[]
+  if chance <= 0.0 or tick1 <= tick0: return res
+  var e = tick0 div 12000
+  if tick0 < 0 and e * 12000 != tick0: e = e - 1
+  while e * 12000 < tick1:
+    if hashU(seed, e, 1, 1) < chance:
+      let st = e * 12000 + int(hashU(seed, e, 2, 1) * 12000.0)
+      if st >= tick0 and st < tick1:
+        var u = hashU(seed, e, 3, 1)
+        if u < 1.0e-6: u = 1.0e-6
+        var m = 4.5 + log10(1.0 / u)
+        if m > 9.0: m = 9.0
+        res.add Quake(x: wx0 + (wx1 - wx0) * hashU(seed, e, 4, 1), y: baseY - 5.0 - 10.0 * hashU(seed, e, 5, 1),
+                      z: wz0 + (wz1 - wz0) * hashU(seed, e, 6, 1), magnitude: m, startTick: st,
+                      duration: 100 + int(60.0 * (m - 4.0)))
+    inc e
+  return res
