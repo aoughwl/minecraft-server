@@ -16,7 +16,7 @@ scheduling half of async work **without threads**: a long relight or a crowd of 
      needs a "pending light" flag so `bulkedit` can still promise exact results to callers that need them (WorldEdit undo).
    * entity ticking: chunk-ordered entity loop in `worldmod.tick` with a per-tick time cap and carry-over cursor; vanilla
      semantics for the entities skipped in a tick (they simply tick next tick) must be an explicit rule agreed with the user.
-2. **Real threads: blocked.** The chunk system shares refcounted chunks with the level and refcounts are not atomic
+2. **Real threads: blocked.** The chunk system shares chunks with the level; the refcounts are atomic but the contents are not safe to share (docs/MULTITHREADING.md)
    (`server/pumpkinlib.aowl`, PROGRESS.md worker-pool notes: the chunk worker pool only works because generation hands over
    finished, unshared chunks). Light and entity ticking read and write live chunks, so they cannot leave the tick thread until
    ENGINE provides atomic refcounts or an ownership-transfer type (move a chunk section to a worker, get it back next tick).

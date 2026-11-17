@@ -135,4 +135,5 @@ Each phase lists what changes, who owns the files, how it is verified. "Gate" = 
 | This plan | written |
 | `threads` / `reserved_cores` config + resolver (`sim/threadcfg.aowl`) + tests | done, tests pass (threadcfgtest, libtest) |
 | Wiring the resolved count into `generation_executor` | needs the chunk-system owner (change list sent) |
-| Everything else | not started |
+| Stale "refcounts are not atomic" comments in docs and sim/regions | fixed (pumpkinlib header: with the chunk-system owner's batch) |
+| Everything else | waiting on the chunk-system owner's branches reaching main |

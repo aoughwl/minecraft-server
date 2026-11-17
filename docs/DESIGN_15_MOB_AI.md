@@ -26,7 +26,7 @@
    `getMobPenalty`.
 4. **Rain exposure uses a 32-cell column scan**, not the heightmap, so a roof higher than 32 blocks above the mob does not count.
 5. **Worker threads (the "on worker threads" part of the goal).** Blocked, ENGINE session: path computation reads chunks
-   (`World.getBlockStateId`) and entity lists, which are refcounted and not atomic (`server/pumpkinlib.aowl` header). A safe
+   (`World.getBlockStateId`) and entity lists, which are shared mutable objects (the refcounts are atomic, the contents are not: see docs/MULTITHREADING.md). A safe
    design needs a read-only snapshot of the cells around the mob (copy cells out on the tick thread, path on the worker, apply
    result next tick). The `PathfindingContext` already isolates all world reads into `computePathTypeFromState` and
    `hasCollisions`, so the snapshot is one replacement of those two procs. Needs the ENGINE session to provide an atomic

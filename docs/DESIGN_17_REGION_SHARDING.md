@@ -14,7 +14,7 @@ Pure planner, no threads, no world access.
 
 ## Not done, and exactly what is left
 
-1. **Nothing runs shards in parallel: blocked.** Same wall as #16: chunks are shared refcounted data and refcounts are not atomic
+1. **Nothing runs shards in parallel: blocked.** Same wall as #16: chunks are shared mutable data (refcounts are atomic, contents are not safe to share; docs/MULTITHREADING.md)
    (`server/pumpkinlib.aowl`). Sharding changes who may touch which chunk, but every shard still touches the same refcounted
    `World`/`Level` objects (entity list, block event queues, `unsentBlockChanges`, lighting queues, the block log, the body
    manager's global collision-provider registry). Needs from ENGINE: atomic refcounts (or shard-owned heap), thread-safe
