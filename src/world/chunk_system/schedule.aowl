@@ -15,6 +15,8 @@ import std/sets
 import std/heapqueue
 import std/assertions
 import std/times
+import std/envvars
+import std/syncio
 import ../../config/lighting
 import ../chunkdata
 import chunk_stage
@@ -74,6 +76,31 @@ type
     finished*: bool
 
 const IOBatchSize = 16
+
+proc envDepth(): int =
+  let raw = getEnv("MC_SCHED_DEPTH")
+  if raw.len == 0 or raw.len > 3:
+    return 2
+  var v = 0
+  for ch in raw:
+    if ch < '0' or ch > '9':
+      return 2
+    v = v * 10 + (ord(ch) - ord('0'))
+  max(v, 1)
+
+var
+  gDepth = envDepth()
+  gSchedStats = getEnv("MC_GEN_STATS") == "1"
+  gStPasses = 0'i64
+  gStWorkPasses = 0'i64
+  gStSubmitted = 0'i64
+  gStIo = 0'i64
+  gStNotReady = 0'i64
+  gStWaiting = 0'i64
+  gStStale = 0'i64
+  gStWorkUs = 0'i64
+  gStWorkMaxUs = 0'i64
+  gStLast: Time = getTime()
 
 proc `<`*(a, b: TaskHeapNode): bool {.inline.} =
   ## `self.0.cmp(&other.0).reverse()` on a max-heap: lowest priority number first.
@@ -630,6 +657,7 @@ proc workOnce*(s: GenerationSchedule, maxGenerationTasks: int): bool =
   if s.finished:
     return false
   var didWork = false
+  let statT0 = getTime()
   if s.shouldUnload:
     s.shouldUnload = false
     garbageCollectDependencies(s)
@@ -675,14 +703,15 @@ proc workOnce*(s: GenerationSchedule, maxGenerationTasks: int): bool =
   var ioBatch = newSeq[ChunkPos](0)
   var generationTasks = 0
   while s.queue.len > 0:
-    if s.runningTaskCount >= s.maxInFlight or generationTasks >= max(maxGenerationTasks, s.executor.workers * 2):
+    if s.runningTaskCount >= s.maxInFlight or generationTasks >= max(maxGenerationTasks, s.executor.workers * gDepth):
       break
     # With workers, keep about two tasks per worker queued: more would only fix the priorities earlier than needed.
-    if s.executor.workers > 0 and s.executor.inFlight >= s.executor.workers * 2:
+    if s.executor.workers > 0 and s.executor.inFlight >= s.executor.workers * gDepth:
       break
     let task = pop(s.queue)
     if containsNode(s.graph, task.key):
       if node(s.graph, task.key).inDegree != 0'u32:
+        inc gStNotReady
         node(s.graph, task.key).inQueue = false
       else:
         node(s.graph, task.key).inFlight = true
@@ -700,7 +729,9 @@ proc workOnce*(s: GenerationSchedule, maxGenerationTasks: int): bool =
           s.waitingForChunks.excl(task.key)
           dropNode(s, task.key)
           didWork = true
+          inc gStStale
         elif nodeCopy.stage == StagedChunkEnum.Empty:
+          inc gStIo
           s.runningTaskCount += 1'u16
           let holder = holderForNode
           assert isNull(holder.occupied)
@@ -724,6 +755,7 @@ proc workOnce*(s: GenerationSchedule, maxGenerationTasks: int): bool =
               node(s.graph, task.key).inQueue = false
               node(s.graph, task.key).inFlight = false
             s.waitingForChunks.incl(task.key)
+            inc gStWaiting
             # The chunk we're waiting for may have arrived already: re-queue it now if so, so it isn't stranded.
             checkWaitingTasks(s)
           else:
@@ -733,6 +765,7 @@ proc workOnce*(s: GenerationSchedule, maxGenerationTasks: int): bool =
             s.runningTaskCount += 1'u16
             submit(s.executor, s.host, nodeCopy.pos, cache, nodeCopy.stage, s.recvChunk)
             inc generationTasks
+            inc gStSubmitted
             didWork = true
 
   # Flush any remaining IO batch.
@@ -748,6 +781,22 @@ proc workOnce*(s: GenerationSchedule, maxGenerationTasks: int): bool =
   if s.queueDirty:
     sortQueue(s)
     s.queueDirty = false
+  if gSchedStats:
+    inc gStPasses
+    if didWork:
+      inc gStWorkPasses
+    let us = (getTime() - statT0).inMicroseconds
+    gStWorkUs += us
+    if us > gStWorkMaxUs:
+      gStWorkMaxUs = us
+    if (getTime() - gStLast).inSeconds >= 5:
+      gStLast = getTime()
+      echo "sched: passes=" & $gStPasses & " work=" & $gStWorkPasses & " submitted=" & $gStSubmitted & " io=" & $gStIo &
+        " notReady=" & $gStNotReady & " waiting=" & $gStWaiting & " stale=" & $gStStale & " workUs=" & $gStWorkUs &
+        " maxPassUs=" & $gStWorkMaxUs & " | queue=" & $s.queue.len & " running=" & $s.runningTaskCount &
+        " inFlight=" & $s.executor.inFlight & " waitSet=" & $s.waitingForChunks.len & " chunkMap=" & $s.chunkMap.len &
+        " " & statsLine(s.executor)
+      gStWorkMaxUs = 0
   didWork
 
 proc isIdle*(s: GenerationSchedule): bool =
