@@ -1,0 +1,470 @@
+## Material property table (phase 1 item 5): per block state density, mass, stiffness, damping, tensile and compressive
+## strength, wind drag area, break threshold and flammability, derived from vanilla data and overridable by data.
+##
+## UNITS (relative, physically flavoured, not a rigorous simulation): density kg/m3; stiffness GPa (Young's modulus);
+## strengths MPa; damping ratio 0..1 (fraction of oscillation energy lost per cycle, 1 = dead); drag area in "faces":
+## wind-facing area of the state's 1 m cell (1.0 = a solid cube face; multiplied by the caller's drag coefficient);
+## break threshold in kJ of impact/blast energy the block absorbs before it fails; flammability/ignitability 0..1.
+##
+## DEFAULTS come from numbers and tags already in the repo, never from block names or ids:
+##   inputs per state: hardness (Block.hardness, BlockState.hardness), blastResistance, luminance, opacity, the state flags
+##   (air, liquid, solid, full cube), the collision/outline shape boxes (-> fill fraction, drag projection), the vanilla
+##   fire odds (Block.flammable: spreadChance = how easily it catches, burnChance = how fast it burns away), and these
+##   block tags: minecraft:mineable/{pickaxe,axe,shovel,hoe}, minecraft:wool, minecraft:leaves, minecraft:sand.
+##
+## STEP 1, class (MatClass), first match wins:
+##   air flag                                  -> mcVoid
+##   liquid flag                               -> mcFluid
+##   no collision shape                        -> mcFoliage   (plants, decor, anything you walk through)
+##   tag wool or leaves, or mineable/hoe       -> mcSoft      (cloth, foliage blocks, hay, moss)
+##   tag sand or mineable/shovel               -> mcGranular  (sand, dirt, gravel, clay, snow)
+##   mineable/pickaxe                          -> mcRock      (stone, ores, metal blocks, ice, glass-like pickaxe blocks)
+##   mineable/axe                              -> mcWood
+##   otherwise                                 -> mcGeneric   (glass, cake, ... no tool class)
+## STEP 2, with h = max(hardness, 0), b = blastResistance, hf = clamp(h / hRef(class), 0.5, 2):
+##   density  Void 1.2 | Fluid 1000 (3100 if luminance > 0: lava-like) | Foliage 80 | Rock 900 + 1800*min(1, b/6) + 120*min(h,20)
+##            Wood 400 + 125*min(h,8) | Granular 1200 + 800*min(h,1) | Soft 100 + 300*min(h,2) | Generic 500 + 300*min(h,3)
+##   stiffness (GPa) = base(class) * hf with base Rock 30, Wood 10, Granular 0.05, Soft 0.02, Generic 5, Foliage 0.01, else 0
+##   compressive (MPa) = base * hf with base Rock 60, Wood 40, Granular 0.3, Soft 2, Generic 20, Foliage 0.5, else 0
+##   tensile (MPa) = compressive * ratio(class): Rock 0.08, Wood 1.0, Granular 0, Soft 2.5, Generic 0.5, Foliage 3
+##   damping  Void 1, Fluid 0.9, Foliage 0.3, Rock 0.02, Wood 0.04, Granular 0.3, Soft 0.5, Generic 0.1
+##   drag area = bboxArea * porosity: bboxArea = mean of the X-face and Z-face projections of the union bounding box of the
+##            collision shapes (outline shapes if none); porosity = 0.5 + 0.5*opacity/15 for Soft and Foliage, else 1;
+##            Void and Fluid 0; a non-air state with no shape at all gets 0.5
+##   break threshold = 0.5 + b kJ; 1e9 if hardness < 0 (indestructible); 0 for Void and Fluid (they do not break)
+##   flammability = burnChance / 100, ignitability = spreadChance / 100 (0 when the block has no fire odds)
+##   fill fraction = clamp(sum of collision box volumes, 0.02, 1) (outline boxes if there is no collision); a slab is 0.5.
+##   mass of a state = density * fill; mass of a volume of this material = density * volume (mass(m, volume)).
+##   A hardness < 0 block also gets 10x strengths (bedrock-like).
+##
+## OVERRIDES (data file, JSON, loadMaterialOverrides / loadMaterialOverridesFile), applied on top of the defaults:
+##   {
+##     "version": 1,
+##     "tags":   { "minecraft:logs": { "density": 700, "stiffness": 12 } },
+##     "blocks": { "minecraft:stone": { "compressive": 90, "breakThreshold": 12 }, "mymod:foam": { "density": 30 } }
+##   }
+##   Fields (all optional): density, stiffness, damping, tensile, compressive, dragArea, breakThreshold, flammability,
+##   ignitability. A tag entry applies to every block in the tag (tags apply in sorted key order, a later one wins a
+##   conflict); a block entry beats any tag entry; a later loaded file beats an earlier one. Names without a namespace
+##   mean "minecraft:". Unknown blocks and tags are reported in the error string but do not stop the rest from loading.
+##   Mods and data packs may also call setBlockOverride / setTagOverride directly. clearMaterialOverrides() restores defaults.
+
+import std/[syncio, math]
+import "../generated/block_properties"
+import "../generated/tag"
+import "../codecs/json_value"
+
+type
+  MatClass* = enum
+    mcVoid, mcFluid, mcFoliage, mcSoft, mcGranular, mcRock, mcWood, mcGeneric
+
+  Material* = object
+    matClass*: MatClass
+    density*: float64          ## kg/m3
+    fill*: float64             ## fraction of the cell volume the state occupies (collision shapes)
+    stiffness*: float64        ## GPa
+    damping*: float64          ## 0..1
+    tensile*: float64          ## MPa
+    compressive*: float64      ## MPa
+    dragArea*: float64         ## wind-facing area, in cell faces
+    breakThreshold*: float64   ## kJ
+    flammability*: float64     ## 0..1 burn rate
+    ignitability*: float64     ## 0..1 how easily it catches fire
+    liquid*: bool
+    indestructible*: bool
+
+  MaterialOverride* = object
+    ## Each field applies only when its has* flag is set.
+    hasDensity*, hasStiffness*, hasDamping*, hasTensile*, hasCompressive*: bool
+    hasDragArea*, hasBreakThreshold*, hasFlammability*, hasIgnitability*: bool
+    density*, stiffness*, damping*, tensile*, compressive*: float64
+    dragArea*, breakThreshold*, flammability*, ignitability*: float64
+
+# ---------------------------------------------------------------------------------------------------------------------
+# state
+
+var gMat: seq[Material] = @[]
+var gHave: seq[bool] = @[]
+var gClass: seq[int8] = @[]
+var gTagOv: seq[MaterialOverride] = @[]      # per block id, from tags
+var gTagHas: seq[bool] = @[]
+var gBlockOv: seq[MaterialOverride] = @[]    # per block id, from block entries
+var gBlockHas: seq[bool] = @[]
+var gInit = false
+
+proc ensureInit() =
+  if gInit: return
+  gInit = true
+  let ns = int(STATE_COUNT)
+  let nb = int(BLOCK_COUNT)
+  gMat = newSeq[Material](ns)
+  gHave = newSeq[bool](ns)
+  gClass = newSeq[int8](nb)
+  gTagOv = newSeq[MaterialOverride](nb)
+  gTagHas = newSeq[bool](nb)
+  gBlockOv = newSeq[MaterialOverride](nb)
+  gBlockHas = newSeq[bool](nb)
+  for i in 0 ..< nb: gClass[i] = -1'i8
+
+proc invalidate() =
+  ensureInit()
+  for i in 0 ..< gHave.len: gHave[i] = false
+
+proc clampf(x, lo, hi: float64): float64 =
+  if x < lo: lo elif x > hi: hi else: x
+
+proc minf(a, b: float64): float64 =
+  if a < b: a else: b
+
+# ---------------------------------------------------------------------------------------------------------------------
+# defaults
+
+proc classOfBlock(blockId: int, st: BlockState): MatClass =
+  let bid = uint16(blockId)
+  if st.isAir: return mcVoid
+  if st.isLiquid: return mcFluid
+  if st.collisionShapes.len == 0: return mcFoliage
+  if hasTag(bid, Block_MINECRAFT_WOOL) or hasTag(bid, Block_MINECRAFT_LEAVES) or hasTag(bid, Block_MINECRAFT_MINEABLE_HOE):
+    return mcSoft
+  if hasTag(bid, Block_MINECRAFT_SAND) or hasTag(bid, Block_MINECRAFT_MINEABLE_SHOVEL): return mcGranular
+  if hasTag(bid, Block_MINECRAFT_MINEABLE_PICKAXE): return mcRock
+  if hasTag(bid, Block_MINECRAFT_MINEABLE_AXE): return mcWood
+  mcGeneric
+
+proc hardnessRef(c: MatClass): float64 =
+  case c
+  of mcRock: 1.5
+  of mcWood: 2.0
+  of mcGranular: 0.5
+  of mcSoft: 0.5
+  of mcGeneric: 1.0
+  else: 1.0
+
+proc shapeBounds(st: BlockState): (float64, float64, float64, float64) =
+  ## (fill volume sum, X-face projection, Z-face projection, 0) over collision shapes, else outline shapes.
+  var ids = st.collisionShapes
+  if ids.len == 0: ids = st.outlineShapes
+  if ids.len == 0: return (0.0, 0.0, 0.0, 0.0)
+  var vol = 0.0
+  var minX = 1.0e9
+  var minY = 1.0e9
+  var minZ = 1.0e9
+  var maxX = -1.0e9
+  var maxY = -1.0e9
+  var maxZ = -1.0e9
+  for sid in ids:
+    let b = COLLISION_SHAPES[int(sid)]
+    vol += (b.maxX - b.minX) * (b.maxY - b.minY) * (b.maxZ - b.minZ)
+    if b.minX < minX: minX = b.minX
+    if b.minY < minY: minY = b.minY
+    if b.minZ < minZ: minZ = b.minZ
+    if b.maxX > maxX: maxX = b.maxX
+    if b.maxY > maxY: maxY = b.maxY
+    if b.maxZ > maxZ: maxZ = b.maxZ
+  let faceX = (maxZ - minZ) * (maxY - minY)   # seen by wind blowing along X
+  let faceZ = (maxX - minX) * (maxY - minY)   # seen by wind blowing along Z
+  (vol, faceX, faceZ, 0.0)
+
+proc defaultMaterial(stateId: int): Material =
+  let sid = newBlockStateIdUnchecked(uint16(stateId))
+  let st = BlockState.fromId(sid)
+  let blk = Block.fromStateId(sid)
+  let bidInt = int(asU16(blk.id))
+  let cls = classOfBlock(bidInt, st)
+  let hard = float64(blk.hardness)
+  let h = if hard < 0.0: 0.0 else: hard
+  let b = float64(blk.blastResistance)
+  let hf = clampf(h / hardnessRef(cls), 0.5, 2.0)
+  var m = Material(matClass: cls)
+  m.liquid = cls == mcFluid
+  m.indestructible = hard < 0.0
+  case cls
+  of mcVoid: m.density = 1.2
+  of mcFluid: m.density = (if st.luminance > 0'u8: 3100.0 else: 1000.0)
+  of mcFoliage: m.density = 80.0
+  of mcRock: m.density = 900.0 + 1800.0 * minf(1.0, b / 6.0) + 120.0 * minf(h, 20.0)
+  of mcWood: m.density = 400.0 + 125.0 * minf(h, 8.0)
+  of mcGranular: m.density = 1200.0 + 800.0 * minf(h, 1.0)
+  of mcSoft: m.density = 100.0 + 300.0 * minf(h, 2.0)
+  of mcGeneric: m.density = 500.0 + 300.0 * minf(h, 3.0)
+  var stiff = 0.0
+  var comp = 0.0
+  var ratio = 0.0
+  case cls
+  of mcRock:
+    stiff = 30.0
+    comp = 60.0
+    ratio = 0.08
+  of mcWood:
+    stiff = 10.0
+    comp = 40.0
+    ratio = 1.0
+  of mcGranular:
+    stiff = 0.05
+    comp = 0.3
+    ratio = 0.0
+  of mcSoft:
+    stiff = 0.02
+    comp = 2.0
+    ratio = 2.5
+  of mcGeneric:
+    stiff = 5.0
+    comp = 20.0
+    ratio = 0.5
+  of mcFoliage:
+    stiff = 0.01
+    comp = 0.5
+    ratio = 3.0
+  else: discard
+  let strengthScale = if m.indestructible: 10.0 else: 1.0
+  m.stiffness = stiff * hf
+  m.compressive = comp * hf * strengthScale
+  m.tensile = m.compressive * ratio
+  case cls
+  of mcVoid: m.damping = 1.0
+  of mcFluid: m.damping = 0.9
+  of mcFoliage: m.damping = 0.3
+  of mcRock: m.damping = 0.02
+  of mcWood: m.damping = 0.04
+  of mcGranular: m.damping = 0.3
+  of mcSoft: m.damping = 0.5
+  of mcGeneric: m.damping = 0.1
+  let (vol, fx, fz, unused) = shapeBounds(st)
+  m.fill = clampf(vol, 0.02, 1.0)
+  if cls == mcVoid:
+    m.fill = 0.0
+  var area = 0.5 * (fx + fz)
+  if vol == 0.0: area = 0.5
+  if cls == mcSoft or cls == mcFoliage:
+    area = area * (0.5 + 0.5 * float64(st.opacity) / 15.0)
+  if cls == mcVoid or cls == mcFluid: area = 0.0
+  m.dragArea = area
+  if m.indestructible: m.breakThreshold = 1.0e9
+  elif cls == mcVoid or cls == mcFluid: m.breakThreshold = 0.0
+  else: m.breakThreshold = 0.5 + b
+  if blk.hasFlammable:
+    m.flammability = float64(blk.flammable.burnChance) / 100.0
+    m.ignitability = float64(blk.flammable.spreadChance) / 100.0
+  m
+
+proc applyOverride(m: var Material, o: MaterialOverride) =
+  if o.hasDensity: m.density = o.density
+  if o.hasStiffness: m.stiffness = o.stiffness
+  if o.hasDamping: m.damping = o.damping
+  if o.hasTensile: m.tensile = o.tensile
+  if o.hasCompressive: m.compressive = o.compressive
+  if o.hasDragArea: m.dragArea = o.dragArea
+  if o.hasBreakThreshold: m.breakThreshold = o.breakThreshold
+  if o.hasFlammability: m.flammability = o.flammability
+  if o.hasIgnitability: m.ignitability = o.ignitability
+
+proc mergeOverride(dst: var MaterialOverride, src: MaterialOverride) =
+  ## src wins where it sets a field.
+  if src.hasDensity:
+    dst.hasDensity = true
+    dst.density = src.density
+  if src.hasStiffness:
+    dst.hasStiffness = true
+    dst.stiffness = src.stiffness
+  if src.hasDamping:
+    dst.hasDamping = true
+    dst.damping = src.damping
+  if src.hasTensile:
+    dst.hasTensile = true
+    dst.tensile = src.tensile
+  if src.hasCompressive:
+    dst.hasCompressive = true
+    dst.compressive = src.compressive
+  if src.hasDragArea:
+    dst.hasDragArea = true
+    dst.dragArea = src.dragArea
+  if src.hasBreakThreshold:
+    dst.hasBreakThreshold = true
+    dst.breakThreshold = src.breakThreshold
+  if src.hasFlammability:
+    dst.hasFlammability = true
+    dst.flammability = src.flammability
+  if src.hasIgnitability:
+    dst.hasIgnitability = true
+    dst.ignitability = src.ignitability
+
+# ---------------------------------------------------------------------------------------------------------------------
+# public lookups
+
+proc materialOf*(stateId: int): Material =
+  ## The material of a block state (global state id). Out-of-range ids give air's material.
+  ensureInit()
+  var sid = stateId
+  if sid < 0 or sid >= int(STATE_COUNT): sid = 0
+  if gHave[sid]: return gMat[sid]
+  var m = defaultMaterial(sid)
+  let blk = Block.fromStateId(newBlockStateIdUnchecked(uint16(sid)))
+  let bid = int(asU16(blk.id))
+  if gTagHas[bid]: applyOverride(m, gTagOv[bid])
+  if gBlockHas[bid]: applyOverride(m, gBlockOv[bid])
+  gMat[sid] = m
+  gHave[sid] = true
+  m
+
+proc materialOfBlock*(blockId: int): Material =
+  ## Material of a block's default state.
+  if blockId < 0 or blockId >= int(BLOCK_COUNT): return materialOf(0)
+  let blk = Block.fromId(newBlockIdUnchecked(uint16(blockId)))
+  materialOf(int(asU16(blk.defaultState.id)))
+
+proc materialByName*(name: string): (bool, Material) =
+  ## Material of a block by registry name ("stone" or "minecraft:stone"), default state.
+  let b = Block.fromName(name)
+  if b == nil: return (false, Material())
+  (true, materialOf(int(asU16(b.defaultState.id))))
+
+proc mass*(m: Material, volume: float64): float64 =
+  ## Mass in kg of `volume` m3 of this material (a full cube is volume 1).
+  m.density * volume
+
+proc massOfCube*(m: Material): float64 = m.density
+
+proc massOfState*(stateId: int): float64 =
+  ## Mass in kg of the block state as placed (density * fill fraction): a bottom slab is half a cube.
+  let m = materialOf(stateId)
+  m.density * m.fill
+
+proc className*(c: MatClass): string =
+  case c
+  of mcVoid: "void"
+  of mcFluid: "fluid"
+  of mcFoliage: "foliage"
+  of mcSoft: "soft"
+  of mcGranular: "granular"
+  of mcRock: "rock"
+  of mcWood: "wood"
+  of mcGeneric: "generic"
+
+# ---------------------------------------------------------------------------------------------------------------------
+# overrides
+
+proc clearMaterialOverrides*() =
+  ensureInit()
+  for i in 0 ..< gTagHas.len:
+    gTagHas[i] = false
+    gBlockHas[i] = false
+    gTagOv[i] = MaterialOverride()
+    gBlockOv[i] = MaterialOverride()
+  invalidate()
+
+proc normalizeName(n: string): string =
+  var hasColon = false
+  for c in n:
+    if c == ':': hasColon = true
+  if hasColon: n else: "minecraft:" & n
+
+proc setBlockOverride*(blockName: string, o: MaterialOverride): bool =
+  ## Override one block (all its states). False if the block does not exist.
+  ensureInit()
+  let b = Block.fromName(blockName)
+  if b == nil: return false
+  let bid = int(asU16(b.id))
+  mergeOverride(gBlockOv[bid], o)
+  gBlockHas[bid] = true
+  invalidate()
+  true
+
+proc setTagOverride*(tagName: string, o: MaterialOverride): bool =
+  ## Override every block in a block tag. False if the tag does not exist.
+  ensureInit()
+  let (found, ids) = getTagIds(rkBlock, normalizeName(tagName))
+  if not found: return false
+  for id in ids:
+    let bid = int(id)
+    if bid < gTagOv.len:
+      mergeOverride(gTagOv[bid], o)
+      gTagHas[bid] = true
+  invalidate()
+  true
+
+proc numOf(v: JsonValue): (bool, float64) =
+  case v.kind
+  of jvInt: (true, float64(v.intVal))
+  of jvFloat: (true, v.floatVal)
+  else: (false, 0.0)
+
+proc parseOverride(v: JsonValue, o: var MaterialOverride): string =
+  ## Returns an error message, "" on success.
+  if v.kind != jvObject: return "override must be an object"
+  for i in 0 ..< v.keys.len:
+    let k = v.keys[i]
+    let (ok, x) = numOf(v.vals[i])
+    if not ok: return "field " & k & " must be a number"
+    if x < 0.0: return "field " & k & " must not be negative"
+    if k == "density":
+      o.hasDensity = true
+      o.density = x
+    elif k == "stiffness":
+      o.hasStiffness = true
+      o.stiffness = x
+    elif k == "damping":
+      o.hasDamping = true
+      o.damping = x
+    elif k == "tensile":
+      o.hasTensile = true
+      o.tensile = x
+    elif k == "compressive":
+      o.hasCompressive = true
+      o.compressive = x
+    elif k == "dragArea":
+      o.hasDragArea = true
+      o.dragArea = x
+    elif k == "breakThreshold":
+      o.hasBreakThreshold = true
+      o.breakThreshold = x
+    elif k == "flammability":
+      o.hasFlammability = true
+      o.flammability = x
+    elif k == "ignitability":
+      o.hasIgnitability = true
+      o.ignitability = x
+    else:
+      return "unknown field " & k
+  ""
+
+proc loadMaterialOverrides*(jsonText: string): (bool, string) =
+  ## Parse and apply an overrides document (format in the header). Returns (true, warnings) when the document parsed (the
+  ## warnings list unknown blocks/tags that were skipped) and (false, error) when it is malformed, applying nothing.
+  ensureInit()
+  let r = parseJsonValue(jsonText)
+  if not r.ok: return (false, "invalid JSON: " & r.error)
+  let doc = r.value
+  if doc.kind != jvObject: return (false, "top level must be an object")
+  var tagList: seq[(string, MaterialOverride)] = @[]
+  var blockList: seq[(string, MaterialOverride)] = @[]
+  let (hasTags, tags) = doc.get("tags")
+  if hasTags:
+    if tags.kind != jvObject: return (false, "tags must be an object")
+    for i in 0 ..< tags.keys.len:
+      var o = MaterialOverride()
+      let e = parseOverride(tags.vals[i], o)
+      if e.len > 0: return (false, "tags." & tags.keys[i] & ": " & e)
+      tagList.add((tags.keys[i], o))
+  let (hasBlocks, blocks) = doc.get("blocks")
+  if hasBlocks:
+    if blocks.kind != jvObject: return (false, "blocks must be an object")
+    for i in 0 ..< blocks.keys.len:
+      var o = MaterialOverride()
+      let e = parseOverride(blocks.vals[i], o)
+      if e.len > 0: return (false, "blocks." & blocks.keys[i] & ": " & e)
+      blockList.add((blocks.keys[i], o))
+  var warn = ""
+  for i in 0 ..< tagList.len:
+    if not setTagOverride(tagList[i][0], tagList[i][1]): warn = warn & "unknown tag " & tagList[i][0] & "; "
+  for i in 0 ..< blockList.len:
+    if not setBlockOverride(blockList[i][0], blockList[i][1]): warn = warn & "unknown block " & blockList[i][0] & "; "
+  (true, warn)
+
+proc loadMaterialOverridesFile*(path: string): (bool, string) =
+  ## Read a JSON overrides file and apply it. (false, reason) if unreadable or malformed.
+  var text = ""
+  try:
+    text = readFile(path)
+  except ErrorCode:
+    return (false, "cannot read " & path)
+  loadMaterialOverrides(text)

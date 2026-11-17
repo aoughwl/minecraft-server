@@ -1,0 +1,261 @@
+## SERVER COPY of the client wind core. The source of truth is
+## C:\Users\timbuktu\Desktop\jester_data\apps\mc\basemods\aoughwl.wind\windcore.aowl (apps/mc/basemods/aoughwl.wind).
+## The body below this header is that file VERBATIM. Any change must be made in BOTH copies, byte for byte, or client
+## and server will disagree about the wind. Server-only additions (terrain shelter, cave drafts, weather feed) live in
+## windfield.aowl, never here.
+
+## windcore: the deterministic wind field, in one portable file.
+##
+## PORTABLE ON PURPOSE. This file imports nothing but `std/math` (for `sqrt`)
+## and mentions no mod, no host call and no catalog, so the SAME file is copied
+## verbatim to the server twin (`minecraft-server/src/physics/windcore.aowl`)
+## and a client and a server given the same inputs agree on the wind to the
+## last bit. To keep that true:
+##
+##  * Only `+ - * /`, `sqrt`, comparisons and integer arithmetic are used.
+##    No `sin`/`cos`/`pow`/`exp`: those are libm calls whose last bit differs
+##    between platforms. Directions are unit VECTORS made from hashed
+##    components and normalised with `sqrt` (exact in IEEE), never an angle.
+##  * The hash is 32-bit integer arithmetic masked at every step (the 64-bit
+##    `int` never overflows), the same shape `aoughwl.voxel/vxnoise.aowl` uses.
+##  * `ticks` is a float so a caller can pass `day time + partial tick`; the
+##    field only ever uses it through `floor`, `-`, `*`, `/`.
+##
+## THE FIELD
+##
+##   windAt(seed, ticks, x, y, z, rain, thunder) -> WindVec  (blocks / second)
+##
+##  * seed     the world seed (or its hash, `hashed seed` of the login packet:
+##             any int the two sides agree on). 0 is a valid seed.
+##  * ticks    the world's day time counter, running on past 24000 (tick 0 is
+##             06:00, tick 6000 noon, as the game has it). Day number =
+##             floor(ticks / 24000).
+##  * x y z    game coordinates (Minecraft's y, not a render-space y).
+##  * rain     0..1 the sky's rain level, thunder 0..1 its thunder level.
+##             Unknown weather is clear: pass 0, 0.
+##
+## What it is made of, outermost first:
+##
+##  1. PREVAILING WIND PER DAY. Each day hashes (seed, day) to a direction and
+##     a base strength (calm days are commoner than blowy ones). The last 20 %
+##     of a day blends smoothly into the next day's, so there is no step at
+##     dawn.
+##  2. TIME OF DAY. 0.8 .. 1.2 x: calmest in the small hours (02:00), blowiest
+##     mid-afternoon (14:00), smooth in between.
+##  3. WEATHER. x (1 + 0.8 rain + 0.6 thunder): a thunderstorm blows 2.4 x.
+##  4. ALTITUDE GAIN. 0.30 x at y <= 32 (valleys, caves), 1.0 at sea level 63,
+##     1.7 x at y >= 192 (peaks and the build limit).
+##  5. GUSTS. Two octaves of 3-D value noise, slowly drifting along a
+##     seed-fixed axis, so the same gust is felt by neighbouring positions a
+##     moment apart (spatially coherent, not white noise). Gust depth grows
+##     with rain/thunder. The direction wobbles up to ~27 degrees with a
+##     separate low-frequency noise; a little vertical turbulence is added.
+##
+## Reference values (seed 12345, ticks 6000, point 100 70 -50, clear) are
+## logged by `aoughwl.wind` at load as `[wind] windcore check ...` so a server
+## twin can be compared against the client's line.
+
+import std/math
+
+const
+  WindMask* = 0xFFFFFFFF
+  WindDayTicks* = 24000.0
+  WindBaseSpeed* = 3.2
+    ## Blocks per second on an average day at sea level in clear weather,
+    ## before gusts: a light breeze. Storm peaks are ~10 x 2.4.
+  WindGustDrift* = 2.4
+    ## Blocks per second a gust pattern travels along its axis.
+
+type
+  WindVec* = object
+    x*, y*, z*: float
+      ## Blocks per second, game axes (x east, y up, z south).
+    speed*: float
+      ## The horizontal speed, sqrt(x*x + z*z).
+
+  WindDay* = object
+    dx*, dz*: float
+      ## Unit direction the wind blows TOWARD.
+    base*: float
+      ## 0.25 .. 1.0, how strong the day is.
+
+# ---------------------------------------------------------------------------
+# Integer hash and value noise
+
+proc windMix*(value: int): int =
+  var h = value and WindMask
+  h = (h xor (h shr 16)) and WindMask
+  h = (h * 0x7feb352d) and WindMask
+  h = (h xor (h shr 15)) and WindMask
+  h = (h * 0x846ca68b) and WindMask
+  h = (h xor (h shr 16)) and WindMask
+  h
+
+proc windSeedFold*(seed: int): int =
+  ## Fold a 64-bit seed into 32 bits (both halves count).
+  (seed xor (seed shr 32)) and WindMask
+
+proc windHash*(seed, a, b, c: int): int =
+  windMix(((a * 0x27d4eb2d) and WindMask) + ((b * 0x85ebca6b) and WindMask) +
+          ((c * 0x165667b1) and WindMask) + ((windSeedFold(seed) * 0x9e3779b1) and WindMask))
+
+## 0.0 <= v < 1.0.
+proc windUnit*(seed, a, b, c: int): float =
+  float(windHash(seed, a, b, c)) / 4294967296.0
+
+proc windFloor*(v: float): int =
+  let t = int(v)
+  if v < 0.0 and float(t) != v: return t - 1
+  t
+
+proc windClamp*(v, lo, hi: float): float =
+  if v < lo: return lo
+  if v > hi: return hi
+  v
+
+proc windSmooth*(t: float): float = t * t * (3.0 - 2.0 * t)
+
+## Trilinear value noise, 0 .. 1, on a unit lattice. `channel` picks an
+## independent field out of the one seed.
+proc windNoise3*(seed, channel: int; x, y, z: float): float =
+  let ix = windFloor(x)
+  let iy = windFloor(y)
+  let iz = windFloor(z)
+  let fx = windSmooth(x - float(ix))
+  let fy = windSmooth(y - float(iy))
+  let fz = windSmooth(z - float(iz))
+  let s = seed + channel * 7919
+  let c000 = windUnit(s, ix, iy, iz)
+  let c100 = windUnit(s, ix + 1, iy, iz)
+  let c010 = windUnit(s, ix, iy + 1, iz)
+  let c110 = windUnit(s, ix + 1, iy + 1, iz)
+  let c001 = windUnit(s, ix, iy, iz + 1)
+  let c101 = windUnit(s, ix + 1, iy, iz + 1)
+  let c011 = windUnit(s, ix, iy + 1, iz + 1)
+  let c111 = windUnit(s, ix + 1, iy + 1, iz + 1)
+  let x00 = c000 + (c100 - c000) * fx
+  let x10 = c010 + (c110 - c010) * fx
+  let x01 = c001 + (c101 - c001) * fx
+  let x11 = c011 + (c111 - c011) * fx
+  let y0 = x00 + (x10 - x00) * fy
+  let y1 = x01 + (x11 - x01) * fy
+  y0 + (y1 - y0) * fz
+
+# ---------------------------------------------------------------------------
+# The slow parts: day, time of day, weather, altitude
+
+## The prevailing wind of one whole day number.
+proc windDay*(seed, day: int): WindDay =
+  var dx = windUnit(seed, day, 11, 3) * 2.0 - 1.0
+  var dz = windUnit(seed, day, 12, 3) * 2.0 - 1.0
+  let l2 = dx * dx + dz * dz
+  if l2 < 0.0625:
+    dx = 1.0
+    dz = 0.0
+  else:
+    let l = sqrt(l2)
+    dx = dx / l
+    dz = dz / l
+  let u = windUnit(seed, day, 13, 3)
+  WindDay(dx: dx, dz: dz, base: 0.25 + 0.75 * u * u)
+
+## Today's wind, blended into tomorrow's over the last fifth of the day.
+proc windPrevailing*(seed: int; ticks: float): WindDay =
+  let day = windFloor(ticks / WindDayTicks)
+  let f = (ticks - float(day) * WindDayTicks) / WindDayTicks
+  let a = windDay(seed, day)
+  if f <= 0.8: return a
+  let w = windSmooth(windClamp((f - 0.8) / 0.2, 0.0, 1.0))
+  let b = windDay(seed, day + 1)
+  var dx = a.dx * (1.0 - w) + b.dx * w
+  var dz = a.dz * (1.0 - w) + b.dz * w
+  let l2 = dx * dx + dz * dz
+  if l2 < 0.0025:
+    dx = a.dx
+    dz = a.dz
+  else:
+    let l = sqrt(l2)
+    dx = dx / l
+    dz = dz / l
+  WindDay(dx: dx, dz: dz, base: a.base * (1.0 - w) + b.base * w)
+
+## 0.8 (02:00) .. 1.2 (14:00). Tick 0 is 06:00, so 14:00 is tick 8000.
+proc windTimeOfDay*(ticks: float): float =
+  let day = windFloor(ticks / WindDayTicks)
+  let tod = ticks - float(day) * WindDayTicks
+  var d = tod - 8000.0
+  if d < 0.0: d = -d
+  if d > 12000.0: d = WindDayTicks - d
+  let tri = 1.0 - d / 12000.0
+  0.8 + 0.4 * windSmooth(windClamp(tri, 0.0, 1.0))
+
+proc windWeatherMul*(rain, thunder: float): float =
+  1.0 + 0.8 * windClamp(rain, 0.0, 1.0) + 0.6 * windClamp(thunder, 0.0, 1.0)
+
+## 0.30 (y <= 32) .. 1.0 (y = 63) .. 1.7 (y >= 192).
+proc windAltitude*(y: float): float =
+  if y <= 32.0: return 0.30
+  if y <= 63.0: return 0.30 + 0.70 * (y - 32.0) / 31.0
+  if y <= 192.0: return 1.0 + 0.70 * (y - 63.0) / 129.0
+  1.7
+
+## The whole-world wind for this moment: prevailing direction and the
+## horizontal speed at sea level with the gusts averaged out. This is what a
+## HUD, a sound bed or a sway amplitude wants.
+proc windGlobal*(seed: int; ticks, rain, thunder: float): WindVec =
+  let p = windPrevailing(seed, ticks)
+  let s = WindBaseSpeed * p.base * windTimeOfDay(ticks) * windWeatherMul(rain, thunder)
+  WindVec(x: p.dx * s, y: 0.0, z: p.dz * s, speed: s)
+
+## A 0..1 sway amplitude from a horizontal speed: a calm 2 b/s sways a little,
+## 14 b/s and over is a full gale.
+proc windSway01*(speed: float): float =
+  windClamp(speed / 14.0, 0.0, 1.0)
+
+# ---------------------------------------------------------------------------
+# The field
+
+proc windAt*(seed: int; ticks, x, y, z, rain, thunder: float): WindVec =
+  let p = windPrevailing(seed, ticks)
+  let sg = WindBaseSpeed * p.base * windTimeOfDay(ticks) * windWeatherMul(rain, thunder)
+  let gain = windAltitude(y)
+  let sec = ticks / 20.0
+  # Gust pattern drifts along a seed-fixed axis (not the day's wind, so the
+  # pattern never jumps when the day changes).
+  var ax = windUnit(seed, 0, 21, 5) * 2.0 - 1.0
+  var az = windUnit(seed, 0, 22, 5) * 2.0 - 1.0
+  let al2 = ax * ax + az * az
+  if al2 < 0.0625:
+    ax = 1.0
+    az = 0.0
+  else:
+    let al = sqrt(al2)
+    ax = ax / al
+    az = az / al
+  let travel = sec * WindGustDrift
+  let gx = x - ax * travel
+  let gz = z - az * travel
+  let n1 = windNoise3(seed, 1, gx / 40.0, gz / 40.0, sec / 9.0 + y / 60.0)
+  let n2 = windNoise3(seed, 2, gx / 14.0, gz / 14.0, sec / 3.0 + y / 20.0)
+  let gust = 0.65 * n1 + 0.35 * n2
+  let r = windClamp(rain, 0.0, 1.0)
+  let t = windClamp(thunder, 0.0, 1.0)
+  let depth = 0.45 + 0.35 * r + 0.20 * t
+  var factor = 1.0 + (gust - 0.5) * 2.0 * depth
+  if factor < 0.15: factor = 0.15
+  # Direction wobble: turn the prevailing vector a little toward its
+  # perpendicular, then re-normalise.
+  let wob = windNoise3(seed, 3, x / 55.0, z / 55.0, sec / 20.0 + y / 90.0)
+  let k = (wob - 0.5) * 1.0
+  var dx = p.dx - p.dz * k
+  var dz = p.dz + p.dx * k
+  let dl = sqrt(dx * dx + dz * dz)
+  if dl > 0.0001:
+    dx = dx / dl
+    dz = dz / dl
+  else:
+    dx = p.dx
+    dz = p.dz
+  let speed = sg * gain * factor
+  let up = windNoise3(seed, 4, gx / 18.0, gz / 18.0, sec / 4.0 + y / 25.0)
+  WindVec(x: dx * speed, y: (up - 0.5) * 0.5 * speed, z: dz * speed, speed: speed)

@@ -1,0 +1,133 @@
+## NBT save/load of a Body (design section 1, "Body NBT"). Pure: only nbt/tag and the body modules.
+##
+## Layout of the compound (entity-level fields such as Pos/Rotation/Motion belong to the BodyEntity wrapper, not here):
+##   Version   int      format version (1)
+##   Id        int[4]   UUID, putUuid layout (hi, lo)
+##   Pos       list<double>[3]   world position of the body-local origin
+##   Orient    list<double>[4]   w, x, y, z
+##   Vel       list<double>[3]   AngVel list<double>[3]
+##   Sleeping  byte, SleepTicks int
+##   Sections  list<compound>: X, Y, Z (int, section coords), Palette int[] (state ids, [0] == 0, canonical: ids in the
+##             order of first appearance in cell order, so equal volumes give equal NBT whatever their in-memory palette
+##             history), Cells int[4096] (indices into Palette)
+## Derived data (mass, com, inertia) and the pose history are NOT saved; loadBody recomputes the mass from the
+## palette through the given PropsFn. Doubles are written as doubles, so the round trip is bit-identical.
+
+import std/options
+import ../nbt/tag
+import body
+import bodymass
+
+const BodyNbtVersion* = 1'i32
+
+proc dvec(vals: openArray[float64]): NbtTag =
+  var l: seq[NbtTag] = @[]
+  for v in vals: l.add nbtTag(v)
+  NbtTag(kind: ntkList, listVal: l)
+
+proc readDoubles(c: NbtCompound, name: string, n: int): (bool, seq[float64]) =
+  let lo = getList(c, name)
+  if lo.isNone: return (false, @[])
+  let l = lo.get
+  if l.len != n: return (false, @[])
+  var r: seq[float64] = @[]
+  for t in l:
+    let d = extractDouble(t)
+    if d.isNone: return (false, @[])
+    r.add d.get
+  (true, r)
+
+proc sectionToNbt(s: BodySection): NbtCompound =
+  var pal: seq[int32] = @[0'i32]
+  var remap = newSeq[int32](s.palette.len)
+  for i in 0 ..< remap.len: remap[i] = -1
+  remap[0] = 0
+  var cells = newSeq[int32](SectionVolume)
+  for ci in 0 ..< SectionVolume:
+    let pi = int(s.idx[ci])
+    if remap[pi] < 0:
+      pal.add s.palette[pi]
+      remap[pi] = int32(pal.len - 1)
+    cells[ci] = remap[pi]
+  var c = newCompound()
+  putInt(c, "X", s.sx)
+  putInt(c, "Y", s.sy)
+  putInt(c, "Z", s.sz)
+  put(c, "Palette", NbtTag(kind: ntkIntArray, intArrayVal: pal))
+  put(c, "Cells", NbtTag(kind: ntkIntArray, intArrayVal: cells))
+  c
+
+proc bodyToNbt*(b: Body): NbtCompound =
+  var c = newCompound()
+  putInt(c, "Version", BodyNbtVersion)
+  putUuid(c, "Id", b.idHi, b.idLo)
+  put(c, "Pos", dvec([b.pos.x, b.pos.y, b.pos.z]))
+  put(c, "Orient", dvec([b.orient.w, b.orient.x, b.orient.y, b.orient.z]))
+  put(c, "Vel", dvec([b.vel.x, b.vel.y, b.vel.z]))
+  put(c, "AngVel", dvec([b.angVel.x, b.angVel.y, b.angVel.z]))
+  putBool(c, "Sleeping", b.sleeping)
+  putInt(c, "SleepTicks", b.sleepTicks)
+  var secs: seq[NbtTag] = @[]
+  for s in b.sections: secs.add NbtTag(kind: ntkCompound, compoundVal: sectionToNbt(s))
+  putList(c, "Sections", secs)
+  c
+
+proc bodyFromNbt*(c: NbtCompound, props: PropsFn): (bool, Body) =
+  ## (false, nil) on a missing or malformed field or an unknown version.
+  let ver = getInt(c, "Version")
+  if ver.isNone or ver.get != BodyNbtVersion: return (false, nil)
+  let id = getUuid(c, "Id")
+  if id.isNone: return (false, nil)
+  let (okP, p) = readDoubles(c, "Pos", 3)
+  let (okO, o) = readDoubles(c, "Orient", 4)
+  let (okV, v) = readDoubles(c, "Vel", 3)
+  let (okA, a) = readDoubles(c, "AngVel", 3)
+  if not (okP and okO and okV and okA): return (false, nil)
+  let secsOpt = getList(c, "Sections")
+  if secsOpt.isNone: return (false, nil)
+  let (hi, lo) = id.get
+  let b = newBody(hi, lo)
+  for st in secsOpt.get:
+    let so = extractCompound(st)
+    if so.isNone: return (false, nil)
+    let sc = so.get
+    let sx = getInt(sc, "X")
+    let sy = getInt(sc, "Y")
+    let sz = getInt(sc, "Z")
+    let pal = getIntArray(sc, "Palette")
+    let cells = getIntArray(sc, "Cells")
+    if sx.isNone or sy.isNone or sz.isNone or pal.isNone or cells.isNone: return (false, nil)
+    if cells.get.len != SectionVolume: return (false, nil)
+    let palette = pal.get
+    for ci in 0 ..< SectionVolume:
+      let pi = int(cells.get[ci])
+      if pi < 0 or pi >= palette.len: return (false, nil)
+      if palette[pi] != 0:
+        setCell(b, int(sx.get) * 16 + (ci and 15), int(sy.get) * 16 + (ci shr 8),
+                int(sz.get) * 16 + ((ci shr 4) and 15), int(palette[pi]))
+  b.pos = Vec3(x: p[0], y: p[1], z: p[2])
+  b.orient = Quat(w: o[0], x: o[1], y: o[2], z: o[3])
+  b.vel = Vec3(x: v[0], y: v[1], z: v[2])
+  b.angVel = Vec3(x: a[0], y: a[1], z: a[2])
+  let sl = getBool(c, "Sleeping")
+  b.sleeping = sl.isSome and sl.get
+  let stk = getInt(c, "SleepTicks")
+  b.sleepTicks = if stk.isSome: stk.get else: 0'i32
+  recomputeMass(b, props)
+  (true, b)
+
+proc sameV(a, b: Vec3): bool = a.x == b.x and a.y == b.y and a.z == b.z
+
+proc sameVolumeAndPose*(a, b: Body): bool =
+  ## Equality used by the round-trip tests: same id, same cells (state per cell, palette order irrelevant), same pose
+  ## and velocities bit for bit, same sleep state.
+  if a.idHi != b.idHi or a.idLo != b.idLo: return false
+  let ca = cellList(a)
+  let cb = cellList(b)
+  if ca.len != cb.len: return false
+  for i in 0 ..< ca.len:
+    if ca[i].x != cb[i].x or ca[i].y != cb[i].y or ca[i].z != cb[i].z or ca[i].state != cb[i].state: return false
+  if not (sameV(a.pos, b.pos) and sameV(a.vel, b.vel) and sameV(a.angVel, b.angVel)): return false
+  if a.orient.w != b.orient.w or a.orient.x != b.orient.x or a.orient.y != b.orient.y or a.orient.z != b.orient.z:
+    return false
+  a.sleeping == b.sleeping and a.sleepTicks == b.sleepTicks

@@ -1,0 +1,204 @@
+## Server wind/environment field service (phase 1 item 11). The portable base is windcore.aowl (a verbatim copy of the
+## client's aoughwl.wind core: level 1, works on any server). This file adds what only the server can know (level 2):
+##
+##  * TERRAIN SHELTER (needs heightAt): march upwind in ShelterStep-block steps for ShelterSteps steps. A sample at distance
+##    d whose terrain stands r = h - y above the point shelters it by clamp(r / ShelterRise, 0, 1) * (1 - d / (maxD + step));
+##    shelter = max over samples (cost: ShelterSteps heightAt calls). Wind is scaled by 1 - ShelterMax * shelter, so the
+##    lee of a tall ridge is calmer.
+##  * EXPOSURE: a point below the local surface (y < surface - 1) is underground and gets no surface wind.
+##  * CAVE DRAFTS (needs heightAt + solidAt), documented approximation: an underground AIR cell is connected to the sky
+##    through openings. Six axis rays are walked through air up to DraftRange cells; a ray reaching a cell in the open
+##    (heightAt(x', z') <= y') is an opening at distance k with weight 1/(1+k). A slow barometric swing s in [-1, 1]
+##    (windcore value noise over time, one lattice step per 1200 ticks) is the pressure difference between open and enclosed
+##    air. Air flows high -> low: for s > 0 (outside high) it enters, so the draft points away from each opening; for s < 0
+##    toward each. draft = -s * DraftSpeed * sum(w_i * dir_i) / max(1, sum(w_i)), magnitude clamped to DraftSpeed.
+##    Cost bound: 6 * DraftRange solidAt + heightAt calls. No flow around corners, no pressure memory.
+##  * REAL-WEATHER FEED: a WeatherProvider callback (no HTTP here) may return rain, thunder and optionally a wind vector;
+##    when it has wind, that vector (blocks/s) replaces the horizontal prevailing wind keeping the core's gusts as a factor.
+##
+## The server state (seed, terrain callbacks, local weather, provider) is kept here. All of it is optional: with no terrain,
+## windAtWorld is exactly windcore's windAt.
+
+import std/math
+import windcore
+export windcore
+
+type
+  HeightFn* = proc (x, z: int): int {.closure.}      ## Y of the top terrain surface of column (x, z)
+  SolidFn* = proc (x, y, z: int): bool {.closure.}   ## does the block at (x, y, z) block air flow?
+
+  WeatherSample* = object
+    rain*, thunder*: float      ## 0..1
+    hasWind*: bool
+    windX*, windZ*: float       ## blocks/second toward +x / +z
+
+  WeatherProvider* = proc (ticks: float): WeatherSample {.closure.}
+
+  FieldParams* = object
+    useShelter*, useDrafts*: bool
+    shelterSteps*: int
+    shelterStep*: float
+    shelterRise*: float
+    shelterMax*: float
+    draftRange*: int
+    draftSpeed*: float
+
+proc defaultFieldParams*(): FieldParams =
+  FieldParams(useShelter: true, useDrafts: true, shelterSteps: 8, shelterStep: 2.0, shelterRise: 6.0, shelterMax: 0.85,
+              draftRange: 12, draftSpeed: 1.5)
+
+proc noHeight*(x, z: int): int = -100000
+proc noSolid*(x, y, z: int): bool = false
+
+proc shelterAt*(x, y, z: float, dirX, dirZ: float, heightAt: HeightFn, p: FieldParams): float =
+  ## 0 (open) .. 1 (fully in the lee). (dirX, dirZ) is the unit direction the wind blows TOWARD.
+  var best = 0.0
+  let maxD = float(p.shelterSteps) * p.shelterStep
+  for k in 1 .. p.shelterSteps:
+    let d = float(k) * p.shelterStep
+    let sx = windFloor(x - dirX * d)
+    let sz = windFloor(z - dirZ * d)
+    let r = float(heightAt(sx, sz)) - y
+    if r > 0.0:
+      let e = windClamp(r / p.shelterRise, 0.0, 1.0) * (1.0 - d / (maxD + p.shelterStep))
+      if e > best: best = e
+  best
+
+proc caveDraft*(seed: int, ticks: float, x, y, z: float, heightAt: HeightFn, solidAt: SolidFn,
+                p: FieldParams): WindVec =
+  ## Draft inside an enclosed air cell. Zero when the cell is solid or open to the sky.
+  let cx = windFloor(x)
+  let cy = windFloor(y)
+  let cz = windFloor(z)
+  if solidAt(cx, cy, cz): return WindVec()
+  if heightAt(cx, cz) <= cy + 1: return WindVec()
+  let s = windNoise3(seed, 9, 0.5, 0.5, ticks / 1200.0) * 2.0 - 1.0
+  var sx = 0.0
+  var sy = 0.0
+  var sz = 0.0
+  var wsum = 0.0
+  for dir in 0 ..< 6:
+    var ddx = 0
+    var ddy = 0
+    var ddz = 0
+    case dir
+    of 0: ddx = 1
+    of 1: ddx = -1
+    of 2: ddy = 1
+    of 3: ddy = -1
+    of 4: ddz = 1
+    else: ddz = -1
+    var px = cx
+    var py = cy
+    var pz = cz
+    for k in 1 .. p.draftRange:
+      px += ddx
+      py += ddy
+      pz += ddz
+      if solidAt(px, py, pz): break
+      if heightAt(px, pz) <= py:
+        let w = 1.0 / (1.0 + float(k))
+        sx += w * float(ddx)
+        sy += w * float(ddy)
+        sz += w * float(ddz)
+        wsum += w
+        break
+  if wsum <= 0.0: return WindVec()
+  let norm = if wsum > 1.0: wsum else: 1.0
+  var vx = -s * p.draftSpeed * sx / norm
+  var vy = -s * p.draftSpeed * sy / norm
+  var vz = -s * p.draftSpeed * sz / norm
+  let l = sqrt(vx * vx + vy * vy + vz * vz)
+  if l > p.draftSpeed:
+    let k = p.draftSpeed / l
+    vx = vx * k
+    vy = vy * k
+    vz = vz * k
+  WindVec(x: vx, y: vy, z: vz, speed: sqrt(vx * vx + vz * vz))
+
+proc windAtField*(seed: int, ticks, x, y, z, rain, thunder: float, heightAt: HeightFn, solidAt: SolidFn,
+                  p: FieldParams, feedActive: bool, feedX, feedZ: float): WindVec =
+  ## windcore's windAt plus shelter, exposure and cave drafts (and an optional feed vector for the horizontal wind).
+  let base = windAt(seed, ticks, x, y, z, rain, thunder)
+  var wx = base.x
+  var wy = base.y
+  var wz = base.z
+  if feedActive:
+    # keep the core's gust/altitude factor, replace the direction and magnitude by the feed's
+    let g = windGlobal(seed, ticks, rain, thunder)
+    let ratio = if g.speed > 0.0001: base.speed / g.speed else: 1.0
+    wx = feedX * ratio
+    wz = feedZ * ratio
+  var speed = sqrt(wx * wx + wz * wz)
+  if p.useShelter:
+    let surface = float(heightAt(windFloor(x), windFloor(z)))
+    var f = 1.0
+    if y < surface - 1.0:
+      f = 0.0
+    elif speed > 0.0001:
+      f = 1.0 - p.shelterMax * shelterAt(x, y, z, wx / speed, wz / speed, heightAt, p)
+    wx = wx * f
+    wy = wy * f
+    wz = wz * f
+  if p.useDrafts and p.useShelter:
+    let d = caveDraft(seed, ticks, x, y, z, heightAt, solidAt, p)
+    wx += d.x
+    wy += d.y
+    wz += d.z
+  speed = sqrt(wx * wx + wz * wz)
+  WindVec(x: wx, y: wy, z: wz, speed: speed)
+
+# ---------------------------------------------------------------------------------------------------------------------
+# server state
+
+var gSeed: int = 0
+var gHeight: HeightFn = noHeight
+var gSolid: SolidFn = noSolid
+var gRain: float = 0.0
+var gThunder: float = 0.0
+var gProvider: WeatherProvider = proc (ticks: float): WeatherSample {.closure.} = WeatherSample()
+var gHasProvider: bool = false
+var gParams: FieldParams = FieldParams(useShelter: false, useDrafts: false, shelterSteps: 8, shelterStep: 2.0,
+                                       shelterRise: 6.0, shelterMax: 0.85, draftRange: 12, draftSpeed: 1.5)
+
+proc setWindSeed*(seed: int) = gSeed = seed
+proc windSeed*(): int = gSeed
+proc setFieldParams*(p: FieldParams) = gParams = p
+
+proc setWindTerrain*(heightAt: HeightFn, solidAt: SolidFn) =
+  gHeight = heightAt
+  gSolid = solidAt
+  gParams.useShelter = true
+  gParams.useDrafts = true
+
+proc clearWindTerrain*() =
+  gHeight = noHeight
+  gSolid = noSolid
+  gParams.useShelter = false
+  gParams.useDrafts = false
+
+proc setWindWeather*(rain, thunder: float) =
+  gRain = windClamp(rain, 0.0, 1.0)
+  gThunder = windClamp(thunder, 0.0, 1.0)
+
+proc setWeatherProvider*(p: WeatherProvider) =
+  gProvider = p
+  gHasProvider = true
+
+proc clearWeatherProvider*() = gHasProvider = false
+
+proc windAtWorld*(ticks: float, x, y, z: float): WindVec =
+  ## THE service call. Deterministic given seed, terrain, weather and provider state.
+  var rain = gRain
+  var thunder = gThunder
+  var fa = false
+  var fx = 0.0
+  var fz = 0.0
+  if gHasProvider:
+    let s = gProvider(ticks)
+    rain = windClamp(s.rain, 0.0, 1.0)
+    thunder = windClamp(s.thunder, 0.0, 1.0)
+    fa = s.hasWind
+    fx = s.windX
+    fz = s.windZ
+  windAtField(gSeed, ticks, x, y, z, rain, thunder, gHeight, gSolid, gParams, fa, fx, fz)

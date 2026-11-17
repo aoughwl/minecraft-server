@@ -1,0 +1,154 @@
+## Mass, centre of mass and inertia of a Body, plus break and split (design section 1 and 2.3).
+##
+## MATERIAL SEAM. The only dependency on the material table is the next import line and `defaultProps`.
+## `import materials` is the real table (src/physics/materials.aowl, materialOf(stateId: int): Material with
+## `density` kg/m3 and `fill`, the collision-shape volume fraction of the 1 m cell). Changing it to
+## `import materials_stub` swaps in the fallback table, which exposes the same names. Every proc below takes the
+## properties as a `PropsFn` argument (default `defaultProps`), so tests inject exact numbers.
+##
+## FORMULAS. One cell is 1 m^3, centre c_i = (x+.5, y+.5, z+.5), mass m_i = density_i * fill_i (a half slab weighs half a
+## cube). Each cell is modelled as a uniform UNIT CUBE of mass m_i (its fill only scales mass; the true sub-shape is not
+## tracked: stated approximation). Moments of a uniform unit cube of mass m about its own centre: I = m (1^2 + 1^2) / 12
+## = m/6 per axis, no products. Totals:
+##   M      = sum m_i
+##   com    = (sum m_i c_i) / M
+##   I_origin(per entry) = sum m_i/6 (diagonal)  +  [ tr(S) E - S ]   with S = sum m_i c_i c_i^T  (parallel axis theorem
+##            about the body-local origin, E the identity)
+##   I_com  = I_origin - M [ |com|^2 E - com com^T ]   (shift to the centre of mass)
+## stored as Ixx Iyy Izz Ixy Ixz Iyz where the off-diagonal entries are the tensor entries (Ixy = -sum m dx dy).
+## Only the raw sums (MassAcc) change per cell, so adding or removing one cell is O(1); finalizeMass is O(1).
+## Cell-local coordinates are small, so the cancellation in I_com is harmless in float64.
+
+import body
+import materials
+
+type
+  CellProps* = object
+    density*: float64       ## kg per m3
+    fill*: float64          ## fraction of the cell volume that is solid (collision shape volume), 0..1
+
+  PropsFn* = proc (state: int): CellProps {.closure.}
+
+proc defaultProps*(state: int): CellProps =
+  ## The seam: material table lookup. Mass of the cell = density * fill (same as materials.massOfState).
+  let m = materialOf(state)
+  CellProps(density: m.density, fill: m.fill)
+
+proc cellMassOf*(props: PropsFn, state: int): float64 =
+  let p = props(state)
+  p.density * p.fill
+
+proc accAdd(a: var MassAcc, m, cx, cy, cz: float64) =
+  a.m += m
+  a.sx += m * cx
+  a.sy += m * cy
+  a.sz += m * cz
+  a.qxx += m * cx * cx
+  a.qyy += m * cy * cy
+  a.qzz += m * cz * cz
+  a.qxy += m * cx * cy
+  a.qxz += m * cx * cz
+  a.qyz += m * cy * cz
+  a.self += m / 6.0
+  inc a.cells
+
+proc accRemove(a: var MassAcc, m, cx, cy, cz: float64) =
+  a.m -= m
+  a.sx -= m * cx
+  a.sy -= m * cy
+  a.sz -= m * cz
+  a.qxx -= m * cx * cx
+  a.qyy -= m * cy * cy
+  a.qzz -= m * cz * cz
+  a.qxy -= m * cx * cy
+  a.qxz -= m * cx * cz
+  a.qyz -= m * cy * cz
+  a.self -= m / 6.0
+  dec a.cells
+
+proc finalizeMass*(b: Body) =
+  ## Derive mass, com and inertia (about com) from the accumulated sums.
+  let a = b.acc
+  if a.cells <= 0 or a.m <= 0.0:
+    b.mass = 0.0
+    b.com = Vec3()
+    for i in 0 ..< 6: b.inertia[i] = 0.0
+    return
+  b.mass = a.m
+  let cx = a.sx / a.m
+  let cy = a.sy / a.m
+  let cz = a.sz / a.m
+  b.com = Vec3(x: cx, y: cy, z: cz)
+  let tr = a.qxx + a.qyy + a.qzz
+  let c2 = cx * cx + cy * cy + cz * cz
+  # about the origin, then shifted to the com
+  b.inertia[0] = a.self + (tr - a.qxx) - a.m * (c2 - cx * cx)
+  b.inertia[1] = a.self + (tr - a.qyy) - a.m * (c2 - cy * cy)
+  b.inertia[2] = a.self + (tr - a.qzz) - a.m * (c2 - cz * cz)
+  b.inertia[3] = -a.qxy + a.m * cx * cy
+  b.inertia[4] = -a.qxz + a.m * cx * cz
+  b.inertia[5] = -a.qyz + a.m * cy * cz
+
+proc recomputeMass*(b: Body, props: PropsFn) =
+  ## Full O(cells) recompute (assemble, load, material table reload).
+  b.acc = MassAcc()
+  for c in cellList(b):
+    accAdd(b.acc, cellMassOf(props, int(c.state)), float64(c.x) + 0.5, float64(c.y) + 0.5, float64(c.z) + 0.5)
+  finalizeMass(b)
+
+proc setCellMass*(b: Body, x, y, z: int, state: int, props: PropsFn) =
+  ## setCell plus the incremental mass update (remove the old cell's contribution, add the new one).
+  let old = getCell(b, x, y, z)
+  if old == state: return
+  let cx = float64(x) + 0.5
+  let cy = float64(y) + 0.5
+  let cz = float64(z) + 0.5
+  if old != 0: accRemove(b.acc, cellMassOf(props, old), cx, cy, cz)
+  setCell(b, x, y, z, state)
+  if state != 0: accAdd(b.acc, cellMassOf(props, state), cx, cy, cz)
+  finalizeMass(b)
+
+proc breakCells*(b: Body, cells: openArray[Cell], props: PropsFn): int =
+  ## Remove cells (those that exist), updating mass incrementally. Returns how many were removed.
+  var n = 0
+  for c in cells:
+    let old = getCell(b, int(c.x), int(c.y), int(c.z))
+    if old == 0: continue
+    accRemove(b.acc, cellMassOf(props, old), float64(c.x) + 0.5, float64(c.y) + 0.5, float64(c.z) + 0.5)
+    setCell(b, int(c.x), int(c.y), int(c.z), 0)
+    inc n
+  finalizeMass(b)
+  n
+
+proc childId(hi, lo: uint64, k: int): (uint64, uint64) =
+  ## Deterministic id of the k-th split child (k >= 1): the parent id mixed with k by an odd 64-bit multiplier.
+  let m = 0x9E3779B97F4A7C15'u64 * uint64(k)
+  (hi xor m, lo + m)
+
+proc splitBody*(b: Body, props: PropsFn): seq[Body] =
+  ## Split by 6-neighbour connectivity (union-find, body.splitConnected). One component: returns @[b] unchanged.
+  ## Otherwise the component holding the smallest canonical cell keeps the parent's id, the others get childId(k).
+  ## Children keep the parent's body-local frame and pose (geometry is unchanged, only the cell set shrinks), so
+  ## pos and orient are copied. A child's centre of mass velocity is the rigid-body velocity of that point:
+  ##   v_child = v_parent + omega x ( R(orient) (com_child - com_parent) ),  omega world-frame, per tick.
+  ## angVel is shared (rigid rotation about different centres). Sleep state is cleared so the pieces get simulated.
+  let cells = cellList(b)
+  let comps = splitConnected(cells)
+  if comps.len <= 1: return @[b]
+  result = @[]
+  for k in 0 ..< comps.len:
+    var ch: Body
+    if k == 0: ch = newBody(b.idHi, b.idLo)
+    else:
+      let (hi, lo) = childId(b.idHi, b.idLo, k)
+      ch = newBody(hi, lo)
+    for ci in comps[k]:
+      let c = cells[ci]
+      setCell(ch, int(c.x), int(c.y), int(c.z), int(c.state))
+    recomputeMass(ch, props)
+    ch.pos = b.pos
+    ch.orient = b.orient
+    ch.angVel = b.angVel
+    let r = rotate(b.orient, ch.com - b.com)
+    ch.vel = b.vel + cross(b.angVel, r)
+    result.add ch

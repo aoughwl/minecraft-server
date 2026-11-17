@@ -1,0 +1,192 @@
+## Structural solver, part 1: the contact graph in structure-of-arrays form, and union-find connectivity.
+##
+## PURE: no world, entity or server imports. Only std types and plain arrays, so this file can run in a worker thread and be
+## compiled into the Jester client later (same rule as windcore.aowl).
+##
+## The voxel box is dense: index(x, y, z) = x + nx * (z + nz * y)  (x fastest, y slowest, so a "layer" is one y slice).
+## A cell has a kind: 0 empty, 1 structural solid, 2 granular (sand/gravel-like: stands on what is below, holds no tension).
+## Graph nodes are the non-empty cells numbered in increasing cell index; edges are 6-neighbour contacts, stored CSR
+## (adjStart / adj). A granular cell touches only the cell below it and the cell above it (it cannot be pulled sideways, it
+## does not hold anything up horizontally); every other pair of face neighbours is joined.
+##
+## Everything is deterministic: ascending-index iteration only, and the union-find root is always the SMALLEST node index of
+## the set, so labels do not depend on the order of unions.
+##
+## Building is incremental: GraphBuild carries a stage and a cursor and `graphStep` does at most `budget` units of work
+## (a unit is one cell or one node or one adjacency visit) and returns the units used, so the caller can slice it across ticks.
+
+const FillOrder = [4, 2, 0, 1, 3, 5]
+
+type
+  Graph* = object
+    nx*, ny*, nz*: int
+    nodeCell*: seq[int]        ## node -> grid cell index
+    cellNode*: seq[int]        ## grid cell -> node, -1 for empty
+    adjStart*: seq[int]        ## n + 1 entries, CSR row starts
+    adj*: seq[int]             ## neighbour node ids, ascending inside a row
+    parent*: seq[int]          ## union-find parent, root = smallest index in the set
+    rootAnchored*: seq[bool]   ## per node (valid for roots): the set contains an anchored node
+    nodeAnchor*: seq[bool]     ## per node: the cell itself is an anchor
+
+  GraphStage* = enum
+    gsNodes, gsDegree, gsPrefix, gsFill, gsUnion, gsAnchor, gsDone
+
+  GraphBuild* = object
+    stage*: GraphStage
+    cur*: int
+    g*: Graph
+
+proc cellIndex*(nx, nz, x, y, z: int): int {.inline.} = x + nx * (z + nz * y)
+
+proc ufFind*(g: var Graph; x: int): int =
+  var a = x
+  while true:
+    let p = g.parent[a]
+    if p == a: break
+    let gp = g.parent[p]
+    g.parent[a] = gp
+    a = gp
+  return a
+
+proc ufUnion*(g: var Graph; a, b: int) =
+  let ra = ufFind(g, a)
+  let rb = ufFind(g, b)
+  if ra == rb: return
+  if ra < rb: g.parent[rb] = ra
+  else: g.parent[ra] = rb
+
+proc nodeCount*(g: Graph): int = g.nodeCell.len
+
+proc newGraphBuild*(nx, ny, nz: int): GraphBuild =
+  result = GraphBuild(stage: gsNodes, cur: 0)
+  result.g.nx = nx
+  result.g.ny = ny
+  result.g.nz = nz
+  result.g.cellNode = newSeq[int](nx * ny * nz)
+
+proc linkAllowed(kindA, kindB: uint8; vertical: bool): bool {.inline.} =
+  if kindA == 0'u8 or kindB == 0'u8: return false
+  if vertical: return true
+  return kindA == 1'u8 and kindB == 1'u8
+
+## Neighbour cell of c in direction d (0:-x 1:+x 2:-z 3:+z 4:-y 5:+y) or -1 outside the box.
+proc neighbourCell*(g: Graph; c, d: int): int {.inline.} =
+  let nxz = g.nx * g.nz
+  let y = c div nxz
+  let r = c - y * nxz
+  let z = r div g.nx
+  let x = r - z * g.nx
+  case d
+  of 0:
+    if x == 0: return -1
+    return c - 1
+  of 1:
+    if x + 1 >= g.nx: return -1
+    return c + 1
+  of 2:
+    if z == 0: return -1
+    return c - g.nx
+  of 3:
+    if z + 1 >= g.nz: return -1
+    return c + g.nx
+  of 4:
+    if y == 0: return -1
+    return c - nxz
+  else:
+    if y + 1 >= g.ny: return -1
+    return c + nxz
+
+## Advance the build by up to `budget` units. kind[c] 0/1/2, anchor[c] anchored flag. Returns units used (at least 1 while not done).
+proc graphStep*(b: var GraphBuild; kind: seq[uint8]; anchor: seq[bool]; budget: int): int =
+  var used = 0
+  let total = b.g.nx * b.g.ny * b.g.nz
+  while b.stage != gsDone and used < budget:
+    case b.stage
+    of gsNodes:
+      while b.cur < total and used < budget:
+        if kind[b.cur] != 0'u8:
+          b.g.cellNode[b.cur] = b.g.nodeCell.len
+          b.g.nodeCell.add b.cur
+          b.g.nodeAnchor.add anchor[b.cur]
+        else:
+          b.g.cellNode[b.cur] = -1
+        inc b.cur
+        inc used
+      if b.cur >= total:
+        b.stage = gsDegree
+        b.cur = 0
+        b.g.adjStart = newSeq[int](b.g.nodeCell.len + 1)
+    of gsDegree:
+      let n = b.g.nodeCell.len
+      while b.cur < n and used < budget:
+        let c = b.g.nodeCell[b.cur]
+        var deg = 0
+        for d in 0 ..< 6:
+          let nb = neighbourCell(b.g, c, d)
+          if nb >= 0 and linkAllowed(kind[c], kind[nb], d >= 4): inc deg
+        b.g.adjStart[b.cur + 1] = deg
+        inc b.cur
+        inc used
+      if b.cur >= n:
+        b.stage = gsPrefix
+        b.cur = 0
+    of gsPrefix:
+      let n = b.g.nodeCell.len
+      while b.cur < n and used < budget:
+        b.g.adjStart[b.cur + 1] = b.g.adjStart[b.cur + 1] + b.g.adjStart[b.cur]
+        inc b.cur
+        inc used
+      if b.cur >= n:
+        b.stage = gsFill
+        b.cur = 0
+        b.g.adj = newSeq[int](b.g.adjStart[n])
+    of gsFill:
+      let n = b.g.nodeCell.len
+      while b.cur < n and used < budget:
+        let c = b.g.nodeCell[b.cur]
+        var w = b.g.adjStart[b.cur]
+        # ascending neighbour cell order: -y, -z, -x, +x, +z, +y  (cell indices ascend in that order)
+        for q in 0 ..< 6:
+          let d = FillOrder[q]
+          let nb = neighbourCell(b.g, c, d)
+          if nb >= 0 and linkAllowed(kind[c], kind[nb], d >= 4):
+            b.g.adj[w] = b.g.cellNode[nb]
+            inc w
+        inc b.cur
+        inc used
+      if b.cur >= n:
+        b.stage = gsUnion
+        b.cur = 0
+        b.g.parent = newSeq[int](n)
+        for i in 0 ..< n: b.g.parent[i] = i
+    of gsUnion:
+      let n = b.g.nodeCell.len
+      while b.cur < n and used < budget:
+        let i = b.cur
+        for e in b.g.adjStart[i] ..< b.g.adjStart[i + 1]:
+          let j = b.g.adj[e]
+          if j > i: ufUnion(b.g, i, j)
+        inc b.cur
+        inc used
+      if b.cur >= n:
+        b.stage = gsAnchor
+        b.cur = 0
+        b.g.rootAnchored = newSeq[bool](n)
+    of gsAnchor:
+      let n = b.g.nodeCell.len
+      while b.cur < n and used < budget:
+        if b.g.nodeAnchor[b.cur]:
+          b.g.rootAnchored[ufFind(b.g, b.cur)] = true
+        inc b.cur
+        inc used
+      if b.cur >= n:
+        b.stage = gsDone
+    of gsDone:
+      discard
+  if used == 0: used = 1
+  return used
+
+proc graphDone*(b: GraphBuild): bool = b.stage == gsDone
+
+## Is the node supported (its set contains an anchor)?
+proc nodeSupported*(g: var Graph; node: int): bool = g.rootAnchored[ufFind(g, node)]

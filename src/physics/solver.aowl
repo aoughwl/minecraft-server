@@ -1,0 +1,677 @@
+## Structural stress solver core (level 2 physics, task T8): a deterministic, budgetable game approximation, NOT a finite
+## element solver. PURE: no world/entity/server imports; plain arrays in, plain arrays out (worker-thread and Jester-client safe).
+##
+## INPUT (SolverInput): a dense voxel box nx*ny*nz, index = x + nx*(z + nz*y). cells[i] = material index (0 empty), looked up in
+## `materials` (a small struct array: mass per cell in kg, strengths, break threshold, friction/stiffness, granular/terrain
+## flags). anchor[i] marks supports (ground, bedrock, world boundary, terrain): they never fail and absorb any load. Loads:
+## ExtLoad entries add a lateral wind load (fx, fz) and/or an extra downward point load fy (kg) on a cell.
+## UNITS: loads are kgf (a cell's weight is its mass in kg); strengths are kgf per m2 of a 1 m cell face (callers map MPa with
+## mpaToKgfPerM2 and may scale everything with SolverParams.strengthScale to "game" values; the materials table is ~1e6 times
+## stronger than a game wants, which is why the scale exists).
+##
+## MODEL (all of it is an approximation, the honest list):
+##  1. Granular cells (sand/gravel flag) hold no tension and nothing sideways: a granular cell with no solid below it falls.
+##     They are reported in `granular` (for the vanilla falling-entity path) and removed before the structure is solved. The
+##     scan runs bottom-up, so a whole sand column over a hole is reported. Anchors never fall.
+##  2. Connectivity (solvergraph: 6-neighbour contact graph, union-find): a connected set with no anchor cell is a free body.
+##     Granular cells connect only up/down. Free sets are returned as `components` (kind: unsupported at round 0, collapse
+##     after a failure) and are removed from the structure; `terrain` marks sets that are mostly terrain-flag material (cave-in
+##     candidates, listed in `caveIns`).
+##  3. Load paths, solved layer by layer from the top down. A cell is "standing" if a solid cell is below it (or it is at y=0
+##     and groundBelow is set) or it is an anchor; its whole load (own weight, point loads, everything resting on it, beam
+##     reactions) goes straight down and is checked in compression (crush) and for wind bending (cantilever moment of the
+##     lateral load above, tension on the far fibre = 6M/(t^2) - N/A, shear). A cell with no solid below that hangs from an
+##     anchor cell directly above it is "hung" (tension = its load / tensile strength). Every other cell is "spanning".
+##  4. Spanning cells form maximal horizontal runs along x and along z (granular cells break runs). A run is a 1D beam on its
+##     standing cells: between two standing cells the span is simply supported (reactions by the lever rule, moment
+##     M(x) = Ra*x - sum w_j (x - x_j)); beyond the outermost standing cell it is a cantilever (M = sum w_j * lever). The
+##     moment also applies at the standing cell itself (hogging), except for anchors. Bending stress = 6M/t^2 where t is the
+##     number of vertically contiguous cells of the SAME material above-and-including the cell (a composite thick beam;
+##     a different heavy block on top is a load, not stiffness), capped at 8. Shear = V/(t*shear strength). A beam failing
+##     means the cell whose stress is highest, so a bridge breaks mid-span and a cantilever at its root cell.
+##  5. Plates and two-way action (no real plate theory): each spanning cell is assigned to one run. A run with no standing cell
+##     gets "level" 2 if it crosses a level-1 run, level 3 if it crosses a level-2 run, and so on (SolverParams.maxLevels,
+##     default 8 passes, this is the fixed iteration cap): it then acts as a secondary beam whose supports are its crossing
+##     cells of the lower-level runs, and passes its reactions to them as point loads. Runs are processed from the highest level
+##     to level 1 so reactions flow along the load path to the real supports. A cell whose runs reach no support within the cap
+##     is an orphan: hung from above (tension) or unsupported.
+##  6. Failure and progressive collapse: ratio = demand/capacity/breakThreshold per cell (max over bending, shear, crush, tension,
+##     hang). Cells with ratio > 1 fail; per round only the worst `breakPerRound` (default 4, ties: lowest index) are removed (reported
+##     in `broken` with kind and ratio, first round first), then connectivity is recomputed (newly detached sets become
+##     components) and the loads are solved again, up to `maxRounds` (default 32). If failing cells remain at the cap, converged=false.
+##  7. NOT modelled: continuous-beam fixity at walls (we assume pinned spans, up to 2x conservative mid-span, unconservative at
+##     fixed ends), torsion, buckling, joint/adhesion strength (loose stacking is treated as glued), dynamic loads, diagonal
+##     bracing, load carried by structures that hang under an anchor (their tension is checked but the load is not added to the
+##     anchor's supporter), moments transmitted from beams into columns, the 3D combination of two wind directions (|fx|+|fz| is
+##     applied as one lateral load), hysteresis. Friction and stiffness are carried for the body simulation and not used here.
+##
+## DETERMINISM: ascending-index iteration only, no hashing, no threads, float64 math with a fixed operation order. The result is
+## independent of how `step(budgetOps)` slices the work: the work is a state machine whose cursor only decides WHERE it pauses.
+## A budget unit is about one cell visit (one layer costs nx*nz); each call does at least one unit of work, and a unit that is
+## indivisible (building a layer, allocating) can overrun the budget by its own size.
+
+import std/math
+import solvergraph
+
+const
+  INFL = 1000          # "no support level yet"
+  phGran = 0
+  phGraph = 1
+  phLabel = 2
+  phInit = 3
+  phLayer = 4
+  phEval = 5
+  phDone = 6
+
+type
+  SolverMaterial* = object
+    mass*: float64            ## kg per cell (density * fill)
+    tensile*: float64         ## kgf/m2
+    compressive*: float64     ## kgf/m2
+    shear*: float64           ## kgf/m2
+    breakThreshold*: float64  ## demand/capacity at which a cell fails; <= 0 means 1
+    friction*: float64        ## carried for the body simulation, unused here
+    stiffness*: float64       ## carried for the body simulation, unused here
+    granular*: bool           ## sand/gravel-like: stands on what is below, no tension, reported for the falling-entity path
+    terrain*: bool            ## natural terrain flavour: free sets that are mostly terrain are cave-in candidates
+    indestructible*: bool     ## never fails (bedrock)
+
+  ExtLoad* = object
+    cell*: int
+    fx*, fy*, fz*: float64    ## wind lateral (fx, fz) and extra downward weight fy, kgf
+
+  SolverParams* = object
+    maxRounds*: int           ## progressive-collapse rounds
+    breakPerRound*: int       ## cells removed per round
+    maxLevels*: int           ## plate/secondary-beam iteration cap
+    groundBelow*: bool        ## cells at y=0 stand on solid ground
+    strengthScale*: float64   ## multiplies all strengths (game scaling)
+
+  SolverInput* = object
+    nx*, ny*, nz*: int
+    cells*: seq[uint16]
+    materials*: seq[SolverMaterial]
+    anchor*: seq[bool]        ## empty or one flag per cell
+    loads*: seq[ExtLoad]
+
+  FailKind* = enum
+    fkNone, fkBending, fkShear, fkCrush, fkTension, fkHang, fkUnsupported
+
+  BrokenCell* = object
+    cell*: int
+    ratio*: float64
+    kind*: FailKind
+    round*: int
+
+  Component* = object
+    cells*: seq[int]          ## grid cell indices, ascending
+    mass*: float64
+    fromFailure*: bool        ## detached by a structural failure (false: already unsupported in the input)
+    round*: int
+    terrain*: bool
+
+  SolverResult* = object
+    broken*: seq[BrokenCell]
+    components*: seq[Component]
+    granular*: seq[int]       ## granular cells with nothing below, for the vanilla falling-block path
+    caveIns*: seq[int]        ## indices into components: free sets that are mostly terrain material
+    rounds*: int
+    converged*: bool
+    maxRatio*: float64        ## peak demand/capacity/breakThreshold of the final structure
+    ratio*: seq[float64]      ## per cell, final structure
+    ops*: int64
+
+  SolverJob* = object
+    inp*: SolverInput
+    params*: SolverParams
+    nx, ny, nz: int
+    kind: seq[uint8]
+    mat: seq[uint16]
+    anchorF: seq[bool]
+    build: GraphBuild
+    phase: int
+    cur: int
+    round: int
+    baseLoad: seq[float64]
+    baseLat: seq[float64]
+    ld, lat, mom: seq[float64]
+    ratioF: seq[float64]
+    fk: seq[uint8]
+    # layer scratch
+    sflag: seq[uint8]
+    runOfX, runOfZ, chosen: seq[int]
+    rStart, rLen, rStep, rLvl: seq[int]
+    nXRuns: int
+    # run scratch
+    rw, rl, rM, rV, rR, rRL: seq[float64]
+    rSupp: seq[bool]
+    supList: seq[int]
+    # eval scratch
+    candC: seq[int]
+    candR: seq[float64]
+    candK: seq[uint8]
+    peak: float64
+    res*: SolverResult
+    totalOps: int64
+
+proc mpaToKgfPerM2*(mpa: float64): float64 = mpa * 1.0e6 / 9.80665
+
+proc defaultSolverParams*(): SolverParams =
+  SolverParams(maxRounds: 32, breakPerRound: 4, maxLevels: 8, groundBelow: false, strengthScale: 1.0)
+
+proc cellIdx*(inp: SolverInput; x, y, z: int): int = x + inp.nx * (z + inp.nz * y)
+
+proc newSolverInput*(nx, ny, nz: int): SolverInput =
+  return SolverInput(nx: nx, ny: ny, nz: nz, cells: newSeq[uint16](nx * ny * nz),
+                     anchor: newSeq[bool](nx * ny * nz), materials: newSeq[SolverMaterial](1), loads: @[])
+
+# ---------------------------------------------------------------------------------------------------------------------
+# helpers
+
+proc capOf(x, scale: float64): float64 =
+  let v = x * scale
+  if v < 1.0e-9: return 1.0e-9
+  return v
+
+proc failRatioOf(job: SolverJob; c: int): float64 =
+  let b = job.inp.materials[int(job.mat[c])].breakThreshold
+  if b <= 0.0: return 1.0
+  return b
+
+proc bump(job: var SolverJob; c: int; demandOverCap: float64; k: FailKind) =
+  if job.anchorF[c]: return
+  let m = job.inp.materials[int(job.mat[c])]
+  if m.indestructible: return
+  let r = demandOverCap / failRatioOf(job, c)
+  if r > job.ratioF[c]:
+    job.ratioF[c] = r
+    job.fk[c] = uint8(ord(k))
+
+proc thickness(job: SolverJob; c: int): int =
+  let nxz = job.nx * job.nz
+  let total = job.nx * job.ny * job.nz
+  var t = 1
+  var cc = c + nxz
+  let m = job.mat[c]
+  while t < 8 and cc < total and job.kind[cc] != 0'u8 and job.mat[cc] == m:
+    inc t
+    cc += nxz
+  return t
+
+proc belowSolid(job: SolverJob; c, y: int): bool =
+  if y == 0: return job.params.groundBelow
+  return job.kind[c - job.nx * job.nz] != 0'u8
+
+# ---------------------------------------------------------------------------------------------------------------------
+# 1D beam: supports at flagged positions, loads w (vertical) and l (lateral) at the others.
+
+proc solveRun(job: var SolverJob; n: int): bool =
+  for i in 0 ..< n:
+    job.rM[i] = 0.0
+    job.rV[i] = 0.0
+    job.rR[i] = 0.0
+    job.rRL[i] = 0.0
+  job.supList.setLen(0)
+  for i in 0 ..< n:
+    if job.rSupp[i]: job.supList.add i
+  if job.supList.len == 0: return false
+  let s0 = job.supList[0]
+  let sl = job.supList[job.supList.len - 1]
+  # left overhang: cantilever toward s0
+  var t = 0.0
+  var tl = 0.0
+  var mm = 0.0
+  for i in 0 ..< s0:
+    job.rM[i] = mm
+    job.rV[i] = t
+    t += job.rw[i]
+    tl += job.rl[i]
+    mm += t
+  job.rR[s0] += t
+  job.rRL[s0] += tl
+  var hogL = mm
+  # right overhang
+  t = 0.0
+  tl = 0.0
+  mm = 0.0
+  var i = n - 1
+  while i > sl:
+    job.rM[i] = mm
+    job.rV[i] = t
+    t += job.rw[i]
+    tl += job.rl[i]
+    mm += t
+    dec i
+  job.rR[sl] += t
+  job.rRL[sl] += tl
+  var hogR = mm
+  # hogging moment recorded at the end supports (max when one support serves both sides)
+  if s0 == sl:
+    job.rM[s0] = max(hogL, hogR)
+  else:
+    job.rM[s0] = hogL
+    job.rM[sl] = hogR
+  # simply supported spans
+  for k in 0 ..< job.supList.len - 1:
+    let a = job.supList[k]
+    let b = job.supList[k + 1]
+    let L = float64(b - a)
+    if b - a < 2: continue
+    var ra = 0.0
+    var rb = 0.0
+    var ral = 0.0
+    var rbl = 0.0
+    for j in a + 1 ..< b:
+      let fa = float64(b - j) / L
+      let fb = float64(j - a) / L
+      ra += job.rw[j] * fa
+      rb += job.rw[j] * fb
+      ral += job.rl[j] * fa
+      rbl += job.rl[j] * fb
+    job.rR[a] += ra
+    job.rR[b] += rb
+    job.rRL[a] += ral
+    job.rRL[b] += rbl
+    var vc = ra
+    var mq = 0.0
+    for j in a + 1 ..< b:
+      mq += vc
+      job.rM[j] = mq
+      let v1 = abs(vc)
+      let v2 = abs(vc - job.rw[j])
+      job.rV[j] = if v1 > v2: v1 else: v2
+      vc -= job.rw[j]
+  return true
+
+# ---------------------------------------------------------------------------------------------------------------------
+# one layer of the load solve
+
+proc processRun(job: var SolverJob; y, r, lv: int) =
+  let nxz = job.nx * job.nz
+  let base = y * nxz
+  let n = job.rLen[r]
+  let st = job.rStart[r]
+  let sp = job.rStep[r]
+  let isX = r < job.nXRuns
+  job.rw.setLen(n)
+  job.rl.setLen(n)
+  job.rM.setLen(n)
+  job.rV.setLen(n)
+  job.rR.setLen(n)
+  job.rRL.setLen(n)
+  job.rSupp.setLen(n)
+  for k in 0 ..< n:
+    let i = st + k * sp
+    let c = base + i
+    var supp = false
+    if lv == 1:
+      supp = job.sflag[i] != 0'u8
+    else:
+      let perp = if isX: job.runOfZ[i] else: job.runOfX[i]
+      supp = perp >= 0 and job.rLvl[perp] < lv
+    job.rSupp[k] = supp
+    job.rw[k] = 0.0
+    job.rl[k] = 0.0
+    if (not supp) and job.chosen[i] == r:
+      job.rw[k] = job.ld[c]
+      job.rl[k] = job.lat[c]
+  if not solveRun(job, n): return
+  let scale = job.params.strengthScale
+  for k in 0 ..< n:
+    let i = st + k * sp
+    let c = base + i
+    let mt = job.inp.materials[int(job.mat[c])]
+    let th = float64(thickness(job, c))
+    if job.rSupp[k]:
+      job.ld[c] += job.rR[k]
+      job.lat[c] += job.rRL[k]
+      if job.rM[k] > 0.0 and not job.anchorF[c]:
+        bump(job, c, 6.0 * job.rM[k] / (th * th) / capOf(mt.tensile, scale), fkBending)
+    else:
+      if job.rM[k] > 0.0:
+        bump(job, c, 6.0 * job.rM[k] / (th * th) / capOf(mt.tensile, scale), fkBending)
+      if job.rV[k] > 0.0:
+        bump(job, c, job.rV[k] / th / capOf(mt.shear, scale), fkShear)
+
+proc pushRun(job: var SolverJob; start, len, step: int) =
+  job.rStart.add start
+  job.rLen.add len
+  job.rStep.add step
+
+proc solveLayer(job: var SolverJob; y: int) =
+  let nx = job.nx
+  let nz = job.nz
+  let nxz = nx * nz
+  let base = y * nxz
+  let scale = job.params.strengthScale
+  var nonS = 0
+  for i in 0 ..< nxz:
+    let c = base + i
+    job.sflag[i] = 0'u8
+    job.chosen[i] = -1
+    job.runOfX[i] = -1
+    job.runOfZ[i] = -1
+    if job.kind[c] == 0'u8: continue
+    if job.anchorF[c]: job.sflag[i] = 1'u8
+    elif belowSolid(job, c, y): job.sflag[i] = 1'u8
+    elif y + 1 < job.ny and job.kind[c + nxz] != 0'u8 and job.anchorF[c + nxz]: job.sflag[i] = 2'u8
+    else: inc nonS
+  if nonS > 0:
+    job.rStart.setLen(0)
+    job.rLen.setLen(0)
+    job.rStep.setLen(0)
+    job.rLvl.setLen(0)
+    for z in 0 ..< nz:
+      var x = 0
+      while x < nx:
+        let i = z * nx + x
+        if job.kind[base + i] == 1'u8:
+          let rid = job.rStart.len
+          var len = 0
+          while x < nx and job.kind[base + z * nx + x] == 1'u8:
+            job.runOfX[z * nx + x] = rid
+            inc len
+            inc x
+          pushRun(job, i, len, 1)
+        else:
+          inc x
+    job.nXRuns = job.rStart.len
+    for x in 0 ..< nx:
+      var z = 0
+      while z < nz:
+        let i = z * nx + x
+        if job.kind[base + i] == 1'u8:
+          let rid = job.rStart.len
+          var len = 0
+          while z < nz and job.kind[base + z * nx + x] == 1'u8:
+            job.runOfZ[z * nx + x] = rid
+            inc len
+            inc z
+          pushRun(job, i, len, nx)
+        else:
+          inc z
+    let nr = job.rStart.len
+    job.rLvl.setLen(nr)
+    for r in 0 ..< nr:
+      job.rLvl[r] = INFL
+      for k in 0 ..< job.rLen[r]:
+        if job.sflag[job.rStart[r] + k * job.rStep[r]] != 0'u8:
+          job.rLvl[r] = 1
+          break
+    var maxLv = 1
+    var p = 2
+    while p <= job.params.maxLevels:
+      var changed = false
+      for r in 0 ..< nr:
+        if job.rLvl[r] != INFL: continue
+        let isX = r < job.nXRuns
+        for k in 0 ..< job.rLen[r]:
+          let i = job.rStart[r] + k * job.rStep[r]
+          let perp = if isX: job.runOfZ[i] else: job.runOfX[i]
+          if perp >= 0 and job.rLvl[perp] < p:
+            job.rLvl[r] = p
+            changed = true
+            break
+      if not changed: break
+      maxLv = p
+      inc p
+    # each spanning cell joins the lower-level run of its two (tie: the x run)
+    for i in 0 ..< nxz:
+      let c = base + i
+      if job.kind[c] != 1'u8 or job.sflag[i] != 0'u8: continue
+      let rx = job.runOfX[i]
+      let rz = job.runOfZ[i]
+      let lx = if rx >= 0: job.rLvl[rx] else: INFL
+      let lz = if rz >= 0: job.rLvl[rz] else: INFL
+      if lx == INFL and lz == INFL: continue
+      job.chosen[i] = if lx <= lz: rx else: rz
+    var lv = maxLv
+    while lv >= 1:
+      for r in 0 ..< nr:
+        if job.rLvl[r] == lv: processRun(job, y, r, lv)
+      dec lv
+    # orphans: no support reached within the level cap
+    for i in 0 ..< nxz:
+      let c = base + i
+      if job.kind[c] != 1'u8 or job.sflag[i] != 0'u8 or job.chosen[i] >= 0: continue
+      let mt = job.inp.materials[int(job.mat[c])]
+      if y + 1 < job.ny and job.kind[c + nxz] != 0'u8:
+        bump(job, c, job.ld[c] / capOf(mt.tensile, scale), fkHang)
+      else:
+        bump(job, c, 1.0e9, fkUnsupported)
+  # standing and hung cells
+  for i in 0 ..< nxz:
+    let c = base + i
+    let sf = job.sflag[i]
+    if sf == 0'u8 or job.anchorF[c]: continue
+    let mt = job.inp.materials[int(job.mat[c])]
+    let n = job.ld[c]
+    if sf == 2'u8:
+      bump(job, c, n / capOf(mt.tensile, scale), fkHang)
+      continue
+    let v = job.lat[c]
+    let m = job.mom[c]
+    bump(job, c, (n + 6.0 * m) / capOf(mt.compressive, scale), fkCrush)
+    let sigT = 6.0 * m - n
+    if sigT > 0.0: bump(job, c, sigT / capOf(mt.tensile, scale), fkTension)
+    if v > 0.0: bump(job, c, v / capOf(mt.shear, scale), fkShear)
+    if y > 0:
+      let b = c - nxz
+      job.ld[b] += n
+      job.lat[b] += v
+      job.mom[b] += m + v
+
+# ---------------------------------------------------------------------------------------------------------------------
+# job
+
+proc newSolverJob*(inp: SolverInput; params: SolverParams): SolverJob =
+  var j = SolverJob(inp: inp, params: params, nx: inp.nx, ny: inp.ny, nz: inp.nz, phase: phGran)
+  let total = inp.nx * inp.ny * inp.nz
+  j.kind = newSeq[uint8](total)
+  j.mat = newSeq[uint16](total)
+  j.anchorF = newSeq[bool](total)
+  j.baseLoad = newSeq[float64](total)
+  j.baseLat = newSeq[float64](total)
+  for c in 0 ..< total:
+    let m = inp.cells[c]
+    if m != 0'u16:
+      j.mat[c] = m
+      j.kind[c] = if inp.materials[int(m)].granular: 2'u8 else: 1'u8
+      if inp.anchor.len == total: j.anchorF[c] = inp.anchor[c]
+  for e in inp.loads:
+    if e.cell >= 0 and e.cell < total:
+      j.baseLoad[e.cell] += e.fy
+      j.baseLat[e.cell] += abs(e.fx) + abs(e.fz)
+  j.ld = newSeq[float64](total)
+  j.lat = newSeq[float64](total)
+  j.mom = newSeq[float64](total)
+  j.ratioF = newSeq[float64](total)
+  j.fk = newSeq[uint8](total)
+  let nxz = inp.nx * inp.nz
+  j.sflag = newSeq[uint8](nxz)
+  j.runOfX = newSeq[int](nxz)
+  j.runOfZ = newSeq[int](nxz)
+  j.chosen = newSeq[int](nxz)
+  j.res.converged = false
+  return j
+
+proc jobDone*(job: SolverJob): bool = job.phase == phDone
+
+proc candInsert(job: var SolverJob; c: int; r: float64; k: uint8) =
+  let cap = max(job.params.breakPerRound, 1)
+  var pos = job.candC.len
+  if pos < cap:
+    job.candC.add c
+    job.candR.add r
+    job.candK.add k
+  else:
+    if not (r > job.candR[pos - 1]): return
+    pos = pos - 1
+    job.candC[pos] = c
+    job.candR[pos] = r
+    job.candK[pos] = k
+  var cc = job.candC
+  var cr = job.candR
+  var ck = job.candK
+  while pos > 0 and cr[pos] > cr[pos - 1]:
+    let tc = cc[pos]
+    let tr = cr[pos]
+    let tk = ck[pos]
+    let pc = cc[pos - 1]
+    let pr = cr[pos - 1]
+    let pk = ck[pos - 1]
+    cc[pos] = pc
+    cr[pos] = pr
+    ck[pos] = pk
+    cc[pos - 1] = tc
+    cr[pos - 1] = tr
+    ck[pos - 1] = tk
+    dec pos
+  job.candC = cc
+  job.candR = cr
+  job.candK = ck
+
+proc finish(job: var SolverJob; converged: bool) =
+  job.res.converged = converged
+  job.res.rounds = job.round + 1
+  job.res.maxRatio = job.peak
+  job.res.ratio = job.ratioF
+  job.res.ops = job.totalOps
+  job.phase = phDone
+
+proc runPhase(job: var SolverJob; budget: int): int =
+  let total = job.nx * job.ny * job.nz
+  let nxz = job.nx * job.nz
+  var used = 0
+  case job.phase
+  of phGran:
+    while job.cur < total and used < budget:
+      let c = job.cur
+      if job.kind[c] == 2'u8 and not job.anchorF[c]:
+        let y = c div nxz
+        if not belowSolid(job, c, y):
+          job.kind[c] = 0'u8
+          job.mat[c] = 0'u16
+          job.res.granular.add c
+      inc job.cur
+      inc used
+    if job.cur >= total:
+      job.cur = 0
+      job.build = newGraphBuild(job.nx, job.ny, job.nz)
+      job.phase = phGraph
+  of phGraph:
+    used += graphStep(job.build, job.kind, job.anchorF, budget)
+    if graphDone(job.build):
+      job.cur = 0
+      job.phase = phLabel
+  of phLabel:
+    # one pass: free sets become components (ascending node order), their cells leave the structure
+    let n = nodeCount(job.build.g)
+    used += n + 1
+    var compOf = newSeq[int](n)
+    var compTerr: seq[int] = @[]
+    let firstNew = job.res.components.len
+    for i in 0 ..< n: compOf[i] = -1
+    for i in 0 ..< n:
+      let root = ufFind(job.build.g, i)
+      if job.build.g.rootAnchored[root]: continue
+      var ci = compOf[root]
+      if ci < 0:
+        ci = job.res.components.len
+        compOf[root] = ci
+        job.res.components.add Component(fromFailure: job.round > 0, round: job.round)
+      let c = job.build.g.nodeCell[i]
+      job.res.components[ci].cells.add c
+      job.res.components[ci].mass += job.inp.materials[int(job.mat[c])].mass
+      if job.inp.materials[int(job.mat[c])].terrain:
+        while compTerr.len <= ci: compTerr.add 0
+        compTerr[ci] += 1
+    for ci in firstNew ..< job.res.components.len:
+      let nt = if ci < compTerr.len: compTerr[ci] else: 0
+      if 2 * nt >= job.res.components[ci].cells.len and nt > 0:
+        job.res.components[ci].terrain = true
+        job.res.caveIns.add ci
+    for i in 0 ..< n:
+      let root = ufFind(job.build.g, i)
+      if not job.build.g.rootAnchored[root]:
+        let c = job.build.g.nodeCell[i]
+        job.kind[c] = 0'u8
+        job.mat[c] = 0'u16
+    job.build = GraphBuild()
+    job.cur = 0
+    job.phase = phInit
+  of phInit:
+    while job.cur < total and used < budget:
+      let c = job.cur
+      if job.kind[c] != 0'u8:
+        job.ld[c] = job.inp.materials[int(job.mat[c])].mass + job.baseLoad[c]
+        job.lat[c] = job.baseLat[c]
+      else:
+        job.ld[c] = 0.0
+        job.lat[c] = 0.0
+      job.mom[c] = 0.0
+      job.ratioF[c] = 0.0
+      job.fk[c] = 0'u8
+      inc job.cur
+      inc used
+    if job.cur >= total:
+      job.cur = 0
+      job.phase = phLayer
+  of phLayer:
+    if job.cur < job.ny:
+      solveLayer(job, job.ny - 1 - job.cur)
+      inc job.cur
+      used += nxz
+    if job.cur >= job.ny:
+      job.cur = 0
+      job.candC.setLen(0)
+      job.candR.setLen(0)
+      job.candK.setLen(0)
+      job.peak = 0.0
+      job.phase = phEval
+  of phEval:
+    while job.cur < total and used < budget:
+      let c = job.cur
+      let r = job.ratioF[c]
+      if job.kind[c] != 0'u8:
+        if r > job.peak: job.peak = r
+        if r > 1.0: candInsert(job, c, r, job.fk[c])
+      inc job.cur
+      inc used
+    if job.cur >= total:
+      job.cur = 0
+      if job.candC.len == 0:
+        finish(job, true)
+      elif job.round + 1 >= job.params.maxRounds:
+        finish(job, false)
+      else:
+        for q in 0 ..< job.candC.len:
+          let c = job.candC[q]
+          job.res.broken.add BrokenCell(cell: c, ratio: job.candR[q], kind: FailKind(job.candK[q]), round: job.round)
+          job.kind[c] = 0'u8
+          job.mat[c] = 0'u16
+        inc job.round
+        job.phase = phGran
+  of phDone:
+    discard
+  else:
+    discard
+  if used < 1: used = 1
+  return used
+
+## Advance the solve by about `budgetOps` units (at least one unit of work per call). Returns true when finished.
+proc step*(job: var SolverJob; budgetOps: int): bool =
+  var left = budgetOps
+  if left < 1: left = 1
+  while job.phase != phDone:
+    if left <= 0: return false
+    let used = runPhase(job, left)
+    left -= used
+    job.totalOps += int64(used)
+  return true
+
+## Convenience: run the whole solve in one go.
+proc solve*(inp: SolverInput; params: SolverParams): SolverResult =
+  var job = newSolverJob(inp, params)
+  discard step(job, high(int) div 4)
+  return job.res

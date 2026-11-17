@@ -1,0 +1,319 @@
+## Rigid block body: pure data model (design: overnight/BODIES-DESIGN.md section 1, task T2).
+##
+## NO world and NO entity imports: this file, bodymass.aowl and bodynbt.aowl compile into solver workers and tests.
+##
+## VOLUME. The body owns a sparse 3D grid of block-state ids in BODY-LOCAL integer cell coordinates (any sign).
+## The grid is cut into 16^3 sections, sorted by (sy, sz, sx). A section keeps a palette of the state ids it holds
+## (palette[0] is always 0 = empty) and 4096 palette indices, cell order ((ly*16)+lz)*16+lx. That is the same shape as
+## world/palette.aowl PalettedContainer, but a local array: palette.aowl imports world/blockstates (the generated block
+## tables), which a pure body must not pull in. The cells (state ids) are identical, so assembling from world sections
+## is a per-cell copy. A section with no solid cell is deleted. State id 0 means "no cell".
+##
+## Cell (x,y,z) occupies the unit cube [x,x+1) x [y,y+1) x [z,z+1) in body-local space; its centre is (x+.5,y+.5,z+.5).
+##
+## POSE. `pos` is the WORLD position of the body-local origin (0,0,0) corner, `orient` the unit quaternion body->world,
+## `vel` the linear velocity of the centre of mass (blocks/tick) and `angVel` the angular velocity (rad/tick, world frame).
+## world(p_local) = pos + rotate(orient, p_local).
+##
+## POSE HISTORY. A ring of 24 samples (1.2 s at 20 tps) indexed tick mod 24, written by recordPose. poseAt(t) answers the
+## pose at a (fractional) past tick by linear interpolation of pos and spherical interpolation of orient.
+
+import std/[tables, math]
+
+const
+  SectionVolume* = 4096
+  PoseHistoryLen* = 24
+
+type
+  Vec3* = object
+    x*, y*, z*: float64
+
+  Quat* = object
+    w*, x*, y*, z*: float64     ## unit quaternion
+
+  Cell* = object
+    x*, y*, z*: int32
+    state*: int32               ## block-state id, never 0 in a cell list
+
+  BodySection* = object
+    sx*, sy*, sz*: int32        ## section coordinates (cell coordinate shr 4, arithmetic)
+    palette*: seq[int32]        ## palette[0] == 0
+    idx*: seq[uint16]           ## SectionVolume palette indices
+    solid*: int32               ## number of non-empty cells
+
+  PoseSample* = object
+    valid*: bool
+    tick*: int32
+    pos*: Vec3
+    orient*: Quat
+
+  MassAcc* = object
+    ## Raw moment sums over cells, all about the body-local origin. See bodymass.aowl for the formulas.
+    m*: float64                 ## sum m_i
+    sx*, sy*, sz*: float64      ## sum m_i c_i
+    qxx*, qyy*, qzz*, qxy*, qxz*, qyz*: float64   ## sum m_i c_i c_i^T
+    self*: float64              ## sum m_i / 6 (inertia of each unit-cube cell about its own centre, per axis)
+    cells*: int32
+
+  Body* = ref object
+    idHi*, idLo*: uint64        ## the entity UUID
+    sections*: seq[BodySection]
+    acc*: MassAcc
+    # derived from acc by finalizeMass (never saved; recomputed on load)
+    mass*: float64
+    com*: Vec3                  ## centre of mass, body-local
+    inertia*: array[6, float64] ## about com: Ixx Iyy Izz Ixy Ixz Iyz (tensor entries, Ixy = -sum m dx dy)
+    # pose
+    pos*: Vec3
+    orient*: Quat
+    vel*: Vec3
+    angVel*: Vec3
+    sleeping*: bool
+    sleepTicks*: int32
+    history*: array[24, PoseSample]
+
+# ----------------------------------------------------------------------------------------------------------------------
+# vectors and quaternions
+
+proc vec3*(x, y, z: float64): Vec3 = Vec3(x: x, y: y, z: z)
+proc `+`*(a, b: Vec3): Vec3 = Vec3(x: a.x + b.x, y: a.y + b.y, z: a.z + b.z)
+proc `-`*(a, b: Vec3): Vec3 = Vec3(x: a.x - b.x, y: a.y - b.y, z: a.z - b.z)
+proc scale*(a: Vec3, s: float64): Vec3 = Vec3(x: a.x * s, y: a.y * s, z: a.z * s)
+proc dot*(a, b: Vec3): float64 = a.x * b.x + a.y * b.y + a.z * b.z
+proc cross*(a, b: Vec3): Vec3 =
+  Vec3(x: a.y * b.z - a.z * b.y, y: a.z * b.x - a.x * b.z, z: a.x * b.y - a.y * b.x)
+
+proc quatIdentity*(): Quat = Quat(w: 1.0, x: 0.0, y: 0.0, z: 0.0)
+
+proc qmul*(a, b: Quat): Quat =
+  Quat(w: a.w * b.w - a.x * b.x - a.y * b.y - a.z * b.z,
+       x: a.w * b.x + a.x * b.w + a.y * b.z - a.z * b.y,
+       y: a.w * b.y - a.x * b.z + a.y * b.w + a.z * b.x,
+       z: a.w * b.z + a.x * b.y - a.y * b.x + a.z * b.w)
+
+proc qnormalize*(q: Quat): Quat =
+  let n2 = q.w * q.w + q.x * q.x + q.y * q.y + q.z * q.z
+  if n2 <= 0.0: return quatIdentity()
+  let inv = 1.0 / sqrt(n2)
+  Quat(w: q.w * inv, x: q.x * inv, y: q.y * inv, z: q.z * inv)
+
+proc rotate*(q: Quat, v: Vec3): Vec3 =
+  ## q v q^-1 for a unit quaternion: v + 2 w (u x v) + 2 u x (u x v), u = (q.x, q.y, q.z).
+  let u = Vec3(x: q.x, y: q.y, z: q.z)
+  let t = scale(cross(u, v), 2.0)
+  v + scale(t, q.w) + cross(u, t)
+
+proc qdot(a, b: Quat): float64 = a.w * b.w + a.x * b.x + a.y * b.y + a.z * b.z
+
+proc slerp*(a, b: Quat, t: float64): Quat =
+  ## Shortest-arc spherical interpolation; falls back to normalised lerp when the quaternions are nearly parallel.
+  var c = qdot(a, b)
+  var bb = b
+  if c < 0.0:
+    c = -c
+    bb = Quat(w: -b.w, x: -b.x, y: -b.y, z: -b.z)
+  if c > 0.9995:
+    return qnormalize(Quat(w: a.w + (bb.w - a.w) * t, x: a.x + (bb.x - a.x) * t,
+                           y: a.y + (bb.y - a.y) * t, z: a.z + (bb.z - a.z) * t))
+  let th = arccos(c)
+  let s = sin(th)
+  let wa = sin((1.0 - t) * th) / s
+  let wb = sin(t * th) / s
+  Quat(w: a.w * wa + bb.w * wb, x: a.x * wa + bb.x * wb, y: a.y * wa + bb.y * wb, z: a.z * wa + bb.z * wb)
+
+proc integrateOrient*(q: Quat, angVel: Vec3, dt: float64): Quat =
+  ## q' = normalize(q + 0.5 dt (omega * q)), omega a pure quaternion (world frame).
+  let w = Quat(w: 0.0, x: angVel.x, y: angVel.y, z: angVel.z)
+  let d = qmul(w, q)
+  qnormalize(Quat(w: q.w + 0.5 * dt * d.w, x: q.x + 0.5 * dt * d.x, y: q.y + 0.5 * dt * d.y, z: q.z + 0.5 * dt * d.z))
+
+# ----------------------------------------------------------------------------------------------------------------------
+# construction and cell access
+
+proc newBody*(idHi, idLo: uint64): Body =
+  result = Body(idHi: idHi, idLo: idLo, orient: quatIdentity())
+  result.sections = @[]
+
+proc findSection(b: Body, sx, sy, sz: int32): int =
+  ## Index of the section, or -(insertionIndex)-1 when absent. Linear scan: bodies have few sections.
+  var i = 0
+  while i < b.sections.len:
+    let s = b.sections[i]
+    if s.sx == sx and s.sy == sy and s.sz == sz: return i
+    if s.sy > sy or (s.sy == sy and (s.sz > sz or (s.sz == sz and s.sx > sx))): return -i - 1
+    inc i
+  -b.sections.len - 1
+
+proc cellIndex(x, y, z: int): int =
+  (((y and 15) * 16) + (z and 15)) * 16 + (x and 15)
+
+proc getCell*(b: Body, x, y, z: int): int =
+  ## State id at the body-local cell, 0 when empty.
+  let i = findSection(b, int32(x shr 4), int32(y shr 4), int32(z shr 4))
+  if i < 0: return 0
+  int(b.sections[i].palette[int(b.sections[i].idx[cellIndex(x, y, z)])])
+
+proc setCell*(b: Body, x, y, z: int, state: int) =
+  ## Set a cell (state 0 clears it); creates and deletes sections as needed.
+  let sx = int32(x shr 4)
+  let sy = int32(y shr 4)
+  let sz = int32(z shr 4)
+  var i = findSection(b, sx, sy, sz)
+  if i < 0:
+    if state == 0: return
+    let at = -i - 1
+    let s = BodySection(sx: sx, sy: sy, sz: sz, palette: @[0'i32], idx: newSeq[uint16](SectionVolume), solid: 0)
+    b.sections.add s
+    var j = b.sections.len - 1
+    while j > at:
+      let prev = b.sections[j - 1]
+      b.sections[j] = prev
+      dec j
+    b.sections[at] = s
+    i = at
+  let ci = cellIndex(x, y, z)
+  let old = int(b.sections[i].palette[int(b.sections[i].idx[ci])])
+  if old == state: return
+  var pi = -1
+  var k = 0
+  while k < b.sections[i].palette.len:
+    if int(b.sections[i].palette[k]) == state:
+      pi = k
+      break
+    inc k
+  if pi < 0:
+    b.sections[i].palette.add(int32(state))
+    pi = b.sections[i].palette.len - 1
+  b.sections[i].idx[ci] = uint16(pi)
+  if old == 0 and state != 0: inc b.sections[i].solid
+  elif old != 0 and state == 0: dec b.sections[i].solid
+  if b.sections[i].solid == 0:
+    var j = i
+    while j + 1 < b.sections.len:
+      let nxt = b.sections[j + 1]
+      b.sections[j] = nxt
+      inc j
+    b.sections.setLen(b.sections.len - 1)
+
+proc cellList*(b: Body): seq[Cell] =
+  ## All non-empty cells in canonical order (section order, then ly, lz, lx). Deterministic.
+  result = @[]
+  for s in b.sections:
+    for ci in 0 ..< SectionVolume:
+      let st = s.palette[int(s.idx[ci])]
+      if st != 0:
+        result.add Cell(x: s.sx * 16 + int32(ci and 15), y: s.sy * 16 + int32(ci shr 8),
+                        z: s.sz * 16 + int32((ci shr 4) and 15), state: st)
+
+proc cellCount*(b: Body): int =
+  var n = 0
+  for s in b.sections: n += int(s.solid)
+  n
+
+proc bodyFromCells*(idHi, idLo: uint64, cells: openArray[Cell]): Body =
+  result = newBody(idHi, idLo)
+  for c in cells: setCell(result, int(c.x), int(c.y), int(c.z), int(c.state))
+
+# ----------------------------------------------------------------------------------------------------------------------
+# connectivity
+
+proc cellKey(x, y, z: int32): int64 =
+  ## 21 bits per axis, offset so coordinates in +-1,048,576 pack uniquely.
+  (int64(x + 1048576'i32) shl 42) or (int64(y + 1048576'i32) shl 21) or int64(z + 1048576'i32)
+
+proc ufFind(parent: var seq[int], i: int): int =
+  var r = i
+  while parent[r] != r: r = parent[r]
+  var j = i
+  while parent[j] != r:
+    let n = parent[j]
+    parent[j] = r
+    j = n
+  r
+
+proc splitConnected*(cells: openArray[Cell]): seq[seq[int]] =
+  ## Union-find over the 6-neighbour contact graph. Returns components as lists of indices into `cells`.
+  ## Deterministic: indices ascend inside a component, and components are ordered by their smallest index
+  ## (the larger root is always attached under the smaller, so a root is its component's smallest index).
+  let n = cells.len
+  var parent = newSeq[int](n)
+  var at = initTable[int64, int]()
+  for i in 0 ..< n:
+    parent[i] = i
+    at[cellKey(cells[i].x, cells[i].y, cells[i].z)] = i
+  for i in 0 ..< n:
+    let c = cells[i]
+    for d in 0 ..< 3:
+      let nx = if d == 0: c.x + 1 else: c.x
+      let ny = if d == 1: c.y + 1 else: c.y
+      let nz = if d == 2: c.z + 1 else: c.z
+      let k = cellKey(nx, ny, nz)
+      let other = at.getOrDefault(k, -1)
+      if other >= 0:
+        let a = ufFind(parent, i)
+        let bb = ufFind(parent, other)
+        if a != bb:
+          if a < bb: parent[bb] = a else: parent[a] = bb
+  var compOf = newSeq[int](n)
+  result = @[]
+  for i in 0 ..< n:
+    let r = ufFind(parent, i)
+    if r == i:
+      compOf[i] = result.len
+      result.add @[i]
+    else:
+      let ci = compOf[r]
+      compOf[i] = ci
+      result[ci].add i
+
+# ----------------------------------------------------------------------------------------------------------------------
+# pose history and sleep
+
+proc recordPose*(b: Body, tick: int) =
+  ## Store the current pose as the sample for `tick` (ring slot tick mod 24). Call once per tick, ascending.
+  let slot = ((tick mod PoseHistoryLen) + PoseHistoryLen) mod PoseHistoryLen
+  b.history[slot] = PoseSample(valid: true, tick: int32(tick), pos: b.pos, orient: b.orient)
+
+proc latestPoseTick*(b: Body): (bool, int) =
+  var best = -2147483647
+  var ok = false
+  for s in b.history:
+    if s.valid and int(s.tick) > best:
+      best = int(s.tick)
+      ok = true
+  (ok, best)
+
+proc sampleAt(b: Body, tick: int): (bool, PoseSample) =
+  let slot = ((tick mod PoseHistoryLen) + PoseHistoryLen) mod PoseHistoryLen
+  let s = b.history[slot]
+  if s.valid and int(s.tick) == tick: (true, s) else: (false, s)
+
+proc poseAt*(b: Body, t: float64): (bool, Vec3, Quat) =
+  ## Pose at the fractional tick `t` (lag compensation rewind). False when t is older than the oldest retained sample
+  ## or newer than the newest. Between two consecutive samples: pos lerp, orient slerp. Exactly on a sample: that sample.
+  let (any, latest) = latestPoseTick(b)
+  if not any: return (false, Vec3(), quatIdentity())
+  let t0 = int(floor(t))
+  let f = t - float64(t0)
+  let (ok0, s0) = sampleAt(b, t0)
+  if not ok0: return (false, Vec3(), quatIdentity())
+  if f == 0.0: return (true, s0.pos, s0.orient)
+  if t0 + 1 > latest: return (false, Vec3(), quatIdentity())
+  let (ok1, s1) = sampleAt(b, t0 + 1)
+  if not ok1: return (false, Vec3(), quatIdentity())
+  (true, s0.pos + scale(s1.pos - s0.pos, f), slerp(s0.orient, s1.orient, f))
+
+proc updateSleep*(b: Body, linThresh, angThresh: float64, ticksToSleep: int) =
+  ## Design default: below 0.01 blocks/tick and 0.005 rad/tick for 20 ticks puts the body to sleep. A faster tick wakes it.
+  let lv = sqrt(dot(b.vel, b.vel))
+  let av = sqrt(dot(b.angVel, b.angVel))
+  if lv < linThresh and av < angThresh:
+    inc b.sleepTicks
+    if int(b.sleepTicks) >= ticksToSleep: b.sleeping = true
+  else:
+    b.sleepTicks = 0
+    b.sleeping = false
+
+proc wake*(b: Body) =
+  b.sleeping = false
+  b.sleepTicks = 0
