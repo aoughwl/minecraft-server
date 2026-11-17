@@ -77,6 +77,7 @@ unloading one restarts that program, which runs the others' `onEnable` again (un
 | the world (overworld) | `blockAt(x, y, z)`, `setBlock(x, y, z, name)`, `worldTime()`, `setWorldTime(ticks)` | `server.blockAt(x, y, z)`, `server.setBlock(x, y, z, name)`, `server.time()`, `server.setTime(ticks)` |
 | inventory | `p.give(item, count)`, `p.itemCount(item)`, `p.setFood(level)` | the same |
 | an entity (by the id an event gives; overworld) | `entityHealth(id)`, `setEntityHealth(id, h)`, `entityPos(id)`, `teleportEntity(id, x, y, z)`, `setEntityOnFire(id, seconds)`, `removeEntity(id)` | `server.entityHealth(id)`, `server.setEntityHealth(id, h)`, `server.entityPos(id)`, `server.teleportEntity(id, x, y, z)`, `server.removeEntity(id)` |
+| custom payloads and capabilities (server mods, `docs/SERVER_MODS.md`) | `p.sendPayload(channel, bytes)`, `p.hasChannel(ch)`, `p.channels()`, `CustomPayloadEvent.data`, `advertiseCapability(name)`, `p.hasCapability(name)`, `p.jesterVersion()` | `p.sendPayload(channel, bytes)`, `p.hasChannel(ch)`, `p.channels()`, `e.data`, `server.advertiseCapability(name)`, `p.hasCapability(name)`, `p.jesterVersion()` |
 | start and stop | `onEnable(handler)`, `onDisable(handler)` | `onEnable(fn)`, `onDisable(fn)` |
 
 Command level 0 lets anyone use it; 1 to 4 an operator of at least that level. 20 ticks make a second.
