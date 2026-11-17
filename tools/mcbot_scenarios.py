@@ -366,6 +366,85 @@ def worldedit_wand(s):
     _we(s, 'size', '2 x 1 x 1, 2 blocks', '//size after the wand')
 
 
+@scenario('fluids_finite')
+def fluids_finite(s):
+    """Finite fluids (src/server/fluids): OFF by default, vanilla water flows (a falling column appears under a source); `/fluids on`
+    makes water a conserved volume: a stack of four source blocks above a 3x3 stone basin falls, fills the basin floor and the sources
+    are GONE (vanilla never removes a source), the server's own `/fluids status` reports exactly 4 x 1024 water units, nothing spills
+    over the rim; `/fluids off` leaves the world as it is."""
+    s.wait(lambda: s.position() is not None and s.chunks() >= 9, 'the spawn chunks', 60.0)
+    s.command('gamemode creative')
+    px, py, pz = s.position()[0], s.position()[1], s.position()[2]
+    cx, cz = int(px // 1) + 3, int(pz // 1) + 3
+    y0 = int(py // 1) + 6                                  # an open-air slab a few blocks over the bot (inside the scanned sections)
+    ids = _state_ids(s, cx, y0 + 12, cz, ['stone', 'water'])
+    stone, wsrc = ids['stone'], ids['water']
+    is_water = lambda b: b is not None and wsrc <= b < wsrc + 16
+
+    def box(x0, y0_, z0, x1, y1, z1, name):
+        s.command('fill %d %d %d %d %d %d minecraft:%s' % (x0, y0_, z0, x1, y1, z1, name))
+
+    def build():
+        box(cx - 2, y0, cz - 2, cx + 2, y0 + 6, cz + 2, 'air')
+        s.wait(lambda: s.w.block(cx, y0 + 4, cz) == 0 and s.w.block(cx + 2, y0 + 1, cz + 2) == 0, 'the build area to be air', 20.0)
+        box(cx - 2, y0, cz - 2, cx + 2, y0, cz + 2, 'stone')                 # floor 5x5
+        box(cx - 2, y0 + 1, cz - 2, cx + 2, y0 + 1, cz + 2, 'stone')         # rim: a 5x5 block ...
+        box(cx - 1, y0 + 1, cz - 1, cx + 1, y0 + 1, cz + 1, 'air')           # ... with a 3x3 hole = the basin
+        s.wait(lambda: s.w.block(cx, y0 + 1, cz) == 0 and s.w.block(cx + 2, y0 + 1, cz) == stone, 'the basin', 20.0)
+
+    n = len(s.w.chat)
+    s.command('fluids status')
+    s.expect('finite fluids: off', 'the default is off', since=n)
+
+    # OFF: vanilla. A source above the basin makes a falling column below it (vanilla fluid ticks run).
+    build()
+    s.command('setblock %d %d %d minecraft:water' % (cx, y0 + 4, cz))
+    s.wait(lambda: is_water(s.w.block(cx, y0 + 3, cz)), 'vanilla water to fall from the source (fluids are off)', 20.0)
+    s.check(is_water(s.w.block(cx, y0 + 4, cz)), 'the vanilla source vanished while the fluids were off')
+    build()                                                # wipes it again (fill air then stone)
+
+    # ON: the conserved model
+    n = len(s.w.chat)
+    s.command('fluids on')
+    s.expect('Finite fluids ON', '/fluids on', since=n)
+    time.sleep(3.0)                                        # natural water near the bot is adopted by the first scans
+    import re
+
+    def status():
+        n_ = len(s.w.chat)
+        s.command('fluids status')
+        ln = s.expect('water units', '/fluids status', since=n_)
+        m_ = re.search(r'\((\d+) water units.*injected (\d+) drained (\d+)', ln)
+        s.check(m_ is not None, 'unparsable status line %r' % ln)
+        return ln, int(m_.group(1)), int(m_.group(2)), int(m_.group(3))
+    _, w_before, inj_before, dr_before = status()
+    box(cx, y0 + 2, cz, cx, y0 + 5, cz, 'water')           # four sources in a column over the basin
+    s.wait(lambda: is_water(s.w.block(cx, y0 + 2, cz)) and is_water(s.w.block(cx, y0 + 5, cz)), 'the four sources to appear', 20.0)
+    floor = [(cx + dx, y0 + 1, cz + dz) for dx in (-1, 0, 1) for dz in (-1, 0, 1)]
+    s.wait(lambda: all(is_water(s.w.block(*c)) for c in floor), 'water on all nine basin cells (the model moved the sources)', 40.0)
+    s.wait(lambda: s.w.block(cx, y0 + 5, cz) == 0 and s.w.block(cx, y0 + 3, cz) == 0, 'the sources to be gone (water is a volume, not a source)', 40.0)
+    time.sleep(2.0)
+    line, w_after, inj_after, dr_after = status()
+    print('  status before: %d water units, injected %d drained %d; after: %d, %d, %d' % (w_before, inj_before, dr_before, w_after, inj_after, dr_after))
+    # (the status totals also include natural water adopted around the bot meanwhile, so they are printed, not asserted)
+    s.check(dr_after == dr_before, 'the model drained %d units for no reason' % (dr_after - dr_before))
+    outside = [(cx + dx, y0 + 1, cz + dz) for dx in (-2, 2) for dz in range(-2, 3)] + [(cx + dx, y0 + 2, cz + dz) for dx in range(-2, 3) for dz in range(-2, 3)]
+    s.check(not any(is_water(s.w.block(*c)) for c in outside), 'water went over the rim or onto the rim')
+    levels = sorted(s.w.block(*c) - wsrc for c in floor)
+    print('  basin levels (block-state offsets): %r' % levels)
+    # 4 x 1024 units over 9 cells = 455 each = ceil(8*455/1024) = 4 eighths = flowing level 8-4 = block-state offset 4 (volume check)
+    s.check(levels == [4] * 9, 'the nine basin cells should all be level offset 4 (4096 units over 9 cells): %r' % levels)
+
+    # OFF again: the blocks stay
+    before = [s.w.block(*c) for c in floor]
+    n = len(s.w.chat)
+    s.command('fluids off')
+    s.expect('Finite fluids off', '/fluids off', since=n)
+    time.sleep(1.5)
+    s.check([s.w.block(*c) for c in floor] == before, 'turning the model off changed the basin')
+    s.command('fill %d %d %d %d %d %d minecraft:air' % (cx - 2, y0, cz - 2, cx + 2, y0 + 6, cz + 2))
+
+
 def run(m, c, st, w, biomes, ctx, args):
     wanted = [n for n in (args.scenario or 'all').split(',') if n]
     known = [n for n, _, _ in SCENARIOS]

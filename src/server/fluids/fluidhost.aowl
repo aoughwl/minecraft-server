@@ -1,0 +1,414 @@
+## Finite fluids, the server half (phase 3 item 9, level 2): runs the conserved-volume model of src/physics/fluids.aowl on the
+## real world. OFF by default (`/fluids on|off|status`, fluidcmd.aowl). While it is OFF nothing here runs: no block is read,
+## no block is written, `gFluidTicksSuppressed` stays false and vanilla water and lava behave exactly as before.
+##
+## What turning it ON does
+##   * vanilla fluid ticks are suppressed (block/fluidseam.aowl): the host owns every fluid block of the worlds it runs in;
+##   * every `ScanEvery` ticks the sections around each player (`Radius` chunks, +-`VerticalSections` sections) are looked at:
+##     a section seen for the first time, or whose `blockVersion` moved for a reason other than this host's own writes (a
+##     player poured a bucket, broke a wall, WorldEdit ran), is rescanned. Fluid blocks that are exposed to air or flowing
+##     (level != source) and not yet tracked are ADOPTED: their level becomes mass (source = full = 1024 units, flowing level L =
+##     L/8 of a cell). Tracked cells whose block was replaced by something else are forgotten (their mass counts as drained);
+##     tracked cells near a changed section are woken, so a removed wall lets a pool run;
+##   * every `StepEvery` ticks `FluidSim.step` runs with a budget of `Budget` cells per step; the cells that changed are
+##     rendered back into vanilla block states and written with ONE bulk edit per tick (bulkedit.writeCells: one heightmap pass,
+##     one multi-block update per section, one light pass; no plugin veto, no neighbour updates, no block log: fluid flow is
+##     far too chatty for any of them).
+##
+## Rendering. A cell holding under 1/16 of a block shows as air (kept in the model, so the volume is conserved: a drained pool
+## does not leave a film of 1/8-high water behind). A cell of mass m in a cell of capacity C is the vanilla level L = ceil(8 m / C) (1..8): L8 and up is a source block
+## (level 0), L1..L7 is flowing water of level 8-L; a stream cell (fluid above, room below) is the falling block (level 8).
+## Cells hold only air or fluid as far as the host is concerned: ANY other block is a wall; the host never replaces a block that is
+## not air or fluid, so water never breaks plants, torches or redstone.
+##
+## Not done (documented in docs/FLUIDS.md): the model state is in memory only (a restart adopts the vanilla blocks again, so a
+## compressed or falling cell comes back at its rendered volume); buckets are not hooked (a placed source is adopted at the next
+## scan, a scooped one is forgotten); lava and water do not react (they never share a cell: the contact is counted in `status`);
+## oceans are finite too once they are touched.
+
+{.feature: "lenientnils".}
+
+import std/[tables, strutils, math]
+import ../../physics/fluids
+import ../../data/block_ext
+from ../../data/block_state import newBlockStateIdUnchecked, asU16, isAir, BlockState
+from ../../generated/fluid import Fluid, WATER, LAVA
+import ../../util/math/position
+import ../../world/[chunkdata, level]
+import "../block/fluidseam"
+import ../serverbase
+import ../world/bulkedit
+
+const
+  FilmDivisor* = 16      ## a cell holding less than cap/16 renders as air (see renderState)
+  ScanEvery* = 10        ## ticks between two looks at the sections around the players
+  Radius* = 2            ## chunks around a player
+  VerticalSections* = 3  ## sections above and below the player's section
+  ForgetEvery = 100      ## ticks between two sweeps for cells whose chunk is not loaded any more
+  MaxScansPerTick = 12   ## section rescans (4096 cells each) per tick, the rest wait for the next scan
+
+type
+  DimFluids* = ref object
+    dim*: string
+    world*: World
+    sim*: FluidSim
+    seen*: Table[int64, uint32]   ## section key -> blockVersion as of the host's last look or write
+    pendingScan*: seq[int64]
+    writes*: int64                ## cells written to the world
+    adopted*: int64               ## fluid blocks adopted from the world
+    forgotten*: int64
+    stepsRun*: int64
+    opsRun*: int64
+    lastOps*: int
+    lastWritten*: int
+
+var gEnabled*: bool = false
+var gBudget*: int = 600
+var gStepEvery*: int = 2
+var gDims: Table[string, DimFluids] = initTable[string, DimFluids]()
+var gTick: int64 = 0
+
+proc fluidsEnabled*(): bool = gEnabled
+
+# ---- block states <-> fluid cells --------------------------------------------------------------------------------------
+
+proc waterBase(): int = int(asU16(Fluid.WATER.states[0].blockStateId))
+proc lavaBase(): int = int(asU16(Fluid.LAVA.states[0].blockStateId))
+
+proc fluidKindOf*(stateId: int): int =
+  ## KindWater / KindLava when the state is a water or lava block (any level), else KindNone.
+  let wb = waterBase()
+  let lb = lavaBase()
+  if stateId >= wb and stateId < wb + 16:
+    return KindWater
+  if stateId >= lb and stateId < lb + 16:
+    return KindLava
+  KindNone
+
+proc fluidMassOfState*(stateId: int; cap: int): int =
+  ## The mass a vanilla fluid block stands for: a source and a falling block are full, flowing level n (1..7) is (8-n)/8.
+  let kind = fluidKindOf(stateId)
+  if kind == KindNone:
+    return 0
+  let n = stateId - (if kind == KindWater: waterBase() else: lavaBase())
+  if n == 0 or n >= 8:
+    return cap
+  ((8 - n) * cap) div 8
+
+proc renderState*(kind, mass, cap: int; falling: bool): int =
+  ## The vanilla block state of a cell of `mass` units; 0 (air) when empty.
+  if mass <= 0 or kind == KindNone or mass * FilmDivisor < cap:
+    return 0   # a damp film under 1/16 of a block is kept in the model (volume is conserved) but not shown
+  let base = if kind == KindWater: waterBase() else: lavaBase()
+  var l = (mass * 8 + cap - 1) div cap
+  if l > 8:
+    l = 8
+  if l < 1:
+    l = 1
+  if falling:
+    return base + 8
+  if l >= 8:
+    return base
+  base + (8 - l)
+
+# ---- reading the world -------------------------------------------------------------------------------------------------
+
+proc rawState(world: World; x, y, z: int): int =
+  ## The block state id at a cell, or -1 when its chunk is not loaded or it is outside the build height.
+  let chunk = world.level.loadedChunks.getOrDefault(chunkKey(int32(x shr 4), int32(z shr 4)), nil)
+  if chunk == nil:
+    return -1
+  let (ok, id) = getBlockAbsoluteY(chunk.section, x and 15, int32(y), z and 15)
+  if not ok:
+    return -1
+  int(id)
+
+proc isAirState(id: int): bool =
+  id == 0 or (id > 0 and BlockState.fromId(newBlockStateIdUnchecked(uint16(id))).isAir)
+
+proc secKey(cx, cz: int32; sy: int): int64 =
+  (int64(cx) shl 36) xor (int64(cz and 0xFFFFFFF'i32) shl 8) xor int64(sy)
+
+proc newDim(world: World): DimFluids =
+  let d = DimFluids(dim: world.dimension.minecraftName, world: world, seen: initTable[int64, uint32](), pendingScan: @[])
+  let w = world
+  d.sim = newFluidSim(proc(x, y, z: int): bool {.closure.} =
+    let id = rawState(w, x, y, z)
+    if id < 0:
+      return true
+    if isAirState(id):
+      return false
+    if fluidKindOf(id) != KindNone:
+      # a fluid block is free for the model when the model owns it (or is about to rewrite it); an unowned one is a wall
+      return not (d.sim.isTracked(x, y, z) or d.sim.isPending(x, y, z))
+    true)
+  d
+
+proc dimFor(world: World): DimFluids =
+  let name = world.dimension.minecraftName
+  var d = gDims.getOrDefault(name, nil)
+  if d == nil or d.world != world:
+    d = newDim(world)
+    gDims[name] = d
+  d
+
+# ---- adoption and rescans ----------------------------------------------------------------------------------------------
+
+proc exposed(world: World; x, y, z: int): bool =
+  ## A fluid cell worth tracking: flowing, or with air next to it. Interior source cells stay vanilla blocks (inert).
+  const dx = [1, -1, 0, 0, 0, 0]
+  const dy = [0, 0, 1, -1, 0, 0]
+  const dz = [0, 0, 0, 0, 1, -1]
+  for i in 0 ..< 6:
+    if isAirState(rawState(world, x + dx[i], y + dy[i], z + dz[i])):
+      return true
+  false
+
+proc adoptCell(d: DimFluids; x, y, z, id: int) =
+  let kind = fluidKindOf(id)
+  if kind == KindNone or d.sim.isTracked(x, y, z):
+    return
+  let m = fluidMassOfState(id, int(d.sim.cap))
+  if m > 0 and d.sim.adoptFluid(x, y, z, kind, m) > 0:
+    inc d.adopted
+
+proc rescanSection(d: DimFluids; cx, cz: int32; sy: int; external: bool) =
+  ## Adopts exposed fluid blocks of one section; with `external` also forgets tracked cells that something else replaced and
+  ## wakes the tracked cells around the section so a changed wall or floor is noticed.
+  let chunk = d.world.level.loadedChunks.getOrDefault(chunkKey(cx, cz), nil)
+  if chunk == nil:
+    return
+  let cells = chunk.section.blockSections[sy].cells()
+  let baseY = int(chunk.section.minY) + sy * 16
+  let wb = waterBase()
+  let lb = lavaBase()
+  for i in 0 ..< 4096:
+    let id = int(cells[i])
+    let isFluid = (id >= wb and id < wb + 16) or (id >= lb and id < lb + 16)
+    let x = int(cx) * 16 + (i and 15)
+    let z = int(cz) * 16 + ((i shr 4) and 15)
+    let y = baseY + (i shr 8)
+    if isFluid:
+      let n = id - (if id >= lb: lb else: wb)
+      if not d.sim.isTracked(x, y, z) and (n != 0 or exposed(d.world, x, y, z)):
+        adoptCell(d, x, y, z, id)
+    elif external and d.sim.isTracked(x, y, z) and not d.sim.isPending(x, y, z):
+      # the cell holds something else now (a block placed in it, a bucket scooped it); air is fine for a damp film
+      if id != 0 and not isAirState(id) or d.sim.massAt(x, y, z) * FilmDivisor >= int(d.sim.cap):
+        discard d.sim.forgetCell(x, y, z)
+        inc d.forgotten
+  if external:
+    d.sim.wakeSection(int(cx) * 16 - 1, baseY - 1, int(cz) * 16 - 1, int(cx) * 16 + 16, baseY + 16, int(cz) * 16 + 16)
+
+proc scanPlayers(d: DimFluids) =
+  for pl in d.world.players:
+    let px = int(floor(pl.pos.x)) shr 4
+    let pz = int(floor(pl.pos.z)) shr 4
+    for cz in (pz - Radius) .. (pz + Radius):
+      for cx in (px - Radius) .. (px + Radius):
+        let chunk = d.world.level.loadedChunks.getOrDefault(chunkKey(int32(cx), int32(cz)), nil)
+        if chunk == nil:
+          continue
+        let minY = int(chunk.section.minY)
+        let psy = (int(floor(pl.pos.y)) - minY) shr 4
+        for sy in (psy - VerticalSections) .. (psy + VerticalSections):
+          if sy < 0 or sy >= chunk.section.blockSections.len:
+            continue
+          let key = secKey(int32(cx), int32(cz), sy)
+          let ver = sectionVersion(chunk.section, sy)
+          if not d.seen.hasKey(key) or d.seen.getOrDefault(key, 0'u32) != ver:
+            d.pendingScan.add(key)
+            d.seen[key] = ver
+
+proc unpackKey(key: int64; cx, cz: var int32; sy: var int) =
+  sy = int(key and 255'i64)
+  var zz = int32((key shr 8) and 0xFFFFFFF'i64)
+  if zz >= 0x8000000'i32:
+    zz = zz - 0x10000000'i32
+  cz = zz
+  cx = int32(key shr 36)
+
+proc runScans(d: DimFluids) =
+  var n = 0
+  while d.pendingScan.len > 0 and n < MaxScansPerTick:
+    let key = d.pendingScan[0]
+    d.pendingScan.delete(0)
+    var cx = 0'i32
+    var cz = 0'i32
+    var sy = 0
+    unpackKey(key, cx, cz, sy)
+    # the first look at a section adopts; later ones are changes by somebody else
+    rescanSection(d, cx, cz, sy, true)
+    inc n
+
+# ---- writing back ---------------------------------------------------------------------------------------------------------
+
+proc fallingAt(d: DimFluids; x, y, z, kind: int): bool =
+  let above = d.sim.cellOf(x, y + 1, z)
+  if above.mass <= 0 or int(above.kind) != kind:
+    return false
+  if d.sim.solidAt(x, y - 1, z):
+    return false
+  d.sim.cellOf(x, y - 1, z).mass < d.sim.cap
+
+proc writeBack(d: DimFluids) =
+  let changed = d.sim.drainChanged()
+  d.lastWritten = 0
+  if changed.len == 0:
+    return
+  # every changed cell plus the cells above and below it (their falling flag may flip)
+  var want = initTable[int64, bool]()
+  for k in changed:
+    let x = keyX(k)
+    let y = keyY(k)
+    let z = keyZ(k)
+    want[k] = true
+    for dy in [-1, 1]:
+      let k2 = cellKey(x, y + dy, z)
+      if d.sim.cells.hasKey(k2):
+        want[k2] = true
+  var keys: seq[int64] = @[]
+  for k, v in want:
+    keys.add(k)
+  var cellsOut: seq[BlockPos] = @[]
+  var statesOut: seq[uint32] = @[]
+  var emptied: seq[int64] = @[]
+  for k in keys:
+    let x = keyX(k)
+    let y = keyY(k)
+    let z = keyZ(k)
+    let cur = rawState(d.world, x, y, z)
+    if cur < 0:
+      # chunk went away under us: the cell cannot be written, drop it
+      if d.sim.isTracked(x, y, z):
+        discard d.sim.forgetCell(x, y, z)
+        inc d.forgotten
+      continue
+    let c = d.sim.cellOf(x, y, z)
+    var target = 0
+    if c.mass > 0:
+      if not (isAirState(cur) or fluidKindOf(cur) != KindNone):
+        # something solid was placed here since the last scan: the cell is not ours any more
+        discard d.sim.forgetCell(x, y, z)
+        inc d.forgotten
+        continue
+      target = renderState(int(c.kind), int(c.mass), int(d.sim.cap), fallingAt(d, x, y, z, int(c.kind)))
+    else:
+      if fluidKindOf(cur) == KindNone:
+        continue   # the cell is not fluid in the world either: nothing to clear (and never touch a block that is not fluid)
+      emptied.add(k)
+    if target != cur:
+      cellsOut.add(newBlockPos(int32(x), int32(y), int32(z)))
+      statesOut.add(uint32(target))
+  if cellsOut.len > 0:
+    let opts = BulkOptions(fireHooks: false, notifyEdge: false, logChanges: false)
+    let rep = writeCells(d.world, cellsOut, statesOut, opts)
+    if rep.status == esOk:
+      d.writes += int64(rep.changed)
+      d.lastWritten = rep.changed
+      # our own writes are not external changes: refresh the stamps of the sections we touched
+      for p in cellsOut:
+        let cx = p.vec.x shr 4
+        let cz = p.vec.z shr 4
+        let chunk = d.world.level.loadedChunks.getOrDefault(chunkKey(cx, cz), nil)
+        if chunk != nil:
+          let sy = int((p.vec.y - chunk.section.minY) shr 4)
+          let key = secKey(cx, cz, sy)
+          if d.seen.hasKey(key):
+            d.seen[key] = sectionVersion(chunk.section, sy)
+    else:
+      # the write refused (a plugin cannot veto here, so this is a chunk problem): try the cells again next tick
+      for p in cellsOut:
+        d.sim.markChanged(int(p.vec.x), int(p.vec.y), int(p.vec.z))
+  # a cell that became empty may have uncovered a vanilla fluid block next to it: adopt those so they keep flowing
+  const dx = [1, -1, 0, 0, 0, 0]
+  const dy = [0, 0, 1, -1, 0, 0]
+  const dz = [0, 0, 0, 0, 1, -1]
+  for k in emptied:
+    for i in 0 ..< 6:
+      let nx = keyX(k) + dx[i]
+      let ny = keyY(k) + dy[i]
+      let nz = keyZ(k) + dz[i]
+      if not d.sim.isTracked(nx, ny, nz):
+        let id = rawState(d.world, nx, ny, nz)
+        if id >= 0 and fluidKindOf(id) != KindNone:
+          adoptCell(d, nx, ny, nz, id)
+
+proc forgetUnloaded(d: DimFluids) =
+  var gone: seq[int64] = @[]
+  for k, c in d.sim.cells:
+    if not isChunkLoaded(d.world.level, int32(keyX(k) shr 4), int32(keyZ(k) shr 4)):
+      gone.add(k)
+  for k in gone:
+    discard d.sim.forgetCell(keyX(k), keyY(k), keyZ(k))
+    inc d.forgotten
+
+# ---- the tick -------------------------------------------------------------------------------------------------------------
+
+proc tickDim*(d: DimFluids; tick: int64) =
+  ## One server tick of one world: look around the players, run the budgeted step when due, write the changes back.
+  if tick mod int64(ScanEvery) == 0:
+    scanPlayers(d)
+  runScans(d)
+  if tick mod int64(gStepEvery) == 0 and not d.sim.idle():
+    let ops = d.sim.step(gBudget)
+    inc d.stepsRun
+    d.opsRun += int64(ops)
+    d.lastOps = ops
+  if tick mod int64(ForgetEvery) == 0:
+    forgetUnloaded(d)
+  writeBack(d)
+
+proc tickFluids*(server: Server) =
+  ## ONE call per server tick (servermod.tickWorlds). A single bool test while the fluids are off.
+  if not gEnabled:
+    return
+  inc gTick
+  gFluidTicksSuppressed = true
+  for w in server.worlds:
+    tickDim(dimFor(w), server.tickCounter)
+
+proc setFluidsEnabled*(on: bool) =
+  ## `/fluids on|off`. Off: the vanilla fluid ticks run again and the model state is dropped (the world already holds the
+  ## last rendered blocks, so nothing is lost: flowing water simply goes back to vanilla rules).
+  if on == gEnabled:
+    return
+  gEnabled = on
+  if on:
+    gFluidTicksSuppressed = true
+  else:
+    gFluidTicksSuppressed = false
+    gDims = initTable[string, DimFluids]()
+
+proc fluidsStatus*(): seq[string] =
+  result = @[]
+  result.add("finite fluids: " & (if gEnabled: "ON" else: "off") & "; budget " & $gBudget & " cells per step, a step every " &
+    $gStepEvery & " tick(s)")
+  for name, d in gDims:
+    let s = d.sim
+    result.add("  " & name & ": " & $s.cellCount() & " cells (" & $s.totalMass(KindWater) & " water units, " & $s.totalMass(KindLava) &
+      " lava units), awake " & $(s.awake.len + s.carry.len) & ", injected " & $s.injected & " drained " & $s.drained &
+      ", adopted " & $d.adopted & ", forgotten " & $d.forgotten & ", written " & $d.writes & ", last step " & $d.lastOps &
+      " cells, water/lava contacts " & $s.contacts)
+
+proc setFluidBudget*(n: int) =
+  if n >= 1 and n <= 100000:
+    gBudget = n
+
+proc setFluidStepEvery*(n: int) =
+  if n >= 1 and n <= 200:
+    gStepEvery = n
+
+proc fluidDims*(): seq[DimFluids] =
+  result = @[]
+  for name, d in gDims:
+    result.add(d)
+
+proc fluidDimFor*(world: World): DimFluids =
+  ## For tests and tools: the host state of a world (created on first use).
+  dimFor(world)
+
+proc fluidsScanNow*(world: World; cx, cz: int32; sy: int) =
+  ## For tests and `/fluids adopt`: look at one section now, as the periodic scan would.
+  let d = dimFor(world)
+  rescanSection(d, cx, cz, sy, true)

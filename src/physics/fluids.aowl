@@ -1,0 +1,383 @@
+## fluids: a finite, conserved-volume fluid model (water, lava) on a sparse 3D grid. Phase 3 item 9, level 2 core.
+##
+## PURE. Imports only std/tables: no world, entity or server state. The world is reached through one closure,
+## `solidAt(x, y, z)`, that the host supplies (true = the cell cannot hold fluid; unloaded and out-of-world cells must say true).
+## Everything is integer arithmetic, so a run is bit-for-bit reproducible: same cells, same inputs, same step count -> same result.
+##
+## CELL. A free cell holds `mass` units of ONE fluid kind (kind 1 water, 2 lava, any small positive number is allowed; 0 = no
+## fluid). One cell is full at `cap` units (default 1024). A cell sitting under fluid is compressed and may hold more than `cap`
+## (that is the pressure). Fluid is never created or destroyed by `step`: only `addFluid` / `removeFluid` change the total, and
+## the counters `injected` and `drained` let a caller prove  totalMass == injected - drained.
+##
+## STEP. `step(sim, budget)` processes the awake cells in ascending key order (y, then z, then x), at most `budget` cells.
+## A cell is awake when it has just received or lost fluid or when a neighbour did; an idle pool costs nothing. For each awake
+## cell, in this order:
+##   1. gravity / pressure with the cell below, 2. pressure with the cell above (both through `pairTarget`), 3. horizontal
+##   levelling over the cell and its free, same-kind, supported horizontal neighbours (empty neighbours included, so a puddle
+##   spreads and water runs off an edge); a levelling happens only when the group's highest and lowest cell differ by >= 2
+##   units, so every move strictly lowers the sum of squares and a still pool stops changing (no 1-unit flicker).
+## Pair balance (vertical). For a lower cell holding `lo` and the one above holding `hi` with total t = lo + hi, the lower cell
+## should hold  t                                if t <= cap                 (all of it falls)
+##              (cap*cap + t*comp)/(cap+comp)    if t < 2*cap + comp         (the lower cell is squeezed over cap)
+##              (t + comp)/2                     otherwise
+## Moving mass is `target - lo`: positive = falls down, negative = pushed up. This is the pressure model of communicating
+## vessels: a U tube settles to equal surface levels in both legs.
+## Two kinds never share a cell and never flow into each other (`contacts` counts the refused moves); lava runs `lavaPeriod`
+## times slower (its cells are only processed every lavaPeriod-th step).
+##
+## Budgeting. `step` returns the cells processed; the unprocessed rest stays awake for the next call. Changed cells are
+## collected for the host: `drainChanged` returns them sorted.
+
+import std/tables
+
+const
+  KindNone* = 0
+  KindWater* = 1
+  KindLava* = 2
+  CellOffset = 33554432'i64  ## 2^25: x and z are stored with this offset in 26 bits
+
+type
+  FCell* = object
+    mass*: int32
+    kind*: int32
+
+  SolidProc* = proc(x, y, z: int): bool {.closure.}
+
+  FluidSim* = ref object
+    cells*: Table[int64, FCell]
+    awake*: Table[int64, bool]
+    carry*: seq[int64]     ## cells a budget-limited step did not reach: they go first next time (no starvation)
+    changed*: Table[int64, bool]
+    solidAt*: SolidProc
+    cap*: int32
+    comp*: int32
+    lavaPeriod*: int
+    stepNo*: int64
+    injected*: int64
+    drained*: int64
+    contacts*: int64
+    opsTotal*: int64
+
+proc cellKey*(x, y, z: int): int64 =
+  (int64(y + 64) shl 52) or ((int64(z) + CellOffset) shl 26) or (int64(x) + CellOffset)
+
+proc keyX*(k: int64): int = int(k and 67108863'i64) - int(CellOffset)
+proc keyZ*(k: int64): int = int((k shr 26) and 67108863'i64) - int(CellOffset)
+proc keyY*(k: int64): int = int(k shr 52) - 64
+
+proc newFluidSim*(solidAt: SolidProc; cap: int = 1024; comp: int = 48; lavaPeriod: int = 3): FluidSim =
+  FluidSim(cells: initTable[int64, FCell](), awake: initTable[int64, bool](), carry: @[], changed: initTable[int64, bool](), solidAt: solidAt,
+    cap: int32(cap), comp: int32(comp), lavaPeriod: lavaPeriod, stepNo: 0, injected: 0, drained: 0, contacts: 0, opsTotal: 0)
+
+proc cellOf*(s: FluidSim; x, y, z: int): FCell =
+  s.cells.getOrDefault(cellKey(x, y, z), FCell(mass: 0, kind: 0))
+
+proc massAt*(s: FluidSim; x, y, z: int): int = int(cellOf(s, x, y, z).mass)
+
+proc kindAt*(s: FluidSim; x, y, z: int): int = int(cellOf(s, x, y, z).kind)
+
+proc wake(s: FluidSim; x, y, z: int) =
+  s.awake[cellKey(x, y, z)] = true
+
+proc wakeAround*(s: FluidSim; x, y, z: int) =
+  ## The host calls this when a block next to fluid changed (a wall removed, a floor dug).
+  wake(s, x, y, z)
+  wake(s, x + 1, y, z)
+  wake(s, x - 1, y, z)
+  wake(s, x, y + 1, z)
+  wake(s, x, y - 1, z)
+  wake(s, x, y, z + 1)
+  wake(s, x, y, z - 1)
+
+proc wakeSection*(s: FluidSim; x0, y0, z0, x1, y1, z1: int) =
+  ## Wakes every tracked cell inside the box (inclusive). The host calls this when blocks changed around them.
+  for k, c in s.cells:
+    let x = keyX(k)
+    let y = keyY(k)
+    let z = keyZ(k)
+    if x >= x0 and x <= x1 and y >= y0 and y <= y1 and z >= z0 and z <= z1:
+      s.awake[k] = true
+
+proc setCell(s: FluidSim; x, y, z, mass, kind: int) =
+  let k = cellKey(x, y, z)
+  if mass <= 0:
+    if s.cells.hasKey(k):
+      s.cells.del(k)
+  else:
+    s.cells[k] = FCell(mass: int32(mass), kind: int32(kind))
+  s.changed[k] = true
+  wakeAround(s, x, y, z)
+
+proc addFluid*(s: FluidSim; x, y, z, kind, amount: int): int =
+  ## Puts up to `amount` units into the cell (up to `cap`); returns what was accepted.
+  if amount <= 0 or s.solidAt(x, y, z):
+    return 0
+  let c = cellOf(s, x, y, z)
+  if c.mass > 0 and int(c.kind) != kind:
+    return 0
+  let room = int(s.cap) - int(c.mass)
+  if room <= 0:
+    return 0
+  let take = min(room, amount)
+  setCell(s, x, y, z, int(c.mass) + take, kind)
+  s.injected += int64(take)
+  take
+
+proc adoptFluid*(s: FluidSim; x, y, z, kind, amount: int): int =
+  ## `addFluid` for fluid the world already holds in the cell (the host adopts a vanilla block): the cell is not asked whether it is
+  ## solid (a fluid block that is not tracked yet reads as a wall to the model), the amount is still capped at `cap`.
+  if amount <= 0:
+    return 0
+  let c = cellOf(s, x, y, z)
+  if c.mass > 0:
+    return 0
+  let take = min(int(s.cap), amount)
+  setCell(s, x, y, z, take, kind)
+  s.injected += int64(take)
+  take
+
+proc removeFluid*(s: FluidSim; x, y, z, amount: int): int =
+  ## Takes up to `amount` units out of the cell; returns what was removed.
+  let c = cellOf(s, x, y, z)
+  if c.mass <= 0 or amount <= 0:
+    return 0
+  let take = min(int(c.mass), amount)
+  setCell(s, x, y, z, int(c.mass) - take, int(c.kind))
+  s.drained += int64(take)
+  take
+
+proc forgetCell*(s: FluidSim; x, y, z: int): int =
+  ## Drops a cell without changing the world (the host does this when something else took the cell, or its chunk unloaded).
+  ## The mass counts as drained, so the conservation identity still holds. Returns the mass dropped.
+  let k = cellKey(x, y, z)
+  if not s.cells.hasKey(k):
+    return 0
+  let m = int(s.cells.getOrDefault(k, FCell(mass: 0, kind: 0)).mass)
+  s.cells.del(k)
+  s.drained += int64(m)
+  wakeAround(s, x, y, z)
+  m
+
+proc markChanged*(s: FluidSim; x, y, z: int) =
+  ## Asks the host to write this cell again (its world state may have drifted).
+  s.changed[cellKey(x, y, z)] = true
+
+proc isTracked*(s: FluidSim; x, y, z: int): bool =
+  s.cells.hasKey(cellKey(x, y, z))
+
+proc isPending*(s: FluidSim; x, y, z: int): bool =
+  ## Whether the cell changed since the last `drainChanged` (the world still shows its older content).
+  s.changed.hasKey(cellKey(x, y, z))
+
+proc totalMass*(s: FluidSim; kind: int = -1): int64 =
+  result = 0'i64
+  for k, c in s.cells:
+    if kind < 0 or int(c.kind) == kind:
+      result += int64(c.mass)
+
+proc cellCount*(s: FluidSim): int = s.cells.len
+
+proc pairTarget*(s: FluidSim; t: int): int =
+  ## How much of a vertical pair's total `t` the lower cell should hold.
+  let cap = int(s.cap)
+  let comp = int(s.comp)
+  if t <= cap:
+    t
+  elif t < 2 * cap + comp:
+    (cap * cap + t * comp) div (cap + comp)
+  else:
+    (t + comp) div 2
+
+proc compatible(a, b: FCell): bool =
+  a.mass <= 0 or b.mass <= 0 or a.kind == b.kind
+
+proc vpair(s: FluidSim; lx, ly, lz: int) =
+  ## Balances the cell (lx,ly,lz) with the one above it.
+  if s.solidAt(lx, ly, lz) or s.solidAt(lx, ly + 1, lz):
+    return
+  let lo = cellOf(s, lx, ly, lz)
+  let hi = cellOf(s, lx, ly + 1, lz)
+  if lo.mass <= 0 and hi.mass <= 0:
+    return
+  if not compatible(lo, hi):
+    inc s.contacts
+    return
+  let kind = if lo.mass > 0: int(lo.kind) else: int(hi.kind)
+  let t = int(lo.mass) + int(hi.mass)
+  var target = pairTarget(s, t)
+  if target > t:
+    target = t
+  if target == int(lo.mass):
+    return
+  setCell(s, lx, ly, lz, target, kind)
+  setCell(s, lx, ly + 1, lz, t - target, kind)
+
+proc supported(s: FluidSim; x, y, z: int): bool =
+  ## Whether a cell rests on something: a solid below, or a full (or squeezed) cell of fluid.
+  if s.solidAt(x, y - 1, z):
+    return true
+  cellOf(s, x, y - 1, z).mass >= s.cap
+
+proc hlevel(s: FluidSim; x, y, z: int) =
+  ## Levels the cell with its horizontal neighbours.
+  let me = cellOf(s, x, y, z)
+  if me.mass <= 0 or not supported(s, x, y, z):
+    return
+  var px: array[5, int] = [0, 0, 0, 0, 0]
+  var pz: array[5, int] = [0, 0, 0, 0, 0]
+  var pm: array[5, int] = [0, 0, 0, 0, 0]
+  var n = 1
+  px[0] = x
+  pz[0] = z
+  pm[0] = int(me.mass)
+  for d in 0 ..< 4:
+    let nx = x + (if d == 0: 1 elif d == 1: -1 else: 0)
+    let nz = z + (if d == 2: 1 elif d == 3: -1 else: 0)
+    if s.solidAt(nx, y, nz):
+      continue
+    let c = cellOf(s, nx, y, nz)
+    if c.mass > 0:
+      if c.kind != me.kind:
+        inc s.contacts
+        continue
+      if not supported(s, nx, y, nz):
+        continue
+    px[n] = nx
+    pz[n] = nz
+    pm[n] = int(c.mass)
+    inc n
+  if n < 2:
+    return
+  var lo = pm[0]
+  var hi = pm[0]
+  var sum = 0
+  for i in 0 ..< n:
+    sum += pm[i]
+    if pm[i] < lo:
+      lo = pm[i]
+    if pm[i] > hi:
+      hi = pm[i]
+  if hi - lo < 2:
+    return
+  let base = sum div n
+  let rem = sum mod n
+  let start = int((s.stepNo + int64(x) * 7 + int64(z) * 13 + 1000000) mod int64(n))
+  for i in 0 ..< n:
+    var give = base
+    let rank = (i - start + n) mod n
+    if rank < rem:
+      inc give
+    if give != pm[i]:
+      setCell(s, px[i], y, pz[i], give, int(me.kind))
+
+proc processCell(s: FluidSim; k: int64) =
+  let x = keyX(k)
+  let y = keyY(k)
+  let z = keyZ(k)
+  if not s.cells.hasKey(k):
+    return
+  vpair(s, x, y - 1, z)
+  vpair(s, x, y, z)
+  hlevel(s, x, y, z)
+
+proc sortKeys(a: var seq[int64]) =
+  ## Bottom-up merge sort (ascending); keys are unique so stability does not matter.
+  if a.len < 2:
+    return
+  var buf = newSeq[int64](a.len)
+  var w = 1
+  while w < a.len:
+    var i = 0
+    while i < a.len:
+      let mid = min(i + w, a.len)
+      let hi = min(i + 2 * w, a.len)
+      var l = i
+      var r = mid
+      var k = i
+      while l < mid and r < hi:
+        if a[l] <= a[r]:
+          buf[k] = a[l]
+          inc l
+        else:
+          buf[k] = a[r]
+          inc r
+        inc k
+      while l < mid:
+        buf[k] = a[l]
+        inc l
+        inc k
+      while r < hi:
+        buf[k] = a[r]
+        inc r
+        inc k
+      i += 2 * w
+    for j in 0 ..< a.len:
+      a[j] = buf[j]
+    w *= 2
+
+proc step*(s: FluidSim; budget: int): int =
+  ## Processes up to `budget` awake cells (ascending key order). Returns how many were processed.
+  inc s.stepNo
+  var keys = s.carry
+  s.carry = @[]
+  var seen = initTable[int64, bool]()
+  for k in keys:
+    seen[k] = true
+  var fresh: seq[int64] = @[]
+  for k, v in s.awake:
+    if not seen.hasKey(k):
+      fresh.add(k)
+  s.awake.clear()
+  sortKeys(fresh)
+  for k in fresh:
+    keys.add(k)
+  var ops = 0
+  for k in keys:
+    if ops >= budget:
+      s.carry.add(k)
+      continue
+    let c = cellOf(s, keyX(k), keyY(k), keyZ(k))
+    if c.mass <= 0:
+      continue
+    if c.kind == KindLava and s.lavaPeriod > 1 and (s.stepNo mod int64(s.lavaPeriod)) != 0:
+      s.awake[k] = true
+      continue
+    inc ops
+    processCell(s, k)
+  s.opsTotal += int64(ops)
+  ops
+
+proc idle*(s: FluidSim): bool = s.awake.len == 0 and s.carry.len == 0
+
+proc settle*(s: FluidSim; budget, maxSteps: int): int =
+  ## Steps until nothing is awake (or maxSteps); returns the steps taken.
+  var n = 0
+  while n < maxSteps and not idle(s):
+    discard step(s, budget)
+    inc n
+  n
+
+proc drainChanged*(s: FluidSim): seq[int64] =
+  ## Cells whose content changed since the last call, ascending.
+  result = @[]
+  for k, v in s.changed:
+    result.add(k)
+  s.changed.clear()
+  sortKeys(result)
+
+proc columnTop*(s: FluidSim; x, z, yLo, yHi: int): int =
+  ## The highest y in [yLo, yHi] holding fluid, or yLo - 1.
+  var y = yHi
+  while y >= yLo:
+    if s.cells.hasKey(cellKey(x, y, z)):
+      return y
+    dec y
+  yLo - 1
+
+proc checksum*(s: FluidSim): int64 =
+  ## Order-independent digest of the whole fluid state (for the determinism test).
+  result = 0'i64
+  for k, c in s.cells:
+    var h = k * 1000003'i64 + int64(c.mass) * 7919'i64 + int64(c.kind) * 104729'i64
+    h = h xor (h shr 17)
+    result = result + h * 31'i64

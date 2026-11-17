@@ -1,0 +1,267 @@
+## Finite fluids on the real world code (fluidhost.aowl + bulkedit.writeCells) on an in-memory world: off changes nothing, on adopts,
+## spreads, settles and conserves, a removed wall lets the pool run, a placed block is respected, lava and water stay apart.
+import std/[assertions, syncio, cmdline, tables, strutils]
+import "../block/fluidseam"
+import ../../config/lib as configlib
+import ../../world/[chunkdata, level, lightingruntime, palette, playerdata, worldfs, worldinfo]
+import ../../world/blockstates as states
+import ../../nbt/tag as nbttag
+import ../../plugin/pluginhooksblock
+import ../../util/math/position
+import ../data/datamod
+import ../recipe
+import ../scheduler
+import ../serverbase
+import ../tick_rate_manager
+import ../net/winsock
+import "../block/worldadapter"
+import ../world/[bulkedit, worldmod]
+import ../fluids/fluidhost
+import ../../physics/fluids
+
+var failures = 0
+var gCalls = 0
+var gVetoAt: array[3, int] = [20, 20, 20]
+
+proc check(name: string; cond: bool) =
+  if cond:
+    echo "PASS ", name
+  else:
+    echo "FAIL ", name
+    inc failures
+
+proc scratch(): string =
+  result = parentDirW(paramStr(0)) & "/bulkedit_scratch"
+  discard createDirAllW(result)
+
+const Sections = 9   # y -16..127: one section below the edited boxes, so the one-block light shell stays inside the world
+
+let adv = defaultAdvancedConfiguration()
+let theLevel = fromRootFolder(adv.world, scratch(), 1'i64, OVERWORLD)
+let server = Server(basicConfig: defaultBasicConfiguration(), advancedConfig: adv, worlds: @[], dimensions: @[OVERWORLD],
+  tickCounter: 0'i64, nextEntityId: 1'i32, tickRateManager: newServerTickRateManager(20.0'f32), keyStore: nil,
+  recipeManager: newRecipeManager(), scheduler: newTaskScheduler(), data: ServerData(),
+  playerDataStorage: PlayerDataStorage(), levelFolder: "", playerIdleTimeout: 0'i32, mojangPublicKeys: @[],
+  stopRequested: false, stopAtMs: 0'i64)
+let bw = loadWorld(theLevel, defaultLevelData(1'u64), OVERWORLD, 63'i32, 0'i32, server)
+
+proc mkChunk(x, z: int32): ChunkData =
+  let c = newChunkData(x, z, newChunkSections(Sections, -16'i32))
+  c.lightEngine.skyLight = newSeq[LightContainer](Sections)
+  c.lightEngine.blockLight = newSeq[LightContainer](Sections)
+  for i in 0 ..< Sections:
+    c.lightEngine.skyLight[i] = newLightEmpty(0'u8)
+    c.lightEngine.blockLight[i] = newLightEmpty(0'u8)
+  c
+
+let (_, stone) = defaultStateByName("stone")
+let (_, dirt) = defaultStateByName("dirt")
+let (_, glow) = defaultStateByName("glowstone")
+let (_, chest) = defaultStateByName("chest")
+let (_, planks) = defaultStateByName("oak_planks")
+let (_, stairs) = defaultStateByName("oak_stairs")
+
+var chunks: seq[ChunkData] = @[]
+for cz in 0'i32 .. 1'i32:
+  for cx in 0'i32 .. 1'i32:
+    let c = mkChunk(cx, cz)
+    addLoadedChunk(theLevel, c)
+    chunks.add(c)
+
+proc fillBox(x0, y0, z0, x1, y1, z1: int32; id: uint32) =
+  for y in y0 .. y1:
+    for z in z0 .. z1:
+      for x in x0 .. x1:
+        discard setBlockState(theLevel, newBlockPos(x, y, z), id)
+
+proc stateAt(x, y, z: int32): uint32 = getBlockState(theLevel, newBlockPos(x, y, z))
+
+proc rebuildHeightmaps() =
+  for c in chunks:
+    c.heightmap = calculateHeightmap(c)
+
+let (_, water) = defaultStateByName("water")
+let (_, lava) = defaultStateByName("lava")
+let (_, air) = defaultStateByName("air")
+
+# ---- the world: stone everywhere to y 19; basin A (x 4..7, z 4..7, y 14..19) and pit B (x 9..10, z 4..7, y 10..19) -----------
+fillBox(0, -16, 0, 31, 19, 31, stone)
+fillBox(4, 14, 4, 7, 19, 7, air)
+fillBox(9, 10, 4, 10, 19, 7, air)
+rebuildHeightmaps()
+bw.bulkUpdateLighting(newBlockPos(0'i32, 0'i32, 0'i32), newBlockPos(31'i32, 40'i32, 31'i32))
+server.worlds.add(bw)
+
+proc fluidBlocks(x0, y0, z0, x1, y1, z1: int32): int =
+  result = 0
+  for y in y0 .. y1:
+    for z in z0 .. z1:
+      for x in x0 .. x1:
+        if fluidKindOf(int(stateAt(x, y, z))) != KindNone:
+          inc result
+
+proc nonFluidDump(): seq[seq[uint32]] =
+  ## Every block that is not water or lava (fluid positions read as 0), for "nothing else was touched".
+  result = @[]
+  for c in chunks:
+    var d = dumpBlocks(c.section)
+    for i in 0 ..< d.len:
+      if fluidKindOf(int(d[i])) != KindNone:
+        d[i] = 0'u32
+    result.add(d)
+
+var tick = 0'i64
+proc run(d: DimFluids; ticks: int) =
+  for i in 0 ..< ticks:
+    inc tick
+    server.tickCounter = tick
+    tickDim(d, tick)
+
+proc settleWorld(d: DimFluids; maxTicks: int): int =
+  var n = 0
+  while n < maxTicks and not d.sim.idle():
+    run(d, 1)
+    inc n
+  run(d, 3)
+  n
+
+proc mismatched(d: DimFluids): int =
+  ## Tracked cells whose world state differs from the model's render of the cell.
+  result = 0
+  for k, c in d.sim.cells:
+    let x = keyX(k)
+    let y = keyY(k)
+    let z = keyZ(k)
+    let cur = int(stateAt(int32(x), int32(y), int32(z)))
+    let above = d.sim.cellOf(x, y + 1, z)
+    let falling = above.mass > 0 and above.kind == c.kind and not d.sim.solidAt(x, y - 1, z) and d.sim.cellOf(x, y - 1, z).mass < d.sim.cap
+    if cur != renderState(int(c.kind), int(c.mass), int(d.sim.cap), falling):
+      inc result
+
+# ---- 0. the state mapping ---------------------------------------------------------------------------------------------------
+check("mapping: water source is full", fluidMassOfState(int(water), 1024) == 1024 and fluidKindOf(int(water)) == KindWater)
+check("mapping: lava is lava", fluidKindOf(int(lava)) == KindLava and fluidKindOf(int(stone)) == KindNone)
+check("mapping: render of a full cell is the source block", renderState(KindWater, 1024, 1024, false) == int(water))
+check("mapping: render of 1/8 is the thinnest flowing level", renderState(KindWater, 128, 1024, false) == int(water) + 7)
+check("mapping: render then read gives the same eighth", fluidMassOfState(renderState(KindWater, 512, 1024, false), 1024) == 512)
+check("mapping: empty renders air", renderState(KindWater, 0, 1024, false) == 0)
+check("mapping: a damp film under 1/16 renders air, 1/16 renders the thinnest water", renderState(KindWater, 63, 1024, false) == 0 and renderState(KindWater, 64, 1024, false) == int(water) + 7)
+
+# ---- 1. OFF (the default): nothing runs, nothing is written ---------------------------------------------------------------
+check("default: finite fluids are off", not fluidsEnabled())
+check("default: vanilla fluid ticks are not suppressed", not gFluidTicksSuppressed)
+for y in 14 .. 19:
+  discard setBlockState(theLevel, newBlockPos(5'i32, int32(y), 5'i32), water)
+  discard setBlockState(theLevel, newBlockPos(6'i32, int32(y), 6'i32), water)
+rebuildHeightmaps()
+let dimOff = fluidDimFor(bw)
+let offBase = dumpBlocks(chunks[0].section)
+for i in 0 ..< 60:
+  inc tick
+  server.tickCounter = tick
+  tickFluids(server)
+check("off: 60 ticks with water placed change no block", dumpBlocks(chunks[0].section) == offBase)
+check("off: the host tracked nothing and wrote nothing", dimOff.sim.cellCount() == 0 and dimOff.writes == 0)
+check("off: the suppression flag stayed false", not gFluidTicksSuppressed)
+
+# ---- 2. ON: adopt, spread, settle, conserve ------------------------------------------------------------------------------------
+setFluidsEnabled(true)
+check("on: enabled and vanilla fluid ticks suppressed", fluidsEnabled() and gFluidTicksSuppressed)
+let dim = fluidDimFor(bw)
+let nonFluid0 = nonFluidDump()
+fluidsScanNow(bw, 0'i32, 0'i32, 0)
+fluidsScanNow(bw, 0'i32, 0'i32, 1)
+fluidsScanNow(bw, 0'i32, 0'i32, 2)
+check("on: exposed source blocks were adopted", dim.sim.cellCount() > 0 and dim.sim.cellCount() <= 12)
+let adoptedMass = dim.sim.totalMass()
+echo "     adopted ", dim.sim.cellCount(), " cells, ", adoptedMass, " units, injected ", dim.sim.injected
+var conservedAlways = true
+var maxPerTick = 0
+for t in 0 ..< 400:
+  run(dim, 1)
+  if dim.sim.totalMass() != dim.sim.injected - dim.sim.drained:
+    conservedAlways = false
+  if dim.lastWritten > maxPerTick:
+    maxPerTick = dim.lastWritten
+  if dim.sim.idle() and t > 40:
+    break
+discard settleWorld(dim, 400)
+check("on: totalMass == injected - drained on every tick", conservedAlways)
+check("on: settled", dim.sim.idle())
+check("on: the world shows what the model says (no tracked cell differs)", mismatched(dim) == 0)
+check("on: water spread over the whole basin floor (y14)", fluidBlocks(4'i32, 14'i32, 4'i32, 7'i32, 14'i32, 7'i32) == 16)
+check("on: only water changed in the world (every other block identical)", nonFluidDump() == nonFluid0)
+check("on: no water outside basin A", fluidBlocks(0'i32, 0'i32, 0'i32, 31'i32, 40'i32, 31'i32) == fluidBlocks(4'i32, 14'i32, 4'i32, 7'i32, 19'i32, 7'i32))
+var lo = 100000
+var hi = 0
+for z in 4 .. 7:
+  for x in 4 .. 7:
+    let m = dim.sim.massAt(x, 14, z)
+    if m < lo: lo = m
+    if m > hi: hi = m
+echo "     floor cell masses ", lo, " .. ", hi, ", total ", dim.sim.totalMass(), ", most cells written in one tick ", maxPerTick
+check("on: the floor layer is level to ~1% (" & $lo & ".." & $hi & ")", hi - lo <= 12)
+check("on: the volume equals what was adopted (" & $dim.sim.totalMass() & " = " & $adoptedMass & ")", dim.sim.totalMass() == adoptedMass)
+check("on: cells were really written to the world", dim.writes > 0 and maxPerTick > 0)
+
+# ---- 3. a wall is removed: the pool runs into the pit and both settle to one level ----------------------------------------------
+let totalBefore = dim.sim.totalMass()
+let topBeforeA = dim.sim.columnTop(5, 5, 10, 19)
+for z in 4 .. 7:
+  for y in 10 .. 14:
+    discard setBlockState(theLevel, newBlockPos(8'i32, int32(y), int32(z)), air)
+fluidsScanNow(bw, 0'i32, 0'i32, 0)
+fluidsScanNow(bw, 0'i32, 0'i32, 1)
+let wallW = settleWorld(dim, 3000)
+let topA = dim.sim.columnTop(5, 5, 10, 19)
+let topB = dim.sim.columnTop(9, 5, 10, 19)
+echo "     after the wall opened (", wallW, " ticks): top A ", topA, " (was ", topBeforeA, "), top B ", topB, ", total ", dim.sim.totalMass()
+check("wall: settled", dim.sim.idle())
+check("wall: water reached the pit (B has fluid on its floor)", dim.sim.massAt(9, 10, 5) > 0 and dim.sim.massAt(10, 10, 6) > 0)
+var inB = 0
+for z in 4 .. 7:
+  for x in 8 .. 10:
+    for y in 10 .. 19:
+      inB += dim.sim.massAt(x, y, z)
+check("wall: A drained into the pit (A shows no water block, B holds " & $inB & " of " & $totalBefore & ")", fluidBlocks(4'i32, 14'i32, 4'i32, 7'i32, 19'i32, 7'i32) == 0 and inB * 100 >= int(totalBefore) * 99)
+check("wall: B's floor layer is full", fluidBlocks(9'i32, 10'i32, 4'i32, 10'i32, 10'i32, 7'i32) == 8)
+check("wall: volume conserved (" & $dim.sim.totalMass() & " vs " & $totalBefore & ")", dim.sim.totalMass() == totalBefore)
+check("wall: the world shows the model", mismatched(dim) == 0)
+
+# ---- 4. a player puts a block into the water: the cell is forgotten and nothing is overwritten -----------------------------------
+let massBefore = dim.sim.totalMass()
+discard setBlockState(theLevel, newBlockPos(9'i32, 10'i32, 5'i32), stone)
+fluidsScanNow(bw, 0'i32, 0'i32, 0)
+fluidsScanNow(bw, 0'i32, 0'i32, 1)
+discard settleWorld(dim, 600)
+check("block: the stone stayed", stateAt(9, 10, 5) == stone)
+check("block: the model dropped that cell and counted its mass as drained", not dim.sim.isTracked(9, 10, 5) and dim.sim.totalMass() < massBefore)
+check("block: conservation identity still holds", dim.sim.totalMass() == dim.sim.injected - dim.sim.drained)
+
+# ---- 5. lava and water never mix --------------------------------------------------------------------------------------------------
+discard setBlockState(theLevel, newBlockPos(5'i32, 17'i32, 5'i32), lava)
+fluidsScanNow(bw, 0'i32, 0'i32, 1)
+fluidsScanNow(bw, 0'i32, 0'i32, 2)
+discard settleWorld(dim, 600)
+var mixedCells = 0
+for k, c in dim.sim.cells:
+  let cur = fluidKindOf(int(stateAt(int32(keyX(k)), int32(keyY(k)), int32(keyZ(k)))))
+  if cur != int(c.kind) and int(c.mass) * 16 >= 1024:
+    inc mixedCells
+check("lava: every tracked cell shows its own fluid kind in the world", mixedCells == 0)
+check("lava: lava is tracked and the kinds' masses are separate", dim.sim.totalMass(KindLava) > 0 and dim.sim.totalMass(KindWater) > 0)
+
+# ---- 6. OFF again: the vanilla ticks come back and nothing more is written ---------------------------------------------------------
+setFluidsEnabled(false)
+check("off again: vanilla fluid ticks are not suppressed", not gFluidTicksSuppressed)
+let offBase2 = dumpBlocks(chunks[0].section)
+for i in 0 ..< 80:
+  inc tick
+  server.tickCounter = tick
+  tickFluids(server)
+check("off again: 80 ticks change no block", dumpBlocks(chunks[0].section) == offBase2)
+
+if failures > 0:
+  echo "fluidhosttest: ", failures, " FAILED"
+  quit(1)
+echo "fluidhosttest: all passed"

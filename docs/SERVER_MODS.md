@@ -184,3 +184,9 @@ cause). Undo keeps the pre-edit section snapshot, so it restores block states an
 
 `worldedit:cui`: a client that registered the channel, sent `v|<n>` on it, or holds the Jester `cui` capability receives `s|cuboid` and
 `p|<0|1>|x|y|z|volume` (UTF-8 text, one per packet) whenever its selection changes.
+
+## 10. Finite fluids (real, optional, off by default)
+
+`src/physics/fluids.aowl` (pure conserved-volume model) + `src/server/fluids/` (host, `/fluids on|off|status`, op level 3): water and lava as a volume per
+cell, pressure-style flow, a per-tick cell budget, every change written through `bulkedit.writeCells`. Off = vanilla, untouched. See docs/FLUIDS.md
+(also the level 1, client-only visual version).
