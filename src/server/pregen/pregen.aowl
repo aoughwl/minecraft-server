@@ -1,0 +1,327 @@
+## The built-in pre-generator: generates the chunks round a centre, nearest ring first, through the chunk system's public
+## ticket API, and saves them. Replaces Chunky of the old Fabric setup, throttled by the same client signal.
+##
+## How a chunk is made: a `FullChunkLevel` ticket (the one `/forceload` uses, `addTicket` + `sendChange`) asks the chunk
+## system for the chunk at the Full stage; when `Level.loadedChunks` has it, the ticket is removed again and the level is
+## told to unload, which writes it to the region files. At most `maxInFlight` tickets are out at once, so memory stays
+## bounded; a chunk the system never answers is dropped after `StuckMs`. Only `Level`'s public procs and the ticket procs
+## are used, so whatever the chunk system does inside (a worker pool) is picked up as it is.
+##
+## Control: `/pregen start|pause|resume|cancel|status|go|hold|inflight` (pregencmd.aowl). Progress is written to
+## `<level folder>/pregen-<dimension>.txt` every `CheckpointTicks` and on every change, and a restart resumes a task that
+## was running. The client's word comes from `jester-pregen-signal.txt` in the server's folder (`JESTER_PREGEN_SIGNAL`
+## names another file), the file mcserver.ps1's `Set-PregenSignal` writes; `/pregen go|hold` is the same word over RCON.
+## `JESTER_PREGEN_RADIUS` (blocks) starts the overworld at the world spawn on the first tick when no task is saved.
+## PARTIAL: a signal file rewritten with the same word is not seen as a new word (no modification time is read).
+
+import std/[syncio, envvars, strutils]
+import ../serverbase
+import ../logging
+import ../net/winsock
+import ../../world/level
+import ../../world/worldfs
+import ../../world/chunk_system/chunk_system
+import pregenstate
+export pregenstate
+
+const
+  CheckpointTicks = 100
+  SignalPollTicks = 5
+  MaxNewPerTick = 8
+  StuckMs = 120_000'i64
+  DefaultInFlight = 48
+
+type
+  InFlight = object
+    index: int64
+    x, z: int32
+    since: int64
+
+  Active* = ref object
+    task*: PregenTask
+    world*: World
+    base*: int64          ## the spiral index this run began at
+    next*: int64          ## the next spiral index to schedule
+    flying*: seq[InFlight]
+    done*: int64          ## chunks finished this run (generated, read from disk, or given up on)
+    stuck*: int64
+    activeMs*: int64      ## time spent running, for the rate
+    lastMs*: int64
+
+var
+  gServer: nil Server = nil
+  gActive: seq[Active] = @[]
+  gLoaded = false
+  gGate = newGate()
+  gMaxInFlight = DefaultInFlight
+  gSignalWord = ""
+  gSignalSerial = 0'i64
+  gSignalNext = 0
+  gRemoteWord = ""         ## the word `/pregen go|hold` set
+  gRemoteSerial = 0'i64
+  gGateOpen = true
+  gLastCheckpoint = 0'i64
+
+proc installPregen*(server: Server) =
+  gServer = server
+
+proc signalPath(): string =
+  let p = getEnv("JESTER_PREGEN_SIGNAL")
+  if p.len > 0: p else: "jester-pregen-signal.txt"
+
+proc taskPath(server: Server; dimension: string): string =
+  var name = dimension
+  let colon = name.find(':')
+  if colon >= 0:
+    name = name.substr(colon + 1)
+  joinPathW(server.levelFolder, "pregen-" & name & ".txt")
+
+proc saveTask(a: Active) =
+  let server = gServer
+  if server == nil:
+    return
+  let text = taskToText(a.task)
+  var bytes = newSeq[byte](text.len)
+  for i in 0 ..< text.len:
+    bytes[i] = byte(ord(text[i]))
+  let path = taskPath(server, a.task.dimension)
+  if not writeFileBytes(path & ".tmp", bytes) or not renameReplace(path & ".tmp", path):
+    warn("pregen: cannot save " & path)
+
+proc worldOf(dimension: string): nil World =
+  let server = gServer
+  if server == nil:
+    return nil
+  for w in server.worlds:
+    if w.dimension.minecraftName == dimension:
+      return w
+  nil
+
+proc findActive*(dimension: string): nil Active =
+  for a in gActive:
+    if a.task.dimension == dimension:
+      return a
+  nil
+
+proc activeTasks*(): seq[Active] = gActive
+
+proc serverWorlds*(): seq[World] =
+  result = @[]
+  let server = gServer
+  if server != nil:
+    result = server.worlds
+
+proc inFlightCount*(a: Active): int = a.flying.len
+proc totalOf*(a: Active): int64 = totalChunks(a.task.radius)
+proc finishedCount*(a: Active): int64 = a.base + a.done
+proc maxInFlight*(): int = gMaxInFlight
+proc setMaxInFlight*(n: int) =
+  gMaxInFlight = max(1, min(n, 4096))
+proc gateOpen*(): bool = gGateOpen
+proc signalWord*(): string = (if gRemoteSerial > 0'i64 and gRemoteSerial >= gSignalSerial: gRemoteWord else: gSignalWord)
+
+proc chunksPerSecond*(a: Active): float64 =
+  if a.activeMs <= 0'i64:
+    return 0.0
+  float64(a.done) * 1000.0 / float64(a.activeMs)
+
+proc releaseAll(a: Active) =
+  let w = a.world
+  if w.level.chunkLoading == nil:
+    a.flying = @[]
+    return
+  for f in a.flying:
+    removeTicket(w.level.chunkLoading, chunkPos(f.x, f.z), FullChunkLevel)
+  if a.flying.len > 0:
+    sendChange(w.level.chunkLoading)
+    w.level.shouldUnload = true
+  a.flying = @[]
+
+proc lowestUnfinished(a: Active): int64 =
+  result = a.next
+  for f in a.flying:
+    if f.index < result:
+      result = f.index
+
+proc startTask*(dimension: string; cx, cz, radius: int32): string =
+  ## "" when started, else the reason it was not.
+  let w = worldOf(dimension)
+  if w == nil:
+    return "no such dimension: " & dimension
+  let old = findActive(dimension)
+  if old != nil:
+    releaseAll(old)
+    var kept: seq[Active] = @[]
+    for a in gActive:
+      if a != old:
+        kept.add(a)
+    gActive = kept
+  discard ensureChunkSystem(w.level)
+  let a = Active(task: PregenTask(dimension: dimension, cx: cx, cz: cz, radius: radius, resume: 0'i64, phase: ppRunning),
+    world: w, base: 0'i64, next: 0'i64, flying: @[], done: 0'i64, stuck: 0'i64, activeMs: 0'i64, lastMs: nowMs())
+  gActive.add(a)
+  saveTask(a)
+  info("pregen: " & dimension & " " & $totalChunks(radius) & " chunks round chunk " & $cx & " " & $cz)
+  ""
+
+proc setPhase*(dimension: string; phase: PregenPhase): bool =
+  ## pause (ppPaused) or resume (ppRunning) a task that is not finished.
+  let a = findActive(dimension)
+  if a == nil:
+    return false
+  if a.task.phase == ppDone or a.task.phase == ppCancelled:
+    return false
+  a.task.resume = lowestUnfinished(a)
+  if phase != ppRunning:
+    releaseAll(a)
+    a.next = a.task.resume
+  a.task.phase = phase
+  a.lastMs = nowMs()
+  saveTask(a)
+  true
+
+proc cancelTask*(dimension: string): bool =
+  let a = findActive(dimension)
+  if a == nil:
+    return false
+  a.task.resume = lowestUnfinished(a)
+  releaseAll(a)
+  a.next = a.task.resume
+  a.task.phase = ppCancelled
+  saveTask(a)
+  true
+
+proc setRemoteWord*(word: string) =
+  gRemoteWord = word
+  gRemoteSerial = max(gSignalSerial, gRemoteSerial) + 1'i64
+  gSignalSerial = gRemoteSerial
+
+proc loadPersisted() =
+  gLoaded = true
+  let server = gServer
+  if server == nil:
+    return
+  for w in server.worlds:
+    let path = taskPath(server, w.dimension.minecraftName)
+    let (status, bytes) = readFileBytes(path)
+    if status != rsOk:
+      continue
+    var text = newString(bytes.len)
+    for i in 0 ..< bytes.len:
+      text[i] = char(bytes[i])
+    var t = PregenTask(dimension: "", cx: 0'i32, cz: 0'i32, radius: 0'i32, resume: 0'i64, phase: ppRunning)
+    if not taskFromText(text, t):
+      warn("pregen: ignoring unreadable " & path)
+      continue
+    discard ensureChunkSystem(w.level)
+    gActive.add(Active(task: t, world: w, base: t.resume, next: t.resume, flying: @[], done: 0'i64, stuck: 0'i64,
+      activeMs: 0'i64, lastMs: nowMs()))
+    if t.phase == ppRunning or t.phase == ppPaused:
+      info("pregen: " & t.dimension & " " & phaseName(t.phase) & " at chunk " & $t.resume & " of " & $totalChunks(t.radius))
+  let env = getEnv("JESTER_PREGEN_RADIUS")
+  if env.len > 0 and server.worlds.len > 0:
+    var r = 0'i32
+    if parseRadius(env, r) and r > 0'i32:
+      let w = server.worlds[0]
+      let have = findActive(w.dimension.minecraftName)
+      if have == nil or (have.task.radius < r and have.task.phase != ppRunning):
+        discard startTask(w.dimension.minecraftName, w.levelInfo.spawnX shr 4, w.levelInfo.spawnZ shr 4, r)
+
+proc readSignal() =
+  let (status, bytes) = readFileBytes(signalPath())
+  var word = ""
+  if status == rsOk:
+    for b in bytes:
+      if b > 32'u8 and b < 127'u8:
+        word.add(char(b))
+  word = word.toLowerAscii()
+  if word != gSignalWord:
+    gSignalWord = word
+    gSignalSerial = max(gSignalSerial, gRemoteSerial) + 1'i64
+
+proc playerCount(): int =
+  result = 0
+  let server = gServer
+  if server == nil:
+    return
+  for w in server.worlds:
+    result += w.players.len
+
+proc stepActive(a: Active; running: bool; nowMsv: int64) =
+  let level = a.world.level
+  let total = totalChunks(a.task.radius)
+  # chunks that have arrived release their tickets, also while held, so memory stays bounded
+  var kept: seq[InFlight] = @[]
+  var released = false
+  for f in a.flying:
+    let loaded = isChunkLoaded(level, f.x, f.z)
+    let stuck = nowMsv - f.since > StuckMs
+    if loaded or stuck:
+      removeTicket(level.chunkLoading, chunkPos(f.x, f.z), FullChunkLevel)
+      inc a.done
+      if stuck and not loaded:
+        inc a.stuck
+        warn("pregen: chunk " & $f.x & " " & $f.z & " did not generate in time; skipped")
+      released = true
+    else:
+      kept.add(f)
+  a.flying = kept
+  if released:
+    sendChange(level.chunkLoading)
+    level.shouldUnload = true
+  if a.task.phase != ppRunning:
+    return
+  if a.lastMs > 0'i64 and running:
+    a.activeMs += nowMsv - a.lastMs
+  a.lastMs = nowMsv
+  if running:
+    var added = 0
+    while a.next < total and a.flying.len < gMaxInFlight and added < MaxNewPerTick:
+      let (dx, dz) = spiralOffset(a.next)
+      let x = a.task.cx + dx
+      let z = a.task.cz + dz
+      addTicket(level.chunkLoading, chunkPos(x, z), FullChunkLevel)
+      a.flying.add(InFlight(index: a.next, x: x, z: z, since: nowMsv))
+      inc a.next
+      inc added
+    if added > 0:
+      sendChange(level.chunkLoading)
+  a.task.resume = lowestUnfinished(a)
+  if a.next >= total and a.flying.len == 0:
+    a.task.phase = ppDone
+    a.task.resume = total
+    saveTask(a)
+    level.shouldSave = true
+    info("pregen: " & a.task.dimension & " finished: " & $total & " chunks, " & $int(chunksPerSecond(a)) & " chunks/s while running")
+
+proc tickPregen*(server: Server) =
+  ## The tick loop's call, once a tick.
+  if gServer == nil:
+    gServer = server
+  if not gLoaded:
+    loadPersisted()
+  if gActive.len == 0:
+    return
+  let tick = int64(server.tickCounter)
+  if gSignalNext <= 0:
+    gSignalNext = SignalPollTicks
+    readSignal()
+  else:
+    dec gSignalNext
+  gGateOpen = gateStep(gGate, signalWord(), gSignalSerial, playerCount(), tick)
+  let now = nowMs()
+  for a in gActive:
+    stepActive(a, gGateOpen, now)
+  if tick - gLastCheckpoint >= CheckpointTicks:
+    gLastCheckpoint = tick
+    for a in gActive:
+      if a.task.phase == ppRunning:
+        saveTask(a)
+
+proc shutdownPregen*() =
+  ## On a stop: the progress is saved and the tickets released.
+  for a in gActive:
+    if a.task.phase == ppRunning or a.task.phase == ppPaused:
+      a.task.resume = lowestUnfinished(a)
+      releaseAll(a)
+      saveTask(a)

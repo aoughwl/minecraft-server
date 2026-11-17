@@ -1,0 +1,215 @@
+## The pure half of the built-in pre-generator: the spiral order, the persisted task text and the go/hold gate.
+## Nothing here touches a world, a file or a clock, so pregentest.aowl covers it without a server.
+##
+## Order: concentric square rings round the centre chunk, nearest first (Chunky's `pattern concentric`). Index 0 is
+## the centre; ring r (r >= 1) holds indices (2r-1)^2 .. (2r+1)^2-1, 8r chunks.
+##
+## Gate: the client throttling of the old Fabric setup. aoughwl.voxel says `hold` while the player's terrain is
+## loading and `go` once it has arrived; mcserver.ps1 writes the word into jester-pregen-signal.txt (see
+## `Set-PregenSignal`). The rules are those of mcserver.ps1's `Invoke-PregenWatch`:
+##   - a player logging in holds the pre-generator, and a `go` written before that login does not count;
+##   - `hold` holds it, `go` (written after the newest login) releases it;
+##   - nobody online releases it (nobody is loading then);
+##   - no word for FallbackTicks after the login releases it; a standing `hold` after HoldFallbackTicks;
+##   - words act when written (a new serial), so a `hold` left in the file after a fallback does not hold it again.
+
+import std/strutils
+
+const
+  FallbackTicks* = 120'i64 * 20'i64       ## PregenFallbackSec
+  HoldFallbackTicks* = 600'i64 * 20'i64   ## PregenHoldFallbackSec
+
+type
+  PregenPhase* = enum
+    ppRunning
+    ppPaused
+    ppDone
+    ppCancelled
+
+  PregenTask* = ref object
+    dimension*: string      ## "minecraft:overworld" ...
+    cx*, cz*: int32         ## the centre chunk
+    radius*: int32          ## in chunks: the square is (2*radius+1) chunks wide
+    resume*: int64          ## the first spiral index not known to be finished
+    phase*: PregenPhase
+
+  GateState* = object
+    held*: bool
+    players*: int
+    loginTick*: int64
+    heldTick*: int64        ## when it was last held (a login or a hold)
+    loginSerial*: int64
+    lastSerial*: int64
+    lastWord*: string
+
+proc totalChunks*(radius: int32): int64 =
+  let side = 2'i64 * int64(radius) + 1'i64
+  side * side
+
+proc isqrt(n: int64): int64 =
+  var r = 0'i64
+  while (r + 1'i64) * (r + 1'i64) <= n:
+    inc r
+  r
+
+proc ringOf(index: int64): int64 =
+  ## The ring of spiral index `index`: the smallest r with (2r+1)^2 > index. Counted from an estimate, so it is cheap.
+  var r = (isqrt(index) - 1'i64) div 2'i64
+  if r < 0'i64:
+    r = 0'i64
+  while (2'i64 * r + 1'i64) * (2'i64 * r + 1'i64) <= index:
+    inc r
+  while r > 0'i64 and (2'i64 * r - 1'i64) * (2'i64 * r - 1'i64) > index:
+    dec r
+  r
+
+proc spiralOffset*(index: int64): (int32, int32) =
+  ## The (dx, dz) of spiral index `index` from the centre.
+  if index <= 0'i64:
+    return (0'i32, 0'i32)
+  let r = ringOf(index)
+  let k = index - (2'i64 * r - 1'i64) * (2'i64 * r - 1'i64)
+  let side = k div (2'i64 * r)
+  let t = k mod (2'i64 * r)
+  if side == 0'i64:
+    (int32(r), int32(-r + t))
+  elif side == 1'i64:
+    (int32(r - t), int32(r))
+  elif side == 2'i64:
+    (int32(-r), int32(r - t))
+  else:
+    (int32(-r + t), int32(-r))
+
+proc phaseName*(p: PregenPhase): string =
+  case p
+  of ppRunning: "running"
+  of ppPaused: "paused"
+  of ppDone: "done"
+  of ppCancelled: "cancelled"
+
+proc phaseOf(s: string): PregenPhase =
+  if s == "paused": ppPaused
+  elif s == "done": ppDone
+  elif s == "cancelled": ppCancelled
+  else: ppRunning
+
+proc taskToText*(t: PregenTask): string =
+  "dimension=" & t.dimension & "\ncx=" & $t.cx & "\ncz=" & $t.cz & "\nradius=" & $t.radius & "\nresume=" & $t.resume &
+    "\nphase=" & phaseName(t.phase) & "\n"
+
+proc parseNum(s: string; res: var int64): bool =
+  let t = s.strip()
+  if t.len == 0:
+    return false
+  var i = 0
+  var neg = false
+  if t[0] == '-':
+    neg = true
+    i = 1
+  if i >= t.len:
+    return false
+  var v = 0'i64
+  while i < t.len:
+    let c = t[i]
+    if c < '0' or c > '9':
+      return false
+    v = v * 10'i64 + int64(ord(c) - ord('0'))
+    inc i
+  res = if neg: -v else: v
+  true
+
+proc taskFromText*(text: string; res: var PregenTask): bool =
+  ## False when the text is not a task (a missing or damaged file).
+  var t = PregenTask(dimension: "", cx: 0'i32, cz: 0'i32, radius: -1'i32, resume: 0'i64, phase: ppRunning)
+  var seen = 0
+  for raw in text.splitLines():
+    let line = raw.strip()
+    let eq = line.find('=')
+    if eq <= 0:
+      continue
+    let key = line.substr(0, eq - 1)
+    let val = line.substr(eq + 1)
+    var n = 0'i64
+    if key == "dimension":
+      t.dimension = val.strip()
+      inc seen
+    elif key == "phase":
+      t.phase = phaseOf(val.strip())
+    elif key == "cx" and parseNum(val, n):
+      t.cx = int32(n)
+      inc seen
+    elif key == "cz" and parseNum(val, n):
+      t.cz = int32(n)
+      inc seen
+    elif key == "radius" and parseNum(val, n):
+      t.radius = int32(n)
+      inc seen
+    elif key == "resume" and parseNum(val, n):
+      t.resume = n
+  if seen < 4 or t.dimension.len == 0 or t.radius < 0'i32:
+    return false
+  res = t
+  true
+
+proc newGate*(): GateState =
+  GateState(held: false, players: 0, loginTick: 0'i64, heldTick: 0'i64, loginSerial: 0'i64, lastSerial: 0'i64, lastWord: "")
+
+proc gateStep*(g: var GateState; word: string; serial: int64; players: int; tick: int64): bool =
+  ## One look at the signal file (`word`, with `serial` bumped whenever it is rewritten) and the player count. True when
+  ## the pre-generator may run.
+  if players > g.players:
+    g.held = true
+    g.loginTick = tick
+    g.heldTick = tick
+    g.loginSerial = serial
+  g.players = players
+  if serial != g.lastSerial:
+    g.lastSerial = serial
+    g.lastWord = word
+    if word == "hold":
+      if not g.held:
+        g.heldTick = tick
+      g.held = true
+    elif word == "go" and serial > g.loginSerial and g.held:
+      g.held = false
+  if g.held:
+    let since = tick - g.heldTick
+    if players <= 0:
+      g.held = false
+    elif g.lastWord != "hold" and g.lastWord != "go" and since >= FallbackTicks:
+      g.held = false
+    elif g.lastWord == "hold" and since >= HoldFallbackTicks:
+      g.held = false
+    elif g.lastWord == "go" and g.lastSerial <= g.loginSerial and since >= FallbackTicks:
+      g.held = false
+  not g.held
+
+proc parseRadius*(s: string; res: var int32): bool =
+  ## "4096" is blocks (Chunky's unit, rounded up to whole chunks, from the centre chunk's edge); "256c" is chunks.
+  var t = s.strip().toLowerAscii()
+  var chunks = false
+  if t.len > 1 and t[t.len - 1] == 'c':
+    chunks = true
+    t = t.substr(0, t.len - 2)
+  var n = 0'i64
+  if not parseNum(t, n) or n < 0'i64 or n > 100000'i64:
+    return false
+  if chunks:
+    res = int32(n)
+  else:
+    res = int32((n + 15'i64) div 16'i64)
+  true
+
+proc dimensionKey*(s: string): string =
+  ## "overworld", "nether" and "end" in any common spelling; "" when it is none of the three.
+  var t = s.strip().toLowerAscii()
+  if t.startsWith("minecraft:"):
+    t = t.substr(10)
+  if t == "overworld":
+    "minecraft:overworld"
+  elif t == "nether" or t == "the_nether":
+    "minecraft:the_nether"
+  elif t == "end" or t == "the_end":
+    "minecraft:the_end"
+  else:
+    ""
