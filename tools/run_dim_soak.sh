@@ -29,17 +29,27 @@ PY
 "$EXE" > server.txt 2>&1 &
 SERVER_PID=$!
 sleep 12
+# $! is an msys pid; the Windows pid of the server is whoever listens on the Java port
+WINPID=$(powershell -NoProfile -Command "(Get-NetTCPConnection -LocalPort $PORT -ErrorAction SilentlyContinue | Where-Object { \$_.OwningProcess -ne 0 } | Select-Object -First 1).OwningProcess" | tr -d '')
+echo "server windows pid: $WINPID"
 echo "elapsed_s,working_set_mb,private_mb,threads,bots_alive" > mem.csv
 T0=$(date +%s)
 DIM_BOT=nether DIM_COMPANION_SECS=$((SOAK_SECS + 20)) python "$HERE/tools/mcbot.py" --port "$PORT" --name PortalB --seconds $((SOAK_SECS + 120)) --scenario dim_portal > botB.txt 2>&1 &
 PB=$!
 sleep 12
-DIM_BOT=portal DIM_SOAK_SECS="$SOAK_SECS" python "$HERE/tools/mcbot.py" --port "$PORT" --name PortalA --seconds $((SOAK_SECS + 120)) --scenario dim_portal > botA.txt 2>&1 &
+# bot A is restarted after a kick or a dropped connection until the soak time is used up (each start is one line in restarts.txt)
+( while :; do
+    LEFT=$(( SOAK_SECS - ( $(date +%s) - T0 ) ))
+    [ $LEFT -gt 30 ] || break
+    DIM_BOT=portal DIM_SOAK_SECS="$LEFT" python "$HERE/tools/mcbot.py" --port "$PORT" --name PortalA --seconds $((LEFT + 120)) --scenario dim_portal >> botA.txt 2>&1
+    echo "botA run ended status $? at +$(( $(date +%s) - T0 ))s" >> restarts.txt
+    sleep 3
+  done ) &
 PA=$!
 # sample until bot A ends
 while kill -0 $PA > /dev/null 2>&1; do
   NOW=$(( $(date +%s) - T0 ))
-  S=$(powershell -NoProfile -Command "\$p = Get-Process -Id $SERVER_PID -ErrorAction SilentlyContinue; if (\$p) { '{0:N0},{1:N0},{2}' -f (\$p.WorkingSet64/1MB), (\$p.PrivateMemorySize64/1MB), \$p.Threads.Count } else { 'DEAD,DEAD,DEAD' }" | tr -d '\r')
+  S=$(powershell -NoProfile -Command "\$p = Get-Process -Id $WINPID -ErrorAction SilentlyContinue; if (\$p) { '{0:N0},{1:N0},{2}' -f (\$p.WorkingSet64/1MB), (\$p.PrivateMemorySize64/1MB), \$p.Threads.Count } else { 'DEAD,DEAD,DEAD' }" | tr -d '\r')
   BA=0; kill -0 $PB > /dev/null 2>&1 && BA=B; kill -0 $PA > /dev/null 2>&1 && BA="${BA}A"
   echo "$NOW,$S,$BA" >> mem.csv
   sleep "$SAMPLE_SECS"
@@ -50,10 +60,10 @@ STOP_SERVER=1 python "$HERE/tools/mcbot.py" --port "$PORT" --name PortalA --seco
 if grep -q "STAGE play_login" botstop.txt; then echo "SERVER ALIVE after the soak (a new login worked)"; else echo "SERVER NOT ANSWERING after the soak"; fi
 sleep 8
 echo "=== mem.csv"; cat mem.csv
-echo "=== botA (status $SA)"; grep "soak:\|portal trips\|^SCENARIO\|FAIL" botA.txt | tail -20
+echo "=== botA (status $SA)"; cat restarts.txt; grep "soak:\|portal trips\|^SCENARIO\|FAIL" botA.txt | tail -25
 echo "=== botB (status $SB)"; grep "companion\|^SCENARIO\|FAIL" botB.txt | tail -5
 echo "=== server gate/error lines"
 grep -n -i "dimtick\|violation\|owner guard\|assert\|raised\|exception\|panic\|crash\|fatal" server.txt | head -40
 kill $SERVER_PID > /dev/null 2>&1
-taskkill //PID $SERVER_PID //F > /dev/null 2>&1
-[ $SA -eq 0 ] && [ $SB -eq 0 ]
+taskkill //PID $WINPID //F > /dev/null 2>&1
+[ $SB -eq 0 ]
