@@ -1,0 +1,214 @@
+## Relight job (sim/lightjob): the same edit sequence gives the same light as relighting inline, with 0 and 3 workers, applied at a fixed offset.
+
+import std/[syncio, assertions, cmdline, envvars]
+import ../../config/[chunk, lighting, world]
+import ../../generated/dimension as dimensiondata
+import ../../world/[blockstates, palette, chunkdata, tick, level, worldfs, lightingruntime, lightsnapshot]
+import jobpool, lightjob
+
+proc sid(name: string): uint32 =
+  let (ok, id) = defaultStateByName(name)
+  assert ok, name
+  id
+
+proc scratch(name: string): string =
+  var base = getEnv("WORLDTEST_DIR")
+  if base.len == 0:
+    base = parentDirW(paramStr(0)) & "/lightjob_scratch"
+  result = base & "/" & name
+  discard createDirAllW(result)
+
+proc emptyChunk(x, z: int32, sections = 4): ChunkData =
+  let c = newChunkData(x, z, newChunkSections(sections, 0'i32))
+  c.lightEngine.skyLight = newSeq[LightContainer](sections)
+  c.lightEngine.blockLight = newSeq[LightContainer](sections)
+  for i in 0 ..< sections:
+    c.lightEngine.skyLight[i] = newLightEmpty(0'u8)
+    c.lightEngine.blockLight[i] = newLightEmpty(0'u8)
+  c.heightmap = calculateHeightmap(c)
+  c
+
+const
+  ChunksX = 8'i32
+  ChunksZ = 3'i32
+  Top = 80'i32
+
+var failures = 0
+proc check(ok: bool, name: string) =
+  if ok:
+    echo "PASS " & name
+  else:
+    echo "FAIL " & name
+    inc failures
+
+var rngState = 1'u32
+proc rnd(n: int): int =
+  rngState = rngState * 1664525'u32 + 1013904223'u32
+  int((rngState shr 8) mod uint32(n))
+
+proc lightHash(l: Level): uint64 =
+  ## FNV over every light array of the loaded chunks.
+  result = 1469598103934665603'u64
+  for cz in 0'i32 ..< ChunksZ:
+    for cx in 0'i32 ..< ChunksX:
+      let c = l.lightAccess.chunkAt(cx, cz)
+      for k in 0 ..< 2:
+        let arr = if k == 0: c.lightEngine.skyLight else: c.lightEngine.blockLight
+        for s in 0 ..< arr.len:
+          result = (result xor uint64(arr[s].default)) * 1099511628211'u64
+          for b in arr[s].data:
+            result = (result xor uint64(b)) * 1099511628211'u64
+
+proc lightsEqual(a, b: Level): bool =
+  lightHash(a) == lightHash(b)
+
+proc buildWorld(l: Level, palette: array[8, uint32]) =
+  let air = sid("air")
+  for cz in 0'i32 ..< ChunksZ:
+    for cx in 0'i32 ..< ChunksX:
+      addLoadedChunk(l, emptyChunk(cx, cz, 6))
+  for z in 0'i32 ..< ChunksZ * 16'i32:
+    for x in 0'i32 ..< ChunksX * 16'i32:
+      for y in 0'i32 .. 79'i32:
+        var id = air
+        if y < 12'i32:
+          id = palette[3]
+        else:
+          let r = rnd(palette.len + 6)
+          id = if r < palette.len: palette[r] else: air
+          if id == palette[7] and rnd(3) != 0:
+            id = air
+        if id != air:
+          discard setBlockState(l, blockPos(x, y, z), id)
+
+proc editBox(l: Level, lo, hi: BlockPos, palette: array[8, uint32], mode: int) =
+  for y in lo.y .. hi.y:
+    for z in lo.z .. hi.z:
+      for x in lo.x .. hi.x:
+        var id = palette[0]
+        if mode == 1:
+          id = palette[3]
+        elif mode == 2:
+          id = palette[rnd(palette.len)]
+        discard setBlockState(l, blockPos(x, y, z), id)
+
+type Edit = object
+  tick: int
+  lo: BlockPos
+  hi: BlockPos
+  mode: int
+
+proc makeEdits(count: int, overlapping: bool): seq[Edit] =
+  result = @[]
+  for i in 0 ..< count:
+    var bx = 0'i32
+    if overlapping:
+      bx = int32(40 + rnd(20))
+    elif i mod 2 == 0:
+      bx = int32(6 + rnd(10))      # chunks 0..1, snapshot range chunks 0..2
+    else:
+      bx = int32(100 + rnd(10))    # chunks 6..7, snapshot range chunks 5..8
+    let by = int32(2 + rnd(40))
+    let bz = int32(6 + rnd(30))
+    let sx = int32(1 + rnd(8))
+    let sy = int32(1 + rnd(12))
+    let sz = int32(1 + rnd(8))
+    let t = if overlapping: i div 2 else: i
+    result.add(Edit(tick: t, lo: blockPos(bx, by, bz), hi: blockPos(bx + sx - 1'i32, by + sy - 1'i32, bz + sz - 1'i32), mode: i mod 3))
+
+type Outcome = object
+  hashes: seq[uint64]      ## job level light after each tick's poll
+  finalEqual: bool
+  applied: int
+  conflicts: int
+  deferred: int
+  sawPending: bool
+  lagSeen: bool
+
+proc scenario(workers: int, overlapping: bool): Outcome =
+  rngState = 0x2545F491'u32
+  let stone = sid("stone")
+  let glow = sid("glowstone")
+  let glass = sid("glass")
+  let leaves = sid("oak_leaves")
+  let air = sid("air")
+  let pal = [air, air, air, stone, stone, glass, leaves, glow]
+  let la = fromRootFolder(defaultLevelConfig(), scratch("la"), 1'i64, OVERWORLD)
+  let lb = fromRootFolder(defaultLevelConfig(), scratch("lb"), 1'i64, OVERWORLD)
+  buildWorld(la, pal)
+  rngState = 0x2545F491'u32
+  buildWorld(lb, pal)
+  let top = blockPos(ChunksX * 16'i32 - 1'i32, Top, ChunksZ * 16'i32 - 1'i32)
+  updateLightingRegionExhaustive(la.lightEngine, la.lightAccess, blockPos(0, 0, 0), top)
+  updateLightingRegionExhaustive(lb.lightEngine, lb.lightAccess, blockPos(0, 0, 0), top)
+  discard takeLightDirty(la.lightAccess)
+  discard takeLightDirty(lb.lightAccess)
+  assert lightsEqual(la, lb)
+  let pool = newJobPool(workers + 1)
+  useLightPool(pool, 0)
+  let lj = lightJobsOf(la.lightAccess)
+  rngState = 0xBEEF1234'u32
+  let edits = makeEdits(if overlapping: 10 else: 8, overlapping)
+  let ticks = edits[edits.len - 1].tick + 4
+  result = Outcome(hashes: @[], finalEqual: false, sawPending: false, lagSeen: false)
+  for t in 0 ..< ticks:
+    # Tick start: nothing else; edits of this tick, then the end-of-tick poll (flush) like worldmod.
+    for e in edits:
+      if e.tick != t:
+        continue
+      rngState = rngState + uint32(t * 977 + 13)
+      let st = rngState
+      editBox(la, e.lo, e.hi, pal, e.mode)
+      rngState = st
+      editBox(lb, e.lo, e.hi, pal, e.mode)
+      updateLightingRegion(lb, e.lo, e.hi)
+      submitRelight(lj, la.lightAccess, la.lightEngine, e.lo, e.hi)
+      if relightPending(lj, e.lo.x shr 4, e.lo.z shr 4):
+        result.sawPending = true
+    if not lightsEqual(la, lb):
+      result.lagSeen = true
+    pollRelights(lj, la.lightAccess, la.lightEngine)
+    result.hashes.add(lightHash(la))
+  drainRelights(lj, la.lightAccess, la.lightEngine)
+  result.finalEqual = lightsEqual(la, lb)
+  result.applied = lj.applied
+  result.conflicts = lj.conflicts
+  result.deferred = lj.deferred
+  check(inFlightCount(lj) == 0 and heldCount(lj) == 0, "nothing left in flight (workers " & $workers & ")")
+  check(pending(pool, 0) == 0, "pool pending 0 (workers " & $workers & ")")
+  shutdown(pool)
+  useLightPool(nil, 0)
+
+proc editsDeterministic() =
+  # editBox draws from the rng for mode 2: the two levels must see the same draw, so both calls above restart from `state`; verify the generator assumption.
+  rngState = 77'u32
+  let a = rnd(1000)
+  rngState = 77'u32
+  check(rnd(1000) == a, "rng restart")
+
+editsDeterministic()
+
+# Edit boxes far apart: every job result applies, none is dropped.
+let n0 = scenario(0, false)
+let n3 = scenario(3, false)
+check(n0.finalEqual, "non-overlapping edits: job light == inline light (0 workers)")
+check(n3.finalEqual, "non-overlapping edits: job light == inline light (3 workers)")
+check(n0.applied == 8 and n0.conflicts == 0, "non-overlapping: 8 applied, 0 conflicts (0 workers) " & $n0.applied & "/" & $n0.conflicts)
+check(n3.applied == 8 and n3.conflicts == 0, "non-overlapping: 8 applied, 0 conflicts (3 workers) " & $n3.applied & "/" & $n3.conflicts)
+check(n0.hashes == n3.hashes, "per-tick light hashes identical at 0 and 3 workers (non-overlapping)")
+check(n0.lagSeen and n0.sawPending, "light lags the edit until the apply, and the chunk reports pending")
+
+# Edits on the same area, several per tick: held regions and conflicts fall back to a live relight.
+let o0 = scenario(0, true)
+let o3 = scenario(3, true)
+check(o0.finalEqual, "overlapping edits: final light == inline light (0 workers)")
+check(o3.finalEqual, "overlapping edits: final light == inline light (3 workers)")
+check(o0.hashes == o3.hashes, "per-tick light hashes identical at 0 and 3 workers (overlapping)")
+echo "overlapping: applied ", o0.applied, " conflicts ", o0.conflicts, " deferred ", o0.deferred, " (3 workers: ", o3.applied, "/", o3.conflicts, "/", o3.deferred, ")"
+check(o0.applied == o3.applied and o0.conflicts == o3.conflicts and o0.deferred == o3.deferred, "same applied/conflict/deferred counts at 0 and 3 workers")
+
+if failures == 0:
+  echo "lightjob: all checks passed"
+else:
+  echo "lightjob: ", failures, " FAILED"
+  quit(1)

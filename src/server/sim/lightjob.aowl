@@ -1,0 +1,296 @@
+## Region relight as a pool job (docs/MULTITHREADING_PHASES.md phase 1, item c, step 2), built on sim/jobpool and world/lightsnapshot.
+##
+## `submitRelight(lj, live, engine, lo, hi)` replaces a direct `updateLightingRegion(engine, live, lo, hi)`: the tick thread copies the
+## chunks the relight can touch (`captureLightSnapshot`), a pool job runs the same `updateLightingRegion` on the copies and computes the
+## list of changed cells, and `pollRelights` applies that list to the live chunks on the tick thread. Rules:
+##   * Fixed offset, in EVERY mode: a region submitted between polls k-1 and k is applied by poll k+1 (one tick later when the host polls once
+##     per tick), whether it ran on a worker, inline at submit (no workers) or has long been finished. A poll waits for a due job that is still
+##     running. So threads = 1 and N give the same light at the same tick.
+##   * Readers and in-flight regions. Until its apply, the live chunks of a region keep their pre-edit light, and no client is told anything
+##     (the changed chunks are marked light-dirty at apply, so a client never gets a half state). `relightPending(lj, cx, cz)` says whether a
+##     chunk is inside an unapplied region (the chunks of its snapshot range); code that must not act on stale light (a spawn check, a light
+##     read after a bulk edit, a save of that chunk) asks it, or calls `drainRelights` first. Chunk saves and shutdown should call `drainRelights`.
+##   * Regions whose snapshot ranges overlap are never in flight together: a later region that overlaps an unapplied one is held (deferred)
+##     in submission order and captured when the earlier one has been applied, so it starts from its light and blocks.
+##   * An applied job is checked, not trusted: if anything of its snapshot range changed since the capture (a chunk loaded, unloaded or replaced,
+##     a block section written, any light array no longer what was copied, for example by an inline single-cell relight) or the job failed, its result
+##     is dropped and the region is relit on the live level instead (`conflicts`). That is the old behaviour, so the result is always right.
+##   * The job body touches only the snapshot; it never calls setBlockState, hooks or any tick-owned state.
+##
+## Pool: jobpool allows one pool with workers per process. `enableLightJobs(workers)` (tests) and `lightJobsEnabled()` (MC_LIGHT_WORKERS=1 AND
+## `planThreads` workers > 0, off by default) first reuse the path pool when it is live (`pathpool.pathPool()`), under a distinct owner id, and
+## only create a pool when none exists. `useLightPool(pool, owner)` lets a host hand over any other live pool. The net encode/decode and plugin
+## job pools are not consulted (they are not reachable from here without pulling in the protocol layer): enabling light jobs together with
+## them still means two pools, which jobpool cannot do; use `useLightPool`.
+
+{.feature: "lenientnils".}
+
+import std/[envvars, cpuinfo, locks]
+import jobpool, threadcfg
+import ../entity/ai/pathfinder/pathpool
+import ../../world/[tick, lightingruntime, lightsnapshot]
+
+const SharedOwner = 1048576      ## owner id on a pool somebody else made (path navigators count up from 1, net uses 0)
+
+type
+  RelightJob = ref object
+    snap: LightSnapshot
+    diff: LightDiff
+    ok: bool
+
+  Pending = object            ## one region submitted and not yet applied
+    slot: int
+    epoch: int
+    lo: BlockPos
+    hi: BlockPos
+    cx0, cx1, cz0, cz1: int32
+
+  Held = object              ## a region waiting for an overlapping one to be applied
+    lo: BlockPos
+    hi: BlockPos
+    cx0, cx1, cz0, cz1: int32
+
+  LightJobs* = ref object
+    epoch: int
+    inflight: seq[Pending]
+    held: seq[Held]
+    applied*: int            ## results written from a job
+    conflicts*: int          ## results dropped (stale snapshot or failed job) and relit live
+    deferred*: int           ## regions that had to wait for an overlapping one
+
+var gPool: JobPool = nil
+var gOwner = 0
+var gDecided = false
+var gOn = false
+var gSlots: seq[RelightJob] = @[]
+var gFinished: seq[bool] = @[]
+var gFailed: seq[bool] = @[]
+var gLock: Lock
+var gLockInit = false
+var gSink: seq[JobResult] = @[]
+
+proc ensureLock() =
+  if not gLockInit:
+    initLock(gLock)
+    gLockInit = true
+
+proc useLightPool*(pool: JobPool, owner: int) =
+  ## Tests and hosts: run light jobs on this pool (the caller shuts it down) under `owner`.
+  ensureLock()
+  gPool = pool
+  gOwner = owner
+  gDecided = true
+  gOn = pool != nil
+
+proc enableLightJobs*(workers: int): bool =
+  ## `workers` = 0 runs the jobs inline at submit, still applied by the poll after next. Reuses the live path pool when there is one.
+  ensureLock()
+  if gPool == nil:
+    let pp = pathPool()
+    if pp != nil and pp.workers > 0:
+      gPool = pp
+      gOwner = SharedOwner
+    else:
+      gPool = newJobPool(workers + 1)
+      gOwner = 0
+  gDecided = true
+  gOn = true
+  true
+
+proc lightJobsEnabled*(): bool =
+  ## Decided once: MC_LIGHT_WORKERS=1 and the thread plan (same inputs as the other gates) has workers.
+  if not gDecided:
+    gDecided = true
+    if getEnv("MC_LIGHT_WORKERS") == "1":
+      var envThreads = -1
+      var envChunk = -1
+      let t = getEnv("MC_THREADS")
+      if t.len > 0:
+        envThreads = 0
+        for c in t:
+          if c >= '0' and c <= '9':
+            envThreads = envThreads * 10 + (ord(c) - ord('0'))
+      let w = getEnv("MC_CHUNK_WORKERS")
+      if w.len > 0:
+        envChunk = 0
+        for c in w:
+          if c >= '0' and c <= '9':
+            envChunk = envChunk * 10 + (ord(c) - ord('0'))
+      let plan = planThreads(0, 0, countProcessors(), envThreads, envChunk)
+      if plan.workers > 0:
+        discard enableLightJobs(if plan.workers > 4: 4 else: plan.workers)
+  gOn
+
+proc lightPool*(): JobPool = gPool
+
+proc newLightJobs*(): LightJobs =
+  LightJobs(epoch: 0, inflight: @[], held: @[])
+
+proc jobBody(arg: pointer): int {.nimcall, raises.} =
+  ## Pool body: never raises. `arg` is a slot of gSlots, owned by the job until the tick thread takes it back.
+  var job: RelightJob = nil
+  let slot = cast[int](arg)
+  acquire(gLock)
+  if slot >= 0 and slot < gSlots.len:
+    job = gSlots[slot]
+  release(gLock)
+  if job == nil:
+    return 0
+  try:
+    var eng = newDynamicLightEngine()
+    updateLightingRegion(eng, snapshotAccess(job.snap), job.snap.lo, job.snap.hi)
+    job.diff = snapshotDiff(job.snap)
+    job.ok = true
+  except:
+    job.ok = false
+  0
+
+proc rangesOverlap(a0, a1, b0, b1: int32): bool {.inline.} = a0 <= b1 and b0 <= a1
+
+proc overlapsLive(lj: LightJobs, cx0, cx1, cz0, cz1: int32): bool =
+  for p in lj.inflight:
+    if rangesOverlap(cx0, cx1, p.cx0, p.cx1) and rangesOverlap(cz0, cz1, p.cz0, p.cz1):
+      return true
+  for h in lj.held:
+    if rangesOverlap(cx0, cx1, h.cx0, h.cx1) and rangesOverlap(cz0, cz1, h.cz0, h.cz1):
+      return true
+  false
+
+proc start(lj: LightJobs, live: LightLevelAccess, lo, hi: BlockPos) =
+  let snap = captureLightSnapshot(live, lo, hi)
+  let job = RelightJob(snap: snap, diff: LightDiff(changes: @[]), ok: false)
+  var slot = -1
+  acquire(gLock)
+  for i in 0 ..< gSlots.len:
+    if gSlots[i] == nil:
+      slot = i
+      break
+  if slot < 0:
+    gSlots.add(nil)
+    gFinished.add(false)
+    gFailed.add(false)
+    slot = gSlots.len - 1
+  gSlots[slot] = job
+  gFinished[slot] = false
+  gFailed[slot] = false
+  release(gLock)
+  lj.inflight.add(Pending(slot: slot, epoch: lj.epoch, lo: lo, hi: hi, cx0: snap.cx0, cx1: snap.cx1, cz0: snap.cz0, cz1: snap.cz1))
+  submit(gPool, gOwner, jobBody, cast[pointer](slot))
+
+proc submitRelight*(lj: LightJobs, live: LightLevelAccess, engine: var DynamicLightEngine, lo, hi: BlockPos) =
+  ## Tick thread. Light jobs not enabled (or no pool): relights on the live level right now, as before.
+  if gPool == nil:
+    updateLightingRegion(engine, live, lo, hi)
+    return
+  let (cx0, cx1, cz0, cz1) = snapshotChunkRange(lo, hi)
+  if overlapsLive(lj, cx0, cx1, cz0, cz1):
+    lj.held.add(Held(lo: lo, hi: hi, cx0: cx0, cx1: cx1, cz0: cz0, cz1: cz1))
+    inc lj.deferred
+    return
+  start(lj, live, lo, hi)
+
+proc pump() =
+  ## Moves finished results of our owner into gFinished/gFailed (pool results carry the slot).
+  gSink.setLen(0)
+  discard drainDone(gPool, gOwner, gSink)
+  for r in gSink:
+    let slot = cast[int](r.arg)
+    if slot >= 0 and slot < gFinished.len:
+      gFinished[slot] = true
+      gFailed[slot] = r.failed
+
+proc waitFinished(slot: int) =
+  pump()
+  while not gFinished[slot]:
+    pump()
+
+proc applyOne(lj: LightJobs, live: LightLevelAccess, engine: var DynamicLightEngine, p: Pending) =
+  waitFinished(p.slot)
+  acquire(gLock)
+  let job = gSlots[p.slot]
+  gSlots[p.slot] = nil
+  let failed = gFailed[p.slot]
+  release(gLock)
+  if job != nil and job.ok and not failed and applyLightDiff(live, job.snap, job.diff):
+    inc lj.applied
+  else:
+    inc lj.conflicts
+    updateLightingRegion(engine, live, p.lo, p.hi)
+
+proc startHeld(lj: LightJobs, live: LightLevelAccess) =
+  var keep: seq[Held] = @[]
+  var pend: seq[Held] = @[]
+  for h in lj.held:
+    pend.add(h)
+  lj.held = @[]
+  for h in pend:
+    # Still behind an in-flight region or an earlier held one: stays, in order.
+    var blocked = false
+    for p in lj.inflight:
+      if rangesOverlap(h.cx0, h.cx1, p.cx0, p.cx1) and rangesOverlap(h.cz0, h.cz1, p.cz0, p.cz1):
+        blocked = true
+    for k in keep:
+      if rangesOverlap(h.cx0, h.cx1, k.cx0, k.cx1) and rangesOverlap(h.cz0, h.cz1, k.cz0, k.cz1):
+        blocked = true
+    if blocked:
+      keep.add(h)
+    else:
+      start(lj, live, h.lo, h.hi)
+  # `start` does not look at `held`, so what is kept goes back after the loop.
+  for k in keep:
+    lj.held.add(k)
+
+proc pollRelights*(lj: LightJobs, live: LightLevelAccess, engine: var DynamicLightEngine) =
+  ## Tick thread, once per tick, before the light-dirty chunks are flushed to clients. Applies the regions submitted before the previous
+  ## poll (waiting for any still running), then captures the held regions that are no longer blocked.
+  if gPool == nil:
+    return
+  var rest: seq[Pending] = @[]
+  var due: seq[Pending] = @[]
+  for p in lj.inflight:
+    if p.epoch < lj.epoch:
+      due.add(p)
+    else:
+      rest.add(p)
+  lj.inflight = rest
+  for p in due:
+    applyOne(lj, live, engine, p)
+  startHeld(lj, live)
+  inc lj.epoch
+
+proc drainRelights*(lj: LightJobs, live: LightLevelAccess, engine: var DynamicLightEngine) =
+  ## Applies everything now, in-flight and held (stop, save, tests). Regions captured here are applied immediately.
+  if gPool == nil:
+    return
+  while lj.inflight.len > 0 or lj.held.len > 0:
+    let all = lj.inflight
+    lj.inflight = @[]
+    for p in all:
+      applyOne(lj, live, engine, p)
+    startHeld(lj, live)
+
+proc relightPending*(lj: LightJobs, cx, cz: int32): bool =
+  ## Whether the light of chunk (cx, cz) may still change because a region that covers it is unapplied or held.
+  for p in lj.inflight:
+    if cx >= p.cx0 and cx <= p.cx1 and cz >= p.cz0 and cz <= p.cz1:
+      return true
+  for h in lj.held:
+    if cx >= h.cx0 and cx <= h.cx1 and cz >= h.cz0 and cz <= h.cz1:
+      return true
+  false
+
+proc inFlightCount*(lj: LightJobs): int = lj.inflight.len
+proc heldCount*(lj: LightJobs): int = lj.held.len
+
+# One LightJobs per level, found by its light access.
+var gLevelKeys: seq[LightLevelAccess] = @[]
+var gLevelJobs: seq[LightJobs] = @[]
+
+proc lightJobsOf*(live: LightLevelAccess): LightJobs =
+  for i in 0 ..< gLevelKeys.len:
+    if gLevelKeys[i] == live:
+      return gLevelJobs[i]
+  let lj = newLightJobs()
+  gLevelKeys.add(live)
+  gLevelJobs.add(lj)
+  lj
