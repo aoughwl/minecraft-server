@@ -1,0 +1,38 @@
+# Multithreading phases 1 to 4: change lists
+
+Companion to docs/MULTITHREADING.md, from read-only audits of the tree (chunk chain tip f5827b9). file:line references are at that tip and drift. Files under `src/world/chunk_system`,
+`src/world/generation`, `src/physics`, `src/server/world/bulkedit.aowl` belong to the chunk-system/physics owner: they get a change list first.
+
+## Phase 1: offload (job pool)
+
+Order: **1** generalise `generation_executor` onto `sim/jobpool` (no behaviour change) > **2** erosion/solver (already pure) > **3** save compress > **4** packet compress > **5** relight > **6** pathfinding.
+Rules for every item: an owner handle per World or connection, never-raise bodies, `workers == 0` runs inline at submit, results applied only in a tick-thread poll.
+
+* **(f) generation_executor on the pool.** Today: `GenJob`, one FIFO (`jobs`/`jobHead`), a second lane `lodJobs` taken only when the first is empty, decode batches as `GenJob.decode`, one global `gExec`, per-handle `done`. Pool needs lanes
+  (`lnUrgent`, `lnNormal`, `lnBackground`; per-lane FIFO, a worker takes the lowest non-empty lane), `submit(handle, lane, job)`, `pollDone`, `laneDepth`. Generation keeps its API as thin wrappers; stage stats become per-kind.
+  Gate: `genhash` threads 1 vs N, scenarios with `MC_CHUNK_WORKERS=0` and `4`.
+* **(d) erosion and solver.** `physwire/erosionwire.aowl` `tickErosion` runs `sim.step(OpsPerTick)` each tick on a snapshot: submit the whole run as one Background job, keep `applyJob` (with its stale-cell guard) on the tick thread; inline when no workers. Solver: `physics/solver.aowl solve` is pure on `SolverInput`. Gate: erosiontest/scenes output equal.
+* **(a) chunk save.** Chain: `schedule.aowl` unload/saveAll > `worker_logic.ioWriteBatch` > `filemanager.saveChunks/saveGeneric` > `chunkformat.internalToBytes` (serialise: needs the tick thread or a snapshot, except on unload where nothing else mutates it) > `chunkio.updateChunkOf` (compress, pure) > `writeOf`. First diff: split serialise from compress and run compress as a job, still joined before `writeOf`; later move `writeOf` on one lane per region file (order). Shutdown must drain. Gate: region files byte-identical.
+* **(b) outgoing chunk packets.** `chunk_data.writePacket` builds; `packet_encoder.writePacket` compresses (`zlibCompressBytes`); encryption is a per-connection stream cipher, so it stays in order (phase 3). First diff: compress-only job with an ordered per-client slot list; test bytes equal at 1 and N.
+* **(c) relight.** `lightingruntime.updateLightingRegion` runs against `LightLevelAccess` closures over the live Level, so it cannot leave the thread yet. Step 1: a snapshot-backed `LightLevelAccess` (arrays for the box plus a one-chunk margin) run inline and compared with the live result in `lightingruntimetest`. Then a job returning a diff applied on the tick thread; readers must not see stale light. Hardest, last.
+* **(e) pathfinding.** `ai/pathfinder/pathfindermod.computePath` reads the live World through `PathfindingContext`. Needs a snapshot-backed context; the result arrives at a fixed offset (next tick) in **all** modes including threads = 1, otherwise determinism is lost.
+
+## Phase 2: ownership
+
+Smallest first: **1** threadvar the ambient parameters: `gMetaTarget` (`entity/entitymod.aowl:989`), `gSourceOverride` (`command/cmdsource.aowl:624`), `gBlastWorlds/Ox/Oy/Oz` (`body/trigger.aowl:484`), plugin `gCurPlayer/gEvName/gScope` (`plugin/engine/engineplugins.aowl:63-70`; tick-thread only anyway).
+**2** `entity/entitymod.gWorlds`/`entitiesOf` onto a `World.entities` field (same signature; pre-create in `loadWorld` because the lazy append races; `gPlayerBases`, `gExperienceDelays` need an owner).
+**3** `fluids/fluidhost.gDims` (already keyed by dimension): a `worldFluids(world)` accessor. **4** `body/trigger` `TrigState` per dimension. **5** `body/bodymanager` into a `BodyState` per world with `bodiesOf(world)`; ids and uuids stay global and atomic;
+`gBodies` is exported, check `jester/bodysync`. **6** `physwire/firewire.gZones` per World; `climatewire` samples `worlds[0]`, keep it server-level; `erosionwire` stays a single job.
+**Hook lane rule:** hooks fire only on the tick thread (`block/blockbehaviour.aowl:925` `setBlockState` is the hottest site; also piston, portal, crops, hopper, furnace, explosion, weather, entity teleport, hunger, items, player events, `bulkedit.aowl:293` which is the owner's); code on other threads queues events; pool jobs never call `setBlockState`.
+
+## Phase 3: network off the tick thread
+
+`pumpkinlib.serverLoop` (:122) pumps accept, each connection (`pumpConnection`), console/RCON/query/Bedrock, `stepTicker` (flushes outgoing), reap. Read path: `JavaClient.pumpSocket` > `networkReader.feed` (decrypt) > `getPacket` (decompress) > handlers on the tick thread. Write path: `writePacketFor` (runs the sent hook) > `networkWriter.writePacket` (compress) > `flush` (encrypt) > `flushOutgoing`.
+Order: **1** encode worker (compress, encrypt, append, send), one in-flight job per connection, handoff queue; tick thread keeps serialisation and hook. **2** decode worker with a ready-packet queue popped by `getPacket`. **3** a Lock and atomic `closed`/`gone` on `JavaClient`.
+`setCompression/setEncryption` (login/config on the tick thread) must drain the connection first; `kick` stays on the tick thread; Bedrock stand-ins stay inline.
+
+## Phase 4: one thread per dimension
+
+`servermod.tickWorlds` (:343): plugin manager/WorldEdit/pregen, then the per-world loop (`worldmod.tick`, :353), then the server-level ticks (:357-365: bodies, create, triggers, fluids, climate, fire, erosion, body sync, lod sync). The per-world loop is where threads go; :357-365 run after the barrier until phase 2 makes them per world.
+Cross-world interactions that become messages applied in a join phase: portal transfer (`portal/portalmod.tryUsePortal`, `gPortalManagers`, `Entity.teleport` + teleport hook), player dimension change (`worldmod.teleportWorld`, `respawn`), death broadcasts (`entitymod:2882`), advancement and boss bar loops over all worlds, `broadcastAll`, and commands (`commandbridge`, `command/execute` with `gSourceOverride`), which run from the network pump and must queue to the world thread.
+Shared state a world tick touches that needs a rule: `gPortalManagers`, entity-id allocator (check atomic), the hook lane, per-world RNGs (phase 0, loot/spawn done, entity/block per thread), the profiler scope stack (per-thread buffers), `levelsync` and `climatewire` reading `worlds[0]`.
