@@ -137,7 +137,7 @@ Each phase lists what changes, who owns the files, how it is verified. "Gate" = 
 | Wiring the resolved count into `generation_executor` | needs the chunk-system owner (change list sent) |
 | Stale "refcounts are not atomic" comments in docs and sim/regions | fixed (pumpkinlib header: with the chunk-system owner's batch) |
 | Phase 0: atomic stopFlag, prewarmAll, weather RNG per world, thread-local entity/block/durability RNGs, atomic item-stack ids; job pool and owner guard modules (sim/jobpool, sim/ownerguard) | done, built and scenario-run (worldedit_wand and create_live failed once in the full run and passed on rerun; no baseline to prove flaky) |
-| Loot and spawner RNG per World | done (full build, scenarios 14 pass); explosion RNG, materials prewarm after reload still open |
+| Loot and spawner RNG per World | done (full build, scenarios 14 pass); explosion RNG thread-local (explosiontest passes); materials prewarm after reload still open |
 | Phase 2 steps 1-3: thread-local ambient params, entities stored on World, worldFluids accessor | done (full build, scenarios 14 pass) |
 | Phase 3 step 1: optional Java encode worker (sim/netencode, MC_NET_WORKERS=1 and workers>0; default off) | byte-identical encode test passes; scenarios equal baseline off, flaky worldedit/create_live with it on (pass on rerun); not load-tested; playtest signature assertion fails on origin/main too |
 | Phase 3 step 2: optional decode worker (sim/netdecode, armed at Play, same gate, default off) | equivalence test passes (17 checks); scenarios equal baseline off; not shown armed in scenarios, not load-tested |
