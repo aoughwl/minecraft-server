@@ -1,0 +1,154 @@
+## Compress-only jobs for outgoing chunk packets with an ordered per-client slot list (docs/MULTITHREADING_PHASES.md phase 1, item b).
+##
+## Off unless MC_CHUNKPKT_WORKERS=1 AND the resolved thread plan has workers (`chunkPacketJobsEnabled`). It uses the shared net pool
+## (`netencode.ensureNetPool`, owner 1; netencode and netdecode use owner 0), so it adds no second worker pool.
+##
+## Unlike `EncodeLane` the encoder never leaves the tick thread: `slotsPush` snapshots the connection's compression settings and
+## queues a `Slot` (arrival order = packet order); a pool job runs `compressFrame` (pure: framing + zlib) into that slot;
+## `slotsAppend` walks the list from the head and, for each finished slot, `appendFrame`s it on the tick thread (encryption is a
+## stream cipher, so it must stay in order), stopping at the first unfinished slot. `slotsDrain` waits for all of them, which
+## `setCompression`/`setEncryption`/close must do first. The bytes equal `writePacket` over the same packets because
+## `writePacket` is `compressFrame` + `appendFrame`.
+
+{.feature: "lenientnils".}
+
+import std/locks
+import std/envvars
+import std/cpuinfo
+import ../../protocol/java/packet_encoder
+import ../../protocol/proto
+import threadcfg, jobpool, netencode
+
+type
+  Slot = ref object
+    packet: seq[byte]
+    hasCompression: bool
+    threshold: CompressionThreshold
+    level: CompressionLevel
+    frame: PacketFrame
+    done: bool          ## Guarded by gTableLock.
+    at: int
+
+  SlotList* = ref object
+    ## One per client. Tick thread only, except the `done`/`frame` of a slot, written by its job.
+    slots: seq[Slot]
+    head: int
+
+var gPktDecided = false
+var gPktOn = false
+var gTable: seq[Slot] = @[]
+var gTableLock: Lock
+var gTableInit = false
+var gPktSink: seq[JobResult] = @[]
+
+const PktOwner = 1
+
+proc sleepWin(ms: uint32) {.stdcall, importc: "Sleep", dynlib: "kernel32.dll".}
+
+proc enableChunkPacketJobs*(workers: int): bool =
+  ## Tests pass a number (0 = jobs run inline at submit). Tick thread.
+  if not gTableInit:
+    initLock(gTableLock)
+    gTableInit = true
+  discard ensureNetPool(workers)
+  gPktDecided = true
+  gPktOn = true
+  true
+
+proc chunkPacketJobsEnabled*(): bool =
+  if not gPktDecided:
+    gPktDecided = true
+    if getEnv("MC_CHUNKPKT_WORKERS") == "1":
+      var envThreads = -1
+      var envChunk = -1
+      let t = getEnv("MC_THREADS")
+      if t.len > 0:
+        envThreads = 0
+        for c in t:
+          if c >= '0' and c <= '9':
+            envThreads = envThreads * 10 + (ord(c) - ord('0'))
+      let w = getEnv("MC_CHUNK_WORKERS")
+      if w.len > 0:
+        envChunk = 0
+        for c in w:
+          if c >= '0' and c <= '9':
+            envChunk = envChunk * 10 + (ord(c) - ord('0'))
+      let plan = planThreads(0, 0, countProcessors(), envThreads, envChunk)
+      if plan.workers > 0:
+        discard enableChunkPacketJobs(if plan.workers > 4: 4 else: plan.workers)
+  gPktOn
+
+proc newSlotList*(): SlotList =
+  SlotList(slots: @[], head: 0)
+
+proc slotJob(arg: pointer): int {.nimcall, raises.} =
+  acquire(gTableLock)
+  let s = gTable[cast[int](arg)]
+  release(gTableLock)
+  s.frame = compressFrame(s.hasCompression, s.threshold, s.level, s.packet)
+  s.packet = @[]
+  acquire(gTableLock)
+  s.done = true
+  release(gTableLock)
+  0
+
+proc slotsPush*(list: SlotList; enc: TCPNetworkEncoder; packet: openArray[byte]) =
+  ## Tick thread. Queues a slot (settings as of now) and submits its compress job.
+  let (hc, th, lv) = compressionSettings(enc)
+  let s = Slot(packet: @packet, hasCompression: hc, threshold: th, level: lv)
+  list.slots.add(s)
+  var at = -1
+  acquire(gTableLock)
+  for k in 0 ..< gTable.len:
+    if gTable[k] == nil:
+      at = k
+      break
+  if at < 0:
+    gTable.add(s)
+    at = gTable.len - 1
+  else:
+    gTable[at] = s
+  s.at = at
+  release(gTableLock)
+  gPktSink.setLen(0)
+  discard drainDone(netPool(), PktOwner, gPktSink)
+  gPktSink.setLen(0)
+  submit(netPool(), PktOwner, slotJob, cast[pointer](at))
+
+proc slotDone(s: Slot): bool =
+  acquire(gTableLock)
+  result = s.done
+  release(gTableLock)
+
+proc slotsAppend*(list: SlotList; enc: var TCPNetworkEncoder): string =
+  ## Tick thread. Appends every finished slot at the head of the list, in order, to the encoder; the first error message (or "").
+  result = ""
+  while list.head < list.slots.len and slotDone(list.slots[list.head]):
+    let s = list.slots[list.head]
+    let r = appendFrame(enc, s.frame)
+    if not r.isOk and result.len == 0:
+      result = r.error.msg
+    acquire(gTableLock)
+    gTable[s.at] = nil
+    release(gTableLock)
+    list.slots[list.head] = nil
+    inc list.head
+  if list.head == list.slots.len:
+    list.slots.setLen(0)
+    list.head = 0
+  gPktSink.setLen(0)
+  discard drainDone(netPool(), PktOwner, gPktSink)
+  gPktSink.setLen(0)
+
+proc slotsPending*(list: SlotList): int =
+  list.slots.len - list.head
+
+proc slotsDrain*(list: SlotList; enc: var TCPNetworkEncoder): string =
+  ## Tick thread. Waits until every queued slot finished and was appended.
+  result = ""
+  while slotsPending(list) > 0:
+    let e = slotsAppend(list, enc)
+    if e.len > 0 and result.len == 0:
+      result = e
+    if slotsPending(list) > 0:
+      sleepWin(0'u32)
