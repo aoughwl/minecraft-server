@@ -2207,6 +2207,14 @@ def dim_threads_two_worlds(s):
         if got:
             lat.append(time.time() - t0)
         return got
+    def holds_retry(dim, x, y, z, block):
+        """A positive query, asked up to 3 times 10 s apart (an unanswered query was seen once; the repeat answered at once)."""
+        for attempt in range(3):
+            if holds(dim, x, y, z, block, 10.0):
+                if attempt:
+                    print('  note: query needed %d attempts' % (attempt + 1), flush=True)
+                return True
+        return False
     # sync with the other bot: chat does not cross worlds on this server (see the report), so each bot raises a flag block in its own world and
     # polls the server's cross-world query for the other's
     def raise_flag(name):
@@ -2224,10 +2232,10 @@ def dim_threads_two_worlds(s):
     gone = [(x, z) for x, z in placed if s.w.block(x, 120, z) != want]
     print('  cells placed %d, client sees %d still there %s' % (len(placed), len(placed) - len(gone), gone[:6]), flush=True)
     s.check(not gone, 'cells lost: %r (state %r)' % (gone[:4], s.w.block(*(gone[0][0], 120, gone[0][1]))) if gone else '')
-    s.check(holds(my_dim, px, 120, px + 2, mine), 'the server does not see my block in my world')
-    s.check(holds(my_dim, px + 3, 120, px - 2, mine), 'the server does not hold my /fill in my world')
+    s.check(holds_retry(my_dim, px, 120, px + 2, mine), 'the server does not see my block in my world')
+    s.check(holds_retry(my_dim, px + 3, 120, px - 2, mine), 'the server does not hold my /fill in my world')
     s.check(not holds(other_dim, px, 120, px + 2, mine, 3.0), 'the other world holds my block at the same coordinates')
-    other_ok = holds(other_dim, px, 120, px + 2, other)
+    other_ok = holds_retry(other_dim, px, 120, px + 2, other)
     if not other_ok:
         print('  diagnostic (%s): deck %s, obsidian@(4,120,6) %s, stone@(4,120,6) %s, air %s, again %s' % (
             other_dim, holds(other_dim, px, 119, px + 2, 'minecraft:bedrock'), holds(other_dim, px, 120, px + 2, 'minecraft:obsidian'),
