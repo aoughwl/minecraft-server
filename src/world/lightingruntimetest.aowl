@@ -3,7 +3,7 @@
 import std/[syncio, assertions, cmdline, envvars]
 import ../config/[chunk, lighting, world]
 import ../generated/dimension as dimensiondata
-import blockstates, palette, chunkdata, tick, level, worldfs, lightingruntime
+import blockstates, palette, chunkdata, tick, level, worldfs, lightingruntime, lightsnapshot
 
 proc sid(name: string): uint32 =
   let (ok, id) = defaultStateByName(name)
@@ -172,7 +172,126 @@ proc testStaleQueueEntry() =
         for x in 0'i32 .. 31'i32:
           assert getBlockLightLevel(l.lightAccess, blockPos(x, y, z))[1] == 0'u8, "stale block light at " & $x & "," & $y & "," & $z
 
+# --- snapshot-backed access against the live level -------------------------------------------------------------------------
+# Two identical levels get the same random world and edit; A relights on the live level, B on a snapshot (run inline with a fresh
+# engine, then the diff applied to the live chunks). Every cell of both must hold the same block and sky light. Some trials use a
+# chunk grid wider than the edit so the margin is exercised, others put the edit at the border of the loaded area.
+
+proc testSnapshotEqualsLive() =
+  let stone = sid("stone")
+  let glow = sid("glowstone")
+  let glass = sid("glass")
+  let leaves = sid("oak_leaves")
+  let air = sid("air")
+  let palette = [air, air, air, stone, stone, glass, leaves, glow]
+  var trials = 0
+  var changedCells = 0
+  for trial in 0 ..< 18:
+    let n = if trial mod 2 == 0: 3'i32 else: 4'i32
+    let la = fromRootFolder(defaultLevelConfig(), scratch("snap_a"), 1'i64, OVERWORLD)
+    let lb = fromRootFolder(defaultLevelConfig(), scratch("snap_b"), 1'i64, OVERWORLD)
+    for cz in 0'i32 ..< n:
+      for cx in 0'i32 ..< n:
+        addLoadedChunk(la, emptyChunk(cx, cz, 6))
+        addLoadedChunk(lb, emptyChunk(cx, cz, 6))
+    let airBias = 1 + trial mod 4
+    for z in 0'i32 ..< n * 16'i32:
+      for x in 0'i32 ..< n * 16'i32:
+        for y in 0'i32 .. 79'i32:
+          var id = air
+          if y < 12'i32:
+            id = stone
+          else:
+            let r = rnd(palette.len + airBias * 3)
+            id = if r < palette.len: palette[r] else: air
+            if id == glow and rnd(3) != 0:
+              id = air
+          if id != air:
+            discard setBlockState(la, blockPos(x, y, z), id)
+            discard setBlockState(lb, blockPos(x, y, z), id)
+    let top = n * 16'i32 - 1'i32
+    updateLightingRegionExhaustive(la.lightEngine, la.lightAccess, blockPos(0, 0, 0), blockPos(top, 80, top))
+    updateLightingRegionExhaustive(lb.lightEngine, lb.lightAccess, blockPos(0, 0, 0), blockPos(top, 80, top))
+    discard takeLightDirty(la.lightAccess)
+    discard takeLightDirty(lb.lightAccess)
+    let bx = int32(2 + rnd(int(n * 16'i32) - 18))
+    let by = int32(2 + rnd(40))
+    let bz = int32(2 + rnd(int(n * 16'i32) - 18))
+    let sx = int32(1 + rnd(14))
+    let sy = int32(1 + rnd(14))
+    let sz = int32(1 + rnd(14))
+    let mode = trial mod 3
+    for y in by .. by + sy - 1'i32:
+      for z in bz .. bz + sz - 1'i32:
+        for x in bx .. bx + sx - 1'i32:
+          var id = air
+          if mode == 1:
+            id = stone
+          elif mode == 2:
+            id = palette[rnd(palette.len)]
+          discard setBlockState(la, blockPos(x, y, z), id)
+          discard setBlockState(lb, blockPos(x, y, z), id)
+    let lo = blockPos(bx, by, bz)
+    let hi = blockPos(bx + sx - 1'i32, by + sy - 1'i32, bz + sz - 1'i32)
+    updateLightingRegion(la, lo, hi)
+    let snap = captureLightSnapshot(lb.lightAccess, lo, hi)
+    var eng = newDynamicLightEngine()
+    updateLightingRegion(eng, snapshotAccess(snap), lo, hi)
+    let diff = snapshotDiff(snap)
+    changedCells += diff.changes.len
+    # The live level is untouched until the diff is applied.
+    assert applyLightDiff(lb.lightAccess, snap, diff), "fresh snapshot refused"
+    let (same, why) = lightsEqual(la, lb, top, 90'i32, top)
+    assert same, "trial " & $trial & ": snapshot differs from live at " & why
+    # The client is told about every chunk whose light changed. A live run also flags a chunk whose cell changed and changed back,
+    # so the snapshot's set is a subset of it (and, the light being equal, misses no real change).
+    let da = takeLightDirty(la.lightAccess)
+    let db = takeLightDirty(lb.lightAccess)
+    for cb in db:
+      var found = false
+      for ca in da:
+        if ca.x == cb.x and ca.z == cb.z:
+          found = true
+      assert found, "snapshot flagged a chunk the live run did not"
+    inc trials
+  echo "snapshot relight == live relight on ", trials, " random edits (", changedCells, " changed cells in total)"
+
+proc testSnapshotStale() =
+  ## A snapshot whose chunk was written to (or replaced, or unloaded) since the capture is refused and writes nothing.
+  let l = fromRootFolder(defaultLevelConfig(), scratch("snapstale"), 1'i64, OVERWORLD)
+  for cz in 0'i32 .. 2'i32:
+    for cx in 0'i32 .. 2'i32:
+      addLoadedChunk(l, emptyChunk(cx, cz, 6))
+  discard setBlockState(l, blockPos(20, 20, 20), sid("glowstone"))
+  let lo = blockPos(20, 20, 20)
+  let hi = blockPos(20, 20, 20)
+  var snap = captureLightSnapshot(l.lightAccess, lo, hi)
+  var eng = newDynamicLightEngine()
+  updateLightingRegion(eng, snapshotAccess(snap), lo, hi)
+  var diff = snapshotDiff(snap)
+  assert diff.changes.len > 0
+  assert getBlockLightLevel(l.lightAccess, blockPos(20, 20, 20)) == (true, 0'u8)  # live untouched by the job
+  # A block written inside the copied range after the capture.
+  discard setBlockState(l, blockPos(2, 5, 2), sid("stone"))
+  assert not applyLightDiff(l.lightAccess, snap, diff)
+  assert getBlockLightLevel(l.lightAccess, blockPos(20, 20, 20)) == (true, 0'u8)
+  # Light changed by someone else.
+  snap = captureLightSnapshot(l.lightAccess, lo, hi)
+  updateLightingRegion(eng, snapshotAccess(snap), lo, hi)
+  diff = snapshotDiff(snap)
+  setBlockLightLevel(l.lightAccess, blockPos(40, 30, 40), 7'u8)
+  assert not applyLightDiff(l.lightAccess, snap, diff)
+  # Fresh again: accepted.
+  snap = captureLightSnapshot(l.lightAccess, lo, hi)
+  updateLightingRegion(eng, snapshotAccess(snap), lo, hi)
+  diff = snapshotDiff(snap)
+  assert applyLightDiff(l.lightAccess, snap, diff)
+  assert getBlockLightLevel(l.lightAccess, blockPos(20, 20, 20)) == (true, 15'u8)
+  echo "stale snapshot refused, fresh one applied"
+
 testRuntime()
 testStaleQueueEntry()
 testDenseEqualsExhaustive()
+testSnapshotEqualsLive()
+testSnapshotStale()
 echo "lightingruntime: all checks passed"
