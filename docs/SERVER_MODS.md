@@ -221,6 +221,13 @@ the server). An operator's client gets them; others do not (root commands a play
 a block for pos1, right click for pos2). Edits: `//set`, `//replace <mask> <pattern>`, `//walls`, `//hollow`, `//sphere [-h]`, `//cyl [-h]`,
 `//copy`, `//cut`, `//paste [-a] [-s]`, `//rotate`, `//flip`, `//stack`, `//move [-s]`, `//count`, `//distribution [-d]`, `//undo [n]`, `//redo [n]`.
 Patterns are `stone`, `50%stone,50%dirt`, `oak_stairs[facing=east]`; masks `stone,dirt`, `!air`, `*`.
+More, with WorldEdit's semantics and wording: selection `//expand <n> [reverse] [dir]` and `//expand vert`, `//contract`, `//shift`,
+`//outset`/`//inset [-h|-v]`, `//chunk`; region `//center`, `//smooth [iterations]` (height map, Gaussian radius 5 sigma 1),
+`//naturalize`, `//overlay`, `//line [-h] <pattern> [thickness]`; around you `//drain [-w]`, `//fill <pattern> <radius> [depth]`,
+`//fixwater`, `//pyramid`, `//hpyramid`, `//hsphere`, `//hcyl`; entities `//copy -e`, `//cut -e`, `//paste -e`; brushes
+`//brush` (`//br`) `sphere|cylinder [-h] <pattern> [radius] [height]`, `smooth [size] [iterations]`, `none`, and tools
+`//tool info|repl <pattern>|none`, `//none`: bound to the held item, used with a right click (on a block, or in the air: the first
+block within 300 along your view), each stroke one undoable edit. `//historysize [n]` sets your undo depth, `//clearhistory` empties it.
 
 Every edit goes through `bulkedit` (one light pass, one client update per section, block entities kept, block log entries with the command
 cause). Undo keeps the pre-edit section snapshot, so it restores block states and block entities exactly. Limits: 4 000 000 cells per edit,
