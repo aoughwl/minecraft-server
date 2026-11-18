@@ -97,6 +97,40 @@ def nbuild():
     return sum(t.count(n) for n in ('cc1.exe', 'gcc.exe', 'aowlmony.exe', 'cc1plus.exe'))
 
 bot = None
+WATCH = os.environ.get('BENCH_WATCH', '')   # set: sample the server's per-thread CPU/wait state every 8 s (stall diagnosis)
+samples = []
+def watcher():
+    import threading
+    def run():
+        ps = ("$p=Get-Process -Id %d; $p.Threads | %% { '{0},{1},{2},{3}' -f $_.Id,$_.ThreadState,$_.WaitReason,[math]::Round($_.TotalProcessorTime.TotalMilliseconds) }" % srv.pid)
+        while srv.poll() is None:
+            t = round(time.time() - t0, 1)
+            o = sh(['powershell', '-NoProfile', '-Command', ps])
+            cur = {}
+            for l in o.splitlines():
+                q = l.strip().split(',')
+                if len(q) == 4 and q[3].isdigit():
+                    cur[q[0]] = int(q[3])
+            samples.append({'t': t, 'threads': [l.strip() for l in o.splitlines() if l.strip()]})
+            # stall trap: one thread burning ~100% of the interval, every other thread idle, twice in a row -> stack dump with gdb
+            if WATCH == 'gdb' and watcher.prev is not None:
+                d = {k: v - watcher.prev.get(k, v) for k, v in cur.items()}
+                hot = [k for k, v in d.items() if v > 7000]
+                if len(hot) == 1 and sum(1 for v in d.values() if v > 150) == 1:
+                    watcher.hits += 1
+                else:
+                    watcher.hits = 0
+                if watcher.hits == 2 and not watcher.dumped:
+                    watcher.dumped = True
+                    g = subprocess.run(['gdb', '-p', str(srv.pid), '-batch', '-ex', 'info threads', '-ex', 'thread apply all bt 14',
+                                        '-ex', 'detach'], capture_output=True, text=True, timeout=120)
+                    samples.append({'t': t, 'hot_thread': hot[0], 'gdb': (g.stdout + g.stderr)[-12000:]})
+            watcher.prev = cur
+            time.sleep(8)
+    threading.Thread(target=run, daemon=True).start()
+watcher.prev = None; watcher.hits = 0; watcher.dumped = False
+if WATCH:
+    watcher()
 res = {'label': label, 'env': envs, 'radius': RADIUS, 'fills': FILLS}
 try:
     rc = None
@@ -129,6 +163,9 @@ try:
             res[name]['profile_error'] = repr(e)
 
     def gen():
+        if os.environ.get('BENCH_IDLE'):   # no pregen: profile an idle server for N seconds (what a gate costs by itself)
+            time.sleep(float(os.environ['BENCH_IDLE']))
+            return {'idle': True}
         rc.cmd('setworldspawn 0 80 0')
         rc.cmd('pregen inflight %d' % INFLIGHT)
         out = rc.cmd('pregen start %dc 0 0' % RADIUS)
@@ -162,6 +199,15 @@ try:
     def save():
         return {}
 
+    if os.environ.get('BENCH_WARM'):   # a tiny pregen far away first (outside any profile): one-time cold costs are paid before 'gen'
+        rc.cmd('setworldspawn 0 80 0')
+        rc.cmd('pregen start 1c 4000 4000')
+        for _ in range(300):
+            time.sleep(1.0)
+            st = rc.cmd('pregen status')
+            if 'nothing running' in st or re.search(r': done \d+/\d+ chunks', st):
+                break
+        res['warm_done_s'] = round(time.time() - t0, 1)
     profile('gen', gen)
     profile('fill', fill)
     t = time.time()
@@ -188,6 +234,8 @@ txt = open(RUN + '/server.txt', errors='replace').read()
 res['gate_lines'] = [l.strip()[:160] for l in txt.splitlines()
                      if re.search(r'refus|pool|worker|MC_|gate|violation|assert|panic|exception', l, re.I)][:12]
 res['build_procs_after'] = nbuild()
+if WATCH:
+    res['thread_samples'] = samples
 line = json.dumps(res)
 print(line)
 if OUT:
