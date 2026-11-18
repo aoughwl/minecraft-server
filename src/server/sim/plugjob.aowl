@@ -11,8 +11,9 @@
 ## `submitPlugJob` but its result waits in the done queue until the next poll, exactly as a worker result would, so threads = 1 and N behave alike.
 ## The delivery callback runs on the tick thread and may touch the world and fire hooks.
 ##
-## The pool: `newPlugJobs(plan)` makes its own pool sized by `planThreads` (docs section 5). jobpool has one live worker pool per process, so a caller
-## that already has a pool with workers uses `newPlugJobsOn(pool, ownerBase)` instead; owner ids are `ownerBase + plugin handle`.
+## The pool: `newPlugJobs(plan)` takes the process's one pool from `jobpool.sharedJobPool` (a new one sized by `planThreads` when none is live,
+## docs section 5; it then also shuts it down). `newPlugJobsOn(pool)` uses a pool the caller has. Each plugin handle gets its own owner id from
+## `allocOwner`, so plugin jobs never collide with the other users of the shared pool.
 
 {.feature: "lenientnils".}
 
@@ -35,7 +36,7 @@ type
   PlugJobs* = ref object
     pool: JobPool
     ownsPool: bool
-    ownerBase: int
+    owners: seq[int]          ## per plugin handle: owner id in the pool (`allocOwner`)
     nextPlugin: int
     nextTicket: seq[int]      ## per plugin handle: next ticket to hand out
     nextDeliver: seq[int]     ## per plugin: next ticket to deliver (delivery is strictly in ticket order)
@@ -43,12 +44,13 @@ type
     delivered*: int
     callbackErrors*: int
 
-proc newPlugJobsOn*(pool: JobPool, ownerBase: int): PlugJobs =
-  PlugJobs(pool: pool, ownsPool: false, ownerBase: ownerBase, nextPlugin: 0, nextTicket: @[], nextDeliver: @[], held: @[])
+proc newPlugJobsOn*(pool: JobPool): PlugJobs =
+  PlugJobs(pool: pool, ownsPool: false, owners: @[], nextPlugin: 0, nextTicket: @[], nextDeliver: @[], held: @[])
 
 proc newPlugJobs*(plan: ThreadPlan): PlugJobs =
   ## Own pool with `plan.threads - 1` workers (none at threads = 1: inline).
-  PlugJobs(pool: newJobPool(plan.threads), ownsPool: true, ownerBase: 0, nextPlugin: 0, nextTicket: @[], nextDeliver: @[], held: @[])
+  let fresh = liveWorkerPool() == nil
+  PlugJobs(pool: sharedJobPool(plan.threads), ownsPool: fresh, owners: @[], nextPlugin: 0, nextTicket: @[], nextDeliver: @[], held: @[])
 
 proc workers*(pj: PlugJobs): int =
   pj.pool.workers
@@ -58,6 +60,7 @@ proc registerPlugin*(pj: PlugJobs): int =
   assertOwner("plugjob registerPlugin")
   result = pj.nextPlugin
   inc pj.nextPlugin
+  pj.owners.add(allocOwner(pj.pool))
   pj.nextTicket.add(0)
   pj.nextDeliver.add(0)
   pj.held.add(@[])
@@ -87,7 +90,7 @@ proc submitPlugJob*(pj: PlugJobs, plugin: int, fn: PlugJobFn, arg: pointer, done
   rec.ctx = ctx
   inc pj.nextTicket[plugin]
   result = rec.ticket
-  submit(pj.pool, pj.ownerBase + plugin, trampoline, cast[pointer](rec))
+  submit(pj.pool, pj.owners[plugin], trampoline, cast[pointer](rec))
 
 proc cmpTicket(a, b: JobResult): int =
   cmp(cast[ptr JobRec](a.arg).ticket, cast[ptr JobRec](b.arg).ticket)
@@ -99,7 +102,7 @@ proc pollPlugJobs*(pj: PlugJobs, plugin: int): int =
   if plugin < 0 or plugin >= pj.nextPlugin:
     return
   var sink: seq[JobResult] = @[]
-  discard drainDone(pj.pool, pj.ownerBase + plugin, sink)
+  discard drainDone(pj.pool, pj.owners[plugin], sink)
   for r in sink:
     pj.held[plugin].add(r)
   pj.held[plugin].sort(cmpTicket)
@@ -133,7 +136,7 @@ proc pollAllPlugJobs*(pj: PlugJobs): int =
     result += pollPlugJobs(pj, i)
 
 proc pendingPlugJobs*(pj: PlugJobs, plugin: int): int =
-  pending(pj.pool, pj.ownerBase + plugin) + pj.held[plugin].len
+  pending(pj.pool, pj.owners[plugin]) + pj.held[plugin].len
 
 proc shutdownPlugJobs*(pj: PlugJobs) =
   ## Finishes queued jobs and joins workers (own pool only); results can still be polled afterwards.
