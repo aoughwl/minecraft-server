@@ -1,0 +1,136 @@
+## solverjob: the structural solver as one pool job gives exactly the result of the direct `solve`, inline (0 workers), on 1 and on 4 workers,
+## over many generated inputs; completions come back in submit order; the one-tick apply offset does not depend on the mode; a pipelined
+## queue (one run in flight, applied SolveDelayTicks later, the next submitted the same tick) is mode independent. Exit 0 and "ALL PASS".
+
+{.feature: "untyped".}
+
+import std/syncio
+import ../../physics/solver
+import ../sim/jobpool
+import solverjob
+
+var failures = 0
+var checks = 0
+
+proc check(cond: bool, what: string) =
+  inc checks
+  if cond:
+    echo "  PASS ", what
+  else:
+    echo "  FAIL ", what
+    inc failures
+
+proc mats(): seq[SolverMaterial] =
+  var m = newSeq[SolverMaterial](5)
+  m[1] = SolverMaterial(mass: 2400.0, tensile: 60000.0, compressive: 400000.0, shear: 100000.0, breakThreshold: 1.0, terrain: true)
+  m[2] = SolverMaterial(mass: 700.0, tensile: 300000.0, compressive: 400000.0, shear: 150000.0, breakThreshold: 1.0)
+  m[3] = SolverMaterial(mass: 70830.0, tensile: 2000000.0, compressive: 20000000.0, shear: 2000000.0, breakThreshold: 1.0)
+  m[4] = SolverMaterial(mass: 1600.0, tensile: 0.0, compressive: 100000.0, shear: 1000.0, breakThreshold: 1.0, granular: true)
+  m
+
+proc gen(seed: int): SolverInput =
+  var r = uint64(seed) * 6364136223846793005'u64 + 1442695040888963407'u64
+  proc nxt(r: var uint64; n: int): int =
+    r = r * 6364136223846793005'u64 + 1442695040888963407'u64
+    int((r shr 33) mod uint64(n))
+  let nx = 6 + nxt(r, 8)
+  let nz = 4 + nxt(r, 6)
+  let ny = 8 + nxt(r, 10)
+  var inp = newSolverInput(nx, ny, nz)
+  inp.materials = mats()
+  for z in 0 ..< nz:
+    for x in 0 ..< nx:
+      inp.cells[inp.cellIdx(x, 0, z)] = 1'u16
+      inp.anchor[inp.cellIdx(x, 0, z)] = true
+  # random columns, bridges and a few loose blobs
+  for k in 0 ..< 3 + nxt(r, 6):
+    let x = nxt(r, nx)
+    let z = nxt(r, nz)
+    let h = 1 + nxt(r, ny - 1)
+    let m = uint16(1 + nxt(r, 4))
+    for y in 1 .. h:
+      inp.cells[inp.cellIdx(x, y, z)] = m
+  for k in 0 ..< 2 + nxt(r, 3):
+    let y = 2 + nxt(r, ny - 3)
+    let z = nxt(r, nz)
+    let x0 = nxt(r, nx div 2)
+    let len = 2 + nxt(r, nx - x0 - 1)
+    let m = uint16(1 + nxt(r, 3))
+    for x in x0 ..< min(nx, x0 + len):
+      inp.cells[inp.cellIdx(x, y, z)] = m
+  for k in 0 ..< nxt(r, 3):
+    inp.loads.add(ExtLoad(cell: inp.cellIdx(nxt(r, nx), 1 + nxt(r, ny - 1), nxt(r, nz)), fx: float64(nxt(r, 4000)), fy: float64(nxt(r, 9000)), fz: 0.0))
+  inp
+
+proc viaJob(pool: JobPool; inp: SolverInput; p: SolverParams): SolveRun =
+  let run = newSolveRun(inp, p)
+  submitSolve(pool, run)
+  waitSolve(pool, run)
+  run
+
+let p = defaultSolverParams()
+var direct: seq[SolverResult] = @[]
+var inputs: seq[SolverInput] = @[]
+var anyBroken = 0
+var anyComp = 0
+for seed in 1 .. 60:
+  let inp = gen(seed)
+  inputs.add(inp)
+  let r = solve(inp, p)
+  direct.add(r)
+  if r.broken.len > 0: inc anyBroken
+  if r.components.len > 0: inc anyComp
+check(anyBroken > 5 and anyComp > 5, "the generated inputs exercise failures (" & $anyBroken & ") and free sets (" & $anyComp & ")")
+
+for poolThreads in [1, 2, 5]:
+  let pool = newJobPool(poolThreads)
+  let label = (if poolThreads == 1: "inline" else: $(poolThreads - 1) & " workers")
+  check(pool.workers == (if poolThreads == 1: 0 else: poolThreads - 1), label & ": pool shape")
+  var allEq = true
+  var allOk = true
+  for i in 0 ..< inputs.len:
+    let run = viaJob(pool, inputs[i], p)
+    if not run.ok: allOk = false
+    if not (run.res == direct[i]): allEq = false
+  check(allOk, label & ": no job body failed")
+  check(allEq, label & ": all 60 results equal the direct solve")
+  # ordering: a pipeline with one run in flight; each is applied SolveDelayTicks after its submit and the next goes out that tick
+  var applied: seq[int] = @[]
+  var appliedTick: seq[int] = @[]
+  var cur: SolveRun = nil
+  var curIdx = -1
+  var curTick = 0
+  var nextIdx = 0
+  var tick = 0
+  while applied.len < 12:
+    inc tick
+    if cur != nil and solveApplyDue(tick - curTick):
+      waitSolve(pool, cur)
+      check(cur.res == direct[curIdx], label & ": pipelined result " & $curIdx & " equals direct")
+      applied.add(curIdx)
+      appliedTick.add(tick)
+      cur = nil
+    if cur == nil and nextIdx < 12:
+      cur = newSolveRun(inputs[nextIdx], p)
+      curIdx = nextIdx
+      curTick = tick
+      inc nextIdx
+      submitSolve(pool, cur)
+  var inOrder = true
+  for i in 0 ..< applied.len:
+    if applied[i] != i: inOrder = false
+  var cadence = true
+  for i in 1 ..< appliedTick.len:
+    if appliedTick[i] - appliedTick[i - 1] != SolveDelayTicks: cadence = false
+  check(inOrder, label & ": results applied in submit order")
+  check(cadence and appliedTick[0] == 1 + SolveDelayTicks, label & ": applied exactly " & $SolveDelayTicks & " tick(s) after the submit, same cadence in every mode")
+  check(pool.failedCount == 0, label & ": pool saw no failures")
+  if poolThreads > 1:
+    shutdown(pool)
+
+check(not solveApplyDue(0) and solveApplyDue(1) and solveApplyDue(5), "solveApplyDue: not on the submit tick, due from the next")
+if failures == 0:
+  echo "ALL PASS (", checks, " checks)"
+else:
+  echo "FAILED ", failures, " of ", checks
+  quit(1)

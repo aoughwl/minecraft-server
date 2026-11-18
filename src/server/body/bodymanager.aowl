@@ -35,7 +35,7 @@
 
 {.feature: "lenientnils".}
 
-import std/[math, options, tables, strutils, syncio, atomics]
+import std/[math, options, tables, strutils, syncio, atomics, envvars]
 import ../../data/block_ext
 from ../../data/block_state import newBlockStateIdUnchecked, asU16
 import ../../nbt/tag as nbttag
@@ -52,6 +52,9 @@ import ../serverbase
 import ../world/[bulkedit, worldmod, lootbridge]
 import "../block/blockbehaviour"
 import bodyentity, bodyworld, bodyjournal
+import ../sim/jobpool
+import ../entity/ai/pathfinder/pathpool
+import ../physwire/solverjob
 
 export bodyentity, bodyjournal
 
@@ -177,6 +180,9 @@ type
     job: SolverJob
     opts: CollapseOpts
     report*: CollapseReport
+    vers: seq[uint32]          ## section versions when the box was read (worker mode stale guard)
+    run: SolveRun              ## worker mode: the solve as one pool job (nil = sliced on the tick thread)
+    submitTick: int64
 
   BlockDirty* = object
     ## `onBlockChanged` record for the trigger task: a changed cell.
@@ -1186,6 +1192,9 @@ proc collapseStart*(world: World; box: VolumeBox; opts: CollapseOpts; tick: int6
   result.nx = nx
   result.ny = ny
   result.nz = nz
+  result.vers = @[]
+  for sec in snap.sections:
+    result.vers.add(sec.version)
   var ids = newSeq[int](nx * ny * nz)
   var structural = 0
   for sec in snap.sections:
@@ -1348,8 +1357,91 @@ proc collapseResult*(jobId: int): Option[CollapseReport] =
       return some(r)
   none[CollapseReport]()
 
+var gSolvePool: JobPool = nil
+var gSolveDecided = false
+
+proc enableSolverJobs*(pool: JobPool) =
+  ## Tests: use `pool` (nil = back to the sliced run), skipping the environment gate.
+  gSolvePool = pool
+  gSolveDecided = true
+
+proc solverPool(): JobPool =
+  ## MC_SOLVER_WORKERS=1 AND a thread plan with workers; default off.
+  if not gSolveDecided:
+    gSolveDecided = true
+    if getEnv("MC_SOLVER_WORKERS") == "1":
+      let n = envPlanWorkers()
+      if n > 0:
+        gSolvePool = sharedJobPool(n)
+  gSolvePool
+
+proc collapseStale(job: CollapseJob): bool =
+  ## True when any block of the checked box differs from what the solver was given (or the box cannot be read any more).
+  let snap = readVolume(job.world, job.ebox)
+  if snap.status != esOk or snap.sections.len != job.vers.len:
+    return true
+  for i in 0 ..< snap.sections.len:
+    let sec = snap.sections[i]
+    if sec.version == job.vers[i]:
+      continue
+    let vals = sec.blocks.cells()
+    for y in sec.y0 .. sec.y1:
+      for z in sec.z0 .. sec.z1:
+        for x in sec.x0 .. sec.x1:
+          let wx = sec.cx * 16'i32 + int32(x)
+          let wy = sec.baseY + int32(y)
+          let wz = sec.cz * 16'i32 + int32(z)
+          let c = int(wx - job.ebox.minX) + job.nx * (int(wz - job.ebox.minZ) + job.nz * int(wy - job.ebox.minY))
+          if int(vals[y * 256 + z * 16 + x]) != job.ids[c]:
+            return true
+  false
+
+proc stepCollapseJobsWorker(pool: JobPool; tick: int64): bool =
+  ## Worker mode: the front job's solve is ONE pool job submitted on a snapshot; its result is applied on the tick thread SolveDelayTicks later in every
+  ## mode (waiting for the worker when it is not done), then the next queued job is submitted the same tick. A job whose box changed in between is dropped.
+  ## Returns true when it handled the queue (the caller then skips the sliced path).
+  if gJobs.len == 0:
+    return true
+  var job = gJobs[0]
+  if job.run != nil:
+    if not solveApplyDue(int(tick - job.submitTick)):
+      return true
+    waitSolve(pool, job.run)
+    if job.run.ok:
+      job.job.res = job.run.res
+      if collapseStale(job):
+        var rep = job.report
+        rep.ok = true
+        rep.reason = "the world changed during the check (result dropped)"
+        rep.done = true
+        job.report = rep
+        inc gStats.collapseRuns
+      else:
+        collapseApply(job, tick)
+    else:
+      job.report.reason = "the solver failed"
+      job.report.done = true
+    job.run = nil
+    gCollapseResults.add(job.report)
+    if gCollapseResults.len > 32:
+      gCollapseResults.delete(0)
+    gJobs.delete(0)
+    echo "[body] collapse check " & $job.id & " finished: " & $job.report.broken & " broken, " & $job.report.bodies.len & " bodies"
+    if gJobs.len == 0:
+      return true
+    job = gJobs[0]
+  if job.run == nil:
+    job.run = newSolveRun(job.job.inp, adapterSolverParams())
+    job.submitTick = tick
+    submitSolve(pool, job.run)
+  true
+
 proc stepCollapseJobs(tick: int64) =
   if gJobs.len == 0:
+    return
+  let pool = solverPool()
+  if pool != nil:
+    discard stepCollapseJobsWorker(pool, tick)
     return
   let job = gJobs[0]
   if collapseStep(job, gCfg.collapseOps):
