@@ -3,8 +3,10 @@
 ## be queued; a hook fired from a dimension job is flagged by the owner guard.
 import std/[assertions, syncio]
 import jobpool
+import std/tables
 import ownerguard
 import dimtick
+import playerlock
 
 const
   Worlds = 3
@@ -21,6 +23,9 @@ var
   gLog: seq[uint64] = @[]        ## the hook-event log: global, appended only through postHookEvent
   gNow = 0
   gDirectLogCalls = 0
+  gCmdLog: seq[uint64] = @[]               ## "command block" results: appended only through postCross(CrossCommand)
+  gPlayerTab = initTable[int32, uint64]()  ## id-keyed per-player table shared by all worlds (phase 4 sim/playerlock)
+  gPlayerPoseTab = initTable[int32, int]()
 
 proc mix(x: uint64): uint64 =
   var z = x + 0x9E3779B97F4A7C15'u64
@@ -33,6 +38,9 @@ proc reset() =
   gInbox = @[]
   gLog = @[]
   gNow = 0
+  gCmdLog = @[]
+  gPlayerTab = initTable[int32, uint64]()
+  gPlayerPoseTab = initTable[int32, int]()
   for i in 0 ..< Worlds:
     gState.add mix(uint64(i + 1) * 7919'u64)
     gInbox.add @[]
@@ -59,6 +67,29 @@ proc worldTick(i: int) =
     let dst = (i + 1) mod Worlds
     let v = s
     postCross(CrossPortal, proc() {.closure.} = gInbox[dst].add Item(stamp: t, value: v))
+  # per-player tables: players of every world update their own ids in the shared tables (lock only inside a dimension job, like
+  # entitymod.playerBase / player.incrementStat); two players per world, ids never shared between worlds
+  for pl in 0 ..< 2:
+    let id = int32(i * 10 + pl)
+    ptLock()
+    let old = gPlayerTab.getOrDefault(id, 0'u64)
+    gPlayerTab[id] = mix(old xor s xor uint64(pl))
+    if (t + pl) mod 4 == 0:
+      gPlayerPoseTab[id] = t
+    elif gPlayerPoseTab.hasKey(id):
+      gPlayerPoseTab.del(id)
+    ptUnlock()
+  # a "command block" that reaches another world: deferred to the join phase from a dimension job, run at once otherwise
+  if t mod 3 == 0:
+    let dstc = (i + 1) mod Worlds
+    let vc = s xor uint64(dstc)
+    proc cmd() {.closure.} =
+      assertTickThread("synthetic command block")   # runs on the tick thread in both modes
+      gCmdLog.add vc
+    if inDimJob():
+      postCross(CrossCommand, cmd)
+    else:
+      cmd()
   let ev = mix(s xor uint64(i))
   postHookEvent(proc() {.closure.} = gLog.add ev)
   if t mod 7 == 0:
@@ -75,6 +106,12 @@ proc digest(): uint64 =
       h = mix(h xor it.value xor uint64(it.stamp))
   for e in gLog:
     h = mix(h xor e)
+  for e in gCmdLog:
+    h = mix(h xor e)
+  for i in 0 ..< Worlds:
+    for pl in 0 ..< 2:
+      let id = int32(i * 10 + pl)
+      h = mix(h xor gPlayerTab.getOrDefault(id, 0'u64) xor uint64(gPlayerPoseTab.getOrDefault(id, -1) + 2))
   h
 
 proc runAll(mode: int; pool: JobPool; owner: int): seq[uint64] =
@@ -100,7 +137,9 @@ proc main() =
   assert decideGate(true, 4, 1, 0, 0, 0) == dgOneWorld
   assert decideGate(true, 4, 3, 1, 0, 0) == dgHooks
   assert decideGate(true, 4, 3, 0, 2, 0) == dgPlugins
-  assert decideGate(true, 4, 3, 0, 0, 2) == dgPlayers
+  # players in several worlds are allowed since the per-player tables are locked; MC_DIM_PLAYERS_ONE_WORLD=1 restores the refusal
+  assert not dimPlayersOneWorldOnly()
+  assert decideGate(true, 4, 3, 0, 0, 2) == dgOn
   assert decideGate(true, 4, 3, 0, 0, 1) == dgOn
   assert decideGate(true, 4, 3, 0, 0, 0) == dgOn
   # hook consumers: one that cannot be queued closes the gate, a queueable one does not
@@ -146,6 +185,9 @@ proc main() =
   assert bad == 0, "off, 1 worker and 4 workers must agree after every tick"
   assert messageCount(CrossHook) == 2 * Ticks * Worlds
   assert messageCount(CrossPortal) > 0 and messageCount(CrossBroadcast) > 0
+  assert messageCount(CrossCommand) == 2 * (Ticks div 3) * Worlds, "command blocks of both threaded runs were deferred"
+  assert gCmdLog.len == (Ticks div 3) * Worlds
+  assert gPlayerTab.len == Worlds * 2
   assert failedMessages() == 0
   # the state is not trivially constant
   assert off[0] != off[Ticks - 1]
