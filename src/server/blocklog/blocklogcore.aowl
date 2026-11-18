@@ -19,6 +19,8 @@
 
 import std/[syncio, tables, algorithm, dirs, paths, times, strutils]
 import ../../world/worldfs
+import ../sim/dimtick
+import ../sim/ownerguard
 
 const
   BlockMagic* = 0xB1'u8
@@ -68,6 +70,7 @@ type
     cause*: uint8
     kind*: uint8
     actor*: uint16
+    name*: string    ## only set inside a dimension job (phase 4): the actor is interned at the join phase, in order
 
   LogQuery* = object
     dim*: int            ## -1: every dimension
@@ -275,7 +278,7 @@ var gRing: BlockRing = newRing(16)
 var gDims: seq[string] = @[]
 var gUsers: seq[string] = @[]
 var gUserIdx: Table[string, int] = initTable[string, int]()
-var gCtx: BlockLogCtx = BlockLogCtx()
+var gCtx {.threadvar.}: BlockLogCtx   ## per thread: a dimension thread's attribution is its own (zero = natural, no actor)
 var gPendingPaths: seq[string] = @[]
 var gPendingData: seq[seq[byte]] = @[]
 var gLastFlushTick: int = 0
@@ -415,6 +418,10 @@ proc userName*(idx: int): string =
 proc blockLogPush*(cause, kind: uint8; name: string): BlockLogCtx =
   ## Everything written until `blockLogPop(previous)` is attributed to this. Answers what to restore.
   result = gCtx
+  if inDimJob():
+    # `userIndex` appends to shared tables and a file: not from a world thread. The name travels and is interned at the join.
+    gCtx = BlockLogCtx(cause: cause, kind: kind, actor: 0'u16, name: (if gFolder.len > 0: name else: ""))
+    return
   gCtx = BlockLogCtx(cause: cause, kind: kind, actor: (if name.len > 0 and gFolder.len > 0: uint16(userIndex(name)) else: 0'u16))
 
 proc blockLogPop*(prev: BlockLogCtx) =
@@ -481,18 +488,30 @@ var
   gChangeHookOn* = false     ## the replay recorder's tap (replay/replay.aowl): one bool test per change while nobody records
   gChangeHook*: proc(dimension: string; x, y, z: int; oldState, newState: int) {.closure.} = nil
 
-proc blockLogRecordChange*(dimension: string; x, y, z: int; oldState, newState: int) =
-  ## The seam: one block went from `oldState` to `newState`. Cheap: a name lookup, a clock read and a ring store.
+proc recordChangeNow(ctx: BlockLogCtx; dimension: string; x, y, z: int; oldState, newState: int) =
   if gChangeHookOn and oldState != newState:
     gChangeHook(dimension, x, y, z, oldState, newState)
   if gFolder.len == 0 or oldState == newState:
     return
   if gRing.count >= gRing.items.len:
     blockLogFlush()     # full before the tick could drain it: nothing is dropped, the tick pays once
+  let actor = if ctx.name.len > 0: uint16(userIndex(ctx.name)) else: ctx.actor
   let rec = BlockLogRec(t: uint32(gClock()), dim: uint8(dimIndex(dimension)), x: int32(x), y: int32(y), z: int32(z),
-    oldS: uint16(oldState), newS: uint16(newState), cause: gCtx.cause, kind: gCtx.kind, actor: gCtx.actor)
+    oldS: uint16(oldState), newS: uint16(newState), cause: ctx.cause, kind: ctx.kind, actor: actor)
   if not ringPush(gRing, rec):
     inc gDropped
+
+proc blockLogRecordChange*(dimension: string; x, y, z: int; oldState, newState: int) =
+  ## The seam: one block went from `oldState` to `newState`. Cheap: a name lookup, a clock read and a ring store.
+  ## Inside a dimension job (phase 4) the ring, the name tables and the replay tap are tick-thread state: the change is queued with the
+  ## thread's context and recorded in the join phase, world ascending and in call order (the order the sequential loop writes them in).
+  if inDimJob():
+    if oldState == newState or (gFolder.len == 0 and not gChangeHookOn):
+      return
+    let ctx = gCtx
+    postCross(CrossHook, proc() {.closure.} = recordChangeNow(ctx, dimension, x, y, z, oldState, newState))
+    return
+  recordChangeNow(gCtx, dimension, x, y, z, oldState, newState)
 
 # ---- reading -----------------------------------------------------------------------------------------------------
 
