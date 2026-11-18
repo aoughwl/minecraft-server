@@ -327,38 +327,61 @@ proc nextRandom(l: Level): uint32 =
 
 proc tickLess(a, b: OrderedTick[string]): int = cmp(a, b)
 
-proc getTickData*(l: Level, activeChunks: openArray[(int32, int32)], randomTickSpeed: int64 = 3'i64): TickData =
-  ## `Level::get_tick_data`. `randomTickSpeed` is the game rule: upstream fixes the three samples per section that vanilla
-  ## has as the rule's default, so this keeps `/gamerule randomTickSpeed` working where upstream ignores it.
-  result = TickData(blockTicks: @[], fluidTicks: @[], randomTicks: @[])
-  # 1. Active chunks: random ticks.
+type
+  ChunkRolls* = object
+    ## One active chunk's random-tick draws (`drawRandomRolls`, tick thread) and what the scan of them found (`scanRolls`, may run on a
+    ## region worker: reads only `chunk`'s block sections and constant tables, writes only `samples`).
+    chunk*: ChunkData
+    perSection*: int               ## draws per ticking section
+    rolls*: seq[uint32]            ## perSection per ticking section, ascending
+    samples*: seq[RandomTickSample]
+
+proc drawRandomRolls*(l: Level, activeChunks: openArray[(int32, int32)], randomTickSpeed: int64): seq[ChunkRolls] =
+  ## The RNG half of the random ticks of `getTickData`: draws in exactly the order the one-pass loop did (active chunk order, ticking
+  ## section ascending, draw ascending), so the shared stream is consumed identically. Tick thread only (the Level RNG and `loadedChunks`).
+  result = @[]
   for pos in activeChunks:
     let chunk = l.loadedChunks.getOrDefault(chunkKey(pos[0], pos[1]), nil)
     if chunk == nil:
       continue
-    let chunkXBase = chunk.x * 16'i32
-    let chunkZBase = chunk.z * 16'i32
     let mask = chunk.section.randomlyTickingMask
     if mask == 0'u32:
       continue
+    var cr = ChunkRolls(chunk: chunk, perSection: int(max(0'i64, min(randomTickSpeed, 4096'i64))), rolls: @[], samples: @[])
     for i in 0 ..< chunk.section.count:
       if (mask and (1'u32 shl i)) == 0'u32:
         continue
-      let yBase = chunk.section.minY + int32(i) * 16'i32
-      for _ in 0 ..< int(max(0'i64, min(randomTickSpeed, 4096'i64))):
-        let r = nextRandom(l)
-        let xOffset = int(r and 0xF'u32)
-        let zOffset = int((r shr 8) and 0xF'u32)
-        let yInSection = int((r shr 4) and 0xF'u32)
-        let id = get(chunk.section.blockSections[i], xOffset, yInSection, zOffset)
-        let tickBlock = hasRandomTicks(id)
-        let tickFluid = hasRandomTickingFluid(id)
-        if tickBlock or tickFluid:
-          result.randomTicks.add(RandomTickSample(
-            position: blockPos(chunkXBase + int32(xOffset), yBase + int32(yInSection), chunkZBase + int32(zOffset)),
-            tickBlock: tickBlock, tickFluid: tickFluid))
+      for _ in 0 ..< cr.perSection:
+        cr.rolls.add(nextRandom(l))
+    result.add(cr)
 
-  # 2. Chunks with scheduled ticks; keys first, the set changes below.
+proc scanRolls*(cr: var ChunkRolls) =
+  ## The read half: turns the draws into samples. Footprint: the home chunk `cr.chunk` only (margin 0); no Level, no RNG, no hooks.
+  cr.samples.setLen(0)
+  let mask = cr.chunk.section.randomlyTickingMask
+  let chunkXBase = cr.chunk.x * 16'i32
+  let chunkZBase = cr.chunk.z * 16'i32
+  var k = 0
+  for i in 0 ..< cr.chunk.section.count:
+    if (mask and (1'u32 shl i)) == 0'u32:
+      continue
+    let yBase = cr.chunk.section.minY + int32(i) * 16'i32
+    for _ in 0 ..< cr.perSection:
+      let r = cr.rolls[k]
+      inc k
+      let xOffset = int(r and 0xF'u32)
+      let zOffset = int((r shr 8) and 0xF'u32)
+      let yInSection = int((r shr 4) and 0xF'u32)
+      let id = get(cr.chunk.section.blockSections[i], xOffset, yInSection, zOffset)
+      let tickBlock = hasRandomTicks(id)
+      let tickFluid = hasRandomTickingFluid(id)
+      if tickBlock or tickFluid:
+        cr.samples.add(RandomTickSample(
+          position: blockPos(chunkXBase + int32(xOffset), yBase + int32(yInSection), chunkZBase + int32(zOffset)),
+          tickBlock: tickBlock, tickFluid: tickFluid))
+
+proc collectScheduledTicks*(l: Level, result: var TickData) =
+  ## The scheduled block and fluid ticks half of `getTickData` (mutates the chunk schedulers: tick thread only).
   var scheduled = newSeq[int64](0)
   for k in items(l.chunksWithScheduledTicks):
     scheduled.add(k)
@@ -375,9 +398,24 @@ proc getTickData*(l: Level, activeChunks: openArray[(int32, int32)], randomTickS
         excl(l.chunksWithScheduledTicks, k)
     else:
       excl(l.chunksWithScheduledTicks, k)  # Chunk unloaded
-
   sort(result.blockTicks, tickLess)
   sort(result.fluidTicks, tickLess)
+
+proc getTickDataWith*(l: Level, rs: var seq[ChunkRolls], scanned: bool): TickData =
+  ## `getTickData` from draws already made by `drawRandomRolls`; `scanned` false = scan them here, true = a region phase already did.
+  result = TickData(blockTicks: @[], fluidTicks: @[], randomTicks: @[])
+  for i in 0 ..< rs.len:
+    if not scanned:
+      scanRolls(rs[i])
+    for s in rs[i].samples:
+      result.randomTicks.add(s)
+  collectScheduledTicks(l, result)
+
+proc getTickData*(l: Level, activeChunks: openArray[(int32, int32)], randomTickSpeed: int64 = 3'i64): TickData =
+  ## `Level::get_tick_data`. `randomTickSpeed` is the game rule: upstream fixes the three samples per section that vanilla
+  ## has as the rule's default, so this keeps `/gamerule randomTickSpeed` working where upstream ignores it.
+  var rs = drawRandomRolls(l, activeChunks, randomTickSpeed)
+  getTickDataWith(l, rs, false)
 
 proc fetchChunkFromDisk*(l: Level, x, z: int32): FetchResult =
   ## The disk half of `Level::get_or_fetch_chunk`: never generates.
