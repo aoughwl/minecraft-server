@@ -251,6 +251,18 @@ var __sdk = (function () {
     tasks = tasks.filter(function (t) { return t.id != id; });
   }
 
+  // ---- jobs on the server's worker threads (docs/PLUGIN_JOBS.md). `kind` names a server kernel ("fnv1a", "primes", "sort"): plugin code itself never
+  // runs on a worker. job() answers an id at once (-1 unknown kind, -2 input over 64 KiB); `fn({ id, value, failed, text })` runs later, on the
+  // tick thread, with the jobs of this plugin delivered in the order they were submitted. job_abi_version is 1.
+  var jobs = [];              // { id, fn }
+  function job(kind, input, fn) {
+    var id = hostv("job_submit", kind, String(input));
+    if (id > 0) { want("on_job"); jobs.push({ id: id, fn: fn }); }
+    return id;
+  }
+  function jobStatus(id) { return hostv("job_status", id); }        // 0 pending, 1 done, 2 failed, -1 unknown or already delivered
+  function jobAbiVersion() { return hostv("job_abi_version"); }
+
   function commandContext() {
     var who = str("player");
     var raw = str("args");
@@ -292,6 +304,17 @@ var __sdk = (function () {
       }
       return;
     }
+    if (entry == "on_job") {
+      var jid = num("id");
+      for (var j = 0; j < jobs.length; j++) {
+        if (jobs[j].id == jid) {
+          var jb = jobs.splice(j, 1)[0];
+          jb.fn({ id: jid, value: num("value"), failed: num("failed") != 0, text: str("text") });
+          return;
+        }
+      }
+      return;
+    }
     var list = handlers[entry];
     if (!list || !byEntry[entry]) return;
     var ev = byEntry[entry]();
@@ -318,12 +341,13 @@ var __sdk = (function () {
   }
 
   return {
-    fire: fire, on: on, command: command, after: after, every: every, cancelTask: cancelTask, server: server, tokens: tokens,
+    fire: fire, on: on, command: command, after: after, every: every, cancelTask: cancelTask, job: job, jobStatus: jobStatus, jobAbiVersion: jobAbiVersion, server: server, tokens: tokens,
     onEnable: function (fn) { enables.push(fn); }, onDisable: function (fn) { disables.push(fn); }
   };
 })();
 
 var on = __sdk.on, command = __sdk.command, after = __sdk.after, every = __sdk.every, cancelTask = __sdk.cancelTask;
+var job = __sdk.job, jobStatus = __sdk.jobStatus, jobAbiVersion = __sdk.jobAbiVersion;
 var onEnable = __sdk.onEnable, onDisable = __sdk.onDisable, server = __sdk.server;
 var ChatEvent = __sdk.tokens.ChatEvent, PlayerCommandEvent = __sdk.tokens.PlayerCommandEvent, JoinEvent = __sdk.tokens.JoinEvent;
 var LeaveEvent = __sdk.tokens.LeaveEvent, LoginEvent = __sdk.tokens.LoginEvent, MoveEvent = __sdk.tokens.MoveEvent;

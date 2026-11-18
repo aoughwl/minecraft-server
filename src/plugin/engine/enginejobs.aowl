@@ -1,0 +1,332 @@
+## Plugin jobs: the engine-plugin side of the job primitive (`sim/plugjob`, docs/MULTITHREADING.md phase 6, docs/PLUGIN_JOBS.md).
+##
+## A plugin is a program the engine runs, and the engine may only be called on the thread that started it, so plugin code can never run on a pool
+## thread. What a plugin can hand to a worker is therefore a NAMED KERNEL of the server: a pure function over the bytes it is given (`fnv1a`,
+## `primes`, `sort`). The plugin asks with the host call `job_submit(kind, input)` (a job id comes back at once), a worker runs the kernel, and the
+## answer is delivered on the tick thread, in submission order per plugin, as the plugin's `on_job` entry (`hostv("event_num", "id")`,
+## "value", "failed", `hostv("event_str", "text")`), or is looked up with `job_status(id)`. Nothing is delivered before the tick's poll, in any
+## thread mode (threads = 1 runs the kernel at submit and still delivers on the next poll).
+##
+## Kernel rules (they are what keeps a job off the world): a kernel reads its input buffer, writes its output buffer, allocates only raw memory,
+## and touches nothing else: no World, Entity, setBlockState, hook or host call. `ownerguard` flags a violation under MC_THREAD_ASSERT=1.
+##
+## Everything here except the kernels runs on the tick thread. ABI version: `JobAbiVersion` (host call `job_abi_version`).
+
+{.feature: "lenientnils".}
+
+import std/[syncio, envvars, cpuinfo]
+import ../../server/sim/[plugjob, jobpool, threadcfg]
+
+proc winSleep(ms: uint32) {.stdcall, importc: "Sleep", dynlib: "kernel32.dll".}
+
+const
+  JobAbiVersion* = 1
+  MaxJobInput* = 65536        ## bytes of input a job may carry
+  MaxPrimeLimit = 20000000
+  MaxSortInts = 8192
+  DrainSleepMs = 1
+  DrainMaxTries = 5000        ## the longest an unload or stop waits for a plugin's running jobs (~5 s)
+  OwnerBase = 100000          ## owner ids inside a pool shared with another job user
+
+  JobPending* = 0
+  JobDone* = 1
+  JobFailed* = 2
+  JobUnknown* = -1
+
+  KindFnv1a = 1
+  KindPrimes = 2
+  KindSort = 3
+
+type
+  JobArg = object
+    id: int
+    kind: int
+    inp: nil pointer
+    inLen: int
+    outp: nil pointer
+    outLen: int
+
+  JobMeta = object
+    id: int
+    owner: int            ## index into gOwners
+    state: int            ## JobPending / JobDone / JobFailed
+
+  JobOwner = object
+    name: string
+    handle: int           ## the plugjob handle
+    native: bool
+    closed: bool
+
+  ReadyJob* = object
+    id*: int
+    owner*: string
+    value*: int
+    failed*: bool
+    text*: string
+
+var
+  gJobs: nil PlugJobs = nil
+  gOwners: seq[JobOwner] = @[]
+  gMeta: seq[JobMeta] = @[]
+  gReady: seq[ReadyJob] = @[]
+  gNextId = 1
+
+# ---- kernels (worker threads): raw memory only ------------------------------------------------------------------------------------------------
+
+proc byteAt(p: nil pointer; i: int): int =
+  int(cast[ptr UncheckedArray[uint8]](p)[i])
+
+proc putText(a: ptr JobArg; text: string) =
+  ## Copies `text` into a fresh output buffer (raw memory).
+  let n = text.len
+  let buf = cast[ptr UncheckedArray[uint8]](alloc0(n + 1))
+  for i in 0 ..< n:
+    buf[i] = uint8(ord(text[i]))
+  a.outp = cast[pointer](buf)
+  a.outLen = n
+
+proc kernelFnv1a(a: ptr JobArg): int =
+  var h = 2166136261
+  for i in 0 ..< a.inLen:
+    h = h xor byteAt(a.inp, i)
+    h = (h * 16777619) and 0xFFFFFFFF
+  putText(a, $h)
+  h
+
+proc kernelPrimes(a: ptr JobArg): int =
+  ## Count of primes up to n (n is the decimal text of the input).
+  var n = 0
+  for i in 0 ..< a.inLen:
+    let c = byteAt(a.inp, i)
+    if c >= 48 and c <= 57:
+      n = n * 10 + (c - 48)
+      if n > MaxPrimeLimit:
+        n = MaxPrimeLimit
+        break
+  if n < 2:
+    putText(a, "0")
+    return 0
+  let sieve = cast[ptr UncheckedArray[uint8]](alloc0(n + 1))
+  var count = 0
+  var i = 2
+  while i <= n:
+    if sieve[i] == 0'u8:
+      inc count
+      var j = i * i
+      while j <= n:
+        sieve[j] = 1'u8
+        j += i
+    inc i
+  dealloc(cast[pointer](sieve))
+  putText(a, $count)
+  count
+
+proc kernelSort(a: ptr JobArg): int =
+  ## Sorts the whitespace-separated integers of the input; the output is the sorted list, space separated; the value is how many.
+  let nums = cast[ptr UncheckedArray[int]](alloc0(MaxSortInts * 8))
+  var count = 0
+  var cur = 0
+  var neg = false
+  var inNum = false
+  for i in 0 .. a.inLen:
+    let c = if i < a.inLen: byteAt(a.inp, i) else: 32
+    if c >= 48 and c <= 57:
+      cur = cur * 10 + (c - 48)
+      inNum = true
+    elif c == 45 and not inNum:
+      neg = true
+    else:
+      if inNum and count < MaxSortInts:
+        nums[count] = (if neg: -cur else: cur)
+        inc count
+      cur = 0
+      neg = false
+      inNum = false
+  # insertion sort is fine for the capped size
+  for i in 1 ..< count:
+    let v = nums[i]
+    var j = i - 1
+    while j >= 0 and nums[j] > v:
+      nums[j + 1] = nums[j]
+      dec j
+    nums[j + 1] = v
+  var text = ""
+  for i in 0 ..< count:
+    if i > 0: text.add ' '
+    text.add $nums[i]
+  dealloc(cast[pointer](nums))
+  putText(a, text)
+  count
+
+proc runKernel(arg: pointer): int {.nimcall, raises.} =
+  let a = cast[ptr JobArg](arg)
+  case a.kind
+  of KindFnv1a: kernelFnv1a(a)
+  of KindPrimes: kernelPrimes(a)
+  of KindSort: kernelSort(a)
+  else: 0
+
+proc kindOf(name: string): int =
+  if name == "fnv1a": KindFnv1a
+  elif name == "primes": KindPrimes
+  elif name == "sort": KindSort
+  else: 0
+
+proc jobKinds*(): seq[string] = @["fnv1a", "primes", "sort"]
+
+# ---- tick thread -----------------------------------------------------------------------------------------------------------------------------
+
+proc enableJobs*(plan: ThreadPlan; shared: nil JobPool = nil) =
+  ## Starts the job set once: on `shared` (a pool another feature already runs; one worker pool is live per process) or on a pool of its own.
+  if gJobs != nil: return
+  if shared != nil and shared.workers > 0:
+    gJobs = newPlugJobsOn(shared, OwnerBase)
+  else:
+    gJobs = newPlugJobs(plan)
+
+proc ensureJobs() =
+  ## Default: inline (threads = 1). MC_PLUGIN_JOBS=1 gives the jobs the workers of the resolved thread plan (same inputs as the other pools).
+  if gJobs != nil: return
+  var plan = planThreads(0, 0, 1, -1, -1)
+  if getEnv("MC_PLUGIN_JOBS") == "1":
+    var envThreads = -1
+    let t = getEnv("MC_THREADS")
+    if t.len > 0:
+      envThreads = 0
+      for c in t:
+        if c >= '0' and c <= '9':
+          envThreads = envThreads * 10 + (ord(c) - ord('0'))
+    plan = planThreads(0, 0, countProcessors(), envThreads, -1)
+  enableJobs(plan)
+
+proc ownerIndex(name: string): int =
+  result = -1
+  for i in 0 ..< gOwners.len:
+    if gOwners[i].name == name and not gOwners[i].closed:
+      return i
+
+proc registerJobOwner*(name: string; native: bool): int =
+  ## Registers a plugin with the job set (idempotent while it is loaded). A reload gets a fresh handle.
+  ensureJobs()
+  result = ownerIndex(name)
+  if result >= 0: return
+  gOwners.add JobOwner(name: name, handle: registerPlugin(gJobs), native: native, closed: false)
+  result = gOwners.len - 1
+
+proc metaIndex(id: int): int =
+  result = -1
+  for i in 0 ..< gMeta.len:
+    if gMeta[i].id == id: return i
+
+proc textOf(a: ptr JobArg): string =
+  result = ""
+  if a.outp != nil:
+    for i in 0 ..< a.outLen:
+      result.add char(byteAt(a.outp, i))
+
+proc freeArg(a: ptr JobArg) =
+  if a.inp != nil: dealloc(a.inp)
+  if a.outp != nil: dealloc(a.outp)
+  dealloc(cast[pointer](a))
+
+proc onJobDone(plugin: int, ticket: int, value: int, failed: bool, ctx: pointer) {.nimcall.} =
+  ## Runs inside pollPlugJobs, on the tick thread, in ticket order.
+  let a = cast[ptr JobArg](ctx)
+  let m = metaIndex(a.id)
+  var ownerName = ""
+  var closed = true
+  if m >= 0:
+    let o = gMeta[m].owner
+    ownerName = gOwners[o].name
+    closed = gOwners[o].closed
+    if closed:
+      gMeta.delete(m)
+    else:
+      gMeta[m].state = (if failed: JobFailed else: JobDone)
+  if not closed:
+    gReady.add ReadyJob(id: a.id, owner: ownerName, value: value, failed: failed, text: textOf(a))
+  freeArg(a)
+
+proc submitJob*(owner: string; kind: string; input: string): int =
+  ## A job id (> 0), or -1 for an unknown kind, -2 for an input over MaxJobInput.
+  let k = kindOf(kind)
+  if k == 0: return -1
+  if input.len > MaxJobInput: return -2
+  let o = registerJobOwner(owner, false)
+  let a = cast[ptr JobArg](alloc0(sizeof(JobArg)))
+  a.id = gNextId
+  a.kind = k
+  a.inLen = input.len
+  let buf = cast[ptr UncheckedArray[uint8]](alloc0(input.len + 1))
+  for i in 0 ..< input.len:
+    buf[i] = uint8(ord(input[i]))
+  a.inp = cast[pointer](buf)
+  # the meta row exists before the submit: an inline job finishes inside it
+  gMeta.add JobMeta(id: a.id, owner: o, state: JobPending)
+  let ticket = submitPlugJob(gJobs, gOwners[o].handle, runKernel, cast[pointer](a), onJobDone, cast[pointer](a))
+  if ticket < 0:
+    gMeta.delete(gMeta.len - 1)
+    dealloc(a.inp)
+    dealloc(cast[pointer](a))
+    return -1
+  result = a.id
+  inc gNextId
+
+proc jobStatus*(id: int): int =
+  ## JobPending, JobDone or JobFailed (until the `on_job` delivery has happened), else JobUnknown.
+  let m = metaIndex(id)
+  if m < 0: JobUnknown else: gMeta[m].state
+
+proc pendingJobs*(owner: string): int =
+  let o = ownerIndex(owner)
+  if o < 0 or gJobs == nil: return 0
+  pendingPlugJobs(gJobs, gOwners[o].handle)
+
+proc tickJobs*(): seq[ReadyJob] =
+  ## Once per tick, tick thread: delivers the finished jobs of every plugin (per plugin in submission order) and answers them for the caller to
+  ## fire as `on_job`. Their status entries are forgotten here.
+  result = @[]
+  if gJobs == nil: return
+  discard pollAllPlugJobs(gJobs)
+  result = gReady
+  gReady = @[]
+  for r in result:
+    let m = metaIndex(r.id)
+    if m >= 0: gMeta.delete(m)
+
+proc closeOwner(o: int) =
+  ## Stops delivering for the plugin and waits (bounded) for its running jobs; their answers are dropped.
+  if gOwners[o].closed: return
+  gOwners[o].closed = true
+  var tries = 0
+  while gJobs != nil and pendingPlugJobs(gJobs, gOwners[o].handle) > 0 and tries < DrainMaxTries:
+    discard pollPlugJobs(gJobs, gOwners[o].handle)
+    if pendingPlugJobs(gJobs, gOwners[o].handle) > 0: winSleep(uint32(DrainSleepMs))
+    inc tries
+  var kept: seq[ReadyJob] = @[]
+  for r in gReady:
+    if r.owner != gOwners[o].name: kept.add r
+  gReady = kept
+
+proc dropJobOwner*(name: string) =
+  ## A plugin was unloaded: its jobs' answers are dropped and its running jobs are waited for.
+  let o = ownerIndex(name)
+  if o >= 0: closeOwner(o)
+
+proc dropJavaScriptJobOwners*() =
+  ## The shared JavaScript program was unloaded: every non-native plugin's jobs go.
+  for o in 0 ..< gOwners.len:
+    if not gOwners[o].native: closeOwner(o)
+
+proc shutdownJobs*() =
+  ## Server stop: every plugin's jobs are drained and dropped, workers of an own pool are joined.
+  for o in 0 ..< gOwners.len: closeOwner(o)
+  if gJobs != nil:
+    shutdownPlugJobs(gJobs)
+    gJobs = nil
+    gOwners = @[]
+    gMeta = @[]
+    gReady = @[]
+
+proc jobsWorkers*(): int =
+  if gJobs == nil: 0 else: workers(gJobs)
