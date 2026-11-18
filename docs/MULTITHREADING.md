@@ -450,3 +450,96 @@ The next candidate with real work in it, once phase 2 steps 2 to 4 land: a per-b
 
 **Verified:** `regionphasetest` (built and run on its own nimcache): a 10x10-chunk scripted world over 30 ticks with the gate off, on with 0 workers (inline pool), 1 worker and 4 workers (3 reps) gives identical per-tick sample digests and final world hashes; 7200 tasks, widest phase 4 shards, 0 failed, 0 guard violations; a margin-1 workload on overlapping 3x3 footprints gives identical slots at 1 and 4 workers; the footprint guard flags a deliberate out-of-footprint read. `leveltest` (getTickData unchanged results), `ownerguardtest` and `regionschedtest` re-run.
 **Not verified:** a full server build or any scenario with `MC_REGION_THREADS=1`; `servermod`/`worldmod` were only semantic-checked (`aowlmony check` of servermod passes, no code generation); any speedup; behaviour under `MC_THREAD_ASSERT=1` with a live server.
+
+## Measured on a real server
+
+What this measures: whether the opt-in thread gates speed up or slow down a real server process. One workload, one machine, one prebuilt
+executable; read "What is NOT shown" before quoting any number.
+
+**Machine and build.** Windows 11, 20 logical processors (desktop part, SMT on), `C:/m/int_final.exe` (prebuilt integration build of this
+tree, not rebuilt for this test). The machine was shared: other agents were building and running their own servers during the runs, so the
+CPU was never idle. Each run records the machine CPU percentage (2 s sample after boot, before the load): 23 to 66 percent across runs, with
+no pattern by configuration (`cpu_before_pct` in the raw file). Absolute numbers are therefore pessimistic; the comparison relies on the
+round-robin order (A B C ... A B C ...) so that drift hits all configs alike.
+
+**Commands.** `sh tools/bench_server.sh C:/m/int_final.exe 3` runs the matrix below round-robin, 3 rounds; `python tools/bench_server.py
+<exe> <label> [MC_*=v ...]` runs one configuration (env `BENCH_PORT` 26010, `BENCH_RADIUS` 8, `BENCH_FILLS` 12, `BENCH_RESULTS` jsonl file).
+Per run: a fresh world with seed 123456789, `view_distance` 6, `simulation_distance` 4, offline mode; RCON is the control channel. All `MC_*`
+variables are cleared, then set per configuration. Three phases, the first two each under its own `/profile start`/`stop`/`export` session
+(MSPT numbers are the profiler's per-tick session stats):
+
+1. **gen**: `/setworldspawn 0 80 0`, `/pregen start 8c` = 17 x 17 = 289 chunks. Wall time from the command until `/pregen status` reports done.
+2. **fill**: one idle bot (`tools/mcbot.py`, no scenario) joins at spawn so the chunks near it are loaded; then 12 `/fill` commands of 8192
+   blocks (32 x 8 x 32, stone/air alternating) around spawn: block updates, relight and chunk resends to that player. The commands go one
+   after another over RCON, so the phase wall time (about 20 s) is bounded by that and is not a throughput figure.
+3. **save**: `save-all` round trip right after the fill phase (`save_all_flush_s`), and a second one (`save_all_flush2_s`).
+
+Raw results: `docs/bench_server_results.jsonl`, 28 lines (the 24 matrix runs, then 4 extra `cw4_save` runs). One `base` run of round 2 lost its
+RCON connection (ConnectionResetError, cause not found) and was replaced by an extra `base` run at the end, so that one is not in round-robin
+position. Each line holds all phases, the profiler scopes and the environment.
+
+**Results** (mean of 3 runs, min-max in parentheses where useful; MSPT in ms):
+
+| config (env) | gen wall s | chunks/s | gen MSPT mean | gen MSPT p95 | gen MSPT max | tick-thread chunk-system ms during gen | fill MSPT mean | fill MSPT p95 | fill MSPT max | save-all s |
+|---|---|---|---|---|---|---|---|---|---|---|
+| base (`MC_CHUNK_WORKERS=0`) | 45.0 (44.0-46.8) | 6.4 | 0.13 | 0.29 | 1.5 | 44135 | 25.6 (23.2-28.5) | 57.5 | 152 (145-165) | 0.084 |
+| `MC_CHUNK_WORKERS=4` | 19.8 (18.8-20.9) | 14.6 | 0.18 | 0.61 | 3.8 (2.7-5.1) | 2506 | 24.4 (21.8-26.2) | 54.7 | 121 (99-149) | 0.067 |
+| `MC_CHUNK_WORKERS=8` | 15.2 (14.6-16.0) | 19.0 | 0.23 | 0.95 | 4.0 (3.6-4.4) | 2471 | 26.0 (24.4-28.5) | 58.1 | 122 (115-127) | 0.077 |
+| `MC_THREADS=0` (automatic) | 15.5 (14.8-16.6) | 18.7 | 0.24 | 0.90 | 3.7 (3.4-4.1) | 2422 | 25.2 (21.8-29.3) | 55.3 | 179 (153-214) | 0.078 |
+| `MC_THREADS=1` | 46.3 (45.1-47.5) | 6.2 | 0.14 | 0.31 | 4.9 (1.5-10.9) | 45324 | 26.1 (24.2-29.1) | 58.7 | 179 (164-197) | 0.072 |
+| workers 4 + `MC_SAVE_WORKERS=1` | 19.8 (18.5-20.9) | 14.6 | 0.18 | 0.54 | 5.9 (3.7-8.2) | 2363 | 24.6 / 1123.8 / 21.3 (3 runs) | 56 | 197 / 254351 / 126 (3 runs) | 0.073 |
+| workers 4 + `MC_LIGHT_WORKERS=1` | 18.9 (18.1-19.6) | 15.3 | 0.17 | 0.59 | 3.2 (2.1-4.6) | 2078 | 23.9 (23.2-24.9) | 54.1 | 131 (121-140) | 0.078 |
+| workers 4 + `MC_DIM_THREADS=1` | 20.5 (19.6-21.4) | 14.1 | **22.5 (21.6-24.1)** | **30.4** | **2986 (2505-3291)** | 2482 | 25.0 (24.5-25.6) | 53.9 | 133 (120-151) | 0.068 |
+
+The gates that need workers (`SAVE`, `LIGHT`, `DIM`) were run on top of `MC_CHUNK_WORKERS=4` (the pool is shared and sized by its first user, and a
+gate with 0 workers stays off); compare them with the `MC_CHUNK_WORKERS=4` row. The server printed no gate, refusal or pool line in any
+configuration (`gate_lines` is empty in all 28 runs), so "the gate engaged" is NOT confirmed by a log line, only suggested by behaviour
+(for `DIM`, clearly; for `LIGHT` and `SAVE` not at all).
+
+**What the data shows**
+
+* **Generation workers speed up pregen a lot.** 45.0 s with no workers, 19.8 s with 4 (2.3x), 15.2 s with 8 (3.0x), 15.5 s with `MC_THREADS=0`
+  (automatic; 3.0x). Runs of one config agree within about 7 percent; every worker config is far outside the baseline range. 8 workers beat 4 by
+  1.3x, not 2x.
+* **The tick thread's chunk-system time during generation falls from about 44 s (the whole run: generation ran on the tick thread) to about
+  2.5 s** with workers. It does not show as tick MSPT: that scope runs outside the profiled tick in this build, and MSPT stayed at 0.13 ms in
+  the baseline gen phase (20 tps). No player was online during gen, so whether the inline generation would stall a player's view was NOT
+  measured.
+* **Worker configs raise gen-phase MSPT a little** (mean 0.13 to 0.18 to 0.24 ms, p95 0.29 to 0.6 to 0.9 ms; max a few ms): still tiny.
+* **`MC_THREADS=1` equals the baseline** (46.3 s vs 45.0 s).
+* **Fill phase (block updates, relight, player resend): no gate changed it.** Mean MSPT 24 to 26 ms, p95 54 to 59 ms, max 120 to 180 ms in every
+  config, `MC_LIGHT_WORKERS=1` included (23.9 ms, inside the others' range). With 3 runs per config and 20-30 percent spread, the max
+  differences (e.g. 179 for `MC_THREADS=0/1` vs 152 for base) are not distinguishable from noise. So no speedup of the tick-bound part of this
+  workload is shown. For `MC_LIGHT_WORKERS=1` either relight is not the dominant cost of this fill or the job path was not taken (no counter
+  is exposed, not checked).
+* **`save-all`** took 0.06 to 0.09 s in every config: the world was nearly all saved already (pregen unloading writes the chunks), so it is a
+  near-empty flush. `MC_SAVE_WORKERS=1` is NOT shown to help or hurt a save of a large dirty world.
+
+**Slowdowns and anomalies (as found)**
+
+* **`MC_DIM_THREADS=1` slows the tick during generation: mean MSPT 22.5 ms vs 0.18 ms for the same workers without it, p95 30 ms, and single
+  ticks of 2.5 to 3.3 s in all 3 runs.** The profiler puts 9 s of the 20 s gen phase in the "tick world" scope. Reading (hypothesis, not
+  tested): the dimension jobs queue on the same pool as the generation batches and the tick thread waits at the join behind generation
+  work. Generation itself was not slower (20.5 s vs 19.8 s). In the fill phase, with no generation load, it is neutral (25.0 ms vs 24.4 ms).
+  Do not enable it with heavy generation on the shared pool. Nothing here tests it with several busy dimensions, where it could help.
+* **`MC_SAVE_WORKERS=1` (with 4 workers): 2 of 7 runs stalled 236 to 254 s in the fill phase** (one tick of 236 or 254 s; the phase took 256 or
+  275 s instead of 19 s). The other 5 runs were normal. The server printed no error and recovered; generation and `save-all` were normal in the
+  stalled runs. Cause unknown (the stall is inside a tick but outside any profiler scope; no thread dump was taken). It did not occur in
+  the 21 matrix runs of the other configs. Treat `MC_SAVE_WORKERS=1` as unsafe on a live server until this is understood. The `cw4_save`
+  table row's mean fill MSPT hides this; use the three listed values.
+* One `base` run (round 2) lost its RCON connection (`ConnectionResetError`); reason unknown, not seen again in the later 27 runs (it could
+  be a server crash or a script problem, not distinguished).
+
+**What is NOT shown**
+
+* One workload, one machine: a fresh seed, one idle player, an almost empty tick (0.1 to 0.2 ms) outside the fill phase. No mobs, redstone,
+  fluids, several players flying into new terrain, no real pathing mob (so `MC_PATH_WORKERS` was not run), no net load (`MC_NET_WORKERS`
+  not run: one bot is no net load), no `MC_EROSION_WORKERS`, `MC_SOLVER_WORKERS` or `MC_REGION_THREADS` runs (no matching load).
+* No benefit of `SAVE`, `LIGHT` or `DIM` is shown (one harm, one unexplained stall, two neutral results); no save of a large dirty world;
+  no relight of a big edit (the 12 fills are about 100k blocks); no player-driven generation; only 4 and 8 workers (and automatic) as points.
+* Generation speed is the server's own throttled pregen of radius 8 chunks (up to 256 tickets in flight), not view-distance generation by a
+  player, and one radius.
+* Noise: gen wall within about 7 percent between runs of a config; fill MSPT mean +-15 percent and max much more. 3 runs per config (7 for
+  `cw4_save`) are too few for p99 or max statements except the large effects above. The machine was shared and busy (23-66 percent CPU before
+  each run, other servers running).
+* The "chunk system / IO" 44 s is a profiler scope outside the tick that sums to about the run wall time because generation ran inline on the tick thread; it is not a per-tick cost.
