@@ -1,0 +1,131 @@
+{.feature: "lenientnils".}
+
+## Region footprint scheduler (docs/MULTITHREADING.md phase 5, generic part): no world access, no tick wiring.
+##
+## A task has a home chunk and a body. Its footprint is the square of chunks within `margin` (Chebyshev) of the home chunk: what the body
+## may read or write. `runRegionTasks` groups tasks by tile (`planPhases`, `tileSize > 2 * margin`), so the footprints of two tiles of one
+## colour never overlap. It then runs the 4 colour phases one after another; inside a phase every tile is one pool job that runs its tasks
+## one by one in task-id order; the phase ends when all of its jobs are drained (the join). Tasks of one tile share footprints and so never
+## run concurrently either.
+##
+## Determinism: the plan (phase, tile and in-tile order) depends only on the task list, never on the thread count, and each task writes
+## its own result slot, so threads=1 (every job inline on the caller) and threads=N give identical `results`, merged in task-id order.
+## A body must only touch state inside its footprint (and its own `arg`); that is the caller's contract, `FootprintGuard` helps tests check it.
+##
+## One owner (the caller) per call; bodies run on workers or inline and must not raise out (jobpool catches and flags them: `failed`).
+
+import std/tables
+import jobpool
+import regions
+
+type
+  RegionTask* = object
+    home*: ChunkCoord
+    body*: Job               ## `proc(arg: pointer): int {.nimcall, raises.}`
+    arg*: pointer
+
+  RegionRunStats* = object
+    phases*: int             ## phases run (empty colours omitted)
+    shards*: int
+    tasks*: int
+    maxShardsInPhase*: int   ## the parallelism available at best
+    failed*: int
+    planned*: bool           ## false when tileSize/margin were unsafe: nothing ran
+
+  ShardCtx = object
+    run: ptr RunState
+    first: int               ## index into RunState.order
+    count: int
+
+  RunState = object
+    tasks: ptr RegionTask    ## base of the caller's task array
+    order: ptr int           ## task indices, shard after shard
+    values: ptr int          ## per task result
+    failedFlags: ptr bool    ## per task
+
+proc floorDivS(a, b: int): int =
+  if a >= 0: a div b else: -((-a + b - 1) div b)
+
+proc tileKey(tx, tz: int): int64 = (int64(tx) shl 32) xor (int64(tz) and 0xFFFFFFFF'i64)
+
+proc autoTileSize*(margin: int): int =
+  ## Smallest safe tile: the one with the most shards.
+  2 * margin + 1
+
+proc runShard(arg: pointer): int {.nimcall, raises.} =
+  let c = cast[ptr ShardCtx](arg)
+  let rs = c.run
+  for i in c.first ..< c.first + c.count:
+    let ti = cast[ptr int](cast[int](rs.order) + i * sizeof(int))[]
+    let t = cast[ptr RegionTask](cast[int](rs.tasks) + ti * sizeof(RegionTask))
+    let vp = cast[ptr int](cast[int](rs.values) + ti * sizeof(int))
+    let fp = cast[ptr bool](cast[int](rs.failedFlags) + ti * sizeof(bool))
+    try:
+      vp[] = t.body(t.arg)
+    except:
+      fp[] = true
+  c.count
+
+proc runRegionTasks*(pool: JobPool, owner: int, tasks: seq[RegionTask], margin, tileSize: int,
+                     results: var seq[int], stats: var RegionRunStats) =
+  ## Runs every task once and fills `results[i]` with the value of `tasks[i]` (0 for a body that raised). `tileSize` 0 = `autoTileSize`.
+  ## With unsafe parameters nothing runs and `stats.planned` is false. Blocks the caller until every phase is joined.
+  stats = RegionRunStats()
+  results = newSeq[int](tasks.len)
+  let ts = if tileSize <= 0: autoTileSize(margin) else: tileSize
+  if tasks.len == 0 or not validTileSize(ts, margin):
+    stats.planned = tasks.len == 0
+    return
+  stats.planned = true
+  # Task indices per home chunk, in id order (several tasks may share a chunk).
+  var active: seq[ChunkCoord] = @[]
+  var byTile = initTable[int64, seq[int]]()   # tile -> task indices in id order
+  for i in 0 ..< tasks.len:
+    let h = tasks[i].home
+    let k = tileKey(floorDivS(h.x, ts), floorDivS(h.z, ts))
+    if not byTile.hasKey(k):
+      byTile[k] = @[]
+    var l = byTile.getOrDefault(k)
+    l.add i
+    byTile[k] = l
+    active.add h
+  let phases = planPhases(active, ts, margin)
+  var order: seq[int] = @[]
+  var ctxs: seq[ShardCtx] = @[]
+  var phaseEnd: seq[int] = @[]       # ctx count at the end of each phase
+  var failedFlags = newSeq[bool](tasks.len)
+  var values = newSeq[int](tasks.len)
+  var rs = RunState()
+  for ph in phases:
+    for sh in ph.shards:
+      let first = order.len
+      for i in byTile.getOrDefault(tileKey(sh.tileX, sh.tileZ)):
+        order.add i
+      ctxs.add ShardCtx(first: first, count: order.len - first)
+    phaseEnd.add ctxs.len
+  rs.tasks = unsafeAddr tasks[0]
+  rs.order = unsafeAddr order[0]
+  rs.values = unsafeAddr values[0]
+  rs.failedFlags = unsafeAddr failedFlags[0]
+  for i in 0 ..< ctxs.len:
+    ctxs[i].run = addr rs
+  stats.phases = phases.len
+  stats.shards = ctxs.len
+  stats.tasks = tasks.len
+  var start = 0
+  var sink: seq[JobResult] = @[]
+  for p in 0 ..< phaseEnd.len:
+    let stop = phaseEnd[p]
+    if stop - start > stats.maxShardsInPhase:
+      stats.maxShardsInPhase = stop - start
+    for s in start ..< stop:
+      submit(pool, owner, runShard, addr ctxs[s])
+    var got = 0
+    while got < stop - start:
+      sink.setLen(0)
+      got += drainDone(pool, owner, sink)
+    start = stop
+  for i in 0 ..< tasks.len:
+    results[i] = values[i]
+    if failedFlags[i]:
+      inc stats.failed

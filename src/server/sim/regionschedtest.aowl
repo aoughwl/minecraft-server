@@ -1,0 +1,139 @@
+{.feature: "lenientnils".}
+
+## Footprint scheduler: identical results at threads 1/2/4, overlapping footprints never concurrent, failures contained.
+import std/syncio
+import std/atomics
+import jobpool
+import regions
+import regionsched
+import threadcfg
+
+const
+  Grid = 40
+  Margin = 2
+
+var
+  gWorld: seq[int] = @[]        ## per chunk value, read and written by task bodies inside their footprint
+  gOcc: seq[int] = @[]          ## per chunk: number of tasks currently holding it in their footprint
+  gViolations = 0
+  gRuns = 0
+
+proc cell(x, z: int): int = z * Grid + x
+
+proc body(arg: pointer): int {.nimcall, raises.} =
+  let id = cast[int](arg) - 1
+  let hx = id * 7 mod 31 + 4    # recomputed from id so the body needs no table
+  let hz = id * 13 mod 29 + 4
+  # take the footprint
+  for z in hz - Margin .. hz + Margin:
+    for x in hx - Margin .. hx + Margin:
+      if atomicFetchAdd(gOcc[cell(x, z)], 1, moSequentiallyConsistent) != 0:
+        discard atomicFetchAdd(gViolations, 1, moSequentiallyConsistent)
+  discard atomicFetchAdd(gRuns, 1, moSequentiallyConsistent)
+  var acc = 0
+  for z in hz - Margin .. hz + Margin:
+    for x in hx - Margin .. hx + Margin:
+      let c = cell(x, z)
+      acc = (acc * 31 + gWorld[c]) mod 1000000007
+      gWorld[c] = (gWorld[c] * 17 + id + 1) mod 1000000007
+  var spin = 0
+  for i in 0 ..< 20000:
+    spin = (spin + i * acc) mod 1009
+  for z in hz - Margin .. hz + Margin:
+    for x in hx - Margin .. hx + Margin:
+      discard atomicFetchAdd(gOcc[cell(x, z)], -1, moSequentiallyConsistent)
+  acc + (spin and 0)
+
+proc raiser(arg: pointer): int {.nimcall, raises.} =
+  raise BadOperation
+
+proc homeOf(id: int): ChunkCoord =
+  ChunkCoord(x: id * 7 mod 31 + 4, z: id * 13 mod 29 + 4)
+
+var failures = 0
+proc check(ok: bool, name: string) =
+  if ok:
+    echo "PASS " & name
+  else:
+    echo "FAIL " & name
+    inc failures
+
+proc worldHash(): int =
+  var h = 7
+  for v in gWorld:
+    h = (h * 1000003 + v) mod 1000000007
+  h
+
+proc runOnce(threads, n: int; res: var seq[int]; st: var RegionRunStats): int =
+  gWorld = newSeq[int](Grid * Grid)
+  for i in 0 ..< gWorld.len: gWorld[i] = i * 3 + 1
+  gOcc = newSeq[int](Grid * Grid)
+  gViolations = 0
+  gRuns = 0
+  var tasks: seq[RegionTask] = @[]
+  for id in 0 ..< n:
+    tasks.add RegionTask(home: homeOf(id), body: body, arg: cast[pointer](id + 1))
+  let p = newJobPool(threads)
+  runRegionTasks(p, 0, tasks, Margin, 0, res, st)
+  shutdown(p)
+  worldHash()
+
+block:
+  var base: seq[int] = @[]
+  var baseSt = RegionRunStats()
+  let baseHash = runOnce(1, 300, base, baseSt)
+  check(baseSt.planned and baseSt.tasks == 300 and gRuns == 300, "threads=1 ran every task once")
+  check(baseSt.phases > 1 and baseSt.maxShardsInPhase > 1, "workload has several phases and parallel shards (phases " & $baseSt.phases & ", shards " & $baseSt.shards & ", widest " & $baseSt.maxShardsInPhase & ")")
+  check(gViolations == 0, "threads=1 no footprint overlap")
+  for threads in [2, 4]:
+    for rep in 0 ..< 5:
+      var r: seq[int] = @[]
+      var st = RegionRunStats()
+      let h = runOnce(threads, 300, r, st)
+      check(h == baseHash and r == base, "threads=" & $threads & " rep " & $rep & " identical world hash and results")
+      check(gViolations == 0 and gRuns == 300, "threads=" & $threads & " rep " & $rep & " no concurrent overlapping footprints")
+      check(st.phases == baseSt.phases and st.shards == baseSt.shards, "threads=" & $threads & " same plan")
+
+block:
+  # tasks that share a home chunk keep id order
+  var res: seq[int] = @[]
+  var st = RegionRunStats()
+  gWorld = newSeq[int](Grid * Grid)
+  gOcc = newSeq[int](Grid * Grid)
+  var tasks: seq[RegionTask] = @[]
+  for id in 0 ..< 20:
+    tasks.add RegionTask(home: ChunkCoord(x: 10, z: 10), body: body, arg: cast[pointer](1))
+  let p = newJobPool(4)
+  runRegionTasks(p, 0, tasks, Margin, 0, res, st)
+  shutdown(p)
+  check(gViolations == 0 and st.shards == 1 and st.phases == 1, "same-tile tasks run serially in one shard")
+
+block:
+  var res: seq[int] = @[]
+  var st = RegionRunStats()
+  let p = newJobPool(3)
+  var tasks: seq[RegionTask] = @[]
+  tasks.add RegionTask(home: ChunkCoord(x: 1, z: 1), body: raiser, arg: nil)
+  tasks.add RegionTask(home: ChunkCoord(x: 20, z: 20), body: raiser, arg: nil)
+  runRegionTasks(p, 0, tasks, Margin, 0, res, st)
+  check(st.failed == 2 and res == @[0, 0], "raising bodies are contained and counted")
+  runRegionTasks(p, 0, tasks, 2, 4, res, st)
+  check(not st.planned, "unsafe tile size runs nothing")
+  runRegionTasks(p, 0, @[], 2, 0, res, st)
+  check(st.planned and res.len == 0, "empty task list")
+  shutdown(p)
+
+block:
+  let tp = planThreads(0, 0, 8, 4, -1)
+  var r1: seq[int] = @[]
+  var r2: seq[int] = @[]
+  var s1 = RegionRunStats()
+  var s2 = RegionRunStats()
+  let h1 = runOnce(1, 120, r1, s1)
+  let h2 = runOnce(tp.threads, 120, r2, s2)
+  check(tp.threads == 4 and h1 == h2 and r1 == r2, "planThreads-sized pool matches threads=1")
+
+if failures > 0:
+  echo "FAILED " & $failures
+  quit(1)
+echo "regionschedtest ok"
