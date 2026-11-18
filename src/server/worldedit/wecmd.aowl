@@ -7,9 +7,12 @@
 ##   //stack [count] [direction] [-a]   //move [count] [direction] [leave] [-s]
 ##   //count <mask>   //distribution [-d]   //undo [n]   //redo [n]
 ##
-## A client types `//set stone`, which reaches the server as the command string `/set stone`; the dispatcher drops one more leading
-## slash (cmddispatch.handleCommand), so the commands are registered as `set`, `pos1`, ... (`/set` works too). The same logic is also reachable as `/we <name> <args>` (for consoles and for clients that
-## cannot type the double slash).
+## A client types `//set stone`, which reaches the server as the command string `/set stone`. The commands are registered in
+## the node dispatcher under root literals named `/set`, `/pos1`, ... (as WorldEdit for Fabric does), so they are part of the
+## command tree the client receives: it knows them, completes them and shows their arguments (see "the command tree" below).
+## cmddispatch.handleCommand keeps the leading slash of a command whose name has one. The same logic is also reachable as
+## `/we <name> <args>` (for consoles and for clients that cannot type the double slash). `/plugins` lists WorldEdit as a built-in
+## server mod and `/help WorldEdit` lists its commands.
 ##
 ## The wand is a wooden axe: left click on a block sets position 1, right click on a block sets position 2 (the click does
 ## not break or use the block). The server also sends the selection to clients on the `worldedit:cui` channel: a client that
@@ -18,7 +21,9 @@
 
 import ../../util/closureset
 import std/[options, strutils, math]
-import ../../command/[cmderrors, cmdsource, fallbackdispatch, args]
+import ../../command/[cmderrors, cmdsource, cmdtree, argument_builder, argtype, coordinates, string_reader, suggestion, cmddispatch,
+  builtinmods]
+import ../../protocol/java/client/play/commands
 import ../../util/[vector3, permission]
 import ../../util/text/[textbase, text, color]
 import ../../util/math/position
@@ -407,37 +412,255 @@ proc runCommand*(sender: CommandSender; name, line: string) =
   else:
     sayBad(sender, "Unknown WorldEdit command " & name & ".")
 
-proc commandTreeFor(commandName: string; registered: string): CommandTree =
-  let run = proc(sender: CommandSender; server: nil CommandServer; args: ConsumedArgs): CommandResult {.closure.} =
-    var line = ""
-    discard findMsg(args, ArgRest, line)
-    runCommand(sender, commandName, line)
-    cmdSuccess(1'i32)
-  then(execute(newCommandTree([registered], Description), run), execute(argument(ArgRest, newMsgArgConsumer()), run))
+# ---- the command tree ------------------------------------------------------------------------------------------------
+#
+# Every command is a real node of the brigadier dispatcher, under a root literal whose name starts with a slash (`/set`), as
+# WorldEdit for Fabric registers them: the client then knows `//set`, completes it and hints its arguments. The arguments are
+# typed for the client (block positions, integers, directions with suggestions, patterns with block-name suggestions asked of
+# the server); the executors put the parsed values back into one line and hand it to `runCommand`, the same code `/we` uses.
+#
+# A pattern or mask that is the last argument is a greedy string. One that is followed by more arguments (`//replace <from>
+# <to>`, `//sphere <pattern> <radius>`) goes to the client as a `score_holder`: the only vanilla parser that takes any run of
+# characters up to a space, so `50%stone,dirt` or `!air` is not marked as an error; its completions come from the server.
 
-proc weAllTree(): CommandTree =
+const
+  ArgPos = "pos"
+  ArgCoords = "coords"
+  ArgPattern = "pattern"
+  ArgMask = "mask"
+  ArgFrom = "from"
+  ArgTo = "to"
+  ArgRadius = "radius"
+  ArgRadii = "radii"
+  ArgHeight = "height"
+  ArgLeave = "leave"
+  ArgDegrees = "degrees"
+  ArgDirection = "direction"
+  ArgCount = "count"
+  ArgTimes = "times"
+  DirectionNames = ["me", "north", "south", "east", "west", "up", "down"]
+  MaxBlockSuggestions = 100
+
+proc expectedValueError(): CommandErrorType = literalErrorType("Expected a value")
+
+proc tokenType(client: JavaClientArgumentType; examples: seq[string]): AnyArgumentType =
+  ## Any characters up to the next space; the client parses the argument as `client`.
+  AnyArgumentType(clientParser: client, overrideSuggestion: none[SuggestionProviders](), examples: examples,
+    parseProc: proc(r: var StringReader): CmdResult[ArgValue] {.closure.} =
+      let start = cursor(r)
+      readUntilSpace(r)
+      let stop = cursor(r)
+      if stop == start:
+        return cmdFail[ArgValue](create(expectedValueError(), r))
+      cmdOk[ArgValue](boxString(r.str[start ..< stop])))
+
+proc anyTokenType(examples: seq[string]): AnyArgumentType =
+  tokenType(JavaClientArgumentType(kind: atScoreHolder, flags: ScoreHolderFlagAllowMultiple), examples)
+
+proc blockSuggestions(context: CommandContext; builder: SuggestionsBuilder): Suggestions =
+  ## The block names that complete the element being typed: the text after the last `,`, `%` or `!` outside of `[...]`.
+  var b = builder
+  let typed = remaining(builder)
+  var cut = 0
+  var depth = 0
+  var i = 0
+  while i < typed.len:
+    let c = typed[i]
+    if c == '[':
+      inc depth
+    elif c == ']':
+      dec depth
+    elif depth == 0 and (c == ',' or c == '%' or c == '!'):
+      cut = i + 1
+    inc i
+  if depth > 0:
+    return build(b)
+  let head = typed[0 ..< cut]
+  var tail = toLowerAscii(typed[cut ..< typed.len])
+  var ns = ""
+  if tail.startsWith("minecraft:"):
+    ns = "minecraft:"
+    tail = tail[10 ..< tail.len]
+  var shown = 0
+  var id = 0
+  let n = blockCount()
+  while id < n and shown < MaxBlockSuggestions:
+    let name = blockName(id)
+    if name.startsWith(tail):
+      b = suggest(b, head & ns & name)
+      inc shown
+    inc id
+  build(b)
+
+proc directionSuggestions(context: CommandContext; builder: SuggestionsBuilder): Suggestions =
+  var b = builder
+  let typed = remainingLowercase(builder)
+  for d in DirectionNames:
+    if d.startsWith(typed):
+      b = suggest(b, d)
+  build(b)
+
+proc greedyPattern(name: string): ArgumentBuilder =
+  suggests(argument(name, newStringArgumentType(spGreedyPhrase)), blockSuggestions)
+
+proc tokenPattern(name: string): ArgumentBuilder =
+  suggests(argument(name, anyTokenType(@["stone", "50%stone,50%dirt", "oak_log[axis=y]"])), blockSuggestions)
+
+proc directionArg(): ArgumentBuilder =
+  suggests(argument(ArgDirection, newStringArgumentType(spSingleWord)), directionSuggestions)
+
+proc argText(c: CommandContext; name: string): string =
+  ## The text of an argument as the user meant it ("" when it was not given); a block position comes back resolved, `x y z`.
+  let s = getString(c, name)
+  if s.isOk:
+    return s.value
+  let i = getInt(c, name)
+  if i.isOk:
+    return $i.value
+  let p = getBlockPos(c, name)
+  if p.isOk:
+    return $p.value.vec.x & " " & $p.value.vec.y & " " & $p.value.vec.z
+  ""
+
+proc weExec(name, flags: string; argNames: seq[string]): CommandExecutor =
+  ## Rebuilds `[-flags] <args...>` from the parsed arguments and runs the WorldEdit command.
+  result = proc(context: CommandContext): CmdResult[int32] {.closure.} =
+    var line = ""
+    if flags.len > 0:
+      line = "-" & flags
+    for a in argNames:
+      let t = argText(context, a)
+      if t.len > 0:
+        if line.len > 0:
+          line.add(' ')
+        line.add(t)
+    runCommand(context.source.output, name, line)
+    cmdOk[int32](1'i32)
+
+proc weRoot(name, description: string): ArgumentBuilder =
+  requires(command("/" & name, description), Permission0)
+
+proc flagNode(parent: ArgumentBuilder; flags: string): ArgumentBuilder =
+  ## The node the arguments hang off for this flag set: the command itself, or its `-<flags>` literal.
+  if flags.len == 0: parent else: literal("-" & flags)
+
+proc attachFlag(parent, node: ArgumentBuilder; flags: string): ArgumentBuilder =
+  if flags.len == 0: node else: then(parent, node)
+
+proc plainCommand(name, description: string): ArgumentBuilder =
+  executes(weRoot(name, description), weExec(name, "", @[]))
+
+proc posCommand(name, description: string): ArgumentBuilder =
+  result = executes(weRoot(name, description), weExec(name, "", @[]))
+  result = then(result, executes(argument(ArgPos, newBlockPosArgumentType()), weExec(name, "", @[ArgPos])))
+  result = then(result, executes(argument(ArgCoords, anyTokenType(@["10,64,-3"])), weExec(name, "", @[ArgCoords])))
+
+proc patternCommand(name, description, argName: string; optional: bool): ArgumentBuilder =
+  ## `//<name> <pattern>`, or `//<name> [pattern]` when `optional`.
+  result = weRoot(name, description)
+  if optional:
+    result = executes(result, weExec(name, "", @[]))
+  result = then(result, executes(greedyPattern(argName), weExec(name, "", @[argName])))
+
+proc replaceCommand(): ArgumentBuilder =
+  then(weRoot("replace", "Replaces the blocks matching a mask in the selection with a pattern."),
+    then(tokenPattern(ArgFrom), executes(greedyPattern(ArgTo), weExec("replace", "", @[ArgFrom, ArgTo]))))
+
+proc shapeCommand(name, description: string; flagSets: seq[string]; withHeight: bool): ArgumentBuilder =
+  ## `//sphere [-h|-r|-hr] <pattern> <radius>|<rx,ry,rz>`, `//cyl [-h] <pattern> <radius>|<rx,rz> [height]`.
+  result = weRoot(name, description)
+  for flags in flagSets:
+    let args = @[ArgPattern, ArgRadius, ArgRadii, ArgHeight]
+    var radius = executes(argument(ArgRadius, newIntegerArgumentType(1'i32)), weExec(name, flags, args))
+    var radii = executes(argument(ArgRadii, anyTokenType(@["5", "5,3,5"])), weExec(name, flags, args))
+    if withHeight:
+      radius = then(radius, executes(argument(ArgHeight, newIntegerArgumentType(1'i32)), weExec(name, flags, args)))
+      radii = then(radii, executes(argument(ArgHeight, newIntegerArgumentType(1'i32)), weExec(name, flags, args)))
+    let pattern = then(then(tokenPattern(ArgPattern), radius), radii)
+    let at = flagNode(result, flags)
+    result = attachFlag(result, then(at, pattern), flags)
+
+proc pasteCommand(): ArgumentBuilder =
+  result = executes(weRoot("paste", "Pastes the clipboard where you stand (-a skips air, -s selects the pasted region)."),
+    weExec("paste", "", @[]))
+  for flags in ["a", "s", "as"]:
+    result = then(result, executes(literal("-" & flags), weExec("paste", flags, @[])))
+
+proc stackOrMove(name, description: string; flagSets: seq[string]): ArgumentBuilder =
+  ## `//stack [-a] [count] [direction]`, `//move [-s] [count] [direction] [leave]`.
+  result = weRoot(name, description)
+  for flags in flagSets:
+    let args = @[ArgCount, ArgDirection, ArgLeave]
+    var dirAfterCount = executes(directionArg(), weExec(name, flags, args))
+    if name == "move":
+      dirAfterCount = then(dirAfterCount, executes(greedyPattern(ArgLeave), weExec(name, flags, args)))
+    let count = then(executes(argument(ArgCount, newIntegerArgumentType(1'i32)), weExec(name, flags, args)), dirAfterCount)
+    let dirOnly = executes(directionArg(), weExec(name, flags, args))
+    let at = executes(flagNode(result, flags), weExec(name, flags, @[]))
+    result = attachFlag(result, then(then(at, count), dirOnly), flags)
+
+proc historyCommand(name, description: string): ArgumentBuilder =
+  then(executes(weRoot(name, description), weExec(name, "", @[])),
+    executes(argument(ArgTimes, newIntegerArgumentType(1'i32)), weExec(name, "", @[ArgTimes])))
+
+proc weAllExecutor(context: CommandContext): CmdResult[int32] =
   ## `/we <name> <args>`: the same commands for a console or a client that cannot type the double slash.
-  let run = proc(sender: CommandSender; server: nil CommandServer; args: ConsumedArgs): CommandResult {.closure.} =
-    var line = ""
-    discard findMsg(args, ArgRest, line)
-    let words = line.splitWhitespace()
-    if words.len == 0:
-      var all = ""
-      for n in CommandNames:
-        all.add(n & " ")
-      say(sender, "/we <command> [args]: " & all)
-    else:
-      var rest = ""
-      for i in 1 ..< words.len:
-        rest.add(words[i] & " ")
-      runCommand(sender, words[0].strip(chars = {'/'}), rest)
-    cmdSuccess(1'i32)
-  then(execute(newCommandTree(["we", "worldedit"], Description), run), execute(argument(ArgRest, newMsgArgConsumer()), run))
+  let sender = context.source.output
+  var line = ""
+  let given = getString(context, ArgRest)
+  if given.isOk:
+    line = given.value
+  let words = line.splitWhitespace()
+  if words.len == 0:
+    var all = ""
+    for n in CommandNames:
+      all.add("//" & n & " ")
+    say(sender, "/we <command> [args]: " & all)
+  else:
+    var rest = ""
+    for i in 1 ..< words.len:
+      rest.add(words[i] & " ")
+    runCommand(sender, words[0].strip(chars = {'/'}), rest)
+  cmdOk[int32](1'i32)
 
-proc registerWorldEditCommands*(fallback: FallbackDispatcher) =
+proc registerWorldEditCommands*(d: CommandDispatcher) =
+  ## Every WorldEdit command as a node of the dispatcher (so the client's command tree has it), op level 2.
+  discard register(d, posCommand("pos1", "Sets position 1 of the selection (your block, or the coordinates given)."))
+  discard register(d, posCommand("pos2", "Sets position 2 of the selection (your block, or the coordinates given)."))
+  discard register(d, plainCommand("wand", "Gives you the selection wand (a wooden axe)."))
+  discard register(d, plainCommand("sel", "Clears the selection."))
+  discard register(d, plainCommand("desel", "Clears the selection."))
+  discard register(d, plainCommand("size", "Shows the size of the selection."))
+  discard register(d, patternCommand("set", "Sets every block of the selection to a pattern.", ArgPattern, false))
+  discard register(d, replaceCommand())
+  discard register(d, patternCommand("walls", "Builds the four walls of the selection.", ArgPattern, false))
+  discard register(d, patternCommand("hollow", "Hollows out the selection, leaving a one-block shell (air or a pattern inside).",
+    ArgPattern, true))
+  discard register(d, shapeCommand("sphere", "Builds a sphere centred on you (-h hollow, -r raised).", @["", "h", "r", "hr"], false))
+  discard register(d, shapeCommand("cyl", "Builds a cylinder standing on your block (-h hollow).", @["", "h"], true))
+  discard register(d, plainCommand("copy", "Copies the selection to your clipboard, relative to where you stand."))
+  discard register(d, patternCommand("cut", "Copies the selection and clears it (to air, or the pattern given).", ArgLeave, true))
+  discard register(d, pasteCommand())
+  discard register(d, then(weRoot("rotate", "Rotates the clipboard around the vertical axis (multiples of 90)."),
+    executes(argument(ArgDegrees, newIntegerArgumentType()), weExec("rotate", "", @[ArgDegrees]))))
+  discard register(d, then(executes(weRoot("flip", "Flips the clipboard along a direction (default: where you look)."),
+    weExec("flip", "", @[])), executes(directionArg(), weExec("flip", "", @[ArgDirection]))))
+  discard register(d, stackOrMove("stack", "Repeats the selection along a direction (-a skips air).", @["", "a"]))
+  discard register(d, stackOrMove("move", "Moves the selection along a direction (-s moves the selection too).", @["", "s"]))
+  discard register(d, then(weRoot("count", "Counts the blocks in the selection that match a mask."),
+    executes(suggests(argument(ArgMask, newStringArgumentType(spGreedyPhrase)), blockSuggestions), weExec("count", "", @[ArgMask]))))
+  discard register(d, then(executes(weRoot("distribution", "Lists the blocks of the selection by count (-d by block state)."),
+    weExec("distribution", "", @[])), executes(literal("-d"), weExec("distribution", "d", @[]))))
+  discard register(d, historyCommand("undo", "Undoes your last edits."))
+  discard register(d, historyCommand("redo", "Redoes edits you undid."))
+  let weNode = then(executes(requires(command("we", Description), Permission0), weAllExecutor),
+    executes(argument(ArgRest, newStringArgumentType(spGreedyPhrase)), weAllExecutor))
+  discard registerWithAliases(d, weNode, ["worldedit"])
+  var names: seq[string] = @[]
   for n in CommandNames:
-    register(fallback, commandTreeFor(n, n), Permission0)
-  register(fallback, weAllTree(), Permission0)
+    names.add("/" & n)
+  names.add("we")
+  registerBuiltinMod(BuiltinMod(name: "WorldEdit", version: "1.0", description: Description, commands: names))
 
 # ---- the wand and the cui handshake ----------------------------------------------------------------------------------
 
