@@ -551,6 +551,7 @@ def worldedit_more(s):
         _worldedit_more_body(s)
     finally:
         s.command('tp @s %.2f %.2f %.2f' % home)
+        s.command('clear @s')      # no stick (or bound brush) left in slot 0 for the scenarios after
         time.sleep(0.5)
 
 
@@ -701,6 +702,8 @@ def _worldedit_more_body(s):
 
     # ---- //copy -e and //paste -e with an armor stand
     ex = bx + 34
+    # the clipboard keeps the copy's offset from the player, so copy from beside the box: the paste 10 up lands in loaded chunks
+    _tp(s, ex + 1.5, y0 + 3, bz + 1.5)
     sel(ex, y0, bz, ex + 2, y0 + 2, bz + 2)
     s.command('summon minecraft:armor_stand %d.5 %d %d.5 {NoGravity:1b}' % (ex + 1, y0 + 1, bz + 1))
     time.sleep(0.5)
@@ -711,11 +714,12 @@ def _worldedit_more_body(s):
     time.sleep(0.5)
     s.check(not any('entities' in t for t in s.w.chat[n:]), 'a plain //copy copied entities')
     _we(s, 'copy -e', '1 entities copied.', '//copy -e again')
-    _tp(s, ex + 1.5, y0 + 10, bz + 1.5)
+    _tp(s, ex + 1.5, y0 + 13, bz + 1.5)
     _we(s, 'paste -e', '1 entities pasted.', '//paste -e')
 
     # ---- brushes and tools on a right click
     tx, ty, tz = bx + 40, y0, bz
+    _tp(s, tx + 0.5, ty + 3, tz + 0.5)          # a click on a block must be within reach
     s.command('setblock %d %d %d minecraft:stone' % (tx, ty, tz))
     s.wait(lambda: s.w.block(tx, ty, tz) == stone, 'the brush target')
     s.command('clear @s')
@@ -735,16 +739,18 @@ def _worldedit_more_body(s):
     s.c.send(s.m.SB_USE, s.m.varint(0) + s.m.varint(41) + struct.pack('>ff', 0.0, 90.0))
     cells_are([c for c in ball if c[1] < ty + 2], glass, 'the brush stroke from a right click in the air')
     _we(s, 'undo', 'Undid 1', 'undo the air stroke')
+    cells_are([c for c in ball if c != (tx, ty, tz)], 0, 'the air stroke undone')
     _we(s, 'br cylinder glass 1 2', 'Cylinder brush shape equipped (1 by 2).', '//br cylinder glass 1 2')
     cyl = _cyl_cells(tx, ty, tz, 1, 2, False)
     _use_on(s, tx, ty, tz)
     cells_are(cyl, glass, 'the cylinder brush stroke (%d cells)' % len(cyl))
     _we(s, 'undo', 'Undid 1 edit(s): %d block(s) restored.' % len(cyl), 'undo the cylinder')
+    cells_are([c for c in cyl if c != (tx, ty, tz)], 0, 'the cylinder undone')
     _we(s, 'brush smooth', 'Smooth brush equipped (2 x 4x using any block).', '//brush smooth')
     _we(s, 'br none', 'Brush unbound from your current item.', '//br none')
     _use_on(s, tx, ty, tz)
     time.sleep(1.0)
-    s.check(s.w.block(tx, ty + 1, tz) == 0, 'the unbound brush still painted')
+    s.check(s.w.block(tx, ty + 1, tz) == 0, 'the unbound brush still painted (%r over the target, %r)' % (s.w.block(tx, ty + 1, tz), [s.w.block(*c) for c in cyl]))
     _we(s, 'tool info', 'Info tool bound to minecraft:stick.', '//tool info')
     n = len(s.w.chat)
     _use_on(s, tx, ty, tz)
@@ -1417,6 +1423,8 @@ def phys_fell(s):
     every other pillar block still there. A natural block broken next to the pad moves nothing either."""
     s.wait(lambda: s.position() is not None and s.chunks() >= 9, 'the spawn chunks', 60.0)
     s.command('gamemode creative')
+    # an empty hand: the cut must be a plain break (worldedit_wand leaves the wand in the hand, and a wand click only sets //pos1)
+    s.command('clear @s')
     _idle(s, 0.5)
     px, py, pz = s.position()
     px, pz = int(px // 1), int(pz // 1)
@@ -1434,6 +1442,10 @@ def phys_fell(s):
     s.command('fill %d %d %d %d %d %d minecraft:air' % (tx - 6, gy + 1, tz - 6, tx + 11, gy + 13, tz + 7))
     # a 5 thick pad: a 1 thick stone slab over uneven ground can really span a dip and crack in the structural check
     s.command('fill %d %d %d %d %d %d minecraft:stone' % (tx - 6, gy - 4, tz - 6, tx + 11, gy, tz + 7))
+    # spawn may be on a beach: water (and its plants) under the pad is no support, so the structural check would drop the pad and the
+    # oak on it. Fill the water below down to the sea floor with stone so the pad stands on the ground.
+    for loose in ('water', 'seagrass', 'tall_seagrass', 'kelp', 'kelp_plant', 'bubble_column'):
+        s.command('fill %d %d %d %d %d %d minecraft:stone replace minecraft:%s' % (tx - 6, gy - 40, tz - 6, tx + 11, gy - 5, tz + 7, loose))
     s.wait(lambda: s.block(tx + 11, gy, tz + 7) == stone and s.block(tx - 6, gy, tz - 6) == stone, 'the stone pad', 40.0)
     # the oak: trunk gy+1..gy+5, leaves 2 layers of 5x5 around the top two logs, 3x3 on top
     s.command('fill %d %d %d %d %d %d minecraft:oak_leaves[persistent=true]' % (tx - 2, gy + 4, tz - 2, tx + 2, gy + 5, tz + 2))
@@ -1443,8 +1455,10 @@ def phys_fell(s):
     s.wait(lambda: _count_cells(s, tree_box, log_y) == 5 and _count_cells(s, tree_box, leaf) == 57, 'the oak (5 logs, 57 leaves)', 40.0)
     # built by commands, so `structures` collapse checks the pad and the oak: an intact tree and pad must stay (no spurious collapse)
     _idle(s, 8.0)
-    s.check(_count_cells(s, tree_box, log_y) == 5 and _count_cells(s, tree_box, leaf) == 57,
-            'the standing oak was left alone by the structural check (logs %d, leaves %d)' % (_count_cells(s, tree_box, log_y), _count_cells(s, tree_box, leaf)))
+    if not (_count_cells(s, tree_box, log_y) == 5 and _count_cells(s, tree_box, leaf) == 57):
+        why = ' '.join(_ask(s, 'body status', 'created', 'body status (the oak is gone)'))
+        s.check(False, 'the standing oak was left alone by the structural check (logs %d, leaves %d; %d new CREATE; %s)' %
+                (_count_cells(s, tree_box, log_y), _count_cells(s, tree_box, leaf), len(_bodies_msgs(s, 1)) - creates_start, why[:160]))
     pad_top = _count_cells(s, (tx - 6, gy, tz - 6, tx + 11, gy, tz + 7), stone)
     s.check(pad_top == 18 * 14, 'the pad is intact (%d of %d top cells)' % (pad_top, 18 * 14))
     s.check(len(_bodies_msgs(s, 1)) == creates_start, 'no body before the cut (%d new CREATE)' % (len(_bodies_msgs(s, 1)) - creates_start))
