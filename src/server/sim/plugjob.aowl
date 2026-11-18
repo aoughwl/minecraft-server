@@ -1,0 +1,141 @@
+## Plugin-facing job primitive (docs/MULTITHREADING.md phase 6), built on sim/jobpool.
+##
+## A plugin runs PURE compute (hashing, parsing, pathing over its own copied data, ...) on a pool thread and gets the result applied on the
+## tick thread. Rules for a job body (`PlugJobFn`):
+##   * it must not call setBlockState, fire or run hooks, or touch World / Entity / any tick-owned state; it works on data it was handed
+##     (`arg`, owned by the plugin and kept alive until the result is delivered) and returns an int;
+##   * it never raises out (`raises.`): an escaping exception becomes `failed = true`;
+##   * with MC_THREAD_ASSERT=1, tick-owned code that calls `ownerguard.assertOwner` records a violation when reached from a job body, on a worker
+##     AND when the job ran inline (threads = 1), because the body runs between enterJob/leaveJob.
+## Results surface only in `pollPlugJobs`, on the tick thread, strictly in submission order per plugin (a finished job waits for earlier ones), in EVERY mode: with threads <= 1 the job runs inside
+## `submitPlugJob` but its result waits in the done queue until the next poll, exactly as a worker result would, so threads = 1 and N behave alike.
+## The delivery callback runs on the tick thread and may touch the world and fire hooks.
+##
+## The pool: `newPlugJobs(plan)` makes its own pool sized by `planThreads` (docs section 5). jobpool has one live worker pool per process, so a caller
+## that already has a pool with workers uses `newPlugJobsOn(pool, ownerBase)` instead; owner ids are `ownerBase + plugin handle`.
+
+{.feature: "lenientnils".}
+
+import std/algorithm
+import jobpool
+import threadcfg
+import ownerguard
+
+type
+  PlugJobFn* = proc(arg: pointer): int {.nimcall, raises.}
+  PlugJobDone* = proc(plugin: int, ticket: int, value: int, failed: bool, ctx: pointer) {.nimcall.}
+
+  JobRec = object
+    fn: PlugJobFn
+    arg: pointer
+    ticket: int
+    done: PlugJobDone
+    ctx: pointer
+
+  PlugJobs* = ref object
+    pool: JobPool
+    ownsPool: bool
+    ownerBase: int
+    nextPlugin: int
+    nextTicket: seq[int]      ## per plugin handle: next ticket to hand out
+    nextDeliver: seq[int]     ## per plugin: next ticket to deliver (delivery is strictly in ticket order)
+    held: seq[seq[JobResult]] ## per plugin: finished out of order, waiting for earlier tickets
+    delivered*: int
+    callbackErrors*: int
+
+proc newPlugJobsOn*(pool: JobPool, ownerBase: int): PlugJobs =
+  PlugJobs(pool: pool, ownsPool: false, ownerBase: ownerBase, nextPlugin: 0, nextTicket: @[], nextDeliver: @[], held: @[])
+
+proc newPlugJobs*(plan: ThreadPlan): PlugJobs =
+  ## Own pool with `plan.threads - 1` workers (none at threads = 1: inline).
+  PlugJobs(pool: newJobPool(plan.threads), ownsPool: true, ownerBase: 0, nextPlugin: 0, nextTicket: @[], nextDeliver: @[], held: @[])
+
+proc workers*(pj: PlugJobs): int =
+  pj.pool.workers
+
+proc registerPlugin*(pj: PlugJobs): int =
+  ## One owner handle per plugin; its results are only ever delivered through this handle's poll.
+  assertOwner("plugjob registerPlugin")
+  result = pj.nextPlugin
+  inc pj.nextPlugin
+  pj.nextTicket.add(0)
+  pj.nextDeliver.add(0)
+  pj.held.add(@[])
+
+proc trampoline(arg: pointer): int {.nimcall, raises.} =
+  let r = cast[ptr JobRec](arg)
+  result = 0
+  enterJob()
+  try:
+    result = r.fn(r.arg)
+  except:
+    leaveJob()
+    raise BadOperation       # reported as failed by the pool
+  leaveJob()
+
+proc submitPlugJob*(pj: PlugJobs, plugin: int, fn: PlugJobFn, arg: pointer, done: PlugJobDone, ctx: pointer): int =
+  ## Tick thread only. Returns the ticket (per-plugin submission number, from 0), -1 for an unknown plugin.
+  assertOwner("plugjob submit")
+  result = -1
+  if plugin < 0 or plugin >= pj.nextPlugin:
+    return
+  let rec = cast[ptr JobRec](alloc0(sizeof(JobRec)))
+  rec.fn = fn
+  rec.arg = arg
+  rec.ticket = pj.nextTicket[plugin]
+  rec.done = done
+  rec.ctx = ctx
+  inc pj.nextTicket[plugin]
+  result = rec.ticket
+  submit(pj.pool, pj.ownerBase + plugin, trampoline, cast[pointer](rec))
+
+proc cmpTicket(a, b: JobResult): int =
+  cmp(cast[ptr JobRec](a.arg).ticket, cast[ptr JobRec](b.arg).ticket)
+
+proc pollPlugJobs*(pj: PlugJobs, plugin: int): int =
+  ## Tick thread only. Delivers every finished job of `plugin`, in ticket order; returns how many. Unfinished jobs stay queued.
+  assertOwner("plugjob poll")
+  result = 0
+  if plugin < 0 or plugin >= pj.nextPlugin:
+    return
+  var sink: seq[JobResult] = @[]
+  discard drainDone(pj.pool, pj.ownerBase + plugin, sink)
+  for r in sink:
+    pj.held[plugin].add(r)
+  pj.held[plugin].sort(cmpTicket)
+  # Strictly in ticket order: a finished job waits until every earlier job of the plugin has finished, so the delivery order does not depend on
+  # which worker was faster (threads = 1 and N deliver the same sequence).
+  var used = 0
+  for r in pj.held[plugin]:
+    let rec = cast[ptr JobRec](r.arg)
+    if rec.ticket != pj.nextDeliver[plugin]:
+      break
+    inc used
+    inc pj.nextDeliver[plugin]
+    let done = rec.done
+    let ctx = rec.ctx
+    let ticket = rec.ticket
+    dealloc(rec)
+    inc result
+    inc pj.delivered
+    if done != nil:
+      try:
+        done(plugin, ticket, r.value, r.failed, ctx)
+      except:
+        inc pj.callbackErrors
+  if used > 0:
+    for _ in 0 ..< used:
+      pj.held[plugin].delete(0)
+
+proc pollAllPlugJobs*(pj: PlugJobs): int =
+  result = 0
+  for i in 0 ..< pj.nextPlugin:
+    result += pollPlugJobs(pj, i)
+
+proc pendingPlugJobs*(pj: PlugJobs, plugin: int): int =
+  pending(pj.pool, pj.ownerBase + plugin) + pj.held[plugin].len
+
+proc shutdownPlugJobs*(pj: PlugJobs) =
+  ## Finishes queued jobs and joins workers (own pool only); results can still be polled afterwards.
+  if pj.ownsPool:
+    shutdown(pj.pool)

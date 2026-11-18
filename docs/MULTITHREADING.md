@@ -111,6 +111,7 @@ Each phase lists what changes, who owns the files, how it is verified. "Gate" = 
 
 **Phase 6: plugins on other cores (optional)**
 * After native plugin images exist, an engine job primitive (`aoe_job_*`, proposed by the ENGINE side) for compute-only plugin work. Not needed for the server itself.
+* Server side done as `sim/plugjob.aowl` (on `sim/jobpool`): per-plugin owner handle, `submitPlugJob` / `pollPlugJobs` on the tick thread, results applied only in the poll and strictly in ticket order, in every mode (threads = 1 runs the job inline but still delivers on the next poll). Sized by `planThreads`. Job bodies must not call setBlockState, run hooks or touch World/Entity; under `MC_THREAD_ASSERT=1` `assertOwner` now also flags calls made from inside a job body (inline included). The `aoe_job_*` engine ABI itself is not defined here.
 
 ## 7. Verification strategy
 
@@ -146,3 +147,4 @@ Each phase lists what changes, who owns the files, how it is verified. "Gate" = 
 | Phases 1 to 4 change lists | written (docs/MULTITHREADING_PHASES.md) |
 | Worker count from the thread plan + never-raise workers | prepared on top of the chunk chain (branch mt-items-1-3), not pushed |
 | Wiring jobpool into generation_executor, phases 1 to 6 | waiting on the chunk-system owner's branches reaching main |
+| Phase 6 (server side): plugin job primitive `sim/plugjob` (owner handle per plugin, poll-only in-order delivery, inline at threads<=1, `planThreads` sizing, job-body guard in ownerguard) | plugjobtest passes (300 jobs equal at threads=1 and 4, ticket order, nothing before poll, two plugins isolated, failed jobs, guard flags a world touch in both modes); jobpooltest and ownerguardtest still pass; not wired into pluginmanager/engine plugins, no `aoe_job_*` ABI, not part of the full server build, no load test |
