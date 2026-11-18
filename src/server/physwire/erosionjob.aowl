@@ -1,0 +1,103 @@
+## The erosion run as ONE pool job (docs/MULTITHREADING_PHASES.md phase 1 item d), free of World so it can be tested alone.
+##
+## `submitErosionRun(pool, run)` hands the whole `sim.step(opsPerTick)` loop (at most `maxSteps` steps, stopping when the sim is done) to the
+## shared worker pool; with a pool that has no workers `submit` runs it inline. The body never raises (a failure sets `ok = false`).
+## While the job is in flight the tick thread must not touch `run.sim`. `pollErosionRun` is the tick-thread side: it moves the finished
+## result (non-blocking) and sets `run.ready`. The caller (erosionwire) applies the result on the tick thread, at the same tick in
+## every mode: `erosionApplyDue(age, steps)` is true once `steps` ticks have passed since the start, the tick the single-threaded run
+## would have finished on, but never before the result is in.
+
+{.feature: "lenientnils".}
+
+import std/locks
+import ../../physics/erosion
+import ../sim/jobpool
+
+const ErosionOwner* = 0     ## owner id in the shared pool (path jobs use navigator ids from 1)
+
+type
+  ErosionRun* = ref object
+    sim*: ErosionSim
+    opsPerTick*, maxSteps*: int
+    steps*: int
+    ops*: int64
+    ok*: bool
+    ready*: bool
+    slot: int
+
+var gRuns: seq[ErosionRun] = @[]
+var gRunsLock: Lock
+var gRunsInit = false
+
+proc newErosionRun*(sim: ErosionSim; opsPerTick, maxSteps: int): ErosionRun =
+  ErosionRun(sim: sim, opsPerTick: opsPerTick, maxSteps: maxSteps, slot: -1)
+
+proc erosionBody(arg: pointer): int {.nimcall, raises.} =
+  var run: ErosionRun = nil
+  acquire(gRunsLock)
+  let slot = cast[int](arg)
+  if slot >= 0 and slot < gRuns.len:
+    run = gRuns[slot]
+  release(gRunsLock)
+  if run == nil:
+    return 0
+  try:
+    var steps = 0
+    var ops = 0'i64
+    while steps < run.maxSteps:
+      let info = run.sim.step(run.opsPerTick)
+      ops += int64(info.ops)
+      inc steps
+      if info.done:
+        break
+    run.steps = steps
+    run.ops = ops
+    run.ok = true
+  except:
+    run.ok = false
+  0
+
+proc submitErosionRun*(pool: JobPool; run: ErosionRun) =
+  ## Tick thread.
+  if not gRunsInit:
+    initLock(gRunsLock)
+    gRunsInit = true
+  var slot = -1
+  acquire(gRunsLock)
+  for i in 0 ..< gRuns.len:
+    if gRuns[i] == nil:
+      slot = i
+      break
+  if slot < 0:
+    gRuns.add(nil)
+    slot = gRuns.len - 1
+  gRuns[slot] = run
+  release(gRunsLock)
+  run.slot = slot
+  run.ready = false
+  submit(pool, ErosionOwner, erosionBody, cast[pointer](slot))
+
+proc pollErosionRun*(pool: JobPool; run: ErosionRun): bool =
+  ## Tick thread, non-blocking: true once the job has finished (the result is then in `run`, and the slot is released).
+  if run.ready:
+    return true
+  var sink: seq[JobResult] = @[]
+  if drainDone(pool, ErosionOwner, sink) > 0:
+    if sink[0].failed:
+      run.ok = false
+    acquire(gRunsLock)
+    if run.slot >= 0 and run.slot < gRuns.len:
+      gRuns[run.slot] = nil
+    release(gRunsLock)
+    run.slot = -1
+    run.ready = true
+  run.ready
+
+proc waitErosionRun*(pool: JobPool; run: ErosionRun) =
+  ## Tests and shutdown only: spins until the job is done.
+  while not pollErosionRun(pool, run):
+    discard
+
+proc erosionApplyDue*(age, steps: int): bool =
+  ## `age` = ticks since the run started (>= 1 on the first tick after the start). The single-threaded schedule finished after `steps` ticks.
+  age >= (if steps < 1: 1 else: steps)

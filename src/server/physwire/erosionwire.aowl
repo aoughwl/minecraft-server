@@ -13,8 +13,14 @@
 ## the result ONCE at the end through bulkedit (`writeCells`: block log cause "natural", collapse triggers see the cells as changed,
 ## clients get one multi-block update per section). A cell the world changed while the job ran is skipped. Volume is conserved: the
 ## model moves cells, it never creates or destroys them (slabs that leave as bodies keep their cells in the body). Only one job at a time.
+##
+## OPT-IN WORKER MODE (default off): with MC_EROSION_WORKERS=1 and a thread plan that has workers, the whole step loop runs as ONE job on the
+## shared worker pool (`erosionjob`, pool from `pathpool.sharedJobPool`; no second pool), off the tick thread. `applyJob` and its stale-cell
+## guard stay on the tick thread. The result is applied `steps` ticks after the start, the tick the stepwise run would have finished on, so
+## the outcome does not depend on the thread count; it is applied later only if the worker is slower than that (never blocking the tick).
+## `/erosion cancel` stops the application; the worker still finishes its run and the slot frees when it does.
 
-import std/[math, options]
+import std/[math, options, envvars]
 import ../../data/block_ext
 import ../../physics/[body, bodymass, erosion, materials, solveradapter]
 import ../../util/math/position
@@ -23,6 +29,9 @@ import ../blocklog/blocklogcore
 import ../serverbase
 import ../world/[bulkedit, worldmod]
 import ../body/[bodyworld, bodymanager]
+import ../sim/jobpool
+import ../entity/ai/pathfinder/pathpool
+import erosionjob
 import physparse
 
 {.feature: "lenientnils".}
@@ -54,11 +63,29 @@ type
     maxSlopeBefore: float64
     maxSlopeAfter: float64
     note: string
+    run: ErosionRun        ## worker mode: the whole run as one pool job (nil = stepwise on the tick thread)
+    age: int
 
 var
+  gErosionPool: JobPool = nil
+  gErosionDecided = false
   gJob: Job = nil
   gLast: Job = nil
   gJobsRun = 0
+
+proc enableErosionJobs*(pool: JobPool) =
+  ## Tests: use `pool` (nil = back to the stepwise run), skipping the environment gate.
+  gErosionPool = pool
+  gErosionDecided = true
+
+proc erosionPool(): JobPool =
+  if not gErosionDecided:
+    gErosionDecided = true
+    if getEnv("MC_EROSION_WORKERS") == "1":
+      let n = envPlanWorkers()
+      if n > 0:
+        gErosionPool = sharedJobPool(n)
+  gErosionPool
 
 proc startJob*(world: World; cx, cy, cz, radius, seed: int; wet: float64; tick: int64; msg: var string): bool =
   if gJob != nil:
@@ -92,6 +119,10 @@ proc startJob*(world: World; cx, cy, cz, radius, seed: int; wet: float64; tick: 
     maxSlopeBefore: maxSpanSlope(sim))
   gJob = j
   inc gJobsRun
+  let pool = erosionPool()
+  if pool != nil:
+    j.run = newErosionRun(sim, OpsPerTick, MaxSteps)
+    submitErosionRun(pool, j.run)
   msg = "erosion job started: " & $nx & " x " & $nz & " blocks, seed " & $seed & ", wetness " & $(round(wet * 100.0) / 100.0)
   true
 
@@ -142,7 +173,29 @@ proc tickErosion*(server: Server) =
   if gJob == nil:
     return
   let j = gJob
-  if j.cancelled:
+  if j.cancelled and j.run == nil:
+    gLast = j
+    gJob = nil
+    return
+  if j.run != nil:
+    let pool = erosionPool()
+    if j.cancelled:
+      if pool == nil or pollErosionRun(pool, j.run):
+        gLast = j
+        gJob = nil
+      return
+    inc j.age
+    if pool == nil or not pollErosionRun(pool, j.run):
+      return
+    if not erosionApplyDue(j.age, j.run.steps):
+      return
+    j.steps = j.run.steps
+    j.ops = j.run.ops
+    j.done = true
+    if j.run.ok:
+      applyJob(j)
+    else:
+      j.note = "the worker job failed, nothing was written"
     gLast = j
     gJob = nil
     return
@@ -186,7 +239,7 @@ proc erosionExec*(server: Server; world: World; parts: seq[string]; px, py, pz: 
       result.add("no erosion job is running")
     else:
       gJob.cancelled = true
-      result.add("erosion job cancelled, nothing was written")
+      result.add("erosion job cancelled, nothing was written" & (if gJob.run != nil: " (the worker is stopping)" else: ""))
   elif sub == "status":
     if gJob != nil:
       result.add(describe(gJob, "running"))
