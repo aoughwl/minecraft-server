@@ -32,8 +32,8 @@ threads = 1 and becomes per-thread (so per-dimension in phase 4). `featureWorldS
 
 `src/server/sim/prewarm.aowl` with one `prewarmAll()` called early in `runMain`, **before the first Level or schedule exists** (`sharedExecutor()` starts workers when
 the first schedule is built). It forces: `staticRegistries(v)` and `remapBiomeForVersion(0, v)` for every version; `getRegistryKeyTags(v, key)` for every key;
-`blockLootTable(i)` for every block; `materialOf(s)` for every state (redo after `loadMaterialOverrides*`); `prewarmWorldgen()` (exists). No import cycle: nothing outside
-`server/sim` imports `server/sim`. `physics/materials` is the physics owner's: ask them for a `prewarmMaterials()`. Also pre-touch the Bedrock crypto's bignum constants if they are lazy (not audited).
+`blockLootTable(i)` for every block; `materialOf(s)` for every state (`physics/materials.prewarmMaterials()`, which `loadMaterialOverrides` and `clearMaterialOverrides` also run themselves after they invalidate the table); `prewarmWorldgen()` (exists). No import cycle: nothing outside
+`server/sim` imports `server/sim`. `prewarmMaterials()` now exists in `physics/materials` (done). Also pre-touch the Bedrock crypto's bignum constants if they are lazy (not audited).
 
 ## 4. Cross-thread flags
 
