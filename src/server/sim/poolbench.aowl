@@ -1,0 +1,246 @@
+## Synthetic speedup benchmark of sim/jobpool (NOT a test gate: it asserts only that results are correct, never a speed).
+##
+## What it measures, on the machine it runs on:
+##   * jobs/sec and wall time at 0 (inline submit), 1, 2, 4 and 8 workers for two CPU-bound job kinds:
+##       zlib   : zlib level 6 of a chunk-sized (64 KiB, half compressible) buffer, the work of a save compress or net encode job
+##       flood  : a light-like flood fill (BFS spreading a level 15 -> 0 through a 48x48x24 cube of mixed opaque/open cells)
+##   * the speedup against the same jobs run in a plain loop with no pool (the true single-thread time);
+##   * the pool's overhead per job: an empty job (body returns at once) timed through the pool at 1 and 4 workers and inline,
+##     which is submit (task-table lock, lane push, signal) + worker take (lock) + finish (lock) + drainDone (lock, O(done)).
+## The submitting thread only submits and drains (spin with Sleep(0) when nothing finished), so W workers = W busy cores.
+## Each point is the best of REPS repetitions (the median is printed too): the machine is shared, so the best is the cleanest.
+##
+## Env: PB_JOBS (jobs per point, default 600), PB_REPS (default 5).
+
+{.feature: "lenientnils".}
+
+import std/[syncio, monotimes, envvars, cpuinfo]
+import ../../world/chunkcompress
+import jobpool
+
+proc sleepWin(ms: uint32) {.stdcall, importc: "Sleep", dynlib: "kernel32.dll".}
+
+const
+  BufBytes = 65536
+  Variants = 16
+  FW = 48
+  FH = 24
+
+var gBufs: seq[seq[byte]] = @[]
+var gGrids: seq[seq[bool]] = @[]     ## per variant: open cells
+
+proc envInt(name: string, dflt: int): int =
+  let s = getEnv(name)
+  if s.len == 0:
+    return dflt
+  result = 0
+  for c in s:
+    if c >= '0' and c <= '9':
+      result = result * 10 + (ord(c) - ord('0'))
+
+proc nowUs(): int64 =
+  ticks(getMonoTime()) div 1000'i64
+
+proc makeBufs() =
+  for v in 0 ..< Variants:
+    var b = newSeq[byte](BufBytes)
+    var s = uint32(v + 1) * 2654435761'u32
+    for k in 0 ..< BufBytes:
+      if (k div 128 + v) mod 2 == 0:
+        b[k] = byte((k * 5 + v) mod 251)
+      else:
+        s = s * 1664525'u32 + 1013904223'u32
+        b[k] = byte(s shr 24)
+    gBufs.add(b)
+    var g = newSeq[bool](FW * FW * FH)
+    var t = uint32(v + 7) * 2654435761'u32
+    for k in 0 ..< g.len:
+      t = t * 1664525'u32 + 1013904223'u32
+      g[k] = ((t shr 8) mod 100) < 72
+    g[(FH div 2) * FW * FW + (FW div 2) * FW + FW div 2] = true
+    gGrids.add(g)
+
+proc zlibWork(v: int): int =
+  let r = zlibCompress(gBufs[v mod Variants], 6)
+  if r.ok: r.data.len else: -1
+
+proc floodWork(v: int): int =
+  let g = gGrids[v mod Variants]
+  var level = newSeq[int8](g.len)
+  var q = newSeq[int](g.len)
+  var qh = 0
+  var qt = 0
+  let start = (FH div 2) * FW * FW + (FW div 2) * FW + FW div 2
+  level[start] = 15'i8
+  q[qt] = start
+  inc qt
+  var visited = 0
+  while qh < qt:
+    let c = q[qh]
+    inc qh
+    inc visited
+    let l = level[c]
+    if l <= 1'i8:
+      continue
+    let x = c mod FW
+    let z = (c div FW) mod FW
+    let y = c div (FW * FW)
+    for d in 0 ..< 6:
+      var nx = x
+      var ny = y
+      var nz = z
+      if d == 0: nx = x + 1
+      elif d == 1: nx = x - 1
+      elif d == 2: nz = z + 1
+      elif d == 3: nz = z - 1
+      elif d == 4: ny = y + 1
+      else: ny = y - 1
+      if nx < 0 or nz < 0 or ny < 0 or nx >= FW or nz >= FW or ny >= FH:
+        continue
+      let n = ny * FW * FW + nz * FW + nx
+      if not g[n] or level[n] >= l - 1'i8:
+        continue
+      level[n] = l - 1'i8
+      q[qt] = n
+      inc qt
+  visited
+
+proc zlibBody(arg: pointer): int {.nimcall, raises.} =
+  zlibWork(cast[int](arg))
+
+proc floodBody(arg: pointer): int {.nimcall, raises.} =
+  floodWork(cast[int](arg))
+
+proc emptyBody(arg: pointer): int {.nimcall, raises.} =
+  cast[int](arg)
+
+proc directRun(body: Job, n: int): (int64, int) =
+  ## The jobs in a plain loop: no pool at all.
+  let t0 = nowUs()
+  var sum = 0
+  for i in 0 ..< n:
+    try:
+      sum += body(cast[pointer](i))
+    except:
+      discard
+  (nowUs() - t0, sum)
+
+proc poolRun(p: JobPool, owner: int, body: Job, n: int): (int64, int) =
+  let t0 = nowUs()
+  for i in 0 ..< n:
+    submit(p, owner, body, cast[pointer](i))
+  var sink: seq[JobResult] = @[]
+  var got = 0
+  var sum = 0
+  while got < n:
+    sink.setLen(0)
+    let k = drainDone(p, owner, sink)
+    if k == 0:
+      sleepWin(0'u32)
+    for r in sink:
+      sum += r.value
+    got += k
+  (nowUs() - t0, sum)
+
+proc medianOf(xs: seq[int64]): int64 =
+  var a = xs
+  for i in 0 ..< a.len:
+    for j in i + 1 ..< a.len:
+      if a[j] < a[i]:
+        let t = a[i]
+        let u = a[j]
+        a[i] = u
+        a[j] = t
+  a[a.len div 2]
+
+proc minOf(xs: seq[int64]): int64 =
+  result = xs[0]
+  for x in xs:
+    if x < result:
+      result = x
+
+proc fmt1(x: float64): string =
+  let v = int(x * 10.0 + 0.5)
+  $(v div 10) & "." & $(v mod 10)
+
+proc fmt2(x: float64): string =
+  let v = int(x * 100.0 + 0.5)
+  let f = v mod 100
+  $(v div 100) & "." & (if f < 10: "0" else: "") & $f
+
+var failures = 0
+
+proc bench(name: string, body: Job, n, reps: int) =
+  echo ""
+  echo name, ": ", n, " jobs per point, best of ", reps
+  var dBest: seq[int64] = @[]
+  var wantSum = 0
+  for r in 0 ..< reps:
+    let (t, s) = directRun(body, n)
+    dBest.add(t)
+    wantSum = s
+  let d = minOf(dBest)
+  echo "  plain loop (no pool): ", d div 1000, " ms, ", fmt1(float64(n) * 1000000.0 / float64(d)), " jobs/s, ", fmt1(float64(d) / float64(n)), " us/job"
+  var w1 = int64(0)
+  for workers in [0, 1, 2, 4, 8]:
+    let p = newJobPool(workers + 1)
+    if p.workers != workers:
+      echo "  (pool refused or short: wanted ", workers, ", got ", p.workers, ")"
+    let owner = allocOwner(p)
+    var ts: seq[int64] = @[]
+    var ok = true
+    for r in 0 ..< reps:
+      let (t, s) = poolRun(p, owner, body, n)
+      ts.add(t)
+      if s != wantSum:
+        ok = false
+    shutdown(p)
+    let b = minOf(ts)
+    let m = medianOf(ts)
+    if workers == 1:
+      w1 = b
+    var line = "  workers " & $workers & ": best " & $(b div 1000) & " ms (median " & $(m div 1000) & "), " & fmt1(float64(n) * 1000000.0 / float64(b)) & " jobs/s, speedup vs plain loop " & fmt2(float64(d) / float64(b)) & "x"
+    if workers >= 2 and w1 > 0:
+      line = line & ", vs 1 worker " & fmt2(float64(w1) / float64(b)) & "x, efficiency " & fmt1(100.0 * float64(w1) / float64(b) / float64(workers)) & "%"
+    if not ok:
+      line = line & "   RESULT MISMATCH"
+      inc failures
+    echo line
+
+proc overhead(n, reps: int) =
+  echo ""
+  echo "pool overhead per job: an empty job through the pool (", n, " jobs, best of ", reps, ")"
+  var dBest: seq[int64] = @[]
+  for r in 0 ..< reps:
+    let (t, s) = directRun(emptyBody, n)
+    dBest.add(t)
+  echo "  plain loop: ", fmt2(float64(minOf(dBest)) / float64(n)), " us/job"
+  for workers in [0, 1, 2, 4, 8]:
+    let p = newJobPool(workers + 1)
+    let owner = allocOwner(p)
+    var ts: seq[int64] = @[]
+    for r in 0 ..< reps:
+      let (t, s) = poolRun(p, owner, emptyBody, n)
+      ts.add(t)
+    shutdown(p)
+    let b = minOf(ts)
+    echo "  workers ", workers, ": ", fmt2(float64(b) / float64(n)), " us/job (best), ", fmt2(float64(medianOf(ts)) / float64(n)), " (median), ", fmt1(float64(n) * 1000000.0 / float64(b)), " jobs/s"
+
+proc main() =
+  let n = envInt("PB_JOBS", 600)
+  let reps = envInt("PB_REPS", 5)
+  echo "poolbench: logical processors ", countProcessors(), ", jobs ", n, ", reps ", reps
+  makeBufs()
+  # warm up (page in, code paths, allocator)
+  discard directRun(zlibBody, 20)
+  discard directRun(floodBody, 20)
+  bench("zlib level 6 of a 64 KiB buffer", zlibBody, n, reps)
+  bench("light-like flood fill (48x48x24)", floodBody, n * 2, reps)
+  overhead(20000, reps)
+  if failures > 0:
+    echo "RESULT MISMATCHES: ", failures
+    quit(1)
+  echo ""
+  echo "poolbench done"
+
+main()
