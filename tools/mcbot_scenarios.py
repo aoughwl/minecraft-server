@@ -806,9 +806,12 @@ def fluids_finite(s):
     over the rim; `/fluids off` leaves the world as it is."""
     s.wait(lambda: s.position() is not None and s.chunks() >= 9, 'the spawn chunks', 60.0)
     s.command('gamemode creative')
+    # centred in its cell, so the basin's column (x and z from +1) can never overlap the bot
+    s.command('tp @s %.2f %.2f %.2f' % (int(s.position()[0] // 1) + 0.5, s.position()[1], int(s.position()[2] // 1) + 0.5))
+    time.sleep(0.5)
     px, py, pz = s.position()[0], s.position()[1], s.position()[2]
     cx, cz = int(px // 1) + 3, int(pz // 1) + 3
-    y0 = int(py // 1) + 6                                  # an open-air slab a few blocks over the bot (inside the scanned sections)
+    y0 = int(py // 1) + 6                                  # a slab a few blocks over the bot (inside the scanned sections)
     ids = _state_ids(s, cx, y0 + 12, cz, ['stone', 'water'])
     stone, wsrc = ids['stone'], ids['water']
     is_water = lambda b: b is not None and wsrc <= b < wsrc + 16
@@ -819,6 +822,9 @@ def fluids_finite(s):
     def build():
         box(cx - 2, y0, cz - 2, cx + 2, y0 + 6, cz + 2, 'air')
         s.wait(lambda: s.w.block(cx, y0 + 4, cz) == 0 and s.w.block(cx + 2, y0 + 1, cz + 2) == 0, 'the build area to be air', 20.0)
+        # A column from below the bot's feet up to the floor: a floating /fill basin is a player built structure with no support,
+        # which the collapse triggers (default `structures`) drop as a body, spilling the water (fluids_finite failed ~half the time).
+        box(cx - 2, int(py // 1) - 4, cz - 2, cx + 2, y0 - 1, cz + 2, 'stone')
         box(cx - 2, y0, cz - 2, cx + 2, y0, cz + 2, 'stone')                 # floor 5x5
         box(cx - 2, y0 + 1, cz - 2, cx + 2, y0 + 1, cz + 2, 'stone')         # rim: a 5x5 block ...
         box(cx - 1, y0 + 1, cz - 1, cx + 1, y0 + 1, cz + 1, 'air')           # ... with a 3x3 hole = the basin
