@@ -1,6 +1,6 @@
 """Automatic collapse triggers against a private server (never the user's): a 12 long plank bridge between two stone pillars, 9 iron blocks
 PLACED BY THE BOT on it (use-item-on, so the block log records cause=place), with `physics_triggers`
-  1. at its default (off): nothing happens, the bridge keeps standing and no body appears;
+  1. off (the runner sets JESTER_PHYSICS_TRIGGERS=off; the built-in default is structures): nothing happens, the bridge keeps standing and no body appears;
   2. structures (switched on with /body triggers structures over RCON): the debounced trigger runs the solver, the deck breaks and a body
      appears (`/body status` created >= 1, blocks vanish on the client).
 
