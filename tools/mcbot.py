@@ -1047,7 +1047,12 @@ def pump(c, st, w, biomes, ctx, until, what, seconds=8.0):
             pid, r = c.recv()
         except socket.timeout:
             continue
-        one_packet(c, st, w, biomes, ctx, pid, r)
+        try:
+            one_packet(c, st, w, biomes, ctx, pid, r)
+        except Fail as e:
+            if pid == 0x61 and 'components' in str(e):
+                continue        # entity data of an item entity with components (a dropped item): this bot cannot read them, nothing needs them
+            raise Fail('%s (while handling play packet 0x%02x of %d bytes: %s)' % (e, pid, len(r.data), bytes(r.data[:40]).hex()))
 
 
 def one_packet(c, st, w, biomes, ctx, pid, r):
