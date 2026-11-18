@@ -213,8 +213,11 @@ payloads and wait for the server's. The bot does not track entities yet. `WORLD=
 
 ## 9. WorldEdit (real, built into the server)
 
-`src/server/worldedit/` is a WorldEdit-style editor, op level 2. Commands are registered as `/set`, `/pos1`, ... so a client types `//set stone`;
-`/we <name> <args>` reaches the same code. Selection: `//pos1 [x,y,z]`, `//pos2`, `//sel`, `//size`, and `//wand` (wooden axe: left click
+`src/server/worldedit/` is a WorldEdit-style editor, op level 2. Commands are nodes of the brigadier dispatcher under root literals named
+`/set`, `/pos1`, ... (as WorldEdit for Fabric registers them), so a client types `//set stone` and its command tree knows the command: no red
+"unknown command", tab completion, argument hints (block positions, integers, flags such as `-h`, directions and block patterns completed by
+the server). An operator's client gets them; others do not (root commands a player fails the requirements of are left out of its tree).
+`/we <name> <args>` reaches the same code; `/help WorldEdit` and `/plugins` list it. Selection: `//pos1 [x y z | x,y,z]`, `//pos2`, `//sel`, `//size`, and `//wand` (wooden axe: left click
 a block for pos1, right click for pos2). Edits: `//set`, `//replace <mask> <pattern>`, `//walls`, `//hollow`, `//sphere [-h]`, `//cyl [-h]`,
 `//copy`, `//cut`, `//paste [-a] [-s]`, `//rotate`, `//flip`, `//stack`, `//move [-s]`, `//count`, `//distribution [-d]`, `//undo [n]`, `//redo [n]`.
 Patterns are `stone`, `50%stone,50%dirt`, `oak_stairs[facing=east]`; masks `stone,dirt`, `!air`, `*`.
