@@ -1,0 +1,380 @@
+## The solver job wiring of the body manager (bodymanager stepCollapseJobs worker path, enableSolverJobs, collapseEnqueue, collapseStale) on an
+## in-memory world: two unsupported bridges are queued through collapseEnqueue; the tick loop runs with the gate OFF (sliced baseline), ON with an
+## inline pool and ON with 4 workers. Gate-on modes must agree tick by tick and with the gate off at the end; a block edited inside the box after the
+## submit drops the result; a big job the worker is not done with makes the due tick wait. Exit 0 and "ALL PASS".
+
+import std/[syncio, cmdline, tables, options, math, strutils]
+import ../../config/lib as configlib
+import ../../world/[chunkdata, level, lightingruntime, palette, playerdata, worldfs, worldinfo]
+import ../../world/blockstates as states
+import ../../nbt/tag as nbttag
+import ../../util/math/position
+import ../../util/math/boundingbox
+import ../../util/vector3
+import ../../data/block_ext
+from ../../data/block_state import newBlockStateIdUnchecked, asU16
+import "../../data/item_stack/mod"
+import ../../generated/item_full
+import ../data/datamod
+import ../recipe
+import ../scheduler
+import ../serverbase
+import ../tick_rate_manager
+import ../net/winsock
+import "../block/worldadapter"
+import ../world/[bulkedit, worldmod]
+import ../entity/[collision_providers, entitymod, entitytype, itementity]
+import ../entity/mob/zombie/zombie
+import ../../physics/[body, integrator]
+import bodymanager, bodyworld
+import ../sim/jobpool
+
+var failures = 0
+
+proc check(name: string; cond: bool) =
+  if cond:
+    echo "PASS ", name
+  else:
+    echo "FAIL ", name
+    inc failures
+
+proc scratch(): string =
+  result = parentDirW(paramStr(0)) & "/solverwire_scratch"
+  discard createDirAllW(result)
+
+const Sections = 8   # y 0..127
+
+let adv = defaultAdvancedConfiguration()
+let theLevel = fromRootFolder(adv.world, scratch(), 1'i64, OVERWORLD)
+let server = Server(basicConfig: defaultBasicConfiguration(), advancedConfig: adv, worlds: @[], dimensions: @[OVERWORLD],
+  tickCounter: 0'i64, nextEntityId: 1'i32, tickRateManager: newServerTickRateManager(20.0'f32), keyStore: nil,
+  recipeManager: newRecipeManager(), scheduler: newTaskScheduler(), data: ServerData(),
+  playerDataStorage: PlayerDataStorage(), levelFolder: "", playerIdleTimeout: 0'i32, mojangPublicKeys: @[],
+  stopRequested: false, stopAtMs: 0'i64)
+let bw = loadWorld(theLevel, defaultLevelData(1'u64), OVERWORLD, 63'i32, 0'i32, server)
+server.worlds.add(bw)
+
+proc mkChunk(x, z: int32): ChunkData =
+  let c = newChunkData(x, z, newChunkSections(Sections, 0'i32))
+  c.lightEngine.skyLight = newSeq[LightContainer](Sections)
+  c.lightEngine.blockLight = newSeq[LightContainer](Sections)
+  for i in 0 ..< Sections:
+    c.lightEngine.skyLight[i] = newLightEmpty(0'u8)
+    c.lightEngine.blockLight[i] = newLightEmpty(0'u8)
+  c
+
+let (_, stone) = defaultStateByName("stone")
+let (_, dirt) = defaultStateByName("dirt")
+let (_, planks) = defaultStateByName("oak_planks")
+let (_, stairs) = defaultStateByName("oak_stairs")
+let (_, iron) = defaultStateByName("iron_block")
+let (_, chest) = defaultStateByName("chest")
+
+var chunks: seq[ChunkData] = @[]
+for cz in 0'i32 .. 1'i32:
+  for cx in 0'i32 .. 1'i32:
+    let c = mkChunk(cx, cz)
+    addLoadedChunk(theLevel, c)
+    chunks.add(c)
+
+proc fillBox(x0, y0, z0, x1, y1, z1: int32; id: uint32) =
+  for y in y0 .. y1:
+    for z in z0 .. z1:
+      for x in x0 .. x1:
+        discard setBlockState(theLevel, newBlockPos(x, y, z), id)
+
+proc stateAt(x, y, z: int32): uint32 = getBlockState(theLevel, newBlockPos(x, y, z))
+
+proc countNonAir(x0, y0, z0, x1, y1, z1: int32): int =
+  result = 0
+  for y in y0 .. y1:
+    for z in z0 .. z1:
+      for x in x0 .. x1:
+        if stateAt(x, y, z) != 0'u32:
+          inc result
+
+proc blockName(st: uint32): string =
+  Block.fromStateId(newBlockStateIdUnchecked(uint16(st))).name
+
+proc propOf(st: uint32; key: string): string =
+  let sid = newBlockStateIdUnchecked(uint16(st))
+  let b = Block.fromStateId(sid)
+  let (has, dp) = properties(b, sid)
+  if has:
+    for p in dp.toProps():
+      if p[0] == key:
+        return p[1]
+  ""
+
+proc has(s, sub: string): bool =
+  if sub.len == 0: return true
+  if s.len < sub.len: return false
+  for i in 0 .. s.len - sub.len:
+    if s[i ..< i + sub.len] == sub:
+      return true
+  false
+
+
+proc tickNow(): int64 = server.tickCounter
+
+proc runTicks(n: int) =
+  for i in 0 ..< n:
+    inc server.tickCounter
+    tickBodies(server)
+
+proc clearJournal() =
+  for rec in journalList(bw):
+    journalDelete(bw, rec.body.idHi, rec.body.idLo)
+
+proc fnv(h: uint64; v: int64): uint64 =
+  (h xor uint64(v)) * 1099511628211'u64
+
+proc worldHash(): uint64 =
+  result = 14695981039346656037'u64
+  for y in 18'i32 .. 60'i32:
+    for z in 0'i32 .. 31'i32:
+      for x in 0'i32 .. 31'i32:
+        result = fnv(result, int64(stateAt(x, y, z)))
+
+proc stateHash(): uint64 =
+  ## world blocks + the live bodies (cells, positions to 1/1000)
+  result = worldHash()
+  var cs = 0
+  var py = 0.0
+  var px = 0.0
+  var pz = 0.0
+  let bl = bodyList()
+  for be in bl:
+    cs += cellCount(be.body)
+    px += be.body.pos.x
+    py += be.body.pos.y
+    pz += be.body.pos.z
+  result = fnv(result, int64(bodyCount()))
+  result = fnv(result, int64(cs))
+  result = fnv(result, int64(px * 1000.0))
+  result = fnv(result, int64(py * 1000.0))
+  result = fnv(result, int64(pz * 1000.0))
+
+proc buildBridge(z: int32; iron9: bool) =
+  for y in 20'i32 .. 24'i32:
+    discard setBlockState(theLevel, newBlockPos(8'i32, y, z), stone)
+    discard setBlockState(theLevel, newBlockPos(21'i32, y, z), stone)
+  for x in 9'i32 .. 20'i32:
+    discard setBlockState(theLevel, newBlockPos(x, 24'i32, z), planks)
+  if iron9:
+    for k in 0'i32 .. 8'i32:
+      discard setBlockState(theLevel, newBlockPos(14'i32, 25'i32 + k, z), iron)
+
+proc boxFor(z: int32): VolumeBox = volumeBox(8'i32, 20'i32, z - 1'i32, 21'i32, 35'i32, z + 1'i32)
+
+proc resetWorld() =
+  fillBox(0, 20, 0, 31, 60, 31, 0'u32)
+  bodyReset()
+  clearJournal()
+  discard bodyEventsDrain()
+
+# --- baseline world -----------------------------------------------------------------------------------------------------------
+fillBox(0, 0, 0, 31, 17, 31, stone)
+fillBox(0, 18, 0, 31, 19, 31, dirt)
+for c in chunks:
+  c.heightmap = calculateHeightmap(c)
+clearJournal()
+bodyReset()
+
+var optsC = defaultCollapseOpts()
+optsC.wind = false
+
+type RunOut = object
+  trace: seq[uint64]
+  final: uint64
+  reps: seq[CollapseReport]
+  applyTick: seq[int64]
+  submitTick: int64
+  fWorld: uint64
+  fBodies: int
+
+const RunTicks = 260
+
+proc runMode(mode: string; pool: JobPool): RunOut =
+  ## two bridges queued at tick T through collapseEnqueue, then RunTicks ticks
+  resetWorld()
+  enableSolverJobs(pool)
+  buildBridge(5'i32, true)
+  buildBridge(13'i32, true)
+  result = RunOut(trace: @[], final: 0'u64, reps: @[], applyTick: @[], submitTick: 0'i64, fWorld: 0'u64, fBodies: 0)
+  server.tickCounter = 1000'i64
+  let t0 = tickNow()
+  result.submitTick = t0
+  let r1 = collapseEnqueue(bw, boxFor(5'i32), optsC, t0)
+  let r2 = collapseEnqueue(bw, boxFor(13'i32), optsC, t0)
+  check(mode & ": both jobs queued", r1.queued and r2.queued and collapseJobsQueued() == 2)
+  var seen = @[false, false]
+  for i in 0 ..< RunTicks:
+    runTicks(1)
+    result.trace.add(stateHash())
+    for k in 0 ..< 2:
+      let id = (if k == 0: r1.jobId else: r2.jobId)
+      if not seen[k]:
+        let r = collapseResult(id)
+        if r.isSome:
+          seen[k] = true
+          result.reps.add(r.get())
+          result.applyTick.add(tickNow() - t0)
+  result.final = stateHash()
+  result.fWorld = worldHash()
+  result.fBodies = bodyCount()
+
+proc sameRep(a, b: CollapseReport): bool =
+  a.ok == b.ok and a.done == b.done and a.cells == b.cells and a.rounds == b.rounds and a.converged == b.converged and
+    a.maxRatio == b.maxRatio and a.broken == b.broken and a.components == b.components and a.bodies.len == b.bodies.len and
+    a.skipped == b.skipped and a.reason == b.reason
+
+proc ticksStr(a: seq[int64]): string =
+  result = ""
+  for v in a:
+    result.add($v & " ")
+
+proc showRep(r: CollapseReport): string =
+  "cells=" & $r.cells & " rounds=" & $r.rounds & " broken=" & $r.broken & " comps=" & $r.components & " bodies=" & $r.bodies.len &
+    " skipped=" & $r.skipped & " reason='" & r.reason & "'"
+
+# ======================================================================================================================
+# A. gate off / inline pool / 4 workers
+# ======================================================================================================================
+let inlinePool = newJobPool(1)
+let workerPool = newJobPool(5)
+check("pools: inline has no workers, the other has 4", inlinePool.workers == 0 and workerPool.workers == 4)
+
+let off = runMode("off", nil)
+let inl = runMode("inline", inlinePool)
+let w4 = runMode("workers4", workerPool)
+let w4b = runMode("workers4 again", workerPool)
+
+for o in [off, inl, w4]:
+  check("each mode reported both jobs", o.reps.len == 2)
+if off.reps.len == 2 and inl.reps.len == 2 and w4.reps.len == 2 and w4b.reps.len == 2:
+  echo "  off     : ", showRep(off.reps[0]), " | ", showRep(off.reps[1]), " apply ticks ", ticksStr(off.applyTick)
+  echo "  inline  : ", showRep(inl.reps[0]), " | ", showRep(inl.reps[1]), " apply ticks ", ticksStr(inl.applyTick)
+  echo "  workers4: ", showRep(w4.reps[0]), " | ", showRep(w4.reps[1]), " apply ticks ", ticksStr(w4.applyTick)
+  check("the bridges collapse (broken > 0, bodies made)", off.reps[0].ok and off.reps[0].broken > 0 and off.reps[0].bodies.len > 0)
+  for k in 0 ..< 2:
+    check("report " & $k & ": inline == off", sameRep(off.reps[k], inl.reps[k]))
+    check("report " & $k & ": workers4 == off", sameRep(off.reps[k], w4.reps[k]))
+    check("report " & $k & ": workers4 again == workers4", sameRep(w4.reps[k], w4b.reps[k]))
+  var firstDiff = -1
+  for i in 0 ..< RunTicks:
+    if inl.trace[i] != w4.trace[i] or w4.trace[i] != w4b.trace[i]:
+      firstDiff = i
+      break
+  check("gate on: inline == 4 workers == 4 workers again, tick by tick (first diff " & $firstDiff & ")", firstDiff < 0)
+  var offDiff = -1
+  for i in 0 ..< RunTicks:
+    if off.trace[i] != inl.trace[i]:
+      offDiff = i
+      break
+  echo "  first tick where off differs from inline: ", offDiff
+  check("gate on: apply ticks identical in every mode", ticksStr(inl.applyTick) == ticksStr(w4.applyTick) and ticksStr(w4.applyTick) == ticksStr(w4b.applyTick))
+  check("gate on: first job applied 2 ticks after the enqueue (submit on the first tick, apply SolveDelayTicks later)", inl.applyTick[0] == 2)
+  check("gate on: second job applied one tick after the first (pipelined)", inl.applyTick[1] == inl.applyTick[0] + 1)
+  check("gate off applies no later than the gate-on modes", off.applyTick[0] <= inl.applyTick[0])
+  check("final state: inline == off", inl.final == off.final)
+  check("final state: workers4 == off", w4.final == off.final)
+  check("final state: workers4 again == off", w4b.final == off.final)
+  echo "  hashes off=", off.final, " inline=", inl.final, " w4=", w4.final, " | world off=", off.fWorld, " inline=", inl.fWorld, " w4=", w4.fWorld, " | bodies ", off.fBodies, " ", inl.fBodies, " ", w4.fBodies
+
+# ======================================================================================================================
+# B. stale drop
+# ======================================================================================================================
+proc staleRun(mode: string; pool: JobPool; ex, ey, ez: int32; expectDrop: bool) =
+  resetWorld()
+  enableSolverJobs(pool)
+  buildBridge(5'i32, true)
+  let r = collapseEnqueue(bw, boxFor(5'i32), optsC, tickNow())
+  runTicks(1)   # the submit tick
+  check(mode & ": still queued after the submit tick", collapseJobsQueued() == 1 and collapseResult(r.jobId).isNone)
+  discard setBlockState(theLevel, newBlockPos(ex, ey, ez), planks)
+  let hashEdited = worldHash()
+  runTicks(1)   # the apply tick
+  let res = collapseResult(r.jobId)
+  check(mode & ": result present at the apply tick", res.isSome and collapseJobsQueued() == 0)
+  if res.isSome:
+    let rep = res.get()
+    echo "    ", mode, " edit (", ex, ",", ey, ",", ez, "): ", showRep(rep)
+    if expectDrop:
+      check(mode & ": dropped ('result dropped'), nothing broken, no bodies", rep.reason.contains("result dropped") and rep.broken == 0 and
+        rep.bodies.len == 0 and rep.done)
+      check(mode & ": the world is untouched by the dropped result", worldHash() == hashEdited and bodyCount() == 0)
+      runTicks(5)
+      check(mode & ": not re-queued (reported only)", collapseJobsQueued() == 0 and bodyCount() == 0)
+    else:
+      check(mode & ": not dropped (edit outside the box, same section), applied", not rep.reason.contains("result dropped") and rep.broken > 0)
+
+staleRun("stale inline", inlinePool, 14'i32, 30'i32, 5'i32, true)       # in the box (air above the iron stack, y 25..33 iron)
+staleRun("stale workers4", workerPool, 14'i32, 30'i32, 5'i32, true)
+staleRun("stale workers4 (air cell)", workerPool, 10'i32, 30'i32, 5'i32, true)
+staleRun("outside inline", inlinePool, 2'i32, 30'i32, 5'i32, false)       # same sections, x 2 is outside the box x 7..22
+staleRun("outside workers4", workerPool, 2'i32, 30'i32, 5'i32, false)
+# a fresh check after a drop works
+block redo:
+  resetWorld()
+  enableSolverJobs(workerPool)
+  buildBridge(5'i32, true)
+  let r = collapseEnqueue(bw, boxFor(5'i32), optsC, tickNow())
+  runTicks(2)
+  let res = collapseResult(r.jobId)
+  check("redo: a new check after the drops applies normally", res.isSome and res.get().broken > 0)
+
+# ======================================================================================================================
+# C. a big job: the worker is not done at the due tick, the tick waits (apply tick unchanged)
+# ======================================================================================================================
+proc bigRun(mode: string; pool: JobPool): (int64, int64, string, uint64) =
+  resetWorld()
+  enableSolverJobs(pool)
+  # a 28 x 36 x 28 block of planks on stone pillars, heavily loaded: the solver has a lot to do
+  for y in 20'i32 .. 24'i32:
+    for pz in [2'i32, 29'i32]:
+      for px in [2'i32, 29'i32]:
+        discard setBlockState(theLevel, newBlockPos(px, y, pz), stone)
+  for z in 2'i32 .. 29'i32:
+    for x in 2'i32 .. 29'i32:
+      discard setBlockState(theLevel, newBlockPos(x, 25'i32, z), planks)
+      for k in 26'i32 .. 40'i32:
+        discard setBlockState(theLevel, newBlockPos(x, k, z), iron)
+  let t0 = tickNow()
+  let r = collapseEnqueue(bw, volumeBox(1'i32, 20'i32, 1'i32, 30'i32, 45'i32, 30'i32), optsC, t0)
+  runTicks(1)
+  let tSub = tickNow()
+  runTicks(1)
+  let tDue = tickNow()
+  var res = collapseResult(r.jobId)
+  var applied = res.isSome
+  var n = 0
+  while not applied and n < 400:
+    runTicks(1)
+    inc n
+    res = collapseResult(r.jobId)
+    applied = res.isSome
+  let rs = (if res.isSome: showRep(res.get()) else: "none")
+  (tDue - tSub, (if applied: n else: -1), rs, stateHash())
+
+let bigOff = bigRun("big off", nil)
+let bigInl = bigRun("big inline", inlinePool)
+let bigW = bigRun("big workers4", workerPool)
+echo "  big off     : late ticks ", bigOff[1], " ", bigOff[2]
+echo "  big inline  : late ticks ", bigInl[1], " ", bigInl[2]
+echo "  big workers4: late ticks ", bigW[1], " ", bigW[2]
+check("big: inline applies at the due tick (no late ticks)", bigInl[1] == 0)
+check("big: workers4 applies at the due tick although the worker may not be done (waits)", bigW[1] == 0)
+check("big: the report is identical (inline vs workers4)", bigInl[2] == bigW[2])
+check("big: the state is identical (inline vs workers4)", bigInl[3] == bigW[3])
+check("big: the report is identical to the sliced gate-off run", bigOff[2] == bigInl[2])
+
+enableSolverJobs(nil)
+resetWorld()
+shutdown(workerPool)
+
+if failures == 0:
+  echo "ALL PASS"
+else:
+  echo failures, " FAILED"
+  quit(1)
