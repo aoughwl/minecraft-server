@@ -1,0 +1,107 @@
+{.feature: "lenientnils".}
+
+## Phase 5 wiring (docs/MULTITHREADING.md "Phase 5 status"): the per-world `regionPhase` stage of `worldmod.tickChunks`, on `sim/regionsched`.
+##
+## What runs through the scheduler: the SCAN half of the random block ticks (`level.scanRolls`). The tick thread draws the random numbers
+## from the Level's single RNG stream in the original order (`level.drawRandomRolls`), one `ChunkRolls` per active chunk with a randomly
+## ticking section; each is one region task with home chunk = that chunk and margin 0 (it reads only that chunk's block sections and constant
+## block-state tables, and writes only its own `samples` slot). After the join the tick thread concatenates the slots in task-id order into the
+## `TickData` and applies the ticks exactly as before (`runTickData`: `randomTick` bodies, `setBlockState`, hooks, all on the tick thread).
+## So the output equals the one-pass loop for any thread count, by construction (same draws, same order).
+##
+## GATE: `MC_REGION_THREADS=1` AND the thread plan has workers > 0, decided once (default off: `scanChunksOnPool` answers false at once and the
+## caller scans inline, the code that ran before). Also refused (false) when called from inside a pool/dimension job: the caller would block a
+## worker on the pool it is running on.
+##
+## Honest cost note: a scan is 3 table reads per ticking section, far less than the cost of a job; tiles of `TileSize` chunks are one job each to
+## amortise, but expect no speedup from this workload. It exists as the proven first user of the footprint scheduler; the footprint/apply split is
+## the part that carries over to heavier read-only scans.
+
+import std/envvars
+import std/cpuinfo
+import ../../world/level
+import jobpool
+import threadcfg
+import regions
+import regionsched
+import ownerguard
+
+const TileSize = 4    ## chunks per tile side (margin 0 allows any tile size >= 1)
+
+var
+  gDecided = false
+  gOn = false
+  gPool: JobPool = nil
+  gOwner = -1
+  gRuns = 0
+  gTasks = 0
+  gFailed = 0
+  gMaxShards = 0
+
+proc parseNum(v: string): int =
+  if v.len == 0: return -1
+  result = 0
+  for c in v:
+    if c >= '0' and c <= '9':
+      result = result * 10 + (ord(c) - ord('0'))
+
+proc enableRegionPhase*(workers: int) =
+  ## Test hook and the gate's tail: `workers` 0 runs every job inline at submit (still through the planner and slots).
+  if gPool == nil:
+    gPool = sharedJobPool(workers + 1)
+    gOwner = allocOwner(gPool)
+  gDecided = true
+  gOn = true
+
+proc regionPhaseEnabled*(): bool =
+  if not gDecided:
+    gDecided = true
+    if getEnv("MC_REGION_THREADS") == "1":
+      let plan = planThreads(0, 0, countProcessors(), parseNum(getEnv("MC_THREADS")), parseNum(getEnv("MC_CHUNK_WORKERS")))
+      if plan.workers > 0:
+        enableRegionPhase(if plan.workers > 4: 4 else: plan.workers)
+  gOn
+
+proc regionPhaseStats*(): (int, int, int, int) =
+  ## (phases run, tasks run, failed tasks, widest shard count seen)
+  (gRuns, gTasks, gFailed, gMaxShards)
+
+proc scanBody(arg: pointer): int {.nimcall, raises.} =
+  let cr = cast[ptr ChunkRolls](arg)
+  enterRegionTask(int(cr.chunk.x), int(cr.chunk.z), 0)
+  assertInFootprint(int(cr.chunk.x), int(cr.chunk.z), "random tick scan home chunk")
+  scanRolls(cr[])
+  leaveRegionTask()
+  cr.samples.len
+
+proc scanChunksOnPool*(rs: var seq[ChunkRolls]): bool =
+  ## True when every `ChunkRolls` was scanned through the footprint scheduler (join done, slots filled); false = nothing was touched, scan inline.
+  if rs.len == 0 or not regionPhaseEnabled() or gPool == nil or inJob() or inDimJob():
+    return false
+  var tasks: seq[RegionTask] = @[]
+  for i in 0 ..< rs.len:
+    tasks.add RegionTask(home: ChunkCoord(x: int(rs[i].chunk.x), z: int(rs[i].chunk.z)), body: scanBody, arg: addr rs[i])
+  var res: seq[int] = @[]
+  var st = RegionRunStats()
+  runRegionTasks(gPool, gOwner, tasks, 0, TileSize, res, st)
+  inc gRuns
+  gTasks += st.tasks
+  gFailed += st.failed
+  if st.maxShardsInPhase > gMaxShards: gMaxShards = st.maxShardsInPhase
+  if not st.planned or st.failed > 0:
+    for i in 0 ..< rs.len:     # a failed or unplanned run: redo inline so the result is the sequential one
+      scanRolls(rs[i])
+  true
+
+proc resetRegionPhase*() =
+  ## Tests: drop the pool so the next `enableRegionPhase` can size a new one (jobpool allows one pool with workers at a time).
+  if gPool != nil:
+    shutdown(gPool)
+  gPool = nil
+  gOwner = -1
+  gOn = false
+  gDecided = true
+  gRuns = 0
+  gTasks = 0
+  gFailed = 0
+  gMaxShards = 0
