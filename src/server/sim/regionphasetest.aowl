@@ -1,0 +1,213 @@
+{.feature: "lenientnils".}
+
+## Phase 5 wiring test: the random-tick scan on the region scheduler (sim/regionphase) gives the same world as the inline scan.
+## A scripted world (10x10 chunks, wheat/stone/lava mix) is ticked N times: draw, scan (gate off = inline, gate on 0/1/4 workers),
+## apply on this thread (each sample rewrites its block and a pseudo-random cell of its chunk). Per-tick digests and the final world hash
+## must be identical in all modes. Second part: a margin-1 task body (reads the 3x3 chunks around home, per-task slots, ordered apply)
+## through runRegionTasks on overlapping footprints, identical at 1/4 workers, plus the footprint guard catching an out-of-footprint read.
+
+import std/[syncio, assertions, cmdline, envvars, tables]
+import ../../config/[chunk, lighting, world]
+import ../../generated/dimension as dimensiondata
+import ../../world/[blockstates, palette, chunkdata, tick, level, worldfs]
+import jobpool, regions, regionsched, regionphase, ownerguard
+
+proc sid(name: string): uint32 =
+  let (ok, id) = defaultStateByName(name)
+  assert ok, name
+  id
+
+proc scratch(name: string): string =
+  var base = getEnv("WORLDTEST_DIR")
+  if base.len == 0:
+    base = parentDirW(paramStr(0)) & "/regionphase_scratch"
+  result = base & "/" & name
+  discard createDirAllW(result)
+
+const
+  CX = 10'i32
+  CZ = 10'i32
+  Sections = 3
+
+var failures = 0
+proc check(ok: bool, name: string) =
+  if ok:
+    echo "PASS " & name
+  else:
+    echo "FAIL " & name
+    inc failures
+
+var rngState = 1'u32
+proc rnd(n: int): int =
+  rngState = rngState * 1664525'u32 + 1013904223'u32
+  int((rngState shr 8) mod uint32(n))
+
+proc emptyChunk(x, z: int32): ChunkData =
+  let c = newChunkData(x, z, newChunkSections(Sections, 0'i32))
+  c.heightmap = calculateHeightmap(c)
+  c
+
+proc buildWorld(name: string): Level =
+  rngState = 12345'u32
+  let l = fromRootFolder(defaultLevelConfig(), scratch(name), 1'i64, OVERWORLD)
+  let pal = [sid("air"), sid("stone"), sid("wheat"), sid("lava"), sid("stone")]
+  for cz in 0'i32 ..< CZ:
+    for cx in 0'i32 ..< CX:
+      let c = emptyChunk(cx, cz)
+      if (cx + cz) mod 5 != 4:     # a few chunks have no ticking blocks at all
+        for _ in 0 ..< 220:
+          c.setRelativeBlock(rnd(16), rnd(Sections * 16), rnd(16), pal[rnd(pal.len)])
+      addLoadedChunk(l, c)
+  l
+
+proc worldHash(l: Level): uint64 =
+  result = 1469598103934665603'u64
+  for cz in 0'i32 ..< CZ:
+    for cx in 0'i32 ..< CX:
+      let c = l.loadedChunks.getOrDefault(chunkKey(cx, cz), nil)
+      for s in 0 ..< Sections:
+        for y in 0 ..< 16:
+          for z in 0 ..< 16:
+            for x in 0 ..< 16:
+              result = (result xor uint64(get(c.section.blockSections[s], x, y, z))) * 1099511628211'u64
+
+proc activeList(): seq[(int32, int32)] =
+  result = @[]
+  for cz in 0'i32 ..< CZ:
+    for cx in 0'i32 ..< CX:
+      result.add((cx, cz))
+
+proc runWorld(name: string, ticks: int, onPool: bool): (seq[uint64], uint64, int) =
+  ## Returns (per tick sample digest, final world hash, how many ticks went through the scheduler).
+  let l = buildWorld(name)
+  let wheat = sid("wheat")
+  let stone = sid("stone")
+  var digests: seq[uint64] = @[]
+  var viaPool = 0
+  let active = activeList()
+  for t in 0 ..< ticks:
+    var rolls = drawRandomRolls(l, active, 12'i64)
+    let scanned = if onPool: scanChunksOnPool(rolls) else: false
+    if scanned: inc viaPool
+    let data = getTickDataWith(l, rolls, scanned)
+    var d = 1469598103934665603'u64
+    for s in data.randomTicks:
+      d = (d xor uint64(s.position.x)) * 1099511628211'u64
+      d = (d xor uint64(s.position.y)) * 1099511628211'u64
+      d = (d xor uint64(s.position.z)) * 1099511628211'u64
+      d = (d xor (if s.tickBlock: 1'u64 else: 2'u64) xor (if s.tickFluid: 4'u64 else: 8'u64)) * 1099511628211'u64
+      # apply on the tick thread: rewrite the sampled block and seed a new ticking block in the same chunk
+      let c = l.loadedChunks.getOrDefault(chunkKey(s.position.x div 16'i32, s.position.z div 16'i32), nil)
+      let rx = int(s.position.x mod 16'i32)
+      let ry = int(s.position.y)
+      let rz = int(s.position.z mod 16'i32)
+      c.setRelativeBlock(rx, ry, rz, stone)
+      c.setRelativeBlock((rx * 7 + t) mod 16, (ry * 5 + t) mod (Sections * 16), (rz * 3 + 2 * t) mod 16, wheat)
+    digests.add d
+  (digests, worldHash(l), viaPool)
+
+# --- margin-1 workload on overlapping footprints -------------------------------------------------------------------------
+
+type Slot = object
+  l: Level
+  cx, cz: int32
+  value: int
+
+proc marginBody(arg: pointer): int {.nimcall, raises.} =
+  let s = cast[ptr Slot](arg)
+  enterRegionTask(int(s.cx), int(s.cz), 1)
+  var acc = 0
+  for dz in -1 .. 1:
+    for dx in -1 .. 1:
+      let x = s.cx + int32(dx)
+      let z = s.cz + int32(dz)
+      if x < 0 or z < 0 or x >= CX or z >= CZ:
+        continue
+      assertInFootprint(int(x), int(z), "neighbour read")
+      let c = s.l.loadedChunks.getOrDefault(chunkKey(x, z), nil)
+      acc = (acc * 31 + int(c.section.randomlyTickingMask)) mod 1000000007
+      for i in 0 ..< Sections:
+        acc = (acc * 31 + int(get(c.section.blockSections[i], dx + 1, i, dz + 1))) mod 1000000007
+  s.value = acc
+  leaveRegionTask()
+  acc
+
+proc strayBody(arg: pointer): int {.nimcall, raises.} =
+  let s = cast[ptr Slot](arg)
+  enterRegionTask(int(s.cx), int(s.cz), 1)
+  assertInFootprint(int(s.cx) + 2, int(s.cz), "stray read two chunks away")
+  leaveRegionTask()
+  0
+
+proc runMargin(workers: int): (seq[int], int) =
+  let l = buildWorld("margin" & $workers)
+  let p = newJobPool(workers + 1)
+  var slots = newSeq[Slot](int(CX * CZ))
+  var tasks: seq[RegionTask] = @[]
+  for cz in 0'i32 ..< CZ:
+    for cx in 0'i32 ..< CX:
+      let i = int(cz * CX + cx)
+      slots[i] = Slot(l: l, cx: cx, cz: cz)
+      tasks.add RegionTask(home: ChunkCoord(x: int(cx), z: int(cz)), body: marginBody, arg: addr slots[i])
+  var res: seq[int] = @[]
+  var st = RegionRunStats()
+  runRegionTasks(p, 0, tasks, 1, 0, res, st)
+  shutdown(p)
+  (res, st.phases * 100 + st.shards)
+
+proc main() =
+  setGuards(true)
+  registerTickThread()
+  let ticks = 30
+  let (d0, h0, v0) = runWorld("off", ticks, false)
+  check(v0 == 0, "gate off: nothing went through the scheduler")
+  var anySamples = 0
+  for d in d0:
+    if d != 1469598103934665603'u64: inc anySamples
+  check(anySamples > ticks div 2, "workload produces random tick samples")
+
+  # gate off by default: scanChunksOnPool answers false before anything is enabled
+  var probe = drawRandomRolls(buildWorld("probe"), activeList(), 3'i64)
+  check(not scanChunksOnPool(probe), "default: gate off answers false")
+
+  enableRegionPhase(0)
+  let (d1, h1, v1) = runWorld("inline", ticks, true)
+  check(v1 == ticks and d1 == d0 and h1 == h0, "gate on, inline pool (0 workers): same digests and world hash")
+  resetRegionPhase()
+
+  enableRegionPhase(1)
+  let (d2, h2, v2) = runWorld("w1", ticks, true)
+  check(v2 == ticks and d2 == d0 and h2 == h0, "gate on, 1 worker: same digests and world hash")
+  resetRegionPhase()
+
+  enableRegionPhase(4)
+  for rep in 0 ..< 3:
+    let (d3, h3, v3) = runWorld("w4_" & $rep, ticks, true)
+    check(v3 == ticks and d3 == d0 and h3 == h0, "gate on, 4 workers rep " & $rep & ": same digests and world hash")
+  let (runs, tasks, failed, widest) = regionPhaseStats()
+  check(failed == 0 and tasks > 0 and widest > 1, "scheduler stats: " & $runs & " runs, " & $tasks & " tasks, widest phase " & $widest & " shards, " & $failed & " failed")
+  check(violationCount() == 0, "no footprint or owner violations in the scan tasks")
+  resetRegionPhase()
+
+  let (r1, p1) = runMargin(0)
+  let (r4, p4) = runMargin(4)
+  check(r1 == r4 and p1 == p4 and r1.len == int(CX * CZ), "margin-1 overlapping footprints: identical slots at 1 and 4 workers (plan " & $p1 & ")")
+  check(violationCount() == 0, "margin-1 body stayed inside its footprint")
+
+  # the guard sees an out-of-footprint touch
+  resetViolations()
+  var st = Slot(cx: 2, cz: 2)
+  let p = newJobPool(1)
+  var res: seq[int] = @[]
+  var rst = RegionRunStats()
+  runRegionTasks(p, 0, @[RegionTask(home: ChunkCoord(x: 2, z: 2), body: strayBody, arg: addr st)], 1, 0, res, rst)
+  shutdown(p)
+  check(violationCount() == 1, "footprint guard flags a read outside the declared footprint")
+  resetViolations()
+
+  if failures > 0:
+    echo "FAILED " & $failures
+    quit(1)
+  echo "regionphasetest ok"
+
+main()
