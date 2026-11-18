@@ -28,11 +28,14 @@
 ## `bodyDirtyDrain`), networking, body-vs-body contact (the integrator treats other bodies as non-existent), entity pushing, a body
 ## entering a different dimension. Block entities travel with their cell (chest items intact) but are not rotated.
 ##
-## THREADING. Everything runs on the tick thread; module globals are fine.
+## THREADING. Bodies live in a `BodyState` per World (`bodiesOf(world)`, `World.bodyState`), stepped by `tickBodies` world by world with
+## the budget (`maxAwake`, `maxCells`) and the round robin cursor per world. Body ids and uuids are global and atomic (`allocId`,
+## `newUuid`). Still module wide: the event / fx feeds, stats, collapse jobs (sliced for every world), the collision provider (one,
+## it answers for all worlds), the journal replay list. Everything runs on the tick thread until phase 4.
 
 {.feature: "lenientnils".}
 
-import std/[math, options, tables, strutils, syncio]
+import std/[math, options, tables, strutils, syncio, atomics]
 import ../../data/block_ext
 from ../../data/block_state import newBlockStateIdUnchecked, asU16
 import ../../nbt/tag as nbttag
@@ -62,6 +65,11 @@ const
   FellMaxTicks* = 400'i64        ## a felled tree's stage (falling with leaves, falling bare) ends after this many ticks even if it never sleeps
 
 type
+  BodyState* = ref object of RootObj
+    ## The live bodies of ONE world (creation order) and the round robin cursor of its step budget.
+    bodies*: seq[BodyEntity]
+    cursor*: int
+
   BodyConfig* = object
     maxAwake*: int            ## awake bodies stepped per tick
     maxCells*: int            ## surface cells stepped per tick (a body costs its surface cell count + 1)
@@ -181,13 +189,12 @@ var gCfg* = BodyConfig(maxAwake: 32, maxCells: 8000, checkpointEvery: 100, autoS
   settleRadius: 2, shatter: false, journal: true, voidMargin: 32, collapseOps: 20000, collapseInline: 70000)
 var gStats* = BodyStats()
 var gTestCrash* = 0     ## test hook: 1 = stop after the pending journal write, 2 = after the blocks were removed, 3 = after the settling write
-var gBodies*: seq[BodyEntity] = @[]
-var gNextId: int32 = 1'i32
-var gUuidCounter: uint64 = 0'u64
+var gNextId: int32          # (atomicFetchAdd only) last id handed out (the first id is 1)
+var gUuidCounter: uint64    # (atomicFetchAdd only)
+var gBodyStates: seq[BodyState] = @[]    # every world's state in creation order: the index for the global views (provider, bodyList, reset)
 var gProviderId: int32 = 0'i32
 var gServers: seq[Server] = @[]
 var gReplayed: seq[string] = @[]
-var gCursor = 0
 var gLastTick: int64 = 0'i64
 var gEvents: seq[BodyEvent] = @[]
 var gFx: seq[BodyFxEvent] = @[]
@@ -219,13 +226,12 @@ proc statusName*(s: EditStatus): string =
   of esWrongState: "wrong state"
 
 proc newUuid(): (uint64, uint64) =
-  inc gUuidCounter
+  let n = atomicFetchAdd(gUuidCounter, 1'u64, moSequentiallyConsistent) + 1'u64
   let t = uint64(nowNanos())
-  (t xor (gUuidCounter * 0x9E3779B97F4A7C15'u64), (t shl 13) xor (gUuidCounter * 0xC2B2AE3D27D4EB4F'u64) xor 0x5851F42D4C957F2D'u64)
+  (t xor (n * 0x9E3779B97F4A7C15'u64), (t shl 13) xor (n * 0xC2B2AE3D27D4EB4F'u64) xor 0x5851F42D4C957F2D'u64)
 
 proc allocId(): int32 =
-  result = gNextId
-  inc gNextId
+  result = atomicFetchAdd(gNextId, 1'i32, moSequentiallyConsistent) + 1'i32
 
 proc vec3Of(v: Vec3): Vector3[float64] =
   Vector3[float64](x: v.x, y: v.y, z: v.z)
@@ -293,15 +299,45 @@ proc parseFloatSafe*(s: string; v: var float64): bool =
 proc f2*(v: float64): string =
   formatFloat(v, ffDecimal, 2)
 
-proc bodyCount*(): int = gBodies.len
+proc bodyStateOf*(world: World): BodyState =
+  ## The body state of one world, made on first use.
+  if world.bodyState == nil:
+    let st = BodyState(bodies: @[], cursor: 0)
+    world.bodyState = st
+    gBodyStates.add(st)
+  BodyState(world.bodyState)
+
+proc bodiesOf*(world: World): seq[BodyEntity] = bodyStateOf(world).bodies
+  ## The live bodies of one world, in creation order (a copy).
+
+iterator liveBodies(): BodyEntity {.sideEffect.} =
+  ## Every world's bodies (the collision provider has no world).
+  var i = 0
+  while i < gBodyStates.len:
+    let bs = gBodyStates[i]
+    var j = 0
+    while j < bs.bodies.len:
+      yield bs.bodies[j]
+      inc j
+    inc i
+
+proc bodyCount*(): int =
+  result = 0
+  for bs in gBodyStates:
+    result += bs.bodies.len
 
 proc bodyById*(id: int32): Option[BodyEntity] =
-  for be in gBodies:
+  for be in liveBodies():
     if be.id == id:
       return some(be)
   none[BodyEntity]()
 
-proc bodyList*(): seq[BodyEntity] = gBodies
+proc bodyList*(): seq[BodyEntity] =
+  ## All worlds, world by world (the order the worlds first held a body), each in creation order.
+  result = @[]
+  for bs in gBodyStates:
+    for be in bs.bodies:
+      result.add(be)
 
 proc trackServer(server: Server) =
   if gServers.len == 0:
@@ -376,7 +412,7 @@ proc bodyEventsPending*(): int = gEvents.len
 proc bodyEventsSnapshot*(): seq[BodyEvent] =
   ## One bekCreate per live body with its CURRENT pose: for a consumer that joined late or lost events (`gEventsOverflow`).
   result = @[]
-  for be in gBodies:
+  for be in liveBodies():
     if be.phase == bpFree:
       result.add(makeEvent(bekCreate, be, drNone, gLastTick))
 
@@ -403,7 +439,7 @@ proc boxOf(a: Aabb): BoundingBox =
   newBoundingBox(Vector3[float64](x: a.x0, y: a.y0, z: a.z0), Vector3[float64](x: a.x1, y: a.y1, z: a.z1))
 
 proc provQuery(handle: int; region: BoundingBox; moverId: int32; outBoxes: var seq[ProvidedBox]) {.nimcall.} =
-  for be in gBodies:
+  for be in liveBodies():
     if be.phase != bpFree:
       continue
     let ab = bodyAabb(be)
@@ -422,7 +458,7 @@ proc provQuery(handle: int; region: BoundingBox; moverId: int32; outBoxes: var s
 
 proc provVelocity(handle: int; box: BoundingBox; vel: var Vector3[float64]): bool {.nimcall.} =
   let region = box.expand(0.0'f64, 0.1'f64, 0.0'f64)
-  for be in gBodies:
+  for be in liveBodies():
     if be.phase != bpFree:
       continue
     if not overlaps(bodyAabb(be), region):
@@ -463,7 +499,7 @@ proc provRay(handle: int; origin, delta: Vector3[float64]; tHit: var float64): b
   let sy1 = max(origin.y, origin.y + delta.y)
   let sz0 = min(origin.z, origin.z + delta.z)
   let sz1 = max(origin.z, origin.z + delta.z)
-  for be in gBodies:
+  for be in liveBodies():
     if be.phase != bpFree:
       continue
     let ab = bodyAabb(be)
@@ -495,20 +531,22 @@ proc ensureProvider() =
 # registry
 
 proc registerBody(be: BodyEntity; tick: int64) =
-  gBodies.add(be)
+  let bs = bodyStateOf(be.world)
+  bs.bodies.add(be)
   ensureProvider()
   inc gStats.created
   emitCreate(be, tick)
 
 proc destroyBody(be: BodyEntity; reason: DestroyReason; tick: int64; deleteJournal: bool = true) =
+  let bs = bodyStateOf(be.world)
   var at = -1
-  for i in 0 ..< gBodies.len:
-    if gBodies[i] == be:
+  for i in 0 ..< bs.bodies.len:
+    if bs.bodies[i] == be:
       at = i
       break
   if at < 0:
     return
-  gBodies.delete(at)
+  bs.bodies.delete(at)
   if deleteJournal and gCfg.journal:
     journalDelete(be.world, be.body.idHi, be.body.idLo)
   inc gStats.destroyed
@@ -530,14 +568,15 @@ proc wakeBody*(be: BodyEntity) =
 
 proc bodyReset*() =
   ## Forget every body, event and job (tests; a "process restart" in the crash test). Journal files stay.
-  gBodies.setLen(0)
+  for bs in gBodyStates:
+    bs.bodies.setLen(0)
+    bs.cursor = 0
   gEvents.setLen(0)
   gStatePending.clear()
   gEventsOverflow = false
   gDirty.setLen(0)
   gJobs.setLen(0)
   gReplayed.setLen(0)
-  gCursor = 0
   gStats = BodyStats()
   gTestCrash = 0
   if gProviderId != 0'i32:
@@ -938,7 +977,7 @@ proc stepOne(be: BodyEntity; tick: int64) =
     return
   if gCfg.shatter and impacts.len > 0:
     applyShatter(be, impacts, tick)
-    if not (be in gBodies):
+    if not (be in bodyStateOf(be.world).bodies):
       return
   if be.body.sleeping:
     if not be.sleepAnnounced:
@@ -1045,11 +1084,11 @@ proc trySettleAuto(be: BodyEntity; tick: int64) =
 # ----------------------------------------------------------------------------------------------------------------------
 # journal replay
 
-proc resolveReplayed(tick: int64) =
-  ## Finishes the bodies replayed from the journal whose claim cells are in loaded chunks (see bodyjournal.aowl, claims rule).
+proc resolveReplayed(bs: BodyState; tick: int64) =
+  ## Finishes the bodies of one world replayed from the journal whose claim cells are in loaded chunks (see bodyjournal.aowl, claims rule).
   var i = 0
-  while i < gBodies.len:
-    let be = gBodies[i]
+  while i < bs.bodies.len:
+    let be = bs.bodies[i]
     if be.phase != bpUnresolved:
       inc i
       continue
@@ -1071,7 +1110,7 @@ proc resolveReplayed(tick: int64) =
       inc gStats.claimedCells
     if cellCount(be.body) == 0:
       journalDelete(be.world, be.body.idHi, be.body.idLo)
-      gBodies.delete(i)
+      bs.bodies.delete(i)
       continue
     var keep: seq[Claim] = @[]
     for k in be.claims:
@@ -1099,7 +1138,7 @@ proc replayJournal*(world: World; tick: int64): int =
   let recs = journalList(world)
   for rec in recs:
     var dup = false
-    for have in gBodies:
+    for have in liveBodies():
       if have.body.idHi == rec.body.idHi and have.body.idLo == rec.body.idLo:
         dup = true
     if dup:
@@ -1111,7 +1150,8 @@ proc replayJournal*(world: World; tick: int64): int =
       be.claims.add(k)
     be.blockEntities = rec.blockEntities
     be.phase = bpUnresolved
-    gBodies.add(be)
+    let bs = bodyStateOf(world)
+    bs.bodies.add(be)
     inc result
     inc gStats.replayed
 
@@ -1348,8 +1388,9 @@ proc spawnDebrisBody*(world: World; b: Body; tick: int64): BodyEntity =
 proc onBlockChanged*(world: World; x, y, z: int32; oldState, newState: uint32) =
   ## STUB for the next task (the automatic triggers). Today it wakes the bodies near the cell (a block that disappeared under a
   ## sleeping body, or appeared in its way) and queues the cell in `bodyDirtyDrain` so the trigger code can run `collapseCheck`.
-  if gBodies.len > 0:
-    for be in gBodies:
+  let bs = bodyStateOf(world)
+  if bs.bodies.len > 0:
+    for be in bs.bodies:
       if be.world != world or be.phase != bpFree or not be.body.sleeping:
         continue
       let ab = bodyAabb(be)
@@ -1376,19 +1417,9 @@ proc ensureJournal(world: World; tick: int64) =
     if n > 0:
       echo "[body] replayed " & $n & " body journal record(s) for " & world.dimension.minecraftName
 
-proc tickBodies*(server: Server) =
-  ## ONE call per server tick. Replays the journals on first sight of a world, finishes replayed bodies, slices queued collapse
-  ## checks, steps the awake bodies inside the budget, settles bodies that came to rest.
-  trackServer(server)
-  let tick = server.tickCounter
-  gLastTick = tick
-  for w in server.worlds:
-    ensureJournal(w, tick)
-  if gBodies.len == 0 and gJobs.len == 0:
-    return
-  resolveReplayed(tick)
-  stepCollapseJobs(tick)
-  let snapshot = gBodies
+proc tickWorldBodies(world: World; bs: BodyState; tick: int64) =
+  ## Steps the awake bodies of ONE world inside the budget (per world), settles the ones that came to rest.
+  let snapshot = bs.bodies
   let n = snapshot.len
   var stepped = 0
   var spent = 0
@@ -1396,7 +1427,7 @@ proc tickBodies*(server: Server) =
   var firstSkipped = -1
   var settleList: seq[BodyEntity] = @[]
   for i in 0 ..< n:
-    let idx = (gCursor + i) mod n
+    let idx = (bs.cursor + i) mod n
     let be = snapshot[idx]
     if be.phase != bpFree or be.kinematic:
       continue
@@ -1413,15 +1444,31 @@ proc tickBodies*(server: Server) =
     stepOne(be, tick)
     inc stepped
     spent += cost
-  gCursor = (if firstSkipped >= 0: firstSkipped else: 0)
+  bs.cursor = (if firstSkipped >= 0: firstSkipped else: 0)
   if skipped > 0:
     gStats.skipped += skipped
     if tick - gLastSkipLog >= 200'i64:
       gLastSkipLog = tick
       echo "[body] budget: " & $skipped & " awake bodies waited this tick (" & $stepped & " stepped, " & $spent & " cells)"
   for be in settleList:
-    if be in gBodies and (be.body.sleeping or be.felled):
+    if be in bs.bodies and (be.body.sleeping or be.felled):
       trySettleAuto(be, tick)
+
+proc tickBodies*(server: Server) =
+  ## ONE call per server tick. Replays the journals on first sight of a world, finishes replayed bodies, slices queued collapse
+  ## checks, steps the awake bodies of every world inside the budget, settles bodies that came to rest.
+  trackServer(server)
+  let tick = server.tickCounter
+  gLastTick = tick
+  for w in server.worlds:
+    ensureJournal(w, tick)
+  if bodyCount() == 0 and gJobs.len == 0:
+    return
+  for w in server.worlds:
+    resolveReplayed(bodyStateOf(w), tick)
+  stepCollapseJobs(tick)
+  for w in server.worlds:
+    tickWorldBodies(w, bodyStateOf(w), tick)
 
 # ----------------------------------------------------------------------------------------------------------------------
 # text commands (bodycmd.aowl is the thin wrapper)
@@ -1480,9 +1527,10 @@ proc bodyExec*(world: World; ox, oy, oz: int32; parts: seq[string]; tick: int64)
     else:
       result.add("Nothing assembled: " & r.reason)
   of "list":
-    if gBodies.len == 0:
+    if bodyCount() == 0:
       result.add("No bodies.")
-    for be in gBodies:
+    let all = bodyList()
+    for be in all:
       result.add(bodyInfoLine(be))
   of "info", "settle", "remove", "impulse":
     var id = 0
@@ -1545,7 +1593,7 @@ proc bodyExec*(world: World; ox, oy, oz: int32; parts: seq[string]; tick: int64)
     else:
       result.add("Collapse check failed: " & r.reason)
   of "status":
-    result.add("Bodies: " & $gBodies.len & " live, created " & $gStats.created & ", settled " & $gStats.settled & ", dropped cells " &
+    result.add("Bodies: " & $bodyCount() & " live, created " & $gStats.created & ", settled " & $gStats.settled & ", dropped cells " &
       $gStats.cellsDropped & ", void " & $gStats.voided & ", steps " & $gStats.steps & ", skipped (over budget) " & $gStats.skipped &
       ", frozen (chunk not loaded) " & $gStats.frozen & ", replayed " & $gStats.replayed & ", events queued " & $gEvents.len &
       ", collapse jobs queued " & $gJobs.len)
