@@ -70,7 +70,6 @@ type
     cause*: uint8
     kind*: uint8
     actor*: uint16
-    name*: string    ## only set inside a dimension job (phase 4): the actor is interned at the join phase, in order
 
   LogQuery* = object
     dim*: int            ## -1: every dimension
@@ -278,7 +277,10 @@ var gRing: BlockRing = newRing(16)
 var gDims: seq[string] = @[]
 var gUsers: seq[string] = @[]
 var gUserIdx: Table[string, int] = initTable[string, int]()
-var gCtx {.threadvar.}: BlockLogCtx   ## per thread: a dimension thread's attribution is its own (zero = natural, no actor)
+var gCtx: BlockLogCtx = BlockLogCtx()
+var gDimCtx {.threadvar.}: BlockLogCtx   ## phase 4: inside a dimension job the attribution is the job thread's own; the tick thread keeps `gCtx`
+var gDimNames {.threadvar.}: seq[string] ## actor names pushed inside the current dimension job; a ctx actor with `DimNameFlag` is 1 + an index here
+const DimNameFlag = 0x8000'u16
 var gPendingPaths: seq[string] = @[]
 var gPendingData: seq[seq[byte]] = @[]
 var gLastFlushTick: int = 0
@@ -417,14 +419,24 @@ proc userName*(idx: int): string =
 
 proc blockLogPush*(cause, kind: uint8; name: string): BlockLogCtx =
   ## Everything written until `blockLogPop(previous)` is attributed to this. Answers what to restore.
-  result = gCtx
   if inDimJob():
     # `userIndex` appends to shared tables and a file: not from a world thread. The name travels and is interned at the join.
-    gCtx = BlockLogCtx(cause: cause, kind: kind, actor: 0'u16, name: (if gFolder.len > 0: name else: ""))
+    result = gDimCtx
+    if result.actor == 0'u16:
+      gDimNames.setLen(0)
+    var a = 0'u16
+    if name.len > 0 and gFolder.len > 0:
+      gDimNames.add name
+      a = DimNameFlag or uint16(gDimNames.len)
+    gDimCtx = BlockLogCtx(cause: cause, kind: kind, actor: a)
     return
+  result = gCtx
   gCtx = BlockLogCtx(cause: cause, kind: kind, actor: (if name.len > 0 and gFolder.len > 0: uint16(userIndex(name)) else: 0'u16))
 
 proc blockLogPop*(prev: BlockLogCtx) =
+  if inDimJob():
+    gDimCtx = prev
+    return
   gCtx = prev
 
 proc blockLogCurrent*(): BlockLogCtx = gCtx
@@ -488,16 +500,16 @@ var
   gChangeHookOn* = false     ## the replay recorder's tap (replay/replay.aowl): one bool test per change while nobody records
   gChangeHook*: proc(dimension: string; x, y, z: int; oldState, newState: int) {.closure.} = nil
 
-proc recordChangeNow(ctx: BlockLogCtx; dimension: string; x, y, z: int; oldState, newState: int) =
+proc recordChangeNow(cause, kind: uint8; actor0: uint16; actorName: string; dimension: string; x, y, z: int; oldState, newState: int) =
   if gChangeHookOn and oldState != newState:
     gChangeHook(dimension, x, y, z, oldState, newState)
   if gFolder.len == 0 or oldState == newState:
     return
   if gRing.count >= gRing.items.len:
     blockLogFlush()     # full before the tick could drain it: nothing is dropped, the tick pays once
-  let actor = if ctx.name.len > 0: uint16(userIndex(ctx.name)) else: ctx.actor
+  let actor = if actorName.len > 0: uint16(userIndex(actorName)) else: actor0
   let rec = BlockLogRec(t: uint32(gClock()), dim: uint8(dimIndex(dimension)), x: int32(x), y: int32(y), z: int32(z),
-    oldS: uint16(oldState), newS: uint16(newState), cause: ctx.cause, kind: ctx.kind, actor: actor)
+    oldS: uint16(oldState), newS: uint16(newState), cause: cause, kind: kind, actor: actor)
   if not ringPush(gRing, rec):
     inc gDropped
 
@@ -508,10 +520,19 @@ proc blockLogRecordChange*(dimension: string; x, y, z: int; oldState, newState: 
   if inDimJob():
     if oldState == newState or (gFolder.len == 0 and not gChangeHookOn):
       return
-    let ctx = gCtx
-    postCross(CrossHook, proc() {.closure.} = recordChangeNow(ctx, dimension, x, y, z, oldState, newState))
+    let ctx = gDimCtx
+    var nm = ""
+    var act = ctx.actor
+    if (act and DimNameFlag) != 0'u16:
+      nm = gDimNames[int(act and 0x7FFF'u16) - 1]
+      act = 0'u16
+    let cause = ctx.cause
+    let kind = ctx.kind
+    let actor1 = act
+    let nameC = nm
+    postCross(CrossHook, proc() {.closure.} = recordChangeNow(cause, kind, actor1, nameC, dimension, x, y, z, oldState, newState))
     return
-  recordChangeNow(gCtx, dimension, x, y, z, oldState, newState)
+  recordChangeNow(gCtx.cause, gCtx.kind, gCtx.actor, "", dimension, x, y, z, oldState, newState)
 
 # ---- reading -----------------------------------------------------------------------------------------------------
 
