@@ -1,0 +1,178 @@
+## Tests for dimtick.aowl (phase 4): a synthetic three-world workload (overworld, nether, end) ticked N times with the gate off (sequential),
+## on with 1 worker and on with 4 workers must produce the same state hash after every tick; the gate refuses a hook consumer that cannot
+## be queued; a hook fired from a dimension job is flagged by the owner guard.
+import std/[assertions, syncio]
+import jobpool
+import ownerguard
+import dimtick
+
+const
+  Worlds = 3
+  Ticks = 120
+
+type
+  Item = object
+    stamp: int          ## tick it was sent
+    value: uint64
+
+var
+  gState: seq[uint64] = @[]
+  gInbox: seq[seq[Item]] = @[]   ## per world, appended by the join phase (or at once in the sequential path)
+  gLog: seq[uint64] = @[]        ## the hook-event log: global, appended only through postHookEvent
+  gNow = 0
+  gDirectLogCalls = 0
+
+proc mix(x: uint64): uint64 =
+  var z = x + 0x9E3779B97F4A7C15'u64
+  z = (z xor (z shr 30)) * 0xBF58476D1CE4E5B9'u64
+  z = (z xor (z shr 27)) * 0x94D049BB133111EB'u64
+  z xor (z shr 31)
+
+proc reset() =
+  gState = @[]
+  gInbox = @[]
+  gLog = @[]
+  gNow = 0
+  for i in 0 ..< Worlds:
+    gState.add mix(uint64(i + 1) * 7919'u64)
+    gInbox.add @[]
+
+proc worldTick(i: int) =
+  ## Reads and writes only world i's state, plus messages. Consumes items stamped before this tick (so the sequential path, where
+  ## a message lands at once, and the threaded path, where it lands at the join, see the same inbox).
+  assertWorldThread("synthetic world")
+  assertWorldOwned(i, "synthetic world state")
+  var s = gState[i]
+  var kept: seq[Item] = @[]
+  for it in gInbox[i]:
+    if it.stamp < gNow:
+      s = mix(s xor it.value)
+    else:
+      kept.add it
+  gInbox[i] = kept
+  for k in 0 ..< 3000:
+    s = mix(s + uint64(k))
+  gState[i] = s
+  let t = gNow
+  # a "portal": every 5th tick world i sends a value to the next world; every tick it logs one hook event
+  if (t + i) mod 5 == 0:
+    let dst = (i + 1) mod Worlds
+    let v = s
+    postCross(CrossPortal, proc() {.closure.} = gInbox[dst].add Item(stamp: t, value: v))
+  let ev = mix(s xor uint64(i))
+  postHookEvent(proc() {.closure.} = gLog.add ev)
+  if t mod 7 == 0:
+    # a second message in the same tick: order within a world must be post order
+    let dst2 = (i + 2) mod Worlds
+    let v2 = s xor 0xABCDEF'u64
+    postCross(CrossBroadcast, proc() {.closure.} = gInbox[dst2].add Item(stamp: t, value: v2))
+
+proc digest(): uint64 =
+  var h = 1469598103934665603'u64
+  for i in 0 ..< Worlds:
+    h = mix(h xor gState[i])
+    for it in gInbox[i]:
+      h = mix(h xor it.value xor uint64(it.stamp))
+  for e in gLog:
+    h = mix(h xor e)
+  h
+
+proc runAll(mode: int; pool: JobPool; owner: int): seq[uint64] =
+  ## mode 0 = sequential, 1 = dimension jobs on `pool`.
+  reset()
+  result = @[]
+  for t in 1 .. Ticks:
+    gNow = t
+    if mode == 0:
+      runSequential(Worlds, worldTick)
+    else:
+      let failed = runDimTicks(pool, owner, Worlds, worldTick)
+      assert failed == 0
+    result.add digest()
+
+proc main() =
+  setGuards(true)
+  registerTickThread()
+
+  # ---- the gate: pure decisions ----
+  assert decideGate(false, 4, 3, 0, 0, 0) == dgOff
+  assert decideGate(true, 0, 3, 0, 0, 0) == dgNoWorkers
+  assert decideGate(true, 4, 1, 0, 0, 0) == dgOneWorld
+  assert decideGate(true, 4, 3, 1, 0, 0) == dgHooks
+  assert decideGate(true, 4, 3, 0, 2, 0) == dgPlugins
+  assert decideGate(true, 4, 3, 0, 0, 2) == dgPlayers
+  assert decideGate(true, 4, 3, 0, 0, 1) == dgOn
+  assert decideGate(true, 4, 3, 0, 0, 0) == dgOn
+  # hook consumers: one that cannot be queued closes the gate, a queueable one does not
+  registerHookConsumer("cancel-everything", false)
+  registerHookConsumer("logger", true)
+  assert unqueueableConsumers() == 1
+  assert decideGate(true, 4, 3, unqueueableConsumers(), 0, 0) == dgHooks
+  unregisterHookConsumer("cancel-everything")
+  assert unqueueableConsumers() == 0
+  assert decideGate(true, 4, 3, unqueueableConsumers(), 0, 0) == dgOn
+  unregisterHookConsumer("logger")
+  # the environment gate is off by default and can be set for tests
+  setDimThreadsWanted(false)
+  assert not dimThreadsWanted()
+  echo "gate decisions ok"
+
+  # ---- postCross outside a dimension job runs at once (the gate-off path) ----
+  var immediate = 0
+  postCross(CrossPortal, proc() {.closure.} = inc immediate)
+  assert immediate == 1 and not inDimJob() and currentDim() == -1
+  assert pendingMessages() == 0
+
+  # ---- determinism: off vs 1 worker vs 4 workers ----
+  let off = runAll(0, nil, -1)
+  assert off.len == Ticks
+  assert gLog.len == Ticks * Worlds, "every world logged every tick"
+  let p1 = newJobPool(2)
+  assert p1.workers == 1
+  let o1 = allocOwner(p1)
+  let one = runAll(1, p1, o1)
+  assert pendingMessages() == 0
+  shutdown(p1)
+  let p4 = newJobPool(5)
+  assert p4.workers == 4
+  let o4 = allocOwner(p4)
+  let four = runAll(1, p4, o4)
+  assert phasesRun() == 2 * Ticks
+  var bad = 0
+  for t in 0 ..< Ticks:
+    if one[t] != off[t] or four[t] != off[t]:
+      inc bad
+  echo "ticks compared: ", Ticks, ", digests differing: ", bad, ", final ", off[Ticks - 1]
+  assert bad == 0, "off, 1 worker and 4 workers must agree after every tick"
+  assert messageCount(CrossHook) == 2 * Ticks * Worlds
+  assert messageCount(CrossPortal) > 0 and messageCount(CrossBroadcast) > 0
+  assert failedMessages() == 0
+  # the state is not trivially constant
+  assert off[0] != off[Ticks - 1]
+  assert violationCount() == 0, "no owner violation in a clean run"
+  echo "determinism ok (off == 1 worker == 4 workers)"
+
+  # ---- a hook fired from a world thread is flagged; per-world token flags the wrong world ----
+  resetViolations()
+  proc badTick(i: int) =
+    assertTickThread("plugin hook fired from world code")
+    assertWorldOwned((i + 1) mod Worlds, "touching another world's state")
+  discard runDimTicks(p4, o4, Worlds, badTick)
+  let flagged = violationCount()
+  echo "violations from a bad world body: ", flagged
+  assert flagged == 2 * Worlds, "one hook-lane and one ownership violation per world"
+  resetViolations()
+
+  # ---- inline pool (no workers) runs the same code path ----
+  let p0 = newJobPool(1)
+  let o0 = allocOwner(p0)
+  let inl = runAll(1, p0, o0)
+  var badInline = 0
+  for t in 0 ..< Ticks:
+    if inl[t] != off[t]:
+      inc badInline
+  assert badInline == 0
+  shutdown(p4)
+  echo "dimticktest passed"
+
+main()

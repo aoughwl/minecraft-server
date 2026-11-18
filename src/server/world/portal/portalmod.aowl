@@ -8,7 +8,8 @@
 {.feature: "untyped".}
 {.feature: "lenientnils".}
 
-import std/[options, tables, math]
+import std/[options, tables, math, locks]
+import ../../sim/dimtick
 import "../../block/blockprelude"
 import ../../../data/block_ext
 from ../../../data/block_state import newBlockStateIdUnchecked
@@ -168,6 +169,30 @@ proc processPortalTeleportation*(self: PortalProcessor; currentWorld: World; ent
 # ---------------------------------------------------------------------------
 
 var gPortalManagers = initTable[int32, PortalProcessor]()
+# Phase 4: entities of different worlds tick on different threads and all go through this table (insert, delete, lookup by entity id).
+# Every access takes the lock; the table is never iterated, so the lock order cannot change a result.
+var gPortalLock: Lock
+initLock(gPortalLock)
+
+proc portalHas(id: int32): bool =
+  acquire(gPortalLock)
+  result = gPortalManagers.hasKey(id)
+  release(gPortalLock)
+
+proc portalGet(id: int32): PortalProcessor =
+  acquire(gPortalLock)
+  result = gPortalManagers.getOrDefault(id)
+  release(gPortalLock)
+
+proc portalSet(id: int32; manager: PortalProcessor) =
+  acquire(gPortalLock)
+  gPortalManagers[id] = manager
+  release(gPortalLock)
+
+proc portalDel(id: int32) =
+  acquire(gPortalLock)
+  gPortalManagers.del(id)
+  release(gPortalLock)
 
 proc defaultPortalCooldownOf(self: Entity): uint32 =
   if self.entityType.id == EntityType.PLAYER.id: 10'u32 else: 300'u32
@@ -185,7 +210,7 @@ proc tryUsePortal*(self: Entity; portalDelay: uint32; portalWorld: World; pos: B
       (portalWorld.dimension.minecraftName == THE_END.minecraftName and not server.basicConfig.allowEnd):
     return
   let world = self.world
-  if not gPortalManagers.hasKey(self.entityId):
+  if not portalHas(self.entityId):
     let portalType = if portalWorld.dimension.minecraftName == THE_END.minecraftName or
         world.dimension.minecraftName == THE_END.minecraftName: ptEnd else: ptNether
     let manager = newPortalProcessor(portalType, pos, portalWorld)
@@ -201,9 +226,9 @@ proc tryUsePortal*(self: Entity; portalDelay: uint32; portalWorld: World; pos: B
         let portal = onZ.unsafeGet
         manager.sourcePortal = some(SourcePortalInfo(lowerCorner: portal.lowerCorner(), axis: portal.axis,
           width: portal.width, height: portal.height))
-    gPortalManagers[self.entityId] = manager
+    portalSet(self.entityId, manager)
   else:
-    let manager = gPortalManagers.getOrDefault(self.entityId)
+    let manager = portalGet(self.entityId)
     manager.entryPosition = pos
     manager.insidePortalThisTick = true
 
@@ -222,25 +247,29 @@ proc tickPortal*(self: Entity; caller: EntityBase) =
   ## `Entity::tick_portal`
   if self.portalCooldown > 0'u32:
     self.portalCooldown -= 1'u32
-  if not gPortalManagers.hasKey(self.entityId):
+  if not portalHas(self.entityId):
     return
-  let processor = gPortalManagers.getOrDefault(self.entityId)
+  let processor = portalGet(self.entityId)
   var shouldRemove = false
   if processor.processPortalTeleportation(self.world, caller, true):
     self.portalCooldown = self.defaultPortalCooldownOf()
-    let transition = processor.portalType.getPortalDestination(self.world, processor.destinationWorld, caller,
-      processor.entryPosition, processor.sourcePortal)
-    if transition.isSome:
-      let t = transition.unsafeGet
-      let yawDelta = if t.yaw.isSome: some(t.yaw.unsafeGet - self.yaw) else: none[float32]()
-      # Teleport the main entity.
-      caller.teleport(t.position, t.yaw, t.pitch, t.newWorld)
-      # Teleport all passengers recursively along with the vehicle.
-      teleportPassengersRecursive(self, t.position, yawDelta, t.newWorld)
+    # Cross-world: the destination search/build, the world change and the plugin events touch the other dimension, so on a dimension thread
+    # (phase 4) this is a message applied in the join phase on the tick thread; everywhere else it runs here, as before.
+    let transfer = proc() {.closure.} =
+      let transition = processor.portalType.getPortalDestination(self.world, processor.destinationWorld, caller,
+        processor.entryPosition, processor.sourcePortal)
+      if transition.isSome:
+        let t = transition.unsafeGet
+        let yawDelta = if t.yaw.isSome: some(t.yaw.unsafeGet - self.yaw) else: none[float32]()
+        # Teleport the main entity.
+        caller.teleport(t.position, t.yaw, t.pitch, t.newWorld)
+        # Teleport all passengers recursively along with the vehicle.
+        teleportPassengersRecursive(self, t.position, yawDelta, t.newWorld)
+    postCross(CrossPortal, transfer)
   elif processor.portalTime == 0'u32:
     shouldRemove = true
   if shouldRemove:
-    gPortalManagers.del(self.entityId)
+    portalDel(self.entityId)
 
 gTickPortalHook = proc(self: Entity; caller: EntityBase) {.closure.} = tickPortal(self, caller)
 
