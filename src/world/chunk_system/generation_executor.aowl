@@ -1,6 +1,11 @@
 ## Runs `runGeneration` on worker threads. No upstream file: pumpkin-world's `generation_work` runs on rayon threads and
-## sends `(pos, RecvChunk::Generation)` back over a channel; this is that pair, with a mutex-protected job queue and result
-## queue because aowlmony has no channel.
+## sends `(pos, RecvChunk::Generation)` back over a channel. The workers are those of `server/sim/jobpool` (the process's one
+## worker pool, shared through `sharedJobPool`): generation and decode batches are Normal-lane jobs, distant-terrain summaries
+## Background-lane jobs (a worker takes Background only when Urgent and Normal are empty). The pool carries only an `int` per
+## job, so a job's payload (`GenTask`) sits in a lock-protected table and the job argument is its index; the finished
+## `RecvChunk`s go to a per-handle done list under the same lock, and the pool's own result is drained and dropped on each poll.
+## Job bodies never raise: a generation that raises comes back as a `GenerationFailure`, a decode that raises yields fresh
+## proto chunks for its unfinished entries, a failed summary is handed back unfinished.
 ##
 ## Ownership: `occupyForGeneration` moves the Protos of a task's write square into its `Cache` and clears the holders'
 ## `chunk`, so while a job is queued or running the schedule (tick thread) holds no reference to anything in that cache and
@@ -12,19 +17,20 @@
 ## as before, and its result is available at the next `pollCompleted`. `Spawn` is never offloaded: it creates entities in
 ## the world (`World.spawnEntity`, plugin hooks), which only the tick thread may touch.
 ##
-## Configuration: `MC_CHUNK_WORKERS` (worker thread count, default 0 = everything inline, as the server always did) and
-## `MC_CHUNK_ASYNC_MASK` (a decimal bit mask of stage ordinals; default every stage but Spawn). `MC_GEN_STATS=1` prints
+## Configuration: the worker count comes from `threadcfg.planThreads` (`chunkWorkers`) when `MC_CHUNK_WORKERS` or `MC_THREADS`
+## is set, otherwise 0 = everything inline, as the server always did (an unset environment never turns threads on by itself);
+## `MC_CHUNK_ASYNC_MASK` is a decimal bit mask of stage ordinals (default every stage but Spawn). `MC_GEN_STATS=1` prints
 ## per-stage totals every ten seconds.
 ##
-## A second, low-priority lane carries distant-terrain summaries (`LodJob`, world/generation/lodsummary.aowl, for the `jester:lod`
+## The low-priority lane carries distant-terrain summaries (`LodJob`, world/generation/lodsummary.aowl, for the `jester:lod`
 ## channel): a worker takes one only when no generation or decode job waits, so summaries never delay a chunk somebody stands next
 ## to. `submitLod` refuses (false) without workers; the caller then runs the job inline within its own budget.
 
 {.feature: "lenientnils".}
 
 import std/locks
-import std/rawthreads
 import std/envvars
+import std/cpuinfo
 import std/times
 import std/strutils
 import std/syncio
@@ -34,6 +40,9 @@ import chunk_stage
 import dag
 import generation_cache
 import worker_logic
+import ../generation/proto_chunk
+import ../../server/sim/jobpool
+import ../../server/sim/threadcfg
 from ../../generated/tag import getLatestMap, RegistryKey
 from ../generation/feature/decode import prewarmFeatureDefs
 from ../generation/feature/feature_order import prewarmFeatureOrder
@@ -44,127 +53,157 @@ from "../generation/structure/template/cache" import prewarmTemplates
 from ../generation/lodsummary import LodJob, runLodJob
 
 type
-  GenJob = object
+  TaskKind = enum
+    tkGen, tkDecode, tkLod
+
+  GenTask = object
+    kind: TaskKind
     host: ScheduleHost
     pos: ChunkPos
     cache: Cache
     stage: StagedChunkEnum
-    raws: seq[LoadedBytes]     ## A decode job (`decode`): region-file bytes to turn into chunks.
-    decode: bool
+    raws: seq[LoadedBytes]     ## tkDecode: region-file bytes to turn into chunks.
+    lod: LodJob                ## tkLod
     owner: GenerationExecutor  ## The handle its result goes back to (see `pool`).
-
-  WorkerThread = ref object
-    t: RawThread
 
   GenerationExecutor* = ref object
     workers*: int
     mask*: int
-    lock: Lock
-    wake: Cond
-    jobs: seq[GenJob]
-    jobHead: int
-    done: seq[RecvChunk]
-    lodJobs: seq[LodJob]     ## the low-priority lane (pool only), with the handle each result goes back to
-    lodOwners: seq[GenerationExecutor]
-    lodHead: int
-    lodDone: seq[LodJob]     ## finished summaries of this handle
+    jp: JobPool              ## The shared pool (set on the pool root only; nil with no workers).
+    owner: int               ## This handle's owner id in `jp`.
+    done: seq[RecvChunk]     ## Guarded by gGenLock.
+    lodDone: seq[LodJob]     ## finished summaries of this handle (gGenLock)
     lodInFlight*: int        ## Tick thread only.
-    stopping: bool
-    threads: seq[WorkerThread]
     inFlight*: int           ## Submitted to a worker and not yet handed back by `pollCompleted`. Tick thread only.
-    pool: GenerationExecutor ## nil for the pool itself. Every level's schedule gets its own handle on the shared pool, with
+    pool: GenerationExecutor ## nil for the pool root. Every level's schedule gets its own handle on the shared pool, with
                              ## its own result queue and in-flight count: results must go back to the schedule (the
                              ## dimension) whose chunks they hold, never to another one's.
-    stageUs: array[16, int64]
+    stageUs: array[16, int64]   ## Pool root only, guarded by gGenLock.
     stageN: array[16, int64]
     inlineUs: array[16, int64]
-    waitUs: int64            ## Worker time spent waiting for a job (stats only).
     lastStats: Time
     stats: bool
 
 var gExec: GenerationExecutor = nil
-  ## The one executor: the worker procs are plain `nimcall`s with a pointer argument and read it from here.
+  ## The one executor root; the job procs are plain `nimcall`s over an index and find everything from here.
+var gGenLock: Lock
+var gGenLockInit = false
+var gTasks: seq[GenTask] = @[]
+var gFreeTasks: seq[int] = @[]
 
 proc sleepWin(ms: uint32) {.stdcall, importc: "Sleep", dynlib: "kernel32.dll".}
 
-proc envInt(name: string, default: int): int =
+proc ensureGenLock() =
+  if not gGenLockInit:
+    initLock(gGenLock)
+    gGenLockInit = true
+
+proc envNum(name: string): int =
+  ## -1 when unset or not a plain number.
   let raw = getEnv(name)
   if raw.len == 0:
-    return default
+    return -1
   var v = 0
   for ch in raw:
     if ch < '0' or ch > '9':
-      return default
+      return -1
     v = v * 10 + (ord(ch) - ord('0'))
   v
 
-proc workerMain(arg: pointer) {.nimcall.} =
-  let ex = gExec
-  while true:
-    var job: GenJob
-    acquire(ex.lock)
-    let w0 = getTime()
-    var waited = false
-    while ex.jobHead >= ex.jobs.len and ex.lodHead >= ex.lodJobs.len and not ex.stopping:
-      waited = true
-      wait(ex.wake, ex.lock)
-    if waited and ex.stats:
-      ex.waitUs += (getTime() - w0).inMicroseconds
-    if ex.jobHead >= ex.jobs.len and ex.stopping:
-      release(ex.lock)
-      return
-    if ex.jobHead >= ex.jobs.len:
-      # nothing of the chunk system waits: one summary from the low-priority lane
-      let lj = ex.lodJobs[ex.lodHead]
-      let lowner = ex.lodOwners[ex.lodHead]
-      ex.lodJobs[ex.lodHead] = nil
-      ex.lodOwners[ex.lodHead] = nil
-      inc ex.lodHead
-      if ex.lodHead == ex.lodJobs.len:
-        ex.lodJobs.setLen(0)
-        ex.lodOwners.setLen(0)
-        ex.lodHead = 0
-      release(ex.lock)
-      let lt0 = getTime()
-      runLodJob(lj)
-      lj.micros = (getTime() - lt0).inMicroseconds
-      acquire(ex.lock)
-      lowner.lodDone.add(lj)
-      release(ex.lock)
-      continue
-    job = ex.jobs[ex.jobHead]
-    let owner = job.owner
-    ex.jobs[ex.jobHead] = GenJob()
-    inc ex.jobHead
-    if ex.jobHead == ex.jobs.len:
-      ex.jobs.setLen(0)
-      ex.jobHead = 0
-    release(ex.lock)
-    if job.decode:
-      var results = newSeq[RecvChunk](0)
-      ioDecodeBatch(job.host, job.raws, results)
-      job = GenJob()
-      acquire(ex.lock)
-      for ri in 0 ..< results.len:
-        owner.done.add(results[ri])
-      release(ex.lock)
-      continue
-    let stage = ord(job.stage)
-    let t0 = getTime()
-    let r = runGeneration(job.host, job.pos, job.cache, job.stage)
-    let us = (getTime() - t0).inMicroseconds
-    job = GenJob()
-    acquire(ex.lock)
-    owner.done.add(r)
-    ex.stageUs[stage] += us
-    ex.stageN[stage] += 1
-    release(ex.lock)
+proc envInt(name: string, default: int): int =
+  let v = envNum(name)
+  if v < 0: default else: v
+
+proc chunkWorkerCount(): int =
+  ## Workers for chunk generation from the thread plan; 0 unless MC_CHUNK_WORKERS or MC_THREADS is set.
+  let envChunk = envNum("MC_CHUNK_WORKERS")
+  let envThreads = envNum("MC_THREADS")
+  if envChunk < 0 and envThreads < 0:
+    return 0
+  planThreads(0, 0, countProcessors(), envThreads, envChunk).chunkWorkers
+
+proc putTask(t: GenTask): pointer =
+  acquire(gGenLock)
+  var idx = 0
+  if gFreeTasks.len > 0:
+    idx = gFreeTasks[gFreeTasks.len - 1]
+    gFreeTasks.setLen(gFreeTasks.len - 1)
+    gTasks[idx] = t
+  else:
+    gTasks.add(t)
+    idx = gTasks.len - 1
+  release(gGenLock)
+  cast[pointer](idx + 1)
+
+proc takeTask(arg: pointer): GenTask =
+  acquire(gGenLock)
+  let idx = cast[int](arg) - 1
+  result = gTasks[idx]
+  gTasks[idx] = GenTask()
+  gFreeTasks.add(idx)
+  release(gGenLock)
+
+proc genJob(arg: pointer): int {.nimcall, raises.} =
+  ## Normal lane: one stage of one chunk. Never raises.
+  var t = takeTask(arg)
+  let owner = t.owner
+  let stage = ord(t.stage)
+  let t0 = getTime()
+  var r: RecvChunk
+  try:
+    r = runGeneration(t.host, t.pos, t.cache, t.stage)
+  except:
+    r = RecvChunk(kind: RecvChunkKind.GenerationFailure, pos: t.pos, stage: t.stage, error: "generation raised")
+  let us = (getTime() - t0).inMicroseconds
+  t = GenTask()
+  acquire(gGenLock)
+  owner.done.add(r)
+  let root = gExec
+  root.stageUs[stage] += us
+  root.stageN[stage] += 1
+  release(gGenLock)
+  0
+
+proc decodeJob(arg: pointer): int {.nimcall, raises.} =
+  ## Normal lane: a decode batch; one result per entry. Never raises.
+  var t = takeTask(arg)
+  let owner = t.owner
+  var results = newSeq[RecvChunk](0)
+  try:
+    ioDecodeBatch(t.host, t.raws, results)
+  except:
+    for ri in results.len ..< t.raws.len:
+      try:
+        let pos = chunkPos(t.raws[ri].x, t.raws[ri].z)
+        results.add(RecvChunk(kind: RecvChunkKind.IO, pos: pos, io: protoChunk(newProtoChunk(pos.x, pos.y, t.host.worldGen))))
+      except:
+        discard
+  t = GenTask()
+  acquire(gGenLock)
+  for ri in 0 ..< results.len:
+    owner.done.add(results[ri])
+  release(gGenLock)
+  0
+
+proc lodJob(arg: pointer): int {.nimcall, raises.} =
+  ## Background lane: one distant-terrain summary. Never raises.
+  var t = takeTask(arg)
+  let owner = t.owner
+  let lt0 = getTime()
+  try:
+    runLodJob(t.lod)
+  except:
+    discard
+  t.lod.micros = (getTime() - lt0).inMicroseconds
+  acquire(gGenLock)
+  owner.lodDone.add(t.lod)
+  release(gGenLock)
+  0
 
 proc newGenerationExecutor*(workers: int, mask: int): GenerationExecutor =
-  result = GenerationExecutor(workers: workers, mask: mask, jobs: @[], jobHead: 0, done: @[], stopping: false,
-    threads: @[], inFlight: 0, lastStats: getTime(), stats: getEnv("MC_GEN_STATS") == "1")
-  initLock(result.lock)
-  initCond(result.wake)
+  ensureGenLock()
+  GenerationExecutor(workers: workers, mask: mask, done: @[], lodDone: @[], inFlight: 0, lastStats: getTime(),
+    stats: getEnv("MC_GEN_STATS") == "1")
 
 proc prewarmWorldgen*() =
   ## Fills, on this thread, every table generation would otherwise fill on first use, so the workers only read them. The
@@ -179,17 +218,15 @@ proc prewarmWorldgen*() =
   prewarmTemplates()
 
 proc startWorkers*(ex: GenerationExecutor) =
+  ## Claims the process's shared job pool for `ex.workers` workers (or joins the live one: then its size wins).
   prewarmWorldgen()
   gExec = ex
-  for i in 0 ..< ex.workers:
-    let w = WorkerThread()
-    try:
-      create(w.t, workerMain, nil)
-      ex.threads.add(w)
-    except:
-      echo "chunk generation: could not start worker thread " & $i & "; continuing with " & $ex.threads.len
-      break
-  ex.workers = ex.threads.len
+  if ex.workers > 0:
+    ex.jp = sharedJobPool(ex.workers + 1)
+    ex.owner = allocOwner(ex.jp)
+    if ex.jp.workers < ex.workers:
+      echo "chunk generation: wanted " & $ex.workers & " workers, the shared pool has " & $ex.jp.workers
+    ex.workers = ex.jp.workers
 
 proc defaultAsyncMask(): int =
   var m = 0
@@ -199,11 +236,11 @@ proc defaultAsyncMask(): int =
   m
 
 proc sharedExecutor*(): GenerationExecutor =
-  ## A handle on the process's one worker pool (made on first use from the environment); every level's schedule shares the
+  ## A handle on the process's one worker pool (made on first use from the thread plan); every level's schedule shares the
   ## workers but has a handle of its own, so each gets back only its own results. With no workers configured it runs
   ## everything inline.
   if gExec == nil:
-    let n = envInt("MC_CHUNK_WORKERS", 0)
+    let n = chunkWorkerCount()
     let mask = envInt("MC_CHUNK_ASYNC_MASK", defaultAsyncMask())
     let ex = newGenerationExecutor(n, mask)
     if n > 0:
@@ -211,7 +248,10 @@ proc sharedExecutor*(): GenerationExecutor =
     else:
       gExec = ex
   let pool = gExec
-  GenerationExecutor(workers: pool.workers, mask: pool.mask, jobs: @[], done: @[], inFlight: 0, pool: pool,
+  var h = 0
+  if pool.jp != nil:
+    h = allocOwner(pool.jp)
+  GenerationExecutor(workers: pool.workers, mask: pool.mask, done: @[], lodDone: @[], inFlight: 0, pool: pool, owner: h,
     lastStats: pool.lastStats, stats: pool.stats)
 
 proc poolOf(ex: GenerationExecutor): GenerationExecutor =
@@ -228,79 +268,80 @@ proc submit*(ex: GenerationExecutor, host: ScheduleHost, pos: ChunkPos, cache: C
     if sp.stats:
       let t0 = getTime()
       sink.add(runGeneration(host, pos, cache, stage))
-      sp.inlineUs[ord(stage)] += (getTime() - t0).inMicroseconds
+      let us = (getTime() - t0).inMicroseconds
+      acquire(gGenLock)
+      sp.inlineUs[ord(stage)] += us
       sp.stageN[ord(stage)] += 1
+      release(gGenLock)
     else:
       sink.add(runGeneration(host, pos, cache, stage))
     return
   let p = poolOf(ex)
-  acquire(p.lock)
-  p.jobs.add(GenJob(host: host, pos: pos, cache: cache, stage: stage, owner: ex))
-  release(p.lock)
+  let a = putTask(GenTask(kind: tkGen, host: host, pos: pos, cache: cache, stage: stage, owner: ex))
   inc ex.inFlight
-  signal(p.wake)
+  submitLane(p.jp, ex.owner, lnNormal, genJob, a)
 
 proc submitDecode*(ex: GenerationExecutor, host: ScheduleHost, raws: seq[LoadedBytes]) =
   ## Hands region-file bytes to a worker to decode (`ioDecodeBatch`); one result per entry comes back through
   ## `pollCompleted`, counted in `inFlight` like generation results. Only with workers: callers check `ex.workers`.
   let p = poolOf(ex)
-  acquire(p.lock)
-  p.jobs.add(GenJob(host: host, raws: raws, decode: true, owner: ex))
-  release(p.lock)
+  let a = putTask(GenTask(kind: tkDecode, host: host, raws: raws, owner: ex))
   ex.inFlight += raws.len
-  signal(p.wake)
+  submitLane(p.jp, ex.owner, lnNormal, decodeJob, a)
 
 proc submitLod*(ex: GenerationExecutor, job: LodJob): bool =
-  ## Queues a summary on the low-priority lane; false (nothing queued) when the pool has no workers.
+  ## Queues a summary on the Background lane; false (nothing queued) when the pool has no workers.
   let p = poolOf(ex)
-  if p.workers <= 0 or p.threads.len == 0:
+  if p.workers <= 0 or p.jp == nil or p.jp.workers == 0:
     return false
-  acquire(p.lock)
-  p.lodJobs.add(job)
-  p.lodOwners.add(ex)
-  release(p.lock)
+  let a = putTask(GenTask(kind: tkLod, lod: job, owner: ex))
   inc ex.lodInFlight
-  signal(p.wake)
+  submitLane(p.jp, ex.owner, lnBackground, lodJob, a)
   true
+
+proc dropPoolResults(ex: GenerationExecutor) =
+  ## The pool's own per-job results (all zero: the payload travels in the done lists) are drained so its books stay empty.
+  var scratch: seq[JobResult] = @[]
+  discard drainDone(poolOf(ex).jp, ex.owner, scratch)
 
 proc pollLodCompleted*(ex: GenerationExecutor, sink: var seq[LodJob]): int =
   ## Moves this handle's finished summaries into `sink`; how many.
   if ex.lodInFlight == 0:
     return 0
-  let p = poolOf(ex)
-  acquire(p.lock)
+  acquire(gGenLock)
   result = ex.lodDone.len
   for i in 0 ..< ex.lodDone.len:
     sink.add(ex.lodDone[i])
   ex.lodDone.setLen(0)
-  release(p.lock)
+  release(gGenLock)
   ex.lodInFlight -= result
+  dropPoolResults(ex)
 
 proc lodWorkers*(ex: GenerationExecutor): int =
   ## Worker threads the low-priority lane can use (0: run summaries inline).
   let p = poolOf(ex)
-  if p.threads.len == 0: 0 else: p.workers
+  if p.jp == nil or p.jp.workers == 0: 0 else: p.workers
 
 proc statsLine*(ex: GenerationExecutor): string =
-  ## MC_GEN_STATS only: the pool's pending jobs and the workers' busy and idle time so far.
+  ## MC_GEN_STATS only: the pool's queued jobs and the workers' busy time so far (idle time is no longer tracked: the shared
+  ## pool does not time its waits).
   let p = poolOf(ex)
-  acquire(p.lock)
+  acquire(gGenLock)
   var busy = 0'i64
   for st in 0 ..< 16:
     busy += p.stageUs[st]
-  let pending = p.jobs.len - p.jobHead
-  let waitUs = p.waitUs
-  release(p.lock)
-  "pending=" & $pending & " busyMs=" & $(busy div 1000) & " idleMs=" & $(waitUs div 1000)
+  release(gGenLock)
+  let pending = if p.jp != nil: laneDepth(p.jp, lnNormal) else: 0
+  "pending=" & $pending & " busyMs=" & $(busy div 1000)
 
 proc printStats(ex: GenerationExecutor) =
-  acquire(ex.lock)
+  acquire(gGenLock)
   var line = "chunkgen stats (workers=" & $ex.workers & "):"
   for st in 0 ..< 16:
     if ex.stageN[st] > 0:
       let total = ex.stageUs[st] + ex.inlineUs[st]
       line.add(" " & $StagedChunkEnum(st) & "=" & $ex.stageN[st] & "x" & $(total div ex.stageN[st]) & "us")
-  release(ex.lock)
+  release(gGenLock)
   echo line
 
 proc pollCompleted*(ex: GenerationExecutor, sink: var seq[RecvChunk]): int =
@@ -311,26 +352,22 @@ proc pollCompleted*(ex: GenerationExecutor, sink: var seq[RecvChunk]): int =
     printStats(p)
   if ex.workers == 0 or ex.inFlight == 0:
     return 0
-  acquire(p.lock)
+  acquire(gGenLock)
   result = ex.done.len
   for i in 0 ..< ex.done.len:
     sink.add(ex.done[i])
   ex.done.setLen(0)
-  release(p.lock)
+  release(gGenLock)
   ex.inFlight -= result
+  dropPoolResults(ex)
 
 proc waitCompleted*(ex: GenerationExecutor, ms: int) =
   ## Sleeps a moment so a caller that has nothing else to do does not spin while workers run.
   sleepWin(uint32(ms))
 
 proc shutdown*(ex: GenerationExecutor) =
-  ## Stops the workers once their queue is empty. Joins them. Only the pool itself (not a handle) can be shut down.
-  if ex.pool != nil or ex.workers == 0 or ex.threads.len == 0:
+  ## Stops the workers once their queue is empty. Joins them. Only the pool root (not a handle) can be shut down; this shuts
+  ## down the shared job pool, so every other user of it stops too.
+  if ex.pool != nil or ex.workers == 0 or ex.jp == nil:
     return
-  acquire(ex.lock)
-  ex.stopping = true
-  release(ex.lock)
-  broadcast(ex.wake)
-  for i in 0 ..< ex.threads.len:
-    join(ex.threads[i].t)
-  ex.threads.setLen(0)
+  shutdown(ex.jp)
