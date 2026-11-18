@@ -1,7 +1,7 @@
 ## Port of pumpkin/src/server/mod.rs
 ## PARTIAL: pumpkin/src/server/mod.rs - construction from a save, all three dimensions, `add_player`, `remove_player`, lookups, counts (`has_n_players`), `for_each_player`, `broadcast_tab_list_header_footer`, branding, status, the tick and the tick-rate manager, recipe manager, key store and `data/`; plugins start in `loadServer`, the command dispatcher is commandbridge.aowl and advancements are advancementglue.aowl. Not here: `new_container_id` (containers number themselves per player here), `spawn_task` (single-threaded). The types are in serverbase.aowl.
 
-import std/[options, syncio, tables]
+import std/[options, syncio, tables, atomics]
 import ../generated/statistic
 import ../generated/translation as tr
 import ../protocol/proto
@@ -45,6 +45,8 @@ import body/trigger
 import physwire/[climatewire, firewire, erosionwire]
 import net/jester/bodysync
 import net/jester/lodsync
+import sim/dimtick
+from sim/ownerguard import registerTickThread
 
 type
   ServerLoadResult* = object
@@ -290,8 +292,7 @@ proc addPlayer*(self: Server; client: JavaClient; profile: GameProfile; config: 
         world = self.getWorldFromDimension(dimension)
       else:
         echo "Invalid dimension key in player data: ", dimensionKey.unsafeGet
-  let entityId = self.nextEntityId
-  self.nextEntityId = entityId + 1'i32
+  let entityId = atomicFetchAdd(self.nextEntityId, 1'i32, moSequentiallyConsistent)
   let player = newPlayer(client, profile, config, world, self, self.basicConfig.defaultGamemode, entityId)
   if loaded.isSome:
     player.readNbt(loaded.unsafeGet)
@@ -340,6 +341,40 @@ proc tickPlayersAndNetwork(self: Server) =
     world.flushSyncedBlockEvents()
     world.tickPlayers(self)
 
+proc worldsWithPlayers(self: Server): int =
+  result = 0
+  for w in self.worlds:
+    if w.players.len > 0:
+      inc result
+
+proc dimGateNow(self: Server): DimGate =
+  ## Phase 4 gate (docs/MULTITHREADING.md section 9): evaluated every tick because plugins can be loaded and players can move at runtime.
+  ## Default off: `dimThreadsWanted()` is MC_DIM_THREADS=1.
+  if not dimThreadsWanted():
+    return dgOff
+  var workers = 0
+  let pool = dimPool()
+  if pool != nil:
+    workers = pool.workers
+  result = decideGate(true, workers, self.worlds.len, unqueueableConsumers(), loadedPluginCount(), worldsWithPlayers(self))
+  reportGate(result)
+
+proc tickWorldsThreaded(self: Server) =
+  ## Every world's `worldmod.tick` as one job on the shared pool, a barrier, then the queued cross-world messages and hook events on this
+  ## thread in (world, sequence) order. The server-level ticks that follow in `tickWorlds` stay on this thread, after the barrier.
+  registerTickThread()
+  let carried = blockLogCurrent()
+  let body = proc(i: int) {.closure.} =
+    profIgnoreThisThread(true)
+    blockLogPop(carried)
+    worldmod.tick(self.worlds[i], self)
+    profIgnoreThisThread(false)
+  profScope(ScTickWorld)
+  let failed = runDimTicks(dimPool(), dimOwnerId(), self.worlds.len, body)
+  profEnd(ScTickWorld)
+  if failed > 0:
+    echo "dimension tick: ", failed, " world tick(s) raised"
+
 proc tickWorlds(self: Server) =
   ## `tick_worlds`
   profScope(ScPlugins)
@@ -350,10 +385,13 @@ proc tickWorlds(self: Server) =
   profScope(ScPregen)
   tickPregen(self)
   profEnd(ScPregen)
-  for world in self.worlds:
-    profScope(ScTickWorld)
-    worldmod.tick(world, self)
-    profEnd(ScTickWorld)
+  if dimGateNow(self) == dgOn:
+    tickWorldsThreaded(self)
+  else:
+    for world in self.worlds:
+      profScope(ScTickWorld)
+      worldmod.tick(world, self)
+      profEnd(ScTickWorld)
   tickBodies(self)
   createTick(self)
   tickTriggers(self)

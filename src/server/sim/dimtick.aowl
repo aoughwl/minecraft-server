@@ -1,0 +1,280 @@
+## Phase 4 (docs/MULTITHREADING.md): one job per dimension with a join phase, opt-in and determinism preserving.
+##
+## This module knows nothing about `World` or `Server`: a "dimension" is an index, the tick body is a closure over that index, so it is
+## testable alone. servermod wires the real world tick through it.
+##
+## THE GATE. `MC_DIM_THREADS=1` AND the thread plan (`planThreads`) has workers AND at least two worlds AND nothing that cannot be queued
+## is registered (`decideGate`). Anything else keeps today's sequential loop, byte for byte: with the gate off none of this runs.
+##
+## THE POOL. No pool of its own: `dimPool()` takes the process's shared pool (`jobpool.sharedJobPool`) under an owner id from `allocOwner`.
+## Each world's tick is one job on the Urgent lane; the tick thread blocks at the barrier (a `drainDone` loop that yields) and only then
+## continues with the server-level ticks. If the pool has no workers the gate refuses (`dgNoWorkers`).
+##
+## CROSS-WORLD MESSAGES. Code that runs inside a dimension job and has an effect outside its own world (portal transfer, player dimension
+## change, broadcast to every world, plugin-visible events) calls `postCross` / `postHookEvent` with a closure instead. Outside a dimension
+## job (gate off, tick thread) the closure runs at once, so the sequential path is exactly what it was. Inside one the closure is appended
+## to that world's outbox; `applyOutboxes` runs after the barrier on the tick thread, world index ascending, post order within a world.
+## That order depends on nothing but the world index and the code path, never on which thread ran which world: threads=1 and N agree.
+## Semantic change to know about: a message acts at the END of the world phase, not in the middle of the world's tick.
+##
+## HOOK LANE. Hooks and plugin callbacks fire on the tick thread only. Fire-and-forget events go through `postHookEvent`. A hook whose
+## answer changes the code that fired it (cancellable events: BlockChangeEvent, the plugin interact/teleport hooks) cannot be deferred:
+## `registerHookConsumer(name, queueable = false)` makes the gate refuse while it is registered, and the server passes the number of loaded
+## plugins (every plugin is such a consumer). Under `MC_THREAD_ASSERT=1` `assertTickThread` flags a hook fired from a world thread.
+
+{.feature: "lenientnils".}
+
+import std/envvars
+import std/cpuinfo
+import std/syncio
+import jobpool
+import threadcfg
+import ownerguard
+
+proc sleepWin(ms: uint32) {.stdcall, importc: "Sleep", dynlib: "kernel32.dll".}
+
+const
+  CrossOther* = 0
+  CrossPortal* = 1        ## portal transfer (portal/portalmod)
+  CrossDimChange* = 2     ## player dimension change (worldmod.teleportWorld, respawn)
+  CrossBroadcast* = 3     ## a message to players of other worlds
+  CrossCommand* = 4
+  CrossHook* = 5          ## a plugin-visible event queued from a world thread
+  CrossKinds* = 6
+
+type
+  DimGate* = enum
+    dgOff            ## MC_DIM_THREADS is not 1 (default)
+    dgOn
+    dgNoWorkers      ## the thread plan has no workers or the shared pool has none
+    dgOneWorld       ## nothing to run in parallel
+    dgHooks          ## a registered hook consumer cannot be queued
+    dgPlugins        ## plugins are loaded: their event hooks are cancellable and fire from block/entity code
+    dgPlayers        ## players in more than one world: id-keyed per-player tables are shared (see docs)
+
+  CrossMsg = object
+    kind: int
+    run: proc() {.closure.}
+
+  HookConsumer = object
+    name: string
+    queueable: bool
+
+var gOutbox: seq[seq[CrossMsg]] = @[]      ## per world; an outbox is only touched by the job that owns that world, then by the tick thread
+var gOwned: seq[Owned] = @[]
+var gErrors: seq[string] = @[]
+var gBody: proc(i: int) {.closure.} = nil
+var gConsumers: seq[HookConsumer] = @[]
+var gPool: JobPool = nil
+var gOwner: int = -1
+var gKindCount: seq[int] = @[0, 0, 0, 0, 0, 0]
+var gMsgFailed: int = 0
+var gWantRead: bool = false
+var gWant: bool = false
+var gLastReported: int = -1
+var gPhaseCount: int = 0
+var gCur {.threadvar.}: int   ## world index + 1 while a dimension job runs on this thread, 0 otherwise
+
+proc currentDim*(): int =
+  ## The world index of the running dimension job, -1 outside one.
+  gCur - 1
+
+# ---- the gate -----------------------------------------------------------------------------------------------------------
+
+proc dimThreadsWanted*(): bool =
+  ## MC_DIM_THREADS=1, read once.
+  if not gWantRead:
+    gWantRead = true
+    gWant = getEnv("MC_DIM_THREADS") == "1"
+  gWant
+
+proc setDimThreadsWanted*(on: bool) =
+  ## Tests: overrides the environment.
+  gWantRead = true
+  gWant = on
+
+proc registerHookConsumer*(name: string; queueable: bool) =
+  ## Tick thread, before ticking. A consumer that is not `queueable` (its answer is used by the firing code) keeps the gate shut.
+  gConsumers.add HookConsumer(name: name, queueable: queueable)
+
+proc unregisterHookConsumer*(name: string) =
+  var keep: seq[HookConsumer] = @[]
+  for c in gConsumers:
+    if c.name != name:
+      keep.add c
+  gConsumers = keep
+
+proc unqueueableConsumers*(): int =
+  result = 0
+  for c in gConsumers:
+    if not c.queueable:
+      inc result
+
+proc decideGate*(wanted: bool; workers, worlds, unqueueable, plugins, worldsWithPlayers: int): DimGate =
+  ## Pure. The order is the order of the reasons reported.
+  if not wanted: return dgOff
+  if workers <= 0: return dgNoWorkers
+  if worlds < 2: return dgOneWorld
+  if unqueueable > 0: return dgHooks
+  if plugins > 0: return dgPlugins
+  if worldsWithPlayers > 1: return dgPlayers
+  dgOn
+
+proc gateName*(g: DimGate): string =
+  case g
+  of dgOff: "off (MC_DIM_THREADS is not 1)"
+  of dgOn: "on"
+  of dgNoWorkers: "refused: no worker threads (MC_THREADS / MC_CHUNK_WORKERS)"
+  of dgOneWorld: "refused: fewer than two worlds"
+  of dgHooks: "refused: a hook consumer that cannot be queued is registered"
+  of dgPlugins: "refused: plugins are loaded"
+  of dgPlayers: "refused: players in more than one world"
+
+proc planWorkers*(): int =
+  ## Workers the resolved thread plan allows (same inputs as the other opt-in users).
+  var envThreads = -1
+  var envChunk = -1
+  let t = getEnv("MC_THREADS")
+  if t.len > 0:
+    envThreads = 0
+    for c in t:
+      if c >= '0' and c <= '9':
+        envThreads = envThreads * 10 + (ord(c) - ord('0'))
+  let w = getEnv("MC_CHUNK_WORKERS")
+  if w.len > 0:
+    envChunk = 0
+    for c in w:
+      if c >= '0' and c <= '9':
+        envChunk = envChunk * 10 + (ord(c) - ord('0'))
+  planThreads(0, 0, countProcessors(), envThreads, envChunk).workers
+
+proc useDimPool*(p: JobPool) =
+  ## Tests: use this pool (shared or not) and a fresh owner id.
+  gPool = p
+  gOwner = if p == nil: -1 else: allocOwner(p)
+
+proc dimPool*(): JobPool =
+  ## The shared pool for dimension jobs; nil when there is none with workers. Created on first use only from the plan's worker count.
+  if gPool == nil:
+    let n = planWorkers()
+    if n <= 0:
+      return nil
+    let p = sharedJobPool(n + 1)
+    if p == nil or p.workers <= 0:
+      return nil
+    useDimPool(p)
+  gPool
+
+proc dimOwnerId*(): int =
+  gOwner
+
+proc reportGate*(g: DimGate) =
+  ## Prints the gate state when it changes (once per change, not per tick). Not printed for the default off.
+  if ord(g) == gLastReported:
+    return
+  gLastReported = ord(g)
+  if g != dgOff:
+    echo "dimtick: dimension threads ", gateName(g)
+
+# ---- messages -------------------------------------------------------------------------------------------------------------
+
+proc postCross*(kind: int; run: proc() {.closure.}) =
+  ## Inside a dimension job: queued for the join phase (this world's outbox, post order). Anywhere else: runs now.
+  if gCur <= 0:
+    run()
+    return
+  let k = if kind < 0 or kind >= CrossKinds: CrossOther else: kind
+  gOutbox[gCur - 1].add CrossMsg(kind: k, run: run)
+
+proc postHookEvent*(run: proc() {.closure.}) =
+  ## A fire-and-forget plugin/hook event raised by world code: see the header (hook lane).
+  postCross(CrossHook, run)
+
+proc assertTickThread*(what: string) =
+  ## Hook lane check: `what` (a hook that must fire on the tick thread) must not be reached from a dimension job.
+  assertOwner(what)
+
+proc applyOutboxes*() =
+  ## Tick thread, after the barrier: runs every queued message, world ascending, post order. Messages posted while this runs (we are
+  ## back outside a dimension job) execute at once.
+  for w in 0 ..< gOutbox.len:
+    var i = 0
+    while i < gOutbox[w].len:
+      let m = gOutbox[w][i]
+      inc gKindCount[m.kind]
+      try:
+        m.run()
+      except:
+        inc gMsgFailed
+      inc i
+    gOutbox[w].setLen(0)
+
+proc pendingMessages*(): int =
+  result = 0
+  for o in gOutbox:
+    result += o.len
+
+proc messageCount*(kind: int): int =
+  if kind < 0 or kind >= CrossKinds: 0 else: gKindCount[kind]
+
+proc failedMessages*(): int = gMsgFailed
+proc phasesRun*(): int = gPhaseCount
+
+# ---- the phase ------------------------------------------------------------------------------------------------------------
+
+proc dimJob(arg: pointer): int {.nimcall, raises.} =
+  let i = cast[ptr int](arg)[]
+  gCur = i + 1
+  enterDimJob()
+  claim(gOwned[i])
+  result = 0
+  try:
+    gBody(i)
+  except:
+    gErrors[i] = "exception in the tick of world " & $i
+    result = 1
+  release(gOwned[i])
+  leaveDimJob()
+  gCur = 0
+
+proc runSequential*(count: int; body: proc(i: int) {.closure.}) =
+  ## The gate-off path: exactly today's loop, no phase, `postCross` runs at once.
+  for i in 0 ..< count:
+    body(i)
+
+proc runDimTicks*(pool: JobPool; owner, count: int; body: proc(i: int) {.closure.}): int =
+  ## One job per index on the Urgent lane, the barrier, then the queued messages applied in order. Returns how many bodies raised
+  ## (their message is printed; the others still ran and their messages were still applied). With a pool without workers the jobs run
+  ## inline at submit: same order, same result.
+  while gOutbox.len < count:
+    gOutbox.add @[]
+  while gOwned.len < count:
+    gOwned.add newOwned("dimension " & $gOwned.len)
+  gErrors = newSeq[string](count)
+  gBody = body
+  var idx = newSeq[int](count)
+  for i in 0 ..< count:
+    idx[i] = i
+  gPhaseCount = gPhaseCount + 1
+  for i in 0 ..< count:
+    submitLane(pool, owner, lnUrgent, dimJob, addr idx[i])
+  var sink: seq[JobResult] = @[]
+  var got = 0
+  while got < count:
+    sink.setLen(0)
+    let n = drainDone(pool, owner, sink)
+    got += n
+    if n == 0 and got < count:
+      sleepWin(0'u32)
+  gBody = nil
+  result = 0
+  for i in 0 ..< count:
+    if gErrors[i].len > 0:
+      inc result
+      echo "dimtick: ", gErrors[i]
+  applyOutboxes()
+
+proc assertWorldOwned*(i: int; what: string) =
+  ## Per-world token check (MC_THREAD_ASSERT=1): the caller must be running world `i`'s job.
+  if i >= 0 and i < gOwned.len:
+    assertHeld(gOwned[i], what)
