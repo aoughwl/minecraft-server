@@ -7,13 +7,31 @@
 ## worker: every exception is caught and reported as `failed = true`, so the pending count cannot stick.
 ## Results are only ever applied by the caller, on its own thread, via `drainDone`.
 ##
-## One pool with workers is live per process (the worker proc is a `nimcall` with a nil argument and reads it from
-## `gJobPool`, the same idiom as generation_executor).
+## Lanes: `lnUrgent`, `lnNormal`, `lnBackground`, each a FIFO; a worker takes the first job of the lowest-numbered non-empty
+## lane, so Background runs only while Urgent and Normal are both empty. `submit` is `submitLane(.., lnNormal, ..)`;
+## `laneDepth` counts queued (not yet started) jobs of a lane. Chunk generation (world/chunk_system/generation_executor)
+## puts generation and decode jobs on Normal and distant-terrain summaries on Background.
+##
+## ONE POOL WITH WORKERS PER PROCESS. The worker proc is a `nimcall` with a nil argument and reads the pool from `gJobPool`, so a
+## second pool with workers would steal the first one's threads. The decision: the process shares one pool. Chunk generation
+## claims it first (`sharedJobPool`); the opt-in users (path, net encode/decode, plugin jobs, region scheduler) either share it
+## through `sharedJobPool` or, when they still call `newJobPool` while a pool with workers is live, are REFUSED: they get an inline
+## pool (no workers, jobs run at submit) and a line is printed and counted in `refusedPools()`. Callers that share a pool must not
+## use owner ids that collide: a shared user takes ids from `allocOwner` (they start far above the small fixed ids the standalone
+## users pick), and a handle must only drain its own owner.
 
 {.feature: "lenientnils".}
 
 import std/locks
 import std/rawthreads
+import std/syncio
+
+const
+  lnUrgent* = 0
+  lnNormal* = 1
+  lnBackground* = 2
+  LaneCount* = 3
+  FirstAllocatedOwner* = 1073741824   ## `allocOwner` ids start here, clear of the small ids standalone users pick
 
 type
   Job* = proc(arg: pointer): int {.nimcall, raises.}
@@ -39,10 +57,12 @@ type
     workers*: int
     lock: Lock
     wake: Cond
-    jobs: seq[JobItem]
-    jobHead: int
+    lq: seq[seq[JobItem]]   ## One FIFO per lane.
+    lh: seq[int]            ## Per lane: index of the next job to take.
     done: seq[DoneItem]
-    pend: seq[int]          ## Per owner: submitted and not yet drained.
+    pendOwner: seq[int]     ## Owners with submissions, parallel to `pendCount` (sparse: allocated owner ids are huge).
+    pendCount: seq[int]     ## Per owner: submitted and not yet drained.
+    nextOwner: int
     stopping: bool
     threads: seq[PoolThread]
     submitted*: int
@@ -50,6 +70,11 @@ type
     failedCount*: int
 
 var gJobPool: JobPool = nil
+var gRefused = 0
+
+proc refusedPools*(): int =
+  ## How many `newJobPool` calls were refused (turned into inline pools) because a pool with workers was already live.
+  gRefused
 
 proc runJob(job: Job, arg: pointer): JobResult =
   result = JobResult(arg: arg, value: 0, failed: false)
@@ -65,21 +90,29 @@ proc finish(p: JobPool, owner: int, r: JobResult) =
   if r.failed:
     inc p.failedCount
 
+proc nextLane(p: JobPool): int =
+  ## Caller holds the lock. The lowest lane with a queued job, -1 when all are empty.
+  result = -1
+  for l in 0 ..< LaneCount:
+    if p.lh[l] < p.lq[l].len:
+      return l
+
 proc workerMain(arg: pointer) {.nimcall.} =
   let p = gJobPool
   while true:
     acquire(p.lock)
-    while p.jobHead >= p.jobs.len and not p.stopping:
+    while nextLane(p) < 0 and not p.stopping:
       wait(p.wake, p.lock)
-    if p.jobHead >= p.jobs.len and p.stopping:
+    let l = nextLane(p)
+    if l < 0:
       release(p.lock)
       return
-    let it = p.jobs[p.jobHead]
-    p.jobs[p.jobHead] = JobItem()
-    inc p.jobHead
-    if p.jobHead == p.jobs.len:
-      p.jobs.setLen(0)
-      p.jobHead = 0
+    let it = p.lq[l][p.lh[l]]
+    p.lq[l][p.lh[l]] = JobItem()
+    inc p.lh[l]
+    if p.lh[l] == p.lq[l].len:
+      p.lq[l].setLen(0)
+      p.lh[l] = 0
     release(p.lock)
     let r = runJob(it.job, it.arg)
     acquire(p.lock)
@@ -87,10 +120,17 @@ proc workerMain(arg: pointer) {.nimcall.} =
     release(p.lock)
 
 proc newJobPool*(threads: int): JobPool =
-  let n = if threads > 1: threads - 1 else: 0
-  result = JobPool(workers: 0, jobs: @[], done: @[], pend: @[], threads: @[])
+  ## `threads` counts the tick thread. If a pool with workers is already live and this one would have workers, it is refused:
+  ## the result is an inline pool (see the header) and the refusal is printed and counted.
+  var n = if threads > 1: threads - 1 else: 0
+  result = JobPool(workers: 0, lq: newSeq[seq[JobItem]](LaneCount), lh: @[0, 0, 0], done: @[], pendOwner: @[], pendCount: @[], threads: @[],
+    nextOwner: FirstAllocatedOwner)
   initLock(result.lock)
   initCond(result.wake)
+  if n > 0 and gJobPool != nil and gJobPool.workers > 0:
+    inc gRefused
+    echo "jobpool: a worker pool is already live; this one runs inline (use sharedJobPool to share it)"
+    n = 0
   if n > 0:
     gJobPool = result
     for i in 0 ..< n:
@@ -101,18 +141,40 @@ proc newJobPool*(threads: int): JobPool =
       except:
         break
     result.workers = result.threads.len
+    if result.workers == 0:
+      gJobPool = nil
 
-proc growPend(p: JobPool, owner: int) =
-  while p.pend.len <= owner:
-    p.pend.add(0)
+proc sharedJobPool*(threads: int): JobPool =
+  ## The process's one worker pool: the live one when there is one (whatever its size), else a new one with `threads - 1` workers.
+  if gJobPool != nil and gJobPool.workers > 0:
+    return gJobPool
+  newJobPool(threads)
 
-proc submit*(p: JobPool, owner: int, job: Job, arg: pointer) =
-  ## Queues the job for a worker (or runs it now when there are none). Owner thread only.
+proc allocOwner*(p: JobPool): int =
+  ## A fresh owner id for a user of a shared pool.
+  acquire(p.lock)
+  result = p.nextOwner
+  inc p.nextOwner
+  release(p.lock)
+
+proc pendIndex(p: JobPool, owner: int, create: bool): int =
+  ## Caller holds the lock.
+  for i in 0 ..< p.pendOwner.len:
+    if p.pendOwner[i] == owner:
+      return i
+  if not create:
+    return -1
+  p.pendOwner.add(owner)
+  p.pendCount.add(0)
+  p.pendOwner.len - 1
+
+proc submitLane*(p: JobPool, owner: int, lane: int, job: Job, arg: pointer) =
+  ## Queues the job on `lane` (out of range: Normal) for a worker, or runs it now when there are none. Owner thread only.
   if owner < 0:
     return
+  let ln = if lane < 0 or lane >= LaneCount: lnNormal else: lane
   acquire(p.lock)
-  growPend(p, owner)
-  inc p.pend[owner]
+  inc p.pendCount[pendIndex(p, owner, true)]
   inc p.submitted
   if p.workers == 0:
     release(p.lock)
@@ -121,9 +183,21 @@ proc submit*(p: JobPool, owner: int, job: Job, arg: pointer) =
     finish(p, owner, r)
     release(p.lock)
     return
-  p.jobs.add(JobItem(job: job, arg: arg, owner: owner))
+  p.lq[ln].add(JobItem(job: job, arg: arg, owner: owner))
   release(p.lock)
   signal(p.wake)
+
+proc submit*(p: JobPool, owner: int, job: Job, arg: pointer) =
+  ## `submitLane` on the Normal lane.
+  submitLane(p, owner, lnNormal, job, arg)
+
+proc laneDepth*(p: JobPool, lane: int): int =
+  ## Jobs queued on `lane` and not yet taken by a worker.
+  if lane < 0 or lane >= LaneCount:
+    return 0
+  acquire(p.lock)
+  result = p.lq[lane].len - p.lh[lane]
+  release(p.lock)
 
 proc drainDone*(p: JobPool, owner: int, sink: var seq[JobResult]): int =
   ## Moves the finished results of `owner` (and only those) into `sink`, in completion order; how many.
@@ -137,14 +211,16 @@ proc drainDone*(p: JobPool, owner: int, sink: var seq[JobResult]): int =
     else:
       keep.add(p.done[i])
   p.done = keep
-  if owner >= 0 and owner < p.pend.len:
-    p.pend[owner] -= result
+  let pi = pendIndex(p, owner, false)
+  if pi >= 0:
+    p.pendCount[pi] -= result
   release(p.lock)
 
 proc pending*(p: JobPool, owner: int): int =
   ## Submitted by `owner` and not yet drained.
   acquire(p.lock)
-  result = if owner >= 0 and owner < p.pend.len: p.pend[owner] else: 0
+  let pi = pendIndex(p, owner, false)
+  result = if pi >= 0: p.pendCount[pi] else: 0
   release(p.lock)
 
 proc shutdown*(p: JobPool) =

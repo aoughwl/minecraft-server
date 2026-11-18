@@ -1,5 +1,27 @@
 import std/syncio
+import std/locks
 import jobpool
+
+proc sleepWin(ms: uint32) {.stdcall, importc: "Sleep", dynlib: "kernel32.dll".}
+
+var gLock: Lock
+var gGo = false
+var gOrder: seq[int] = @[]
+
+proc gate(arg: pointer): int {.nimcall, raises.} =
+  while true:
+    acquire(gLock)
+    let go = gGo
+    release(gLock)
+    if go:
+      return 0
+    sleepWin(1)
+
+proc record(arg: pointer): int {.nimcall, raises.} =
+  acquire(gLock)
+  gOrder.add(cast[int](arg))
+  release(gLock)
+  cast[int](arg)
 
 proc sq(n: int): int =
   var s = 0
@@ -97,6 +119,56 @@ block:
   check(p.completed == 500, "shutdown ran all queued jobs")
   var sink: seq[JobResult] = @[]
   check(drainDone(p, 0, sink) == 500 and pending(p, 0) == 0, "drain after shutdown")
+
+# lanes: one worker held on a gate job while jobs queue on all three lanes; then FIFO per lane, lowest lane first
+block:
+  initLock(gLock)
+  let p = newJobPool(2)
+  check(p.workers == 1, "lane pool has a worker")
+  submit(p, 0, gate, nil)
+  while laneDepth(p, lnNormal) > 0:
+    sleepWin(1)
+  submitLane(p, 0, lnBackground, record, cast[pointer](30))
+  submitLane(p, 0, lnNormal, record, cast[pointer](20))
+  submitLane(p, 0, lnBackground, record, cast[pointer](31))
+  submitLane(p, 0, lnUrgent, record, cast[pointer](10))
+  submit(p, 0, record, cast[pointer](21))
+  submitLane(p, 0, lnUrgent, record, cast[pointer](11))
+  check(laneDepth(p, lnUrgent) == 2 and laneDepth(p, lnNormal) == 2 and laneDepth(p, lnBackground) == 2, "lane depths")
+  acquire(gLock)
+  gGo = true
+  release(gLock)
+  shutdown(p)
+  var ord = ""
+  for v in gOrder:
+    ord.add($v & " ")
+  check(ord == "10 11 20 21 30 31 ", "lane order " & ord)
+  check(laneDepth(p, lnNormal) == 0, "lanes empty after shutdown")
+
+# one pool with workers: a second is refused (inline), sharedJobPool hands back the live one, allocOwner ids are distinct
+block:
+  let p = newJobPool(3)
+  let before = refusedPools()
+  let q = newJobPool(3)
+  check(q.workers == 0 and refusedPools() == before + 1, "second worker pool refused")
+  check(sharedJobPool(5) == p, "sharedJobPool returns the live pool")
+  submit(q, 0, square, cast[pointer](5))
+  var sink: seq[JobResult] = @[]
+  check(drainDone(q, 0, sink) == 1 and sink[0].value == sq(5), "refused pool still runs inline")
+  let a = allocOwner(p)
+  let b = allocOwner(p)
+  check(a != b and a >= FirstAllocatedOwner, "allocOwner distinct")
+  submit(p, a, square, cast[pointer](6))
+  submit(p, b, square, cast[pointer](7))
+  shutdown(p)
+  var sa: seq[JobResult] = @[]
+  var sb: seq[JobResult] = @[]
+  discard drainDone(p, a, sa)
+  discard drainDone(p, b, sb)
+  check(sa.len == 1 and sb.len == 1 and sa[0].value == sq(6) and sb[0].value == sq(7), "allocated owners isolated")
+  let r = newJobPool(2)
+  check(r.workers == 1, "pool allowed again after shutdown")
+  shutdown(r)
 
 if failures == 0:
   echo "ALL OK"
