@@ -7,6 +7,7 @@
 #   SCENARIO_DIR=...    the scratch directory (default ../scenario_run, wiped first)
 #   SCEN_SECONDS=120    how long the bot may run (the phys_* scenarios need 900)
 #   PACKS_FROM=<dir>    copy this folder to packs/ before the real start (content packs, docs/PACKS.md); DATAPACK_FROM=<dir> to world/datapacks/
+#   SEED=<number>       the world seed (a fresh world is generated with it; default: the server's random seed)
 #   NO_PLUGINS=1        do not install the showcase plugins (their scenarios then report INCONCLUSIVE)
 #
 # Exits non-zero when a scenario FAILs; INCONCLUSIVE scenarios do not fail the run.
@@ -39,6 +40,7 @@ cat > jester-mods.json <<'JSON'
   { "id": "test:absent", "version": "2.0.0", "role": "optional", "sha256": "", "size": 0, "url": "https://example.invalid/absent.jar" } ] }
 JSON
 ( timeout 8 "$EXE" > first.txt 2>&1 || true )
+if [ -n "$SEED" ] && [ -z "$WORLD" ]; then sed -i "s/^seed = .*/seed = \"$SEED\"/" minecraft-server.toml; rm -rf world; fi
 if [ -n "$PACKS_FROM" ]; then mkdir -p packs && cp -r "$PACKS_FROM"/. packs/; fi
 if [ -n "$DATAPACK_FROM" ]; then mkdir -p world/datapacks && cp -r "$DATAPACK_FROM"/. world/datapacks/; fi
 sed -i '/^\[networking.java\]/,/^\[/ { s/^encryption = true/encryption = false/; s/^online_mode = true/online_mode = false/ }' minecraft-server.toml
