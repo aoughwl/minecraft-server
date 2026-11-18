@@ -1,0 +1,197 @@
+## Optional encode worker for Java connections (docs/MULTITHREADING.md phase 3, step 1).
+##
+## Off unless the resolved thread plan has workers (`threadcfg.planThreads`, from MC_CHUNK_WORKERS / MC_THREADS) AND the
+## environment has MC_NET_WORKERS=1, so by default nothing changes: `netEncodeEnabled()` is false and no lane is ever made.
+##
+## An `EncodeLane` belongs to one connection. The tick thread has already serialised the packet (and run the sent hook) when it
+## calls `lanePush`; the lane's job (compress, encrypt, frame: `TCPNetworkEncoder.writePacket`) runs on a pool worker. Rules:
+##  * one job in flight per lane; it pops the handoff queue (under the lane lock) in order until it is empty, so per-connection
+##    order is the order of `lanePush`;
+##  * the encoder is touched only by that job, or by the tick thread after `laneDrain` (setCompression / setEncryption);
+##  * finished bytes wait in `ready`; the tick thread takes them with `laneTake` and appends them to the socket buffer.
+## The bytes are those the inline encoder would produce for the same sequence, because it is the same encoder fed the same packets
+## in the same order (netencodetest.aowl proves it).
+
+{.feature: "lenientnils".}
+
+import std/locks
+import std/envvars
+import std/cpuinfo
+import ../../protocol/java/packet_encoder
+import ../../protocol/proto
+import threadcfg, jobpool
+
+type
+  EncodeLane* = ref object
+    slot: int
+    lock: Lock
+    queue: seq[seq[byte]]    ## Packets (id VarInt + body) waiting for the job.
+    ready: seq[byte]         ## Framed, compressed, encrypted bytes not yet taken.
+    inFlight: bool
+    failed: bool
+    failMsg: string
+    dead: bool
+    enc: TCPNetworkEncoder   ## Owned by the job while `inFlight`, by the tick thread otherwise.
+
+var gPool: JobPool = nil
+var gDecided = false
+var gOn = false
+var gLanes: seq[EncodeLane] = @[]
+var gLanesLock: Lock
+var gLanesInit = false
+var gSink: seq[JobResult] = @[]
+
+proc sleepWin(ms: uint32) {.stdcall, importc: "Sleep", dynlib: "kernel32.dll".}
+
+proc ensureLanes() =
+  if not gLanesInit:
+    initLock(gLanesLock)
+    gLanesInit = true
+
+proc enableNetEncode*(workers: int): bool =
+  ## Starts the pool with `workers` workers (tests pass a number; 0 runs the jobs inline on the caller). Tick thread, before any lane.
+  ensureLanes()
+  if gPool == nil:
+    gPool = newJobPool(workers + 1)
+  gDecided = true
+  gOn = true
+  true
+
+proc netEncodeEnabled*(): bool =
+  ## Decided once from the environment and the thread plan.
+  if not gDecided:
+    gDecided = true
+    if getEnv("MC_NET_WORKERS") == "1":
+      var envThreads = -1
+      var envChunk = -1
+      let t = getEnv("MC_THREADS")
+      if t.len > 0:
+        envThreads = 0
+        for c in t:
+          if c >= '0' and c <= '9':
+            envThreads = envThreads * 10 + (ord(c) - ord('0'))
+      let w = getEnv("MC_CHUNK_WORKERS")
+      if w.len > 0:
+        envChunk = 0
+        for c in w:
+          if c >= '0' and c <= '9':
+            envChunk = envChunk * 10 + (ord(c) - ord('0'))
+      let plan = planThreads(0, 0, countProcessors(), envThreads, envChunk)
+      if plan.workers > 0:
+        let n = if plan.workers > 4: 4 else: plan.workers
+        discard enableNetEncode(n)
+  gOn
+
+proc newEncodeLane*(): EncodeLane =
+  ## Only when `netEncodeEnabled()`.
+  ensureLanes()
+  let lane = EncodeLane(queue: @[], ready: @[], enc: newTCPNetworkEncoder(), slot: -1)
+  initLock(lane.lock)
+  acquire(gLanesLock)
+  var at = -1
+  for i in 0 ..< gLanes.len:
+    if gLanes[i] == nil:
+      at = i
+      break
+  if at < 0:
+    gLanes.add(lane)
+    at = gLanes.len - 1
+  else:
+    gLanes[at] = lane
+  lane.slot = at
+  release(gLanesLock)
+  lane
+
+proc laneOf(slot: int): EncodeLane =
+  acquire(gLanesLock)
+  result = gLanes[slot]
+  release(gLanesLock)
+
+proc encodeJob(arg: pointer): int {.nimcall, raises.} =
+  let lane = laneOf(cast[int](arg))
+  while true:
+    acquire(lane.lock)
+    if lane.queue.len == 0:
+      lane.inFlight = false
+      release(lane.lock)
+      return 0
+    var batch = move lane.queue
+    lane.queue = @[]
+    release(lane.lock)
+    var errMsg = ""
+    for i in 0 ..< batch.len:
+      let r = lane.enc.writePacket(batch[i])
+      if not r.isOk and errMsg.len == 0:
+        errMsg = r.error.msg
+    let bytes = lane.enc.flush()
+    acquire(lane.lock)
+    for b in bytes:
+      lane.ready.add(b)
+    if errMsg.len > 0:
+      lane.failed = true
+      lane.failMsg = errMsg
+    release(lane.lock)
+
+proc lanePush*(lane: EncodeLane; packet: openArray[byte]) =
+  ## Tick thread. Queues the packet and makes sure a job is running.
+  if lane.dead:
+    return
+  acquire(lane.lock)
+  lane.queue.add(@packet)
+  let start = not lane.inFlight
+  if start:
+    lane.inFlight = true
+  release(lane.lock)
+  if start:
+    discard drainDone(gPool, 0, gSink)
+    gSink.setLen(0)
+    submit(gPool, 0, encodeJob, cast[pointer](lane.slot))
+
+proc laneBusy*(lane: EncodeLane): bool =
+  ## Packets still queued, being encoded, or encoded and not taken.
+  acquire(lane.lock)
+  result = lane.inFlight or lane.queue.len > 0 or lane.ready.len > 0
+  release(lane.lock)
+
+proc laneTake*(lane: EncodeLane): seq[byte] =
+  ## Tick thread. The bytes finished so far, in order.
+  acquire(lane.lock)
+  result = move lane.ready
+  lane.ready = @[]
+  release(lane.lock)
+
+proc laneError*(lane: EncodeLane): string =
+  ## Non-empty (once) when a packet failed to encode.
+  acquire(lane.lock)
+  result = lane.failMsg
+  lane.failMsg = ""
+  lane.failed = false
+  release(lane.lock)
+
+proc laneDrain*(lane: EncodeLane) =
+  ## Tick thread: waits until the queue is empty and no job runs. The finished bytes stay in `ready`.
+  while true:
+    acquire(lane.lock)
+    let idle = not lane.inFlight and lane.queue.len == 0
+    release(lane.lock)
+    if idle:
+      return
+    sleepWin(0'u32)
+
+proc laneSetCompression*(lane: EncodeLane; threshold: CompressionThreshold; level: CompressionLevel) =
+  laneDrain(lane)
+  lane.enc.setCompression(threshold, level)
+
+proc laneSetEncryption*(lane: EncodeLane; key: openArray[uint8]): bool =
+  laneDrain(lane)
+  lane.enc.setEncryption(key).isOk
+
+proc laneRelease*(lane: EncodeLane) =
+  ## The connection is over and drained: frees the table slot; later pushes are dropped.
+  laneDrain(lane)
+  if not lane.dead:
+    lane.dead = true
+    acquire(gLanesLock)
+    if lane.slot >= 0 and lane.slot < gLanes.len and gLanes[lane.slot] == lane:
+      gLanes[lane.slot] = nil
+    release(gLanesLock)

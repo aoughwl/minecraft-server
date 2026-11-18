@@ -20,6 +20,7 @@ import ../../../util/text/text
 import ../../../plugin/pluginhooksblock
 import ../../../config/networking/compression
 import ../winsock, ../netbase
+import ../../sim/netencode
 import requests/asyncget
 import ../../../world/chunkdata
 
@@ -56,14 +57,16 @@ type
     bedrockSend*: proc(packetId: int32; body: seq[byte]) {.closure.}
       ## Set only on a Bedrock player's stand-in: writes a Bedrock game packet (id and body) to the real client. What
       ## `ClientPlatform::Bedrock(client)` holds upstream; `platform` and the world's editioned broadcasts read it.
+    lane*: nil EncodeLane  ## Set only with MC_NET_WORKERS=1 (sim/netencode.aowl): the encode worker then owns the writer; nil otherwise.
     readBuffer: seq[byte]
 
 proc newJavaClient*(socket: SocketHandle; id: uint64): JavaClient =
+  let lane = (if int(socket) != int(InvalidSocket) and netEncodeEnabled(): newEncodeLane() else: nil)
   JavaClient(id: id, version: CurrentMcVersion, gameprofile: none[GameProfile](), config: none[PlayerConfig](),
     serverAddress: "", peerIp: "", connectionState: csHandShake, brand: none[string](), socket: socket,
     networkWriter: newTCPNetworkEncoder(), networkReader: newTCPNetworkDecoder(), outgoing: @[], outgoingStart: 0,
     closed: false, gone: false, waitForKeepAlive: false, keepAliveId: 0'i64, lastKeepAliveTime: nowMs(),
-    nextKeepAliveAt: 0'i64, packetSequence: -1'i32, pendingAuth: nil, readBuffer: newSeq[byte](ReadChunkSize))
+    nextKeepAliveAt: 0'i64, packetSequence: -1'i32, pendingAuth: nil, lane: lane, readBuffer: newSeq[byte](ReadChunkSize))
 
 proc platform*(self: JavaClient): ClientPlatform =
   ## `Player::client` as a `ClientPlatform`.
@@ -77,6 +80,8 @@ proc sendBedrockPacket*(self: JavaClient; packetId: int32; body: seq[byte]) =
 
 proc close*(self: JavaClient) =
   ## `close`: stops reading. Anything already queued, such as a kick's reason, still goes out.
+  if self.lane != nil:
+    laneDrain(self.lane)   # tick thread: what the worker has is complete before the state flips
   self.closed = true
 
 proc isClosed*(self: JavaClient): bool {.inline.} = self.closed
@@ -85,7 +90,10 @@ proc setCompression*(self: JavaClient; compression: CompressionInfo) =
   if compression.level > 9'u32:
     echo "Invalid compression level! Clients will not be able to read this!"
   self.networkReader.setCompression(int(compression.threshold))
-  self.networkWriter.setCompression(int(compression.threshold), compression.level)
+  if self.lane != nil:
+    laneSetCompression(self.lane, int(compression.threshold), compression.level)   # drains first
+  else:
+    self.networkWriter.setCompression(int(compression.threshold), compression.level)
 
 proc setEncryption*(self: JavaClient; sharedSecret: openArray[byte]): bool =
   ## `set_encryption`. False for a key of the wrong length, or a second one.
@@ -94,11 +102,21 @@ proc setEncryption*(self: JavaClient; sharedSecret: openArray[byte]): bool =
   let readerResult = self.networkReader.setEncryption(sharedSecret)
   if not readerResult.isOk:
     return false
+  if self.lane != nil:
+    return laneSetEncryption(self.lane, sharedSecret)   # drains first
   self.networkWriter.setEncryption(sharedSecret).isOk
 
 proc flushOutgoing*(self: JavaClient) =
   ## Hands the kernel as much as it takes; the rest waits for the next pass.
-  let framed = self.networkWriter.flush()
+  var framed: seq[byte]
+  if self.lane != nil:
+    framed = laneTake(self.lane)
+    let failure = laneError(self.lane)
+    if failure.len > 0:
+      echo "Failed to send packet to client ", self.id, ": ", failure
+      self.close()
+  else:
+    framed = self.networkWriter.flush()
   if framed.len > 0:
     let at = self.outgoing.len
     self.outgoing.setLen(at + framed.len)
@@ -118,14 +136,19 @@ proc flushOutgoing*(self: JavaClient) =
   if self.outgoingStart >= self.outgoing.len:
     self.outgoing.setLen(0)
     self.outgoingStart = 0
+  if self.lane != nil and (self.gone or (self.closed and self.outgoing.len == 0 and not laneBusy(self.lane))):
+    laneRelease(self.lane)   # nothing more will be sent: free the lane's table slot (later packets are dropped)
 
-proc hasOutgoing*(self: JavaClient): bool {.inline.} =
-  self.outgoing.len > self.outgoingStart
+proc hasOutgoing*(self: JavaClient): bool =
+  self.outgoing.len > self.outgoingStart or (self.lane != nil and laneBusy(self.lane))
 
 proc sendPacketNowData*(self: JavaClient; packet: openArray[byte]) =
   ## `send_packet_now_data` and `enqueue_packet_data`, which do not differ here.
   if closureSet(self.tap):
     self.tap(@packet)
+    return
+  if self.lane != nil:
+    lanePush(self.lane, packet)   # compress/encrypt/frame on the encode worker; same bytes, same order
     return
   let res = self.networkWriter.writePacket(packet)
   if not res.isOk:

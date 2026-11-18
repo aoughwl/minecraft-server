@@ -139,6 +139,7 @@ Each phase lists what changes, who owns the files, how it is verified. "Gate" = 
 | Phase 0: atomic stopFlag, prewarmAll, weather RNG per world, thread-local entity/block/durability RNGs, atomic item-stack ids; job pool and owner guard modules (sim/jobpool, sim/ownerguard) | done, built and scenario-run (worldedit_wand and create_live failed once in the full run and passed on rerun; no baseline to prove flaky) |
 | Loot and spawner RNG per World | done (full build, scenarios 14 pass); explosion RNG, materials prewarm after reload still open |
 | Phase 2 steps 1-3: thread-local ambient params, entities stored on World, worldFluids accessor | done (full build, scenarios 14 pass) |
+| Phase 3 step 1: optional Java encode worker (sim/netencode, MC_NET_WORKERS=1 and workers>0; default off) | byte-identical encode test passes; scenarios equal baseline off, flaky worldedit/create_live with it on (pass on rerun); not load-tested; playtest signature assertion fails on origin/main too |
 | Phases 1 to 4 change lists | written (docs/MULTITHREADING_PHASES.md) |
 | Worker count from the thread plan + never-raise workers | prepared on top of the chunk chain (branch mt-items-1-3), not pushed |
 | Wiring jobpool into generation_executor, phases 1 to 6 | waiting on the chunk-system owner's branches reaching main |
