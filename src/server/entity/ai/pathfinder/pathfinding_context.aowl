@@ -12,18 +12,28 @@ import ../../../world/worldmod
 import node, path_type_cache
 
 type
+  BlockSnapshot* = ref object
+    ## A copied box of block-state ids (plus, when collision providers are registered, a per-cell "a provided body fills
+    ## this cell" flag), so a path can be computed with no World access. Built on the main thread by `snapshotBlocks`.
+    minX*, minY*, minZ*: int32
+    sizeX*, sizeY*, sizeZ*: int32
+    states*: seq[uint32]
+    provided*: seq[bool]      ## empty when no collision provider was registered at capture time
+    outsideReads*: int        ## reads outside the box (answered as air); a correct capture keeps this at 0
+
   PathfindingContext* = ref object
     pathTypeCache: PathTypeCache
     mobPosition: Vector3[int32]
-    world: World
+    world: nil World
+    snap: nil BlockSnapshot
     collisionCache: Table[int64, bool]
 
 proc newPathfindingContext*(mobPosition: Vector3[int32]; world: World): PathfindingContext =
-  PathfindingContext(pathTypeCache: newPathTypeCache(), mobPosition: mobPosition, world: world,
+  PathfindingContext(pathTypeCache: newPathTypeCache(), mobPosition: mobPosition, world: world, snap: nil,
     collisionCache: initTable[int64, bool]())
 
 proc withCache*(mobPosition: Vector3[int32]; world: World; cache: PathTypeCache): PathfindingContext =
-  PathfindingContext(pathTypeCache: cache, mobPosition: mobPosition, world: world,
+  PathfindingContext(pathTypeCache: cache, mobPosition: mobPosition, world: world, snap: nil,
     collisionCache: initTable[int64, bool]())
 
 proc mobPosition*(self: PathfindingContext): Vector3[int32] = self.mobPosition
@@ -34,10 +44,76 @@ proc cellHasProvidedBody*(pos: Vector3[int32]): bool =
   let hi = Vector3[float64](x: lo.x + 1.0'f64, y: lo.y + 1.0'f64, z: lo.z + 1.0'f64)
   providedSpaceBlocked(newBoundingBox(lo, hi), 0'i32)
 
+proc snapshotBlocks*(world: World; minX, minY, minZ, sizeX, sizeY, sizeZ: int32): BlockSnapshot =
+  ## Copies the box [min, min + size) from the live world. Main thread only (reads World and the collision providers).
+  let n = int(sizeX) * int(sizeY) * int(sizeZ)
+  result = BlockSnapshot(minX: minX, minY: minY, minZ: minZ, sizeX: sizeX, sizeY: sizeY, sizeZ: sizeZ,
+    states: newSeq[uint32](n), provided: @[], outsideReads: 0)
+  let withProvided = gCollisionProviders.len > 0
+  if withProvided:
+    result.provided = newSeq[bool](n)
+  var i = 0
+  for x in 0'i32 ..< sizeX:
+    for y in 0'i32 ..< sizeY:
+      for z in 0'i32 ..< sizeZ:
+        let p = Vector3[int32](x: minX + x, y: minY + y, z: minZ + z)
+        result.states[i] = world.getBlockStateId(p.asBlockPos())
+        if withProvided:
+          result.provided[i] = cellHasProvidedBody(p)
+        i += 1
+
+proc snapshotAround*(world: World; center: Vector3[int32]; radius: int32): BlockSnapshot =
+  ## The box the evaluator needs around a mob: radius = follow range + 1 horizontally; vertically `radius` up (+2 for the
+  ## head and step-up probes) and max(radius, 66) down (`getStart` walks down 64 blocks, `getOpenNode` falls up to the safe
+  ## fall distance + 2, `getNonWaterNodeBelow` looks 16 down).
+  let down = max(radius, 66'i32)
+  let up = radius + 2'i32
+  snapshotBlocks(world, center.x - radius, center.y - down, center.z - radius, 2'i32 * radius + 1'i32, down + up + 1'i32,
+    2'i32 * radius + 1'i32)
+
+proc newSnapshotContext*(mobPosition: Vector3[int32]; snap: BlockSnapshot): PathfindingContext =
+  ## A context that reads only `snap` (no World, no collision providers).
+  PathfindingContext(pathTypeCache: newPathTypeCache(), mobPosition: mobPosition, world: nil, snap: snap,
+    collisionCache: initTable[int64, bool]())
+
+proc snapIndex(s: BlockSnapshot; pos: Vector3[int32]): int =
+  let x = pos.x - s.minX
+  let y = pos.y - s.minY
+  let z = pos.z - s.minZ
+  if x < 0'i32 or y < 0'i32 or z < 0'i32 or x >= s.sizeX or y >= s.sizeY or z >= s.sizeZ:
+    return -1
+  (int(x) * int(s.sizeY) + int(y)) * int(s.sizeZ) + int(z)
+
+proc stateIdAt(self: PathfindingContext; pos: Vector3[int32]): uint32 =
+  let s = self.snap
+  if s != nil:
+    let i = snapIndex(s, pos)
+    if i < 0:
+      s.outsideReads += 1
+      return 0'u32
+    return s.states[i]
+  let w = self.world
+  if w == nil:
+    return 0'u32
+  w.getBlockStateId(pos.asBlockPos())
+
+proc providedAt(self: PathfindingContext; pos: Vector3[int32]): bool =
+  let s = self.snap
+  if s != nil:
+    if s.provided.len == 0:
+      return false
+    let i = snapIndex(s, pos)
+    return i >= 0 and s.provided[i]
+  gCollisionProviders.len > 0 and cellHasProvidedBody(pos)
+
+proc outsideReads*(self: PathfindingContext): int =
+  let s = self.snap
+  if s != nil: s.outsideReads else: 0
+
 proc computePathTypeFromState*(self: PathfindingContext; pos: Vector3[int32]): PathType =
   ## `compute_path_type_from_state`: classifies a block position into a `PathType` for pathfinding.
   # Single chunk lookup, then derive block & state from static arrays
-  let stateId = newBlockStateIdUnchecked(uint16(self.world.getBlockStateId(pos.asBlockPos())))
+  let stateId = newBlockStateIdUnchecked(uint16(self.stateIdAt(pos)))
   let blockRef = Block.fromStateId(stateId)
   let state = BlockState.fromId(stateId)
   let id = blockRef.id
@@ -45,7 +121,7 @@ proc computePathTypeFromState*(self: PathfindingContext; pos: Vector3[int32]): P
   if id == blockIdAir or id == blockIdVoidAir or id == blockIdCaveAir:
     # A block body (collision provider) filling an air cell is as solid to a path as a stone block: the mob walks around
     # it, onto it (the cell below it then counts as a floor) or jumps up a step. Nothing runs with no provider registered.
-    if gCollisionProviders.len > 0 and cellHasProvidedBody(pos):
+    if self.providedAt(pos):
       return ptBlocked
     return ptOpen
   if hasTag(rawId, Block_MINECRAFT_TRAPDOORS) or id == blockIdLilyPad or id == blockIdBigDripleaf:
@@ -130,8 +206,8 @@ proc hasCollisions*(self: PathfindingContext; pos: Vector3[int32]): bool =
   ## `has_collisions`
   if self.collisionCache.hasKey(keyOf(pos)):
     return self.collisionCache.getOrDefault(keyOf(pos))
-  let stateId = newBlockStateIdUnchecked(uint16(self.world.getBlockStateId(pos.asBlockPos())))
-  result = BlockState.fromId(stateId).isFullCube
+  let stateId = newBlockStateIdUnchecked(uint16(self.stateIdAt(pos)))
+  result =BlockState.fromId(stateId).isFullCube
   self.collisionCache[keyOf(pos)] = result
 
 proc clearCaches*(self: PathfindingContext) =
