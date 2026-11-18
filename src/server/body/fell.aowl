@@ -1,0 +1,237 @@
+## Tree felling: the world side (the pure part is fellogic.aowl). Part of the automatic triggers (trigger.aowl), on in `structures` and
+## `full` worlds.
+##
+## WHEN. A player breaks a block (block log cause `break`; in `full` also fire and explosions): the cell is queued (`fellNote`). Each tick
+## (`tickFelling`) at most `FellPerTick` queued cuts are looked at, inside a token bucket per dimension (burst 6, one back every 10 ticks),
+## a bounded queue (64, oldest dropped) and a live body cap (`FellMaxLiveBodies`): a clear cut of a forest is felled tree by tree.
+##
+## WHAT. A box around the cut (12 blocks each side, 2 below, 40 above) is read once (bulkedit.readVolume: an unloaded part = nothing
+## happens). Its cells are classed by TAG, never by name: `minecraft:logs` = log, `minecraft:leaves` = leaf, any other structural block
+## with a collision shape = ground, the rest empty. fellogic.analyzeFell decides which log components lost their support and which leaves
+## belong to them (see there: leaves never support, a component reaching the box edge or touching any ground block stands, more than
+## `FellMaxCells` cells = skipped). A natural stone or dirt pillar has no log, so this never moves terrain; player built structures of
+## other blocks are the structural solver's business (trigger.aowl), not this.
+##
+## THE FALL. Each free component becomes ONE body (bodymanager.assembleCells: journal, one all-or-nothing removal, the jester:bodies
+## CREATE / vanilla block_display fallback for the clients) marked `felled`. It starts as a rigid rotation about the horizontal axis through
+## the cut face (fellogic.toppleStart, w0 = `FellSpin` rad per tick), tipping AWAY from the nearest player within 8 blocks of the cut, else
+## downwind (windfield), else toward +x; gravity and the integrator's contacts do the rest. When it rests (or after `FellMaxTicks`), the
+## leaves break into their loot drops (material table: the soft class) and the bare logs fall on as a new body, which then settles at
+## the nearest grid rotation (log axis turned by bodyworld.mapStateRot) or, with no free spot, drops as items (bodymanager.settleFelled).
+
+{.feature: "lenientnils".}
+
+import std/[math, options, syncio]
+import ../../data/block_ext
+from ../../data/block_state import newBlockStateIdUnchecked, asU16
+import "../../generated/tag"
+import ../../physics/[body, integrator, materials, solveradapter, windfield]
+import ../../world/level
+import ../serverbase
+import ../world/bulkedit
+import bodyentity, bodyworld, bodymanager, fellogic
+
+const
+  FellMaxCells* = 512          ## logs + leaves of one felled piece; a bigger tree is left standing
+  FellLeafReach = 6
+  FellRadius = 12'i32
+  FellBelow = 2'i32
+  FellAbove = 40'i32
+  FellPerTick = 1
+  FellQueueMax = 64
+  FellBurst = 6.0
+  FellRefillTicks = 10.0
+  FellMaxLiveBodies = 48
+  FellSpin = 0.05              ## rad per tick at the start
+  FellPlayerReach = 8.0
+
+type
+  FellCut = object
+    dim: string
+    x, y, z: int32
+    state: uint32
+    tick: int64
+
+  FellStats* = object
+    noted*, looked*, felled*, grounded*, tooLarge*, unloaded*, noLog*, failed*, deferred*, dropped*: int
+    cells*, leaves*: int
+
+var gFellStats*: FellStats = FellStats()
+var gQueue: seq[FellCut] = @[]
+var gTokens: seq[(string, float64, int64)] = @[]
+var gClass: seq[uint8] = @[]     # state id -> 255 unknown, else Fc*
+
+proc fellClass(state: uint32): uint8 =
+  if state == 0'u32:
+    return FcEmpty
+  if gClass.len == 0:
+    gClass = newSeq[uint8](65536)
+    for i in 0 ..< gClass.len:
+      gClass[i] = 255'u8
+  let i = int(state and 0xFFFF'u32)
+  if gClass[i] == 255'u8:
+    let sid = newBlockStateIdUnchecked(uint16(state))
+    let blk = Block.fromStateId(sid)
+    let bid = uint16(asU16(blk.id))
+    var c = FcEmpty
+    if hasTag(bid, Block_MINECRAFT_LOGS):
+      c = FcLog
+    elif hasTag(bid, Block_MINECRAFT_LEAVES):
+      c = FcLeaf
+    elif isSolidState(state) and isStructural(materialOf(int(state))):
+      c = FcSupport
+    gClass[i] = c
+  gClass[i]
+
+proc isLogState*(state: uint32): bool = fellClass(state) == FcLog
+
+proc fellNote*(dim: string; x, y, z: int32; oldState: uint32; tick: int64) =
+  ## A block was broken at the cell (`oldState` = what it was). Queued when the block or a 26-neighbour may be a log: the neighbour test
+  ## runs at processing time; here only a cheap filter: the broken block itself was solid.
+  if oldState == 0'u32:
+    return
+  inc gFellStats.noted
+  if gQueue.len >= FellQueueMax:
+    gQueue.delete(0)
+    inc gFellStats.dropped
+  gQueue.add(FellCut(dim: dim, x: x, y: y, z: z, state: oldState, tick: tick))
+
+proc takeToken(dim: string; tick: int64): bool =
+  for i in 0 ..< gTokens.len:
+    if gTokens[i][0] == dim:
+      var t = gTokens[i][1] + float64(tick - gTokens[i][2]) / FellRefillTicks
+      if t > FellBurst:
+        t = FellBurst
+      if t < 1.0:
+        gTokens[i] = (dim, t, tick)
+        return false
+      gTokens[i] = (dim, t - 1.0, tick)
+      return true
+  gTokens.add((dim, FellBurst - 1.0, tick))
+  true
+
+proc nearLog(world: World; x, y, z: int32): bool =
+  for dy in -1'i32 .. 1'i32:
+    for dz in -1'i32 .. 1'i32:
+      for dx in -1'i32 .. 1'i32:
+        if (dx != 0'i32 or dy != 0'i32 or dz != 0'i32) and fellClass(stateIdAt(world, int(x + dx), int(y + dy), int(z + dz))) == FcLog:
+          return true
+  false
+
+proc fellDirection(world: World; cx, cy, cz: float64; tick: int64): (float64, float64) =
+  var best = -1.0
+  var px = cx
+  var pz = cz
+  for pl in world.players:
+    let dx = pl.pos.x - cx
+    let dy = pl.pos.y - cy
+    let dz = pl.pos.z - cz
+    let d = sqrt(dx * dx + dy * dy + dz * dz)
+    if d <= FellPlayerReach and (best < 0.0 or d < best):
+      best = d
+      px = pl.pos.x
+      pz = pl.pos.z
+  let w = windAtWorld(float64(tick), cx, cy + 4.0, cz)
+  if best < 0.0:
+    return fallDir(0.0, 0.0, 0.0, 0.0, w.x, w.z)
+  fallDir(px, pz, cx, cz, w.x, w.z)
+
+proc processCut(world: World; cut: FellCut; tick: int64) =
+  inc gFellStats.looked
+  var lo = cut.y - FellBelow
+  var hi = cut.y + FellAbove
+  let d = world.dimension
+  if lo < d.minY:
+    lo = d.minY
+  if hi > d.minY + d.height - 1'i32:
+    hi = d.minY + d.height - 1'i32
+  let box = volumeBox(cut.x - FellRadius, lo, cut.z - FellRadius, cut.x + FellRadius, hi, cut.z + FellRadius)
+  let snap = readVolume(world, box)
+  if snap.status != esOk:
+    inc gFellStats.unloaded
+    return
+  let nx = int(box.maxX - box.minX) + 1
+  let ny = int(box.maxY - box.minY) + 1
+  let nz = int(box.maxZ - box.minZ) + 1
+  var ids = newSeq[uint32](nx * ny * nz)
+  var cls = newSeq[uint8](nx * ny * nz)
+  for sec in snap.sections:
+    let vals = sec.blocks.cells()
+    for y in sec.y0 .. sec.y1:
+      for z in sec.z0 .. sec.z1:
+        for x in sec.x0 .. sec.x1:
+          let st = vals[y * 256 + z * 16 + x]
+          if st != 0'u32:
+            let i = int(sec.cx * 16'i32 + int32(x) - box.minX) + nx * (int(sec.cz * 16'i32 + int32(z) - box.minZ) + nz * int(sec.baseY + int32(y) - box.minY))
+            ids[i] = st
+            cls[i] = fellClass(st)
+  let a = analyzeFell(cls, nx, ny, nz, int(cut.x - box.minX), int(cut.y - box.minY), int(cut.z - box.minZ), FellMaxCells, FellLeafReach)
+  gFellStats.grounded += a.grounded
+  gFellStats.tooLarge += a.tooLarge
+  for p in a.pieces:
+    var cells: seq[Cell] = @[]
+    for list in [p.logs, p.leaves]:
+      for c in list:
+        let y = c div (nx * nz)
+        let r = c - y * nx * nz
+        let z = r div nx
+        let x = r - z * nx
+        cells.add(Cell(x: box.minX + int32(x), y: box.minY + int32(y), z: box.minZ + int32(z), state: int32(ids[c])))
+    let res = assembleCells(world, cells, tick)
+    if not res.ok or res.bodies.len == 0:
+      inc gFellStats.failed
+      echo "[fell] a tree at " & $cut.x & " " & $cut.y & " " & $cut.z & " could not become a body: " & res.reason
+      continue
+    let be = res.bodies[0]
+    be.felled = true
+    be.fellStage = 0
+    be.felledTick = tick
+    let pivot = (float64(box.minX) + p.pivot[0], float64(box.minY) + p.pivot[1], float64(box.minZ) + p.pivot[2])
+    let com = comWorld(be.body)
+    let dir = fellDirection(world, pivot[0], pivot[1], pivot[2], tick)
+    let (w, v) = toppleStart(pivot, (com.x, com.y, com.z), dir, FellSpin)
+    be.body.angVel = Vec3(x: w[0], y: w[1], z: w[2])
+    be.body.vel = Vec3(x: v[0], y: v[1], z: v[2])
+    wakeBody(be)
+    pushSnapFx(world, cut.x, cut.y, cut.z, cut.state, be.id, tick)
+    inc gFellStats.felled
+    gFellStats.cells += p.logs.len
+    gFellStats.leaves += p.leaves.len
+    echo "[fell] tree felled at " & $cut.x & " " & $cut.y & " " & $cut.z & ": body " & $be.id & ", " & $p.logs.len & " logs, " &
+      $p.leaves.len & " leaves, falling toward " & f2(dir[0]) & " " & f2(dir[1])
+
+proc tickFelling*(tick: int64) =
+  ## Once per tick from trigger.tickTriggers (only while some world has triggers on).
+  var done = 0
+  var probes = 0
+  var i = 0
+  while i < gQueue.len and done < FellPerTick and probes < 32:
+    let cut = gQueue[i]
+    if cut.tick >= tick:
+      inc i
+      continue
+    inc probes
+    let ww = worldByDim(cut.dim)
+    if ww.isNone:
+      gQueue.delete(i)
+      inc gFellStats.unloaded
+      continue
+    let world = ww.get
+    if not nearLog(world, cut.x, cut.y, cut.z):
+      gQueue.delete(i)       # mining, building: no log next to the cut, costs no token
+      inc gFellStats.noLog
+      continue
+    if bodyCount() >= FellMaxLiveBodies or not takeToken(cut.dim, tick):
+      inc gFellStats.deferred
+      return
+    gQueue.delete(i)
+    processCut(world, cut, tick)
+    inc done
+
+proc fellQueued*(): int = gQueue.len
+
+proc fellStatusLine*(): string =
+  "tree felling: " & $gFellStats.felled & " felled (" & $gFellStats.cells & " logs, " & $gFellStats.leaves & " leaves), cuts noted " &
+    $gFellStats.noted & ", looked at " & $gFellStats.looked & ", still grounded " & $gFellStats.grounded & ", too large " &
+    $gFellStats.tooLarge & ", no log near " & $gFellStats.noLog & ", unloaded " & $gFellStats.unloaded & ", failed " & $gFellStats.failed &
+    ", deferred " & $gFellStats.deferred & ", queue " & $gQueue.len & " (dropped " & $gFellStats.dropped & "), max " & $FellMaxCells & " cells"

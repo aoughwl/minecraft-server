@@ -1,7 +1,7 @@
 #!/bin/sh
 # Automatic collapse trigger scenario on a PRIVATE server: scratch world dir, ports 25840-25844 only, never the user's instance.
 #   sh tests/run_trigger_scenario.sh C:/m/trig.exe
-# The default (no JESTER_PHYSICS_TRIGGERS, no world file) is OFF: the scenario itself switches the mode over RCON.
+# The scenario starts from OFF (JESTER_PHYSICS_TRIGGERS=off: the built-in default is now structures) and switches the mode over RCON.
 set -e
 EXE="$1"
 [ -n "$EXE" ] && [ -f "$EXE" ] || { echo "usage: run_trigger_scenario.sh <server executable>"; exit 2; }
@@ -12,7 +12,7 @@ RCON=$((PORT + 1))
 BEDROCK=$((PORT + 2))
 NAME=TrigBot
 export PATH="/c/msys64/ucrt64/bin:$PATH"
-unset JESTER_PHYSICS_TRIGGERS
+export JESTER_PHYSICS_TRIGGERS=off
 rm -rf "$RUN"
 mkdir -p "$RUN/data"
 cd "$RUN"
