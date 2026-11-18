@@ -59,6 +59,7 @@ const
   MaxProviderCells* = 6000       ## above this many surface cells a body answers with one body-wide box
   MaxAssembleCells* = 20000      ## largest component `assembleBox` turns into a body
   MaxEvents = 65536
+  FellMaxTicks* = 400'i64        ## a felled tree's stage (falling with leaves, falling bare) ends after this many ticks even if it never sleeps
 
 type
   BodyConfig* = object
@@ -961,7 +962,76 @@ proc bodyPoseChanged*(be: BodyEntity; tick: int64) =
   if tick - be.lastCheckpoint >= int64(gCfg.checkpointEvery):
     checkpoint(be, tick)
 
+proc isSoftCell(state: int32): bool =
+  ## Cells a felled tree loses when it lands, by the material table: the soft class (leaves, wool, hay, moss) and anything shapeless.
+  let m = materialOf(int(state))
+  m.matClass == mcSoft or m.matClass == mcFoliage
+
+proc shedSoftCells(be: BodyEntity; tick: int64): int =
+  ## A felled tree touched down: its soft cells (leaves) break into their loot drops with the break effect, the hard cells (logs) go on as
+  ## a NEW body with the same pose (a new CREATE for the clients: their volume of the old one still holds the leaves), the old body ends
+  ## with reason `drDropped`. Returns 0 when there was nothing soft (`be` unchanged), 1 when a new body took over, 2 when nothing hard was left.
+  var hard: seq[Cell] = @[]
+  var soft: seq[Cell] = @[]
+  for c in cellList(be.body):
+    if isSoftCell(c.state):
+      soft.add(c)
+    else:
+      hard.add(c)
+  if soft.len == 0:
+    return 0
+  for c in soft:
+    let p = worldPointOf(be, float64(c.x) + 0.5, float64(c.y) + 0.5, float64(c.z) + 0.5)
+    breakEffects(be.world, int32(floor(p.x)), int32(floor(p.y)), int32(floor(p.z)), uint32(c.state), be.id)
+  if hard.len == 0:
+    destroyBody(be, drDropped, tick)
+    return 2
+  let (hi, lo) = newUuid()
+  var nb = newBody(hi, lo)
+  for c in hard:
+    setCell(nb, int(c.x), int(c.y), int(c.z), int(c.state))
+  recomputeMass(nb, defaultProps)
+  nb.pos = be.body.pos
+  nb.orient = be.body.orient
+  let ne = newBodyEntity(allocId(), be.world, be.dim, nb, tick)
+  for k in be.claims:
+    if getCell(nb, int(k.lx), int(k.ly), int(k.lz)) != 0:
+      ne.claims.add(k)
+  for e in be.blockEntities:
+    if getCell(nb, int(e.lx), int(e.ly), int(e.lz)) != 0:
+      ne.blockEntities.add(e)
+  ne.felled = true
+  ne.fellStage = 1
+  ne.felledTick = tick
+  destroyBody(be, drDropped, tick)
+  registerBody(ne, tick)
+  checkpoint(ne, tick)
+  1
+
+proc settleFelled(be: BodyEntity; tick: int64) =
+  ## A felled tree that came to rest (or ran out of time): first the leaves go (and the logs fall on without them), then the logs settle
+  ## at the NEAREST of the 24 grid rotations (a trunk lying on its canopy is not within 2 degrees of anything), no free spot: items.
+  if be.fellStage == 0:
+    if shedSoftCells(be, tick) != 0:
+      return            # the bare logs (a new body) fall again and settle the next time they rest; or nothing was left
+    be.fellStage = 1
+  let r = settleBody(be, false, tick)
+  if r.ok:
+    return
+  if r.edit == esOk:
+    dropBodyAsItems(be, tick)
+  else:
+    be.settleFailedTick = tick     # the placement could not run now (unloaded, veto): again in a while
+
+proc pushSnapFx*(world: World; x, y, z: int32; state: uint32; bodyId: int32; tick: int64) =
+  ## The `snap` effect (fx kind 2) where a structure gave way, e.g. the cut of a felled tree.
+  pushFx(BodyFxEvent(kind: 2, dim: world.dimension.minecraftName, x: x, y: y, z: z, state: state, impulse: 1000.0'f32, bodyId: bodyId,
+    hasNormal: false, tick: tick))
+
 proc trySettleAuto(be: BodyEntity; tick: int64) =
+  if be.felled:
+    settleFelled(be, tick)
+    return
   let r = settleBody(be, true, tick)
   if r.ok:
     return
@@ -1330,7 +1400,7 @@ proc tickBodies*(server: Server) =
     let be = snapshot[idx]
     if be.phase != bpFree or be.kinematic:
       continue
-    if be.body.sleeping:
+    if be.body.sleeping or (be.felled and tick - be.felledTick >= FellMaxTicks):
       if gCfg.autoSettle and (be.settleFailedTick < 0 or (be.settleFailedTick != high(int64) and tick - be.settleFailedTick >= 40)):
         settleList.add(be)
       continue
@@ -1350,7 +1420,7 @@ proc tickBodies*(server: Server) =
       gLastSkipLog = tick
       echo "[body] budget: " & $skipped & " awake bodies waited this tick (" & $stepped & " stepped, " & $spent & " cells)"
   for be in settleList:
-    if be in gBodies and be.body.sleeping:
+    if be in gBodies and (be.body.sleeping or be.felled):
       trySettleAuto(be, tick)
 
 # ----------------------------------------------------------------------------------------------------------------------

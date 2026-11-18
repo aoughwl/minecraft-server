@@ -653,7 +653,7 @@ def _count_cells(s, box, state):
 
 @scenario(explicit('phys_blast'))
 def phys_blast(s):
-    """Explosions through the blast model. Default (`physics_triggers` off): /explode is the vanilla blast, the model counts no blast. With
+    """Explosions through the blast model. With `physics_triggers` off (the default is structures now, the scenario switches it off): /explode is the vanilla blast, the model counts no blast. With
     `/body triggers full`: the same blast goes through blast.aowl (`/body triggers status` counts blasts), makes a crater of real air on
     the client and spawns debris bodies (`/body status` created > 0), and soft dirt loses far more than stone for the same power."""
     s.wait(lambda: s.position() is not None and s.chunks() >= 9, 'the spawn chunks', 60.0)
@@ -684,7 +684,8 @@ def phys_blast(s):
 
     try:
         lines = ' '.join(_ask(s, 'body triggers status', 'blasts', 'trigger status'))
-        s.check('physics_triggers' in lines and ': off' in lines, 'default is off: %r' % lines)
+        s.check('physics_triggers' in lines and (': structures' in lines or ': off' in lines), 'a default mode is reported: %r' % lines)
+        _ask(s, 'body triggers off', 'now off', 'triggers off for the vanilla part')
         b0 = _num(lines, r'blasts ([0-9]+)')
         # every cube is built while the triggers are off (a built dirt tower would be collapse checked and could fall on its own)
         sbox0 = cube(px + 3, pz + 3, 'stone', stone, 'stone')
@@ -960,8 +961,133 @@ def physics_api(s):
     s.expect('Physics solve: ok=true broken=0', 'the structural solver', 30.0)
 
 
+def _bodies_msgs(s, kind):
+    """jester:bodies messages of a kind since the start: CREATE (1) heads only (continuation parts left out), DESTROY (2) as (reason, ids)."""
+    out = []
+    for d in s.payloads('jester:bodies'):
+        if not d or d[0] != kind:
+            continue
+        if kind == 1:
+            i = 1
+            while d[i] & 0x80:
+                i += 1
+            i += 1
+            if d[i] & 2 == 0:
+                out.append(d)
+        else:
+            out.append(d)
+    return out
+
+
+def _dig(s, x, y, z, seq):
+    """A creative player breaks the block: start-digging (status 0) on its top face; creative breaks at once."""
+    s.c.send(s.m.SB_ACTION, s.m.varint(0) + s.m.block_pos(x, y, z) + bytes([1]) + s.m.varint(seq))
+
+
+@scenario(explicit('phys_fell'))
+def phys_fell(s):
+    """Tree felling and its limits (physics_triggers default `structures`). On a stone pad: an oak (5 logs, 57 leaves) is cut at its bottom
+    log by the PLAYER; the tree is taken out of the world (all its cells air on the client), a body appears on jester:bodies (CREATE) and in
+    /body status, it topples away from the player (+x), its leaves break into drops and the logs come back as blocks lying on their side
+    (axis x or z) at a fallen position. A ground standing 3x3 stone pillar with one block broken out of its side does NOT collapse: no body,
+    every other pillar block still there. A natural block broken next to the pad moves nothing either."""
+    s.wait(lambda: s.position() is not None and s.chunks() >= 9, 'the spawn chunks', 60.0)
+    s.command('gamemode creative')
+    _idle(s, 0.5)
+    px, py, pz = s.position()
+    px, pz = int(px // 1), int(pz // 1)
+    gy = int(py // 1) - 1
+    tx, tz = px + 4, pz
+    probe = (tx - 3, gy + 14, tz - 3)
+    ids = _state_ids(s, probe[0], probe[1], probe[2], ['stone', 'oak_log', 'oak_log[axis=x]', 'oak_log[axis=z]', 'oak_leaves[persistent=true]'])
+    stone, log_y, log_x, log_z, leaf = ids['stone'], ids['oak_log'], ids['oak_log[axis=x]'], ids['oak_log[axis=z]'], ids['oak_leaves[persistent=true]']
+    status = ' '.join(_ask(s, 'body triggers status', 'tree felling', 'trigger status'))
+    s.check(': structures' in status, 'the default mode is structures: %r' % status)
+    # the pad and a clear space over it
+    s.command('fill %d %d %d %d %d %d minecraft:air' % (tx - 6, gy + 1, tz - 6, tx + 11, gy + 13, tz + 7))
+    s.command('fill %d %d %d %d %d %d minecraft:stone' % (tx - 6, gy, tz - 6, tx + 11, gy, tz + 7))
+    s.wait(lambda: s.block(tx + 11, gy, tz + 7) == stone and s.block(tx - 6, gy, tz - 6) == stone, 'the stone pad', 40.0)
+    # the oak: trunk gy+1..gy+5, leaves 2 layers of 5x5 around the top two logs, 3x3 on top
+    s.command('fill %d %d %d %d %d %d minecraft:oak_leaves[persistent=true]' % (tx - 2, gy + 4, tz - 2, tx + 2, gy + 5, tz + 2))
+    s.command('fill %d %d %d %d %d %d minecraft:oak_leaves[persistent=true]' % (tx - 1, gy + 6, tz - 1, tx + 1, gy + 6, tz + 1))
+    s.command('fill %d %d %d %d %d %d minecraft:oak_log' % (tx, gy + 1, tz, tx, gy + 5, tz))
+    tree_box = (tx - 2, gy + 1, tz - 2, tx + 2, gy + 6, tz + 2)
+    s.wait(lambda: _count_cells(s, tree_box, log_y) == 5 and _count_cells(s, tree_box, leaf) == 57, 'the oak (5 logs, 57 leaves)', 40.0)
+    # the player stands on the -x side of the tree, 3 blocks away
+    s.command('tp @s %.1f %d %.1f' % (tx - 3 + 0.5, gy + 1, tz + 0.5))
+    s.wait(lambda: abs(s.position()[0] - (tx - 2.5)) < 0.01, 'the teleport next to the tree', 20.0)
+    _idle(s, 2.0)
+    creates0 = len(_bodies_msgs(s, 1))
+    destroys0 = len(_bodies_msgs(s, 2))
+    st0 = ' '.join(_ask(s, 'body status', 'created', 'body status before'))
+    created0 = _num(st0, r'created ([0-9]+)') or 0
+    print('  oak at %d %d %d on a pad at y %d; bodystream creates so far %d' % (tx, gy + 1, tz, gy, creates0), flush=True)
+    # 1. cut the bottom log
+    _dig(s, tx, gy + 1, tz, 101)
+    s.wait(lambda: s.block(tx, gy + 1, tz) == 0, 'the cut log to become air', 15.0)
+    t_cut = time.time()
+    upper = (tx - 2, gy + 2, tz - 2, tx + 2, gy + 6, tz + 2)
+    s.wait(lambda: _count_cells(s, upper, log_y) == 0 and _count_cells(s, upper, leaf) == 0, 'the tree to leave the world (its cells air)', 15.0)
+    print('  the tree left the world %.1fs after the cut' % (time.time() - t_cut), flush=True)
+    s.wait(lambda: len(_bodies_msgs(s, 1)) > creates0, 'a jester:bodies CREATE for the falling tree', 15.0)
+    head = _bodies_msgs(s, 1)[creates0]
+    st1 = ' '.join(_ask(s, 'body status', 'created', 'body status after the cut'))
+    s.check((_num(st1, r'created ([0-9]+)') or 0) >= created0 + 1, 'the body manager created a body: %r' % st1)
+    trig = ' '.join(_ask(s, 'body triggers status', 'tree felling', 'trigger status after the cut'))
+    print('  %s' % trig[trig.find('tree felling'):][:220], flush=True)
+    s.check((_num(trig, r'tree felling: ([0-9]+) felled') or 0) >= 1, 'the trigger status counts a felled tree: %r' % trig)
+    s.check(_num(trig, r'felled \(([0-9]+) logs') == 4 and _num(trig, r'logs, ([0-9]+) leaves') == 57,
+            'the felled piece is the 4 logs above the cut and all 57 leaves: %r' % trig)
+    print('  CREATE head %d bytes' % len(head), flush=True)
+    # 2. it falls, sheds its leaves and the logs settle lying down
+    fallen = (tx - 3, gy - 1, tz - 6, tx + 11, gy + 6, tz + 6)
+
+    def lying():
+        return _count_cells(s, fallen, log_x) + _count_cells(s, fallen, log_z)
+    s.wait(lambda: lying() >= 3, 'the logs to come back as blocks lying on their side', 60.0)
+    _idle(s, 3.0)
+    n_x, n_z, n_y = _count_cells(s, fallen, log_x), _count_cells(s, fallen, log_z), _count_cells(s, fallen, log_y)
+    xs = [x for y in range(gy - 1, gy + 7) for z in range(tz - 6, tz + 7) for x in range(tx - 3, tx + 12) if s.block(x, y, z) in (log_x, log_z)]
+    ys = [y for y in range(gy - 1, gy + 7) for z in range(tz - 6, tz + 7) for x in range(tx - 3, tx + 12) if s.block(x, y, z) in (log_x, log_z)]
+    print('  settled %.1fs after the cut: lying logs axis=x %d, axis=z %d, upright %d, at x %s y %s; leaves left %d' %
+          (time.time() - t_cut, n_x, n_z, n_y, sorted(set(xs)), sorted(set(ys)), _count_cells(s, fallen, leaf)), flush=True)
+    s.check(n_x + n_z == 4 and n_y == 0, 'all 4 logs lie on their side (x %d, z %d, upright %d)' % (n_x, n_z, n_y))
+    s.check(n_x == 4 and max(xs) >= tx + 3, 'the tree fell along +x, away from the player (log x %s)' % sorted(set(xs)))
+    s.check(max(ys) <= gy + 2, 'the logs lie on the pad (y %s, pad top %d)' % (sorted(set(ys)), gy + 1))
+    s.check(_count_cells(s, fallen, leaf) == 0, 'the leaves broke into drops (none left as blocks)')
+    s.check(len(_bodies_msgs(s, 2)) > destroys0, 'the body ended on jester:bodies (DESTROY)')
+    st2 = ' '.join(_ask(s, 'body status', 'created', 'body status after the fall'))
+    print('  %s' % st2[:200], flush=True)
+    s.check(_num(st2, r'([0-9]+) live') == 0, 'no body is left live: %r' % st2)
+    # 3. a ground standing 3x3 stone pillar loses a side block: nothing moves
+    bx, bz = tx - 4, tz + 4
+    s.command('fill %d %d %d %d %d %d minecraft:stone' % (bx, gy + 1, bz, bx + 2, gy + 8, bz + 2))
+    pillar = (bx, gy + 1, bz, bx + 2, gy + 8, bz + 2)
+    s.wait(lambda: _count_cells(s, pillar, stone) == 72, 'the stone pillar', 30.0)
+    _idle(s, 2.0)
+    creates1 = len(_bodies_msgs(s, 1))
+    st3 = ' '.join(_ask(s, 'body status', 'created', 'body status before the pillar'))
+    created1 = _num(st3, r'created ([0-9]+)')
+    _dig(s, bx + 1, gy + 4, bz, 102)
+    s.wait(lambda: s.block(bx + 1, gy + 4, bz) == 0, 'the pillar block to become air', 15.0)
+    # 4. a natural block next to the pad
+    nat = (tx - 7, gy, tz)
+    nat_state = s.block(*nat)
+    if nat_state not in (None, 0):
+        _dig(s, nat[0], nat[1], nat[2], 103)
+        s.wait(lambda: s.block(*nat) == 0, 'the natural block to become air', 15.0)
+    _idle(s, 8.0)
+    left = _count_cells(s, pillar, stone)
+    st4 = ' '.join(_ask(s, 'body status', 'created', 'body status after the pillar'))
+    print('  pillar: %d of 71 stone blocks still there; natural block %s broken; creates %d -> %d; %s' %
+          (left, nat_state, creates1, len(_bodies_msgs(s, 1)), st4[:120]), flush=True)
+    s.check(left == 71, 'the pillar stands (%d of 71 blocks)' % left)
+    s.check(len(_bodies_msgs(s, 1)) == creates1, 'no body was sent for the pillar or the natural block')
+    s.check(_num(st4, r'created ([0-9]+)') == created1, 'no body was created for the pillar or the natural block: %r' % st4)
+
+
 def run(m, c, st, w, biomes, ctx, args):
-    wanted = [n for n in (args.scenario or 'all').split(',') if n]
+    wanted =[n for n in (args.scenario or 'all').split(',') if n]
     known = [n for n, _, _ in SCENARIOS]
     for n in wanted:
         if n != 'all' and n not in known:
