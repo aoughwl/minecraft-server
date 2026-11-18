@@ -1,0 +1,173 @@
+## Snapshot-backed `LightLevelAccess` for off-thread relighting (docs/MULTITHREADING_PHASES.md phase 1, item c).
+##
+## `captureLightSnapshot(live, lo, hi)` copies every loaded chunk of the chunk range that covers the box `lo..hi`, its one-block
+## shell (what `updateLightingRegion` checks) and one more chunk on every side (the margin). Whole columns are copied: sky light walks
+## a column to the bottom and `hasOpenSkyAbove` reads up to the build limit. The margin is enough because light spreads at most 15
+## blocks from a changed cell and the nearest cell outside the copied chunks is at least 16 blocks from the shell, so propagation
+## never reaches a chunk the copy does not hold. A chunk that is not loaded at capture time is absent from the snapshot, exactly as
+## it is absent from the live level.
+##
+## `snapshotAccess(s)` is a `LightLevelAccess` over the copies: `updateLightingRegion(engine, access, lo, hi)` runs on it with no
+## reference to the live Level (so it can run on a pool thread) and gives the same light as the live run. `snapshotDiff(s)` lists the
+## cells whose light the run changed, and `applyLightDiff(live, s, diff)` writes them to the live chunks on the tick thread, or
+## refuses (returns false, writes nothing) when anything the run depended on has moved since the capture: a chunk loaded, unloaded
+## or replaced in the range, a block section written to, or a light array of a copied chunk that is no longer what was copied. The
+## caller then relights on the live level, which is always correct.
+
+{.feature: "lenientnils".}
+
+import std/tables
+import ../config/lighting
+import blockstates, chunkdata, palette, lightingruntime, tick
+
+type
+  LightCellChange* = object
+    chunk*: int32        ## index into the snapshot's chunk grid
+    section*: int32
+    cell*: int32         ## y * 256 + z * 16 + x inside the section
+    sky*: bool
+    value*: uint8
+
+  LightDiff* = object
+    changes*: seq[LightCellChange]
+
+  LightSnapshot* = ref object
+    lo*: BlockPos
+    hi*: BlockPos
+    cx0*, cx1*, cz0*, cz1*: int32
+    config: LightingEngineConfig
+    live: seq[ChunkData]                 ## the live chunks at capture (identity check at apply), nil where unloaded
+    work: seq[ChunkData]                 ## the copies the job mutates
+    origSky: seq[seq[LightContainer]]    ## light at capture, per chunk
+    origBlk: seq[seq[LightContainer]]
+    versions: seq[seq[uint32]]           ## block section versions at capture, per chunk
+    table: Table[int64, ChunkData]       ## key -> copy
+
+let voidAir = defaultStateByName("void_air")[1]
+
+proc snapKey(x, z: int32): int64 {.inline.} =
+  (int64(x) shl 32) or (int64(z) and 0xFFFFFFFF'i64)
+
+proc snapIndex(s: LightSnapshot, cx, cz: int32): int {.inline.} =
+  int(cz - s.cz0) * int(s.cx1 - s.cx0 + 1'i32) + int(cx - s.cx0)
+
+proc snapshotChunkRange*(lo, hi: BlockPos): (int32, int32, int32, int32) =
+  ## The chunk range a snapshot of the box covers: box plus shell plus one chunk each side.
+  (((lo.x - 1'i32) shr 4) - 1'i32, ((hi.x + 1'i32) shr 4) + 1'i32,
+   ((lo.z - 1'i32) shr 4) - 1'i32, ((hi.z + 1'i32) shr 4) + 1'i32)
+
+proc copyChunk(c: ChunkData): ChunkData =
+  ChunkData(x: c.x, z: c.z, section: c.section,
+    lightEngine: ChunkLight(skyLight: c.lightEngine.skyLight, blockLight: c.lightEngine.blockLight),
+    status: c.status, lightPopulated: c.lightPopulated)
+
+proc captureLightSnapshot*(lv: LightLevelAccess, lo, hi: BlockPos): LightSnapshot =
+  ## Tick thread. Cost: a copy of up to (chunks across + 4)^2 full chunk columns.
+  let (cx0, cx1, cz0, cz1) = snapshotChunkRange(lo, hi)
+  result = LightSnapshot(lo: lo, hi: hi, cx0: cx0, cx1: cx1, cz0: cz0, cz1: cz1, config: lv.lightingConfig,
+    live: @[], work: @[], origSky: @[], origBlk: @[], versions: @[], table: initTable[int64, ChunkData]())
+  for cz in cz0 .. cz1:
+    for cx in cx0 .. cx1:
+      let f = lv.chunkAt
+      let c = f(cx, cz)
+      result.live.add(c)
+      if c == nil or c.lightEngine == nil:
+        result.work.add(nil)
+        result.origSky.add(@[])
+        result.origBlk.add(@[])
+        result.versions.add(@[])
+        continue
+      let w = copyChunk(c)
+      result.work.add(w)
+      result.origSky.add(c.lightEngine.skyLight)
+      result.origBlk.add(c.lightEngine.blockLight)
+      var v: seq[uint32] = @[]
+      for i in 0 ..< c.section.blockSections.len:
+        v.add(sectionVersion(c.section, i))
+      result.versions.add(v)
+      result.table[snapKey(cx, cz)] = w
+
+proc snapshotAccess*(s: LightSnapshot): LightLevelAccess =
+  ## Reads and writes the copies only. Safe on a pool thread while the tick thread uses the live level.
+  LightLevelAccess(lightingConfig: s.config,
+    getBlockState: proc(pos: BlockPos): BlockStateId {.closure.} =
+      let c = s.table.getOrDefault(snapKey(pos.x shr 4, pos.z shr 4), nil)
+      if c == nil:
+        return voidAir
+      let (ok, id) = getBlockAbsoluteY(c.section, int(pos.x and 15'i32), pos.y, int(pos.z and 15'i32))
+      if ok: id else: voidAir,
+    isChunkLoaded: proc(cx, cz: int32): bool {.closure.} = s.table.hasKey(snapKey(cx, cz)),
+    chunkAt: proc(cx, cz: int32): ChunkData {.closure.} = s.table.getOrDefault(snapKey(cx, cz), nil))
+
+proc sameLight(a, b: seq[LightContainer]): bool =
+  if a.len != b.len:
+    return false
+  for i in 0 ..< a.len:
+    if a[i].default != b[i].default or a[i].data != b[i].data:
+      return false
+  true
+
+proc diffContainers(res: var LightDiff, chunk, sec: int32, sky: bool, a, b: LightContainer) =
+  if a.default == b.default and a.data == b.data:
+    return
+  for y in 0 ..< 16:
+    for z in 0 ..< 16:
+      for x in 0 ..< 16:
+        let nv = b.get(x, y, z)
+        if a.get(x, y, z) != nv:
+          res.changes.add(LightCellChange(chunk: chunk, section: sec, cell: int32(y * 256 + z * 16 + x), sky: sky, value: nv))
+
+proc snapshotDiff*(s: LightSnapshot): LightDiff =
+  ## The cells whose light differs between the capture and now (after the job ran on the copies).
+  result = LightDiff(changes: @[])
+  for i in 0 ..< s.work.len:
+    let w = s.work[i]
+    if w == nil:
+      continue
+    for sec in 0 ..< w.lightEngine.skyLight.len:
+      diffContainers(result, int32(i), int32(sec), true, s.origSky[i][sec], w.lightEngine.skyLight[sec])
+    for sec in 0 ..< w.lightEngine.blockLight.len:
+      diffContainers(result, int32(i), int32(sec), false, s.origBlk[i][sec], w.lightEngine.blockLight[sec])
+
+proc snapshotStillValid*(lv: LightLevelAccess, s: LightSnapshot): bool =
+  ## Whether every chunk of the range is as it was at capture (same objects, same block versions, same light).
+  for cz in s.cz0 .. s.cz1:
+    for cx in s.cx0 .. s.cx1:
+      let i = snapIndex(s, cx, cz)
+      let f = lv.chunkAt
+      let c = f(cx, cz)
+      if c != s.live[i]:
+        return false
+      if c == nil or s.work[i] == nil:
+        continue
+      let v = s.versions[i]
+      if c.section.blockSections.len != v.len:
+        return false
+      for k in 0 ..< v.len:
+        if sectionVersion(c.section, k) != v[k]:
+          return false
+      if not sameLight(c.lightEngine.skyLight, s.origSky[i]) or not sameLight(c.lightEngine.blockLight, s.origBlk[i]):
+        return false
+  true
+
+proc applyLightDiff*(lv: LightLevelAccess, s: LightSnapshot, diff: LightDiff): bool =
+  ## Tick thread. False (nothing written) when the snapshot is stale; true when the live chunks now hold what a live run would have.
+  if not snapshotStillValid(lv, s):
+    return false
+  var touched: seq[bool] = newSeq[bool](s.live.len)
+  for ch in diff.changes:
+    let c = s.live[int(ch.chunk)]
+    let x = int(ch.cell) and 15
+    let z = (int(ch.cell) shr 4) and 15
+    let y = int(ch.cell) shr 8
+    if ch.sky:
+      c.lightEngine.skyLight[int(ch.section)].set(x, y, z, ch.value)
+    else:
+      c.lightEngine.blockLight[int(ch.section)].set(x, y, z, ch.value)
+    touched[int(ch.chunk)] = true
+  for i in 0 ..< touched.len:
+    if touched[i]:
+      let c = s.live[i]
+      c.dirty = true
+      markLightChanged(lv, c)
+  true
