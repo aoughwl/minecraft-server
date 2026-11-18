@@ -2265,3 +2265,221 @@ def dim_threads_two_worlds(s):
 
 
 EXPLICIT_ONLY.add('dim_threads_two_worlds')
+
+
+def _portal_frame(s, x, y, z):
+    """Obsidian frame 4 wide x 5 tall in the x/y plane at (x..x+3, y..y+4, z), the 2x3 interior filled with nether_portal[axis=x]."""
+    s.command('fill %d %d %d %d %d %d minecraft:obsidian' % (x, y, z, x + 3, y + 4, z))
+    s.command('fill %d %d %d %d %d %d minecraft:air' % (x + 1, y + 1, z, x + 2, y + 3, z))
+    s.command('fill %d %d %d %d %d %d minecraft:nether_portal[axis=x]' % (x + 1, y + 1, z, x + 2, y + 3, z))
+
+
+def _portal_cells(s, pid, cx, cy, cz, r=24):
+    """Client-known nether_portal cells within r blocks of (cx, cy, cz)."""
+    out = []
+    for x in range(cx - r, cx + r + 1):
+        for z in range(cz - r, cz + r + 1):
+            for y in range(max(s.w.min_y + 1, cy - 12), cy + 13):
+                if s.w.block(x, y, z) in pid:
+                    out.append((x, y, z))
+    return out
+
+
+def _walk_to(s, tx, ty, tz, step=0.25, dt=0.05):
+    """Walks the bot in a straight line with real serverbound position packets (what a client sends), ending exactly at the target. A /tp
+    into a portal races the client's teleport confirmation against the portal's own teleport (the server kicks "Wrong teleport id")."""
+    x, y, z = s.position()
+    dist = ((tx - x) ** 2 + (ty - y) ** 2 + (tz - z) ** 2) ** 0.5
+    n = max(1, int(dist / step + 0.999))
+    r0 = len(s.respawns)
+    for i in range(1, n + 1):
+        if len(s.respawns) != r0:
+            return           # the portal fired: the server moved us, stop walking
+        f = i / n
+        s.c.send(s.m.SB_MOVE_POS, struct.pack('>ddd', x + (tx - x) * f, y + (ty - y) * f, z + (tz - z) * f) + s.m.move_flags(True))
+        _pause(s, dt)
+    if len(s.respawns) == r0:
+        s.w.pos = (tx, ty, tz)
+
+
+@scenario('dim_portal')
+def dim_portal(s):
+    """Portal entry with real players. DIM_BOT=portal: builds an obsidian frame with nether_portal blocks in the overworld, steps into it
+    (/tp onto the portal block, so the server's own portalmod.tickPortal runs), waits for the respawn into the nether, checks the destination
+    portal exists, steps out and into it again and waits for the way back. DIM_TRIPS round trips. DIM_BOT=nether: companion that sits in
+    the nether and keeps editing blocks there (so two worlds hold players while the other bot crosses)."""
+    import os
+    who = os.environ.get('DIM_BOT', 'portal')
+    trips = int(os.environ.get('DIM_TRIPS', '1'))
+    secs = float(os.environ.get('DIM_COMPANION_SECS', '60'))
+    _ready(s)
+    if who == 'nether':
+        s.command('execute in minecraft:the_nether run tp @s 4.5 150 4.5')
+        s.wait(lambda: s.position() is not None and abs(s.position()[1] - 150) < 0.01, 'the teleport into the nether', 90.0)
+        s.wait(lambda: s.w.block(4, 149, 4) is not None, 'the nether chunk', 60.0)
+        s.command('fill 0 149 0 12 149 12 minecraft:bedrock')
+        end = time.time() + secs
+        i = 0
+        while time.time() < end:
+            x, z = 2 + i % 8, 6 + (i // 8) % 4
+            s.command('setblock %d 150 %d minecraft:%s' % (x, z, 'obsidian' if i % 2 == 0 else 'air'))
+            i += 1
+            _pause(s, 0.2)
+        print('  companion edits: %d, keep-alives: %d' % (i, s.ctx['counts'].get(s.m.PLAY_KEEP_ALIVE, 0)), flush=True)
+        return
+    portal_ids = set()
+    for axis in ('x', 'z'):
+        s.command('setblock 4 120 4 minecraft:nether_portal[axis=%s]' % axis)
+        s.wait(lambda: s.w.block(4, 120, 4) not in (None, 0) and s.w.block(4, 120, 4) not in portal_ids, 'the probe portal block')
+        portal_ids.add(s.w.block(4, 120, 4))
+        s.command('setblock 4 120 4 minecraft:air')
+        s.wait(lambda: s.w.block(4, 120, 4) == 0, 'the probe cell to clear')
+    print('  nether_portal state ids (axis x, z): %r' % sorted(portal_ids), flush=True)
+    bx, by, bz = 100, 100, 100
+    s.command('tp @s %d.5 %d %d.5' % (bx, by + 6, bz))
+    s.wait(lambda: s.position() is not None and abs(s.position()[0] - (bx + 0.5)) < 0.01, 'the teleport to the build site', 60.0)
+    s.wait(lambda: s.w.block(bx, by - 1, bz) is not None, 'the chunk at the build site', 60.0)
+    s.command('fill %d %d %d %d %d %d minecraft:bedrock' % (bx - 2, by - 1, bz - 3, bx + 5, by - 1, bz + 3))
+    _portal_frame(s, bx, by, bz)
+    s.wait(lambda: s.w.block(bx + 1, by + 1, bz) not in (None, 0) and s.w.block(bx + 2, by + 3, bz) not in (None, 0), 'the portal blocks', 30.0)
+    inner = s.w.block(bx + 1, by + 1, bz)
+    print('  overworld portal block state (axis=x): %d' % inner, flush=True)
+    s.check(inner in portal_ids, 'the frame interior is not a nether_portal block (state %r)' % inner)
+    soak = float(os.environ.get('DIM_SOAK_SECS', '0'))
+    deadline = time.time() + soak
+    failures = 0
+    done = 0
+    trip = -1
+    while (time.time() < deadline) if soak else (trip + 1 < trips):
+        trip += 1
+        try:
+            s.command('execute in minecraft:overworld run tp @s %d.5 %d %d.5' % (bx + 1, by + 1, bz - 3))
+            _pause(s, 2.5)
+            r0 = len(s.respawns)
+            t0 = time.time()
+            t0 = time.time()
+            _walk_to(s, bx + 1.5, by + 1, bz + 0.5)
+            s.wait(lambda: len(s.respawns) > r0 and s.respawns[-1] == 'minecraft:the_nether', 'the respawn into the nether (trip %d)' % trip, 40.0)
+            s.wait(lambda: s.position() is not None, 'the position in the nether', 30.0)
+            print('  trip %d: arrived in the nether after %.1fs at %r (respawns %r)' % (trip, time.time() - t0, s.position(), s.respawns[r0:]), flush=True)
+            _pause(s, 3.0)
+            pos = s.position()
+            s.check(pos is not None, 'no position in the nether')
+            cx, cy, cz = int(pos[0] // 1), int(pos[1] // 1), int(pos[2] // 1)
+            s.wait(lambda: s.w.block(cx, cy - 1, cz) is not None, 'the nether chunk at arrival', 30.0)
+            cells = _portal_cells(s, portal_ids, cx, cy, cz)
+            print('  trip %d: destination portal blocks seen by the client within 24 blocks: %d %s' % (trip, len(cells), cells[:3]), flush=True)
+            s.check(len(cells) >= 6, 'no destination portal (%d cells)' % len(cells))
+            said = False
+            for attempt in range(3):
+                n = len(s.w.chat)
+                s.command('execute in minecraft:the_nether if block %d %d %d minecraft:nether_portal run tellraw @s "PORTALHERE%d"' %
+                          (cells[0] + (trip,)))
+                _pause(s, 2.5)
+                said = s.heard('PORTALHERE%d' % trip, n)
+                if said:
+                    break
+            print('  trip %d: server says (nether) %r is nether_portal: %s' % (trip, cells[0], said), flush=True)
+            low = min(cells, key=lambda c: (c[1], c[0], c[2]))
+            mx, mz = low[0] + 0.5, low[2] + 0.5
+            print('  trip %d: portal cells %r, walking in at %.1f %d %.1f' % (trip, sorted(cells), mx, low[1], mz), flush=True)
+            s.command('tp @s %.1f %d %.1f' % (mx - 4, low[1], mz - 4))
+            _pause(s, 3.0)
+            r1 = len(s.respawns)
+            t1 = time.time()
+            _walk_to(s, mx, low[1], mz)
+            s.wait(lambda: len(s.respawns) > r1 and s.respawns[-1] == 'minecraft:overworld', 'the respawn back to the overworld (trip %d)' % trip, 40.0)
+            s.wait(lambda: s.position() is not None, 'the position back in the overworld', 30.0)
+            print('  trip %d: back in the overworld after %.1fs at %r' % (trip, time.time() - t1, s.position()), flush=True)
+            _pause(s, 3.0)
+            s.command('tp @s %d.5 %d %d.5' % (bx + 6, by + 1, bz - 3))
+            _pause(s, 3.0)
+            done += 1
+            if soak and trip % 10 == 0:
+                print('  soak: trip %d ok at +%.0fs, failures so far %d' % (trip, soak - (deadline - time.time()), failures), flush=True)
+        except Exception as e:
+            if not soak:
+                raise
+            failures += 1
+            print('  soak: trip %d failed: %s' % (trip, str(e)[:200]), flush=True)
+            if 'connection lost' in str(e) or 'kicked' in str(e) or failures > 20:
+                raise
+            try:
+                _pause(s, 2.0)
+            except Exception:
+                raise
+    print('  portal trips completed: %d, failures: %d' % (done, failures), flush=True)
+    print('  portal trips done: %d, keep-alives %d' % (trips, s.ctx['counts'].get(s.m.PLAY_KEEP_ALIVE, 0)), flush=True)
+
+
+EXPLICIT_ONLY.add('dim_portal')
+
+
+@scenario('det_world')
+def det_world(s):
+    """A fully scripted, random-free single-bot workload for the saved-world comparison (tools/run_world_hash.sh): fills, setblocks, a stair
+    and slab build, a chest, cross-world edits with `execute in`, a WorldEdit-free /clone, then /save-all. No physics blocks (sand, water)
+    and no command-block repeaters, so nothing depends on tick timing. The stop is done by the caller (stop_server)."""
+    _ready(s)
+    cmds = [
+        'tp @s 200.5 160 200.5',
+        'fill 190 149 190 230 149 230 minecraft:bedrock',
+        'fill 192 150 192 200 154 200 minecraft:stone',
+        'fill 193 151 193 199 153 199 minecraft:air',
+        'fill 192 155 192 200 155 200 minecraft:oak_planks',
+        'setblock 196 156 196 minecraft:oak_stairs[facing=north,half=top]',
+        'setblock 197 156 196 minecraft:oak_slab[type=top]',
+        'setblock 198 156 196 minecraft:glass',
+        'setblock 194 151 194 minecraft:chest[facing=east]',
+        'setblock 195 151 194 minecraft:furnace[facing=south]',
+        'setblock 204 150 204 minecraft:lantern',
+        'fill 205 150 205 215 150 215 minecraft:cobblestone',
+        'fill 206 151 206 214 151 214 minecraft:mossy_cobblestone hollow',
+        'clone 192 150 192 200 155 200 215 150 190',
+        'fill 220 150 220 225 160 225 minecraft:glowstone outline',
+        'fill 221 151 221 224 159 224 minecraft:diamond_block replace minecraft:air',
+        'execute in minecraft:the_nether run forceload add 0 0 31 31',
+        'fill 140 100 140 160 110 160 minecraft:air',
+        'fill 140 100 140 160 100 160 minecraft:gold_block',
+        'fill 100 90 100 120 95 120 minecraft:diamond_ore replace minecraft:stone',
+    ]
+    for line in cmds:
+        s.command(line)
+        if line.startswith('tp '):
+            _pause(s, 1.0)
+            for _ in range(4):      # a real client sends its position; the server streams the new chunks as the player moves
+                x0, y0, z0 = s.position()
+                s.c.send(s.m.SB_MOVE_POS, struct.pack('>ddd', x0, y0, z0) + s.m.move_flags(False))
+                _pause(s, 0.5)
+            try:
+                s.wait(lambda: s.w.block(200, 40, 200) is not None and s.w.block(230, 40, 230) is not None and s.w.block(190, 40, 190) is not None,
+                       'the chunks around the build site', 100.0)
+            except Exception:
+                ks = sorted(s.w.chunks)
+                print('  chunks known: %d, x %s..%s z %s..%s, pos %r' % (len(ks), ks[0][0] if ks else None, ks[-1][0] if ks else None,
+                      min([k[1] for k in ks] or [0]), max([k[1] for k in ks] or [0]), s.position()), flush=True)
+                raise
+        _pause(s, 0.6)
+    # nether edits through execute in (the bot never stands there): a deck at y=150 and a few markers; they land in the nether's chunks
+    for line in ('execute in minecraft:the_nether run fill 2 150 2 20 150 20 minecraft:bedrock',
+                 'execute in minecraft:the_nether run fill 4 151 4 10 155 10 minecraft:obsidian',
+                 'execute in minecraft:the_nether run setblock 6 152 6 minecraft:air',
+                 'execute in minecraft:the_nether run setblock 12 151 12 minecraft:chest[facing=north]'):
+        s.command(line)
+        _pause(s, 1.5)
+    # a client-visible check that the overworld edits landed (the bot is next to them)
+    s.wait(lambda: s.w.block(196, 156, 196) not in (None, 0), 'the overworld edits to reach the client', 30.0)
+    n = len(s.w.chat)
+    s.command('save-all')
+    _pause(s, 10.0)
+    print('  det_world done, chat since save-all: %r' % (s.w.chat[n:][:4],), flush=True)
+    import os
+    if os.environ.get('DET_STOP') == '1':
+        s.command('stop')          # graceful: the server's final save, then the connection ends
+        try:
+            s.wait(lambda: False, 'the server to stop', 8.0)
+        except Exception:
+            pass
+
+
+EXPLICIT_ONLY.add('det_world')
