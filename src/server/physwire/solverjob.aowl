@@ -1,0 +1,103 @@
+## The structural solver as ONE pool job (docs/MULTITHREADING_PHASES.md phase 1 item d, solver half), free of World so it can be tested alone.
+##
+## `submitSolve(pool, run)` hands `solve(run.inp, run.params)` (pure on its SolverInput snapshot) to the shared worker pool; with a pool that has
+## no workers `submit` runs it inline. The body never raises (a failure sets `ok = false`). While the job is in flight the tick thread must not
+## touch `run.inp`/`run.res`. `pollSolve` is the tick-thread side (non-blocking). The caller applies the result on the tick thread at a FIXED
+## offset: `solveApplyDue(age)` is true from `SolveDelayTicks` (1) ticks after the submit in EVERY mode (inline at 0 workers delivers next tick
+## too), so threads=1 and N give the same schedule; at that tick the caller `waitSolve`s if the worker is not done yet (a stall, never a
+## different apply tick). Owner id from `allocOwner` on the shared pool; no pool of its own.
+
+{.feature: "lenientnils".}
+
+import std/locks
+import ../../physics/solver
+import ../sim/jobpool
+
+const SolveDelayTicks* = 1
+
+var gOwnerPool: JobPool = nil
+var gOwnerId = 0
+
+proc solverOwner(pool: JobPool): int =
+  if gOwnerPool != pool:
+    gOwnerPool = pool
+    gOwnerId = allocOwner(pool)
+  gOwnerId
+
+type
+  SolveRun* = ref object
+    inp*: SolverInput
+    params*: SolverParams
+    res*: SolverResult
+    ok*: bool
+    ready*: bool
+    slot: int
+
+var gRuns: seq[SolveRun] = @[]
+var gRunsLock: Lock
+var gRunsInit = false
+
+proc newSolveRun*(inp: SolverInput; params: SolverParams): SolveRun =
+  SolveRun(inp: inp, params: params, slot: -1)
+
+proc solveBody(arg: pointer): int {.nimcall, raises.} =
+  var run: SolveRun = nil
+  acquire(gRunsLock)
+  let slot = cast[int](arg)
+  if slot >= 0 and slot < gRuns.len:
+    run = gRuns[slot]
+  release(gRunsLock)
+  if run == nil:
+    return 0
+  try:
+    run.res = solve(run.inp, run.params)
+    run.ok = true
+  except:
+    run.ok = false
+  0
+
+proc submitSolve*(pool: JobPool; run: SolveRun) =
+  ## Tick thread.
+  if not gRunsInit:
+    initLock(gRunsLock)
+    gRunsInit = true
+  var slot = -1
+  acquire(gRunsLock)
+  for i in 0 ..< gRuns.len:
+    if gRuns[i] == nil:
+      slot = i
+      break
+  if slot < 0:
+    gRuns.add(nil)
+    slot = gRuns.len - 1
+  gRuns[slot] = run
+  release(gRunsLock)
+  run.slot = slot
+  run.ready = false
+  submit(pool, solverOwner(pool), solveBody, cast[pointer](slot))
+
+proc pollSolve*(pool: JobPool; run: SolveRun): bool =
+  ## Tick thread, non-blocking: true once the job has finished (the result is in `run`, the slot is released).
+  ## One owner id is shared by all runs: with several in flight the drained completion is credited to the polled run only when that run's
+  ## own slot is the one that finished, so callers keep at most ONE run in flight per owner (bodymanager runs its queue one job at a time).
+  if run.ready:
+    return true
+  var sink: seq[JobResult] = @[]
+  if drainDone(pool, solverOwner(pool), sink) > 0:
+    if sink[0].failed:
+      run.ok = false
+    acquire(gRunsLock)
+    if run.slot >= 0 and run.slot < gRuns.len:
+      gRuns[run.slot] = nil
+    release(gRunsLock)
+    run.slot = -1
+    run.ready = true
+  run.ready
+
+proc waitSolve*(pool: JobPool; run: SolveRun) =
+  while not pollSolve(pool, run):
+    discard
+
+proc solveApplyDue*(age: int): bool =
+  ## `age` = ticks since the submit.
+  age >= SolveDelayTicks
