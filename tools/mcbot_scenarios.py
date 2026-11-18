@@ -544,6 +544,18 @@ def worldedit_more(s):
     //copy -e //paste -e with an armor stand, brushes and tools on a right click (on a block and in the air), //historysize and
     //clearhistory. Every command must also be a node of the client's command tree."""
     s.wait(lambda: s.position() is not None and s.chunks() >= 9, 'the spawn chunks', 60.0)
+    home = s.position()
+    # The builds float at y 200, so every block in them is placed by WorldEdit (whose edits never set off the structure
+    # triggers): a plain /setblock beside one could let `structures` drop it. The player goes back where it started.
+    try:
+        _worldedit_more_body(s)
+    finally:
+        s.command('tp @s %.2f %.2f %.2f' % home)
+        time.sleep(0.5)
+
+
+def _worldedit_more_body(s):
+    s.wait(lambda: s.position() is not None and s.chunks() >= 9, 'the spawn chunks', 60.0)
     nodes, root = s.m.COMMAND_TREE['nodes'], s.m.COMMAND_TREE['root']
     names = set(nodes[c]['name'] for c in nodes[root]['children'])
     want = ['/expand', '/contract', '/shift', '/outset', '/inset', '/chunk', '/center', '/smooth', '/naturalize', '/overlay',
@@ -648,7 +660,8 @@ def worldedit_more(s):
     cells_are(hole, glass, 'the hole filled with glass')
     _we(s, 'undo', 'Undid 1', 'undo fill')
     cells_are(hole, 0, 'the hole empty again')
-    s.command('setblock %d %d %d minecraft:water' % (bx + 2, y0 + 1, bz + 2))
+    sel(bx + 2, y0 + 1, bz + 2, bx + 2, y0 + 1, bz + 2)
+    _we(s, 'set water', 'set: 1 block(s) changed', 'a water source in the basin')
     s.wait(lambda: s.w.block(bx + 2, y0 + 1, bz + 2) not in (None, 0), 'the water source')
     water = s.w.block(bx + 2, y0 + 1, bz + 2)
     _we(s, 'fixwater 3', '8 blocks have been fixed.', '//fixwater 3')
