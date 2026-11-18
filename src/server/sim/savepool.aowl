@@ -1,0 +1,141 @@
+## Optional worker compression for chunk saves (docs/MULTITHREADING_PHASES.md phase 1, item a).
+##
+## Off unless MC_SAVE_WORKERS=1 AND the resolved thread plan (`threadcfg.planThreads`, same inputs as `netEncodeEnabled`)
+## has workers. `filemanager.saveGeneric` serialises each dirty chunk on the calling thread (`internalToBytes`), then hands the
+## compress half of `update_chunk` (`ChunkSerializer.compress`, which touches no file state) to this pool, joins every job of
+## that region file, and only then applies the results in the original chunk order and calls `writeOf`. So the region file is
+## written by the caller thread exactly as before and its bytes do not depend on the number of workers; the join is also what
+## makes a shutdown drain automatic (no save leaves a job behind).
+##
+## The job pool allows one worker pool per process (its workers read the `gJobPool` global), exactly like pathpool and
+## netencode: this pool is exclusive with MC_NET_WORKERS, MC_PATH_WORKERS and MC_PLUGIN_JOBS in one process.
+
+{.feature: "lenientnils".}
+
+import std/locks
+import std/envvars
+import std/cpuinfo
+import ../../world/[chunkdata, chunkio]
+import threadcfg, jobpool
+
+type
+  SaveTask = ref object
+    ser: ChunkSerializer
+    x, z: int32
+    raw: seq[byte]
+    hint: int
+    res: PreparedChunk
+    ran: bool
+
+var gSavePool: JobPool = nil
+var gSaveDecided = false
+var gSaveOn = false
+var gTasks: seq[SaveTask] = @[]
+var gTasksLock: Lock
+var gTasksInit = false
+var gSaveSink: seq[JobResult] = @[]
+
+var gSaveOwner = -1
+
+proc sleepWin(ms: uint32) {.stdcall, importc: "Sleep", dynlib: "kernel32.dll".}
+
+proc enableSaveJobs*(workers: int): bool =
+  ## Starts the pool (tests pass a number; 0 runs the jobs inline on the caller). Tick thread.
+  if not gTasksInit:
+    initLock(gTasksLock)
+    gTasksInit = true
+  if gSavePool == nil:
+    gSavePool = sharedJobPool(workers + 1)
+    gSaveOwner = allocOwner(gSavePool)
+  gSaveDecided = true
+  gSaveOn = true
+  true
+
+proc saveJobsEnabled*(): bool =
+  if not gSaveDecided:
+    gSaveDecided = true
+    if getEnv("MC_SAVE_WORKERS") == "1":
+      var envThreads = -1
+      var envChunk = -1
+      let t = getEnv("MC_THREADS")
+      if t.len > 0:
+        envThreads = 0
+        for c in t:
+          if c >= '0' and c <= '9':
+            envThreads = envThreads * 10 + (ord(c) - ord('0'))
+      let w = getEnv("MC_CHUNK_WORKERS")
+      if w.len > 0:
+        envChunk = 0
+        for c in w:
+          if c >= '0' and c <= '9':
+            envChunk = envChunk * 10 + (ord(c) - ord('0'))
+      let plan = planThreads(0, 0, countProcessors(), envThreads, envChunk)
+      if plan.workers > 0:
+        let n = if plan.workers > 4: 4 else: plan.workers
+        discard enableSaveJobs(n)
+  gSaveOn
+
+proc shutdownSaveJobs*() =
+  ## Process exit or tests. Every save already joined its jobs, so this only stops the workers.
+  if gSavePool != nil:
+    shutdown(gSavePool)
+    gSavePool = nil
+  gSaveOn = false
+
+proc taskOf(slot: int): SaveTask =
+  acquire(gTasksLock)
+  result = gTasks[slot]
+  release(gTasksLock)
+
+proc saveJob(arg: pointer): int {.nimcall, raises.} =
+  let t = taskOf(cast[int](arg))
+  t.res = compressOf(t.ser, t.x, t.z, t.raw, t.hint)
+  t.ran = true
+  0
+
+proc compressBatch*(ser: ChunkSerializer, xs, zs: seq[int32], raws: seq[seq[byte]], hints: seq[int]): seq[PreparedChunk] =
+  ## Compresses every chunk of one region file on the pool and returns the results in input order, after all jobs finished.
+  ## A job that raised is redone inline.
+  var tasks: seq[SaveTask] = @[]
+  var slots: seq[int] = @[]
+  acquire(gTasksLock)
+  for i in 0 ..< xs.len:
+    let t = SaveTask(ser: ser, x: xs[i], z: zs[i], raw: raws[i], hint: hints[i])
+    var at = -1
+    for k in 0 ..< gTasks.len:
+      if gTasks[k] == nil:
+        at = k
+        break
+    if at < 0:
+      gTasks.add(t)
+      at = gTasks.len - 1
+    else:
+      gTasks[at] = t
+    tasks.add(t)
+    slots.add(at)
+  release(gTasksLock)
+  for i in 0 ..< slots.len:
+    submit(gSavePool, gSaveOwner, saveJob, cast[pointer](slots[i]))
+  var got = 0
+  var failed = 0
+  while got < slots.len:
+    gSaveSink.setLen(0)
+    let n = drainDone(gSavePool, gSaveOwner, gSaveSink)
+    if n == 0:
+      sleepWin(0'u32)
+    else:
+      got += n
+      for r in gSaveSink:
+        if r.failed:
+          inc failed
+  gSaveSink.setLen(0)
+  result = @[]
+  for i in 0 ..< tasks.len:
+    if tasks[i].ran:
+      result.add(tasks[i].res)
+    else:
+      result.add(compressOf(ser, xs[i], zs[i], raws[i], hints[i]))
+  acquire(gTasksLock)
+  for i in 0 ..< slots.len:
+    gTasks[slots[i]] = nil
+  release(gTasksLock)

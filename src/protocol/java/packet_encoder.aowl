@@ -28,6 +28,13 @@ type
     isOk*: bool
     error*: PacketEncodeError
 
+  PacketFrame* = object
+    ## A packet after framing and compression, before encryption (`compressFrame`).
+    isOk*: bool
+    error*: PacketEncodeError
+    header*: seq[byte]
+    payload*: seq[byte]
+
   CompressionLevelError* = object
     ## "Invalid compression Level"
 
@@ -36,6 +43,9 @@ proc encodeOk(): PacketEncodeResult =
 
 proc encodeErr(e: PacketEncodeError): PacketEncodeResult =
   PacketEncodeResult(isOk: false, error: e)
+
+proc frameErr(e: PacketEncodeError): PacketFrame =
+  PacketFrame(isOk: false, error: e)
 
 proc newTCPNetworkEncoder*(): TCPNetworkEncoder =
   TCPNetworkEncoder(output: @[])
@@ -61,9 +71,9 @@ proc sendBytes(self: var TCPNetworkEncoder; bytes: var seq[byte]) =
   for b in bytes:
     self.output.add(b)
 
-proc writePacket*(self: var TCPNetworkEncoder; packetData: openArray[byte]): PacketEncodeResult =
-  ## Appends a Clientbound packet (its id VarInt, then its body) to the output and applies compression
-  ## when needed.
+proc compressFrame*(hasCompression: bool; compressionThreshold: CompressionThreshold; compressionLevel: CompressionLevel;
+                    packetData: openArray[byte]): PacketFrame =
+  ## Frames a Clientbound packet (its id VarInt, then its body) and applies compression when needed.
   ##
   ## If compression is enabled and the packet size reaches the threshold, the packet is compressed. The
   ## packet is prefixed with its length and, with compression enabled, the uncompressed data length.
@@ -75,29 +85,30 @@ proc writePacket*(self: var TCPNetworkEncoder; packetData: openArray[byte]): Pac
   ## - Packet Length: the total length of the packet excluding the Packet Length field itself.
   ## - Data Length: the length of the uncompressed Packet ID and Data; 0 if they are not compressed.
   ##
-  ## NOTE: This does not flush. Call `flush` to take the buffered data.
+  ## Pure (no encoder state): the framing and compression half of `writePacket`, safe on a worker. Encryption and the
+  ## output buffer stay with `appendFrame`.
   let dataLen = packetData.len
   if dataLen > MaxPacketDataSize:
-    return encodeErr(packetTooLong(dataLen))
+    return frameErr(packetTooLong(dataLen))
   let dataLenVarInt = newVarInt(int32(dataLen))
 
   var header: seq[byte] = @[]
   var payload: seq[byte] = @[]
 
-  if self.hasCompression:
-    if dataLen >= self.compressionThreshold:
-      let compressed = zlibCompressBytes(packetData, self.compressionLevel)
+  if hasCompression:
+    if dataLen >= compressionThreshold:
+      let compressed = zlibCompressBytes(packetData, compressionLevel)
       if not compressed.ok:
-        return encodeErr(packetCompressionFailed(compressed.msg))
+        return frameErr(packetCompressionFailed(compressed.msg))
 
       let fullPacketLen = int64(writtenSizeVarInt(dataLenVarInt)) + int64(compressed.data.len)
       if fullPacketLen > int64(int32.high):
-        return encodeErr(packetEncodeMessage("Full packet length is too large to fit in VarInt! (" & $dataLen & ")"))
+        return frameErr(packetEncodeMessage("Full packet length is too large to fit in VarInt! (" & $dataLen & ")"))
       let fullPacketLenVarInt = newVarInt(int32(fullPacketLen))
 
       let completeSerializationLength = writtenSizeVarInt(fullPacketLenVarInt) + int(fullPacketLenVarInt.value)
       if uint64(completeSerializationLength) > MaxPacketSize:
-        return encodeErr(packetTooLong(completeSerializationLength))
+        return frameErr(packetTooLong(completeSerializationLength))
 
       encodeJava(fullPacketLenVarInt, header)
       encodeJava(dataLenVarInt, header)
@@ -108,7 +119,7 @@ proc writePacket*(self: var TCPNetworkEncoder; packetData: openArray[byte]): Pac
 
       let completeSerializationLength = writtenSizeVarInt(fullPacketLenVarInt) + int(fullPacketLenVarInt.value)
       if uint64(completeSerializationLength) > MaxPacketSize:
-        return encodeErr(packetTooLong(completeSerializationLength))
+        return frameErr(packetTooLong(completeSerializationLength))
 
       encodeJava(fullPacketLenVarInt, header)
       encodeJava(zero, header)
@@ -118,14 +129,31 @@ proc writePacket*(self: var TCPNetworkEncoder; packetData: openArray[byte]): Pac
 
     let completeSerializationLength = writtenSizeVarInt(fullPacketLenVarInt) + int(fullPacketLenVarInt.value)
     if uint64(completeSerializationLength) > MaxPacketSize:
-      return encodeErr(packetTooLong(completeSerializationLength))
+      return frameErr(packetTooLong(completeSerializationLength))
 
     encodeJava(fullPacketLenVarInt, header)
     payload = @packetData
 
+  PacketFrame(isOk: true, header: header, payload: payload)
+
+proc appendFrame*(self: var TCPNetworkEncoder; frame: PacketFrame): PacketEncodeResult =
+  ## Encrypts (when on) and buffers a frame made by `compressFrame` with this encoder's settings. Must be called in packet order.
+  if not frame.isOk:
+    return encodeErr(frame.error)
+  var header = frame.header
+  var payload = frame.payload
   self.sendBytes(header)
   self.sendBytes(payload)
   encodeOk()
+
+proc compressionSettings*(self: TCPNetworkEncoder): (bool, CompressionThreshold, CompressionLevel) =
+  (self.hasCompression, self.compressionThreshold, self.compressionLevel)
+
+proc writePacket*(self: var TCPNetworkEncoder; packetData: openArray[byte]): PacketEncodeResult =
+  ## Appends a Clientbound packet (its id VarInt, then its body) to the output; see `compressFrame` for the framing.
+  ## NOTE: This does not flush. Call `flush` to take the buffered data.
+  let frame = compressFrame(self.hasCompression, self.compressionThreshold, self.compressionLevel, packetData)
+  appendFrame(self, frame)
 
 proc flush*(self: var TCPNetworkEncoder): seq[byte] =
   ## Everything written since the last flush, compressed and encrypted, for the socket.
