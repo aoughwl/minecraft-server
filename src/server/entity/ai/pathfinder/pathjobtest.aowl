@@ -1,0 +1,234 @@
+## Path job (MULTITHREADING_PHASES.md 1e): the same (snapshot, goal) jobs give identical Paths inline and on 3 workers, and stale results are dropped.
+
+
+import std/[assertions, cmdline, math, options, syncio]
+import ../../../../data/block_ext
+from ../../../../data/block_state import asU16
+import ../../../../world/[chunkdata, level, playerdata, worldfs, worldinfo]
+import ../../../data/datamod
+import ../../../recipe
+import ../../../scheduler
+import ../../../tick_rate_manager
+import ../../../entity/entitymod
+import ../../../../generated/block_properties
+import ../../../sim/jobpool
+import pathfindermod
+
+let server = Server(basicConfig: defaultBasicConfiguration(), advancedConfig: defaultAdvancedConfiguration(), worlds: @[],
+  dimensions: @[OVERWORLD], tickCounter: 0'i64, nextEntityId: 1'i32, tickRateManager: newServerTickRateManager(20.0'f32),
+  keyStore: nil, recipeManager: newRecipeManager(), scheduler: newTaskScheduler(), data: ServerData(),
+  playerDataStorage: PlayerDataStorage(), levelFolder: "", playerIdleTimeout: 0'i32, mojangPublicKeys: @[],
+  stopRequested: false, stopAtMs: 0'i64)
+let dir = parentDirW(paramStr(0)) & "/pathjob_scratch"
+discard createDirAllW(dir)
+let theLevel = fromRootFolder(server.advancedConfig.world, dir, 1'i64, OVERWORLD)
+let testWorld = loadWorld(theLevel, defaultLevelData(1'u64), OVERWORLD, 63'i32, -64'i32, server)
+server.worlds.add(testWorld)
+
+proc stateOf(b: Block): uint32 = uint32(asU16(b.defaultState.id))
+proc bp(x, y, z: int32): BlockPos = BlockPos(vec: Vector3[int32](x: x, y: y, z: z))
+proc put(x, y, z: int32; b: Block) =
+  discard level.setBlockState(theLevel, bp(x, y, z), stateOf(b))
+
+for cx in -1'i32 .. 2'i32:
+  for cz in -1'i32 .. 2'i32:
+    addLoadedChunk(theLevel, newChunkData(cx, cz, newChunkSections(24, -64'i32)))
+
+var seed = 12345'u64
+proc rnd(n: int): int =
+  seed = seed * 6364136223846793005'u64 + 1442695040888963407'u64
+  int((seed shr 33) mod uint64(n))
+
+const
+  Lo = 0'i32
+  Hi = 36'i32
+  Cx = 18'i32
+  Cz = 18'i32
+  FloorY = 63'i32
+
+proc rx(): int32 = Lo + int32(rnd(int(Hi - Lo)))
+
+proc clearTerrain() =
+  for x in Lo - 2'i32 .. Hi + 2'i32:
+    for z in Lo - 2'i32 .. Hi + 2'i32:
+      for y in 40'i32 .. 80'i32:
+        put(x, y, z, blockAir())
+      put(x, FloorY, z, blockStone())
+
+proc buildTerrain(kind: int) =
+  clearTerrain()
+  case kind
+  of 0: discard                                                  # flat
+  of 1:                                                          # random walls
+    for i in 0 ..< 40:
+      let h = 1 + rnd(3)
+      let x = rx()
+      let z = rx()
+      for y in 0 ..< h:
+        put(x, FloorY + 1'i32 + int32(y), z, blockStone())
+  of 2:                                                          # long wall with a gap, plus pillars
+    for z in Lo .. Hi:
+      for y in 1'i32 .. 3'i32:
+        put(Cx + 3'i32, FloorY + y, z, blockStone())
+    for y in 1'i32 .. 3'i32:
+      put(Cx + 3'i32, FloorY + y, Cz + 6'i32, blockAir())
+    for i in 0 ..< 10:
+      put(rx(), FloorY + 1'i32, rx(), blockStone())
+  of 3:                                                          # holes (fall / no floor)
+    for i in 0 ..< 60:
+      let x = rx()
+      let z = rx()
+      put(x, FloorY, z, blockAir())
+      if rnd(2) == 0:
+        put(x, FloorY - 1'i32, z, blockAir())
+  of 4:                                                          # water pools
+    for i in 0 ..< 8:
+      let x0 = rx() div 2'i32
+      let z0 = rx() div 2'i32
+      let w = 2 + rnd(4)
+      for dx in 0 ..< w:
+        for dz in 0 ..< w:
+          put(x0 + int32(dx), FloorY, z0 + int32(dz), blockWater())
+  of 5:                                                          # doors, fences, cactus, trapdoors, a wall with a door
+    for i in 0 ..< 30:
+      let x = rx()
+      let z = rx()
+      case rnd(5)
+      of 0: put(x, FloorY + 1'i32, z, blockOakDoor())
+      of 1: put(x, FloorY + 1'i32, z, blockOakFence())
+      of 2: put(x, FloorY + 1'i32, z, blockCactus())
+      of 3: put(x, FloorY + 1'i32, z, blockIronDoor())
+      else: put(x, FloorY + 1'i32, z, blockOakTrapdoor())
+    for z in Lo .. Hi:
+      put(Cx + 2'i32, FloorY + 1'i32, z, blockStone())
+      put(Cx + 2'i32, FloorY + 2'i32, z, blockStone())
+    put(Cx + 2'i32, FloorY + 1'i32, Cz, blockOakDoor())
+  of 6:                                                          # ladders against a tower, lava
+    for y in 1'i32 .. 6'i32:
+      put(Cx + 4'i32, FloorY + y, Cz, blockStone())
+      put(Cx + 3'i32, FloorY + y, Cz, blockLadder())
+    for i in 0 ..< 6:
+      put(rx(), FloorY, rx(), blockLava())
+  else:                                                          # stepped hills
+    for x in Lo .. Hi:
+      for z in Lo .. Hi:
+        let h = (abs(x - Cx) + abs(z - Cz)) div 6
+        for y in 1 ..< (4 - min(h, 3)) + 1:
+          put(x, FloorY + int32(y), z, blockStone())
+
+var checked = 0
+var withPath = 0
+var failures = 0
+var outside = 0
+
+proc sameVec(a, b: Vector3[int32]): bool = a.x == b.x and a.y == b.y and a.z == b.z
+
+proc sameNode(a, b: Node): bool =
+  if a.cameFrom.isSome != b.cameFrom.isSome:
+    return false
+  if a.cameFrom.isSome and not sameVec(a.cameFrom.unsafeGet, b.cameFrom.unsafeGet):
+    return false
+  sameVec(a.pos.vec, b.pos.vec) and a.pathType == b.pathType and a.costMalus == b.costMalus and a.g == b.g and a.h == b.h and
+    a.f == b.f and a.walkedDist == b.walkedDist and a.closed == b.closed
+
+proc samePath(a, b: nil Path): bool =
+  if a == nil or b == nil:
+    return a == nil and b == nil
+  if a.getNodeCount() != b.getNodeCount() or a.canReach() != b.canReach():
+    return false
+  for i in 0 ..< a.getNodeCount():
+    if not sameNode(a.getNode(i).unsafeGet, b.getNode(i).unsafeGet):
+      return false
+  true
+const FollowRange = 16.0'f32
+
+type Case = object
+  snap: BlockSnapshot
+  mobPos: Vector3[int32]
+  startPos: Vector3[float64]
+  dest: Vector3[float64]
+  onGround: bool
+
+var cases: seq[Case] = @[]
+for kind in 0 ..< 8:
+  buildTerrain(kind)
+  let snap = snapshotAround(testWorld, Vector3[int32](x: Cx, y: FloorY + 1'i32, z: Cz), int32(FollowRange) + 1'i32 + 6'i32)
+  for trial in 0 ..< 12:
+    let sx = float64(Cx - 5'i32 + int32(rnd(11))) + 0.5'f64
+    let sz = float64(Cz - 5'i32 + int32(rnd(11))) + 0.5'f64
+    let startPos = Vector3[float64](x: sx, y: float64(FloorY + 1'i32), z: sz)
+    let dest = Vector3[float64](x: float64(Cx - 12'i32 + int32(rnd(25))) + 0.5'f64, y: float64(FloorY + 1'i32 + int32(rnd(3))),
+      z: float64(Cz - 12'i32 + int32(rnd(25))) + 0.5'f64)
+    let sv = startPos.toI32()
+    cases.add(Case(snap: snap, mobPos: Vector3[int32](x: sv.x, y: sv.y, z: sv.z), startPos: startPos, dest: dest, onGround: rnd(5) != 0))
+
+proc check(ok: bool, name: string) =
+  if ok:
+    echo "PASS " & name
+  else:
+    echo "FAIL " & name
+    inc failures
+
+proc runAll(workers: int): seq[nil Path] =
+  let pool = newJobPool(workers + 1)
+  usePathPool(pool)
+  var navs: seq[Navigator] = @[]
+  for c in cases:
+    let nav = newNavigator()
+    nav.submitPathJob(c.snap, c.mobPos, c.startPos, c.onGround, FollowRange, c.dest, 1'i64)
+    navs.add(nav)
+  result = @[]
+  for i in 0 ..< navs.len:
+    let o = navs[i].resolvePathJob()
+    result.add(if o.fresh: o.path else: nil)
+    if not o.has or not o.fresh:
+      failures += 1
+  jobpool.shutdown(pool)
+  usePathPool(nil)
+
+let direct = block:
+  var r: seq[nil Path] = @[]
+  for c in cases:
+    r.add(newNavigator().computePathWith(newSnapshotContext(c.mobPos, c.snap), c.startPos, c.onGround, FollowRange, c.dest))
+  r
+let inl = runAll(0)
+let par = runAll(3)
+var same0 = true
+var same3 = true
+for i in 0 ..< cases.len:
+  if direct[i] != nil:
+    withPath += 1
+  if not samePath(direct[i], inl[i]):
+    same0 = false
+  if not samePath(direct[i], par[i]):
+    same3 = false
+check(cases.len == 96, "96 cases")
+check(withPath > cases.len div 3, "enough cases found a path")
+check(same0, "0 workers (inline) equals direct computePathWith")
+check(same3, "3 workers equals direct computePathWith")
+
+# Stale results: stop() between submit and resolve drops the result; a later job is fine again.
+proc staleCheck(workers: int) =
+  let pool = newJobPool(workers + 1)
+  usePathPool(pool)
+  let c = cases[0]
+  let nav = newNavigator()
+  nav.submitPathJob(c.snap, c.mobPos, c.startPos, c.onGround, FollowRange, c.dest, 1'i64)
+  check(nav.hasPathJob(), "job in flight w=" & $workers)
+  nav.stop()
+  let o = nav.resolvePathJob()
+  check(o.has and not o.fresh and o.path == nil, "stale result dropped after stop w=" & $workers)
+  check(not nav.hasPathJob() and pending(pool, nav.ownerOfForTest()) == 0, "slot and pending released w=" & $workers)
+  nav.submitPathJob(c.snap, c.mobPos, c.startPos, c.onGround, FollowRange, c.dest, 2'i64)
+  let o2 = nav.resolvePathJob()
+  check(o2.has and o2.fresh and samePath(o2.path, direct[0]), "fresh job after stale applies w=" & $workers)
+  let o3 = nav.resolvePathJob()
+  check(not o3.has, "nothing pending afterwards w=" & $workers)
+  jobpool.shutdown(pool)
+  usePathPool(nil)
+
+staleCheck(0)
+staleCheck(3)
+echo "pathjob failures ", failures
+assert failures == 0
+echo "pathjob ok"

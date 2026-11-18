@@ -1,12 +1,15 @@
 ## Port of pumpkin/src/entity/ai/pathfinder/mod.rs
 
-import std/[math, options, tables]
+import std/[math, options, tables, locks]
 from ../../../../generated/attributes import MOVEMENT_SPEED, FOLLOW_RANGE, STEP_HEIGHT
 import ../../../../util/math/mathmod
 import ../../../../util/math/rustnum
 import ../../entitymod
+import ../../../sim/jobpool
+import pathpool
 import node, binary_heap, path, pathfinding_context, node_evaluator, walk_node_evaluator
 
+export pathpool
 export node, path, binary_heap, pathfinding_context, node_evaluator, walk_node_evaluator
 
 const
@@ -42,6 +45,12 @@ type
     openSet: BinaryHeap
     neighborsBuf: seq[Node]
     isIdleFlag: bool
+    # Path job (only with `pathJobsEnabled()`): one in flight at most, resolved at the start of the next tick.
+    pathId: int
+    jobSlot: int
+    gen: uint32               ## bumped by `stop`; a result of an older generation is dropped
+    pendDest: Vector3[float64]
+    pendStart: Vector3[float64]
 
 proc newNavigatorGoal*(currentProgress, destination: Vector3[float64]; speed: float64): NavigatorGoal =
   NavigatorGoal(currentProgress: currentProgress, destination: destination, speed: speed)
@@ -50,7 +59,7 @@ proc newNavigator*(): Navigator =
   ## `Navigator::default`
   Navigator(currentGoal: none[NavigatorGoal](), evaluator: newWalkNodeEvaluator(), currentPath0: nil, ticksOnCurrentNode: 0'u32,
     lastNodeIndex: 0, totalTicks: 0'u32, pathStartPos: none[Vector3[float64]](), pathTypeOverrides: initTable[int, float32](),
-    mobWidth: 0.6'f32, mobHeight: 1.95'f32, repathCooldown: 0'u32, openSet: newBinaryHeap(), neighborsBuf: @[], isIdleFlag: true)
+    mobWidth: 0.6'f32, mobHeight: 1.95'f32, repathCooldown: 0'u32, openSet: newBinaryHeap(), neighborsBuf: @[], isIdleFlag: true, pathId: 0, jobSlot: -1, gen: 0'u32)
 
 proc setProgress*(self: Navigator; goal: NavigatorGoal) =
   ## `set_progress`
@@ -67,6 +76,7 @@ proc setSpeed*(self: Navigator; speed: float64) =
     self.currentGoal = some(g)
 
 proc stop*(self: Navigator) =
+  self.gen += 1'u32
   self.isIdleFlag = true
   self.currentGoal = none[NavigatorGoal]()
   self.currentPath0 = nil
@@ -206,6 +216,144 @@ proc computePath*(self: Navigator; entity: LivingEntity; destination: Vector3[fl
   let context = newPathfindingContext(mobPosition, entity.entity.world)
   self.computePathWith(context, startPosF, entity.entity.onGround, float32(entity.getAttributeValue(FOLLOW_RANGE)), destination)
 
+
+# ---- path job: snapshot on the tick thread, search on the pool, apply at the start of the next tick -------------------------
+
+type
+  PathJob = ref object
+    nav: Navigator            ## a private copy: the live one is not touched while the job runs
+    snap: BlockSnapshot
+    mobPos: Vector3[int32]
+    startPos: Vector3[float64]
+    onGround: bool
+    followRange: float32
+    dest: Vector3[float64]
+    owner: int
+    tick: int64
+    gen0: uint32
+    result: nil Path
+    ok: bool
+
+var gPathJobs: seq[nil PathJob] = @[]
+var gPathJobsLock: Lock
+var gPathJobsInit = false
+var gNextPathId = 1
+var gPathStale* = 0          ## results dropped (stale generation, moved target, orphan)
+var gPathApplied* = 0
+var gLastOrphanSweep = -1'i64
+
+proc ensureJobsLock() =
+  if not gPathJobsInit:
+    initLock(gPathJobsLock)
+    gPathJobsInit = true
+
+proc pathJobBody(arg: pointer): int {.nimcall, raises.} =
+  ## Pool body: never raises. Slot `arg` is owned by the job until the tick thread takes it back.
+  var job: nil PathJob = nil
+  acquire(gPathJobsLock)
+  let slot = cast[int](arg)
+  if slot >= 0 and slot < gPathJobs.len:
+    job = gPathJobs[slot]
+  release(gPathJobsLock)
+  if job == nil:
+    return 0
+  try:
+    let ctx = newSnapshotContext(job.mobPos, job.snap)   # fresh PathTypeCache per job
+    job.result = job.nav.computePathWith(ctx, job.startPos, job.onGround, job.followRange, job.dest)
+    job.ok = true
+  except:
+    job.result = nil
+    job.ok = false
+  0
+
+proc takeJob(slot: int): nil PathJob =
+  acquire(gPathJobsLock)
+  result = gPathJobs[slot]
+  gPathJobs[slot] = nil
+  release(gPathJobsLock)
+
+proc ownerOf(self: Navigator): int =
+  if self.pathId == 0:
+    self.pathId = gNextPathId
+    gNextPathId += 1
+  self.pathId
+
+proc hasPathJob*(self: Navigator): bool = self.jobSlot >= 0
+
+proc waitJob(pool: JobPool; owner: int; sink: var seq[JobResult]) =
+  while drainDone(pool, owner, sink) == 0:
+    discard
+
+proc sweepOrphans(tick: int64) =
+  ## Jobs whose navigator never ticked again (mob removed): drain and drop them so the pool counters do not stick.
+  if gLastOrphanSweep == tick:
+    return
+  gLastOrphanSweep = tick
+  let pool = pathPool()
+  var sink: seq[JobResult] = @[]
+  for i in 0 ..< gPathJobs.len:
+    let j = gPathJobs[i]
+    if j != nil and tick - j.tick > 40'i64:
+      waitJob(pool, j.owner, sink)
+      discard takeJob(i)
+      gPathStale += 1
+      sink.setLen(0)
+
+proc submitPathJob*(self: Navigator; snap: BlockSnapshot; mobPos: Vector3[int32]; startPos: Vector3[float64]; onGround: bool;
+    followRange: float32; dest: Vector3[float64]; tick: int64) =
+  ## Tick thread. Hands the search to the pool (or runs it inline with no workers). At most one job per navigator.
+  ensureJobsLock()
+  let pool = pathPool()
+  if self.jobSlot >= 0 or pool == nil:
+    return
+  var copy = newNavigator()
+  copy.mobWidth = self.mobWidth
+  copy.mobHeight = self.mobHeight
+  for k, v in self.pathTypeOverrides:
+    copy.pathTypeOverrides[k] = v
+  let job = PathJob(nav: copy, snap: snap, mobPos: mobPos, startPos: startPos, onGround: onGround, followRange: followRange,
+    dest: dest, owner: self.ownerOf(), tick: tick, gen0: self.gen, result: nil, ok: false)
+  var slot = -1
+  acquire(gPathJobsLock)
+  for i in 0 ..< gPathJobs.len:
+    if gPathJobs[i] == nil:
+      slot = i
+      break
+  if slot < 0:
+    gPathJobs.add(nil)
+    slot = gPathJobs.len - 1
+  gPathJobs[slot] = job
+  release(gPathJobsLock)
+  self.jobSlot = slot
+  self.pendDest = dest
+  self.pendStart = startPos
+  submit(pool, job.owner, pathJobBody, cast[pointer](slot))
+  sweepOrphans(tick)
+
+type PathJobOutcome* = object
+  has*: bool                  ## a job was in flight
+  fresh*: bool                ## it finished, its generation is current and it did not fail
+  path*: nil Path
+
+proc resolvePathJob*(self: Navigator): PathJobOutcome =
+  ## Tick thread: waits for this navigator's job (fixed offset: it is always applied by the next tick) and takes it.
+  result = PathJobOutcome(has: false, fresh: false, path: nil)
+  if self.jobSlot < 0:
+    return
+  var sink: seq[JobResult] = @[]
+  waitJob(pathPool(), self.pathId, sink)
+  let job = takeJob(self.jobSlot)
+  self.jobSlot = -1
+  result.has = true
+  if job == nil:
+    gPathStale += 1
+    return
+  if sink[0].failed or not job.ok or job.gen0 != self.gen:
+    gPathStale += 1
+    return
+  result.fresh = true
+  result.path = job.result
+
 proc needsNewPath(self: Navigator; goal: NavigatorGoal): bool =
   ## `needs_new_path`
   let p = self.currentPath0
@@ -229,6 +377,10 @@ proc zeroInput(entity: LivingEntity) {.inline.} =
 
 proc tick*(self: Navigator; entity: LivingEntity) =
   ## `tick`
+  let jobsOn = pathJobsEnabled()
+  var outcome = PathJobOutcome(has: false, fresh: false, path: nil)
+  if jobsOn:
+    outcome = self.resolvePathJob()
   if self.currentGoal.isNone:
     # Idle: stop the mob
     self.isIdleFlag = true
@@ -244,7 +396,33 @@ proc tick*(self: Navigator; entity: LivingEntity) =
   self.totalTicks += 1'u32
   if self.repathCooldown > 0'u32:
     self.repathCooldown -= 1'u32
-  if self.needsNewPath(goal):
+  if jobsOn:
+    if outcome.has:
+      # Drop a result whose target the goal has since left (the goal moved more than 4 blocks); no cooldown then.
+      let pd = self.pendDest.toI32()
+      let gd = goal.destination.toI32()
+      let ddx = float64(pd.x - gd.x)
+      let ddy = float64(pd.y - gd.y)
+      let ddz = float64(pd.z - gd.z)
+      if outcome.fresh and ddx * ddx + ddy * ddy + ddz * ddz <= 16.0'f64:
+        self.currentPath0 = outcome.path
+        self.ticksOnCurrentNode = 0'u32
+        self.lastNodeIndex = 0
+        self.pathStartPos = some(self.pendStart)
+        gPathApplied += 1
+      else:
+        gPathStale += 1
+        self.repathCooldown = 0'u32
+    if self.needsNewPath(goal):
+      let startPosF = entity.entity.pos
+      let sb = startPosF.toI32()
+      let mobPosition = Vector3[int32](x: sb.x, y: sb.y, z: sb.z)
+      let followRange = float32(entity.getAttributeValue(FOLLOW_RANGE))
+      let snap = snapshotAround(entity.entity.world, mobPosition, int32(followRange) + 1'i32)
+      self.submitPathJob(snap, mobPosition, startPosF, entity.entity.onGround, followRange, goal.destination,
+        int64(entity.entity.world.server.tickCounter))
+      self.repathCooldown = 15'u32
+  elif self.needsNewPath(goal):
     self.currentPath0 = self.computePath(entity, goal.destination)
     self.ticksOnCurrentNode = 0'u32
     self.lastNodeIndex = 0
@@ -321,3 +499,5 @@ proc tick*(self: Navigator; entity: LivingEntity) =
     self.isIdleFlag = true
     self.currentPath0 = nil
     zeroInput(entity)
+
+proc ownerOfForTest*(self: Navigator): int = self.pathId

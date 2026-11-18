@@ -142,6 +142,7 @@ Each phase lists what changes, who owns the files, how it is verified. "Gate" = 
 | Phase 3 step 1: optional Java encode worker (sim/netencode, MC_NET_WORKERS=1 and workers>0; default off) | byte-identical encode test passes; scenarios equal baseline off, flaky worldedit/create_live with it on (pass on rerun); not load-tested; playtest signature assertion fails on origin/main too |
 | Phase 3 step 2: optional decode worker (sim/netdecode, armed at Play, same gate, default off) | equivalence test passes (17 checks); scenarios equal baseline off; not shown armed in scenarios, not load-tested |
 | Phase 1 (e) step 1: snapshot-backed PathfindingContext + computePathWith (live path unchanged) | 320 snapshot-vs-live path comparisons identical; scenarios equal baseline except flaky worldedit_wand (pass/fail across reruns); no job yet |
+| Phase 1 (e) step 2: path search as a pool job (MC_PATH_WORKERS=1 and workers>0, default off, applied next tick in every mode, stale results dropped) | 96 identical-path cases at 0 and 3 workers, stale-drop test; no scenario spawns a pathing mob so the live job path is unexercised; create_live is timing-flaky with and without the flag; snapshot cost (about 105k cells per submit) unmeasured |
 | Phases 1 to 4 change lists | written (docs/MULTITHREADING_PHASES.md) |
 | Worker count from the thread plan + never-raise workers | prepared on top of the chunk chain (branch mt-items-1-3), not pushed |
 | Wiring jobpool into generation_executor, phases 1 to 6 | waiting on the chunk-system owner's branches reaching main |
