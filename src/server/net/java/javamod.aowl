@@ -20,7 +20,7 @@ import ../../../util/text/text
 import ../../../plugin/pluginhooksblock
 import ../../../config/networking/compression
 import ../winsock, ../netbase
-import ../../sim/netencode
+import ../../sim/[netencode, netdecode]
 import requests/asyncget
 import ../../../world/chunkdata
 
@@ -58,6 +58,7 @@ type
       ## Set only on a Bedrock player's stand-in: writes a Bedrock game packet (id and body) to the real client. What
       ## `ClientPlatform::Bedrock(client)` holds upstream; `platform` and the world's editioned broadcasts read it.
     lane*: nil EncodeLane  ## Set only with MC_NET_WORKERS=1 (sim/netencode.aowl): the encode worker then owns the writer; nil otherwise.
+    dlane*: nil DecodeLane ## Set only with MC_NET_WORKERS=1, once the connection is in Play (sim/netdecode.aowl): it then owns the reader.
     readBuffer: seq[byte]
 
 proc newJavaClient*(socket: SocketHandle; id: uint64): JavaClient =
@@ -66,7 +67,7 @@ proc newJavaClient*(socket: SocketHandle; id: uint64): JavaClient =
     serverAddress: "", peerIp: "", connectionState: csHandShake, brand: none[string](), socket: socket,
     networkWriter: newTCPNetworkEncoder(), networkReader: newTCPNetworkDecoder(), outgoing: @[], outgoingStart: 0,
     closed: false, gone: false, waitForKeepAlive: false, keepAliveId: 0'i64, lastKeepAliveTime: nowMs(),
-    nextKeepAliveAt: 0'i64, packetSequence: -1'i32, pendingAuth: nil, lane: lane, readBuffer: newSeq[byte](ReadChunkSize))
+    nextKeepAliveAt: 0'i64, packetSequence: -1'i32, pendingAuth: nil, lane: lane, dlane: nil, readBuffer: newSeq[byte](ReadChunkSize))
 
 proc platform*(self: JavaClient): ClientPlatform =
   ## `Player::client` as a `ClientPlatform`.
@@ -83,13 +84,18 @@ proc close*(self: JavaClient) =
   if self.lane != nil:
     laneDrain(self.lane)   # tick thread: what the worker has is complete before the state flips
   self.closed = true
+  if self.dlane != nil:
+    decodeRelease(self.dlane)   # nothing more is read: wait for the job, free the slot
 
 proc isClosed*(self: JavaClient): bool {.inline.} = self.closed
 
 proc setCompression*(self: JavaClient; compression: CompressionInfo) =
   if compression.level > 9'u32:
     echo "Invalid compression level! Clients will not be able to read this!"
-  self.networkReader.setCompression(int(compression.threshold))
+  if self.dlane != nil:
+    decodeSetCompression(self.dlane, int(compression.threshold))   # drains first
+  else:
+    self.networkReader.setCompression(int(compression.threshold))
   if self.lane != nil:
     laneSetCompression(self.lane, int(compression.threshold), compression.level)   # drains first
   else:
@@ -99,9 +105,13 @@ proc setEncryption*(self: JavaClient; sharedSecret: openArray[byte]): bool =
   ## `set_encryption`. False for a key of the wrong length, or a second one.
   if sharedSecret.len != 16:
     return false
-  let readerResult = self.networkReader.setEncryption(sharedSecret)
-  if not readerResult.isOk:
-    return false
+  if self.dlane != nil:
+    if not decodeSetEncryption(self.dlane, sharedSecret):   # drains first
+      return false
+  else:
+    let readerResult = self.networkReader.setEncryption(sharedSecret)
+    if not readerResult.isOk:
+      return false
   if self.lane != nil:
     return laneSetEncryption(self.lane, sharedSecret)   # drains first
   self.networkWriter.setEncryption(sharedSecret).isOk
@@ -131,6 +141,8 @@ proc flushOutgoing*(self: JavaClient) =
       # leave path (pumpkinlib's `finished`) would wait for the keep-alive timeout, and the player would stay online.
       self.gone = true
       self.closed = true
+      if self.dlane != nil:
+        decodeRelease(self.dlane)
       break
     self.outgoingStart += n
   if self.outgoingStart >= self.outgoing.len:
@@ -214,8 +226,19 @@ proc kick*(self: JavaClient; reason: TextComponent) =
     discard
   self.close()
 
+proc armDecodeLane(self: JavaClient) =
+  ## Play only: the compression and encryption of the reader are final, so a worker may decode ahead of the handlers. The reader
+  ## (with any bytes it already holds) moves to the lane.
+  if self.dlane == nil and self.connectionState == csPlay and int(self.socket) != int(InvalidSocket) and
+      not self.closed and netDecodeEnabled():
+    let lane = newDecodeLane(self.networkReader)
+    self.networkReader = newTCPNetworkDecoder()
+    self.dlane = lane
+    decodeKick(lane)
+
 proc pumpSocket*(self: JavaClient) =
   ## Feeds the decoder what the socket has. The first half of `get_packet`.
+  armDecodeLane(self)
   while not self.gone and not self.closed:
     let n = tryRecv(self.socket, self.readBuffer)
     if n == WouldBlock:
@@ -223,14 +246,29 @@ proc pumpSocket*(self: JavaClient) =
     if n == SocketClosed:
       self.gone = true
       self.closed = true
+      if self.dlane != nil:
+        decodeRelease(self.dlane)
       return
-    self.networkReader.feed(self.readBuffer.toOpenArray(0, n - 1))
+    if self.dlane != nil:
+      decodePush(self.dlane, self.readBuffer.toOpenArray(0, n - 1))
+    else:
+      self.networkReader.feed(self.readBuffer.toOpenArray(0, n - 1))
 
 proc getPacket*(self: JavaClient): Option[RawPacket] =
   ## The other half of `get_packet`: the next whole packet, if one has arrived.
-  if self.closed or not self.networkReader.packetReady():
-    return none[RawPacket]()
-  let res = self.networkReader.getRawPacket()
+  armDecodeLane(self)
+  var res: RawPacketResult
+  if self.dlane != nil:
+    if self.closed:
+      return none[RawPacket]()
+    let popped = decodePop(self.dlane)
+    if popped.isNone:
+      return none[RawPacket]()
+    res = popped.unsafeGet
+  else:
+    if self.closed or not self.networkReader.packetReady():
+      return none[RawPacket]()
+    res = self.networkReader.getRawPacket()
   if res.isOk:
     return some(res.value)
   if res.error.kind != pdeConnectionClosed:

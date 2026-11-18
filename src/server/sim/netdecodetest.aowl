@@ -1,0 +1,252 @@
+## netdecode.aowl: the worker lane yields the inline decoder's exact packet sequence and errors, per connection, in order
+## (3 connections interleaved; compression then encryption switched on mid-stream; arbitrary chunk boundaries).
+import std/[assertions, syncio, options]
+import ../../protocol/[proto, varint]
+import ../../protocol/java/[packet_encoder, packet_decoder]
+import netencode, netdecode
+
+var failures = 0
+proc check(ok: bool, name: string) =
+  if ok:
+    echo "PASS " & name
+  else:
+    echo "FAIL " & name
+    inc failures
+
+proc packetOf(conn, n: int): seq[byte] =
+  var len = 1 + ((n * 37 + conn * 101) mod 3000)
+  if n mod 11 == 0:
+    len = 40000 + conn * 13
+  result = @[byte(n mod 100)]
+  var s = uint32(n) * 2654435761'u32 + uint32(conn)
+  for i in 0 ..< len:
+    if n mod 3 == 0:
+      result.add(byte(i mod 7))
+    else:
+      s = s * 1664525'u32 + 1013904223'u32
+      result.add(byte(s shr 24))
+
+const Key = [1'u8, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]
+const Count = 90
+
+proc cat(a, b: seq[byte]): seq[byte] =
+  result = @[]
+  for x in a: result.add(x)
+  for x in b: result.add(x)
+
+proc sub(a: seq[byte]; lo, hi: int): seq[byte] =
+  ## a[lo ..< hi]
+  result = @[]
+  for i in lo ..< hi: result.add(a[i])
+
+proc streamPhases(conn: int): seq[seq[byte]] =
+  ## Client bytes in three phases: plain (0..19), compressed (20..39), compressed + encrypted (40..).
+  var e = newTCPNetworkEncoder()
+  result = @[]
+  var cur: seq[byte] = @[]
+  for n in 0 ..< Count:
+    if n == 20:
+      for b in e.flush(): cur.add(b)
+      result.add(cur)
+      cur = @[]
+      e.setCompression(256, 6'u32)
+    if n == 40:
+      for b in e.flush(): cur.add(b)
+      result.add(cur)
+      cur = @[]
+      assert e.setEncryption(Key).isOk
+    assert e.writePacket(packetOf(conn, n)).isOk
+  for b in e.flush(): cur.add(b)
+  result.add(cur)
+
+type Item = object
+  ok: bool
+  id: int32
+  payload: seq[byte]
+  kind: int
+  msg: string
+
+proc itemOf(r: RawPacketResult): Item =
+  if r.isOk:
+    Item(ok: true, id: r.value.id, payload: r.value.payload)
+  else:
+    Item(ok: false, kind: int(r.error.kind), msg: r.error.msg)
+
+proc same(a, b: seq[Item]): bool =
+  if a.len != b.len:
+    return false
+  for i in 0 ..< a.len:
+    if a[i].ok != b[i].ok or a[i].id != b[i].id or a[i].payload != b[i].payload or a[i].kind != b[i].kind or a[i].msg != b[i].msg:
+      return false
+  true
+
+proc chunksOf(data: seq[byte]; seed: var uint32): seq[seq[byte]] =
+  result = @[]
+  var at = 0
+  while at < data.len:
+    seed = seed * 1664525'u32 + 1013904223'u32
+    var n = 1 + int((seed shr 8) mod 5000'u32)
+    if n > data.len - at:
+      n = data.len - at
+    result.add(sub(data, at, at + n))
+    at += n
+
+proc runInline(phases: seq[seq[byte]]; seedStart: uint32): seq[Item] =
+  var dec = newTCPNetworkDecoder()
+  var seed = seedStart
+  result = @[]
+  for ph in 0 ..< phases.len:
+    if ph == 1:
+      dec.setCompression(256)
+    if ph == 2:
+      assert dec.setEncryption(Key).isOk
+    for c in chunksOf(phases[ph], seed):
+      dec.feed(c)
+    while dec.packetReady():
+      let r = dec.getRawPacket()
+      result.add(itemOf(r))
+      if not r.isOk:
+        return
+
+proc popAll(lane: DecodeLane; into: var seq[Item]) =
+  while true:
+    let p = decodePop(lane)
+    if p.isNone:
+      break
+    into.add(itemOf(p.unsafeGet))
+
+proc runLanes(workers: int; allPhases: seq[seq[seq[byte]]]) =
+  discard enableNetEncode(workers)
+  var lanes: seq[DecodeLane] = @[]
+  var got: seq[seq[Item]] = @[]
+  var seeds: seq[uint32] = @[]
+  for c in 0 ..< 3:
+    lanes.add(newDecodeLane(newTCPNetworkDecoder()))
+    decodeKick(lanes[c])
+    got.add(@[])
+    seeds.add(uint32(1000 + c))
+  for ph in 0 ..< allPhases[0].len:
+    var pc: seq[seq[seq[byte]]] = @[]
+    for c in 0 ..< 3:
+      if ph == 1:
+        decodeSetCompression(lanes[c], 256)
+      if ph == 2:
+        assert decodeSetEncryption(lanes[c], Key)
+      pc.add(chunksOf(allPhases[c][ph], seeds[c]))
+    var more = true
+    var i = 0
+    while more:
+      more = false
+      for c in 0 ..< 3:
+        if i < pc[c].len:
+          decodePush(lanes[c], pc[c][i])
+          more = true
+        popAll(lanes[c], got[c])
+      inc i
+    for c in 0 ..< 3:
+      decodeDrain(lanes[c])
+      popAll(lanes[c], got[c])
+  for c in 0 ..< 3:
+    let want = runInline(allPhases[c], uint32(1000 + c))
+    check(want.len == Count, "inline decodes all packets conn " & $c)
+    check(same(got[c], want), "packets identical conn " & $c & " workers=" & $workers & " (" & $want.len & " items)")
+    decodeRelease(lanes[c])
+
+var all: seq[seq[seq[byte]]] = @[]
+for c in 0 ..< 3:
+  all.add(streamPhases(c))
+runLanes(3, all)
+runLanes(0, all)
+
+# garbage after the last good packet (decrypted identically by both decoders): same items, same error, then nothing
+var errorsSeen = 0
+for variant in 0 ..< 8:
+  var ps = streamPhases(0)
+  var garbage: seq[byte] = @[]
+  for i in 0 ..< 64:
+    garbage.add(byte((i * 73 + 11 + variant * 29) and 0xff))
+  ps[2] = cat(ps[2], garbage)
+  let want = runInline(ps, uint32(77 + variant))
+  if not want[^1].ok:
+    inc errorsSeen
+  discard enableNetEncode(2)
+  let lane = newDecodeLane(newTCPNetworkDecoder())
+  decodeKick(lane)
+  var seed = uint32(77 + variant)
+  var got: seq[Item] = @[]
+  for ph in 0 ..< ps.len:
+    if ph == 1:
+      decodeSetCompression(lane, 256)
+    if ph == 2:
+      assert decodeSetEncryption(lane, Key)
+    for c in chunksOf(ps[ph], seed):
+      decodePush(lane, c)
+    decodeDrain(lane)
+    popAll(lane, got)
+  check(same(got, want), "garbage tail variant " & $variant & ": same items and error as inline (" & $want.len & " items, last ok=" & $want[^1].ok & ")")
+  if not want[^1].ok:
+    decodePush(lane, garbage)
+    decodeDrain(lane)
+    check(decodePop(lane).isNone, "nothing after the error")
+  decodeRelease(lane)
+check(errorsSeen > 0, "at least one garbage variant produced an error (" & $errorsSeen & ")")
+
+# a deliberately bad frame under compression: declared length 50, garbage body (no encryption in this stream)
+block:
+  var frame: seq[byte] = @[]
+  encodeJava(newVarInt(50'i32), frame)
+  for i in 0 ..< 20:
+    frame.add(byte(0x55 + i))
+  var raw: seq[byte] = @[]
+  encodeJava(newVarInt(int32(frame.len)), raw)
+  for b in frame:
+    raw.add(b)
+  var good = newTCPNetworkEncoder()
+  good.setCompression(256, 6'u32)
+  assert good.writePacket(packetOf(0, 1)).isOk
+  var stream = cat(good.flush(), raw)
+  assert good.writePacket(packetOf(0, 2)).isOk
+  stream = cat(stream, good.flush())
+  var dec = newTCPNetworkDecoder()
+  dec.setCompression(256)
+  dec.feed(stream)
+  var want: seq[Item] = @[]
+  while dec.packetReady():
+    let r = dec.getRawPacket()
+    want.add(itemOf(r))
+    if not r.isOk:
+      break
+  var d2 = newTCPNetworkDecoder()
+  d2.setCompression(256)
+  discard enableNetEncode(2)
+  let lane = newDecodeLane(d2)   # armed with a decoder that is already compressed, as javamod does in Play
+  decodeKick(lane)
+  decodePush(lane, stream)
+  decodeDrain(lane)
+  var got: seq[Item] = @[]
+  popAll(lane, got)
+  check(want.len == 2 and want[0].ok and not want[1].ok, "inline: one packet then an error")
+  check(same(got, want), "bad zlib frame: same packet then same error as inline (" & want[^1].msg & ")")
+  decodeRelease(lane)
+
+# taking over a decoder that already holds a partial buffered stream
+block:
+  let ps = streamPhases(1)
+  var d = newTCPNetworkDecoder()
+  d.feed(sub(ps[0], 0, 100))
+  discard enableNetEncode(2)
+  let lane = newDecodeLane(d)
+  decodeKick(lane)
+  decodePush(lane, sub(ps[0], 100, ps[0].len))
+  decodeDrain(lane)
+  var got: seq[Item] = @[]
+  popAll(lane, got)
+  var dd = newTCPNetworkDecoder()
+  dd.feed(ps[0])
+  var want: seq[Item] = @[]
+  while dd.packetReady():
+    want.add(itemOf(dd.getRawPacket()))
+  check(want.len == 20 and same(got, want), "takeover of a decoder holding buffered bytes")
+  decodeRelease(lane)
+
+echo "failures: " & $failures

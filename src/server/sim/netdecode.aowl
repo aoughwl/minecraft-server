@@ -1,0 +1,183 @@
+## Optional decode worker for Java connections (docs/MULTITHREADING.md phase 3, step 2).
+##
+## Same gate as the encode worker (`netEncodeEnabled`: MC_NET_WORKERS=1 and a thread plan with workers); default off.
+##
+## A `DecodeLane` owns one connection's `TCPNetworkDecoder`. The tick thread pushes the raw socket bytes (`decodePush`); a pool
+## job decrypts (`feed`), decompresses and splits them into packets (`packetReady` / `getRawPacket`, the inline decoder's own
+## code) and appends each result to `ready`; the tick thread pops them in order (`decodePop`) from `JavaClient.getPacket`.
+## Handlers stay on the tick thread.
+##  * one job in flight per lane, so per-connection order is the order of the bytes;
+##  * the decoder is touched only by that job, or by the tick thread after `decodeDrain` (setCompression / setEncryption);
+##  * the first error (bad frame) is queued as an entry after the packets before it and the job stops: the tick thread sees
+##    the same error, at the same position, that the inline decoder would have returned.
+## Because the job decodes ahead of the handlers, a lane must only take over a stream that no longer changes decoder state
+## (inline, bytes after the encryption response are decrypted by `setEncryption`, after the handler ran). javamod therefore
+## arms a lane only once the connection is in Play (compression and encryption are set by then).
+
+{.feature: "lenientnils".}
+
+import std/locks
+import std/options
+import ../../protocol/java/packet_decoder
+import ../../protocol/[proto, netcodec]
+import jobpool, netencode
+
+type
+  DecodeLane* = ref object
+    slot: int
+    lock: Lock
+    queue: seq[seq[byte]]          ## Raw chunks from the socket, in order.
+    ready: seq[RawPacketResult]    ## Decoded packets, then at most one error entry (last).
+    readyHead: int
+    inFlight: bool
+    stopped: bool                  ## An error was queued: further input is ignored.
+    dead: bool
+    dec: TCPNetworkDecoder         ## Owned by the job while `inFlight`, by the tick thread otherwise.
+
+var gDLanes: seq[DecodeLane] = @[]
+var gDLock: Lock
+var gDInit = false
+var gDSink: seq[JobResult] = @[]
+
+proc sleepWin(ms: uint32) {.stdcall, importc: "Sleep", dynlib: "kernel32.dll".}
+
+proc netDecodeEnabled*(): bool =
+  netEncodeEnabled()
+
+proc newDecodeLane*(dec: TCPNetworkDecoder): DecodeLane =
+  ## Takes over `dec` (with whatever it has buffered). Only when `netDecodeEnabled()`.
+  if not gDInit:
+    initLock(gDLock)
+    gDInit = true
+  let lane = DecodeLane(queue: @[], ready: @[], dec: dec, slot: -1)
+  initLock(lane.lock)
+  acquire(gDLock)
+  var at = -1
+  for i in 0 ..< gDLanes.len:
+    if gDLanes[i] == nil:
+      at = i
+      break
+  if at < 0:
+    gDLanes.add(lane)
+    at = gDLanes.len - 1
+  else:
+    gDLanes[at] = lane
+  lane.slot = at
+  release(gDLock)
+  # whatever `dec` already holds is split by a first job
+  acquire(lane.lock)
+  lane.queue.add(@[])
+  release(lane.lock)
+  lane
+
+proc dlaneOf(slot: int): DecodeLane =
+  acquire(gDLock)
+  result = gDLanes[slot]
+  release(gDLock)
+
+proc decodeJob(arg: pointer): int {.nimcall, raises.} =
+  let lane = dlaneOf(cast[int](arg))
+  while true:
+    acquire(lane.lock)
+    if lane.queue.len == 0:
+      lane.inFlight = false
+      release(lane.lock)
+      return 0
+    var batch = move lane.queue
+    lane.queue = @[]
+    let stopped = lane.stopped
+    release(lane.lock)
+    if stopped:
+      continue
+    var outp: seq[RawPacketResult] = @[]
+    var failed = false
+    for i in 0 ..< batch.len:
+      if failed:
+        break
+      lane.dec.feed(batch[i])
+      while lane.dec.packetReady():
+        let r = lane.dec.getRawPacket()
+        outp.add(r)
+        if not r.isOk:
+          failed = true
+          break
+    acquire(lane.lock)
+    for r in outp:
+      lane.ready.add(r)
+    if failed:
+      lane.stopped = true
+    release(lane.lock)
+
+proc startJob(lane: DecodeLane) =
+  discard drainDone(netPool(), 0, gDSink)
+  gDSink.setLen(0)
+  submit(netPool(), 0, decodeJob, cast[pointer](lane.slot))
+
+proc decodePush*(lane: DecodeLane; data: openArray[byte]) =
+  ## Tick thread. Queues the bytes and makes sure a job is running.
+  if lane.dead:
+    return
+  acquire(lane.lock)
+  lane.queue.add(@data)
+  let start = not lane.inFlight
+  if start:
+    lane.inFlight = true
+  release(lane.lock)
+  if start:
+    startJob(lane)
+
+proc decodeKick*(lane: DecodeLane) =
+  ## Tick thread, right after `newDecodeLane`: starts the job that splits what the taken-over decoder already holds.
+  acquire(lane.lock)
+  let start = not lane.inFlight
+  if start:
+    lane.inFlight = true
+  release(lane.lock)
+  if start:
+    startJob(lane)
+
+proc decodePop*(lane: DecodeLane): Option[RawPacketResult] =
+  ## Tick thread. The next decoded packet (or the error) in order, if the worker has one.
+  acquire(lane.lock)
+  if lane.readyHead < lane.ready.len:
+    result = some(lane.ready[lane.readyHead])
+    inc lane.readyHead
+    if lane.readyHead == lane.ready.len:
+      lane.ready.setLen(0)
+      lane.readyHead = 0
+  else:
+    result = none[RawPacketResult]()
+  release(lane.lock)
+
+proc decodeBusy*(lane: DecodeLane): bool =
+  acquire(lane.lock)
+  result = lane.inFlight or lane.queue.len > 0
+  release(lane.lock)
+
+proc decodeDrain*(lane: DecodeLane) =
+  ## Tick thread: waits until all pushed bytes are decoded. Results stay in `ready`.
+  while true:
+    acquire(lane.lock)
+    let idle = not lane.inFlight and lane.queue.len == 0
+    release(lane.lock)
+    if idle:
+      return
+    sleepWin(0'u32)
+
+proc decodeSetCompression*(lane: DecodeLane; threshold: CompressionThreshold) =
+  decodeDrain(lane)
+  lane.dec.setCompression(threshold)
+
+proc decodeSetEncryption*(lane: DecodeLane; key: openArray[uint8]): bool =
+  decodeDrain(lane)
+  lane.dec.setEncryption(key).isOk
+
+proc decodeRelease*(lane: DecodeLane) =
+  ## The connection is over: waits for the job, frees the table slot; later pushes are dropped.
+  decodeDrain(lane)
+  if not lane.dead:
+    lane.dead = true
+    acquire(gDLock)
+    if lane.slot >= 0 and lane.slot < gDLanes.len and gDLanes[lane.slot] == lane:
+      gDLanes[lane.slot] = nil
+    release(gDLock)
