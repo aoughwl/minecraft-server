@@ -9,18 +9,20 @@
 ## redo), so it restores block states and block entities exactly. Every changed cell also goes to the block log with the
 ## command cause and the player's name, so `/bl lookup` shows the edit and `/bl rollback` can undo it from the log too.
 
-import std/[options, strutils]
+import std/[options, strutils, math]
 import ../../util/math/position
 import ../../nbt/tag as nbttag
 import ../../world/blockstates
 import ../serverbase
 import ../blocklog/blocklogcore
 import ../world/bulkedit
+import ../../world/level as wlevel
 import wecore
 
 const
   MaxEditCells* = 4_000_000       ## one edit, in cells of the volume it reads
-  MaxHistoryEntries* = 64
+  MaxHistoryEntries* = 64         ## the default undo depth of a session (`//historysize` changes it)
+  MaxHistoryLimit* = 1000
   MaxHistoryCells* = 24_000_000   ## undo + redo of one player, summed over the boxes
 
 type
@@ -28,6 +30,18 @@ type
     label*: string
     box*: WeBox
     snap*: VolumeSnapshot   ## the cells to put back
+
+  WeToolKind* = enum
+    wtBrushSphere, wtBrushCylinder, wtBrushSmooth, wtInfo, wtReplace
+
+  WeTool* = object
+    ## A brush or tool bound to an item (`//brush`, `//tool`), used with a right click.
+    item*: string           ## the held item's registry key
+    kind*: WeToolKind
+    pattern*: Pattern
+    patternText*: string
+    radius*, height*, iterations*: int
+    hollow*: bool
 
   WeSession* = ref object
     name*: string
@@ -41,6 +55,9 @@ type
     cuiDirty*: bool        ## the selection changed since the client was told
     cuiHello*: bool        ## the client said `v|<n>` on worldedit:cui
     lastSeen*: int64
+    historyLimit*: int     ## undo entries kept
+    tools*: seq[WeTool]
+    lastToolTick*: int64   ## a right click arrives as use-on-block and use-item in one tick: the tool acts once
 
   OpResult* = object
     ok*: bool
@@ -61,7 +78,8 @@ proc sessionFor*(name: string): WeSession =
     if s.name == name:
       return s
   let s = WeSession(name: name, dim: "", has1: false, has2: false, hasClip: false, undo: @[], redo: @[], cuiDirty: false,
-    cuiHello: false, lastSeen: 0'i64)
+    cuiHello: false, lastSeen: 0'i64,
+    historyLimit: MaxHistoryEntries, tools: @[], lastToolTick: -1'i64)
   gSessions.add s
   s
 
@@ -203,16 +221,19 @@ proc trimHistory(ses: WeSession) =
     cells += volume(e.box)
   for e in ses.redo:
     cells += volume(e.box)
-  while ses.undo.len > MaxHistoryEntries or (cells > MaxHistoryCells and ses.undo.len > 1):
+  while ses.undo.len > max(ses.historyLimit, 0) or (cells > MaxHistoryCells and ses.undo.len > 1):
     cells -= volume(ses.undo[0].box)
     ses.undo.delete(0)
 
-proc finishEdit(world: World; ses: WeSession; label: string; ctx: var EditCtx): OpResult =
+proc finishEdit(world: World; ses: WeSession; label: string; ctx: var EditCtx; fmt = ""): OpResult =
+  ## `fmt`, when given, is the success message with `{n}` for the count (WorldEdit's own wording).
   var changed = 0
   for i in 0 ..< ctx.after.cells.len:
     if ctx.after.cells[i] != ctx.before.cells[i]:
       inc changed
   if changed == 0 and ctx.bes.len == 0:
+    if fmt.len > 0:
+      return good(fmt.replace("{n}", "0"), 0)
     return good("No blocks were changed.", 0)
   var after = ctx.snap
   gridIntoSnap(after, ctx.after)
@@ -243,6 +264,8 @@ proc finishEdit(world: World; ses: WeSession; label: string; ctx: var EditCtx): 
   ses.undo.add HistEntry(label: label, box: ctx.box, snap: ctx.snap)
   ses.redo = @[]
   trimHistory(ses)
+  if fmt.len > 0:
+    return good(fmt.replace("{n}", $rep.changed), rep.changed)
   good(label & ": " & $rep.changed & " block(s) changed.", rep.changed)
 
 # ---- edits on the selection ------------------------------------------------------------------------------------------
@@ -299,7 +322,7 @@ proc weHollow*(world: World; ses: WeSession; pat: Pattern): OpResult =
           ctx.after.setCell(x, y, z, pick(pat, x, y, z))
   finishEdit(world, ses, "hollow", ctx)
 
-proc writeCells(world: World; ses: WeSession; label: string; cells: seq[(int, int, int)]; pat: Pattern): OpResult =
+proc writeCells(world: World; ses: WeSession; label: string; cells: seq[(int, int, int)]; pat: Pattern; fmt = ""): OpResult =
   if cells.len == 0:
     return fail("Nothing to generate.")
   var box = weBox(cells[0][0], cells[0][1], cells[0][2], cells[0][0], cells[0][1], cells[0][2])
@@ -310,7 +333,7 @@ proc writeCells(world: World; ses: WeSession; label: string; cells: seq[(int, in
   if not beginEdit(world, box, ctx, err): return fail(err)
   for c in cells:
     ctx.after.setCell(c[0], c[1], c[2], pick(pat, c[0], c[1], c[2]))
-  finishEdit(world, ses, label, ctx)
+  finishEdit(world, ses, label, ctx, fmt)
 
 proc weSphere*(world: World; ses: WeSession; cx, cy, cz: int; pat: Pattern; rx, ry, rz: int; hollow: bool): OpResult =
   if rx < 1 or ry < 1 or rz < 1:
@@ -533,3 +556,444 @@ proc weRedo*(world: World; ses: WeSession; times: int): OpResult =
   if done == 0:
     return fail("Nothing left to redo.")
   good("Redid " & $done & " edit(s): " & $total & " block(s) changed.", total)
+
+# ---- history settings ------------------------------------------------------------------------------------------------
+
+proc weClearHistory*(ses: WeSession): OpResult =
+  ses.undo = @[]
+  ses.redo = @[]
+  good("History cleared.", 0)
+
+proc weSetHistoryLimit*(ses: WeSession; entries: int): OpResult =
+  if entries < 0 or entries > MaxHistoryLimit:
+    return fail("The history size must be between 0 and " & $MaxHistoryLimit & ".")
+  ses.historyLimit = entries
+  while ses.redo.len > entries:
+    ses.redo.delete(0)
+  trimHistory(ses)
+  good("History size set to " & $entries & " edit(s).", entries)
+
+# ---- selection changes (WorldEdit's CuboidRegion.expand / contract / shift) ------------------------------------------
+
+proc expandAxis(a1, a2: var int; change: int) =
+  if change > 0:
+    if max(a1, a2) == a1: a1 += change else: a2 += change
+  elif change < 0:
+    if min(a1, a2) == a1: a1 += change else: a2 += change
+
+proc contractAxis(a1, a2: var int; change: int) =
+  if change < 0:
+    if max(a1, a2) == a1: a1 += change else: a2 += change
+  elif change > 0:
+    if min(a1, a2) == a1: a1 += change else: a2 += change
+
+proc saveSel(ses: WeSession): array[6, int] =
+  [ses.p1x, ses.p1y, ses.p1z, ses.p2x, ses.p2y, ses.p2z]
+
+proc restoreSel(ses: WeSession; a: array[6, int]) =
+  ses.p1x = a[0]
+  ses.p1y = a[1]
+  ses.p1z = a[2]
+  ses.p2x = a[3]
+  ses.p2y = a[4]
+  ses.p2z = a[5]
+  ses.cuiDirty = true
+
+proc expandSel(ses: WeSession; cx, cy, cz: int) =
+  expandAxis(ses.p1x, ses.p2x, cx)
+  expandAxis(ses.p1y, ses.p2y, cy)
+  expandAxis(ses.p1z, ses.p2z, cz)
+  ses.cuiDirty = true
+
+proc contractSel(ses: WeSession; cx, cy, cz: int) =
+  contractAxis(ses.p1x, ses.p2x, cx)
+  contractAxis(ses.p1y, ses.p2y, cy)
+  contractAxis(ses.p1z, ses.p2z, cz)
+  ses.cuiDirty = true
+
+proc clampSelY(ses: WeSession; world: World) =
+  let lo = int(world.dimension.minY)
+  let hi = int(world.dimension.minY + world.dimension.height - 1'i32)
+  ses.p1y = min(max(ses.p1y, lo), hi)
+  ses.p2y = min(max(ses.p2y, lo), hi)
+
+proc weExpand*(world: World; ses: WeSession; amount, reverse, dx, dy, dz: int): OpResult =
+  ## `//expand <amount> [reverse] [direction]`.
+  var box = weBox(0, 0, 0, 0, 0, 0)
+  var err = ""
+  if not needSelection(ses, world, box, err): return fail(err)
+  let before = volume(box)
+  expandSel(ses, dx * amount, dy * amount, dz * amount)
+  if reverse != 0:
+    expandSel(ses, -dx * reverse, -dy * reverse, -dz * reverse)
+  clampSelY(ses, world)
+  let after = selectionVolume(ses)
+  good("Region expanded " & $(after - before) & " blocks.", after - before)
+
+proc weExpandVert*(world: World; ses: WeSession): OpResult =
+  ## `//expand vert`: the selection reaches from the bottom of the world to its top.
+  var box = weBox(0, 0, 0, 0, 0, 0)
+  var err = ""
+  if not needSelection(ses, world, box, err): return fail(err)
+  let before = volume(box)
+  let lo = int(world.dimension.minY)
+  let hi = int(world.dimension.minY + world.dimension.height - 1'i32)
+  if ses.p1y <= ses.p2y:
+    ses.p1y = lo
+    ses.p2y = hi
+  else:
+    ses.p1y = hi
+    ses.p2y = lo
+  ses.cuiDirty = true
+  let after = selectionVolume(ses)
+  good("Region expanded " & $(after - before) & " blocks (top-to-bottom).", after - before)
+
+proc weContract*(world: World; ses: WeSession; amount, reverse, dx, dy, dz: int): OpResult =
+  ## `//contract <amount> [reverse] [direction]`.
+  var box = weBox(0, 0, 0, 0, 0, 0)
+  var err = ""
+  if not needSelection(ses, world, box, err): return fail(err)
+  let before = volume(box)
+  let s1 = saveSel(ses)
+  contractSel(ses, dx * amount, dy * amount, dz * amount)
+  if reverse != 0:
+    contractSel(ses, -dx * reverse, -dy * reverse, -dz * reverse)
+  # a contraction past the opposite face is refused, as WorldEdit refuses a region of negative size
+  let nb = weBox(ses.p1x, ses.p1y, ses.p1z, ses.p2x, ses.p2y, ses.p2z)
+  if (dx != 0 and sizeX(nb) > sizeX(box)) or (dy != 0 and sizeY(nb) > sizeY(box)) or (dz != 0 and sizeZ(nb) > sizeZ(box)):
+    restoreSel(ses, s1)
+    return fail("The region cannot be contracted that far.")
+  let after = selectionVolume(ses)
+  good("Region contracted " & $(before - after) & " blocks.", before - after)
+
+proc weShift*(world: World; ses: WeSession; amount, dx, dy, dz: int): OpResult =
+  var box = weBox(0, 0, 0, 0, 0, 0)
+  var err = ""
+  if not needSelection(ses, world, box, err): return fail(err)
+  shiftSelection(ses, dx * amount, dy * amount, dz * amount)
+  good("Region shifted.", 0)
+
+proc weOutset*(world: World; ses: WeSession; amount: int; onlyH, onlyV, inward: bool): OpResult =
+  ## `//outset` and `//inset [-h|-v] <amount>`: every face moves out (in) by `amount`.
+  var box = weBox(0, 0, 0, 0, 0, 0)
+  var err = ""
+  if not needSelection(ses, world, box, err): return fail(err)
+  var changes: seq[(int, int, int)] = @[]
+  if not onlyV:
+    changes.add((amount, 0, 0))
+    changes.add((-amount, 0, 0))
+    changes.add((0, 0, amount))
+    changes.add((0, 0, -amount))
+  if not onlyH:
+    changes.add((0, amount, 0))
+    changes.add((0, -amount, 0))
+  let s1 = saveSel(ses)
+  for c in changes:
+    if inward:
+      contractSel(ses, c[0], c[1], c[2])
+    else:
+      expandSel(ses, c[0], c[1], c[2])
+  if inward:
+    let nb = weBox(ses.p1x, ses.p1y, ses.p1z, ses.p2x, ses.p2y, ses.p2z)
+    if (not onlyV and (sizeX(nb) > sizeX(box) or sizeZ(nb) > sizeZ(box))) or (not onlyH and sizeY(nb) > sizeY(box)):
+      restoreSel(ses, s1)
+      return fail("The region cannot be inset that far.")
+    return good("Region inset.", 0)
+  clampSelY(ses, world)
+  good("Region outset.", 0)
+
+proc weChunk*(world: World; ses: WeSession; px, pz: int): OpResult =
+  ## `//chunk`: the chunk you stand in, the whole height of the world.
+  let cx = floorDiv(px, 16)
+  let cz = floorDiv(pz, 16)
+  let dim = world.dimension.minecraftName
+  let lo = int(world.dimension.minY)
+  let hi = int(world.dimension.minY + world.dimension.height - 1'i32)
+  setPos1(ses, dim, cx * 16, lo, cz * 16)
+  setPos2(ses, dim, cx * 16 + 15, hi, cz * 16 + 15)
+  good("Chunk selected: " & $cx & ", " & $cz, 0)
+
+# ---- region edits ----------------------------------------------------------------------------------------------------
+
+proc weCenter*(world: World; ses: WeSession; pat: Pattern): OpResult =
+  var box = weBox(0, 0, 0, 0, 0, 0)
+  var err = ""
+  if not needSelection(ses, world, box, err): return fail(err)
+  writeCells(world, ses, "center", centerCells(box), pat, "Center set. ({n} blocks changed)")
+
+proc smoothBox(world: World; ses: WeSession; box: WeBox; iterations: int; label, fmt: string): OpResult =
+  var ctx = EditCtx()
+  var err = ""
+  if not beginEdit(world, box, ctx, err): return fail(err)
+  ctx.after = smoothGrid(ctx.before, iterations)
+  finishEdit(world, ses, label, ctx, fmt)
+
+proc weSmooth*(world: World; ses: WeSession; iterations: int): OpResult =
+  ## `//smooth [iterations]`.
+  var box = weBox(0, 0, 0, 0, 0, 0)
+  var err = ""
+  if not needSelection(ses, world, box, err): return fail(err)
+  if iterations < 1:
+    return fail("The number of iterations must be at least 1.")
+  smoothBox(world, ses, box, iterations, "smooth", "Terrain's height map smoothed. {n} blocks changed.")
+
+proc weNaturalize*(world: World; ses: WeSession): OpResult =
+  var box = weBox(0, 0, 0, 0, 0, 0)
+  var err = ""
+  if not needSelection(ses, world, box, err): return fail(err)
+  var ctx = EditCtx()
+  if not beginEdit(world, box, ctx, err): return fail(err)
+  let (okG, grass) = defaultStateByName("grass_block")
+  let (okD, dirt) = defaultStateByName("dirt")
+  let (okS, stone) = defaultStateByName("stone")
+  if not (okG and okD and okS):
+    return fail("The block registry lacks grass, dirt or stone.")
+  ctx.after = naturalizeGrid(ctx.before, grass, dirt, stone)
+  finishEdit(world, ses, "naturalize", ctx, "{n} block(s) have been made to look more natural.")
+
+proc weOverlay*(world: World; ses: WeSession; pat: Pattern): OpResult =
+  ## `//overlay <pattern>`: on the highest non-air block of each column of the selection, one block of the pattern.
+  var box = weBox(0, 0, 0, 0, 0, 0)
+  var err = ""
+  if not needSelection(ses, world, box, err): return fail(err)
+  let top = int(world.dimension.minY + world.dimension.height - 1'i32)
+  var area = box
+  if area.maxY < top:
+    area.maxY += 1
+  var ctx = EditCtx()
+  if not beginEdit(world, area, ctx, err): return fail(err)
+  for z in box.minZ .. box.maxZ:
+    for x in box.minX .. box.maxX:
+      var y = box.maxY
+      while y >= box.minY:
+        if not isAir(ctx.before.cellAt(x, y, z)):
+          break
+        dec y
+      if y >= box.minY and y + 1 <= area.maxY:
+        ctx.after.setCell(x, y + 1, z, pick(pat, x, y + 1, z))
+  finishEdit(world, ses, "overlay", ctx, "{n} blocks have been overlaid.")
+
+proc weLine*(world: World; ses: WeSession; pat: Pattern; thickness: int; hollow: bool): OpResult =
+  ## `//line [-h] <pattern> [thickness]`: from position 1 to position 2.
+  var box = weBox(0, 0, 0, 0, 0, 0)
+  var err = ""
+  if not needSelection(ses, world, box, err): return fail(err)
+  if thickness < 0:
+    return fail("The thickness cannot be negative.")
+  writeCells(world, ses, "line", lineCells(ses.p1x, ses.p1y, ses.p1z, ses.p2x, ses.p2y, ses.p2z, thickness, not hollow), pat,
+    "{n} blocks have been changed.")
+
+proc wePyramid*(world: World; ses: WeSession; cx, cy, cz: int; pat: Pattern; size: int; hollow: bool): OpResult =
+  if size < 1:
+    return fail("The size must be at least 1.")
+  if (2 * size + 1) * (2 * size + 1) * (size + 1) > MaxEditCells:
+    return fail("That pyramid is too large.")
+  writeCells(world, ses, "pyramid", pyramidCells(cx, cy, cz, size, not hollow), pat, "{n} blocks have been created.")
+
+proc weShapeMsg*(world: World; ses: WeSession; cells: seq[(int, int, int)]; pat: Pattern; label: string): OpResult =
+  ## A sphere or cylinder with WorldEdit's "created" wording (`//hsphere`, `//hcyl`, the brushes).
+  writeCells(world, ses, label, cells, pat, "{n} blocks have been created.")
+
+# ---- flood fills from where the player stands ------------------------------------------------------------------------
+
+proc areaAround(world: World; cx, cy, cz, r, yLo, yHi: int): WeBox =
+  let lo = int(world.dimension.minY)
+  let hi = int(world.dimension.minY + world.dimension.height - 1'i32)
+  weBox(cx - r, max(yLo, lo), cz - r, cx + r, min(yHi, hi), cz + r)
+
+proc inBall(x, y, z, cx, cy, cz, r: int): bool =
+  let dx = x - cx
+  let dy = y - cy
+  let dz = z - cz
+  dx * dx + dy * dy + dz * dz <= r * r
+
+proc isFluidNamed(state: uint32; name: string): bool =
+  blockNameOfState(state) == name
+
+proc waterlogged(state: uint32): bool =
+  for p in stateProperties(state):
+    if p.name == "waterlogged" and p.value == "true":
+      return true
+  false
+
+proc unWaterlogged(state: uint32): uint32 =
+  var props = stateProperties(state)
+  for i in 0 ..< props.len:
+    if props[i].name == "waterlogged":
+      props[i].value = "false"
+  stateIdFromProps(blockIdOf(state), props)
+
+proc weDrain*(world: World; ses: WeSession; cx, cy, cz, radius: int; alsoWaterlogged: bool): OpResult =
+  ## `//drain [-w] <radius>`: the water and lava connected to the 3x3x3 cells around you, within the radius, become air
+  ## (-w: waterlogged blocks are dried too).
+  if radius < 1:
+    return fail("The radius must be at least 1.")
+  let area = areaAround(world, cx, cy, cz, radius, cy - radius, cy + radius)
+  if area.minY > area.maxY:
+    return fail("That is outside the world.")
+  var ctx = EditCtx()
+  var err = ""
+  if not beginEdit(world, area, ctx, err): return fail(err)
+  var allowed = newSeq[bool](ctx.before.cells.len)
+  for y in area.minY .. area.maxY:
+    for z in area.minZ .. area.maxZ:
+      for x in area.minX .. area.maxX:
+        let st = ctx.before.cellAt(x, y, z)
+        let liquid = isFluidNamed(st, "water") or isFluidNamed(st, "lava") or (alsoWaterlogged and waterlogged(st))
+        allowed[gridIndex(ctx.before, x, y, z)] = liquid and inBall(x, y, z, cx, cy, cz, radius)
+  var seeds: seq[(int, int, int)] = @[]
+  for oy in -1 .. 1:
+    for oz in -1 .. 1:
+      for ox in -1 .. 1:
+        seeds.add((cx + ox, cy + oy, cz + oz))
+  for c in floodCells(ctx.before, allowed, seeds, true):
+    let st = ctx.before.cellAt(c[0], c[1], c[2])
+    if isFluidNamed(st, "water") or isFluidNamed(st, "lava"):
+      ctx.after.setCell(c[0], c[1], c[2], 0'u32)
+    else:
+      ctx.after.setCell(c[0], c[1], c[2], unWaterlogged(st))
+  finishEdit(world, ses, "drain", ctx, "{n} blocks have been drained.")
+
+proc weFill*(world: World; ses: WeSession; cx, cy, cz: int; pat: Pattern; radius, depth: int): OpResult =
+  ## `//fill <pattern> <radius> [depth]`: the air connected to your cell going sideways and down (never up), within the
+  ## radius and `depth` layers from your feet down.
+  if radius < 1:
+    return fail("The radius must be at least 1.")
+  if depth < 1:
+    return fail("The depth must be at least 1.")
+  let area = areaAround(world, cx, cy, cz, radius, cy - depth + 1, cy)
+  if area.minY > area.maxY:
+    return fail("That is outside the world.")
+  var ctx = EditCtx()
+  var err = ""
+  if not beginEdit(world, area, ctx, err): return fail(err)
+  var allowed = newSeq[bool](ctx.before.cells.len)
+  for y in area.minY .. area.maxY:
+    for z in area.minZ .. area.maxZ:
+      for x in area.minX .. area.maxX:
+        allowed[gridIndex(ctx.before, x, y, z)] = isAir(ctx.before.cellAt(x, y, z)) and inBall(x, y, z, cx, cy, cz, radius)
+  for c in floodCells(ctx.before, allowed, @[(cx, cy, cz)], false):
+    ctx.after.setCell(c[0], c[1], c[2], pick(pat, c[0], c[1], c[2]))
+  finishEdit(world, ses, "fill", ctx, "{n} blocks have been filled.")
+
+proc weFixWater*(world: World; ses: WeSession; cx, cy, cz, radius: int): OpResult =
+  ## `//fixwater <radius>`: from the water around you, water and air at or below your feet (never up) within the radius
+  ## becomes still water source blocks.
+  if radius < 1:
+    return fail("The radius must be at least 1.")
+  let area = areaAround(world, cx, cy, cz, radius, cy - radius, cy)
+  if area.minY > area.maxY:
+    return fail("That is outside the world.")
+  let (okW, water) = defaultStateByName("water")
+  if not okW:
+    return fail("No water in the block registry.")
+  var ctx = EditCtx()
+  var err = ""
+  if not beginEdit(world, area, ctx, err): return fail(err)
+  var allowed = newSeq[bool](ctx.before.cells.len)
+  for y in area.minY .. area.maxY:
+    for z in area.minZ .. area.maxZ:
+      for x in area.minX .. area.maxX:
+        let st = ctx.before.cellAt(x, y, z)
+        allowed[gridIndex(ctx.before, x, y, z)] = (isAir(st) or isFluidNamed(st, "water")) and inBall(x, y, z, cx, cy, cz, radius)
+  var seeds: seq[(int, int, int)] = @[]
+  for oy in -1 .. 1:
+    for oz in -1 .. 1:
+      for ox in -1 .. 1:
+        let x = cx + ox
+        let y = cy + oy
+        let z = cz + oz
+        if area.inside(x, y, z) and isFluidNamed(ctx.before.cellAt(x, y, z), "water"):
+          seeds.add((x, y, z))
+  for c in floodCells(ctx.before, allowed, seeds, false):
+    ctx.after.setCell(c[0], c[1], c[2], water)
+  finishEdit(world, ses, "fixwater", ctx, "{n} blocks have been fixed.")
+
+# ---- tools and brushes -----------------------------------------------------------------------------------------------
+
+proc bindTool*(ses: WeSession; tool: WeTool) =
+  for i in 0 ..< ses.tools.len:
+    if ses.tools[i].item == tool.item:
+      ses.tools[i] = tool
+      return
+  ses.tools.add tool
+
+proc unbindTool*(ses: WeSession; item: string): bool =
+  var kept: seq[WeTool] = @[]
+  for t in ses.tools:
+    if t.item == item:
+      result = true
+    else:
+      kept.add t
+  ses.tools = kept
+
+proc toolFor*(ses: WeSession; item: string; tool: var WeTool): bool =
+  for t in ses.tools:
+    if t.item == item:
+      tool = t
+      return true
+  false
+
+proc weRaycast*(world: World; ex, ey, ez, yaw, pitch, maxDist: float; hx, hy, hz: var int): bool =
+  ## The first non-air block along the look direction from the eye, up to `maxDist` blocks (WorldEdit's block trace).
+  let yr = degToRad(yaw)
+  let pr = degToRad(pitch)
+  let dx = -sin(yr) * cos(pr)
+  let dy = -sin(pr)
+  let dz = cos(yr) * cos(pr)
+  var t = 0.0
+  var lastX = high(int)
+  var lastY = high(int)
+  var lastZ = high(int)
+  while t <= maxDist:
+    let x = int(floor(ex + dx * t))
+    let y = int(floor(ey + dy * t))
+    let z = int(floor(ez + dz * t))
+    if x != lastX or y != lastY or z != lastZ:
+      lastX = x
+      lastY = y
+      lastZ = z
+      let st = wlevel.getBlockState(world.level, newBlockPos(int32(x), int32(y), int32(z)))
+      if not isAir(st):
+        hx = x
+        hy = y
+        hz = z
+        return true
+    t += 0.05
+  false
+
+proc weUseTool*(world: World; ses: WeSession; tool: WeTool; x, y, z: int): OpResult =
+  ## A brush or the replacer acting on the block at (x, y, z).
+  let lo = int(world.dimension.minY)
+  let hi = int(world.dimension.minY + world.dimension.height - 1'i32)
+  case tool.kind
+  of wtBrushSphere:
+    var cells: seq[(int, int, int)] = @[]
+    for c in sphereCells(x, y, z, tool.radius, tool.radius, tool.radius, tool.hollow):
+      if c[1] >= lo and c[1] <= hi:
+        cells.add c
+    writeCells(world, ses, "brush", cells, tool.pattern, "{n} blocks have been created.")
+  of wtBrushCylinder:
+    var cells: seq[(int, int, int)] = @[]
+    for c in cylCells(x, y, z, tool.radius, tool.radius, tool.height, tool.hollow):
+      if c[1] >= lo and c[1] <= hi:
+        cells.add c
+    writeCells(world, ses, "brush", cells, tool.pattern, "{n} blocks have been created.")
+  of wtBrushSmooth:
+    let box = weBox(x - tool.radius, max(y - tool.radius, lo), z - tool.radius, x + tool.radius, min(y + tool.radius, hi),
+      z + tool.radius)
+    smoothBox(world, ses, box, tool.iterations, "brush", "Terrain's height map smoothed. {n} blocks changed.")
+  of wtReplace:
+    writeCells(world, ses, "replace tool", @[(x, y, z)], tool.pattern, "{n} blocks have been changed.")
+  of wtInfo:
+    let st = wlevel.getBlockState(world.level, newBlockPos(int32(x), int32(y), int32(z)))
+    var label = "minecraft:" & blockNameOfState(st)
+    let props = stateProperties(st)
+    if props.len > 0:
+      label.add "["
+      for i in 0 ..< props.len:
+        if i > 0:
+          label.add ","
+        label.add props[i].name & "=" & props[i].value
+      label.add "]"
+    good("@(" & $x & ", " & $y & ", " & $z & "): " & label & " (#" & $st & ")", 0)

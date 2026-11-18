@@ -439,6 +439,322 @@ def worldedit_commands(s):
     s.expect('WorldEdit', '/plugins names the built-in WorldEdit', since=n)
 
 
+def _in_ellipsoid(dx, dy, dz, rx, ry, rz):
+    ax, ay, az = rx + 0.5, ry + 0.5, rz + 0.5
+    return (dx * dx) / (ax * ax) + (dy * dy) / (ay * ay) + (dz * dz) / (az * az) <= 1.0
+
+
+def _sphere_cells(cx, cy, cz, r, hollow):
+    out = []
+    for dy in range(-r, r + 1):
+        for dz in range(-r, r + 1):
+            for dx in range(-r, r + 1):
+                if not _in_ellipsoid(dx, dy, dz, r, r, r):
+                    continue
+                if hollow and all(_in_ellipsoid(dx + a, dy + b, dz + c, r, r, r)
+                                  for a, b, c in ((1, 0, 0), (-1, 0, 0), (0, 1, 0), (0, -1, 0), (0, 0, 1), (0, 0, -1))):
+                    continue
+                out.append((cx + dx, cy + dy, cz + dz))
+    return out
+
+
+def _cyl_cells(cx, cy, cz, r, height, hollow):
+    out = []
+    for dy in range(height):
+        for dz in range(-r, r + 1):
+            for dx in range(-r, r + 1):
+                if not _in_ellipsoid(dx, 0, dz, r, 0, r):
+                    continue
+                if hollow and all(_in_ellipsoid(dx + a, 0, dz + c, r, 0, r) for a, c in ((1, 0), (-1, 0), (0, 1), (0, -1))):
+                    continue
+                out.append((cx + dx, cy + dy, cz + dz))
+    return out
+
+
+def _smooth_expect(before, x0, y0, z0, w, h, d, iterations):
+    """A port of wecore.smoothGrid: `before[(x, y, z)]` is the state; returns the grid after."""
+    import math as _m
+    after = dict(before)
+    def top(x, z):
+        for y in range(y0 + h - 1, y0 - 1, -1):
+            if before[(x, y, z)] != 0:
+                return y
+        return y0
+    R = 5
+    k = []
+    tot = 0.0
+    for ky in range(-R, R + 1):
+        for kx in range(-R, R + 1):
+            v = _m.exp(-float(kx * kx + ky * ky) / (2.0 * 1.0 * 1.0))
+            k.append(v)
+            tot += v
+    k = [v / tot for v in k]
+    cur = [[top(x0 + x, z0 + z) for x in range(w)] for z in range(d)]
+    data = [[float(cur[z][x]) for x in range(w)] for z in range(d)]
+    for _ in range(max(iterations, 1)):
+        nxt = [[0.0] * w for _ in range(d)]
+        for z in range(d):
+            for x in range(w):
+                acc = 0.0
+                for ky in range(-R, R + 1):
+                    for kx in range(-R, R + 1):
+                        sx = min(max(x + kx, 0), w - 1)
+                        sz = min(max(z + ky, 0), d - 1)
+                        acc += data[sz][sx] * k[(ky + R) * (2 * R + 1) + (kx + R)]
+                nxt[z][x] = acc
+        data = nxt
+    maxY = y0 + h - 1
+    for z in range(d):
+        for x in range(w):
+            xr, zr = x0 + x, z0 + z
+            cH = cur[z][x]
+            nH = min(maxY, int(_m.floor(data[z][x] + 0.5)))
+            if nH > cH:
+                existing = before[(xr, cH, zr)]
+                after[(xr, nH, zr)] = existing
+                scale = float(cH - y0) / float(nH - y0)
+                for y in range(nH - 1 - y0, -1, -1):
+                    after[(xr, y0 + y, zr)] = before[(xr, y0 + int(_m.floor(y * scale)), zr)]
+            elif cH > nH:
+                scale = float(cH - y0) / float(max(nH - y0, 1))
+                for y in range(0, nH - y0):
+                    after[(xr, y0 + y, zr)] = before[(xr, y0 + min(int(_m.floor(y * scale)), cH - y0), zr)]
+                after[(xr, nH, zr)] = before[(xr, cH, zr)]
+                for y in range(nH + 1, cH + 1):
+                    after[(xr, y, zr)] = 0
+    return after
+
+
+def _tp(s, x, y, z):
+    s.command('tp @s %.2f %.2f %.2f' % (x, y, z))
+    s.wait(lambda: s.position() is not None and abs(s.position()[0] - x) < 0.01 and abs(s.position()[1] - y) < 0.01 and
+           abs(s.position()[2] - z) < 0.01, 'the teleport to %.1f %.1f %.1f' % (x, y, z))
+
+
+def _use_on(s, x, y, z):
+    s.c.send(s.m.SB_USE_ON, s.m.varint(0) + s.m.block_pos(x, y, z) + s.m.varint(1) + struct.pack('>fff', 0.5, 1.0, 0.5) +
+             bytes([0, 0]) + s.m.varint(40))
+
+
+@scenario('worldedit_more')
+def worldedit_more(s):
+    """The WorldEdit commands beyond the basics, each with the number of blocks it must change, checked as the client sees the
+    cells: selection changes (//expand, //contract, //shift, //outset, //inset, //chunk), //center, //line, //pyramid, //hpyramid,
+    //hsphere, //hcyl, //fill, //fixwater, //drain, //overlay, //naturalize, //smooth (against a port of the height-map filter),
+    //copy -e //paste -e with an armor stand, brushes and tools on a right click (on a block and in the air), //historysize and
+    //clearhistory. Every command must also be a node of the client's command tree."""
+    s.wait(lambda: s.position() is not None and s.chunks() >= 9, 'the spawn chunks', 60.0)
+    nodes, root = s.m.COMMAND_TREE['nodes'], s.m.COMMAND_TREE['root']
+    names = set(nodes[c]['name'] for c in nodes[root]['children'])
+    want = ['/expand', '/contract', '/shift', '/outset', '/inset', '/chunk', '/center', '/smooth', '/naturalize', '/overlay',
+            '/drain', '/fill', '/fixwater', '/line', '/pyramid', '/hpyramid', '/hsphere', '/hcyl', '/brush', '/br', '/tool', '/none',
+            '/clearhistory', '/historysize']
+    missing = [n for n in want if n not in names]
+    s.check(not missing, 'not in the command tree: %r' % missing)
+    def node(cmd, *path):
+        at = _tree_child(nodes, root, cmd)
+        for p in path:
+            at = _tree_child(nodes, at, p)
+            s.check(at is not None, '%s has no %r below it' % (cmd, path))
+        return nodes[at]
+    s.check(node('/expand', 'vert')['kind'] == 1 and node('/expand', 'amount', 'reverse', 'direction')['parser'] == 5, '//expand tree')
+    s.check(node('/brush', 'sphere', '-h', 'pattern', 'radius')['parser'] == 3, '//brush sphere -h <pattern> <radius>')
+    s.check(node('/brush', 'cylinder', 'pattern', 'radius', 'height')['parser'] == 3, '//brush cylinder ... <height>')
+    s.check(node('/brush', 'smooth', 'size', 'iterations')['flags'] & 4, '//brush smooth <size> <iterations>')
+    s.check(node('/br')['redirect'] is not None, '//br is not an alias of //brush')
+    s.check(node('/tool', 'repl', 'pattern')['parser'] == 5, '//tool repl <pattern>')
+    s.check(node('/drain', '-w', 'radius')['parser'] == 3 and node('/fill', 'pattern', 'radius', 'depth')['parser'] == 3, 'drain/fill')
+    s.check(node('/paste', '-ase')['flags'] & 4 and node('/copy', '-e')['flags'] & 4, '//paste -ase, //copy -e')
+    print('  all %d new commands are in the tree' % len(want), flush=True)
+
+    px, py, pz = s.position()
+    bx, bz, y0 = int(px // 1) + 3, int(pz // 1) + 3, 200
+    s.command('gamemode creative')
+    ids = _state_ids(s, bx, y0 + 30, bz, ['stone', 'dirt', 'grass_block', 'glass', 'glowstone'])
+    stone, dirt, grass, glass, glow = ids['stone'], ids['dirt'], ids['grass_block'], ids['glass'], ids['glowstone']
+
+    def sel(x1, y1, z1, x2, y2, z2):
+        _we(s, 'pos1 %d %d %d' % (x1, y1, z1), 'Position 1 set', '//pos1 %d %d %d' % (x1, y1, z1))
+        _we(s, 'pos2 %d %d %d' % (x2, y2, z2), 'Position 2 set', '//pos2 %d %d %d' % (x2, y2, z2))
+
+    def cells_are(cells, state, what):
+        s.wait(lambda: all(s.w.block(*c) == state for c in cells), what)
+
+    # ---- selection changes
+    Y = y0 + 20
+    sel(bx, Y, bz, bx + 2, Y + 2, bz + 2)
+    _we(s, 'expand 2 up', 'Region expanded 18 blocks.', '//expand 2 up')
+    _we(s, 'size', '3 x 5 x 3, 45 blocks', 'size after expand')
+    _we(s, 'contract 2 up', 'Region contracted 18 blocks.', '//contract 2 up')
+    _we(s, 'size', '3 x 3 x 3, 27 blocks', 'size after contract')
+    _we(s, 'shift 2 down', 'Region shifted.', '//shift 2 down')
+    _we(s, 'outset 1', 'Region outset.', '//outset 1')
+    _we(s, 'size', '5 x 5 x 5, 125 blocks', 'size after outset')
+    _we(s, 'inset 1', 'Region inset.', '//inset 1')
+    _we(s, 'inset -h 1', 'Region inset.', '//inset -h 1')
+    _we(s, 'size', '1 x 3 x 1, 3 blocks', 'size after inset -h')
+    _we(s, 'outset -h 1', 'Region outset.', '//outset -h 1')
+    _we(s, 'expand 1 1 east', 'Region expanded 18 blocks.', '//expand 1 1 east (and 1 west)')
+    _we(s, 'size', '5 x 3 x 3, 45 blocks', 'size after expand east+west')
+    _we(s, 'contract 1 1 east', 'Region contracted 18 blocks.', '//contract 1 1 east')
+    _we(s, 'contract 5 up', 'cannot be contracted that far', '//contract past the far face is refused')
+    _we(s, 'expand vert', '(top-to-bottom)', '//expand vert')
+    _we(s, 'size', '3 x 384 x 3', 'size after expand vert')
+    cx, cz = int(math.floor(s.position()[0] / 16)), int(math.floor(s.position()[2] / 16))
+    _we(s, 'chunk', 'Chunk selected: %d, %d' % (cx, cz), '//chunk')
+    _we(s, 'size', '16 x 384 x 16', 'size of a chunk selection')
+
+    # ---- //center, //line
+    sel(bx + 14, y0, bz, bx + 16, y0 + 2, bz + 2)
+    _we(s, 'center glass', 'Center set. (1 blocks changed)', '//center on 3x3x3')
+    cells_are([(bx + 15, y0 + 1, bz + 1)], glass, 'the centre cell to be glass')
+    _we(s, 'undo', 'Undid 1', 'undo center')
+    sel(bx, y0 + 6, bz, bx + 4, y0 + 6, bz + 2)
+    _we(s, 'line glass', '5 blocks have been changed.', '//line')
+    line = [(bx, y0 + 6, bz), (bx + 1, y0 + 6, bz + 1), (bx + 2, y0 + 6, bz + 1), (bx + 3, y0 + 6, bz + 2), (bx + 4, y0 + 6, bz + 2)]
+    cells_are(line, glass, 'the line cells to be glass')
+    _we(s, 'undo', 'Undid 1', 'undo line')
+    cells_are(line, 0, 'the line removed')
+
+    # ---- shapes at the player: pyramids, hollow sphere and cylinder
+    ax, ay, az = bx + 20, y0 + 6, bz
+    _tp(s, ax + 0.5, ay, az + 0.5)
+    _we(s, 'pyramid stone 2', '10 blocks have been created.', '//pyramid stone 2')
+    pyr = [(ax + x, ay, az + z) for x in (-1, 0, 1) for z in (-1, 0, 1)] + [(ax, ay + 1, az)]
+    cells_are(pyr, stone, 'the pyramid')
+    _we(s, 'undo', 'Undid 1', 'undo pyramid')
+    _we(s, 'hpyramid stone 2', '9 blocks have been created.', '//hpyramid stone 2')
+    cells_are([c for c in pyr if c != (ax, ay, az)], stone, 'the hollow pyramid')
+    s.check(s.w.block(ax, ay, az) == 0, 'the hollow pyramid is not hollow')
+    _we(s, 'undo', 'Undid 1', 'undo hpyramid')
+    hs = _sphere_cells(ax, ay, az, 2, True)
+    _we(s, 'hsphere glass 2', 'sphere: %d block(s) changed.' % len(hs), '//hsphere glass 2 (%d cells)' % len(hs))
+    cells_are(hs, glass, 'the hollow sphere')
+    s.check(s.w.block(ax, ay, az) == 0, 'the hollow sphere has a filled centre')
+    _we(s, 'undo', 'Undid 1', 'undo hsphere')
+    hc = _cyl_cells(ax, ay, az, 2, 2, True)
+    _we(s, 'hcyl glass 2 2', 'cylinder: %d block(s) changed.' % len(hc), '//hcyl glass 2 2 (%d cells)' % len(hc))
+    cells_are(hc, glass, 'the hollow cylinder')
+    _we(s, 'undo', 'Undid 1', 'undo hcyl')
+
+    # ---- a stone basin: //fill, //fixwater, //drain
+    sel(bx, y0, bz, bx + 4, y0 + 1, bz + 4)
+    _we(s, 'set stone', 'set: 50 block(s) changed', 'the basin block')
+    sel(bx + 1, y0 + 1, bz + 1, bx + 3, y0 + 1, bz + 3)
+    _we(s, 'set air', 'set: 9 block(s) changed', 'the basin hole')
+    hole = [(bx + x, y0 + 1, bz + z) for x in (1, 2, 3) for z in (1, 2, 3)]
+    _tp(s, bx + 2.5, y0 + 1, bz + 2.5)
+    _we(s, 'fill glass 5', '9 blocks have been filled.', '//fill glass 5')
+    cells_are(hole, glass, 'the hole filled with glass')
+    _we(s, 'undo', 'Undid 1', 'undo fill')
+    cells_are(hole, 0, 'the hole empty again')
+    s.command('setblock %d %d %d minecraft:water' % (bx + 2, y0 + 1, bz + 2))
+    s.wait(lambda: s.w.block(bx + 2, y0 + 1, bz + 2) not in (None, 0), 'the water source')
+    water = s.w.block(bx + 2, y0 + 1, bz + 2)
+    _we(s, 'fixwater 3', '8 blocks have been fixed.', '//fixwater 3')
+    cells_are(hole, water, 'every cell of the hole a water source')
+    _we(s, 'drain 3', '9 blocks have been drained.', '//drain 3')
+    cells_are(hole, 0, 'the basin drained')
+
+    # ---- //overlay, //naturalize
+    sel(bx + 8, y0, bz, bx + 10, y0, bz + 2)
+    _we(s, 'set stone', 'set: 9 block(s) changed', 'the overlay floor')
+    sel(bx + 8, y0, bz, bx + 10, y0 + 1, bz + 2)
+    _we(s, 'overlay glass', '9 blocks have been overlaid.', '//overlay glass')
+    cells_are([(bx + 8 + x, y0 + 1, bz + z) for x in range(3) for z in range(3)], glass, 'glass on top of the floor')
+    sel(bx + 12, y0, bz, bx + 12, y0 + 5, bz)
+    _we(s, 'set stone', 'set: 6 block(s) changed', 'a stone column')
+    _we(s, 'naturalize', '4 block(s) have been made to look more natural.', '//naturalize')
+    col = [(bx + 12, y0 + y, bz) for y in range(6)]
+    s.wait(lambda: [s.w.block(*c) for c in col] == [stone, stone, dirt, dirt, dirt, grass], 'grass, three dirt, then stone')
+
+    # ---- //smooth: a 7x7 stone floor with a spike of 4 in the middle
+    x0 = bx + 24
+    sel(x0, y0, bz, x0 + 6, y0, bz + 6)
+    _we(s, 'set stone', 'set: 49 block(s) changed', 'the smooth floor')
+    sel(x0 + 3, y0 + 1, bz + 3, x0 + 3, y0 + 4, bz + 3)
+    _we(s, 'set stone', 'set: 4 block(s) changed', 'the spike')
+    before = {}
+    for x in range(x0, x0 + 7):
+        for y in range(y0, y0 + 6):
+            for z in range(bz, bz + 7):
+                before[(x, y, z)] = stone if (y == y0 or (x == x0 + 3 and z == bz + 3 and y <= y0 + 4)) else 0
+    after = _smooth_expect(before, x0, y0, bz, 7, 6, 7, 1)
+    n_changed = sum(1 for k in before if before[k] != after[k])
+    sel(x0, y0, bz, x0 + 6, y0 + 5, bz + 6)
+    _we(s, 'smooth', "Terrain's height map smoothed. %d blocks changed." % n_changed, '//smooth (%d expected)' % n_changed)
+    s.wait(lambda: all(s.w.block(*k) == v for k, v in after.items()), 'the smoothed terrain as the filter predicts')
+    print('  //smooth changed %d blocks as predicted' % n_changed, flush=True)
+
+    # ---- //copy -e and //paste -e with an armor stand
+    ex = bx + 34
+    sel(ex, y0, bz, ex + 2, y0 + 2, bz + 2)
+    s.command('summon minecraft:armor_stand %d.5 %d %d.5 {NoGravity:1b}' % (ex + 1, y0 + 1, bz + 1))
+    time.sleep(0.5)
+    _we(s, 'copy -e', '1 entities copied.', '//copy -e')
+    _we(s, 'copy', 'Copied 27 block(s).', '//copy without -e')
+    n = len(s.w.chat)
+    s.command('/copy')
+    time.sleep(0.5)
+    s.check(not any('entities' in t for t in s.w.chat[n:]), 'a plain //copy copied entities')
+    _we(s, 'copy -e', '1 entities copied.', '//copy -e again')
+    _tp(s, ex + 1.5, y0 + 10, bz + 1.5)
+    _we(s, 'paste -e', '1 entities pasted.', '//paste -e')
+
+    # ---- brushes and tools on a right click
+    tx, ty, tz = bx + 40, y0, bz
+    s.command('setblock %d %d %d minecraft:stone' % (tx, ty, tz))
+    s.wait(lambda: s.w.block(tx, ty, tz) == stone, 'the brush target')
+    s.command('clear @s')
+    s.command('give @s minecraft:stick')
+    time.sleep(0.5)
+    s.c.send(s.m.SB_CARRIED, struct.pack('>h', 0))
+    _we(s, 'brush sphere glass 1', 'Sphere brush shape equipped (1).', '//brush sphere glass 1')
+    ball = _sphere_cells(tx, ty, tz, 1, False)
+    _use_on(s, tx, ty, tz)
+    cells_are(ball, glass, 'the sphere brush stroke (%d cells)' % len(ball))
+    _we(s, 'undo', 'Undid 1 edit(s): %d block(s) restored.' % len(ball), 'undo the stroke')
+    cells_are([c for c in ball if c != (tx, ty, tz)], 0, 'the stroke undone')
+    # in the air: look straight down from above the target, right click
+    _tp(s, tx + 0.5, ty + 3, tz + 0.5)
+    s.c.send(s.m.SB_MOVE_POS_ROT, struct.pack('>dddff', tx + 0.5, ty + 3.0, tz + 0.5, 0.0, 90.0) + s.m.move_flags(False))
+    time.sleep(0.3)
+    s.c.send(s.m.SB_USE, s.m.varint(0) + s.m.varint(41) + struct.pack('>ff', 0.0, 90.0))
+    cells_are([c for c in ball if c[1] < ty + 2], glass, 'the brush stroke from a right click in the air')
+    _we(s, 'undo', 'Undid 1', 'undo the air stroke')
+    _we(s, 'br cylinder glass 1 2', 'Cylinder brush shape equipped (1 by 2).', '//br cylinder glass 1 2')
+    cyl = _cyl_cells(tx, ty, tz, 1, 2, False)
+    _use_on(s, tx, ty, tz)
+    cells_are(cyl, glass, 'the cylinder brush stroke (%d cells)' % len(cyl))
+    _we(s, 'undo', 'Undid 1 edit(s): %d block(s) restored.' % len(cyl), 'undo the cylinder')
+    _we(s, 'brush smooth', 'Smooth brush equipped (2 x 4x using any block).', '//brush smooth')
+    _we(s, 'br none', 'Brush unbound from your current item.', '//br none')
+    _use_on(s, tx, ty, tz)
+    time.sleep(1.0)
+    s.check(s.w.block(tx, ty + 1, tz) == 0, 'the unbound brush still painted')
+    _we(s, 'tool info', 'Info tool bound to minecraft:stick.', '//tool info')
+    n = len(s.w.chat)
+    _use_on(s, tx, ty, tz)
+    s.expect('@(%d, %d, %d): minecraft:stone' % (tx, ty, tz), 'the info tool', since=n)
+    _we(s, 'tool repl glowstone', 'Block replacer tool bound to minecraft:stick.', '//tool repl glowstone')
+    _use_on(s, tx, ty, tz)
+    cells_are([(tx, ty, tz)], glow, 'the replacer tool')
+    _we(s, 'none', 'Tool unbound from your current item.', '//none')
+    _we(s, 'undo', 'Undid 1', 'undo the replacer')
+    cells_are([(tx, ty, tz)], stone, 'the target is stone again')
+
+    # ---- history size and clearing
+    sel(tx + 3, ty, tz, tx + 3, ty, tz)
+    _we(s, 'historysize 1', 'History size set to 1 edit(s).', '//historysize 1')
+    _we(s, 'set stone', 'set: 1 block(s) changed', 'edit 1')
+    _we(s, 'set glass', 'set: 1 block(s) changed', 'edit 2')
+    _we(s, 'undo 2', 'Undid 1 edit(s)', 'only one edit kept')
+    cells_are([(tx + 3, ty, tz)], stone, 'the cell back at edit 1')
+    _we(s, 'historysize 64', 'History size set to 64', '//historysize 64')
+    _we(s, 'clearhistory', 'History cleared.', '//clearhistory')
+    _we(s, 'undo', 'Nothing left to undo.', '//undo after clearing')
+
+
 @scenario('worldedit_wand')
 def worldedit_wand(s):
     """//wand puts the wooden axe in the bot's hand; digging a block (creative) with it sets position 1 and does not break the block,
