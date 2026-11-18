@@ -344,6 +344,101 @@ def worldedit(s):
     s.wait(lambda: want.encode() in s.payloads('worldedit:cui'), 'the new p|1 point on worldedit:cui (%s)' % want)
 
 
+def _tree_child(nodes, at, name):
+    for c in nodes[at]['children']:
+        if nodes[c]['name'] == name:
+            return c
+    return None
+
+
+def _suggest(s, ident, text, seconds=15.0):
+    """Asks for completions of `text` (as typed in the chat box, with its slash); returns the matches."""
+    s.c.send(s.m.SB_COMMAND_SUGGESTION, s.m.varint(ident) + s.m.string(text))
+    s.wait(lambda: any(x[0] == ident for x in s.w.suggestions), 'suggestions for %r' % text, seconds)
+    return [x for x in s.w.suggestions if x[0] == ident][-1][4]
+
+
+@scenario('worldedit_commands')
+def worldedit_commands(s):
+    """The WorldEdit commands are real nodes of the command tree the client gets: root literals named `/set`, `/pos1`, ... (the
+    client's `//set`), with typed arguments (block_pos, integer, a greedy pattern and a direction whose completions come from the
+    server). Completions arrive for a pattern and a direction; //pos1 //pos2 //set stone typed with the double slash edit the
+    world; /help WorldEdit and /plugins list them."""
+    s.wait(lambda: s.position() is not None and s.chunks() >= 9, 'the spawn chunks', 60.0)
+    s.wait(lambda: 'nodes' in s.m.COMMAND_TREE, 'the commands packet')
+    nodes, root = s.m.COMMAND_TREE['nodes'], s.m.COMMAND_TREE['root']
+    names = sorted(nodes[c]['name'] for c in nodes[root]['children'])
+    want = ['/pos1', '/pos2', '/wand', '/sel', '/desel', '/size', '/set', '/replace', '/walls', '/hollow', '/sphere', '/cyl', '/copy',
+            '/cut', '/paste', '/rotate', '/flip', '/stack', '/move', '/count', '/distribution', '/undo', '/redo', 'we', 'worldedit']
+    missing = [n for n in want if n not in names]
+    s.check(not missing, 'not in the command tree: %r' % missing)
+    s.check('set' not in names and 'pos1' not in names, 'the old single-slash names are still in the tree')
+    print('  %d root commands, all %d WorldEdit ones present' % (len(names), len(want)), flush=True)
+
+    def arg(cmd, *path):
+        at = _tree_child(nodes, root, cmd)
+        for p in path:
+            at = _tree_child(nodes, at, p)
+            s.check(at is not None, '%s has no %r below it' % (cmd, path))
+        return nodes[at]
+
+    setp = arg('/set', 'pattern')
+    s.check(setp['kind'] == 2 and setp['parser'] == 5 and setp['suggests'] == 'minecraft:ask_server' and setp['flags'] & 4,
+            '//set <pattern> is not an executable server-completed string: %r' % setp)
+    s.check(not (nodes[_tree_child(nodes, root, '/set')]['flags'] & 4), '//set alone should not be executable')
+    pos = arg('/pos1', 'pos')
+    s.check(pos['parser'] == 8 and pos['flags'] & 4, '//pos1 <pos> is not an executable block_pos: %r' % pos)
+    s.check(nodes[_tree_child(nodes, root, '/pos1')]['flags'] & 4, '//pos1 alone should be executable')
+    frm = arg('/replace', 'from')
+    s.check(frm['parser'] == 31 and frm['suggests'] == 'minecraft:ask_server', '//replace <from>: %r' % frm)
+    s.check(arg('/replace', 'from', 'to')['parser'] == 5, '//replace <from> <to> is not a string')
+    s.check(arg('/undo', 'times')['parser'] == 3, '//undo <times> is not an integer')
+    s.check(arg('/sphere', '-h', 'pattern', 'radius')['parser'] == 3, '//sphere -h <pattern> <radius> is not an integer')
+    s.check(arg('/cyl', 'pattern', 'radius', 'height')['parser'] == 3, '//cyl <pattern> <radius> <height>')
+    s.check(arg('/flip', 'direction')['suggests'] == 'minecraft:ask_server', '//flip <direction> not completed by the server')
+    s.check(arg('/stack', 'count', 'direction')['parser'] == 5, '//stack <count> <direction>')
+    s.check(arg('/paste', '-a')['flags'] & 4, '//paste -a is not executable')
+
+    # completions asked of the server, as a client asks for an ask_server argument
+    got = _suggest(s, 501, '//set sto')
+    s.check('stone' in got and 'stone_bricks' in got, '//set sto completes to %r' % got[:10])
+    got = _suggest(s, 502, '//set 50%stone,gra')
+    s.check('50%stone,gravel' in got, '//set 50%%stone,gra completes to %r' % got[:10])
+    got = _suggest(s, 503, '//flip n')
+    s.check(got == ['north'], '//flip n completes to %r' % got)
+    got = _suggest(s, 504, '//replace dirt gl')
+    s.check('glass' in got, '//replace dirt gl completes to %r' % got[:10])
+    print('  completions: //set sto -> %d names, //flip n -> north' % len(_suggest(s, 505, '//set sto')), flush=True)
+
+    # the commands work as typed: //pos1 //pos2 (block_pos form) and //set stone
+    px, py, pz = s.position()
+    bx, bz, y0 = int(px // 1) + 3, int(pz // 1) + 3, 210
+    s.command('gamemode creative')
+    ids = _state_ids(s, bx, y0 + 12, bz, ['stone'])
+    box = (bx, y0, bz, bx + 2, y0 + 1, bz + 2)              # 3 x 2 x 3 = 18 cells
+    _cells_are(s, box, [0] * 18, 'the build area to be air')
+    _we(s, 'pos1 %d %d %d' % (bx, y0, bz), 'Position 1 set to (%d, %d, %d)' % (bx, y0, bz), '//pos1 x y z')
+    _we(s, 'pos2 %d %d %d' % (bx + 2, y0 + 1, bz + 2), '(18 blocks)', '//pos2 x y z')
+    _we(s, 'set stone', 'set: 18 block(s) changed', '//set stone')
+    _cells_are(s, box, [ids['stone']] * 18, 'every cell of the selection to be stone at the client')
+    _we(s, 'pos1 %d,%d,%d' % (bx, y0, bz), 'Position 1 set', '//pos1 x,y,z (the comma form)')
+    _we(s, 'undo', 'Undid 1 edit(s)', '//undo')
+    _cells_are(s, box, [0] * 18, 'the cells back to air')
+    _we(s, 'sphere -h glass 2', 'sphere:', '//sphere -h (a flag literal)')
+    _we(s, 'undo', 'Undid 1', 'undo the sphere')
+
+    # listed by /help and /plugins
+    n = len(s.w.chat)
+    s.command('help WorldEdit')
+    s.expect('//set', '/help WorldEdit lists //set', since=n)
+    n = len(s.w.chat)
+    s.command('help //replace')
+    s.expect('//replace <from>', '/help //replace shows the usage (brigadier smart usage: one level)', since=n)
+    n = len(s.w.chat)
+    s.command('plugins')
+    s.expect('WorldEdit', '/plugins names the built-in WorldEdit', since=n)
+
+
 @scenario('worldedit_wand')
 def worldedit_wand(s):
     """//wand puts the wooden axe in the bot's hand; digging a block (creative) with it sets position 1 and does not break the block,
