@@ -40,6 +40,7 @@ def scenario(name, needs_plugin=None):
 class Scn:
     def __init__(self, m, c, st, w, biomes, ctx, args):
         self.m, self.c, self.st, self.w, self.biomes, self.ctx, self.args = m, c, st, w, biomes, ctx, args
+        self.respawns = []          # dimension names of the Respawn packets seen
         self.payload_log = []       # (channel, data) of play-phase custom payloads from the server
         self.started = time.time()
         prior = ctx.get('tap')
@@ -47,6 +48,19 @@ class Scn:
         def tap(pid, data):
             if prior:
                 prior(pid, data)
+            if pid == 80:           # clientbound respawn: a new dimension (the client model has to follow its height)
+                rr = m.Reader(data)
+                rr.varint()
+                name = rr.string()
+                self.respawns.append(name)
+                if name != ctx.get('world'):
+                    ctx['world'] = name
+                    if name == 'minecraft:overworld':
+                        ctx['sections'], w.min_y = m.DEFAULT_SECTIONS, -64
+                    else:
+                        ctx['sections'], w.min_y = 16, 0
+                    w.chunks.clear()
+                    w.pos = None
             if pid == 24:           # clientbound custom_payload (play)
                 r = m.Reader(data)
                 self.payload_log.append((r.string(), bytes(data[r.at:])))
@@ -2117,3 +2131,129 @@ def lod_summaries(s):
     s.check(near >= 32, 'too few samples compared (%d)' % near)
     s.check(within >= 0.75 * near, 'noise summaries: only %d of %d samples within 3 blocks of the generated ground' % (within, near))
     s.check(water_ok >= 0.85 * water_n, 'noise summaries: water agrees for only %d of %d samples' % (water_ok, water_n))
+
+
+# ---- phase 4 (one thread per dimension) with real players in two worlds --------------------------------------------------------------
+# Run by tools/run_dim_threads.sh, which starts two bots at once: DIM_BOT=ow stays in the overworld, DIM_BOT=nether is sent to the nether.
+# Both edit blocks at the SAME coordinates with different blocks (so each must see only its own world's block), chat, and the nether bot
+# hops between worlds. Explicit only (it needs two bots).
+
+@scenario('dim_threads_two_worlds')
+def dim_threads_two_worlds(s):
+    """Two operators, one in the overworld and one in the nether, for a few hundred ticks: /setblock and /fill edits, chat that crosses
+    worlds, a repeating command block, a nether hop and back, keep-alives answered. Each bot checks that its own edits arrive as block
+    updates, that the other world's block at the same coordinates never shows, and that the server's own query for each world agrees."""
+    import os
+    who = os.environ.get('DIM_BOT', 'ow')
+    rounds = int(os.environ.get('DIM_ROUNDS', '40'))
+    nether = who == 'nether'
+    mine, other = ('minecraft:obsidian', 'minecraft:stone') if nether else ('minecraft:stone', 'minecraft:obsidian')
+    my_dim, other_dim = ('minecraft:the_nether', 'minecraft:overworld') if nether else ('minecraft:overworld', 'minecraft:the_nether')
+    tag = 'DIM' + ('B' if nether else 'A')
+    other_tag = 'DIM' + ('A' if nether else 'B')
+    _ready(s)
+    ka0 = s.ctx['counts'].get(s.m.PLAY_KEEP_ALIVE, 0)
+    ids = {}
+    # the state ids as this client knows them (placed in the bot's own world at a probe cell)
+    px = 4
+    if nether:
+        s.command('execute in minecraft:the_nether run tp @s %d.5 150 %d.5' % (px, px))
+        s.wait(lambda: s.position() is not None and abs(s.position()[0] - (px + 0.5)) < 0.01 and abs(s.position()[1] - 150) < 0.01,
+               'the teleport into the nether', 90.0)
+        print('  in the nether at %r' % (s.position(),), flush=True)
+        s.wait(lambda: s.w.block(px, 149, px) is not None, 'the nether chunk at the bot', 60.0)
+    ids = _state_ids(s, px + 4, 120, px, ['stone', 'obsidian'])
+    s.check(ids['stone'] != ids['obsidian'], 'stone and gold share a state id')
+    want = ids['obsidian'] if nether else ids['stone']
+    unwanted = ids['stone'] if nether else ids['obsidian']
+    print('  %s world: my block state %d, the other world\'s %d' % (my_dim, want, unwanted), flush=True)
+    # a repeating command block that sets a sea lantern (soft: the repeat may be disabled on the server)
+    cb = (px + 12, 120, px)
+    s.command('setblock %d %d %d minecraft:repeating_command_block{auto:1b,Command:"setblock %d %d %d minecraft:sea_lantern"}' %
+              (cb + (px + 14, 120, px)))
+    placed = []
+    # a bedrock deck under the cells and the fill, so the structural solver has nothing to collapse
+    s.command('fill %d 119 %d %d 119 %d minecraft:bedrock' % (px - 1, px - 4, px + 22, px + 8))
+    s.command('fill %d 121 %d %d 121 %d minecraft:bedrock' % (px - 1, px - 4, px + 22, px + 8))
+    _pause(s, 2.0)
+    for i in range(rounds):
+        x, z = px + (i % 8), px + 2 + (i // 8)
+        s.command('setblock %d 120 %d %s' % (x, z, mine))
+        s.wait(lambda: s.w.block(x, 120, z) == want, 'my block %d at %d 120 %d' % (i, x, z), 30.0)
+        placed.append((x, z))
+        if i % 4 == 0:
+            s.command('fill %d 120 %d %d 120 %d %s' % (px, px - 3, px + 3, px - 2, mine))
+        if i % 5 == 0:
+            s.say('%s round %d' % (tag, i))
+        if i % 10 == 9:
+            _pause(s, 0.5)
+        s.check(s.w.block(x, 120, z) != unwanted, 'the other world\'s block showed at %d 120 %d' % (x, z))
+    # the server's own view of BOTH worlds at the same coordinates (a query answers by saying a marker)
+    qn = [0]
+    lat = []
+
+    def holds(dim, x, y, z, block, seconds=30.0):
+        qn[0] += 1
+        marker = 'Q%s%d' % (tag, qn[0])
+        n = len(s.w.chat)
+        s.command('execute in %s if block %d %d %d %s run tellraw @s "%s"' % (dim, x, y, z, block, marker))
+        t0 = time.time()
+        end = t0 + seconds
+        try:
+            s.wait(lambda: s.heard(marker, n) or time.time() > end, 'the answer to a block query', seconds + 10.0)
+        except Exception:
+            pass
+        got = s.heard(marker, n)
+        if got:
+            lat.append(time.time() - t0)
+        return got
+    # sync with the other bot: chat does not cross worlds on this server (see the report), so each bot raises a flag block in its own world and
+    # polls the server's cross-world query for the other's
+    def raise_flag(name):
+        s.command('setblock %d 120 %d minecraft:emerald_block' % (px + 20, px + (0 if name == 'edits' else 3)))
+
+    def wait_flag(name):
+        end = time.time() + 150.0
+        while time.time() < end:
+            if holds(other_dim, px + 20, 120, px + (0 if name == 'edits' else 3), 'minecraft:emerald_block', 4.0):
+                return
+        s.check(False, 'the other bot never raised its %s flag (server cross-world query)' % name)
+    raise_flag('edits')
+    wait_flag('edits')
+    # every cell still mine, never the other world's
+    gone = [(x, z) for x, z in placed if s.w.block(x, 120, z) != want]
+    print('  cells placed %d, client sees %d still there %s' % (len(placed), len(placed) - len(gone), gone[:6]), flush=True)
+    s.check(not gone, 'cells lost: %r (state %r)' % (gone[:4], s.w.block(*(gone[0][0], 120, gone[0][1]))) if gone else '')
+    s.check(holds(my_dim, px, 120, px + 2, mine), 'the server does not see my block in my world')
+    s.check(holds(my_dim, px + 3, 120, px - 2, mine), 'the server does not hold my /fill in my world')
+    s.check(not holds(other_dim, px, 120, px + 2, mine, 3.0), 'the other world holds my block at the same coordinates')
+    other_ok = holds(other_dim, px, 120, px + 2, other)
+    if not other_ok:
+        print('  diagnostic (%s): deck %s, obsidian@(4,120,6) %s, stone@(4,120,6) %s, air %s, again %s' % (
+            other_dim, holds(other_dim, px, 119, px + 2, 'minecraft:bedrock'), holds(other_dim, px, 120, px + 2, 'minecraft:obsidian'),
+            holds(other_dim, px, 120, px + 2, 'minecraft:stone'), holds(other_dim, px, 120, px + 2, 'minecraft:air'),
+            holds(other_dim, px, 120, px + 2, other)), flush=True)
+    s.check(other_ok, 'the other world does not hold its own block')
+    print('  client view of the /fill corners: %r %r (want %r)' % (s.w.block(px, 120, px - 3), s.w.block(px + 3, 120, px - 2), want), flush=True)
+    lantern = None
+    try:
+        s.wait(lambda: s.w.block(px + 14, 120, px) not in (None, 0), 'the command block output', 20.0)
+        lantern = s.w.block(px + 14, 120, px)
+    except Exception:
+        pass
+    print('  command block output: %s' % ('seen, state %r' % lantern if lantern else 'NOT seen (soft check)'), flush=True)
+    if nether:
+        # a hop back and forth while the other bot keeps working
+        for dim, y in (('minecraft:overworld', 150), ('minecraft:the_nether', 150)):
+            s.command('execute in %s run tp @s %d.5 %d %d.5' % (dim, px, y, px))
+            _pause(s, 4.0)
+            s.check(s.position() is not None, 'no position after the hop to ' + dim)
+        print('  hops done at %r' % (s.position(),), flush=True)
+    raise_flag('all')
+    wait_flag('all')
+    print('  query latency (answered ones): n=%d max %.2fs mean %.2fs' % (len(lat), max(lat or [0]), sum(lat) / max(len(lat), 1)), flush=True)
+    ka = s.ctx['counts'].get(s.m.PLAY_KEEP_ALIVE, 0) - ka0
+    print('  keep-alives answered: %d, blocks placed: %d' % (ka, len(placed)), flush=True)
+
+
+EXPLICIT_ONLY.add('dim_threads_two_worlds')
