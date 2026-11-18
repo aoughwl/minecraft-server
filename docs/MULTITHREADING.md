@@ -135,4 +135,10 @@ Each phase lists what changes, who owns the files, how it is verified. "Gate" = 
 | This plan | written |
 | `threads` / `reserved_cores` config + resolver (`sim/threadcfg.aowl`) + tests | done, tests pass (threadcfgtest, libtest) |
 | Wiring the resolved count into `generation_executor` | needs the chunk-system owner (change list sent) |
+| Phase 2: collapse trigger queue per world (`trigStateOf(world)`, `body/trigger.aowl`) | done, `worldstatetest` passes. Queue, rate buckets, scan budget and starts per tick are per dimension. Built cells, block log tiles, cracks, wind timers and stats are still module wide (keyed by dimension) |
+| Phase 2: bodies per world (`bodiesOf(world)`, `body/bodymanager.aowl`) | done, `worldstatetest`, `bodytest`, `createworldtest`, `replaytest` pass. Body ids and uuids are global and atomic (`atomicFetchAdd`). `gBodies` is gone. `maxAwake`/`maxCells` and the round robin cursor now apply per world (same with one world). Still module wide: event and fx feeds, stats, collapse jobs, the one collision provider (answers for all worlds), journal replay list |
+| Phase 2: fire regions per world (`physwire/firewire.aowl`, `fireRegions(world)`) | done, `worldstatetest` passes. `gStats` (and the region seed counter) stays module wide; climatewire still samples worlds[0], erosionwire is still one job |
+| Phase 2: the other items (entity lists, fluids, climate, erosion, fight/map managers, ambient parameters, per thread profiler/replay/log buffers, the plugin hook serial lane, owner-thread asserts) | not started |
 | Everything else | not started |
+
+The state slots are `World.trigState`, `World.bodyState`, `World.fireState` (`nil RootRef`, typed by the owning module because serverbase sits below it). Nothing here is checked from other threads yet: with `threads = 1` it is the same single-owner code, and no owner-thread assert exists until the phase 2 gate item is done. The server wiring (`servermod`) was not changed; a full server build and the scenario suite have not been run for these three changes.
