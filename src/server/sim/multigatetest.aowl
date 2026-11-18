@@ -1,0 +1,1155 @@
+## Multi-gate stress test: every opt-in user of the process's ONE worker pool at once (docs/MULTITHREADING.md section 9, "multi-gate").
+##
+## One shared pool with 4 workers. The tick thread (this one) steps a random interleaving of users, as the server tick would:
+## generation-style Normal jobs, a Background (LOD-like) stream, Urgent jobs, probes, net encode lanes (sim/netencode), save compress
+## batches (sim/savepool), plugin jobs (sim/plugjob), region scheduler runs with several owners (sim/regionsched), an erosion run
+## (physwire/erosionjob), light relight jobs (sim/lightjob) and path-like jobs (synthetic body on pathpool's pool: the real search needs the entity stack).
+## Where a module has a test hook it is the real module; generation, LOD, urgent and path bodies are synthetic (pure functions of their argument).
+##
+## Asserted: (a) every user's results equal its own inline / single-user result, (b) no second worker pool is ever created (refusedPools stays 0,
+## liveWorkerPool is the one pool), (c) lane priority (deterministic gate test and probes under contention), (d) shutdown drains queued jobs,
+## (e) many rounds with seeded random interleavings. Extra: three helper threads submit to and drain their own owners concurrently.
+##
+## Env: MG_ROUNDS (default 40), MG_SEED (default 20260101), MG_LIGHT_EVERY (default 10: a light scenario every Nth round, 0 = never).
+## Exit 0 and "ALL PASS" when everything holds.
+
+{.feature: "lenientnils".}
+
+import std/[syncio, atomics, locks, rawthreads, envvars, assertions, cmdline]
+import ../../config/[chunk, lighting, world]
+import ../../generated/dimension as dimensiondata
+import ../../generated/block_properties
+import ../../world/[blockstates, palette, chunkdata, tick, level, worldfs, lightingruntime, lightsnapshot]
+import ../../world/[chunkio, chunkformat, anvilformat]
+import ../../physics/[erosion, materials]
+import ../../protocol/java/packet_encoder
+import ../physwire/erosionjob
+import ../../entity/ai/pathfinder/pathpool
+import jobpool, lightjob, netencode, savepool, plugjob, regionsched, regions
+
+proc sleepWin(ms: uint32) {.stdcall, importc: "Sleep", dynlib: "kernel32.dll".}
+
+var failures = 0
+var checks = 0
+
+proc check(ok: bool, name: string) =
+  inc checks
+  if ok:
+    echo "  PASS ", name
+  else:
+    echo "  FAIL ", name
+    inc failures
+
+proc checkQ(ok: bool, name: string) =
+  ## Quiet on success (per-round checks), loud on failure.
+  inc checks
+  if not ok:
+    echo "  FAIL ", name
+    inc failures
+
+# ---- driver randomness (seeded; the interleaving of tick-thread steps) ----
+
+var gD: uint64 = 1'u64
+
+proc drv(n: int): int =
+  gD = gD * 6364136223846793005'u64 + 1442695040888963407'u64
+  int((gD shr 33) mod uint64(n))
+
+proc envInt(name: string, dflt: int): int =
+  let s = getEnv(name)
+  if s.len == 0:
+    return dflt
+  result = 0
+  for c in s:
+    if c >= '0' and c <= '9':
+      result = result * 10 + (ord(c) - ord('0'))
+
+# ---- synthetic job bodies: pure functions of (kind, idx) ----
+
+const
+  KGen = 0        ## chunk-generation-like noise fill, Normal
+  KLod = 1        ## LOD summary, Background
+  KPath = 2       ## grid BFS, Normal
+  KUrg = 3        ## small Urgent job
+  KPlug = 4       ## plugin job
+  IdxMask = 0xFFFFFFFFFF
+
+var gSeqBg = 0       ## atomic: Background bodies started
+var gSeqNorm = 0     ## atomic: Normal synthetic bodies started
+var gExpFail = 0     ## raisers submitted (tick thread only)
+
+proc synRaises(kind, idx: int): bool =
+  (kind == KGen and idx mod 53 == 7) or (kind == KPlug and idx mod 41 == 5)
+
+proc mixv(h: int, v: int): int =
+  ((h xor v) * 1099511 + 12345) and 0x3FFFFFFFFFFF
+
+proc synValue(kind, idx: int): int =
+  var h = idx * 7919 + kind * 104729 + 1
+  if kind == KGen:
+    for i in 0 ..< 3000:
+      h = mixv(h, i + (h shr 7))
+  elif kind == KLod:
+    for i in 0 ..< 700:
+      h = mixv(h, i * 3)
+  elif kind == KPath:
+    const W = 24
+    var wall = newSeq[bool](W * W)
+    var s = idx * 2654435761 + 17
+    for i in 0 ..< W * W:
+      s = (s * 1103515245 + 12345) and 0x7FFFFFFF
+      wall[i] = (s shr 8) mod 100 < 22
+    wall[0] = false
+    wall[W * W - 1] = false
+    var dist = newSeq[int](W * W)
+    for i in 0 ..< W * W:
+      dist[i] = -1
+    var q = newSeq[int](W * W)
+    var qh = 0
+    var qt = 0
+    q[qt] = 0
+    inc qt
+    dist[0] = 0
+    while qh < qt:
+      let c = q[qh]
+      inc qh
+      let x = c mod W
+      let z = c div W
+      for d in 0 ..< 4:
+        var nx = x
+        var nz = z
+        if d == 0: nx = x + 1
+        elif d == 1: nx = x - 1
+        elif d == 2: nz = z + 1
+        else: nz = z - 1
+        if nx < 0 or nz < 0 or nx >= W or nz >= W:
+          continue
+        let n = nz * W + nx
+        if wall[n] or dist[n] >= 0:
+          continue
+        dist[n] = dist[c] + 1
+        q[qt] = n
+        inc qt
+    h = dist[W * W - 1] + 2
+  elif kind == KUrg:
+    for i in 0 ..< 64:
+      h = mixv(h, i)
+  else:
+    for i in 0 ..< 1500:
+      h = mixv(h, i xor (h shr 5))
+  h
+
+proc synBody(arg: pointer): int {.nimcall, raises.} =
+  let a = cast[int](arg)
+  let kind = a shr 40
+  let idx = a and IdxMask
+  if kind == KLod:
+    discard atomicFetchAdd(gSeqBg, 1, moSequentiallyConsistent)
+  elif kind == KGen or kind == KPath:
+    discard atomicFetchAdd(gSeqNorm, 1, moSequentiallyConsistent)
+  if synRaises(kind, idx):
+    raise BadOperation
+  synValue(kind, idx)
+
+proc packArg(kind, idx: int): pointer =
+  cast[pointer]((kind shl 40) or idx)
+
+type
+  SynUser = ref object
+    pool: JobPool
+    kind, lane, owner, n: int
+    submitted, got, bad: int
+    seen: seq[bool]
+
+var gSink: seq[JobResult] = @[]
+
+proc newSyn(pool: JobPool, kind, lane, n: int): SynUser =
+  SynUser(pool: pool, kind: kind, lane: lane, owner: allocOwner(pool), n: n, seen: newSeq[bool](n))
+
+proc stepSyn(u: SynUser): bool =
+  var burst = 1 + drv(12)
+  if u.kind == KLod and drv(6) == 0:
+    burst = 80 + drv(120)       # a deep Background backlog now and then, for the probes to jump
+  for i in 0 ..< burst:
+    if u.submitted < u.n:
+      if synRaises(u.kind, u.submitted):
+        inc gExpFail
+      submitLane(u.pool, u.owner, u.lane, synBody, packArg(u.kind, u.submitted))
+      inc u.submitted
+  gSink.setLen(0)
+  discard drainDone(u.pool, u.owner, gSink)
+  for r in gSink:
+    let a = cast[int](r.arg)
+    let idx = a and IdxMask
+    if (a shr 40) != u.kind or idx >= u.n or u.seen[idx]:
+      inc u.bad
+    else:
+      u.seen[idx] = true
+      if r.failed != synRaises(u.kind, idx):
+        inc u.bad
+      elif not r.failed and r.value != synValue(u.kind, idx):
+        inc u.bad
+    inc u.got
+  gSink.setLen(0)
+  u.got == u.n
+
+# ---- probes: lane priority under contention ----
+
+var gProbeBg: seq[int] = @[]
+var gProbeNorm: seq[int] = @[]
+var gProbeLane: seq[int] = @[]
+
+proc probeBody(arg: pointer): int {.nimcall, raises.} =
+  let id = cast[int](arg)
+  gProbeBg[id] = atomicFetchAdd(gSeqBg, 0, moSequentiallyConsistent)
+  gProbeNorm[id] = atomicFetchAdd(gSeqNorm, 0, moSequentiallyConsistent)
+  id
+
+type
+  ProbeUser = ref object
+    pool: JobPool
+    owner, n, submitted, got, bad, qualified: int
+    b0, n0: seq[int]
+    lanes: seq[int]
+    base: int
+
+var gProbeNext = 0
+var gProbeWorst = 0          ## worst Background starts between a probe's submit and its start
+var gProbeWorstNorm = 0
+var gProbeQualified = 0
+var gProbeTotal = 0
+
+proc newProbe(pool: JobPool, n: int): ProbeUser =
+  result = ProbeUser(pool: pool, owner: allocOwner(pool), n: n, b0: newSeq[int](n), n0: newSeq[int](n), lanes: newSeq[int](n))
+  result.base = gProbeNext
+  gProbeNext += n
+  if gProbeNext > gProbeBg.len:
+    # growth is safe only while no probe job is queued: probes are created before the round's first step
+    gProbeBg.setLen(gProbeNext + 64)
+    gProbeNorm.setLen(gProbeNext + 64)
+
+proc stepProbe(u: ProbeUser): bool =
+  if u.submitted < u.n and drv(3) == 0:
+    let i = u.submitted
+    u.lanes[i] = if drv(2) == 0: lnUrgent else: lnNormal
+    if laneDepth(u.pool, lnBackground) >= 40:
+      inc u.qualified
+    u.b0[i] = atomicFetchAdd(gSeqBg, 0, moSequentiallyConsistent)
+    u.n0[i] = atomicFetchAdd(gSeqNorm, 0, moSequentiallyConsistent)
+    submitLane(u.pool, u.owner, u.lanes[i], probeBody, cast[pointer](u.base + i))
+    inc u.submitted
+  gSink.setLen(0)
+  discard drainDone(u.pool, u.owner, gSink)
+  for r in gSink:
+    let id = r.value - u.base
+    if r.failed or id < 0 or id >= u.n:
+      inc u.bad
+    else:
+      let dBg = gProbeBg[u.base + id] - u.b0[id]
+      let dNorm = gProbeNorm[u.base + id] - u.n0[id]
+      # Background may only start after the probe was queued if a worker had taken it already (at most one per worker: W) or if a worker
+      # took it right after the probe was taken and it read its counter before the probe body did (at most W - 1 more): bound 2W, against
+      # a backlog of 40 and more jobs.
+      let w = 2 * u.pool.workers
+      if dBg > gProbeWorst:
+        gProbeWorst = dBg
+      if dBg > w:
+        inc u.bad
+      if u.lanes[id] == lnUrgent:
+        if dNorm > gProbeWorstNorm:
+          gProbeWorstNorm = dNorm
+        if dNorm > w:
+          inc u.bad
+    inc u.got
+  gSink.setLen(0)
+  u.got == u.n
+
+# ---- net encode lanes (real sim/netencode) ----
+
+const
+  NetCount = 48
+  NetKey = [1'u8, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]
+
+proc packetOf(conn, n: int): seq[byte] =
+  var len = 1 + ((n * 37 + conn * 101) mod 3000)
+  if n mod 11 == 0:
+    len = 20000 + conn * 13
+  result = @[byte(n mod 100)]
+  var s = uint32(n) * 2654435761'u32 + uint32(conn)
+  for i in 0 ..< len:
+    if n mod 3 == 0:
+      result.add(byte(i mod 7))
+    else:
+      s = s * 1664525'u32 + 1013904223'u32
+      result.add(byte(s shr 24))
+
+proc netInline(conn: int): seq[byte] =
+  var e = newTCPNetworkEncoder()
+  var out0: seq[byte] = @[]
+  for n in 0 ..< NetCount:
+    if n == 10:
+      e.setCompression(256, 6'u32)
+    if n == 20:
+      assert e.setEncryption(NetKey).isOk
+    assert e.writePacket(packetOf(conn, n)).isOk
+    if n mod 5 == 0:
+      for b in e.flush():
+        out0.add(b)
+  for b in e.flush():
+    out0.add(b)
+  out0
+
+var gNetWant: seq[seq[byte]] = @[]
+
+type
+  NetUser = ref object
+    lanes: seq[EncodeLane]
+    got: seq[seq[byte]]
+    nextN: seq[int]
+    fin: seq[bool]
+    bad: int
+
+proc newNet(): NetUser =
+  result = NetUser(lanes: @[], got: @[], nextN: @[], fin: @[])
+  for c in 0 ..< 3:
+    result.lanes.add(newEncodeLane())
+    result.got.add(@[])
+    result.nextN.add(0)
+    result.fin.add(false)
+
+proc stepNet(u: NetUser): bool =
+  let c = drv(3)
+  if not u.fin[c]:
+    let n = u.nextN[c]
+    if n < NetCount:
+      if n == 10:
+        laneSetCompression(u.lanes[c], 256, 6'u32)
+      if n == 20:
+        if not laneSetEncryption(u.lanes[c], NetKey):
+          inc u.bad
+      lanePush(u.lanes[c], packetOf(c, n))
+      if n mod 5 == 0:
+        for b in laneTake(u.lanes[c]):
+          u.got[c].add(b)
+      u.nextN[c] = n + 1
+    else:
+      laneDrain(u.lanes[c])
+      for b in laneTake(u.lanes[c]):
+        u.got[c].add(b)
+      if laneBusy(u.lanes[c]) or laneError(u.lanes[c]) != "" or u.got[c] != gNetWant[c]:
+        inc u.bad
+      laneRelease(u.lanes[c])
+      u.fin[c] = true
+  u.fin[0] and u.fin[1] and u.fin[2]
+
+# ---- save compress batches (real sim/savepool on the real Anvil compress step) ----
+
+var gSaveCfg: AnvilChunkConfig
+var gSaveSer: ChunkSerializer = nil
+
+type
+  SaveUser = ref object
+    batches, done, bad, chunks: int
+
+proc rawOf(tag, i: int): seq[byte] =
+  var len = 3000 + ((tag * 977 + i * 131) mod 40000)
+  result = newSeq[byte](len)
+  var s = uint32(tag * 31 + i) * 2654435761'u32 + 7'u32
+  for k in 0 ..< len:
+    if (k div 64 + i) mod 3 == 0:
+      result[k] = byte((k * 5) mod 251)
+    else:
+      s = s * 1664525'u32 + 1013904223'u32
+      result[k] = byte(s shr 24)
+
+proc stepSave(u: SaveUser): bool =
+  let nb = 3 + drv(8)
+  var xs: seq[int32] = @[]
+  var zs: seq[int32] = @[]
+  var raws: seq[seq[byte]] = @[]
+  var hints: seq[int] = @[]
+  let tag = drv(1000)
+  for i in 0 ..< nb:
+    xs.add(int32(i * 3))
+    zs.add(int32(tag mod 32))
+    raws.add(rawOf(tag, i))
+    hints.add(if i mod 4 == 3: -1 else: 2)
+  let res = compressBatch(gSaveSer, xs, zs, raws, hints)
+  if res.len != nb:
+    inc u.bad
+  else:
+    for i in 0 ..< nb:
+      let want = compressOf(gSaveSer, xs[i], zs[i], raws[i], hints[i])
+      if res[i].ok != want.ok or res[i].comp != want.comp or res[i].data != want.data:
+        inc u.bad
+  inc u.done
+  inc u.chunks
+  u.done >= u.batches
+
+# ---- plugin jobs (real sim/plugjob, 3 plugins on the shared pool) ----
+
+var gPlugOut: seq[seq[int]] = @[]
+var gPlugFailed: seq[seq[bool]] = @[]
+var gPlugBadOrder = 0
+
+proc plugBody(arg: pointer): int {.nimcall, raises.} =
+  let a = cast[int](arg)
+  if synRaises(KPlug, a):
+    raise BadOperation
+  synValue(KPlug, a)
+
+proc plugDone(plugin: int, ticket: int, value: int, failed: bool, ctx: pointer) {.nimcall.} =
+  if ticket != gPlugOut[plugin].len:
+    inc gPlugBadOrder
+  gPlugOut[plugin].add(value)
+  gPlugFailed[plugin].add(failed)
+
+type
+  PlugUser = ref object
+    pj: PlugJobs
+    ids: seq[int]
+    n: int
+    submitted: seq[int]
+    bad: int
+
+proc newPlug(pool: JobPool, n: int): PlugUser =
+  result = PlugUser(pj: newPlugJobsOn(pool), ids: @[], n: n, submitted: @[])
+  gPlugOut = @[]
+  gPlugFailed = @[]
+  gPlugBadOrder = 0
+  for i in 0 ..< 3:
+    result.ids.add(registerPlugin(result.pj))
+    result.submitted.add(0)
+    gPlugOut.add(@[])
+    gPlugFailed.add(@[])
+
+proc stepPlug(u: PlugUser): bool =
+  let p = drv(3)
+  let burst = 1 + drv(6)
+  for i in 0 ..< burst:
+    if u.submitted[p] < u.n:
+      let a = p * 100000 + u.submitted[p]
+      if synRaises(KPlug, a):
+        inc gExpFail
+      let t = submitPlugJob(u.pj, u.ids[p], plugBody, cast[pointer](a), plugDone, nil)
+      if t != u.submitted[p]:
+        inc u.bad
+      inc u.submitted[p]
+  discard pollAllPlugJobs(u.pj)
+  var all = true
+  for i in 0 ..< 3:
+    if gPlugOut[i].len < u.n:
+      all = false
+  if all:
+    # delivered sequence equals the single-user (inline) sequence, in ticket order
+    for i in 0 ..< 3:
+      for t in 0 ..< u.n:
+        let a = i * 100000 + t
+        let wantFail = synRaises(KPlug, a)
+        if gPlugFailed[i][t] != wantFail or (not wantFail and gPlugOut[i][t] != synValue(KPlug, a)):
+          inc u.bad
+    if gPlugBadOrder > 0:
+      inc u.bad
+  all
+
+# ---- region scheduler with several owners ----
+
+const
+  RGrid = 40
+  RMargin = 2
+  RTasks = 120
+
+var
+  gRWorld: seq[int] = @[]
+  gROcc: seq[int] = @[]
+  gRViol = 0
+  gRRuns = 0
+
+proc rcell(x, z: int): int = z * RGrid + x
+
+proc rbody(arg: pointer): int {.nimcall, raises.} =
+  let id = cast[int](arg) - 1
+  let hx = id * 7 mod 31 + 4
+  let hz = id * 13 mod 29 + 4
+  for z in hz - RMargin .. hz + RMargin:
+    for x in hx - RMargin .. hx + RMargin:
+      if atomicFetchAdd(gROcc[rcell(x, z)], 1, moSequentiallyConsistent) != 0:
+        discard atomicFetchAdd(gRViol, 1, moSequentiallyConsistent)
+  discard atomicFetchAdd(gRRuns, 1, moSequentiallyConsistent)
+  var acc = 0
+  for z in hz - RMargin .. hz + RMargin:
+    for x in hx - RMargin .. hx + RMargin:
+      let c = rcell(x, z)
+      acc = (acc * 31 + gRWorld[c]) mod 1000000007
+      gRWorld[c] = (gRWorld[c] * 17 + id + 1) mod 1000000007
+  var spin = 0
+  for i in 0 ..< 8000:
+    spin = (spin + i * acc) mod 1009
+  for z in hz - RMargin .. hz + RMargin:
+    for x in hx - RMargin .. hx + RMargin:
+      discard atomicFetchAdd(gROcc[rcell(x, z)], -1, moSequentiallyConsistent)
+  acc + (spin and 0)
+
+proc rhome(id: int): ChunkCoord =
+  ChunkCoord(x: id * 7 mod 31 + 4, z: id * 13 mod 29 + 4)
+
+proc rworldHash(): int =
+  var h = 7
+  for v in gRWorld:
+    h = (h * 1000003 + v) mod 1000000007
+  h
+
+proc regionRun(pool: JobPool, owner: int, res: var seq[int]): int =
+  gRWorld = newSeq[int](RGrid * RGrid)
+  for i in 0 ..< gRWorld.len:
+    gRWorld[i] = i * 3 + 1
+  gROcc = newSeq[int](RGrid * RGrid)
+  gRViol = 0
+  gRRuns = 0
+  var tasks: seq[RegionTask] = @[]
+  for id in 0 ..< RTasks:
+    tasks.add RegionTask(home: rhome(id), body: rbody, arg: cast[pointer](id + 1))
+  var st = RegionRunStats()
+  runRegionTasks(pool, owner, tasks, RMargin, 0, res, st)
+  if gRViol != 0 or gRRuns != RTasks or st.failed != 0 or not st.planned:
+    return -1
+  rworldHash()
+
+var gRegionBaseHash = 0
+var gRegionBase: seq[int] = @[]
+
+type
+  RegionUser = ref object
+    pool: JobPool
+    runs, done, bad: int
+
+proc stepRegion(u: RegionUser): bool =
+  var res: seq[int] = @[]
+  let h = regionRun(u.pool, allocOwner(u.pool), res)   # a fresh owner per run
+  if h != gRegionBaseHash or res != gRegionBase:
+    inc u.bad
+  inc u.done
+  u.done >= u.runs
+
+# ---- erosion (real physwire/erosionjob) ----
+
+proc sid(name: string): int =
+  let b = Block.fromName(name)
+  if b == nil:
+    return 0
+  int(asU16(b.defaultState.id))
+
+proc makeSim(seed, nx, ny, nz: int; wet: float64): ErosionSim =
+  var ids = newSeq[int](nx * ny * nz)
+  let dirt = sid("dirt")
+  let sand = sid("sand")
+  let stone = sid("stone")
+  var r = uint64(seed) * 6364136223846793005'u64 + 1442695040888963407'u64
+  for z in 0 ..< nz:
+    for x in 0 ..< nx:
+      ids[x + nx * (z + nz * 0)] = stone
+      r = r * 6364136223846793005'u64 + 1442695040888963407'u64
+      let h = 1 + int((r shr 33) mod 9'u64)
+      let st = if ((x + z) mod 3) == 0: sand else: dirt
+      for y in 1 .. h:
+        if y < ny: ids[x + nx * (z + nz * y)] = st
+  var p = defaultErosionParams()
+  let sim = newErosionSim(ids, nx, ny, nz, seed, p)
+  sim.setUniformWeather(0.0, 0.0, 10.0, wet)
+  sim
+
+proc mixh(h: var uint64; v: int) =
+  h = (h xor uint64(v)) * 1099511628211'u64
+
+proc edigest(sim: ErosionSim; steps: int; ops: int64): uint64 =
+  let o = drain(sim)
+  var h = 1469598103934665603'u64
+  mixh(h, steps)
+  mixh(h, int(ops))
+  mixh(h, o.changes.len)
+  for c in o.changes:
+    mixh(h, c.x); mixh(h, c.y); mixh(h, c.z); mixh(h, c.fromState); mixh(h, c.toState)
+  mixh(h, o.bodies.len)
+  for b in o.bodies:
+    mixh(h, b.ox); mixh(h, b.oy); mixh(h, b.oz); mixh(h, b.cells.len)
+  h
+
+const
+  EOps = 20000
+  EMaxSteps = 40000
+
+proc erosionStepwise(seed: int; wet: float64): uint64 =
+  let sim = makeSim(seed, 20, 14, 20, wet)
+  var steps = 0
+  var ops = 0'i64
+  while steps < EMaxSteps:
+    let info = sim.step(EOps)
+    ops += int64(info.ops)
+    inc steps
+    if info.done: break
+  edigest(sim, steps, ops)
+
+var gErosionWant: seq[uint64] = @[]   ## per seed 1..6
+
+type
+  ErosionUser = ref object
+    pool: JobPool
+    seed: int
+    sim: ErosionSim
+    run: ErosionRun
+    bad: int
+
+proc newErosion(pool: JobPool): ErosionUser =
+  ErosionUser(pool: pool, seed: 1 + drv(6))
+
+proc stepErosion(u: ErosionUser): bool =
+  if u.run == nil:
+    u.sim = makeSim(u.seed, 20, 14, 20, if u.seed mod 2 == 0: 0.8 else: 0.0)
+    u.run = newErosionRun(u.sim, EOps, EMaxSteps)
+    submitErosionRun(u.pool, u.run)
+    return false
+  if not pollErosionRun(u.pool, u.run):
+    return false
+  if not u.run.ok or edigest(u.sim, u.run.steps, u.run.ops) != gErosionWant[u.seed - 1]:
+    inc u.bad
+  true
+
+# ---- light relight jobs (real sim/lightjob) ----
+
+const
+  LChunksX = 8'i32
+  LChunksZ = 3'i32
+  LTop = 80'i32
+
+proc lsid(name: string): uint32 =
+  let (ok, id) = defaultStateByName(name)
+  assert ok, name
+  id
+
+proc lscratch(name: string): string =
+  var base = getEnv("WORLDTEST_DIR")
+  if base.len == 0:
+    base = parentDirW(paramStr(0)) & "/multigate_scratch"
+  result = base & "/" & name
+  discard createDirAllW(result)
+
+proc emptyChunk(x, z: int32, sections = 4): ChunkData =
+  let c = newChunkData(x, z, newChunkSections(sections, 0'i32))
+  c.lightEngine.skyLight = newSeq[LightContainer](sections)
+  c.lightEngine.blockLight = newSeq[LightContainer](sections)
+  for i in 0 ..< sections:
+    c.lightEngine.skyLight[i] = newLightEmpty(0'u8)
+    c.lightEngine.blockLight[i] = newLightEmpty(0'u8)
+  c.heightmap = calculateHeightmap(c)
+  c
+
+var lRng = 1'u32
+proc lrnd(n: int): int =
+  lRng = lRng * 1664525'u32 + 1013904223'u32
+  int((lRng shr 8) mod uint32(n))
+
+proc lightHash(l: Level): uint64 =
+  result = 1469598103934665603'u64
+  for cz in 0'i32 ..< LChunksZ:
+    for cx in 0'i32 ..< LChunksX:
+      let c = l.lightAccess.chunkAt(cx, cz)
+      for k in 0 ..< 2:
+        let arr = if k == 0: c.lightEngine.skyLight else: c.lightEngine.blockLight
+        for s in 0 ..< arr.len:
+          result = (result xor uint64(arr[s].default)) * 1099511628211'u64
+          for b in arr[s].data:
+            result = (result xor uint64(b)) * 1099511628211'u64
+
+proc buildLWorld(l: Level, palette: array[8, uint32]) =
+  let air = lsid("air")
+  for cz in 0'i32 ..< LChunksZ:
+    for cx in 0'i32 ..< LChunksX:
+      addLoadedChunk(l, emptyChunk(cx, cz, 6))
+  for z in 0'i32 ..< LChunksZ * 16'i32:
+    for x in 0'i32 ..< LChunksX * 16'i32:
+      for y in 0'i32 .. 79'i32:
+        var id = air
+        if y < 12'i32:
+          id = palette[3]
+        else:
+          let r = lrnd(palette.len + 6)
+          id = if r < palette.len: palette[r] else: air
+          if id == palette[7] and lrnd(3) != 0:
+            id = air
+        if id != air:
+          discard setBlockState(l, blockPos(x, y, z), id)
+
+proc editLBox(l: Level, lo, hi: BlockPos, palette: array[8, uint32], mode: int) =
+  for y in lo.y .. hi.y:
+    for z in lo.z .. hi.z:
+      for x in lo.x .. hi.x:
+        var id = palette[0]
+        if mode == 1:
+          id = palette[3]
+        elif mode == 2:
+          id = palette[lrnd(palette.len)]
+        discard setBlockState(l, blockPos(x, y, z), id)
+
+type
+  LEdit = object
+    tick: int
+    lo: BlockPos
+    hi: BlockPos
+    mode: int
+
+  LightUser = ref object
+    pool: JobPool
+    la, lb: Level
+    pal: array[8, uint32]
+    lj: LightJobs
+    edits: seq[LEdit]
+    tick, ticks: int
+    bad: int
+
+proc newLight(pool: JobPool): LightUser =
+  let stone = lsid("stone")
+  let glow = lsid("glowstone")
+  let glass = lsid("glass")
+  let leaves = lsid("oak_leaves")
+  let air = lsid("air")
+  let pal = [air, air, air, stone, stone, glass, leaves, glow]
+  let la = fromRootFolder(defaultLevelConfig(), lscratch("la"), 1'i64, OVERWORLD)
+  let lb = fromRootFolder(defaultLevelConfig(), lscratch("lb"), 1'i64, OVERWORLD)
+  lRng = 0x2545F491'u32
+  buildLWorld(la, pal)
+  lRng = 0x2545F491'u32
+  buildLWorld(lb, pal)
+  let top = blockPos(LChunksX * 16'i32 - 1'i32, LTop, LChunksZ * 16'i32 - 1'i32)
+  updateLightingRegionExhaustive(la.lightEngine, la.lightAccess, blockPos(0, 0, 0), top)
+  updateLightingRegionExhaustive(lb.lightEngine, lb.lightAccess, blockPos(0, 0, 0), top)
+  discard takeLightDirty(la.lightAccess)
+  discard takeLightDirty(lb.lightAccess)
+  useLightPool(pool, allocOwner(pool))
+  result = LightUser(pool: pool, la: la, lb: lb, pal: pal, lj: lightJobsOf(la.lightAccess), edits: @[])
+  lRng = 0xBEEF1234'u32
+  for i in 0 ..< 8:
+    var bx = 0'i32
+    if i mod 2 == 0:
+      bx = int32(6 + lrnd(10))
+    else:
+      bx = int32(100 + lrnd(10))
+    let by = int32(2 + lrnd(40))
+    let bz = int32(6 + lrnd(30))
+    let sx = int32(1 + lrnd(8))
+    let sy = int32(1 + lrnd(12))
+    let sz = int32(1 + lrnd(8))
+    result.edits.add(LEdit(tick: i, lo: blockPos(bx, by, bz), hi: blockPos(bx + sx - 1'i32, by + sy - 1'i32, bz + sz - 1'i32), mode: i mod 3))
+  result.ticks = 8 + 4
+  lRng = 0xBEEF1234'u32 + 99'u32
+
+proc stepLight(u: LightUser): bool =
+  let t = u.tick
+  if t < u.ticks:
+    for e in u.edits:
+      if e.tick != t:
+        continue
+      lRng = lRng + uint32(t * 977 + 13)
+      let st = lRng
+      editLBox(u.la, e.lo, e.hi, u.pal, e.mode)
+      lRng = st
+      editLBox(u.lb, e.lo, e.hi, u.pal, e.mode)
+      updateLightingRegion(u.lb, e.lo, e.hi)
+      submitRelight(u.lj, u.la.lightAccess, u.la.lightEngine, e.lo, e.hi)
+    pollRelights(u.lj, u.la.lightAccess, u.la.lightEngine)
+    inc u.tick
+    return false
+  drainRelights(u.lj, u.la.lightAccess, u.la.lightEngine)
+  if lightHash(u.la) != lightHash(u.lb) or inFlightCount(u.lj) != 0 or heldCount(u.lj) != 0 or u.lj.applied != 8 or u.lj.conflicts != 0:
+    inc u.bad
+  useLightPool(nil, 0)
+  true
+
+# ---- gate test (c1): strict lane order with all workers blocked ----
+
+var gGateOpen = 0
+var gEntered = 0
+var gOrderSeq = 0
+var gOrder: seq[int] = @[]
+
+proc gateBody(arg: pointer): int {.nimcall, raises.} =
+  discard atomicFetchAdd(gEntered, 1, moSequentiallyConsistent)
+  while atomicFetchAdd(gGateOpen, 0, moSequentiallyConsistent) == 0:
+    sleepWin(1'u32)
+  0
+
+proc orderBody(arg: pointer): int {.nimcall, raises.} =
+  let id = cast[int](arg)
+  gOrder[id] = atomicFetchAdd(gOrderSeq, 1, moSequentiallyConsistent)
+  var h = id
+  for i in 0 ..< 200:
+    h = mixv(h, i)
+  id
+
+proc drainAll(p: JobPool, owner: int, want: int) =
+  var sink: seq[JobResult] = @[]
+  var got = 0
+  while got < want:
+    let n = drainDone(p, owner, sink)
+    if n == 0:
+      sleepWin(0'u32)
+    got += n
+
+proc laneGateTest(pool: JobPool) =
+  echo "lane priority, deterministic (all workers held)"
+  let W = pool.workers
+  let owner = allocOwner(pool)
+  gGateOpen = 0
+  gEntered = 0
+  gOrderSeq = 0
+  const NU = 20
+  const NN = 40
+  const NB = 60
+  gOrder = newSeq[int](NU + NN + NB)
+  for i in 0 ..< W:
+    submit(pool, owner, gateBody, nil)
+  while atomicFetchAdd(gEntered, 0, moSequentiallyConsistent) < W:
+    sleepWin(1'u32)
+  # scrambled submission order
+  var ids: seq[int] = @[]
+  for i in 0 ..< NU + NN + NB:
+    ids.add(i)
+  for i in countdown(ids.len - 1, 1):
+    let j = drv(i + 1)
+    let t = ids[i]
+    let tj = ids[j]
+    ids[i] = tj
+    ids[j] = t
+  for id in ids:
+    let lane = if id < NU: lnUrgent elif id < NU + NN: lnNormal else: lnBackground
+    submitLane(pool, owner, lane, orderBody, cast[pointer](id))
+  check(laneDepth(pool, lnUrgent) == NU and laneDepth(pool, lnNormal) == NN and laneDepth(pool, lnBackground) == NB, "queued while workers are held: depths " & $NU & "/" & $NN & "/" & $NB)
+  atomicStore(gGateOpen, 1)
+  drainAll(pool, owner, W + NU + NN + NB)
+  var okU = true
+  var okN = true
+  var okB = true
+  for id in 0 ..< NU + NN + NB:
+    let r = gOrder[id]
+    if id < NU:
+      if r >= NU + W: okU = false
+    elif id < NU + NN:
+      if r < NU - W or r >= NU + NN + W: okN = false
+    else:
+      if r < NU + NN - W: okB = false
+  check(okU, "every Urgent job started within the first " & $NU & "+" & $W & " starts")
+  check(okN, "every Normal job started after the Urgent ones (within a worker's slack) and before the Background tail")
+  check(okB, "no Background job started before the Urgent+Normal jobs had been taken (slack " & $W & ")")
+  var maxU = 0
+  var minB = 1000000
+  for id in 0 ..< NU + NN + NB:
+    if id < NU and gOrder[id] > maxU: maxU = gOrder[id]
+    if id >= NU + NN and gOrder[id] < minB: minB = gOrder[id]
+  echo "    last Urgent start rank ", maxU, ", first Background start rank ", minB, " (", NU + NN, " jobs in front)"
+  check(laneDepth(pool, lnUrgent) == 0 and laneDepth(pool, lnNormal) == 0 and laneDepth(pool, lnBackground) == 0, "lanes empty afterwards")
+
+# ---- concurrent submitters (extra): helper threads use their own owners at the same time ----
+
+var gTBad: array[3, int]
+var gTDone: array[3, int]
+
+proc submitterMain(arg: pointer) {.nimcall.} =
+  let me = cast[int](arg)
+  let pool = liveWorkerPool()
+  if pool == nil:
+    gTBad[me] = -1
+    return
+  let owner = allocOwner(pool)
+  var s = uint64(me + 1) * 88172645463325252'u64
+  const N = 1500
+  var seen = newSeq[bool](N)
+  var kinds = newSeq[int](N)
+  var sink: seq[JobResult] = @[]
+  var submitted = 0
+  var got = 0
+  var bad = 0
+  while got < N:
+    s = s * 6364136223846793005'u64 + 1442695040888963407'u64
+    let burst = 1 + int((s shr 33) mod 9'u64)
+    for i in 0 ..< burst:
+      if submitted < N:
+        s = s * 6364136223846793005'u64 + 1442695040888963407'u64
+        let lane = int((s shr 33) mod 3'u64)
+        let kind = if lane == lnBackground: KLod elif lane == lnUrgent: KUrg else: KPath
+        kinds[submitted] = kind
+        submitLane(pool, owner, lane, synBody, packArg(kind, submitted))
+        inc submitted
+    sink.setLen(0)
+    discard drainDone(pool, owner, sink)
+    for r in sink:
+      let a = cast[int](r.arg)
+      let idx = a and IdxMask
+      if idx >= N or seen[idx] or kinds[idx] != (a shr 40) or r.failed or r.value != synValue(a shr 40, idx):
+        inc bad
+      else:
+        seen[idx] = true
+      inc got
+    if sink.len == 0:
+      sleepWin(0'u32)
+  gTBad[me] = bad
+  gTDone[me] = got
+
+type
+  TBox = ref object
+    t: RawThread
+
+proc concurrentSubmittersTest(pool: JobPool) =
+  echo "concurrent submitters (3 helper threads own their owners while the tick thread runs users)"
+  var boxes: seq[TBox] = @[]
+  var started = 0
+  for i in 0 ..< 3:
+    let b = TBox()
+    try:
+      create(b.t, submitterMain, cast[pointer](i))
+      boxes.add(b)
+      inc started
+    except:
+      discard
+  check(started == 3, "3 helper threads started")
+  let u1 = newSyn(pool, KGen, lnNormal, 1500)
+  let u2 = newSyn(pool, KLod, lnBackground, 3000)
+  var d1 = false
+  var d2 = false
+  while not (d1 and d2):
+    if not d1 and (d2 or drv(2) == 0):
+      d1 = stepSyn(u1)
+    elif not d2:
+      d2 = stepSyn(u2)
+  for b in boxes:
+    join(b.t)
+  check(gTBad[0] == 0 and gTBad[1] == 0 and gTBad[2] == 0 and gTDone[0] == 1500 and gTDone[1] == 1500 and gTDone[2] == 1500, "each helper thread got exactly its own 1500 results, all correct")
+  check(u1.bad == 0 and u2.bad == 0, "tick thread users unaffected by the helper threads")
+  var sink: seq[JobResult] = @[]
+  discard drainDone(pool, netOwner(0), sink)
+  check(pool.completed == pool.submitted and refusedPools() == 0, "pool balanced, one pool")
+
+# ---- shutdown tests (d) ----
+
+proc shutdownStress(iterations: int) =
+  echo "shutdown drains queued jobs (", iterations, " fresh pools)"
+  var badIter = 0
+  for it in 0 ..< iterations:
+    let threads = 2 + drv(6)
+    let p = newJobPool(threads)
+    if p.workers != threads - 1 or liveWorkerPool() != p:
+      inc badIter
+    var owners: seq[int] = @[allocOwner(p), allocOwner(p), allocOwner(p)]
+    var counts: seq[int] = @[0, 0, 0]
+    let total = 1 + drv(250)
+    for i in 0 ..< total:
+      let o = drv(3)
+      let lane = drv(3)
+      let kind = if lane == lnBackground: KLod elif lane == lnUrgent: KUrg else: KGen
+      submitLane(p, owners[o], lane, synBody, packArg(kind, counts[o] * 4 + o))   # unique per owner: idx = count*4+o
+      inc counts[o]
+    if drv(2) == 0:
+      sleepWin(uint32(drv(3)))
+    shutdown(p)
+    if p.workers != 0 or liveWorkerPool() != nil:
+      inc badIter
+    if p.completed != p.submitted or p.submitted != total:
+      inc badIter
+    var raised = 0
+    for o in 0 ..< 3:
+      var sink: seq[JobResult] = @[]
+      let n = drainDone(p, owners[o], sink)
+      if n != counts[o] or pending(p, owners[o]) != 0:
+        inc badIter
+      for r in sink:
+        let a = cast[int](r.arg)
+        let kind = a shr 40
+        let idx = a and IdxMask
+        if idx mod 4 != o:
+          inc badIter
+        elif synRaises(kind, idx):
+          if not r.failed: inc badIter
+          inc raised
+        elif r.failed or r.value != synValue(kind, idx):
+          inc badIter
+    if p.failedCount != raised:
+      inc badIter
+    # a submit after shutdown runs inline instead of hanging or being lost
+    submit(p, owners[0], synBody, packArg(KUrg, 4))
+    var sink2: seq[JobResult] = @[]
+    if drainDone(p, owners[0], sink2) != 1 or sink2[0].value != synValue(KUrg, 4):
+      inc badIter
+  check(badIter == 0, "all " & $iterations & " shutdowns drained every queued job, results intact, workers joined, liveWorkerPool cleared, later submit inline")
+
+proc refusalProbe() =
+  echo "second pool is refused, shared pool is returned"
+  let before = refusedPools()
+  let a = newJobPool(4)
+  check(a.workers == 3 and liveWorkerPool() == a, "fresh pool after shutdown: 3 workers, live")
+  let b = newJobPool(4)
+  check(b.workers == 0 and refusedPools() == before + 1, "a second newJobPool is refused (inline pool), refusedPools +1")
+  check(sharedJobPool(9) == a and liveWorkerPool() == a, "sharedJobPool returns the live pool whatever size is asked")
+  shutdown(a)
+  check(liveWorkerPool() == nil, "no live pool after shutdown")
+
+# ---- rounds ----
+
+proc runRound(pool: JobPool, round: int, lightEvery: int, stats: var seq[int]) =
+  # users
+  let w = pool.workers
+  var syn: seq[SynUser] = @[]
+  syn.add(newSyn(pool, KGen, lnNormal, 150 + drv(250)))          # generation-style
+  syn.add(newSyn(pool, KLod, lnBackground, 400 + drv(700)))       # LOD stream
+  syn.add(newSyn(pool, KPath, lnNormal, 80 + drv(170)))           # path jobs (own owner from allocOwner on pathPool == pool)
+  syn.add(newSyn(pool, KUrg, lnUrgent, 40 + drv(100)))
+  let probe = newProbe(pool, 12 + drv(10))
+  let net = newNet()
+  let save = SaveUser(batches: 2 + drv(3))
+  let plug = newPlug(pool, 30 + drv(40))
+  let region = RegionUser(pool: pool, runs: 3)
+  var erosion: ErosionUser = nil
+  if round mod 2 == 0:
+    erosion = newErosion(pool)
+  var light: LightUser = nil
+  if lightEvery > 0 and round mod lightEvery == 3:
+    light = newLight(pool)
+  # kinds: 0..3 syn, 4 probe, 5 net, 6 save, 7 plug, 8 region, 9 erosion, 10 light
+  var active: seq[int] = @[0, 1, 2, 3, 4, 5, 6, 7, 8]
+  if erosion != nil: active.add(9)
+  if light != nil: active.add(10)
+  let subBefore = pool.submitted
+  let failBefore = pool.failedCount
+  let expBefore = gExpFail
+  var steps = 0
+  while active.len > 0:
+    let at = drv(active.len)
+    let k = active[at]
+    var fin = false
+    if k <= 3: fin = stepSyn(syn[k])
+    elif k == 4: fin = stepProbe(probe)
+    elif k == 5: fin = stepNet(net)
+    elif k == 6: fin = stepSave(save)
+    elif k == 7: fin = stepPlug(plug)
+    elif k == 8: fin = stepRegion(region)
+    elif k == 9: fin = stepErosion(erosion)
+    else: fin = stepLight(light)
+    inc steps
+    if fin:
+      active.delete(at)
+  # (a) each user equals its own single-user result
+  for i in 0 ..< 4:
+    checkQ(syn[i].bad == 0 and syn[i].got == syn[i].n, "round " & $round & " synthetic user " & $i & " results equal inline (" & $syn[i].bad & " bad)")
+  checkQ(probe.bad == 0, "round " & $round & " lane priority probes (" & $probe.bad & " bad)")
+  gProbeQualified += probe.qualified
+  gProbeTotal += probe.n
+  checkQ(net.bad == 0, "round " & $round & " net encode bytes equal inline encoder")
+  checkQ(save.bad == 0, "round " & $round & " save compress equals inline compress")
+  checkQ(plug.bad == 0, "round " & $round & " plugin jobs delivered in ticket order with inline values")
+  checkQ(region.bad == 0, "round " & $round & " region scheduler runs equal threads=1 baseline")
+  if erosion != nil:
+    checkQ(erosion.bad == 0, "round " & $round & " erosion digest equals stepwise")
+  if light != nil:
+    checkQ(light.bad == 0, "round " & $round & " light equals inline relight")
+  # (b) one pool
+  checkQ(liveWorkerPool() == pool and pool.workers == w and refusedPools() == 0 and netPool() == pool and pathPool() == pool, "round " & $round & " still the one pool, none refused")
+  # quiescence: net's finished jobs are drained lazily by netencode itself; do it here
+  var sink: seq[JobResult] = @[]
+  discard drainDone(pool, netOwner(0), sink)
+  checkQ(pool.completed == pool.submitted, "round " & $round & " completed == submitted (" & $pool.completed & "/" & $pool.submitted & ")")
+  checkQ(pool.failedCount - failBefore == gExpFail - expBefore, "round " & $round & " failed jobs == raisers (" & $(pool.failedCount - failBefore) & "/" & $(gExpFail - expBefore) & ")")
+  checkQ(laneDepth(pool, lnUrgent) == 0 and laneDepth(pool, lnNormal) == 0 and laneDepth(pool, lnBackground) == 0, "round " & $round & " lanes empty")
+  stats[0] += steps
+  stats[1] += pool.submitted - subBefore
+
+# ---- main ----
+
+proc main() =
+  let rounds = envInt("MG_ROUNDS", 40)
+  let seed = envInt("MG_SEED", 20260101)
+  let lightEvery = envInt("MG_LIGHT_EVERY", 10)
+  gD = uint64(seed) * 2862933555777941757'u64 + 3037000493'u64
+  echo "multigatetest: rounds ", rounds, ", seed ", seed, ", light every ", lightEvery
+  prewarmMaterials()
+
+  # one shared pool, 4 workers (5 threads counting the tick thread)
+  let pool = newJobPool(5)
+  check(pool.workers == 4 and liveWorkerPool() == pool and refusedPools() == 0, "one pool with 4 workers is live")
+  check(enableNetEncode(4) and netPool() == pool, "netencode uses the pool")
+  check(enableSaveJobs(4), "savepool enabled on the live pool")
+  check(enablePathJobs(4) and pathPool() == pool, "pathpool uses the pool")
+  check(sharedJobPool(7) == pool and liveWorkerPool() == pool and refusedPools() == 0, "sharedJobPool hands the same pool back, nothing refused")
+  gSaveCfg = defaultAnvilChunkConfig()
+  gSaveCfg.writeInPlace = true
+  gSaveSer = toSerializer(newAnvilChunkFile(), gSaveCfg)
+
+  laneGateTest(pool)
+
+  # baselines: each user alone, inline
+  for c in 0 ..< 3:
+    gNetWant.add(netInline(c))
+  let inl = newJobPool(1)
+  check(inl.workers == 0 and refusedPools() == 0, "inline baseline pool does not count as refused")
+  gRegionBase = @[]
+  gRegionBaseHash = regionRun(inl, 0, gRegionBase)
+  check(gRegionBaseHash >= 0, "region baseline ran clean at threads=1")
+  for s in 1 .. 6:
+    gErosionWant.add(erosionStepwise(s, if s mod 2 == 0: 0.8 else: 0.0))
+  gProbeBg = newSeq[int](64)
+  gProbeNorm = newSeq[int](64)
+
+  var stats = @[0, 0]
+  for r in 0 ..< rounds:
+    let f0 = failures
+    runRound(pool, r, lightEvery, stats)
+    if (r + 1) mod 5 == 0 or failures != f0 or r == 0:
+      echo "  round ", r + 1, "/", rounds, ": ", (if failures == f0: "ok" else: "FAILED"), " (", stats[0], " steps, ", stats[1], " pool jobs so far)"
+  echo "rounds done: ", stats[0], " user steps, ", stats[1], " pool jobs"
+  echo "probes: ", gProbeTotal, " total, ", gProbeQualified, " submitted with >= 40 Background jobs queued; worst Background starts between probe submit and probe start: ", gProbeWorst, " (bound ", 2 * pool.workers, "), worst Normal starts for an Urgent probe: ", gProbeWorstNorm
+  check(gProbeQualified > 0, "probes really ran against a deep Background queue")
+  check(liveWorkerPool() == pool and refusedPools() == 0, "after all rounds: still one pool, refusedPools() == 0")
+
+  concurrentSubmittersTest(pool)
+
+  # (d) shutdown of the shared pool with real users' jobs queued
+  echo "shutdown of the shared pool with queued jobs from several owners and net lanes"
+  let lanes = newNet()
+  let o1 = allocOwner(pool)
+  let o2 = allocOwner(pool)
+  var nq = 0
+  for i in 0 ..< 400:
+    submitLane(pool, o1, lnBackground, synBody, packArg(KLod, i))
+    submitLane(pool, o2, lnNormal, synBody, packArg(KGen, 1000 + i))
+    nq += 2
+  for c in 0 ..< 3:
+    for n in 0 ..< 12:
+      lanePush(lanes.lanes[c], packetOf(c, n))
+  shutdown(pool)
+  check(pool.workers == 0 and liveWorkerPool() == nil, "shared pool shut down, no live pool")
+  var s1: seq[JobResult] = @[]
+  var s2: seq[JobResult] = @[]
+  check(drainDone(pool, o1, s1) == 400 and drainDone(pool, o2, s2) == 400, "all 800 queued jobs finished before shutdown returned")
+  var okv = true
+  for r in s1:
+    if r.failed or r.value != synValue(KLod, int(cast[int](r.arg) and IdxMask)): okv = false
+  for r in s2:
+    let idx = int(cast[int](r.arg) and IdxMask)
+    if r.failed != synRaises(KGen, idx) or (not r.failed and r.value != synValue(KGen, idx)): okv = false
+  check(okv, "their results are intact")
+  var laneOk = true
+  for c in 0 ..< 3:
+    laneDrain(lanes.lanes[c])       # would hang if a lane job had been dropped
+    let b = laneTake(lanes.lanes[c])
+    if b.len == 0 or laneError(lanes.lanes[c]) != "": laneOk = false
+    laneRelease(lanes.lanes[c])
+  check(laneOk, "net lanes with queued packets drained by the shutdown")
+  check(pool.completed == pool.submitted, "pool counters balanced after shutdown")
+
+  shutdownStress(40)
+  refusalProbe()
+
+  echo "checks: ", checks, ", failures: ", failures
+  if failures == 0:
+    echo "ALL PASS"
+  else:
+    echo "FAILED ", failures
+    quit(1)
+
+main()
