@@ -166,3 +166,113 @@ Extend `src/server/sim/regionphasetest.aowl` (already a scripted 10x10-chunk wor
 
 Everything above is from reading code and the existing bench file; no build, no run, no sub-scope profile. The statement that the fill-phase cost
 is apply-side is an inference from code structure, not a measurement.
+
+## 7. Populated-tick profile and entity index design (measured 2026-11-19, `C:/m/int_c2.exe`, branch mt-prof from mt-int e8117d6)
+
+### 7.1 Method
+
+`tools/bench_populated.py` (new, standalone, no build): fresh world seed 123456789, view 6 / simulation 4, `pregen 8c` (289 chunks), then 3 idle
+`mcbot.py` bots at spawn, then steps of `/summon` (alternating zombie, cow, skeleton, chicken, random x,z within 40 blocks of spawn, y 100) to a
+total of 0, 100, 300, 600 summoned; each step 5 s settle then `/profile start` for 25 s (about 400 to 507 ticks) then `/profile export`. One server at
+a time, ports 26800.., machine not otherwise idle (other agents' jobs run on it; absolute ms carry noise of a few percent, see the 0-step rows).
+Sub-scopes `blockticks:rolls/scan/apply/spawner` exist in this build; entity sub-scopes do not. The server console had no working way to count
+entities (`execute if entity` answered "Unknown command"), so the natural mob count at step 0 is NOT known; only the summoned count is.
+
+### 7.2 Results (ms per tick, scope self time; all three bots stayed online)
+
+Default settings (all gates off):
+
+| summoned | mspt mean | p95 | entities | blockticks:spawner | players | apply | rolls | world maint | block entities |
+|---|---|---|---|---|---|---|---|---|---|
+| 0 | 21.1 | 32.7 | 9.21 | 10.08 | 0.64 | 0.33 | 0.31 | 0.30 | 0.20 |
+| 100 | 28.2 | 45.3 | 15.52 | 10.73 | 0.65 | 0.35 | 0.32 | 0.31 | 0.21 |
+| 300 | 42.9 | 67.9 | 30.18 | 10.78 | 0.64 | 0.35 | 0.32 | 0.31 | 0.21 |
+| 600 | 61.1 | 92.6 | 48.83 | 10.47 | 0.62 | 0.29 | 0.28 | 0.29 | 0.20 |
+
+`MC_REGION_THREADS=1 MC_THREADS=4`:
+
+| summoned | mspt mean | p95 | entities | blockticks:spawner | players | scan | rolls | apply |
+|---|---|---|---|---|---|---|---|---|
+| 0 | 19.4 | 28.0 | 7.14 | 10.10 | 0.63 | 0.51 | 0.32 | 0.09 |
+| 100 | 24.5 | 40.8 | 12.73 | 9.75 | 0.61 | 0.51 | 0.30 | 0.08 |
+| 300 | 38.7 | 62.2 | 26.65 | 10.03 | 0.62 | 0.49 | 0.30 | 0.08 |
+| 600 | 63.3 | 95.5 | 50.75 | 10.45 | 0.63 | 0.50 | 0.29 | 0.08 |
+
+The tick budget is 50 ms: both configurations are over it at 600 summoned (mean 61 to 63). Network and chunk IO outside the tick are under 0.4 ms
+per tick. Pre-`activeChunkSet` build (`int_all.exe`, no sub-scopes, `block ticks` includes the spawner): 0 summoned mspt 19.4, entities 7.38, block
+ticks 10.95; 600 summoned mspt 59.0, entities 46.96, block ticks 10.98.
+
+### 7.3 What the data says
+
+1. **Entity ticking dominates and grows linearly**: marginal cost about 0.063 to 0.070 ms per summoned mob per tick at every step (100: +6.3,
+   300: +21.0, 600: +39.6 ms over step 0). No superlinear term is visible up to 600 summons, so there is no O(E^2) scan in the loop at this size.
+   At 600 it is 80 percent of the tick.
+2. **The spawner is a constant 10 ms per tick (about half the tick at idle) independent of mob count** (10.1 / 10.7 / 10.8 / 10.5). It does not
+   move when 600 hostile mobs (far above the monster cap) exist, so it is not the entity scan in `newSpawnState`. By code reading it is the
+   per-active-chunk pass (`readChunkSync`, shuffle, `getRandomPosWithin` with a clock-seeded rng per call, `spawnCategoryForPosition`) for categories
+   that are never capped (ambient, water, axolotls), run every tick over 289 chunks: about 35 microseconds per chunk. The attribution is an
+   inference (no sub-scope inside `naturalSpawnTick`); the constancy is measured. This is a much bigger target than anything in sections 2a to 2d.
+3. **Block ticks (rolls + scan + apply) total 0.7 to 0.95 ms per tick**, under 2 percent of the tick. Consistent with 2a/2b: nothing to win there.
+   The gate-on scan (0.51) is not cheaper than the inline path (gate off: rolls 0.31 + apply 0.33; scan is not separately reported when off).
+4. **Gate on vs off**: the differences (mspt 19.4 vs 21.1, 24.5 vs 28.2, 38.7 vs 42.9, 63.3 vs 61.1) are within this machine's run-to-run noise (the
+   old-build 0-step row alone differs by 1.7 ms from the new one with no relevant code change). There is no demonstrable effect of
+   `MC_REGION_THREADS=1` on a populated tick, as predicted: the region workload is under 1 ms of a 20 to 60 ms tick.
+5. **Does the active-chunk set reduce work?** Not measurably: with 600 summoned, entities 46.96 (old linear search) vs 48.83 (set); block ticks 10.98
+   vs spawner 10.47 + 0.9: equal within noise. The arithmetic predicted it (289 compares per entity is about 0.05 to 0.1 ms per 1000 entities). It is
+   correct and free but not where the time is. Its other saving, skipping the AI cost of entities in inactive chunks, is NOT exercised here (every
+   summon is inside the 9x9 simulation area) and was not measured.
+6. **Not seen**: crop farms, redstone, fluids, item entities, many real players (3 idle bots only), network cost. The entity scope has no sub-split
+   (AI, movement/collision, packet sends), so the 0.065 ms per mob is the whole entity tick.
+
+### 7.4 Design: chunk-bucketed entity index (design only, nothing built)
+
+Goal: spatial queries touch only nearby entities. Honest expected gain from the profile: the entity loop is linear and spends its time inside
+`entity.tick` per mob, which an index does not remove. The index removes (a) the O(E) scans mobs issue per query during their tick
+(`getNearbyEntities`, `getClosestEntity`) and (b) O(E) scans in `newSpawnState`, item merging and `sendEntitiesTo`. The profile cannot say how much
+of the 0.065 ms per mob is (a); because the slope is linear and not quadratic, (a) is small at 600 mobs, so expect a payoff at 2000+ mobs or many
+item entities, not at 600. Do the spawner work (7.5) first: that 10 ms is certain.
+
+Data structure, all in `src/server/entity/entitymod.aowl`:
+
+* `WorldEntities` (type, line 299): keep `entities: seq[EntityBase]` as the authoritative ordered list (external code reads and assigns it:
+  `src/server/block/worldhooks.aowl` lines 825 to 845, `src/server/entity/itementity.aowl` line 70, `saveAllEntities`, `sendEntitiesTo`). Add
+  `byChunk: Table[int64, seq[EntityBase]]` (key `chunkKey(cx, cz)`, the helper `activeChunkSet` uses) and per-entity `indexKey: int64` and
+  `spawnSeq: int64` (monotonic, assigned at add, never changed by moves).
+* Maintain in: `addEntitySilent` (line 4108), `spawnEntityNonSave` (~4125), `removeEntity` (~4130; it currently rebuilds the whole list, make it
+  one pass and drop from the bucket), and the chunk move in the position update (~line 1104, where `self.chunkPos` changes): move between buckets
+  when `getSectionCord(floorX/Z)` changes. Entities that write `pos` directly (the comment in `tickEntities` says fast movers do) must be reconciled:
+  route through one `moveEntityIndexed(world, entity)` helper or recompute the key at the end of each entity's tick in `tickEntities` (one floor and
+  a compare). Teleports, dimension changes and NBT loading go through the same add/remove.
+* External writers of `store.entities` (`worldhooks.aowl` ~845, tests) bypass the index. Preferred: rename the field so the compiler finds every
+  user and give them proc access; fallback: `rebuildIndex(store)` after those assignments.
+
+Queries to switch:
+
+* `getNearbyEntities` (4024) and `getClosestEntity` (4042): compute the chunk range of `pos +- radius`, gather buckets, filter by squared distance as
+  now, then sort candidates by `spawnSeq`. Insertion order equals today's list order (`removeEntity` filters and keeps order), so results and the
+  `d < best` first-wins tie rule are identical.
+* `tickEntities` (4150): keeps iterating the ordered list (tick order must not change); its `isActiveChunk` test is already O(1). Optional second
+  step: iterate only active-chunk buckets in `spawnSeq` order (pays only when many mobs are far from players; measure first).
+* `natural_spawner.newSpawnState` (line 209): iterate active-chunk buckets in `spawnSeq` order (counts are order independent but `addCharge` float
+  sums are not, so keep the order to stay bit-identical).
+* `itementity.aowl` line 70 (item merge scan), `broadcastEntitySpawn`, `sendEntitiesTo` (view-distance filter): later consumers.
+
+Risks: (1) stale buckets from direct `pos` writes make entities silently miss queries; guard with a debug check in `tickEntities` under an env flag
+comparing `indexKey` with the live floor. (2) Result-order changes if candidates are not sorted by `spawnSeq` (changes ties and float sums).
+(3) Thread safety: the index inherits the per-world owner thread; decide passes must only read it. (4) Memory: one Table entry per occupied chunk,
+negligible. (5) `loadWorld`'s pre-created `entitiesBox` (`newWorldEntities`, line 598) must build the index, and tests that construct
+`WorldEntities(entities: @[])` literals need a nil Table treated as empty. (6) The 6 external callers of the two query procs must not change; only
+the bodies. Tests: `entitymodtest`; a new randomized test (add/move/remove 2000 entities, compare every query to the linear scan including order);
+`natural_spawnertest` unchanged.
+
+### 7.5 Recommended order from this data
+
+1. Spawner pass (10 ms constant, `natural_spawner.naturalSpawnTick`): add a sub-scope split first (one build): `newSpawnState`, chunk gather and
+   shuffle, `spawnForChunk` per category. Then fixes that keep the rng stream: avoid `readChunkSync` and the shuffle for categories that cannot
+   spawn, avoid the per-call `fromSeed(getSeed())`. Needs a build; not done here.
+2. Entity sub-scopes (AI goals, movement/pathing, packets) to learn the real shape of the 0.065 ms per mob. Without that the index is a guess.
+3. Entity index (7.4) only if step 2 shows query time is a large share.
+4. No more region-task workloads: block ticks are under 1 ms per tick even populated.
+
+Raw outputs (outside the repo): `C:/m3/prof_def.json`, `prof_rt.json`, `prof_old.json`. Not verified: the natural entity count, anything with real
+players or non-idle bots, an A/B on spawner caps, the gate at more than 4 threads.
