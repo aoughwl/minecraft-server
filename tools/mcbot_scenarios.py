@@ -1806,6 +1806,12 @@ def create_live(s):
     y = 220
     s.command('fill %d %d %d %d %d %d minecraft:air' % (cx - 4, y - 2, cz - 4, cx + 4, y + 6, cz + 4))
     _pause(s, 1.0)
+    # Commands count as player built, so with physics_triggers at its default (structures) a floating rig is collapse checked: the platform
+    # and the lone gearbox (inside the check's box) fell before /create took them, about 13 runs in 14. Stone columns down into the ground
+    # hold up the gearbox and a platform corner (the corner column stops at y, under the platform, so the turning body clears it).
+    gy = int(py // 1) - 4
+    s.command('fill %d %d %d %d %d %d minecraft:stone' % (cx, gy, cz, cx, y - 2, cz))
+    s.command('fill %d %d %d %d %d %d minecraft:stone' % (cx - 2, gy, cz + 2, cx - 2, y, cz + 2))
     s.command('fill %d %d %d %d %d %d minecraft:stone' % (cx - 2, y + 1, cz - 2, cx + 2, y + 1, cz + 2))
     s.command('setblock %d %d %d minecraft:copper_block' % (cx, y - 1, cz))       # the gearbox stand-in
     s.wait(lambda: s.w.block(cx, y + 1, cz) not in (None, 0) and s.w.block(cx, y - 1, cz) not in (None, 0), 'the rig', 20.0)
@@ -1821,13 +1827,24 @@ def create_live(s):
     print('  speed: %r' % [l for l in sp if 'scoreboard' not in l])
     speed_ok = any('12' in l and 'rpm' in l for l in sp)
 
-    def status():
+    def status_once():
         lines = _reply(s, 'create status', 0.8)
         for l in lines:
             m_ = re.search(r'turned (-?[0-9.]+) degrees, riders carried last tick (\d+)', l)
             if m_:
                 return float(m_.group(1)), int(m_.group(2)), l
         return None, None, lines
+
+    def status():
+        # A reply can miss its 0.8 s window, and a read can land before a `tick step` has run all its ticks (one tick early = 3.6 degrees
+        # at 12 rpm). While frozen the angle only moves with a step, so read until two answers agree.
+        prev = status_once()
+        for _ in range(8):
+            cur = status_once()
+            if cur[0] is not None and prev[0] is not None and abs(cur[0] - prev[0]) < 1e-6:
+                return cur
+            prev = cur
+        return prev
 
     a0, _, l0 = status()
     s.check(a0 is not None, 'no bearing line in /create status: %r' % (l0,))
@@ -1836,7 +1853,8 @@ def create_live(s):
     _ITEM.clear()
     s.command('kill @e[type=item]')
     _pause(s, 0.4)
-    s.command('summon item %.2f %.2f %.2f {Item:{id:"minecraft:cobblestone",count:1},PickupDelay:32767}' % (ix, y + 2.0, iz))
+    s.command('summon item %.2f %.2f %.2f {Item:{id:"minecraft:cobblestone",count:1},PickupDelay:32767,Tags:["create_rider"]}' % (ix, y + 2.0, iz))
+    _ITEM['uuid'] = '@e[type=item,tag=create_rider,limit=1]'   # by tag: 'nearest the bot' could pick some other dropped item
     _pause(s, 0.3)
     # the server is frozen and stepped in exact blocks of 25 ticks (= 90 degrees at 12 rpm), so the numbers do not depend on wall time
     s.command('tick freeze')
