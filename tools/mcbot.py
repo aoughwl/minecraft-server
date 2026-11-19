@@ -566,12 +566,26 @@ def read_slot(r):
         return 0, 0
     item = r.varint()
     added, removed = r.varint(), r.varint()
-    check(added == 0 and removed == 0, 'a stack with %d+%d components: this bot does not read them' % (added, removed))
+    for _ in range(added):
+        comp = r.varint()
+        # 774: 2 = max_damage, 3 = damage (one varint each); anything else has an unknown size, so the packet cannot be read on
+        check(comp in (2, 3), 'a stack with %d+%d components (first unread id %d): this bot does not read them' % (added, removed, comp))
+        r.varint()
+    for _ in range(removed):
+        r.varint()
     return count, item
 
 
 def write_slot(count, item):
     return varint(0) if count <= 0 else varint(count) + varint(item) + varint(0) + varint(0)
+
+
+def _only_others(status, name):
+    """True when this bot's own name is gone from the status sample while other players remain: a second bot (the two-world dim
+    scenarios start DimA and DimB against one server) joined after `online_before` was taken, so the raw count cannot fall back to it."""
+    pl = status['players']
+    sample = pl.get('sample') or []
+    return pl['online'] > 0 and len(sample) >= pl['online'] and all(p.get('name') != name for p in sample)
 
 
 def block_pos(x, y, z):
@@ -1052,6 +1066,8 @@ def pump(c, st, w, biomes, ctx, until, what, seconds=8.0):
         except Fail as e:
             if pid == 0x61 and 'components' in str(e):
                 continue        # entity data of an item entity with components (a dropped item): this bot cannot read them, nothing needs them
+            if pid == PLAY_EQUIPMENT and 'components' in str(e):
+                continue        # another entity's equipment with a component this bot cannot size (nothing reads equipment)
             raise Fail('%s (while handling play packet 0x%02x of %d bytes: %s)' % (e, pid, len(r.data), bytes(r.data[:40]).hex()))
 
 
@@ -3250,11 +3266,11 @@ def run(args):
     leave_start = time.time()
     while True:
         after = status_ping(args.host, args.port)
-        if after['players']['online'] <= online_before or time.time() - leave_start > 3.0:
+        if after['players']['online'] <= online_before or _only_others(after, args.name) or time.time() - leave_start > 3.0:
             break
         time.sleep(0.05)
     print('status after disconnect: online=%d (after %.2fs)' % (after['players']['online'], time.time() - leave_start))
-    check(after['players']['online'] <= online_before, 'the server still counts the player: %r' % after['players'])
+    check(after['players']['online'] <= online_before or _only_others(after, args.name), 'the server still counts the player: %r' % after['players'])
     if args.relogin:
         # A second login under the same name straight away: it must not be refused as a duplicate.
         again = Conn(args.host, args.port)
