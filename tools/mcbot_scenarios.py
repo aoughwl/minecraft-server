@@ -2522,3 +2522,21 @@ def mem_wander(s):
             if dz == 0:
                 leg += 1
     print('mem_wander: %d teleports' % n, flush=True)
+
+
+@scenario(explicit('tp_storm'))
+def tp_storm(s):
+    """Teleport-confirm stress (the 'Wrong teleport id' kick): an operator /tp's TP_N times (default 60), TP_GAP seconds apart
+    (default 0.0 = back to back), alternating two nearby points, then checks it is still connected."""
+    import os
+    _ready(s)
+    n = int(os.environ.get('TP_N', '60'))
+    gap = float(os.environ.get('TP_GAP', '0.0'))
+    for i in range(n):
+        s.command('tp @s %d 100 %d' % (10 + (i % 2) * 5, 10))
+        if gap:
+            _pause(s, gap)
+    _pause(s, 3.0)
+    s.command('say tp_storm_done')
+    _pause(s, 1.0)
+    print('tp_storm: %d teleports sent, gap %.2f' % (n, gap), flush=True)
