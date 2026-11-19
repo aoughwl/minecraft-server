@@ -369,3 +369,11 @@ So a bounded pregen does not leak per pass and does not grow in the idle tail; t
 ### Reserved Urgent-lane worker (fix for the dimension-gate slowdown during generation)
 
 `sim/jobpool.addReservedWorkers` adds a worker that only ever takes `lnUrgent`; `dimtick.dimPool` adds one. Generation jobs block in `findOrClaimStructureStart` on every general worker, so before this an urgent dimension job waited for a whole generation job (see docs/bench_stall_findings.md). Measured on the real server (pregen radius 8, `MC_CHUNK_WORKERS=8 MC_DIM_THREADS=1`, 2 runs, `tools/bench_server.py`): tick MSPT during generation mean 1.4 / 1.6 ms, p50 0.16 / 0.17, max 49 / 28 ms, against mean 22.5 and max 2.5-4.7 s before. Fill phase unchanged (about 24-26 ms mean). Generation wall time 17.1 / 17.5 s. Two runs, one machine, a loaded host; the tail under saturated CPU is not claimed fixed.
+
+## Closing status (2026-11-19, mt-int, not pushed)
+
+Done and verified on a clean-cache build: phases 0 to 6 as described above (all opt-in gates default off); reserved Urgent worker and its lost-wakeup fix (gated dim_portal 18/18 then 8/8 after the scenario fix, no hangs); save-pool shared-owner hang (F1) and the other audit findings F2/F4 fixed with tests; module-variable audit complete (884 vars, section 8 of MULTITHREADING_VARS.md); populated-tick profile, entity tick breakdown, spawner optimisation and path-snapshot fix (MULTITHREADING_PHASE5_NEXT.md sections 7 to 9).
+
+Decisions from evidence: entity index not built (`ent:nearby` is not a hot scope; pathfinding is); `MC_PATH_WORKERS` stays off (about parity after the fix); `MC_REGION_THREADS` and the active-chunk set show no measurable effect on the profiled workload; real speedup is generation only (2.3x at 4 workers, 3.0x at 8) and the tick stays tick-bound.
+
+Not done, and why: nothing is pushed (origin/main is still b53c2c6; the owner of the chunk/physics chain has not landed theirs, and mt-int must rebase onto it, rebuild clean and re-run the scenario suite, defaults plus gates, before any push). Their fixes for worldedit_more, create_live and the chunk-retention memory growth (we9 build: 506 MB peak against 4601 MB) are in their tree only. `fluids_finite` fails identically on every build tried (fluid model against the scenario, physics owner). packs_live and datapack_tick_live fail by design.
