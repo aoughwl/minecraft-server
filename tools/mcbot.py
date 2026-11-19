@@ -680,6 +680,11 @@ class MetaStop(Exception):
     """An entry this bot cannot size (a particle with data, a profile): the rest of the packet is skipped."""
 
 
+class StackStop(MetaStop):
+    """An item stack with components (a named WorldEdit wand, an enchanted tool): the rest of the packet is skipped and
+    counted in `World.unreadable_stacks`, instead of failing whatever scenario happens to be running when it arrives."""
+
+
 def read_meta_value(r, kind):
     name = META_KINDS_774.get(kind)
     check(name is not None, 'metadata type %d is not a 1.21.11 (774) serializer id' % kind)
@@ -1179,8 +1184,14 @@ def one_packet(c, st, w, biomes, ctx, pid, r):
         st.hit('keep_alive')
     elif pid == PLAY_DISCONNECT:
         raise Fail('kicked %.1fs into play: %r' % (time.time() - ctx['start'], r.take(r.left())))
-    elif handle_play_extra(w, pid, r):
-        check(r.left() == 0, 'packet 0x%02x: %d bytes left over' % (pid, r.left()))
+    else:
+        try:
+            if handle_play_extra(w, pid, r):
+                check(r.left() == 0, 'packet 0x%02x: %d bytes left over' % (pid, r.left()))
+        except StackStop as stop:
+            w.unreadable_stacks = getattr(w, 'unreadable_stacks', 0) + 1
+            if w.unreadable_stacks == 1:
+                print('  packet 0x%02x skipped: %s' % (pid, stop), flush=True)
 
 
 def move_flags(on_ground):
