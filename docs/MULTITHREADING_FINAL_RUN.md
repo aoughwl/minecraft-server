@@ -69,8 +69,37 @@ printed `dimtick: dimension threads on`):
 | run_dim_portal | defaults | PASS x1 |
 | run_dim_portal | on | PASS x2, FAIL x1 (`timed out waiting for the respawn back to the overworld (trip 0)`; no server-side error or assert line; the first gate-on run, before the bot fix, which does not touch this path) |
 
-The gated portal failure is real in the sense that it happened once in three gated runs and zero of one default run; with those counts it is
+(Superseded by the 10+10 table below: gates on fail 5 of 10.) The gated portal failure is real in the sense that it happened once in three gated runs and zero of one default run; with those counts it is
 neither shown to be gate-caused nor shown to be flaky-at-baseline. It needs more runs per configuration.
+
+## dim_portal gated failure: 10 + 10 interleaved runs (Nov 19)
+
+`sh tools/run_dim_portal.sh C:/m/int_all.exe`, 10 runs gates on (MC_THREADS=4 MC_CHUNK_WORKERS=4 MC_DIM_THREADS=1 MC_DIM_PLAYERS_MULTI_WORLD=1
+MC_THREAD_ASSERT=1) alternated with 10 runs on defaults (gate, def, gate, def, ...), one server at a time, ports 26150-26162, free memory 5.6-10.5 GB
+before each run. Per-run directories and outputs are in C:/m3/dp_gate_N and C:/m3/dp_def_N (+ .out).
+
+| Config | PASS | FAIL | Failure text |
+|---|---|---|---|
+| gates on | 5 (runs 1, 2, 4, 6, 10) | 5 (runs 3, 5, 7, 8, 9) | all 5: `timed out waiting for the respawn back to the overworld (trip 0)` |
+| defaults | 9 | 1 (run 7) | `the frame interior is not a nether_portal block (state 10)` (different, earlier failure: the overworld frame did not light; the trip never started) |
+
+Timings: gated passes finished the scenario in 23.5-27.7 s; default passes in 36.3-47 s (the bot's "back in the overworld" lines, where
+printed, were 6.5-10.0 s on defaults, 2.5 s in the one gated pass I inspected). Gated failures: the bot arrives in the nether after 0.8-2.1 s, sees the
+destination portal (`server says nether_portal: True`), walks in (`/tp` to the cell's side), and then no respawn ever comes; scenario times out at ~63-65 s.
+
+Server logs: zero `owner guard` / `raised` / assert / violation lines in all 20 runs; the only `dimtick` line is `dimtick: dimension threads on` in
+the gated runs. The server gives no error at all, but all 5 gated failures show the same pattern: the server log goes quiet right after PortalA's
+last `/tp` (the walk into the portal). Server `setblock` lines executed: 92, 95, 92, 98, 101 in the failed runs vs 394 in a passing run (companion PortalB
+should issue ~90 s of setblocks); the companion bot's keep-alives drop from 12 (pass) to 3-4 (fail); and the post-run `stop_server`
+login (`SERVER NOT ANSWERING after bots`) fails in exactly those 5 gated runs and in no other run (15 of 15 others: `SERVER ALIVE`). So the
+failed gated runs are not "the respawn arrived late": the server stops serving commands and new logins around the time the portal transfer would be
+processed.
+
+Hypothesis (not proven): with MC_DIM_THREADS on and two players in different dimensions, the portal transfer of PortalA out of the nether (queued
+by postCross) stalls or deadlocks the tick, e.g. a lock/join between the dimension job and the main tick that the transfer touches. A one-tick-late
+transfer or the teleport-confirm race would not stop the companion's commands and the login path, so that explanation fits the data poorly. Nothing
+here shows which lock; the next step is a stack dump (or the dim job/join timings, not exposed in the log of this build) of a hung gated server.
+The one default failure is a separate, earlier flake (portal frame not lit) and does not reach the transfer.
 
 ## Honesty notes
 
