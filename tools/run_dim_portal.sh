@@ -23,6 +23,7 @@ import hashlib, uuid, json
 print(json.dumps([{"uuid": str(uuid.UUID(bytes=hashlib.md5(("OfflinePlayer:" + n).encode()).digest(), version=3)), "name": n, "level": 4,
                   "bypasses_player_limit": False} for n in ("PortalA", "PortalB")]))
 PY
+[ -n "$SEED" ] && sed -i "s/^seed = .*/seed = \"$SEED\"/" minecraft-server.toml
 "$EXE" > server.txt 2>&1 &
 SERVER_PID=$!
 sleep 12

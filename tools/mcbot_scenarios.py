@@ -2328,10 +2328,29 @@ def dim_portal(s):
         print('  companion edits: %d, keep-alives: %d' % (i, s.ctx['counts'].get(s.m.PLAY_KEEP_ALIVE, 0)), flush=True)
         return
     portal_ids = set()
+    if os.environ.get('DIM_PORTAL_TRACE'):
+        print('  TRACE pre-probe natural value at probe cell (4,120,4): %r' % (s.w.block(4, 120, 4),), flush=True)
+    # The probe cell can be natural terrain (the world seed is random per run): clear it first, so the wait below can only be satisfied by the
+    # portal block's own update, never by a natural block or a chunk that is still the pre-edit state.
+    force = bool(os.environ.get('DIM_PORTAL_FORCE_TERRAIN'))   # regression: make the probe cell and the frame box solid stone first, like high terrain
+    if force:
+        s.command('setblock 4 120 4 minecraft:stone')
+        s.wait(lambda: s.w.block(4, 120, 4) == 1, 'the forced stone at the probe cell')
+    legacy = bool(os.environ.get('DIM_PORTAL_LEGACY_PROBE'))   # the old, terrain-dependent waits, kept to reproduce the failure on a fixed SEED
+    if not legacy:
+        s.command('setblock 4 120 4 minecraft:air')
+        s.wait(lambda: s.w.block(4, 120, 4) == 0, 'the probe cell to clear (natural terrain)')
     for axis in ('x', 'z'):
         s.command('setblock 4 120 4 minecraft:nether_portal[axis=%s]' % axis)
         s.wait(lambda: s.w.block(4, 120, 4) not in (None, 0) and s.w.block(4, 120, 4) not in portal_ids, 'the probe portal block')
-        portal_ids.add(s.w.block(4, 120, 4))
+        seen = s.w.block(4, 120, 4)
+        portal_ids.add(seen)
+        # The probe value must really be a nether_portal: the server says so (a natural block read from the chunk would not pass).
+        n = len(s.w.chat)
+        s.command('execute if block 4 120 4 minecraft:nether_portal[axis=%s] run tellraw @s "PROBEPORTAL%s"' % (axis, axis))
+        s.wait(lambda: s.heard('PROBEPORTAL' + axis, n), 'the server to confirm nether_portal[axis=%s] at the probe cell (client saw state %r)' % (axis, s.w.block(4, 120, 4)), 10.0)
+        _pause(s, 0.5)
+        s.check(s.w.block(4, 120, 4) == seen, 'the probe value %r was not the nether_portal[axis=%s] state the client ends up with (%r): a natural block or stale chunk value was taken for it' % (seen, axis, s.w.block(4, 120, 4)))
         s.command('setblock 4 120 4 minecraft:air')
         s.wait(lambda: s.w.block(4, 120, 4) == 0, 'the probe cell to clear')
     print('  nether_portal state ids (axis x, z): %r' % sorted(portal_ids), flush=True)
@@ -2339,9 +2358,22 @@ def dim_portal(s):
     s.command('tp @s %d.5 %d %d.5' % (bx, by + 6, bz))
     s.wait(lambda: s.position() is not None and abs(s.position()[0] - (bx + 0.5)) < 0.01, 'the teleport to the build site', 60.0)
     s.wait(lambda: s.w.block(bx, by - 1, bz) is not None, 'the chunk at the build site', 60.0)
+    if os.environ.get('DIM_PORTAL_TRACE'):
+        print('  TRACE pre-fill natural values at interior cells (bx+1,by+1,bz)=%r (bx+2,by+3,bz)=%r' % (s.w.block(bx + 1, by + 1, bz), s.w.block(bx + 2, by + 3, bz)), flush=True)
     s.command('fill %d %d %d %d %d %d minecraft:bedrock' % (bx - 2, by - 1, bz - 3, bx + 5, by - 1, bz + 3))
+    # The build site can be natural terrain too (stone at the interior cells was read as "the portal" before the fill packets arrived): clear
+    # the whole frame box, wait for the client to see air in the interior, build, then wait for portal states specifically.
+    if force:
+        s.command('fill %d %d %d %d %d %d minecraft:stone' % (bx, by, bz, bx + 3, by + 4, bz))
+        s.wait(lambda: s.w.block(bx + 1, by + 1, bz) == 1 and s.w.block(bx + 2, by + 3, bz) == 1, 'the forced stone in the frame box', 30.0)
+    if not legacy:
+        s.command('fill %d %d %d %d %d %d minecraft:air' % (bx, by, bz, bx + 3, by + 4, bz))
+        s.wait(lambda: s.w.block(bx + 1, by + 1, bz) == 0 and s.w.block(bx + 2, by + 3, bz) == 0, 'the frame interior to clear (natural terrain)', 30.0)
     _portal_frame(s, bx, by, bz)
-    s.wait(lambda: s.w.block(bx + 1, by + 1, bz) not in (None, 0) and s.w.block(bx + 2, by + 3, bz) not in (None, 0), 'the portal blocks', 30.0)
+    if legacy:
+        s.wait(lambda: s.w.block(bx + 1, by + 1, bz) not in (None, 0) and s.w.block(bx + 2, by + 3, bz) not in (None, 0), 'the portal blocks', 30.0)
+    else:
+        s.wait(lambda: s.w.block(bx + 1, by + 1, bz) in portal_ids and s.w.block(bx + 2, by + 3, bz) in portal_ids, 'the portal blocks', 30.0)
     inner = s.w.block(bx + 1, by + 1, bz)
     print('  overworld portal block state (axis=x): %d' % inner, flush=True)
     s.check(inner in portal_ids, 'the frame interior is not a nether_portal block (state %r)' % inner)

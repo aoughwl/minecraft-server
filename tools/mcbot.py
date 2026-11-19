@@ -908,11 +908,22 @@ def record_scoreboard_packet(w, pid, r):
     r.take(r.left())
 
 
+TRACE_CELL = (4, 120, 4)
+
+
+def trace_cell(w, pid, kind, extra=''):
+    """DIM_PORTAL_TRACE=1: log every value the client holds at TRACE_CELL after a packet that can change it (the probe cell of dim_portal)."""
+    if os.environ.get('DIM_PORTAL_TRACE'):
+        print('  TRACE t=%.3f pid=0x%02x %s cell=%r dim_respawns=%r pos=%r %s' % (time.time(), pid, kind, w.block(*TRACE_CELL), getattr(w, 'dim', None), w.pos, extra), flush=True)
+
+
 def handle_play_extra(w, pid, r):
     """The packets --play reads. True when it consumed the packet."""
     if pid == PLAY_BLOCK_UPDATE:
         x, y, z = read_block_pos(r)
         w.overrides[(x, y, z)] = r.varint()
+        if (x, y, z) == TRACE_CELL:
+            trace_cell(w, pid, 'block_update')
     elif pid == PLAY_SECTION_UPDATE:
         section = struct.unpack('>Q', r.take(8))[0]
         sx, sz, sy = section >> 42, (section >> 20) & 0x3FFFFF, section & 0xFFFFF
@@ -931,6 +942,8 @@ def handle_play_extra(w, pid, r):
                     break
             rel = v & 0xFFF
             w.overrides[(sx * 16 + (rel >> 8), sy * 16 + (rel & 15), sz * 16 + ((rel >> 4) & 15))] = v >> 12
+            if (sx * 16 + (rel >> 8), sy * 16 + (rel & 15), sz * 16 + ((rel >> 4) & 15)) == TRACE_CELL:
+                trace_cell(w, pid, 'section_update', 'sec=%r' % ((sx, sy, sz),))
     elif pid == PLAY_BLOCK_ACK:
         w.acked = max(w.acked, r.varint())
     elif pid == PLAY_CONTAINER_CONTENT:
@@ -1147,6 +1160,8 @@ def one_packet(c, st, w, biomes, ctx, pid, r):
         w.chunks[(x, z)] = column
         for key in [k for k in w.overrides if (k[0] >> 4, k[2] >> 4) == (x, z)]:
             del w.overrides[key]
+        if (x, z) == (TRACE_CELL[0] >> 4, TRACE_CELL[2] >> 4):
+            trace_cell(w, pid, 'chunk', 'chunk_cell_value=%r' % (w.block(*TRACE_CELL),))
         ctx['chunk_parsed'] = True
         st.hit('chunk_parsed')
     elif pid == PLAY_BATCH_END:
@@ -2501,6 +2516,8 @@ def world_session(c, st, w, biomes, ctx, args):
             r.varint()
             name = r.string()
             respawns.append(name)
+            w.dim = name
+            trace_cell(w, pid, 'respawn', name)
             if name != 'minecraft:overworld':
                 ctx['sections'], w.min_y = 16, 0
             else:
