@@ -175,3 +175,12 @@ Not a race. World layout differs between modules in int_wake.exe (worldmod store
 - Gated dim_portal (MC_THREADS=4 MC_CHUNK_WORKERS=4 MC_DIM_THREADS=1 MC_DIM_PLAYERS_MULTI_WORLD=1), 18 runs: 0 hangs, 0 crashes (pre-fix baseline 5/10 and 3/8 hangs). The lost-wakeup hang is fixed on this evidence.
 - 3 of 12 runs with MC_THREAD_ASSERT=1 failed the scenario (one respawn timeout, two "frame interior is not a nether_portal block"); no violations, panics or hangs in their logs. Unexplained and open; not compared against a baseline.
 - Pregen bench, run_dim_threads x3 and the full scenario run were not completed in this pass.
+
+## Final verification pass (int_cleanc.exe = mt-int clean build; we8/we9 = MINECRAFT's tree)
+
+- run_dim_threads with the dim gate on, 3 runs: 3 of 3 pass, no errors.
+- Pregen bench with MC_DIM_THREADS=1, radius 8: MSPT 0.22 ms mean, 2.9 ms max (the earlier slowdown is gone).
+- Default scenarios (4 chunk workers): 15 pass, 4 fail, 7 inconclusive. packs_live and datapack_tick_live fail by design. lod_summaries timed out once and passed on rerun (flaky, generation timing). fluids_finite fails identically on int_final, int_all, int_cleanc and we9, so it is not a threading regression (fluid model vs scenario, physics owner).
+- mem_wander (240 s wander, then idle): we8 hit the 4500 MB cap (peak 4601 MB; 2956 untargeted protos kept alive by dependency cycles); we9 (mark-from-targets dependency GC) peaks at 506 MB and ends with waitSet=chunkMap=protos=0.
+- MC_SAVE_WORKERS=1 pregen soak (625 chunks) on we8: 40.7 s, no stall, peak 508 MB. The earlier stall was the structure-claim wait, now bounded by a wall-clock deadline.
+- Open: 3 of 12 asserted dim_portal runs failed the scenario (not hangs); not baselined. Rebase and push wait on MINECRAFT's chain reaching origin/main.
