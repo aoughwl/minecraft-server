@@ -36,7 +36,7 @@ def run_one(name, args):
     cache = os.path.join(args.cache, "c_" + name)
     exe = os.path.join(args.cache, "gen_" + name + ".exe" if os.name == "nt" else "gen_" + name)
     cmd = [args.compiler, "c", "-r", "--cc:gcc", "--nimcache:" + cache, "-o:" + exe,
-           "-p:src", "-p:src/data_codegen", "-p:../jwt/src", "-p:../compress/src", "-p:../compress", source]
+           "-p:src", "-p:src/data_codegen", "-p:../std/jwt/src", "-p:../std/compress", source]
     env = dict(os.environ)
     gcc = os.environ.get("AOWLMONY_GCC_DIR")
     if gcc:

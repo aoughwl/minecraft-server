@@ -39,8 +39,8 @@ Never write a stub that looks finished. `grep -rn PARTIAL src` is the honest lis
 Use a private cache per worker; a shared one fails falsely. Paths are relative to the repo root.
 This port needs aowlhexer d596bd9 or later: older ones crash on closures in object fields.
 
-    aowlmony check --nimcache:<own dir> -p:src -p:../jwt/src -p:../compress/src -p:../compress <file>
-    aowlmony c -r --cc:gcc --nimcache:<own dir> -o:<own exe> -p:src -p:<file's dir> -p:../jwt/src <test>
+    aowlmony check --nimcache:<own dir> -p:src -p:../std/jwt/src -p:../std/compress <file>
+    aowlmony c -r --cc:gcc --nimcache:<own dir> -o:<own exe> -p:src -p:<file's dir> -p:../std/jwt/src <test>
 
 gcc from `C:\msys64\ucrt64\bin` must come first on PATH.
 

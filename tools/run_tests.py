@@ -38,7 +38,7 @@ def one(item):
     cache = os.path.join(work, 'c%d' % i)
     exe = os.path.join(work, 't%d.exe' % i)
     cmd = [aowl, 'c', '--cc:gcc', '--nimcache:' + cache, '-o:' + exe, '-p:src', '-p:' + os.path.dirname(t),
-           '-p:../jwt/src', t]
+           '-p:../std/jwt/src', t]
     try:
         for attempt in range(4):
             b = subprocess.run(cmd, capture_output=True, text=True, errors='replace', env=env, timeout=1500)
