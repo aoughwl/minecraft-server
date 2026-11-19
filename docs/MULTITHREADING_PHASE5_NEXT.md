@@ -300,3 +300,9 @@ ms per tick, scope self time:
 Pathfinding is half of the entity cost and the part that grows. `ent:nearby` (the O(E) scan an entity index would remove) does not appear among the top scopes, so **an entity index is not justified**; do not build it. The offload target is the navigator.
 
 With `MC_THREADS=4 MC_PATH_WORKERS=1` at 300 mobs the tick is **621 ms mean** (p95 675), `mob:navigator` 594 ms per tick: the existing path-worker gate is far worse than inline pathfinding here. It stays default off and must not be enabled; cause not yet found (suspects: the tick thread joins each path job in the same tick, per-path snapshot capture cost, or workers starved).
+
+### 9.1 Path-worker gate after the snapshot fix (mt-int aadc3b6, clean build)
+
+Cause of the 621 ms tick: `Navigator.tick` captured a 67 x 102 x 67 = 457,878-cell BlockSnapshot per path request with one world lookup per cell (23.4 ms each, about 20 requests per tick at 300 mobs); `drainDone` also allocated per call and the pool's owner table grew by one entry per navigator ever created. Fixes: section-wise snapshot copy (23.4 ms -> about 1.6 ms), allocation-free drainDone with owner slots dropped at zero.
+
+Measured again, `MC_THREADS=4 MC_PATH_WORKERS=1`, 300 mobs: mean tick **37.96 ms** (p95 47.95), `mob:navigator` 11.53 ms per tick, against 39.3 ms and 13.18 ms inline. So the gate is no longer harmful but is also only about 1.7 ms per tick (within noise) faster: the capture cost on the tick thread cancels most of the search cost moved off it. It stays default off. Further gain needs the capture itself to leave the tick thread (shared per-area capture or read-only section handles from the chunk system) and is not planned.
