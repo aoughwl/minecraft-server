@@ -569,7 +569,9 @@ def read_slot(r):
     for _ in range(added):
         comp = r.varint()
         # 774: 2 = max_damage, 3 = damage (one varint each); anything else has an unknown size, so the packet cannot be read on
-        check(comp in (2, 3), 'a stack with %d+%d components (first unread id %d): this bot does not read them' % (added, removed, comp))
+        if comp not in (2, 3):
+            # unknown size: the rest of this packet cannot be read; the frame itself is intact (same stop as before)
+            raise StackStop('a stack with %d+%d components (first unread id %d): this bot does not read them' % (added, removed, comp))
         r.varint()
     for _ in range(removed):
         r.varint()
