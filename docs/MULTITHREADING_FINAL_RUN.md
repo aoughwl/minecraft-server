@@ -145,3 +145,22 @@ Fix (not applied, docs/patches/jobpool-lost-wakeup.patch, `git apply -p1`): in `
 and the job is not on the Urgent lane. Smallest change; cost is a few spurious wakeups per Normal submit only when dimension threads are on. Cleaner
 alternative: a second condition variable for the reserved workers (signal each per lane). Not verified by a run: no rebuild was possible. Verification
 needed after a rebuild: loop the gated dim_portal 10x, expect 0 hangs.
+
+## int_wake.exe (jobpool lost-wakeup fix, 95a74c5): crashes on the first dim job, hang not testable (Nov 19)
+
+Prebuilt `C:/m/int_wake.exe` = `int_all.exe` + commit 95a74c5. Driver: `docs/dim_portal_hang/driver3.sh` (driver2 with the exe swapped, hang detector unchanged: neither bot log grew for 40 s). Summary: `docs/dim_portal_hang/wake_summary3.txt`.
+
+| run | result |
+|---|---|
+| gated dim_portal, MC_THREAD_ASSERT=1, int_wake, 12 runs | 12/12 server crash, 0 hangs |
+| gated dim_portal, assert unset, int_wake, 4 runs | 4/4 server crash, 0 hangs |
+| control: same gated env + assert, int_all.exe, same driver, 1 run | pass (rc=0, no crash) |
+| bench_server pregen with MC_DIM_THREADS=1 MC_CHUNK_WORKERS=8, int_wake, 1 run | server crash during the fill phase, no gen numbers valid (2nd run not made) |
+| run_dim_threads.sh gated, int_wake, 1 run | server crash (3 runs not made after the same stack reproduced) |
+
+Every crash is an access violation (0xc0000005) at the same address, on a dim job worker thread, within the first seconds of dim ticking:
+`dup(ref BlockRegistry)` <- `runTickData` <- `tickChunks` <- `tick` <- anonproc <- `dimJob` <- `runJob` <- `workerMain`
+(full gdb stack: `docs/dim_portal_hang/wake_crash_stack.txt`). Server only dies once a dim job runs; ungated runs were not tried. The source diff of int_wake vs int_all is only jobpool.aowl (broadcast instead of signal), so either the build is bad (stale shared nimcache is the known failure mode, see the X1 hsl crash) or the broadcast exposes a latent race (workers now all wake and run dim jobs concurrently, and `dup` of a BlockRegistry reference faults). This run cannot tell which.
+
+Verdict on the lost-wakeup fix: NOT VERIFIED. No hang was observed (0/16) but only because the server crashes first; the 3/8 and 5/10 hang rates of int_all.exe cannot be compared. Pregen MSPT (1.4 ms mean with the reserved worker, 22.5 ms without) was not measured.
+Next step: rebuild int_wake from a clean nimcache and rerun; if it still crashes, look at the BlockRegistry ref dup in runTickData under concurrent dim workers.
