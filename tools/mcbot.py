@@ -1122,7 +1122,7 @@ def one_packet(c, st, w, biomes, ctx, pid, r):
         check(r.left() == 0, 'player position: %d bytes left over' % r.left())
         print('  teleport id=%d to %.2f %.2f %.2f flags=%d' % (tid, x, y, z, flags))
         w.pos = (x, y, z)
-        c.send(SB_TELEPORT, varint(tid))
+        c.send(SB_TELEPORT, varint(tid + int(os.environ.get('TP_CONFIRM_OFFSET', '0'))))   # TP_CONFIRM_OFFSET: a deliberately wrong confirm id (test)
         st.hit('teleport')
     elif pid == PLAY_CHUNK:
         ctx['chunks'] += 1
