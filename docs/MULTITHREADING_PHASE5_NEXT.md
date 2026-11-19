@@ -280,3 +280,23 @@ players or non-idle bots, an A/B on spawner caps, the gate at more than 4 thread
 ## 8. Spawner pass measured (mt-int 87b40e3, clean build)
 
 Idle populated bench (3 bots, 0 summoned, 25 s profile): mean tick 21.1 ms before, 17.4 ms after the biome-table / no-list-copy / hoisted-player-positions change (spawner total 10.1 ms -> about 8.6 ms per tick, `spawner:category`; `randpos` 0.13, `state` 0.23, `gather` 0.05, `shuffle` ~0.001 ms per tick). With 300 mobs: mean tick 36.9 ms, `entities` about 25 ms per tick. The remaining `spawner:category` cost is the draw-heavy group loop itself (3 groups x up to 4 draws plus adjustSpawnPosition / isValidSpawnPositionForType per candidate), which cannot be skipped without changing the RNG stream. A 40-sample main-thread stack probe (gdb) of an idle 150 s run caught the main thread sleeping in 26 of 40 samples; the 14 busy samples were spread over pathfinding (computePathWith, getNode, getPathTypeFromState), noise biome lookup, randRange, portal tick and the scheduler, with no single dominant frame, so no further cheap target was found. Entity ticking, not the spawner, is what grows with load.
+
+## 9. Entity tick breakdown (mt-int f6c5eb3, clean build, bench_populated, 30 s profile, 3 bots)
+
+ms per tick, scope self time:
+
+| scope | 0 mobs | 300 mobs |
+|---|---|---|
+| mspt mean | 20.4 | 39.3 |
+| mob:navigator (pathfinding) | 3.25 | 13.18 |
+| spawner:category | 9.08 | 8.47 |
+| living:entitytick | 1.84 | 6.17 |
+| ent:tick (dispatch) | 0.24 | 2.44 |
+| living:travel | 1.42 | 2.23 |
+| living:blockcoll | 0.48 | 1.23 |
+| living:sendchanges | 0.29 | 0.89 |
+| mob:goalsel | 0.35 | 0.53 |
+
+Pathfinding is half of the entity cost and the part that grows. `ent:nearby` (the O(E) scan an entity index would remove) does not appear among the top scopes, so **an entity index is not justified**; do not build it. The offload target is the navigator.
+
+With `MC_THREADS=4 MC_PATH_WORKERS=1` at 300 mobs the tick is **621 ms mean** (p95 675), `mob:navigator` 594 ms per tick: the existing path-worker gate is far worse than inline pathfinding here. It stays default off and must not be enabled; cause not yet found (suspects: the tick thread joins each path job in the same tick, per-path snapshot capture cost, or workers starved).
