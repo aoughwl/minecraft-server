@@ -276,3 +276,7 @@ the bodies. Tests: `entitymodtest`; a new randomized test (add/move/remove 2000 
 
 Raw outputs (outside the repo): `C:/m3/prof_def.json`, `prof_rt.json`, `prof_old.json`. Not verified: the natural entity count, anything with real
 players or non-idle bots, an A/B on spawner caps, the gate at more than 4 threads.
+
+## 8. Spawner pass measured (mt-int 87b40e3, clean build)
+
+Idle populated bench (3 bots, 0 summoned, 25 s profile): mean tick 21.1 ms before, 17.4 ms after the biome-table / no-list-copy / hoisted-player-positions change (spawner total 10.1 ms -> about 8.6 ms per tick, `spawner:category`; `randpos` 0.13, `state` 0.23, `gather` 0.05, `shuffle` ~0.001 ms per tick). With 300 mobs: mean tick 36.9 ms, `entities` about 25 ms per tick. The remaining `spawner:category` cost is the draw-heavy group loop itself (3 groups x up to 4 draws plus adjustSpawnPosition / isValidSpawnPositionForType per candidate), which cannot be skipped without changing the RNG stream. A 40-sample main-thread stack probe (gdb) of an idle 150 s run caught the main thread sleeping in 26 of 40 samples; the 14 busy samples were spread over pathfinding (computePathWith, getNode, getPathTypeFromState), noise biome lookup, randRange, portal tick and the scheduler, with no single dominant frame, so no further cheap target was found. Entity ticking, not the spawner, is what grows with load.
