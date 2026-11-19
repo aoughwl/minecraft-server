@@ -107,3 +107,41 @@ The one default failure is a separate, earlier flake (portal frame not lit) and 
   (port 26180, from a batch I aborted) kept running until its bots finished, then was stopped with the `stop_server` scenario. No process that
   I did not start was touched.
 * No src change and no rebuild were made.
+
+## dim_portal gated hang: ROOT CAUSE PROVEN (Nov 19): lost wakeup in jobpool.submitLane
+
+Method: loop of gated `run_dim_portal.sh C:/m/int_all.exe` runs with a watcher; when neither bot log grew for 40 s the watcher attached
+`gdb -p <server pid> -batch -ex "thread apply all bt 25"` and detached (files in docs/dim_portal_hang/, driver2.sh, summaries). Prebuilt exe only,
+no src change, no rebuild. (A first watcher keyed on "server.txt quiet 15 s" gave one false positive on a passing run, kept as
+g1_pass_run_idle_stacks_false_positive.txt: a healthy server is idle there.)
+
+Stacks of the hung server (identical in 3 of 3 caught hangs: g2, a2, a3):
+* Tick thread (thread 1): `serverLoop > stepTicker > tick > tickWorlds > tickWorldsThreaded > runDimTicks > applyOutboxes > (portal transfer closure,
+  portalmod.tickPortal) > getPortalDestination > findSafeLocation > fetchChunk > generateChunk > pumpUntil > waitCompleted > SleepEx`.
+  I.e. the join phase already finished; the queued CrossPortal message runs on the tick thread, needs a destination chunk, generates it with
+  `pumpUntil`, and pumpUntil loops forever because `executor.inFlight > 0` (`waitCompleted(1)` = Sleep(1), then retry). This is why everything else stops
+  (no tick, no keep-alives, no logins) while the process is alive and quiet.
+* All 5 pool threads (3 general + 1 reserved Urgent-only + ... as created) are in `workerMain > waitSysCond` (SleepConditionVariableCS): idle, asleep.
+  No lock holder, no cycle between dim jobs and the tick: it is not a deadlock, it is a lost wakeup.
+* gdb memory dump of the JobPool object (g2_jobpool_memory.txt): lane Normal `lq[1]` has 1 queued job, `lh` = {0,0,0} (not taken), `pendCount` shows 1 pending
+  for the chunk-gen owner, while all workers wait on the condition. A queued Normal job that no sleeping worker picks up.
+
+Mechanism: `dimtick.dimPool` calls `addReservedWorkers(p, 1)` (a worker that takes only the Urgent lane) and all workers share ONE condition variable
+`p.wake`. `submitLane` ends with a single `signal(p.wake)`. When the chunk system submits a Normal job, the one signal can wake the reserved worker; it
+re-checks `p.lh[lnUrgent] >= len` (nothing for it) and sleeps again, the signal is spent, the Normal job stays in the queue, and the general workers
+that could run it keep sleeping. The only thing that would later wake them is another submit; the tick thread is itself blocked in the pump waiting
+for this very job, so none comes. Only exists when a reserved worker exists = only with MC_DIM_THREADS=1 and the gate on. Probability per Normal submit is
+about 1/(idle workers), hence intermittent; a portal transfer into a not-yet-generated nether chunk with otherwise idle pool makes it likely (one
+chunk, one signal), which is why it hits right after PortalA's walk in. The 19-minute soak passed because chunks were mostly loaded then.
+
+Counts (tick-thread stack identical in each hang): run 1 (assert on) 1 pass (g1), then g2 HANG; then 12 interleaved runs:
+* gate on, MC_THREAD_ASSERT unset (a1..a6, MC_CHUNK_WORKERS=4): 2 hangs / 6 (a2, a3), 4 pass. So the assert gate is not involved.
+* MC_CHUNK_WORKERS=0 with the gates (b1..b6): 0 / 6, but the gate refuses there ("dimtick: dimension threads refused: no worker threads"), so those runs are
+  the gate-off path; consistent with the cause (no reserved worker, no hang) but not an independent test.
+* Earlier 10+10 table: gate on 5/10 hangs, defaults 0/10 of this kind. With this section: gate on + MC_CHUNK_WORKERS=4: 8 hangs / 18 runs overall
+  (5 + 1 + 2 of 10 + 2 + 6... see summaries for the exact runs I made: 3 hangs in my 8 gated runs).
+
+Fix (not applied, docs/patches/jobpool-lost-wakeup.patch, `git apply -p1`): in `submitLane`, `broadcast(p.wake)` instead of `signal` when `p.reserved > 0`
+and the job is not on the Urgent lane. Smallest change; cost is a few spurious wakeups per Normal submit only when dimension threads are on. Cleaner
+alternative: a second condition variable for the reserved workers (signal each per lane). Not verified by a run: no rebuild was possible. Verification
+needed after a rebuild: loop the gated dim_portal 10x, expect 0 hangs.
