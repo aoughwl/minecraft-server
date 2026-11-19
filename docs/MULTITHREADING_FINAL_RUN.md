@@ -168,3 +168,10 @@ Next step: rebuild int_wake from a clean nimcache and rerun; if it still crashes
 ## int_wake.exe crash: root cause proven, stale nimcache (Nov 19)
 
 Not a race. World layout differs between modules in int_wake.exe (worldmod stores blockWorld at +0x428, worldadapter reads +0x408; `activeChunkSet` from 2e8604d was added in one module only). ARC is atomic here (lock add/sub), so the refcount-race hypothesis is refuted. int_all.exe is layout-consistent, not lucky. The lost-wakeup fix is still unverified; rerun on the clean build. Details: docs/dim_portal_hang/wake_crash_analysis.md; tripwire: docs/patches/world-layout-tripwire.patch.
+
+## Lost-wakeup fix verification (clean-cache build, mt-int 52a1ab2)
+
+- Layout tripwire (tools/check_world_layout.sh): int_clean LAYOUT-OK, the stale-cache int_wake LAYOUT-MISMATCH (as expected).
+- Gated dim_portal (MC_THREADS=4 MC_CHUNK_WORKERS=4 MC_DIM_THREADS=1 MC_DIM_PLAYERS_MULTI_WORLD=1), 18 runs: 0 hangs, 0 crashes (pre-fix baseline 5/10 and 3/8 hangs). The lost-wakeup hang is fixed on this evidence.
+- 3 of 12 runs with MC_THREAD_ASSERT=1 failed the scenario (one respawn timeout, two "frame interior is not a nether_portal block"); no violations, panics or hangs in their logs. Unexplained and open; not compared against a baseline.
+- Pregen bench, run_dim_threads x3 and the full scenario run were not completed in this pass.
