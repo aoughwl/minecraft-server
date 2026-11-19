@@ -1,6 +1,6 @@
 ## Port of pumpkin/src/entity/ai/pathfinder/mod.rs
 
-import std/[math, options, tables, locks]
+import std/[math, options, tables, locks, atomics]
 from ../../../../generated/attributes import MOVEMENT_SPEED, FOLLOW_RANGE, STEP_HEIGHT
 import ../../../../util/math/mathmod
 import ../../../../util/math/rustnum
@@ -247,6 +247,13 @@ proc ensureJobsLock() =
     initLock(gPathJobsLock)
     gPathJobsInit = true
 
+# Initialised at module load (tick thread): two dimension jobs must never race on the lazy init above.
+ensureJobsLock()
+
+proc bumpStale() =
+  ## `gPathStale` / `gPathApplied` / `gNextPathId` are touched by mob AI of several worlds when dimension jobs run.
+  discard atomicFetchAdd(gPathStale, 1, moSequentiallyConsistent)
+
 proc pathJobBody(arg: pointer): int {.nimcall, raises.} =
   ## Pool body: never raises. Slot `arg` is owned by the job until the tick thread takes it back.
   var job: nil PathJob = nil
@@ -274,8 +281,7 @@ proc takeJob(slot: int): nil PathJob =
 
 proc ownerOf(self: Navigator): int =
   if self.pathId == 0:
-    self.pathId = gNextPathId
-    gNextPathId += 1
+    self.pathId = atomicFetchAdd(gNextPathId, 1, moSequentiallyConsistent)
   self.pathId
 
 proc hasPathJob*(self: Navigator): bool = self.jobSlot >= 0
@@ -286,18 +292,25 @@ proc waitJob(pool: JobPool; owner: int; sink: var seq[JobResult]) =
 
 proc sweepOrphans(tick: int64) =
   ## Jobs whose navigator never ticked again (mob removed): drain and drop them so the pool counters do not stick.
+  # gPathJobs is read and regrown by other worlds' submitPathJob: snapshot the stale slots under the lock, then wait outside it.
+  var stale: seq[(int, int)] = @[]
+  acquire(gPathJobsLock)
   if gLastOrphanSweep == tick:
+    release(gPathJobsLock)
     return
   gLastOrphanSweep = tick
-  let pool = pathPool()
-  var sink: seq[JobResult] = @[]
   for i in 0 ..< gPathJobs.len:
     let j = gPathJobs[i]
     if j != nil and tick - j.tick > 40'i64:
-      waitJob(pool, j.owner, sink)
-      discard takeJob(i)
-      gPathStale += 1
-      sink.setLen(0)
+      stale.add((i, j.owner))
+  release(gPathJobsLock)
+  let pool = pathPool()
+  var sink: seq[JobResult] = @[]
+  for (i, owner) in stale:
+    waitJob(pool, owner, sink)
+    discard takeJob(i)
+    bumpStale()
+    sink.setLen(0)
 
 proc submitPathJob*(self: Navigator; snap: BlockSnapshot; mobPos: Vector3[int32]; startPos: Vector3[float64]; onGround: bool;
     followRange: float32; dest: Vector3[float64]; tick: int64) =
@@ -346,10 +359,10 @@ proc resolvePathJob*(self: Navigator): PathJobOutcome =
   self.jobSlot = -1
   result.has = true
   if job == nil:
-    gPathStale += 1
+    bumpStale()
     return
   if sink[0].failed or not job.ok or job.gen0 != self.gen:
-    gPathStale += 1
+    bumpStale()
     return
   result.fresh = true
   result.path = job.result
@@ -409,9 +422,9 @@ proc tick*(self: Navigator; entity: LivingEntity) =
         self.ticksOnCurrentNode = 0'u32
         self.lastNodeIndex = 0
         self.pathStartPos = some(self.pendStart)
-        gPathApplied += 1
+        discard atomicFetchAdd(gPathApplied, 1, moSequentiallyConsistent)
       else:
-        gPathStale += 1
+        bumpStale()
         self.repathCooldown = 0'u32
     if self.needsNewPath(goal):
       let startPosF = entity.entity.pos
