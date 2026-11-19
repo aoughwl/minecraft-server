@@ -1,0 +1,108 @@
+## Concurrent compressBatch callers (sim/savepool) on a real worker pool: every caller must get exactly its own results (each
+## batch is checked against the inline compressOf) and no caller may hang. The main thread waits with a bounded poll, so a hang
+## (the old shared owner/sink let one caller steal another's results and the victim spin forever) fails the test instead of
+## blocking it. Run: savepooltest. Prints "savepooltest ok" and exits 0 on success.
+import std/[assertions, syncio, locks, rawthreads]
+import ../../config/chunk as chunkconfig
+import ../../world/[chunkio, chunkformat, anvilformat]
+import savepool
+
+proc sleepWin(ms: uint32) {.stdcall, importc: "Sleep", dynlib: "kernel32.dll".}
+
+const
+  Threads = 4
+  Batches = 25
+
+var gSer: ChunkSerializer = nil
+var gLock: Lock
+var gFinished = 0
+var gBad = 0
+var gBatchesDone = 0
+
+proc rawOf(tag, i: int): seq[byte] =
+  let len = 3000 + ((tag * 977 + i * 131) mod 40000)
+  result = newSeq[byte](len)
+  var s = uint32(tag * 31 + i) * 2654435761'u32 + 7'u32
+  for k in 0 ..< len:
+    if (k div 64 + i) mod 3 == 0:
+      result[k] = byte((k * 5) mod 251)
+    else:
+      s = s * 1664525'u32 + 1013904223'u32
+      result[k] = byte(s shr 24)
+
+proc callerBody(arg: pointer) {.nimcall.} =
+  let id = cast[int](arg)
+  var bad = 0
+  var done = 0
+  for b in 0 ..< Batches:
+    let nb = 3 + ((id + b) mod 6)
+    let tag = id * 100 + b
+    var xs: seq[int32] = @[]
+    var zs: seq[int32] = @[]
+    var raws: seq[seq[byte]] = @[]
+    var hints: seq[int] = @[]
+    for i in 0 ..< nb:
+      xs.add(int32(i * 3 + id))
+      zs.add(int32(tag mod 32))
+      raws.add(rawOf(tag, i))
+      hints.add(if i mod 4 == 3: -1 else: 2)
+    let res = compressBatch(gSer, xs, zs, raws, hints)
+    if res.len != nb:
+      inc bad
+    else:
+      for i in 0 ..< nb:
+        let want = compressOf(gSer, xs[i], zs[i], raws[i], hints[i])
+        if res[i].ok != want.ok or res[i].comp != want.comp or res[i].data != want.data:
+          inc bad
+    inc done
+  acquire(gLock)
+  gBad += bad
+  gBatchesDone += done
+  inc gFinished
+  release(gLock)
+
+type Th = ref object
+  t: RawThread
+
+proc runCase(workers: int) =
+  gFinished = 0
+  gBad = 0
+  gBatchesDone = 0
+  assert enableSaveJobs(workers)
+  var ts: seq[Th] = @[]
+  for i in 0 ..< Threads:
+    let h = Th()
+    try:
+      create(h.t, callerBody, cast[pointer](i + 1))
+    except:
+      echo "thread start failed"
+      quit(2)
+    ts.add(h)
+  var waited = 0
+  var fin = 0
+  while waited < 3000:      # 30 s
+    acquire(gLock)
+    fin = gFinished
+    release(gLock)
+    if fin == Threads:
+      break
+    sleepWin(10'u32)
+    inc waited
+  if fin != Threads:
+    echo "FAIL workers=" & $workers & ": only " & $fin & " of " & $Threads & " callers finished in 30 s (hang)"
+    quit(1)
+  for h in ts:
+    join(h.t)
+  assert gBad == 0, "workers=" & $workers & ": " & $gBad & " batches returned another caller's or wrong results"
+  assert gBatchesDone == Threads * Batches
+  shutdownSaveJobs()
+  echo "PASS workers=" & $workers & " (" & $gBatchesDone & " batches)"
+
+proc main() =
+  initLock(gLock)
+  gSer = toSerializer(newAnvilChunkFile(), defaultAnvilChunkConfig())
+  runCase(3)
+  runCase(0)
+  echo "savepooltest ok"
+
+main()
