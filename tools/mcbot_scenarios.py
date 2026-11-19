@@ -2483,3 +2483,42 @@ def det_world(s):
 
 
 EXPLICIT_ONLY.add('det_world')
+
+
+@scenario(explicit('mem_wander'))
+def mem_wander(s):
+    """Memory test driver (tools/mem_soak.py with WANDER_SECS): an operator in spectator mode teleports every WANDER_STEP seconds
+    (default 6) to the next point of a square spiral with a WANDER_GAP (default 500) block pitch, so the server loads and
+    generates new terrain round the player all the time and unloads the old one. Ends (disconnects) after WANDER_SECS."""
+    import os
+    _ready(s)
+    secs = float(os.environ.get('WANDER_SECS', '120'))
+    step = float(os.environ.get('WANDER_STEP', '6'))
+    gap = int(os.environ.get('WANDER_GAP', '500'))
+    s.command('gamemode spectator')
+    _pause(s, 1.0)
+    end = time.time() + secs
+    fixed = os.environ.get('WANDER_FIXED')      # "x,z": go there once and stay (a location-specific blow-up test)
+    if fixed:
+        fx, fz = [int(v) for v in fixed.split(',')]
+        s.command('tp @s %d 120 %d' % (fx, fz))
+        _pause(s, 0.5)
+        s.c.send(s.m.SB_MOVE_POS, struct.pack('>ddd', fx + 0.5, 120.0, fz + 0.5) + s.m.move_flags(True))
+        _pause(s, max(1.0, secs))
+        print('mem_wander: fixed %d %d' % (fx, fz), flush=True)
+        return
+    x = z = 0
+    dx, dz, leg, run, n = gap, 0, 1, 0, 0
+    while time.time() < end:
+        s.command('tp @s %d 120 %d' % (x, z))
+        _pause(s, 0.5)
+        s.c.send(s.m.SB_MOVE_POS, struct.pack('>ddd', x + 0.5, 120.0, z + 0.5) + s.m.move_flags(True))   # a client reports where it is
+        n += 1
+        _pause(s, step)
+        x += dx; z += dz; run += 1
+        if run == leg:
+            run = 0
+            dx, dz = -dz, dx
+            if dz == 0:
+                leg += 1
+    print('mem_wander: %d teleports' % n, flush=True)
