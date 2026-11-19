@@ -138,8 +138,8 @@ Counts (tick-thread stack identical in each hang): run 1 (assert on) 1 pass (g1)
 * gate on, MC_THREAD_ASSERT unset (a1..a6, MC_CHUNK_WORKERS=4): 2 hangs / 6 (a2, a3), 4 pass. So the assert gate is not involved.
 * MC_CHUNK_WORKERS=0 with the gates (b1..b6): 0 / 6, but the gate refuses there ("dimtick: dimension threads refused: no worker threads"), so those runs are
   the gate-off path; consistent with the cause (no reserved worker, no hang) but not an independent test.
-* Earlier 10+10 table: gate on 5/10 hangs, defaults 0/10 of this kind. With this section: gate on + MC_CHUNK_WORKERS=4: 8 hangs / 18 runs overall
-  (5 + 1 + 2 of 10 + 2 + 6... see summaries for the exact runs I made: 3 hangs in my 8 gated runs).
+* My own gated runs with MC_CHUNK_WORKERS=4 and a watcher: g1 pass, g2 hang, a1..a6 = 2 hangs: 3 hangs in 8 runs, all 3 with the same stack. The earlier 10+10 table
+  (5/10 gated hangs) was not re-run.
 
 Fix (not applied, docs/patches/jobpool-lost-wakeup.patch, `git apply -p1`): in `submitLane`, `broadcast(p.wake)` instead of `signal` when `p.reserved > 0`
 and the job is not on the Urgent lane. Smallest change; cost is a few spurious wakeups per Normal submit only when dimension threads are on. Cleaner
