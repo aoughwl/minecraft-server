@@ -164,3 +164,7 @@ Every crash is an access violation (0xc0000005) at the same address, on a dim jo
 
 Verdict on the lost-wakeup fix: NOT VERIFIED. No hang was observed (0/16) but only because the server crashes first; the 3/8 and 5/10 hang rates of int_all.exe cannot be compared. Pregen MSPT (1.4 ms mean with the reserved worker, 22.5 ms without) was not measured.
 Next step: rebuild int_wake from a clean nimcache and rerun; if it still crashes, look at the BlockRegistry ref dup in runTickData under concurrent dim workers.
+
+## int_wake.exe crash: root cause proven, stale nimcache (Nov 19)
+
+Not a race. World layout differs between modules in int_wake.exe (worldmod stores blockWorld at +0x428, worldadapter reads +0x408; `activeChunkSet` from 2e8604d was added in one module only). ARC is atomic here (lock add/sub), so the refcount-race hypothesis is refuted. int_all.exe is layout-consistent, not lucky. The lost-wakeup fix is still unverified; rerun on the clean build. Details: docs/dim_portal_hang/wake_crash_analysis.md; tripwire: docs/patches/world-layout-tripwire.patch.
