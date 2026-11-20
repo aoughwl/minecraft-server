@@ -15,6 +15,7 @@ import std/assertions
 import std/times
 import std/envvars
 import std/syncio
+import std/atomics
 import ../../config/lighting
 import ../chunkdata
 import ../chunkio
@@ -70,6 +71,7 @@ type
     listener*: ChunkListener
     lightingConfig*: LightingEngineConfig
     lastUnload: Time
+    gcPending: bool  ## a target dropped to None: collect stranded dependency chains on this pass, not up to 1 s later
     shouldUnload*: bool
     shouldSave*: bool
     shutDownChunkSystem*: bool
@@ -347,8 +349,10 @@ proc resortWork*(s: GenerationSchedule, newData: LevelChannelValue): bool =
             s.waitingForChunks.excl(task)
             dropNode(s, task)
             holder.tasks[i] = NullKey
-      if newStage == StagedChunkEnum.None and holder.dependencyStage == StagedChunkEnum.None:
-        s.unloadChunks.incl(pos)
+      if newStage == StagedChunkEnum.None:
+        s.gcPending = true
+        if holder.dependencyStage == StagedChunkEnum.None:
+          s.unloadChunks.incl(pos)
     else:
       if oldStage == StagedChunkEnum.None:
         s.unloadChunks.excl(pos)
@@ -385,40 +389,84 @@ proc resortWork*(s: GenerationSchedule, newData: LevelChannelValue): bool =
   s.queueDirty = true
   true
 
+proc pruneDeadDependents(s: GenerationSchedule, holder: ChunkHolder) =
+  ## Unlinks the `occupiedBy` edges whose task is gone.
+  var curEdge = holder.occupiedBy
+  var prevEdge = NullKey
+  var hasChangeHead = false
+  var changeHead = NullKey
+  while not isNull(curEdge):
+    let edge = getEdge(s.graph, curEdge)
+    if containsNode(s.graph, edge.to):
+      prevEdge = curEdge
+      curEdge = edge.next
+    else:
+      let next = edge.next
+      discard removeEdge(s.graph, curEdge)
+      curEdge = next
+      if isNull(prevEdge):
+        hasChangeHead = true
+        changeHead = next
+      else:
+        setEdgeNext(s.graph, prevEdge, next)
+  if hasChangeHead:
+    holder.occupiedBy = changeHead
+
 proc garbageCollectDependencies(s: GenerationSchedule) =
   ## Garbage collect stranded dependencies.
-  var stranded = newSeq[ChunkPos](0)
+  ##
+  ## A dependency is kept only when it is reachable from what a player (or ticket) still wants: the tasks of targeted holders
+  ## and tasks in flight are live; a dependency holder one of whose dependents is live is needed, and then its own tasks are live
+  ## too; repeat until nothing changes. Upstream's test ("some dependent task still exists") also keeps CYCLES alive: two
+  ## untargeted neighbours each holding a task that depends on the other, both parked in waitingForChunks for a chunk that will
+  ## never load, kept ~3000 ProtoChunks forever after a player left (mem_wander: untargeted=asDep=2956, waitSet=1649).
+  var candidates = newSeq[ChunkPos](0)
+  var live = initNodeSet()
   for pos, holder in pairs(s.chunkMap):
-    if holder.targetStage == StagedChunkEnum.None and holder.dependencyStage != StagedChunkEnum.None:
-      stranded.add(pos)
-  for si in 0 ..< stranded.len:
-    let holder = s.chunkMap.getOrDefault(stranded[si], nil)
-    if not (not isNull(holder.occupied) and containsNode(s.graph, holder.occupied)):
+    let targeted = holder.targetStage != StagedChunkEnum.None
+    if not targeted and holder.dependencyStage != StagedChunkEnum.None:
+      candidates.add(pos)
+    for ti in 0 ..< StagedChunkCount:
+      let task = holder.tasks[ti]
+      if not isNull(task) and containsNode(s.graph, task) and (targeted or node(s.graph, task).inFlight):
+        live.incl(task)
+  var needed = initChunkSet()
+  var changed = true
+  while changed:
+    changed = false
+    for ci in 0 ..< candidates.len:
+      let pos = candidates[ci]
+      if needed.contains(pos):
+        continue
+      let holder = s.chunkMap.getOrDefault(pos, nil)
+      var isNeeded = not isNull(holder.occupied) and containsNode(s.graph, holder.occupied)
       var curEdge = holder.occupiedBy
-      var prevEdge = NullKey
-      var hasChangeHead = false
-      var changeHead = NullKey
-      var hasValidTask = false
-      while not isNull(curEdge):
+      while not isNeeded and not isNull(curEdge):
         let edge = getEdge(s.graph, curEdge)
-        if containsNode(s.graph, edge.to):
-          prevEdge = curEdge
-          curEdge = edge.next
-          hasValidTask = true
-        else:
-          let next = edge.next
-          discard removeEdge(s.graph, curEdge)
-          curEdge = next
-          if isNull(prevEdge):
-            hasChangeHead = true
-            changeHead = next
-          else:
-            setEdgeNext(s.graph, prevEdge, next)
-      if hasChangeHead:
-        holder.occupiedBy = changeHead
-      if not hasValidTask:
-        holder.dependencyStage = StagedChunkEnum.None
-        s.unloadChunks.incl(stranded[si])
+        if live.contains(edge.to):
+          isNeeded = true
+        curEdge = edge.next
+      if isNeeded:
+        needed.incl(pos)
+        changed = true
+        for ti in 0 ..< StagedChunkCount:
+          let task = holder.tasks[ti]
+          if not isNull(task) and containsNode(s.graph, task):
+            live.incl(task)
+  for ci in 0 ..< candidates.len:
+    let holder = s.chunkMap.getOrDefault(candidates[ci], nil)
+    pruneDeadDependents(s, holder)
+    if not needed.contains(candidates[ci]):
+      holder.dependencyStage = StagedChunkEnum.None
+      # Its chain was only there for tasks that are gone: drop it now, or until the unload queue gets to it the queued
+      # stages keep running (an IO task each makes a fresh ProtoChunk) for a chunk nothing wants.
+      for ti in 0 ..< StagedChunkCount:
+        let task = holder.tasks[ti]
+        if not isNull(task) and not (containsNode(s.graph, task) and node(s.graph, task).inFlight):
+          s.waitingForChunks.excl(task)
+          dropNode(s, task)
+          holder.tasks[ti] = NullKey
+      s.unloadChunks.incl(candidates[ci])
 
 proc processUnloadQueue(s: GenerationSchedule) =
   if s.unloadChunks.len == 0:
@@ -433,6 +481,8 @@ proc processUnloadQueue(s: GenerationSchedule) =
     let holder = s.chunkMap.getOrDefault(pos, nil)
     if holder != nil:
       assert holder.targetStage == StagedChunkEnum.None
+      if not isNull(holder.occupied) and not containsNode(s.graph, holder.occupied):
+        holder.occupied = NullKey  # a claim whose node is gone would otherwise be retried every second forever
       if not isNull(holder.occupied):
         s.unloadChunks.incl(pos)
       else:
@@ -458,6 +508,28 @@ proc processUnloadQueue(s: GenerationSchedule) =
   if chunks.len == 0:
     return
   ioWriteBatch(s.host, chunks)
+
+proc holderStats(s: GenerationSchedule): string =
+  ## For the MC_SCHED_STATS line: holders nothing targets that still hold a chunk (split by dependency/none), claims
+  ## held, claims whose node is gone, and the unload queue.
+  var noTargetWithChunk = 0
+  var noTargetDep = 0
+  var occupied = 0
+  var staleOccupied = 0
+  var protos = 0
+  for pos, holder in pairs(s.chunkMap):
+    if holder.chunk != nil and holder.chunk.kind == ChunkKind.Proto:
+      inc protos
+    if holder.targetStage == StagedChunkEnum.None and holder.chunk != nil:
+      inc noTargetWithChunk
+      if holder.dependencyStage != StagedChunkEnum.None:
+        inc noTargetDep
+    if not isNull(holder.occupied):
+      inc occupied
+      if not containsNode(s.graph, holder.occupied):
+        inc staleOccupied
+  "protos=" & $protos & " untargeted=" & $noTargetWithChunk & " (asDep=" & $noTargetDep & ") occupied=" & $occupied &
+    " staleOccupied=" & $staleOccupied & " unloadQ=" & $s.unloadChunks.len & " nodes=" & $nodeKeys(s.graph).len
 
 proc saveAllChunk(s: GenerationSchedule, saveProtoChunk: bool) =
   var chunks = newSeq[(ChunkPos, Chunk)](0)
@@ -573,6 +645,28 @@ proc receiveChunk*(s: GenerationSchedule, pos: ChunkPos, data: RecvChunk) =
     # Neighbor chunks returned to holders: unblock waiting tasks.
     checkWaitingTasks(s)
   of RecvChunkKind.GenerationFailure:
+    echo "chunk generation: ", data.stage, " at ", pos.x, ",", pos.y, " failed, regenerating it: ", data.error
+    # The write square's other chunks went out in the cache: give them back and release the claim, or those holders
+    # stay occupied (never unloaded, never advanced) for good. The failed chunk itself starts over below.
+    if data.cache != nil:
+      var dx = 0'i32
+      var dy = 0'i32
+      for ci in 0 ..< data.cache.chunks.len:
+        let newPos = chunkPos(data.cache.x + dx, data.cache.z + dy)
+        let other = s.chunkMap.getOrDefault(newPos, nil)
+        if other != nil and newPos != pos:
+          other.chunk = data.cache.chunks[ci]
+          if not isNull(other.occupied) and containsNode(s.graph, other.occupied):
+            dropNode(s, other.occupied)
+          other.occupied = NullKey
+          if other.targetStage == StagedChunkEnum.None and other.currentStage >= other.dependencyStage:
+            other.dependencyStage = StagedChunkEnum.None
+            s.unloadChunks.incl(newPos)
+        dy += 1'i32
+        if dy == data.cache.size:
+          dy = 0'i32
+          dx += 1'i32
+      checkWaitingTasks(s)
     let holder = s.chunkMap.getOrDefault(pos, nil)
     if holder != nil:
       let targetStage = holder.targetStage
@@ -690,10 +784,17 @@ proc workOnce*(s: GenerationSchedule, maxGenerationTasks: int): bool =
   # 1. Get latest world state (player moves, etc).
   if resortWork(s, get(s.sendLevel)):
     didWork = true
+  # Chunks a player no longer wants keep their dependency stage until the neighbours that set it are collected; doing
+  # that only once a second (and only while the unload queue was non-empty) let a departing player's whole dependency
+  # halo run its queued stages, thousands of fresh ProtoChunks at once.
+  if s.gcPending:
+    s.gcPending = false
+    garbageCollectDependencies(s)
 
   # Process the unload queue periodically (every 1 second) to batch writes together and act as a brief memory cache
   # if a player walks back into the chunk.
-  if s.unloadChunks.len != 0 and (getTime() - s.lastUnload).inMilliseconds >= 1000:
+  # Also while tasks are parked waiting for chunks: a wait that no target needs any more is only ended by the collection.
+  if (s.unloadChunks.len != 0 or s.waitingForChunks.len != 0) and (getTime() - s.lastUnload).inMilliseconds >= 1000:
     garbageCollectDependencies(s)
     processUnloadQueue(s)
     s.lastUnload = getTime()
@@ -720,7 +821,7 @@ proc workOnce*(s: GenerationSchedule, maxGenerationTasks: int): bool =
     let task = pop(s.queue)
     if containsNode(s.graph, task.key):
       if node(s.graph, task.key).inDegree != 0'u32:
-        inc gStNotReady
+        atomicInc(gStNotReady)
         node(s.graph, task.key).inQueue = false
       else:
         node(s.graph, task.key).inFlight = true
@@ -738,9 +839,9 @@ proc workOnce*(s: GenerationSchedule, maxGenerationTasks: int): bool =
           s.waitingForChunks.excl(task.key)
           dropNode(s, task.key)
           didWork = true
-          inc gStStale
+          atomicInc(gStStale)
         elif nodeCopy.stage == StagedChunkEnum.Empty:
-          inc gStIo
+          atomicInc(gStIo)
           s.runningTaskCount += 1'u16
           let holder = holderForNode
           assert isNull(holder.occupied)
@@ -764,7 +865,7 @@ proc workOnce*(s: GenerationSchedule, maxGenerationTasks: int): bool =
               node(s.graph, task.key).inQueue = false
               node(s.graph, task.key).inFlight = false
             s.waitingForChunks.incl(task.key)
-            inc gStWaiting
+            atomicInc(gStWaiting)
             # The chunk we're waiting for may have arrived already: re-queue it now if so, so it isn't stranded.
             checkWaitingTasks(s)
           else:
@@ -774,7 +875,7 @@ proc workOnce*(s: GenerationSchedule, maxGenerationTasks: int): bool =
             s.runningTaskCount += 1'u16
             submit(s.executor, s.host, nodeCopy.pos, cache, nodeCopy.stage, s.recvChunk)
             inc generationTasks
-            inc gStSubmitted
+            atomicInc(gStSubmitted)
             didWork = true
 
   # Flush any remaining IO batch.
@@ -791,11 +892,11 @@ proc workOnce*(s: GenerationSchedule, maxGenerationTasks: int): bool =
     sortQueue(s)
     s.queueDirty = false
   if gSchedStats:
-    inc gStPasses
+    atomicInc(gStPasses)
     if didWork:
-      inc gStWorkPasses
+      atomicInc(gStWorkPasses)
     let us = (getTime() - statT0).inMicroseconds
-    gStWorkUs += us
+    atomicInc(gStWorkUs, us)
     if us > gStWorkMaxUs:
       gStWorkMaxUs = us
     if (getTime() - gStLast).inSeconds >= 5:
@@ -804,7 +905,7 @@ proc workOnce*(s: GenerationSchedule, maxGenerationTasks: int): bool =
         " notReady=" & $gStNotReady & " waiting=" & $gStWaiting & " stale=" & $gStStale & " workUs=" & $gStWorkUs &
         " maxPassUs=" & $gStWorkMaxUs & " | queue=" & $s.queue.len & " running=" & $s.runningTaskCount &
         " inFlight=" & $s.executor.inFlight & " waitSet=" & $s.waitingForChunks.len & " chunkMap=" & $s.chunkMap.len &
-        " " & statsLine(s.executor)
+        " " & holderStats(s) & " " & statsLine(s.executor)
       gStWorkMaxUs = 0
   didWork
 
