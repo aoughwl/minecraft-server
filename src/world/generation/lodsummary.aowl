@@ -176,8 +176,34 @@ type SampleCol = object
   depth: int32
   floor: uint32
 
-proc summarizeNoise*(gen: VanillaGenerator; cx, cz: int32; shift: int): LodColumn =
+proc sampleDensityRows(g: ChunkNoiseGenerator; start: bool; currentX: int32; yLo, yHi: int) =
+  ## `ChunkNoiseGenerator::sample_density` over corner rows `yLo .. yHi` only (the summary reads the surface band, not the
+  ## whole height: 2026-11-20, a first join's 51k summaries filled all 49 rows a slice and read ~12 of them).
+  let hCount = int32(chunknoise.horizontalCellBlockCount(g))
+  let vCount = int32(chunknoise.verticalCellBlockCount(g))
+  let x = currentX * hCount
+  let n = yHi - yLo + 1
+  for cellZ in 0 .. g.horizontalCellCount:
+    let z = (g.startCellPosZ + int32(cellZ)) * hCount
+    g.cacheFillUniqueId += 1'u64
+    let mapper = newInterpolationMapper(x, z, g.minimumCellY + int32(yLo), vCount)
+    var options = newSampleOptions(false, true, g.cacheResultUniqueId, g.cacheFillUniqueId, 0)
+    setWrapperData(options, 0, 0, 0, int(hCount), int(vCount))
+    for ii in 0 ..< g.router.interpolatorIndices.len:
+      let c = g.router.stack.comps[g.router.interpolatorIndices[ii]]
+      let off = yzToBufIndex(c, yLo, cellZ)
+      if start:
+        fillFromStack(g.router.stack, c.inputIndex, c.startBuffer, off, n, mapper, options)
+      else:
+        fillFromStack(g.router.stack, c.inputIndex, c.endBuffer, off, n, mapper, options)
+    g.cacheResultUniqueId = options.cacheResultUniqueId
+  g.cacheFillUniqueId += 1'u64
+
+proc summarizeNoiseWith(gen: VanillaGenerator; cx, cz: int32; shift: int; ranged: bool; ok: var bool): LodColumn =
   ## The noise-stage summary of chunk (cx, cz). See the file comment for what it does and does not see.
+  ## `ranged`: density only in the band the walk can reach (from the surface estimate); `ok` false when the walk left it
+  ## (the caller does the chunk again in full).
+  ok = true
   let settings = gen.settings
   let shape = settings.shape
   let minY = int32(shape.minY)
@@ -209,10 +235,38 @@ proc summarizeNoise*(gen: VanillaGenerator; cx, cz: int32; shift: int): LodColum
   let defaultBlock = gen.defaultBlock
   var cols = newSeq[SampleCol](0)
 
-  sampleStartDensity(noiseGen)
+  # The corner rows the walk can read: from the highest start (estimate + 48, see below) down to the lowest estimate less
+  # a margin (the surface, or the floor under water, is near the estimate). Full height when not ranged.
+  var rowLo = 0
+  var rowHi = int(cellHeight)
+  if ranged:
+    var hiGuess = -1'i32
+    var loEst = high(int32)
+    var ex = 0'i32
+    while ex < horizontalCells:
+      var ez = 0'i32
+      while ez < horizontalCells:
+        let e = estimateHeight(estimator, startX + ex * hCount, startZ + ez * hCount)
+        let g = (e + 48'i32) div vCount - minimumCellY
+        if g > hiGuess: hiGuess = g
+        if e < loEst: loEst = e
+        inc ez
+      inc ex
+    rowHi = int(min(cellHeight, max(0'i32, hiGuess) + 1'i32))
+    rowLo = int(max(0'i32, (loEst - 40'i32) div vCount - minimumCellY))
+    if hiGuess >= cellHeight - 1'i32: rowHi = int(cellHeight)
+    if rowLo >= rowHi: rowLo = max(0, rowHi - 1)
+  template fillStart() =
+    if ranged: sampleDensityRows(noiseGen, true, noiseGen.startCellPosX, rowLo, rowHi)
+    else: sampleStartDensity(noiseGen)
+  template fillEnd(cx: int32) =
+    if ranged: sampleDensityRows(noiseGen, false, noiseGen.startCellPosX + cx + 1'i32, rowLo, rowHi)
+    else: sampleEndDensity(noiseGen, cx)
+
+  fillStart()
   var cellX = 0'i32
   while cellX < horizontalCells:
-    sampleEndDensity(noiseGen, cellX)
+    fillEnd(cellX)
     let sampleStartX = (startCellX + cellX) * hCount
     var cellZ = 0'i32
     while cellZ < horizontalCells:
@@ -245,6 +299,10 @@ proc summarizeNoise*(gen: VanillaGenerator; cx, cz: int32; shift: int): LodColum
           var first = true
           var cellY = startCellY
           while cellY >= 0'i32 and open > 0:
+            # the walk left the filled band (a restart from the top, or a surface far under the estimate): in full
+            if ranged and (int(cellY) < rowLo or int(cellY) + 1 > rowHi):
+              ok = false
+              return
             onSampledCellCorners(noiseGen, cellX, cellY, cellZ)
             let sampleStartY = (minimumCellY + cellY) * vCount
             var localY = vCount - 1'i32
@@ -314,6 +372,18 @@ proc summarizeNoise*(gen: VanillaGenerator; cx, cz: int32; shift: int): LodColum
           elif cell.state == defaultBlock:
             cell.state = landTop(b.registryId, cell.top)
       result.cells[i] = cell
+
+proc summarizeNoise*(gen: VanillaGenerator; cx, cz: int32; shift: int): LodColumn =
+  ## The noise-stage summary of chunk (cx, cz): the surface band's density first, the whole height when the walk leaves it.
+  var ok = false
+  result = summarizeNoiseWith(gen, cx, cz, shift, true, ok)
+  if not ok:
+    result =summarizeNoiseWith(gen, cx, cz, shift, false, ok)
+
+proc summarizeNoiseFull*(gen: VanillaGenerator; cx, cz: int32; shift: int): LodColumn =
+  ## The whole-height fill, always (the reference the ranged one is checked against).
+  var ok = false
+  summarizeNoiseWith(gen, cx, cz, shift, false, ok)
 
 proc runLodJob*(job: LodJob) =
   ## What a worker runs for a `LodJob`.
