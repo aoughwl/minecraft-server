@@ -48,7 +48,7 @@ import ../net/winsock
 import ../serverbase
 import ../world/[bulkedit, worldmod, lootbridge]
 import "../block/blockbehaviour"
-import bodyentity, bodyworld, bodyjournal
+import bodyentity, bodyworld, bodyjournal, fellmotion
 
 export bodyentity, bodyjournal
 
@@ -59,7 +59,11 @@ const
   MaxProviderCells* = 6000       ## above this many surface cells a body answers with one body-wide box
   MaxAssembleCells* = 20000      ## largest component `assembleBox` turns into a body
   MaxEvents = 65536
-  FellMaxTicks* = 400'i64        ## a felled tree's stage (falling with leaves, falling bare) ends after this many ticks even if it never sleeps
+  FellMaxTicks* = 400'i64        ## a felled tree's stage (with leaves, logs only) ends after this many ticks even if it never sleeps
+  FellCheckpointEvery = 20'i64   ## a felled tree losing leaves is journaled at most this often (and at each stage change)
+  FellGlideTol = 0.05            ## blocks: a felled trunk this close to its grid pose is placed at once ...
+  FellGlideStep = 0.08           ## ... else it glides there, at most this far per cell and tick ...
+  FellGlideMaxTicks = 40         ## ... for at most this many ticks
 
 type
   BodyConfig* = object
@@ -962,59 +966,171 @@ proc bodyPoseChanged*(be: BodyEntity; tick: int64) =
   if tick - be.lastCheckpoint >= int64(gCfg.checkpointEvery):
     checkpoint(be, tick)
 
-proc isSoftCell(state: int32): bool =
-  ## Cells a felled tree loses when it lands, by the material table: the soft class (leaves, wool, hay, moss) and anything shapeless.
-  let m = materialOf(int(state))
-  m.matClass == mcSoft or m.matClass == mcFoliage
+proc breakSoftCell(be: BodyEntity; c: Cell) =
+  ## Loot drops and the break effect of one leaf of a felled tree, at the world cell of its centre, lifted out of the ground (up to 3)
+  ## when the leaf had sunk into it.
+  let p = worldPointOf(be, float64(c.x) + 0.5, float64(c.y) + 0.5, float64(c.z) + 0.5)
+  let x = int32(floor(p.x))
+  var y = int32(floor(p.y))
+  let z = int32(floor(p.z))
+  var k = 0
+  while k < 3 and isSolidState(stateIdAt(be.world, int(x), int(y), int(z))):
+    inc y
+    inc k
+  breakEffects(be.world, x, y, z, uint32(c.state), be.id)
 
-proc shedSoftCells(be: BodyEntity; tick: int64): int =
-  ## A felled tree touched down: its soft cells (leaves) break into their loot drops with the break effect, the hard cells (logs) go on as
-  ## a NEW body with the same pose (a new CREATE for the clients: their volume of the old one still holds the leaves), the old body ends
-  ## with reason `drDropped`. Returns 0 when there was nothing soft (`be` unchanged), 1 when a new body took over, 2 when nothing hard was left.
-  var hard: seq[Cell] = @[]
-  var soft: seq[Cell] = @[]
-  for c in cellList(be.body):
-    if isSoftCell(c.state):
-      soft.add(c)
-    else:
-      hard.add(c)
-  if soft.len == 0:
-    return 0
-  for c in soft:
-    let p = worldPointOf(be, float64(c.x) + 0.5, float64(c.y) + 0.5, float64(c.z) + 0.5)
-    breakEffects(be.world, int32(floor(p.x)), int32(floor(p.y)), int32(floor(p.z)), uint32(c.state), be.id)
-  if hard.len == 0:
-    destroyBody(be, drDropped, tick)
-    return 2
-  let (hi, lo) = newUuid()
-  var nb = newBody(hi, lo)
-  for c in hard:
-    setCell(nb, int(c.x), int(c.y), int(c.z), int(c.state))
-  recomputeMass(nb, defaultProps)
-  nb.pos = be.body.pos
-  nb.orient = be.body.orient
-  let ne = newBodyEntity(allocId(), be.world, be.dim, nb, tick)
+proc removeFelledCells(be: BodyEntity; gone: seq[Cell]; tick: int64) =
+  ## Leaves of a felled tree break (contact or decay): drops + break effect each, and the body goes on without them as a NEW volume
+  ## object with the SAME id and UUID (fellmotion.withoutCells; same pose). ONE create event announces it: bodysync.upsert sees a new
+  ## volume for a known id and replaces the clients' copy (DESTROY + CREATE of the parts, like a shattered body), the replay recorder
+  ## records a re-create (replaycore.sceneApply replaces). Called at most once per body and tick (tickFelledLeaves merges its sets).
+  if gone.len == 0:
+    return
+  for c in gone:
+    breakSoftCell(be, c)
+  be.body = withoutCells(be.body, gone)
+  if cellCount(be.body) == 0:
+    destroyBody(be, drEmptied, tick)
+    return
+  var keep: seq[Claim] = @[]
   for k in be.claims:
-    if getCell(nb, int(k.lx), int(k.ly), int(k.lz)) != 0:
-      ne.claims.add(k)
+    if getCell(be.body, int(k.lx), int(k.ly), int(k.lz)) != 0:
+      keep.add(k)
+  var keepBe: seq[BodyBE] = @[]
   for e in be.blockEntities:
-    if getCell(nb, int(e.lx), int(e.ly), int(e.lz)) != 0:
-      ne.blockEntities.add(e)
-  ne.felled = true
-  ne.fellStage = 1
-  ne.felledTick = tick
-  destroyBody(be, drDropped, tick)
-  registerBody(ne, tick)
-  checkpoint(ne, tick)
-  1
+    if getCell(be.body, int(e.lx), int(e.ly), int(e.lz)) != 0:
+      keepBe.add(e)
+  be.claims = keep
+  be.blockEntities = keepBe
+  rebuildSim(be)
+  if be.fellLanded:
+    landedParams(be.sim.params)
+  emitCreate(be, tick)
+  if tick - be.lastCheckpoint >= FellCheckpointEvery:
+    checkpoint(be, tick)
+
+proc sameCell(a, b: Cell): bool = a.x == b.x and a.y == b.y and a.z == b.z
+
+proc tickFelledLeaves(tick: int64) =
+  ## Felled trees that still have leaves (stage 0), once per tick after the step:
+  ##   * moved this tick: the leaves that touch the world break now (fellmotion.contactSoftCells: only the side that hits the ground);
+  ##     a log touching the world means the trunk is down (`fellLanded`, and the free integrator grips the ground: landedParams);
+  ##   * down (or at rest, or out of time): the rest decay, `decayCount` lowest first every `decayEvery` ticks, about 3 s in all; a
+  ##     resting free body is woken when a decayed leaf was carrying it;
+  ##   * no leaf left: stage 1 (the logs settle when they rest, settleFelled).
+  ## Contact and decay cells of one tick go in ONE removal (one re-create event per body and tick).
+  let snapshot = gBodies
+  for be in snapshot:
+    if not be.felled or be.fellStage != 0 or be.phase != bpFree or be.kinematic or not (be in gBodies):
+      continue
+    if not areaLoaded(be):
+      continue
+    useWorld(be.world)
+    var gone: seq[Cell] = @[]
+    if be.fellMoved == tick:
+      gone = contactSoftCells(be.body, envSolidAt)
+      if not be.fellLanded and be.hinge.phase != hpDrop and be.hinge.phase != hpTurn and hardTouches(be.body, envSolidAt):
+        be.fellLanded = true
+        landedParams(be.sim.params)
+    if be.body.sleeping or tick - be.felledTick >= FellMaxTicks:
+      be.fellLanded = true
+    var wake = false
+    if be.fellLanded:
+      if be.fellDecayNext == 0'i64:
+        be.fellDecayN0 = max(0, softCount(be.body) - gone.len)
+        be.fellDecayStep = 0
+        be.fellDecayNext = tick + int64(decayEvery(be.fellDecayN0))
+      elif tick >= be.fellDecayNext:
+        let n0 = be.fellDecayN0
+        var n = decayCount(n0, be.fellDecayStep)
+        if be.fellDecayStep >= decaySteps(n0) - 1:
+          n = softCount(be.body)        # the last batch takes whatever is left
+        inc be.fellDecayStep
+        be.fellDecayNext = tick + int64(decayEvery(n0))
+        var touching: seq[Cell] = @[]
+        if be.body.sleeping:
+          touching = contactSoftCells(be.body, envSolidAt)
+        var added = 0
+        for c in decayBatch(be.body, n + gone.len):
+          if added >= n:
+            break
+          var dup = false
+          for g in gone:
+            if sameCell(g, c): dup = true
+          if dup:
+            continue
+          gone.add(c)
+          inc added
+          for t in touching:
+            if sameCell(t, c): wake = true
+    if gone.len > 0:
+      removeFelledCells(be, gone, tick)
+      if not (be in gBodies):
+        continue
+      if wake:
+        wakeBody(be)          # a decayed leaf was carrying the resting trunk: it settles onto its logs
+    if be.fellLanded and softCount(be.body) == 0:
+      be.fellStage = 1
+      be.felledTick = tick
+      checkpoint(be, tick)
+
+proc landFx(be: BodyEntity; tick: int64) =
+  ## The hinged trunk hit the ground: one impact effect at its middle log.
+  var hard: seq[Cell] = @[]
+  for c in cellList(be.body):
+    if not isSoftState(c.state):
+      hard.add(c)
+  if hard.len == 0:
+    return
+  let c = hard[hard.len div 2]
+  let p = worldPointOf(be, float64(c.x) + 0.5, float64(c.y) + 0.5, float64(c.z) + 0.5)
+  pushFx(BodyFxEvent(kind: 1, dim: be.dim, x: int32(floor(p.x)), y: int32(floor(p.y)), z: int32(floor(p.z)), state: uint32(c.state),
+    impulse: float32(be.body.mass * 4.0), bodyId: be.id, hasNormal: true, nx: 0, ny: 127, nz: 0, tick: tick))
+
+proc hingeStepOne(be: BodyEntity; tick: int64) =
+  ## One tick of a hinged fall (fellmotion.hingeTick) instead of the integrator: pose, state event, checkpoint like a moving body.
+  if not areaLoaded(be):
+    inc gStats.frozen
+    return
+  useWorld(be.world)
+  let ev = hingeTick(be.hinge, be.body, envSolidAt)
+  recordPose(be.body, int(tick))
+  inc gStats.steps
+  be.fellMoved = tick
+  case ev
+  of heLanded:
+    be.fellLanded = true
+    be.sleepAnnounced = true
+    landFx(be, tick)
+    emitState(be, tick)
+    checkpoint(be, tick)
+  of heReleased:
+    wakeBody(be)          # the free integrator takes over from the hinge's velocities
+    emitState(be, tick)
+  else:
+    emitState(be, tick)
+    if tick - be.lastCheckpoint >= int64(gCfg.checkpointEvery):
+      checkpoint(be, tick)
 
 proc settleFelled(be: BodyEntity; tick: int64) =
-  ## A felled tree that came to rest (or ran out of time): first the leaves go (and the logs fall on without them), then the logs settle
-  ## at the NEAREST of the 24 grid rotations (a trunk lying on its canopy is not within 2 degrees of anything), no free spot: items.
+  ## A felled tree at rest (or out of time). Stage 0: the trunk is down, its leaves decay first (tickFelledLeaves), then it is stage 1.
+  ## Stage 1: the logs become blocks at the NEAREST of the 24 grid rotations (a trunk lying on a stump is not within 2 degrees of
+  ## anything). A hinged fall on flat ground is already exactly there and is placed at once; any other pose first GLIDES to it, at most
+  ## `FellGlideStep` blocks per cell and tick (fellmotion.glideStep), so the conversion is never a visible jump. No free spot: items.
   if be.fellStage == 0:
-    if shedSoftCells(be, tick) != 0:
-      return            # the bare logs (a new body) fall again and settle the next time they rest; or nothing was left
-    be.fellStage = 1
+    be.fellLanded = true
+    return
+  if be.fellGlide < FellGlideMaxTicks:
+    useWorld(be.world)
+    let plan = settlePlan(be.sim, envSolidAt, 7.0, gCfg.settleRadius + 2, false)
+    if plan.ok:
+      let target = matToQuat(plan.rot)
+      if poseShift(be.body, plan.pos, target) > FellGlideTol:
+        discard glideStep(be.body, plan.pos, target, FellGlideStep)
+        inc be.fellGlide
+        recordPose(be.body, int(tick))
+        emitState(be, tick)
+        return
   let r = settleBody(be, false, tick)
   if r.ok:
     return
@@ -1400,7 +1516,11 @@ proc tickBodies*(server: Server) =
     let be = snapshot[idx]
     if be.phase != bpFree or be.kinematic:
       continue
-    if be.body.sleeping or (be.felled and tick - be.felledTick >= FellMaxTicks):
+    var hinged = be.felled and (be.hinge.phase == hpDrop or be.hinge.phase == hpTurn)
+    if hinged and tick - be.felledTick >= FellMaxTicks:
+      be.hinge.phase = hpReleased       # held up far too long (frozen chunks): the integrator takes over
+      hinged = false
+    if not hinged and (be.body.sleeping or (be.felled and tick - be.felledTick >= FellMaxTicks)):
       if gCfg.autoSettle and (be.settleFailedTick < 0 or (be.settleFailedTick != high(int64) and tick - be.settleFailedTick >= 40)):
         settleList.add(be)
       continue
@@ -1410,7 +1530,12 @@ proc tickBodies*(server: Server) =
       if firstSkipped < 0:
         firstSkipped = idx
       continue
-    stepOne(be, tick)
+    if hinged:
+      hingeStepOne(be, tick)
+    else:
+      stepOne(be, tick)
+      if be.felled:
+        be.fellMoved = tick
     inc stepped
     spent += cost
   gCursor = (if firstSkipped >= 0: firstSkipped else: 0)
@@ -1422,6 +1547,7 @@ proc tickBodies*(server: Server) =
   for be in settleList:
     if be in gBodies and (be.body.sleeping or be.felled):
       trySettleAuto(be, tick)
+  tickFelledLeaves(tick)
 
 # ----------------------------------------------------------------------------------------------------------------------
 # text commands (bodycmd.aowl is the thin wrapper)

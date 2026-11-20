@@ -1,0 +1,403 @@
+## How a felled tree moves and loses its leaves: the PURE part (std and the physics modules only, so fellsimtest.aowl runs it with no
+## server). fell.aowl starts it, bodymanager.aowl drives it each tick (tickBodies: hingeStepOne, tickFelledLeaves, settleFelled).
+##
+## THE HINGE (why). A trunk left to the free integrator lands a little off the grid (a few degrees, a fraction of a block) and the final
+## conversion to blocks then has to jump to the nearest grid pose. Instead a felled trunk turns about a HINGE that lies on a grid line:
+##   * the fall direction is CARDINAL (fellogic.cardinalDir of "away from the player / downwind"),
+##   * the hinge axis is horizontal, perpendicular to it, through the bottom edge of the lowest log layer on the falling side, at the
+##     height of the block the trunk will rest on (the trunk first drops into the cut, `drop` whole blocks, at most `HingeMaxDrop`),
+##   * the piece turns by exactly 90 degrees.
+## A rotation by 90 degrees about an axis on integer coordinates maps grid cells onto grid cells, so on flat ground the trunk ends
+## lying EXACTLY where its blocks go: no slide toward the target, no snap. The motion is real rigid body dynamics of a hinged piece:
+## I_p * theta'' = torque of gravity about the hinge (I_p = inertia about the hinge axis, recomputed every tick because leaves break off),
+## 4 substeps per tick, semi-implicit Euler. A trunk whose centre of mass is still behind the hinge edge is helped over it: the turn
+## never gets slower than `HingePush` (the felling wedge). Hard cells (logs) that run into the world end the hinge (`hpReleased`): the
+## body goes on in the free integrator with the hinge's velocities (uneven ground, another tree in the way), and the ordinary nearest
+## rotation settle applies, with the remaining correction spread over several ticks (`glideStep`). Reaching 90 degrees with too little
+## support under the logs (a stump higher than the ground beyond it) is released the same way.
+## Soft cells (leaves) never stop the hinge: those that touch the world break (`contactSoftCells`), on the ground side only, as they hit.
+##
+## LEAVES. `contactSoftCells`: soft cells (material class soft or foliage) whose cell, shrunk by `ContactInset`, overlaps a solid world
+## cell, or whose bottom corners are within `ContactBelow` above one (resting on it). `decayBatch`: the next few soft cells to go once the
+## trunk is down, lowest first (ties by a fixed hash: deterministic), `decayCount` of them every `decayEvery` ticks, so all are gone after
+## about `DecayTicks`.
+
+import std/math
+import ../../physics/[body, bodymass, integrator, materials]
+
+const
+  HingeMaxDrop* = 3          ## blocks: a trunk hanging higher than this above its support falls freely
+  HingeSub = 4               ## substeps per tick
+  HingePush* = 0.02          ## rad/tick: the turn never gets slower than this
+  HingeMaxSpin* = 0.6        ## rad/tick, as the integrator's maxAngSpeed
+  ContactInset* = 0.02       ## a soft cell overlapping a solid cell by more than this touches it
+  ContactBelow* = 0.06       ## or resting on it: a bottom corner less than this above a solid cell
+  HitInset* = 0.12           ## a hard cell overlapping a solid cell by more than this has hit something: the hinge ends
+  DecayTicks* = 60           ## the leaves left after landing go within about this many ticks (3 s) ...
+  DecaySteps* = 20           ## ... in at most this many batches
+
+type
+  HingePhase* = enum
+    hpOff        ## no hinge (the free integrator moves the body)
+    hpDrop       ## dropping straight down into the cut
+    hpTurn       ## turning about the hinge
+    hpLanded     ## turned by 90 degrees and lying on its logs: exactly on the grid, asleep
+    hpReleased   ## something was in the way: handed to the free integrator
+
+  HingeEvent* = enum
+    heNone, heDropped, heLanded, heReleased
+
+  FellHinge* = object
+    phase*: HingePhase
+    pivot*: Vec3               ## world point on the hinge axis (its final height)
+    axis*: Vec3                ## unit, horizontal, cardinal; positive theta tips the piece toward the fall direction
+    theta*, omega*, target*: float64
+    drop*, dropped*, dropVel*: float64   ## blocks to drop, dropped so far, blocks/tick
+    pos0*: Vec3                ## body.pos at theta 0 (after the drop)
+    orient0*: Quat
+    gravity*: float64          ## blocks/tick^2
+
+proc isSoftState*(state: int32): bool =
+  ## Cells a felled tree loses, by the material table: the soft class (leaves, wool, hay, moss) and foliage.
+  let m = materialOf(int(state))
+  m.matClass == mcSoft or m.matClass == mcFoliage
+
+proc softCount*(b: Body): int =
+  result = 0
+  for c in cellList(b):
+    if isSoftState(c.state):
+      inc result
+
+proc worldOf(b: Body; x, y, z: float64): Vec3 =
+  b.pos + rotate(b.orient, Vec3(x: x, y: y, z: z))
+
+proc solidP(solidAt: SolidFn; p: Vec3): bool =
+  solidAt(int(floor(p.x)), int(floor(p.y)), int(floor(p.z)))
+
+proc cellOverlaps(b: Body; c: Cell; solidAt: SolidFn; inset: float64): bool =
+  ## The cell shrunk by `inset` on every side (8 corners and the centre) overlaps a solid world cell.
+  if solidP(solidAt, worldOf(b, float64(c.x) + 0.5, float64(c.y) + 0.5, float64(c.z) + 0.5)):
+    return true
+  for k in 0 ..< 8:
+    let lx = float64(c.x) + (if (k and 1) != 0: 1.0 - inset else: inset)
+    let ly = float64(c.y) + (if (k and 2) != 0: 1.0 - inset else: inset)
+    let lz = float64(c.z) + (if (k and 4) != 0: 1.0 - inset else: inset)
+    if solidP(solidAt, worldOf(b, lx, ly, lz)):
+      return true
+  false
+
+proc cellRests(b: Body; c: Cell; solidAt: SolidFn): bool =
+  ## A corner of the cell (pulled in by ContactInset sideways) lies less than ContactBelow above a solid world cell.
+  var lowest = 1e300
+  for k in 0 ..< 8:
+    let p = worldOf(b, float64(c.x) + float64(k and 1), float64(c.y) + float64((k shr 1) and 1), float64(c.z) + float64((k shr 2) and 1))
+    if p.y < lowest: lowest = p.y
+  let ctr = worldOf(b, float64(c.x) + 0.5, float64(c.y) + 0.5, float64(c.z) + 0.5)
+  for k in 0 ..< 8:
+    let p = worldOf(b, float64(c.x) + float64(k and 1), float64(c.y) + float64((k shr 1) and 1), float64(c.z) + float64((k shr 2) and 1))
+    if p.y > lowest + 0.02:
+      continue
+    # pull the corner toward the centre horizontally so a cell beside a wall does not count
+    let q = Vec3(x: p.x + (ctr.x - p.x) * 2.0 * ContactInset, y: p.y - ContactBelow, z: p.z + (ctr.z - p.z) * 2.0 * ContactInset)
+    if solidP(solidAt, q):
+      return true
+  false
+
+proc contactSoftCells*(b: Body; solidAt: SolidFn): seq[Cell] =
+  ## The soft cells that are in contact with the world now (see the header). Canonical cell order.
+  result = @[]
+  for c in cellList(b):
+    if isSoftState(c.state) and (cellOverlaps(b, c, solidAt, ContactInset) or cellRests(b, c, solidAt)):
+      result.add(c)
+
+proc hardTouches*(b: Body; solidAt: SolidFn): bool =
+  ## Some hard cell (log) touches the world: overlaps it or rests on it. The trunk has landed.
+  for c in cellList(b):
+    if not isSoftState(c.state) and (cellOverlaps(b, c, solidAt, ContactInset) or cellRests(b, c, solidAt)):
+      return true
+  false
+
+proc hardHit(b: Body; solidAt: SolidFn): bool =
+  for c in cellList(b):
+    if not isSoftState(c.state) and cellOverlaps(b, c, solidAt, HitInset):
+      return true
+  false
+
+proc decayBatch*(b: Body; n: int): seq[Cell] =
+  ## The next `n` soft cells to decay: lowest world centre first, ties by a fixed hash of the cell.
+  var soft: seq[Cell] = @[]
+  var key: seq[float64] = @[]
+  for c in cellList(b):
+    if isSoftState(c.state):
+      let p = worldOf(b, float64(c.x) + 0.5, float64(c.y) + 0.5, float64(c.z) + 0.5)
+      let h = ((int64(c.x) * 73856093'i64) xor (int64(c.z) * 19349663'i64) xor (int64(c.y) * 83492791'i64)) and 1023'i64
+      soft.add(c)
+      key.add(floor(p.y * 4.0 + 0.5) + float64(h) / 1024.0 * 0.5)
+  # insertion sort by key (a few hundred cells at most)
+  for i in 1 ..< soft.len:
+    let kc = key[i]
+    let cc = soft[i]
+    var j = i
+    while j > 0 and key[j - 1] > kc:
+      let pk = key[j - 1]
+      let pc = soft[j - 1]
+      key[j] = pk
+      soft[j] = pc
+      dec j
+    key[j] = kc
+    soft[j] = cc
+  result = @[]
+  for i in 0 ..< min(n, soft.len):
+    result.add(soft[i])
+
+proc decaySteps*(n0: int): int =
+  ## How many batches the `n0` leaves left after landing go in: one per leaf up to `DecaySteps`.
+  max(1, min(n0, DecaySteps))
+
+proc decayEvery*(n0: int): int =
+  ## Ticks between two batches: the whole decay takes about `DecayTicks`.
+  max(1, DecayTicks div decaySteps(n0))
+
+proc decayCount*(n0, step: int): int =
+  ## Leaves to remove in batch `step` (0-based): the running total grows linearly to n0 at the last step.
+  let s = decaySteps(n0)
+  if step < 0 or step >= s:
+    return 0
+  (n0 * (step + 1)) div s - (n0 * step) div s
+
+proc withoutCells*(b: Body; gone: seq[Cell]): Body =
+  ## A NEW body object (same UUID, same pose) without the `gone` cells: the network feed sees a new volume object and replaces the
+  ## clients' copy (bodysync.upsert, replay re-create). Mass recomputed; the velocity of the new centre of mass follows the rotation.
+  let nb = bodyFromCells(b.idHi, b.idLo, cellList(b))
+  for c in gone:
+    setCell(nb, int(c.x), int(c.y), int(c.z), 0)
+  recomputeMass(nb, defaultProps)
+  nb.pos = b.pos
+  nb.orient = b.orient
+  nb.angVel = b.angVel
+  nb.vel = b.vel + cross(b.angVel, comWorld(nb) - comWorld(b))
+  nb.sleeping = b.sleeping
+  nb.sleepTicks = b.sleepTicks
+  nb.history = b.history
+  nb
+
+# ----------------------------------------------------------------------------------------------------------------------
+# the hinge
+
+proc pivotInertia(b: Body; axis, pivot: Vec3): float64 =
+  ## Moment of inertia about the hinge axis (kg m^2): the body's tensor about its centre of mass along the axis + m d^2.
+  let r = quatToMat(b.orient)
+  let ax = r[0] * axis.x + r[3] * axis.y + r[6] * axis.z
+  let ay = r[1] * axis.x + r[4] * axis.y + r[7] * axis.z
+  let az = r[2] * axis.x + r[5] * axis.y + r[8] * axis.z
+  let t = b.inertia
+  let icom = ax * ax * t[0] + ay * ay * t[1] + az * az * t[2] + 2.0 * (ax * ay * t[3] + ax * az * t[4] + ay * az * t[5])
+  let d = comWorld(b) - pivot
+  let along = dot(d, axis)
+  max(1e-6, icom + b.mass * max(0.0, dot(d, d) - along * along))
+
+proc applyHingePose*(h: FellHinge; b: Body) =
+  if h.phase == hpDrop:
+    b.pos = h.pos0 - Vec3(x: 0.0, y: h.dropped, z: 0.0)
+    b.orient = h.orient0
+    return
+  let q = quatAxisAngle(h.axis.x, h.axis.y, h.axis.z, h.theta)
+  b.orient = qnormalize(qmul(q, h.orient0))
+  b.pos = h.pivot + rotate(q, h.pos0 - h.pivot)
+
+proc applyHingeVelocity*(h: FellHinge; b: Body) =
+  ## The body's velocities that match the hinge motion (for the clients' extrapolation, carried entities, and a release).
+  if h.phase == hpDrop:
+    b.vel = Vec3(x: 0.0, y: -h.dropVel, z: 0.0)
+    b.angVel = Vec3()
+    return
+  b.angVel = scale(h.axis, h.omega)
+  b.vel = cross(b.angVel, comWorld(b) - h.pivot)
+
+proc hingeStart*(b: Body; dir: (float64, float64); w0, gravity: float64; solidAt: SolidFn): FellHinge =
+  ## A hinge for the freshly assembled piece `b` (identity orientation) falling toward the CARDINAL `dir`; phase `hpOff` when there is
+  ## none: no hard cell, not axis aligned, a non-cardinal direction, or no support within `HingeMaxDrop` blocks under the lowest logs.
+  result = FellHinge(phase: hpOff, target: PI * 0.5, gravity: gravity, orient0: b.orient, pos0: b.pos)
+  if abs(dir[0]) + abs(dir[1]) < 0.5 or (abs(dir[0]) > 1e-9 and abs(dir[1]) > 1e-9):
+    return
+  let (_, err) = nearestRotation(b.orient)
+  if err > 1e-6 or abs(b.orient.w) < 0.999:
+    return
+  var minY = high(int)
+  for c in cellList(b):
+    if not isSoftState(c.state) and int(c.y) < minY:
+      minY = int(c.y)
+  if minY == high(int):
+    return
+  let ox = int(round(b.pos.x))
+  let oy = int(round(b.pos.y))
+  let oz = int(round(b.pos.z))
+  if abs(b.pos.x - float64(ox)) > 1e-6 or abs(b.pos.y - float64(oy)) > 1e-6 or abs(b.pos.z - float64(oz)) > 1e-6:
+    return
+  var lo = high(int)
+  var hi = low(int)
+  var sumAcross = 0.0
+  var n = 0
+  var cols: seq[(int, int)] = @[]
+  for c in cellList(b):
+    if isSoftState(c.state) or int(c.y) != minY:
+      continue
+    let wx = ox + int(c.x)
+    let wz = oz + int(c.z)
+    cols.add((wx, wz))
+    let along = (if abs(dir[0]) > 0.5: wx else: wz)
+    let s = (if abs(dir[0]) > 0.5: dir[0] else: dir[1])
+    let edge = (if s > 0.0: along + 1 else: along)
+    if s > 0.0:
+      if edge > hi: hi = edge
+    else:
+      if edge < lo: lo = edge
+    sumAcross += (if abs(dir[0]) > 0.5: float64(wz) else: float64(wx)) + 0.5
+    inc n
+  let wy = oy + minY
+  var drop = -1
+  for k in 0 .. HingeMaxDrop:
+    for col in cols:
+      if solidAt(col[0], wy - 1 - k, col[1]):
+        drop = k
+        break
+    if drop >= 0:
+      break
+  if drop < 0:
+    return
+  let s = (if abs(dir[0]) > 0.5: dir[0] else: dir[1])
+  let edge = float64(if s > 0.0: hi else: lo)
+  let across = sumAcross / float64(n)
+  let py = float64(wy - drop)
+  result.pivot = (if abs(dir[0]) > 0.5: Vec3(x: edge, y: py, z: across) else: Vec3(x: across, y: py, z: edge))
+  result.axis = Vec3(x: dir[1], y: 0.0, z: -dir[0])
+  result.omega = w0
+  result.drop = float64(drop)
+  result.phase = (if drop > 0: hpDrop else: hpTurn)
+
+proc supported(b: Body; solidAt: SolidFn; axis: Vec3): bool =
+  ## Lying logs carry the piece: hard cells with a solid world cell right below them on both sides of the centre of mass along the
+  ## trunk (the fall direction), so it would not tip over the end of a stump.
+  let com = comWorld(b)
+  let along = Vec3(x: -axis.z, y: 0.0, z: axis.x)   # the fall direction
+  var lo = 1e300
+  var hi = -1e300
+  for c in cellList(b):
+    if isSoftState(c.state):
+      continue
+    let p = worldOf(b, float64(c.x) + 0.5, float64(c.y) + 0.5, float64(c.z) + 0.5)
+    if solidAt(int(floor(p.x)), int(floor(p.y - 1.0)), int(floor(p.z))):
+      let t = dot(p - com, along)
+      if t < lo: lo = t
+      if t > hi: hi = t
+  lo <= 0.5 and hi >= -0.5
+
+proc release(h: var FellHinge; b: Body) =
+  applyHingePose(h, b)
+  applyHingeVelocity(h, b)
+  h.phase = hpReleased
+  b.sleeping = false
+  b.sleepTicks = 0
+
+proc hingeTick*(h: var FellHinge; b: Body; solidAt: SolidFn): HingeEvent =
+  ## One tick of the hinge (see the header). Poses the body and sets its velocities; on `heLanded` the body is asleep with zero
+  ## velocity at the exact grid pose, on `heReleased` it carries the hinge's velocities into the free integrator.
+  case h.phase
+  of hpDrop:
+    let prev = h.dropped
+    h.dropVel = h.dropVel + h.gravity
+    h.dropped = min(h.drop, h.dropped + h.dropVel)
+    applyHingePose(h, b)
+    if hardHit(b, solidAt):
+      h.dropped = prev
+      release(h, b)
+      return heReleased
+    if h.dropped >= h.drop:
+      h.pos0 = b.pos
+      h.phase = hpTurn
+      applyHingeVelocity(h, b)
+      return heDropped
+    applyHingeVelocity(h, b)
+    heNone
+  of hpTurn:
+    let prevTheta = h.theta
+    let prevOmega = h.omega
+    let ip = pivotInertia(b, h.axis, h.pivot)
+    let dt = 1.0 / float64(HingeSub)
+    for s in 0 ..< HingeSub:
+      applyHingePose(h, b)
+      let r = comWorld(b) - h.pivot
+      let tau = h.gravity * b.mass * (h.axis.x * r.z - h.axis.z * r.x)
+      h.omega = min(HingeMaxSpin, max(HingePush, h.omega + tau / ip * dt))
+      h.theta = h.theta + h.omega * dt
+      if h.theta >= h.target:
+        h.theta = h.target
+        break
+    applyHingePose(h, b)
+    if hardHit(b, solidAt):
+      h.theta = prevTheta
+      h.omega = prevOmega
+      release(h, b)
+      return heReleased
+    if h.theta >= h.target:
+      if supported(b, solidAt, h.axis):
+        h.phase = hpLanded
+        h.omega = 0.0
+        b.vel = Vec3()
+        b.angVel = Vec3()
+        b.sleeping = true
+        b.sleepTicks = 0
+        return heLanded
+      release(h, b)
+      return heReleased
+    applyHingeVelocity(h, b)
+    heNone
+  else:
+    heNone
+
+# ----------------------------------------------------------------------------------------------------------------------
+# the remaining correction of a free (released) fall
+
+proc poseShift*(b: Body; pos: Vec3; orient: Quat): float64 =
+  ## The largest distance any cell centre of `b` moves between its current pose and (pos, orient), blocks.
+  result = 0.0
+  for c in cellList(b):
+    let l = Vec3(x: float64(c.x) + 0.5, y: float64(c.y) + 0.5, z: float64(c.z) + 0.5)
+    let d = (b.pos + rotate(b.orient, l)) - (pos + rotate(orient, l))
+    let m = sqrt(dot(d, d))
+    if m > result: result = m
+
+proc glideStep*(b: Body; pos: Vec3; orient: Quat; maxShift: float64): bool =
+  ## Moves the body toward (pos, orient) so no cell centre moves more than about `maxShift` this tick (the centre of mass and the
+  ## orientation advance by the same fraction). True when it got there.
+  let total = poseShift(b, pos, orient)
+  if total <= 1e-9:
+    b.pos = pos
+    b.orient = orient
+    return true
+  if total <= maxShift:
+    b.pos = pos
+    b.orient = orient
+    return true
+  let p0 = b.pos
+  let q0 = b.orient
+  let comA = comWorld(b)
+  let comB = pos + rotate(orient, b.com)
+  var t = maxShift / total
+  for i in 0 ..< 4:
+    # the shift is not linear in t (slerp): shrink t until the step really stays within maxShift
+    let q = qnormalize(slerp(q0, orient, t))
+    b.orient = q
+    b.pos = comA + scale(comB - comA, t) - rotate(q, b.com)
+    let s = poseShift(b, p0, q0)
+    if s <= maxShift:
+      break
+    t = t * maxShift / s * 0.98
+  false
+
+proc landedParams*(p: var SimParams) =
+  ## A trunk that has landed in the free integrator grips the ground (contact friction sqrt(mu * 1.0) instead of sqrt(mu * 0.6)), so it
+  ## slides less and comes to rest sooner where it landed. Measured (fellsimtest probes, 5-log trunk): leaning on a rock at rest after
+  ## 68 instead of 312 ticks; free topple onto flat ground 0.29 instead of 0.39 blocks from its grid pose. A higher contact angular
+  ## damping was tried as rolling resistance and made both worse (it fights the topple), so it is left alone.
+  p.worldFriction = 1.0

@@ -1,7 +1,8 @@
 ## The body manager (bodymanager.aowl) on an in-memory world with chunks: assemble a platform, let it fall onto a floor and settle back
 ## into identical blocks, rotation of oriented block states, journal replay after a simulated crash (never lose both the blocks and the
 ## body), the structural collapse of a 12 long oak bridge under 9 iron blocks, the collision provider (a dropped item and a zombie are
-## stopped, surface velocity, ray), the event feed, the per tick budget and the /body command text. Exit 0 and "ALL PASS" when everything holds.
+## stopped, surface velocity, ray), the event feed, the per tick budget, the /body command text and tree felling end to end (hinged fall,
+## contact leaf breaks, leaf decay, logs placed where they lay). Exit 0 and "ALL PASS" when everything holds.
 
 import std/[syncio, cmdline, tables, options, math, strutils]
 import ../../config/lib as configlib
@@ -26,7 +27,7 @@ import ../world/[bulkedit, worldmod]
 import ../entity/[collision_providers, entitymod, entitytype, itementity]
 import ../entity/mob/zombie/zombie
 import ../../physics/[body, integrator]
-import bodymanager, bodyworld
+import bodymanager, bodyworld, fell, fellmotion
 
 var failures = 0
 
@@ -375,18 +376,18 @@ block bridge:
       if not be.body.sleeping: allAsleep = false
     if bodyCount() == 0 or allAsleep:
       break
-  var fell = true
+  var cameDown = true
   var cellsLeft = 0
   let allBe4 = bodyList()
   for be in allBe4:
     cellsLeft += cellCount(be.body)
-    if be.body.pos.y > startY - 0.5 and not be.body.sleeping: fell = false
+    if be.body.pos.y > startY - 0.5 and not be.body.sleeping: cameDown = false
   echo "     ", ticks, " ticks, ", bodyCount(), " bodies left, stats settled=", bodyStats().settled, " dropped=", bodyStats().cellsDropped
   let worldAfter = countNonAir(0, 20, 0, 31, 60, 31)
   check("bridge: after the fall the pieces rest (settled or asleep)", ticks < 600)
   check("bridge: nothing is lost (world + bodies + dropped == the bridge)",
     worldAfter + cellsLeft + bodyStats().cellsDropped == before)
-  check("bridge: the pieces came down", fell)
+  check("bridge: the pieces came down", cameDown)
   # clean up what is left
   let allBe5 = bodyList()
   for be in allBe5:
@@ -516,6 +517,119 @@ block commands:
   let st = bodyExec(bw, 0'i32, 0'i32, 0'i32, @["status"], tickNow())
   check("cmd: status", st[0].startsWith("Bodies: 0 live"))
   gCfg.autoSettle = true
+  fillBox(0, 20, 0, 31, 60, 31, 0'u32)
+  bodyReset()
+  clearJournal()
+
+# ======================================================================================================================
+# H. tree felling end to end: an oak (5 logs, crown) on the dirt is cut at its base; the trunk drops into the cut and turns on a hinge,
+#    the leaves that hit the ground break while it falls, the rest decay over a few seconds, the logs become blocks exactly where they lay
+# ======================================================================================================================
+block felling:
+  clearJournal()
+  bodyReset()
+  discard bodyEventsDrain()
+  discard bodyFxDrain()
+  let (_, oakLog) = defaultStateByName("oak_log")
+  let (_, oakLeaves) = defaultStateByName("oak_leaves")
+  let tx = 16'i32
+  let tz = 16'i32
+  for y in 20'i32 .. 24'i32:
+    discard setBlockState(theLevel, newBlockPos(tx, y, tz), oakLog)
+  for y in 23'i32 .. 24'i32:
+    for dz in -2'i32 .. 2'i32:
+      for dx in -2'i32 .. 2'i32:
+        if dx != 0'i32 or dz != 0'i32:
+          discard setBlockState(theLevel, newBlockPos(tx + dx, y, tz + dz), oakLeaves)
+  for dz in -1'i32 .. 1'i32:
+    for dx in -1'i32 .. 1'i32:
+      discard setBlockState(theLevel, newBlockPos(tx + dx, 25'i32, tz + dz), oakLeaves)
+  let leaves0 = countNonAir(tx - 2, 23, tz - 2, tx + 2, 25, tz + 2) - 2
+  # the player breaks the bottom log
+  discard setBlockState(theLevel, newBlockPos(tx, 20'i32, tz), 0'u32)
+  let cutTick = tickNow()
+  fellNote("minecraft:overworld", tx, 20'i32, tz, oakLog, cutTick)
+  var bodyId = 0'i32
+  var hingeSeen = false
+  var landTick = -1'i64
+  var creates = 0
+  var maxCreatesPerTick = 0
+  var breaksBefore = 0
+  var breakTicksAfter: seq[int64] = @[]
+  var breaksAfter = 0
+  var lastPose: seq[(float64, float64, float64)] = @[]
+  var gone = false
+  var ticks = 0
+  var destroyReason = drNone
+  while ticks < 600 and not gone:
+    inc server.tickCounter
+    tickBodies(server)
+    tickFelling(server.tickCounter)
+    inc ticks
+    let now = tickNow()
+    var createsNow = 0
+    let evs = bodyEventsDrain()
+    for e in evs:
+      if e.kind == bekCreate:
+        if bodyId == 0'i32: bodyId = e.bodyId
+        if e.bodyId == bodyId:
+          inc creates
+          inc createsNow
+      if e.kind == bekDestroy and e.bodyId == bodyId:
+        gone = true
+        destroyReason = e.reason
+    if createsNow > maxCreatesPerTick: maxCreatesPerTick = createsNow
+    let fxs = bodyFxDrain()
+    for f in fxs:
+      if f.kind == 0 and f.bodyId == bodyId:
+        if landTick < 0'i64:
+          inc breaksBefore
+        else:
+          inc breaksAfter
+          if breakTicksAfter.len == 0 or breakTicksAfter[breakTicksAfter.len - 1] != now:
+            breakTicksAfter.add(now)
+    let live = bodyList()
+    for be in live:
+      if be.id == bodyId:
+        if be.hinge.phase != hpOff: hingeSeen = true
+        if landTick < 0'i64 and be.hinge.phase == hpLanded: landTick = now - cutTick
+        lastPose = @[]
+        let cl = cellList(be.body)
+        for c in cl:
+          if not isSoftState(c.state):
+            let p = worldPointOf(be, float64(c.x) + 0.5, float64(c.y) + 0.5, float64(c.z) + 0.5)
+            lastPose.add((p.x, p.y, p.z))
+  let span = (if breakTicksAfter.len > 0: breakTicksAfter[breakTicksAfter.len - 1] - breakTicksAfter[0] else: 0'i64)
+  echo "     felled body ", bodyId, ": landed after ", landTick, " ticks (", ticks, " in all), ", creates, " creates (max ", maxCreatesPerTick,
+    " per tick), leaves ", leaves0, ": ", breaksBefore, " broke falling, ", breaksAfter, " decayed in ", breakTicksAfter.len, " ticks over ", span
+  check("fell: the cut tree became a body on a hinge", bodyId != 0'i32 and hingeSeen)
+  check("fell: it landed on the hinge (exactly)", landTick > 0'i64 and landTick < 100'i64)
+  check("fell: leaves broke on contact while it fell", breaksBefore > 0)
+  check("fell: at most one re-create of the body per tick", maxCreatesPerTick <= 1 and creates >= 2)
+  check("fell: the other leaves decayed over time, not at once (" & $breakTicksAfter.len & " ticks, span " & $span & ")",
+    breaksAfter > 0 and breakTicksAfter.len >= 8 and span >= 30'i64)
+  check("fell: every leaf broke", breaksBefore + breaksAfter == leaves0)
+  check("fell: the logs became blocks (" & $destroyReason & ")", gone and destroyReason == drSettled)
+  var exact = lastPose.len == 4
+  var allLogs = true
+  var axisOk = true
+  for p in lastPose:
+    let fx = floor(p[0])
+    let fy = floor(p[1])
+    let fz = floor(p[2])
+    if abs(p[0] - fx - 0.5) > 0.05 or abs(p[1] - fy - 0.5) > 0.05 or abs(p[2] - fz - 0.5) > 0.05:
+      exact = false
+    let st = stateAt(int32(fx), int32(fy), int32(fz))
+    if blockName(st) != "oak_log":
+      allLogs = false
+    elif propOf(st, "axis") == "y":
+      axisOk = false
+    if fy != 20.0:
+      exact = false
+  check("fell: the logs lay within 0.05 of their cells at y = 20 (no snap)", exact)
+  check("fell: each lying log is now an oak_log block on its side", allLogs and axisOk)
+  check("fell: no leaf left in the world", countNonAir(0, 21, 0, 31, 40, 31) == 0)
+  check("fell: the journal is empty", journalFileCount(bw) == 0)
   fillBox(0, 20, 0, 31, 60, 31, 0'u32)
   bodyReset()
   clearJournal()
