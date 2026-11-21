@@ -31,6 +31,11 @@ fi
 [ -n "$WORLD" ] && cp -r "$WORLD" "$RUN/world"
 cd "$RUN"
 echo 'print("from the file");' > snippet.js
+cat > jester-mods.json <<'JSON'
+{ "policy": "advisory", "mods": [
+  { "id": "test:present", "version": "1.0.0", "role": "required", "sha256": "0000000000000000000000000000000000000000000000000000000000000001", "size": 10, "url": "" },
+  { "id": "test:absent", "version": "2.0.0", "role": "optional", "sha256": "", "size": 0, "url": "https://example.invalid/absent.jar" } ] }
+JSON
 ( timeout 8 "$EXE" > first.txt 2>&1 || true )
 sed -i '/^\[networking.java\]/,/^\[/ { s/^encryption = true/encryption = false/; s/^online_mode = true/online_mode = false/ }' pumpkin.toml
 sed -i "s/0.0.0.0:25565/0.0.0.0:$PORT/; s/0.0.0.0:25575/0.0.0.0:$RCON/; s/0.0.0.0:19132/0.0.0.0:$BEDROCK/" pumpkin.toml

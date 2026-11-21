@@ -1,0 +1,183 @@
+## Unit tests of the profiler: percentiles, rolling windows, scope nesting, sessions. PASS / FAIL lines, exit 1 on a fail.
+import std/[syncio, strutils]
+import profiler
+
+var fails = 0
+var passes = 0
+
+proc check(name: string; ok: bool) =
+  if ok:
+    inc passes
+    echo "PASS ", name
+  else:
+    inc fails
+    echo "FAIL ", name
+
+proc busyNs(ns: int64) =
+  ## A loop long enough to be measurable.
+  var x = 0'i64
+  for i in 0 ..< int(ns div 10):
+    x += int64(i) mod 7
+  if x == -1'i64:
+    echo "x"
+
+proc testPercentiles() =
+  var s: seq[int32] = @[]
+  for i in 1 .. 100:
+    s.add(int32(i * 1000))        # 1.0 .. 100.0 ms
+  let st = statsOf(s)
+  check("n", st.n == 100)
+  check("mean 50.5 ms", abs(st.meanUs - 50500.0) < 0.001)
+  check("p50 = 50 ms", st.p50Us == 50000'i32)
+  check("p95 = 95 ms", st.p95Us == 95000'i32)
+  check("p99 = 99 ms", st.p99Us == 99000'i32)
+  check("max = 100 ms", st.maxUs == 100000'i32)
+  var rev: seq[int32] = @[]
+  for i in countdown(100, 1):
+    rev.add(int32(i * 1000))
+  check("order independent", statsOf(rev).p95Us == 95000'i32)
+  var spike: seq[int32] = @[]
+  for i in 0 ..< 99:
+    spike.add(2000'i32)
+  spike.add(250000'i32)
+  let sp = statsOf(spike)
+  check("spike: p99 fast", sp.p99Us == 2000'i32)
+  check("spike: max slow", sp.maxUs == 250000'i32)
+  check("spike: mean", abs(sp.meanUs - (99.0 * 2000.0 + 250000.0) / 100.0) < 0.001)
+  let one = statsOf(@[7'i32])
+  check("single sample", one.p50Us == 7'i32 and one.p99Us == 7'i32 and one.maxUs == 7'i32)
+  let none: seq[int32] = @[]
+  check("empty", statsOf(none).n == 0 and percentileUs(none, 0.5) == 0'i32)
+  check("p0 clamps to first", percentileUs(@[3'i32, 4'i32, 5'i32], 0.0) == 3'i32)
+  check("p100 is last", percentileUs(@[3'i32, 4'i32, 5'i32], 1.0) == 5'i32)
+
+proc testWindows() =
+  var w = newRollWin()
+  for sec in 1000 ..< 1120:
+    for t in 0 ..< 20:
+      rwAdd(w, int64(sec), 40_000_000'i64)
+  let m1 = rwQuery(w, 1119'i64, 60)
+  check("1m ticks = 1200", m1.ticks == 1200)
+  check("1m mspt = 40", abs(m1.msptMs - 40.0) < 0.001)
+  check("1m tps = 20", abs(m1.tps - 20.0) < 0.001)
+  let m5 = rwQuery(w, 1119'i64, 300)
+  check("5m covers only 120 s", m5.seconds == 120 and m5.ticks == 2400)
+  check("5m tps = 20 (not diluted by the empty past)", abs(m5.tps - 20.0) < 0.001)
+  for sec in 1120 ..< 1130:
+    for t in 0 ..< 10:
+      rwAdd(w, int64(sec), 100_000_000'i64)
+  let m1b = rwQuery(w, 1129'i64, 60)
+  check("1m after slowdown: ticks = 50*20 + 10*10", m1b.ticks == 1100)
+  check("1m after slowdown: tps = 1100/60", abs(m1b.tps - 1100.0 / 60.0) < 0.001)
+  check("1m after slowdown: mspt", abs(m1b.msptMs - (1000.0 * 40.0 + 100.0 * 100.0) / 1100.0) < 0.001)
+  var w2 = newRollWin()
+  rwAdd(w2, 5'i64, 50_000_000'i64)
+  rwAdd(w2, 905'i64, 10_000_000'i64)    # the same slot as second 5
+  let q = rwQuery(w2, 905'i64, 900)
+  check("slot reuse drops the stale second", q.ticks == 1 and abs(q.msptMs - 10.0) < 0.001)
+  let empty = rwQuery(newRollWin(), 10'i64, 60)
+  check("empty window", empty.ticks == 0 and empty.tps == 0.0)
+  var w3 = newRollWin()
+  for sec in 0 ..< 30:
+    for t in 0 ..< 20:
+      rwAdd(w3, int64(sec), 50_000_000'i64)
+  let g = rwQuery(w3, 59'i64, 60)
+  check("stalled half minute: tps 10", abs(g.tps - 10.0) < 0.001)
+
+proc testScopes() =
+  check("off at first", not profActive())
+  profScope(ScEntities)
+  profEnd(ScEntities)
+  check("off: nothing recorded", not profHasData())
+  profStart(0)
+  check("on", profActive())
+  profTickBegin()
+  profScope(ScEntities)
+  busyNs(2_000_000'i64)
+  profScope(ScLighting)
+  busyNs(4_000_000'i64)
+  profEnd(ScLighting)
+  profEnd(ScEntities)
+  profScope(ScPlugins)
+  busyNs(1_000_000'i64)
+  profEnd(ScPlugins)
+  profTickEnd(1'i64, 9_000_000'i64)
+  profTickBegin()
+  profScope(-1)
+  profEnd(-1)
+  profEnd(ScPregen)
+  profScope(ScBlockTicks)
+  profEnd(ScBlockTicks)
+  profTickEnd(2'i64, 1_000_000'i64)
+  profScope(ScChunkIO)
+  busyNs(500_000'i64)
+  profEnd(ScChunkIO)
+  let rows = profScopeRows(true)
+  var ent = ScopeRow()
+  var lig = ScopeRow()
+  var found = 0
+  var seenPregen = false
+  for r in rows:
+    if r.id == ScEntities:
+      ent = r
+      found += 1
+    if r.id == ScLighting:
+      lig = r
+      found += 1
+    if r.id == ScPregen:
+      seenPregen = true
+  check("entities and lighting recorded", found == 2)
+  check("inclusive time contains the child", ent.inclNs > lig.inclNs and lig.inclNs > 0'i64)
+  check("self time excludes the child", ent.selfNs + lig.inclNs <= ent.inclNs + 1000'i64)
+  check("rows sorted by self time", rows.len >= 2 and rows[0].selfNs >= rows[1].selfNs)
+  check("the stray end recorded nothing", not seenPregen)
+  check("off-tick scope separate", profScopeRows(false).len == 1 and profScopeRows(false)[0].id == ScChunkIO)
+  check("2 session ticks", profSessionTicks() == 2'i64)
+  let slow = profSlowTicks()
+  check("slowest first", slow.len == 2 and slow[0].tick == 1'i64 and slow[0].ns == 9_000_000'i64)
+  check("dominant scope of the slow tick is lighting", slow[0].domId == ScLighting)
+  let pa = profPluginScope("alpha")
+  let pb = profPluginScope("beta")
+  check("plugin scope ids differ and are stable", pa != pb and pa == profPluginScope("alpha") and pa >= 16)
+  check("name round trip", profScopeName(pa) == "plugin:alpha")
+  profTickBegin()
+  profScope(pa)
+  busyNs(1_000_000'i64)
+  profEnd(pa)
+  profTickEnd(3'i64, 2_000_000'i64)
+  profStop()
+  check("stopped", not profActive())
+  var text = ""
+  let repLines = profReportLines()
+  for l in repLines:
+    text.add(l & "\n")
+  check("report has tick percentiles", text.contains("p95") and text.contains("p99") and text.contains("max"))
+  check("report lists entities", text.contains("entities"))
+  check("report lists per plugin", text.contains("alpha"))
+  check("report lists the slowest tick", text.contains("Slowest ticks") and text.contains("tick 1:"))
+  check("report has windows", text.contains("MSPT/TPS 1m"))
+  let js = profReportJson()
+  check("json shape", js.startsWith("{\"version\":1") and js.endsWith("}") and js.contains("\"scopes\":[") and js.contains("\"slowest\":["))
+  check("json has the plugin", js.contains("plugin:alpha"))
+  profStart(0)
+  for i in 1 .. 40:
+    profTickBegin()
+    profTickEnd(int64(i), int64(i) * 1_000_000'i64)
+  check("slow list bounded to 10, largest kept", profSlowTicks().len == SlowKeep and profSlowTicks()[0].tick == 40'i64 and profSlowTicks()[9].tick == 31'i64)
+  check("session sample count", profSessionSamples().len == 40)
+  profStop()
+  profStart(0)
+  check("restart clears", profSessionTicks() == 0'i64 and profScopeRows(true).len == 0)
+  profStop()
+
+proc testFormat() =
+  check("fmtFixed", fmtFixed(1.5, 2) == "1.50" and fmtFixed(0.0, 3) == "0.000" and fmtFixed(12.3456, 1) == "12.3" and fmtFixed(0.004, 2) == "0.00")
+  check("fmtMs", fmtMs(1_234_567'i64) == "1.235")
+
+testPercentiles()
+testWindows()
+testScopes()
+testFormat()
+echo "passed ", passes, ", failed ", fails
+if fails > 0:
+  quit(1)

@@ -1,0 +1,407 @@
+## The `/bl` (`/blocklog`) command: inspect, lookup, rollback, restore, purge, snapshot. Op level 2.
+##
+##   /bl inspect                           toggle: break or place a block to see its history instead of changing it
+##   /bl lookup <radius> <time> [user]     what changed around you (newest 12 shown)
+##   /bl rollback <radius> <time> [user]   undo, last change first, in budgeted slices per tick
+##   /bl restore <radius> <time> [user]    redo (undo a rollback)
+##   /bl purge <time>                      forget records older than <time>
+##   /bl snapshot <name> [radius]          copy the region files around you into <world>/snapshots/<name>/
+##   /bl snapshot restore <name>           copy a snapshot back (nobody may be online; restart the server afterwards)
+##   /bl snapshot list
+##   /bl status
+## <time> is a number with s, m, h, d or w ("90m", "2d"; a bare number is seconds).
+
+import ../../util/closureset
+import std/[options, strutils, math, paths, dirs]
+import ../../command/[cmderrors, cmdsource, fallbackdispatch, args]
+import ../../util/[vector3, permission]
+import ../../util/text/[textbase, text, color]
+import ../../plugin/pluginhooks
+import ../../world/worldfs
+import blocklogcore
+
+const
+  Names = ["bl", "blocklog"]
+  Description = "Block logging: inspect, lookup, rollback, restore, purge, snapshots."
+  ArgRest = "args"
+  Permission0* = "blocklog:command.bl"
+  MaxRadius = 200
+  MaxRollbackBlocks = 2_000_000
+  SnapshotDelayTicks = 60
+
+proc registerPermission*(registry: PermissionRegistry) =
+  registerPermissionOrPanic(registry, newPermission(Permission0, Description, permissionOp(Two)))
+
+proc say(sender: CommandSender; line: string) =
+  sendMessage(sender, text(line))
+
+proc sayOk(sender: CommandSender; line: string) =
+  sendMessage(sender, colorNamed(text(line), ncGreen))
+
+proc sayBad(sender: CommandSender; line: string) =
+  sendMessage(sender, colorNamed(text(line), ncRed))
+
+proc parseNum(s: string; v: var int): bool =
+  if s.len == 0 or s.len > 9:
+    return false
+  var r = 0
+  for c in s:
+    if c < '0' or c > '9':
+      return false
+    r = r * 10 + (ord(c) - ord('0'))
+  v = r
+  true
+
+proc parseSpan(s: string; secs: var int64): bool =
+  ## "90m" -> 5400.
+  if s.len == 0:
+    return false
+  var unit = 1'i64
+  var digits = s
+  let last = s[s.len - 1]
+  if last == 's' or last == 'm' or last == 'h' or last == 'd' or last == 'w':
+    digits = s[0 ..< s.len - 1]
+    case last
+    of 'm': unit = 60'i64
+    of 'h': unit = 3600'i64
+    of 'd': unit = 86400'i64
+    of 'w': unit = 604800'i64
+    else: unit = 1'i64
+  var n = 0
+  if not parseNum(digits, n):
+    return false
+  secs = int64(n) * unit
+  true
+
+proc worldOf(sender: CommandSender; server: nil CommandServer): nil CommandWorld =
+  if sender.kind == cskPlayer and sender.player.entity != nil and closureSet(sender.player.entity.getWorld):
+    return sender.player.entity.getWorld()
+  if server != nil and closureSet(server.getOverworld):
+    return server.getOverworld()
+  nil
+
+proc posOf(sender: CommandSender; world: CommandWorld; x, y, z: var int32) =
+  if sender.kind == cskPlayer and sender.player.entity != nil and closureSet(sender.player.entity.getPos):
+    let p = sender.player.entity.getPos()
+    x = int32(floor(p.x))
+    y = int32(floor(p.y))
+    z = int32(floor(p.z))
+  elif closureSet(world.getSpawnPoint):
+    let sp = world.getSpawnPoint()
+    x = sp.x
+    y = sp.y
+    z = sp.z
+
+proc findWorldByDim(server: nil CommandServer; dimName: string): nil CommandWorld =
+  if server != nil and closureSet(server.getWorlds):
+    let all = server.getWorlds()
+    for w in all:
+      if w.dimensionName == dimName:
+        return w
+  nil
+
+proc playersIn(w: nil CommandWorld): int =
+  if w == nil:
+    return 0
+  if closureSet(w.getPlayers):
+    return w.getPlayers().len
+  0
+
+# ---- lookup / rollback / restore ----------------------------------------------------------------------------------
+
+type Scan = object
+  ok: bool
+  dim: int
+  q: LogQuery
+  userText: string
+
+proc buildScan(sender: CommandSender; server: nil CommandServer; parts: seq[string]; needUserOptional: bool): Scan =
+  ## `<radius> <time> [user]` after the subcommand.
+  result = Scan(ok: false)
+  var radius = 0
+  var span = 0'i64
+  if parts.len < 3 or not parseNum(parts[1], radius) or not parseSpan(parts[2], span):
+    sayBad(sender, "Usage: /bl " & parts[0] & " <radius> <time e.g. 30m, 2h, 1d> [user]")
+    return
+  if radius > MaxRadius:
+    sayBad(sender, "Radius is at most " & $MaxRadius)
+    return
+  let world = worldOf(sender, server)
+  if world == nil:
+    sayBad(sender, "No world")
+    return
+  var x = 0'i32
+  var y = 0'i32
+  var z = 0'i32
+  posOf(sender, world, x, y, z)
+  let dim = findDim(world.dimensionName)
+  if dim < 0:
+    sayBad(sender, "Nothing is logged in " & world.dimensionName & " yet.")
+    return
+  var actor = -1
+  var who = ""
+  if parts.len >= 4 and parts[3] != "*":
+    actor = findUser(parts[3])
+    who = parts[3]
+    if actor < 0:
+      sayBad(sender, "No logged changes by " & parts[3] & ".")
+      return
+  result = Scan(ok: true, dim: dim, userText: who, q: LogQuery(dim: dim, x: x, y: y, z: z, radius: int32(radius),
+    sinceT: blockLogNow() - span, actor: actor, skipRollbacks: parts[0] != "lookup"))
+
+proc lookup(sender: CommandSender; server: nil CommandServer; parts: seq[string]) =
+  let sc = buildScan(sender, server, parts, true)
+  if not sc.ok:
+    return
+  let recs = blockLogQuery(sc.q)
+  if recs.len == 0:
+    say(sender, "No block changes found.")
+    return
+  sayOk(sender, $recs.len & " change(s) (newest first, 12 shown):")
+  let now = blockLogNow()
+  var i = recs.len - 1
+  var shown = 0
+  while i >= 0 and shown < 12:
+    say(sender, recLine(recs[i], now))
+    dec i
+    inc shown
+
+proc issuerName(sender: CommandSender): string =
+  if sender.kind == cskPlayer: sender.player.gameProfile.name else: "Server"
+
+proc startChange(sender: CommandSender; server: nil CommandServer; parts: seq[string]; restore: bool) =
+  let sc = buildScan(sender, server, parts, true)
+  if not sc.ok:
+    return
+  let chron = blockLogQuery(sc.q)
+  let plan = if restore: planRestore(chron) else: planRollback(chron)
+  if plan.len > MaxRollbackBlocks:
+    sayBad(sender, "Too many changes (" & $plan.len & "): narrow the radius or the time.")
+    return
+  var worlds: seq[CommandWorld] = @[]
+  if server != nil and closureSet(server.getWorlds):
+    worlds = server.getWorlds()
+  let apply = proc(dim: int; x, y, z: int32; state: uint16) {.closure.} =
+    let name = dimName(dim)
+    for w in worlds:
+      if w.dimensionName == name:
+        if closureSet(w.isChunkLoaded) and not w.isChunkLoaded(x shr 4, z shr 4):
+          return
+        if closureSet(w.setBlockState):
+          w.setBlockState(x, y, z, state, cbfNotifyNeighbors)
+        return
+  let verb = if restore: "Restore" else: "Rollback"
+  let done = proc(changed: int) {.closure.} =
+    sayOk(sender, verb & " finished: " & $changed & " block change(s) applied.")
+  if not blockLogStartJob(plan, restore, issuerName(sender), apply, done):
+    sayBad(sender, "A rollback or restore is already running (" & $blockLogJobLeft() & " left).")
+    return
+  if plan.len > 0:
+    sayOk(sender, verb & " started: " & $plan.len & " change(s), " & $SetsPerTick & " blocks per tick.")
+
+# ---- snapshots ----------------------------------------------------------------------------------------------------
+
+proc worldRoot(): string =
+  parentDirW(blockLogFolder())
+
+proc regionDirOf(dimension: string): string =
+  let root = worldRoot()
+  case dimension
+  of "minecraft:overworld": joinPathW(root, "region")
+  of "minecraft:the_nether": joinPathW(joinPathW(root, "DIM-1"), "region")
+  of "minecraft:the_end": joinPathW(joinPathW(root, "DIM1"), "region")
+  else:
+    var ns = "minecraft"
+    var nm = dimension
+    let c = dimension.find(':')
+    if c >= 0:
+      ns = dimension[0 ..< c]
+      nm = dimension[c + 1 .. ^1]
+    joinPathW(joinPathW(joinPathW(joinPathW(root, "dimensions"), ns), nm), "region")
+
+proc snapshotRoot(): string = joinPathW(worldRoot(), "snapshots")
+
+proc safeName(s: string): bool =
+  if s.len == 0 or s.len > 40:
+    return false
+  for c in s:
+    if not (c.isAlphaNumeric or c == '_' or c == '-'):
+      return false
+  true
+
+proc copyFile(src, dst: string): bool =
+  let (st, bytes) = readFileBytes(src)
+  if st != rsOk:
+    return false
+  discard createDirAllW(parentDirW(dst))
+  writeFileBytes(dst, bytes)
+
+proc copyRegionFile(srcDir, dstDir, stem: string): int =
+  ## `stem` is `r.<x>.<z>`; copies it whatever the chunk format's extension. How many files were copied.
+  result = 0
+  for ext in ["mca", "linear", "mcr"]:
+    let name = stem & "." & ext
+    if fileExistsW(joinPathW(srcDir, name)):
+      if copyFile(joinPathW(srcDir, name), joinPathW(dstDir, name)):
+        inc result
+
+proc takeSnapshot(sender: CommandSender; dimension: string; name: string; chunkRadius: int; cx, cz: int32) =
+  ## Runs after the saves the command asked for had a moment to finish.
+  let dst = joinPathW(joinPathW(snapshotRoot(), name), "region")
+  let src = regionDirOf(dimension)
+  var seen: seq[string] = @[]
+  var copied = 0
+  let minRx = (cx - int32(chunkRadius)) shr 5
+  let maxRx = (cx + int32(chunkRadius)) shr 5
+  let minRz = (cz - int32(chunkRadius)) shr 5
+  let maxRz = (cz + int32(chunkRadius)) shr 5
+  for rx in minRx .. maxRx:
+    for rz in minRz .. maxRz:
+      let stem = "r." & $rx & "." & $rz
+      copied += copyRegionFile(src, dst, stem)
+      seen.add(stem)
+  # what the snapshot is of, for the restore
+  var meta = dimension & "\n"
+  for s in seen:
+    meta.add(s & "\n")
+  var bytes: seq[byte] = @[]
+  for c in meta:
+    bytes.add(byte(ord(c)))
+  discard writeFileBytes(joinPathW(joinPathW(snapshotRoot(), name), "snapshot.txt"), bytes)
+  sayOk(sender, "Snapshot '" & name & "' saved: " & $copied & " region file(s) of " & dimension & ".")
+
+proc snapshotCmd(sender: CommandSender; server: nil CommandServer; parts: seq[string]) =
+  if parts.len < 2:
+    sayBad(sender, "Usage: /bl snapshot <name> [chunk radius] | restore <name> | list")
+    return
+  if not blockLogActive():
+    sayBad(sender, "The block log is not running.")
+    return
+  if parts[1] == "list":
+    var names: seq[string] = @[]
+    try:
+      for kind, entry in walkDir(path(snapshotRoot())):
+        if kind == pcDir:
+          let full = $entry
+          var cut = -1
+          for i in 0 ..< full.len:
+            if full[i] == '/' or full[i] == '\\':
+              cut = i
+          names.add(full[cut + 1 .. ^1])
+    except ErrorCode:
+      discard
+    var joined = ""
+    for i in 0 ..< names.len:
+      if i > 0:
+        joined.add(", ")
+      joined.add(names[i])
+    say(sender, if names.len == 0: "No snapshots." else: "Snapshots: " & joined)
+    return
+  let world = worldOf(sender, server)
+  if world == nil:
+    sayBad(sender, "No world")
+    return
+  if parts[1] == "restore":
+    if parts.len < 3 or not safeName(parts[2]):
+      sayBad(sender, "Usage: /bl snapshot restore <name>")
+      return
+    let nm = parts[2]
+    let metaPath = joinPathW(joinPathW(snapshotRoot(), nm), "snapshot.txt")
+    let (st, mb) = readFileBytes(metaPath)
+    if st != rsOk:
+      sayBad(sender, "No snapshot named " & nm & ".")
+      return
+    var meta = ""
+    for b in mb:
+      meta.add(char(b))
+    let lines = meta.splitLines()
+    if lines.len < 2:
+      sayBad(sender, "Snapshot '" & nm & "' is damaged.")
+      return
+    let dim = lines[0]
+    let w = findWorldByDim(server, dim)
+    if playersIn(w) > 0:
+      sayBad(sender, "Everybody must leave " & dim & " first (loaded chunks would overwrite the files).")
+      return
+    let src = joinPathW(joinPathW(snapshotRoot(), nm), "region")
+    let live = regionDirOf(dim)
+    let backup = joinPathW(joinPathW(snapshotRoot(), nm & "-before-restore"), "region")
+    var copied = 0
+    for i in 1 ..< lines.len:
+      let stem = lines[i].strip()
+      if stem.len == 0:
+        continue
+      discard copyRegionFile(live, backup, stem)   # the files being replaced are kept
+      copied += copyRegionFile(src, live, stem)
+    sayOk(sender, "Snapshot '" & nm & "' restored: " & $copied & " region file(s). The previous files are in snapshots/" & nm &
+      "-before-restore. Restart the server so no stale chunk stays loaded.")
+    return
+  let nm = parts[1]
+  if not safeName(nm):
+    sayBad(sender, "Snapshot names are letters, digits, _ and - (40 at most).")
+    return
+  var radius = 8
+  if parts.len >= 3 and (not parseNum(parts[2], radius) or radius > 64):
+    sayBad(sender, "Chunk radius is a number up to 64.")
+    return
+  var x = 0'i32
+  var y = 0'i32
+  var z = 0'i32
+  posOf(sender, world, x, y, z)
+  # ask for the saves now, copy once the chunk system had time to write them
+  if closureSet(world.requestSave):
+    world.requestSave()
+  discard callServerSaveAllHook()
+  blockLogFlush()
+  say(sender, "Saving, the snapshot is taken in " & $(SnapshotDelayTicks div 20) & " seconds...")
+  let cx = x shr 4
+  let cz = z shr 4
+  let dimn = world.dimensionName
+  blockLogLater(SnapshotDelayTicks, proc() {.closure.} = takeSnapshot(sender, dimn, nm, radius, cx, cz))
+
+# ---- the command ----------------------------------------------------------------------------------------------------
+
+proc statusCmd(sender: CommandSender) =
+  say(sender, "Block log: " & (if blockLogActive(): "on" else: "off") & ", " & $blockLogBuffered() & " buffered, " &
+    $blockLogRecordsWritten() & " written this run, " & $blockLogDropped() & " dropped" &
+    (if blockLogJobActive(): ", job: " & $blockLogJobLeft() & " left" else: ""))
+
+proc blCommand(sender: CommandSender; server: nil CommandServer; args: ConsumedArgs): CommandResult =
+  var line = ""
+  discard findMsg(args, ArgRest, line)
+  let parts = line.splitWhitespace()
+  if parts.len == 0:
+    say(sender, "/bl inspect | lookup <r> <t> [user] | rollback <r> <t> [user] | restore <r> <t> [user] | purge <t> | snapshot ... | status")
+    return cmdSuccess(0'i32)
+  if not blockLogActive():
+    sayBad(sender, "The block log is not running on this server.")
+    return cmdSuccess(0'i32)
+  case parts[0]
+  of "inspect", "i":
+    if sender.kind != cskPlayer:
+      sayBad(sender, "Inspect is for players.")
+    else:
+      let on = blockLogToggleInspect(sender.player.gameProfile.name)
+      sayOk(sender, "Inspect mode " & (if on: "on: break or place a block to see its history." else: "off."))
+  of "lookup", "l":
+    lookup(sender, server, parts)
+  of "rollback", "rb":
+    startChange(sender, server, parts, false)
+  of "restore":
+    startChange(sender, server, parts, true)
+  of "purge":
+    var span = 0'i64
+    if parts.len < 2 or not parseSpan(parts[1], span) or span < 3600'i64:
+      sayBad(sender, "Usage: /bl purge <time, at least 1h>")
+    else:
+      sayOk(sender, "Purged " & $blockLogPurge(span) & " record(s) older than " & parts[1] & ".")
+  of "snapshot", "snap":
+    snapshotCmd(sender, server, parts)
+  of "status":
+    statusCmd(sender)
+  else:
+    sayBad(sender, "Unknown /bl subcommand " & parts[0] & ".")
+  cmdSuccess(1'i32)
+
+proc initCommandTree*(): CommandTree =
+  then(execute(newCommandTree(Names, Description), blCommand), execute(argument(ArgRest, newMsgArgConsumer()), blCommand))

@@ -36,6 +36,7 @@ var __sdk = (function () {
   Player.prototype.hasChannel = function (channel) { return hostv("player_has_channel", this.name, channel) == true; };
   Player.prototype.channels = function () { var s = hostv("player_channels", this.name); return s ? s.split("\n") : []; };
   Player.prototype.hasCapability = function (name) { return hostv("player_has_capability", this.name, name) == true; };
+  Player.prototype.modState = function (modId) { return hostv("player_mod_state", this.name, modId); };
   Player.prototype.jesterVersion = function () { return hostv("player_jester_version", this.name); };
   Player.prototype.kick = function (reason) { return hostv("player_kick", this.name, reason); };
   Player.prototype.teleport = function (x, y, z) {
@@ -52,9 +53,39 @@ var __sdk = (function () {
   function xyz() { return { x: num("x"), y: num("y"), z: num("z") }; }
   function merge(a, b) { for (var k in b) a[k] = b[k]; return a; }
 
+  function materialFrom(text) {
+    var w = String(text).split(" ");
+    if (w.length < 13) return { known: false };
+    return { known: true, matClass: w[0], density: Number(w[1]), fill: Number(w[2]), stiffness: Number(w[3]), damping: Number(w[4]),
+             tensile: Number(w[5]), compressive: Number(w[6]), dragArea: Number(w[7]), breakThreshold: Number(w[8]),
+             flammability: Number(w[9]), ignitability: Number(w[10]), liquid: w[11] === "1", indestructible: w[12] === "1" };
+  }
+
   var server = {
     log: function (text) { hostS("server_log", text); },
     broadcast: function (text) { hostS("server_broadcast", text); },
+    windAt: function (x, y, z) {
+      var w = String(hostv("physics_wind_at", x, y, z)).split(" ");
+      return w.length >= 4 ? { x: Number(w[0]), y: Number(w[1]), z: Number(w[2]), speed: Number(w[3]) } : { x: 0, y: 0, z: 0, speed: 0 };
+    },
+    materialByName: function (name) { return materialFrom(hostv("physics_material_by_name", name)); },
+    materialAt: function (x, y, z) { return materialFrom(hostv("physics_material_at", x, y, z)); },
+    massOf: function (name, volume) { var m = materialFrom(hostv("physics_material_by_name", name)); return m.known ? m.density * (volume === undefined ? 1 : volume) : 0; },
+    solveRegion: function (x, y, z, nx, ny, nz, options) {
+      options = options || {};
+      var text = String(hostv("physics_solve", x + " " + y + " " + z, nx + " " + ny + " " + nz,
+        options.floorAnchored === false ? "0" : "1", options.wind ? "1" : "0"));
+      if (text.indexOf("error:") === 0) return { ok: false, error: text.substr(7), broken: [] };
+      var lines = text.split("\n"), h = lines[0].split(" ");
+      var kinds = ["none", "bending", "shear", "crush", "tension", "hang", "unsupported"];
+      var r = { ok: true, error: "", maxRatio: Number(h[0]), converged: h[1] === "1", rounds: Number(h[2]), granular: Number(h[4]),
+                caveIns: Number(h[5]), components: Number(h[6]), broken: [] };
+      for (var i = 1; i < lines.length; i++) {
+        var b = lines[i].split(" ");
+        if (b.length >= 5) r.broken.push({ x: Number(b[0]), y: Number(b[1]), z: Number(b[2]), ratio: Number(b[3]), kind: kinds[Number(b[4])] || "none" });
+      }
+      return r;
+    },
     advertiseCapability: function (name) { return hostv("server_advertise_capability", name) == true; },
     onlineCount: function () { return hostv("server_player_count"); },
     player: function (name) { return new Player(name); },

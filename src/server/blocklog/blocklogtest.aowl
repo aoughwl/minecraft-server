@@ -1,0 +1,250 @@
+## Unit tests of the block log: codec, ring, store, queries, rollback order and slices, purge. PASS / FAIL lines, exit 1 on a fail.
+import std/[syncio, tables, strutils, times]
+import blocklogcore
+import ../../world/worldfs
+
+var fails = 0
+var passes = 0
+
+proc check(name: string; ok: bool) =
+  if ok:
+    inc passes
+    echo "PASS ", name
+  else:
+    inc fails
+    echo "FAIL ", name
+
+proc rec(t: uint32; x, y, z: int32; o, n: uint16; cause, kind: uint8; actor: uint16): BlockLogRec =
+  BlockLogRec(t: t, dim: 0'u8, x: x, y: y, z: z, oldS: o, newS: n, cause: cause, kind: kind, actor: actor)
+
+proc sameRec(a, b: BlockLogRec): bool =
+  a.t == b.t and a.dim == b.dim and a.x == b.x and a.y == b.y and a.z == b.z and a.oldS == b.oldS and a.newS == b.newS and
+    a.cause == b.cause and a.kind == b.kind and a.actor == b.actor
+
+proc sameSeq(a, b: seq[BlockLogRec]): bool =
+  if a.len != b.len: return false
+  for i in 0 ..< a.len:
+    if not sameRec(a[i], b[i]): return false
+  true
+
+var now = 1_800_000_000'i64
+var folderN = 0
+
+proc freshFolder(): string =
+  inc folderN
+  "C:/m/blogtest_" & $int64(toUnix(getTime())) & "_" & $folderN
+
+# ---- varints ----
+proc testVarints() =
+  var buf: seq[byte] = @[]
+  let vals = [0'i64, 1'i64, -1'i64, 63'i64, -64'i64, 1_000_000'i64, -1_000_000'i64, 2147483647'i64, -2147483648'i64]
+  for v in vals:
+    putVar(buf, zig(v))
+  var pos = 0
+  var ok = true
+  var good = true
+  for v in vals:
+    if unzig(getVar(buf, pos, ok)) != v: good = false
+  check("varint+zigzag round trip", good and ok and pos == buf.len)
+
+# ---- codec ----
+proc testCodec() =
+  var recs: seq[BlockLogRec] = @[]
+  recs.add(rec(1_800_000_000'u32, -5, 64, 1000, 1'u16, 0'u16, CauseBreak, KindPlayer, 3'u16))
+  recs.add(rec(1_800_000_001'u32, -4, 64, 1000, 0'u16, 9'u16, CausePlace, KindPlayer, 4'u16))
+  # a fill row: same fields, x stepping by 1 -> a run
+  for i in 0 ..< 200:
+    recs.add(rec(1_800_000_005'u32, int32(100 + i), 70, -3000, 0'u16, 1'u16, CauseCommand, KindPlayer, 3'u16))
+  recs.add(rec(1_800_000_005'u32, 7, -60, 7, 5'u16, 6'u16, CauseExplosion, KindEntity, 0'u16))
+  recs.add(rec(1_800_000_004'u32, 7, -60, 8, 5'u16, 6'u16, CauseExplosion, KindEntity, 0'u16))  # time goes backwards
+  let enc = encodeBlock(recs)
+  let dec = decodeBlocks(enc, 0'u8)
+  check("codec round trip (negative coords, runs, backwards time)", sameSeq(recs, dec))
+  check("codec run-length keeps a 200 block row small (" & $enc.len & " bytes)", enc.len < 80)
+  let cut = enc[0 ..< enc.len - 3]
+  check("truncated tail ends the read without a crash", decodeBlocks(cut, 0'u8).len == 0)
+  var two = enc
+  for b in enc: two.add(b)
+  check("two appended blocks decode in file order", decodeBlocks(two, 0'u8).len == 2 * recs.len)
+
+# ---- ring ----
+proc testRing() =
+  var r = newRing(4)
+  let a = ringPush(r, rec(1'u32, 1, 0, 0, 0, 1, 0, 0, 0))
+  let b = ringPush(r, rec(2'u32, 2, 0, 0, 0, 1, 0, 0, 0))
+  let c = ringPush(r, rec(3'u32, 3, 0, 0, 0, 1, 0, 0, 0))
+  let d = ringPush(r, rec(4'u32, 4, 0, 0, 0, 1, 0, 0, 0))
+  check("ring push 1..4", a and b and c and d)
+  check("ring full refuses a fifth", ringFull(r) and not ringPush(r, rec(5'u32, 5, 0, 0, 0, 1, 0, 0, 0)))
+  let dr = ringDrain(r)
+  check("ring drains oldest first and empties", dr.len == 4 and dr[0].t == 1'u32 and dr[3].t == 4'u32 and r.count == 0)
+  discard ringPush(r, rec(9'u32, 9, 0, 0, 0, 1, 0, 0, 0))
+  discard ringPush(r, rec(10'u32, 9, 0, 0, 0, 1, 0, 0, 0))
+  let d2 = ringDrain(r)
+  check("ring reusable after a drain", d2.len == 2 and d2[0].t == 9'u32)
+
+# ---- store, queries ----
+proc testStore() =
+  let folder = freshFolder()
+  blockLogInit(folder)
+  let alice = blockLogPush(CauseBreak, KindPlayer, "Alice")
+  blockLogRecordChange("minecraft:overworld", 10, 64, 10, 1, 0)
+  now += 100
+  blockLogRecordChange("minecraft:overworld", 11, 64, 10, 1, 0)
+  blockLogPop(alice)
+  let bob = blockLogPush(CausePlace, KindPlayer, "Bob")
+  now += 100
+  blockLogRecordChange("minecraft:overworld", 10, 64, 10, 0, 7)
+  blockLogRecordChange("minecraft:overworld", 2000, 64, -2000, 0, 7)     # another region
+  blockLogRecordChange("minecraft:the_nether", 10, 64, 10, 0, 8)         # another dimension
+  blockLogRecordChange("minecraft:overworld", 5, 5, 5, 3, 3)             # no change: not logged
+  blockLogPop(bob)
+  check("ring holds the 5 changes, none written yet", blockLogBuffered() == 5)
+  blockLogTick(5)
+  check("tick before the timer keeps the ring", blockLogBuffered() == 5)
+  blockLogTick(250)
+  check("timer tick drains the ring", blockLogBuffered() == 0)
+  blockLogTick(251)
+  blockLogTick(252)
+  check("pending blocks written within the per tick budget", blockLogPendingBlocks() == 0)
+  let ow = findDim("minecraft:overworld")
+  let aliceIdx = findUser("alice")
+  let bobIdx = findUser("Bob")
+  check("names interned (case insensitive lookup)", aliceIdx >= 0 and bobIdx >= 0 and aliceIdx != bobIdx and userName(aliceIdx) == "Alice")
+  let near = blockLogQuery(LogQuery(dim: ow, x: 10, y: 64, z: 10, radius: 5, sinceT: 0, actor: -1))
+  check("query by position radius sees 3 near changes in time order", near.len == 3 and near[0].t <= near[1].t and near[1].t <= near[2].t)
+  let far = blockLogQuery(LogQuery(dim: ow, x: 2000, y: 64, z: -2000, radius: 10, sinceT: 0, actor: -1))
+  check("query by region finds the far one only", far.len == 1 and far[0].x == 2000)
+  let byBob = blockLogQuery(LogQuery(dim: ow, x: 0, y: 0, z: 0, radius: -1, sinceT: 0, actor: bobIdx))
+  check("query by user (no position, all regions)", byBob.len == 2)
+  let recent = blockLogQuery(LogQuery(dim: ow, x: 10, y: 64, z: 10, radius: 5, sinceT: now - 50, actor: -1))
+  check("query by time window", recent.len == 1 and recent[0].newS == 7'u16)
+  let nether = blockLogQuery(LogQuery(dim: findDim("minecraft:the_nether"), x: 10, y: 64, z: 10, radius: 5, sinceT: 0, actor: -1))
+  check("dimensions are separate", nether.len == 1 and nether[0].newS == 8'u16)
+  let h = blockLogHistory("minecraft:overworld", 10, 64, 10, 10)
+  check("history lines: count then newest first", h.len == 3 and h[0].startsWith("2 change") and h[1].contains("Bob"))
+  let on1 = blockLogToggleInspect("Alice")
+  let seen = blockLogInspecting("Alice")
+  let on2 = blockLogToggleInspect("Alice")
+  check("inspect toggle", on1 and seen and not on2 and not blockLogInspecting("Alice"))
+  # persistence: a fresh init reads the same files and name tables
+  blockLogInit(folder)
+  let ow2 = findDim("minecraft:overworld")
+  let all = blockLogQuery(LogQuery(dim: ow2, x: 0, y: 0, z: 0, radius: -1, sinceT: 0, actor: -1))
+  check("log survives a restart (4 overworld records)", all.len == 4 and userName(findUser("Bob")) == "Bob")
+
+# ---- rollback ----
+var simWorld = initTable[int64, uint16]()
+
+proc simKey(x, y, z: int32): int64 = int64(x) * 1000003'i64 + int64(y) * 1009'i64 + int64(z)
+
+proc setSim(who: string; cause: uint8; x, y, z: int32; s: uint16) =
+  let prev = blockLogPush(cause, KindPlayer, who)
+  let old = simWorld.getOrDefault(simKey(x, y, z), 0'u16)
+  simWorld[simKey(x, y, z)] = s
+  blockLogRecordChange("minecraft:overworld", int(x), int(y), int(z), int(old), int(s))
+  blockLogPop(prev)
+
+var applied: seq[uint16] = @[]
+var redo: seq[uint16] = @[]
+var finished = -1
+var rfin = -1
+var efin = -1
+
+proc applyReal(dim: int; x, y, z: int32; s: uint16) {.closure.} =
+  ## What the world does for the job: write the state, the recorder runs inside (under the job's rollback context).
+  applied.add(s)
+  let old = simWorld.getOrDefault(simKey(x, y, z), 0'u16)
+  simWorld[simKey(x, y, z)] = s
+  blockLogRecordChange("minecraft:overworld", int(x), int(y), int(z), int(old), int(s))
+
+proc applyRedo(dim: int; x, y, z: int32; s: uint16) {.closure.} =
+  redo.add(s)
+
+proc doneRollback(n: int) {.closure.} = finished = n
+proc doneRestore(n: int) {.closure.} = rfin = n
+proc doneEmpty(n: int) {.closure.} = efin = n
+proc doneNothing(n: int) {.closure.} = discard
+
+proc testRollback() =
+  blockLogInit(freshFolder())
+  let t0 = now
+  setSim("Carol", CausePlace, 1, 1, 1, 5'u16)
+  now += 10
+  setSim("Dave", CauseBreak, 1, 1, 1, 0'u16)
+  now += 10
+  setSim("Carol", CausePlace, 1, 1, 1, 6'u16)
+  now += 10
+  setSim("Carol", CausePlace, 2, 1, 1, 9'u16)
+  let ow = findDim("minecraft:overworld")
+  let chron = blockLogQuery(LogQuery(dim: ow, x: 1, y: 1, z: 1, radius: 3, sinceT: t0, actor: -1, skipRollbacks: true))
+  check("4 chronological records for the scene", chron.len == 4 and chron[0].newS == 5'u16)
+  let plan = planRollback(chron)
+  check("rollback plan: last change first", plan.len == 4 and plan[0].newS == 9'u16 and plan[1].newS == 6'u16 and plan[3].newS == 5'u16)
+  check("job starts", blockLogStartJob(plan, false, "Admin", applyReal, doneRollback))
+  check("a second job is refused while one runs", not blockLogStartJob(plan, false, "Admin", applyReal, doneNothing))
+  runJobSlice(2)
+  check("budgeted slice applies only 2 (the last two changes first, undone to their old states 0, 0)", applied.len == 2 and applied[0] == 0'u16 and applied[1] == 0'u16)
+  check("job still active after one slice", blockLogJobActive() and blockLogJobLeft() == 2 and finished == -1)
+  runJobSlice(100)
+  check("job finishes and reports 4", not blockLogJobActive() and finished == 4)
+  check("rollback restored the pre-window state (air at 1,1,1 and 2,1,1)",
+    simWorld.getOrDefault(simKey(1, 1, 1), 0'u16) == 0'u16 and simWorld.getOrDefault(simKey(2, 1, 1), 0'u16) == 0'u16)
+  let after = blockLogQuery(LogQuery(dim: ow, x: 1, y: 1, z: 1, radius: 3, sinceT: t0, actor: -1))
+  var rb = 0
+  for r in after:
+    if r.cause == CauseRollback: inc rb
+  let hidden = blockLogQuery(LogQuery(dim: ow, x: 1, y: 1, z: 1, radius: 3, sinceT: t0, actor: -1, skipRollbacks: true))
+  check("rollback writes are logged as cause=rollback (" & $rb & "), skipRollbacks hides them", rb >= 2 and hidden.len == 4)
+  check("a second plan from the same window ignores rollback records", planRollback(after).len == 4)
+  # partial rollback: only Carol's changes in the window, and a time-restricted one
+  let carol = findUser("Carol")
+  let partial = blockLogQuery(LogQuery(dim: ow, x: 1, y: 1, z: 1, radius: 3, sinceT: t0, actor: carol, skipRollbacks: true))
+  check("partial rollback by user selects only that user's 3", partial.len == 3)
+  let late = blockLogQuery(LogQuery(dim: ow, x: 1, y: 1, z: 1, radius: 3, sinceT: t0 + 15, actor: -1, skipRollbacks: true))
+  check("partial rollback by time selects only the last 2", late.len == 2)
+  # restore redoes in order
+  let rplan = planRestore(chron)
+  check("restore job starts", blockLogStartJob(rplan, true, "Admin", applyRedo, doneRestore))
+  runJobSlice(100)
+  check("restore applies new states first to last", redo.len == 4 and redo[0] == 5'u16 and redo[1] == 0'u16 and redo[2] == 6'u16 and
+    redo[3] == 9'u16 and rfin == 4)
+  discard blockLogStartJob(@[], false, "Admin", applyReal, doneEmpty)
+  check("an empty job completes immediately", efin == 0 and not blockLogJobActive())
+
+# ---- purge ----
+proc testPurge() =
+  blockLogInit(freshFolder())
+  blockLogRecordChange("minecraft:overworld", 4, 4, 4, 0, 2)
+  now += 100000
+  blockLogRecordChange("minecraft:overworld", 1, 1, 1, 0, 3)
+  let removed = blockLogPurge(50000)
+  check("purge removes the old record (" & $removed & ")", removed == 1)
+  let left = blockLogQuery(LogQuery(dim: 0, x: 0, y: 0, z: 0, radius: -1, sinceT: 0, actor: -1))
+  check("purge keeps the recent record only", left.len == 1 and left[0].newS == 3'u16)
+
+# ---- ring overflow never drops ----
+proc testOverflow() =
+  blockLogInit(freshFolder())
+  let n = RingCapacity + 100
+  for i in 0 ..< n:
+    blockLogRecordChange("minecraft:overworld", i mod 400, 64, i div 400, 0, 1 + (i mod 5))
+  blockLogFlush()
+  check("ring overflow flushes instead of dropping (" & $blockLogRecordsWritten() & " written)", blockLogDropped() == 0 and
+    blockLogRecordsWritten() == n)
+  let all = blockLogQuery(LogQuery(dim: 0, x: 0, y: 0, z: 0, radius: -1, sinceT: 0, actor: -1))
+  check("all overflow records readable back", all.len == n)
+
+proc clock(): int64 {.closure.} = now
+
+setBlockLogClock(clock)
+testVarints()
+testCodec()
+testRing()
+testStore()
+testRollback()
+testPurge()
+testOverflow()
+echo "blocklog tests: ", passes, " passed, ", fails, " failed"
+if fails > 0:
+  quit(1)

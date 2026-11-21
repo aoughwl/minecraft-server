@@ -1,0 +1,576 @@
+## A spark-like profiler for the server: named section timers per tick, tick duration percentiles, rolling MSPT/TPS.
+##
+## Cost model
+##   * OFF (default): `profScope` / `profEnd` are one test of a module bool and a return. `profTickEnd` always runs (once per
+##     tick): it files the duration in a 18000-tick ring and a per-second window, a few array writes plus one clock read.
+##   * ON (`profStart`): each scope costs two `nowNanos()` reads (QueryPerformanceCounter) and a few array writes; scopes
+##     nest up to 32 deep, a deeper scope is counted by depth only and not timed. Memory is bounded: the session keeps at
+##     most 72000 tick samples (1 h at 20 tps, int32 microseconds), the slowest 10 ticks and one row per scope (64 scopes).
+##
+## Scopes nest: a scope's INCLUSIVE time contains its children, its SELF time does not. A tick's dominant scope is the scope
+## with the largest self time in that tick. Scopes entered outside a tick (network pump, chunk IO) are summed separately.
+##
+## The clock is `nowNanos()` of net/winsock (QueryPerformanceCounter, monotonic, sub-microsecond).
+## Worker-thread generation is NOT visible here: the generation executor only prints its own stats (MC_GEN_STATS=1); the
+## generation scope times the main-thread part (polling and receiving results).
+
+import std/[syncio, algorithm, strutils, math]
+import ../net/winsock
+
+const
+  ScNetwork* = 0       ## connection pump, console, RCON, query, flush
+  ScTickWorld* = 1     ## `worldmod.tick` of one dimension (contains the scopes below)
+  ScEntities* = 2      ## the entity tick hook
+  ScChunkIO* = 3       ## chunk system pump outside the tick (IO and generation stages on the main thread)
+  ScGeneration* = 4    ## generation results received on the main thread
+  ScLighting* = 5
+  ScBlockTicks* = 6    ## random and scheduled block ticks (`tickChunks`)
+  ScPlugins* = 7       ## plugin manager tick
+  ScPhysics* = 8       ## physics / bodies
+  ScBlockLog* = 9
+  ScPregen* = 10
+  ScPlayers* = 11      ## per-player tick (movement, packets)
+  ScEnvironment* = 12  ## time, weather
+  ScBlockEntities* = 13
+  ScPlayerData* = 14   ## player data autosave
+  ScWorldMaint* = 15   ## block update flush, active chunk bookkeeping
+  BuiltinScopes = 16
+  MaxScopes* = 64
+  MaxDepth = 32
+  RingSize* = 18000
+  MaxSession* = 72000
+  SlowKeep* = 10
+  WindowSecs* = 900
+  PluginPrefix* = "plugin:"
+
+type
+  TickStats* = object
+    n*: int
+    meanUs*: float64
+    p50Us*, p95Us*, p99Us*, maxUs*: int32
+
+  RollWin* = object
+    ## Per-second slots covering the last `WindowSecs` seconds.
+    slotSec*: seq[int64]
+    slotNs*: seq[int64]
+    slotCount*: seq[int32]
+    firstSec*: int64
+
+  WinStat* = object
+    ticks*: int
+    seconds*: int
+    msptMs*: float64
+    tps*: float64
+
+  SlowTick* = object
+    tick*: int64
+    ns*: int64
+    domId*: int
+    domNs*: int64
+
+  ScopeRow* = object
+    id*: int
+    name*: string
+    selfNs*: int64
+    inclNs*: int64
+    calls*: int64
+
+# ---- pure statistics (unit tested) -------------------------------------------------------------------------------------
+
+proc percentileUs*(sorted: seq[int32]; p: float64): int32 =
+  ## Nearest rank on an ascending sample: the smallest value with at least p of the samples at or below it.
+  if sorted.len == 0:
+    return 0'i32
+  var rank = int(ceil(p * float64(sorted.len)))
+  if rank < 1:
+    rank = 1
+  if rank > sorted.len:
+    rank = sorted.len
+  sorted[rank - 1]
+
+proc cmpI32(a, b: int32): int =
+  if a < b: -1 elif a > b: 1 else: 0
+
+proc statsOf*(samples: seq[int32]): TickStats =
+  ## Mean, p50, p95, p99 and max of tick durations in microseconds.
+  result = TickStats(n: samples.len)
+  if samples.len == 0:
+    return
+  var s = samples
+  s.sort(cmpI32)
+  var sum = 0'i64
+  for v in s:
+    sum += int64(v)
+  result.meanUs = float64(sum) / float64(s.len)
+  result.p50Us = percentileUs(s, 0.50)
+  result.p95Us = percentileUs(s, 0.95)
+  result.p99Us = percentileUs(s, 0.99)
+  result.maxUs = s[s.len - 1]
+
+proc newRollWin*(): RollWin =
+  RollWin(slotSec: newSeq[int64](WindowSecs), slotNs: newSeq[int64](WindowSecs), slotCount: newSeq[int32](WindowSecs), firstSec: -1'i64)
+
+proc rwAdd*(w: var RollWin; sec: int64; ns: int64) =
+  ## One tick of `ns` nanoseconds finished during second number `sec` (any monotonic origin).
+  if w.slotSec.len == 0:
+    w = newRollWin()
+  if w.firstSec < 0'i64:
+    w.firstSec = sec
+  let i = int(sec mod int64(WindowSecs))
+  if w.slotSec[i] != sec:
+    w.slotSec[i] = sec
+    w.slotNs[i] = 0'i64
+    w.slotCount[i] = 0'i32
+  w.slotNs[i] += ns
+  w.slotCount[i] += 1'i32
+
+proc rwQuery*(w: RollWin; curSec: int64; secs: int): WinStat =
+  ## MSPT and TPS over the last `secs` seconds ending at `curSec`. The TPS denominator is the time covered since the first
+  ## tick when that is shorter than the window, so a fresh server does not read as a low TPS.
+  result = WinStat()
+  if w.slotSec.len == 0 or w.firstSec < 0'i64:
+    return
+  var sumNs = 0'i64
+  var count = 0
+  var s = curSec - int64(secs) + 1'i64
+  if s < w.firstSec:
+    s = w.firstSec
+  let covered = int(curSec - s + 1'i64)
+  var t = s
+  while t <= curSec:
+    let i = int(t mod int64(WindowSecs))
+    if w.slotSec[i] == t:
+      sumNs += w.slotNs[i]
+      count += int(w.slotCount[i])
+    t += 1'i64
+  result.ticks = count
+  result.seconds = covered
+  if count > 0:
+    result.msptMs = float64(sumNs) / float64(count) / 1_000_000.0
+    result.tps = float64(count) / float64(covered)
+
+# ---- state -----------------------------------------------------------------------------------------------------------
+
+var
+  gOn: bool = false
+  gInTick: bool = false
+  gInited: bool = false
+  gNames: seq[string] = @[]
+  gDepth: int = 0
+  gStackId: seq[int] = newSeq[int](MaxDepth)
+  gStackStart: seq[int64] = newSeq[int64](MaxDepth)
+  gStackChild: seq[int64] = newSeq[int64](MaxDepth)
+  # accumulators of the tick being timed
+  tSelf: seq[int64] = newSeq[int64](MaxScopes)
+  tIncl: seq[int64] = newSeq[int64](MaxScopes)
+  tCalls: seq[int64] = newSeq[int64](MaxScopes)
+  # session totals: in tick, and outside any tick
+  sSelf: seq[int64] = newSeq[int64](MaxScopes)
+  sIncl: seq[int64] = newSeq[int64](MaxScopes)
+  sCalls: seq[int64] = newSeq[int64](MaxScopes)
+  oSelf: seq[int64] = newSeq[int64](MaxScopes)
+  oIncl: seq[int64] = newSeq[int64](MaxScopes)
+  oCalls: seq[int64] = newSeq[int64](MaxScopes)
+  sDom: seq[int64] = newSeq[int64](MaxScopes)   ## ticks in which the scope was dominant
+  sTicks: int64 = 0'i64
+  sSumNs: int64 = 0'i64
+  sMaxNs: int64 = 0'i64
+  sDur: seq[int32] = @[]
+  sDropped: int64 = 0'i64
+  sSlow: seq[SlowTick] = @[]
+  sStartNs: int64 = 0'i64
+  sEndNs: int64 = 0'i64
+  sDeadlineNs: int64 = 0'i64
+  sHasData: bool = false
+  gFolder: string = ""
+  # always on
+  ring: seq[int32] = newSeq[int32](RingSize)
+  ringN: int64 = 0'i64
+  win: RollWin = newRollWin()
+  winCur: int64 = 0'i64
+
+proc profInit() =
+  if gInited:
+    return
+  gInited = true
+  gNames = @["network", "tick world", "entities", "chunk system / IO", "generation", "lighting", "block ticks", "plugins",
+    "physics / bodies", "blocklog", "pregen", "players", "environment", "block entities", "player data", "world maintenance"]
+
+proc profSetFolder*(folder: string) =
+  ## Where `/profile export` writes (the world folder).
+  gFolder = folder
+
+proc profFolder*(): string = gFolder
+proc profActive*(): bool = gOn
+proc profHasData*(): bool = sHasData
+
+proc profScopeNamed*(name: string): int =
+  ## The id of a scope by name, registered on first use (up to 64 scopes); -1 when the table is full. `profScope(-1)` is a no-op.
+  profInit()
+  for i in 0 ..< gNames.len:
+    if gNames[i] == name:
+      return i
+  if gNames.len >= MaxScopes:
+    return -1
+  gNames.add(name)
+  gNames.len - 1
+
+proc profPluginScope*(plugin: string): int =
+  profScopeNamed(PluginPrefix & plugin)
+
+proc profScopeName*(id: int): string =
+  profInit()
+  if id >= 0 and id < gNames.len: gNames[id] else: "?"
+
+proc profScopeCount*(): int =
+  profInit()
+  gNames.len
+
+# ---- hot path --------------------------------------------------------------------------------------------------------
+
+proc profScope*(id: int) =
+  ## Opens scope `id`. Pair with `profEnd(id)` on every path.
+  if not gOn or id < 0:
+    return
+  if gDepth < MaxDepth:
+    gStackId[gDepth] = id
+    gStackStart[gDepth] = nowNanos()
+    gStackChild[gDepth] = 0'i64
+  gDepth += 1
+
+proc profEnd*(id: int) =
+  ## Closes scope `id`. An end that does not match the open scope (the profiler was started inside it) is ignored.
+  if not gOn or id < 0 or gDepth == 0:
+    return
+  let d = gDepth - 1
+  if d >= MaxDepth:
+    gDepth = d
+    return
+  if gStackId[d] != id:
+    return
+  gDepth = d
+  let el = nowNanos() - gStackStart[d]
+  var selfNs = el - gStackChild[d]
+  if selfNs < 0'i64:
+    selfNs = 0'i64
+  if d > 0 and d - 1 < MaxDepth:
+    gStackChild[d - 1] += el
+  if gInTick:
+    tSelf[id] += selfNs
+    tIncl[id] += el
+    tCalls[id] += 1'i64
+  else:
+    oSelf[id] += selfNs
+    oIncl[id] += el
+    oCalls[id] += 1'i64
+
+proc profTickBegin*() =
+  ## Start of a server tick.
+  if not gOn:
+    return
+  gInTick = true
+  gDepth = 0
+
+# ---- session control -------------------------------------------------------------------------------------------------
+
+proc clearSession() =
+  for i in 0 ..< MaxScopes:
+    tSelf[i] = 0'i64
+    tIncl[i] = 0'i64
+    tCalls[i] = 0'i64
+    sSelf[i] = 0'i64
+    sIncl[i] = 0'i64
+    sCalls[i] = 0'i64
+    oSelf[i] = 0'i64
+    oIncl[i] = 0'i64
+    oCalls[i] = 0'i64
+    sDom[i] = 0'i64
+  sTicks = 0'i64
+  sSumNs = 0'i64
+  sMaxNs = 0'i64
+  sDur = @[]
+  sDropped = 0'i64
+  sSlow = @[]
+
+proc profStart*(seconds: int = 0) =
+  ## Starts a session (discarding the previous one); with `seconds` > 0 it stops by itself after that long.
+  profInit()
+  clearSession()
+  gDepth = 0
+  gInTick = false
+  sStartNs = nowNanos()
+  sEndNs = 0'i64
+  sDeadlineNs = if seconds > 0: sStartNs + int64(seconds) * 1_000_000_000'i64 else: 0'i64
+  sHasData = true
+  gOn = true
+
+proc profStop*() =
+  if not gOn:
+    return
+  gOn = false
+  gInTick = false
+  gDepth = 0
+  sEndNs = nowNanos()
+
+proc profElapsedNs*(): int64 =
+  if not sHasData: return 0'i64
+  if gOn: nowNanos() - sStartNs else: sEndNs - sStartNs
+
+# ---- per tick --------------------------------------------------------------------------------------------------------
+
+proc noteSlow(tick, ns: int64; domId: int; domNs: int64) =
+  var pos = sSlow.len
+  if sSlow.len >= SlowKeep:
+    if ns <= sSlow[sSlow.len - 1].ns:
+      return
+    pos = sSlow.len - 1
+    sSlow[pos] = SlowTick(tick: tick, ns: ns, domId: domId, domNs: domNs)
+  else:
+    sSlow.add(SlowTick(tick: tick, ns: ns, domId: domId, domNs: domNs))
+    pos = sSlow.len - 1
+  while pos > 0 and sSlow[pos].ns > sSlow[pos - 1].ns:
+    let cur = sSlow[pos]
+    let prev = sSlow[pos - 1]
+    sSlow[pos] = prev
+    sSlow[pos - 1] = cur
+    pos -= 1
+
+proc profTickEnd*(tick: int64; durationNs: int64) =
+  ## End of a server tick that took `durationNs` (the ticker measures it). Always call it: it feeds the rolling windows even
+  ## while no session runs.
+  var us = durationNs div 1000'i64
+  if us > 2_000_000_000'i64:
+    us = 2_000_000_000'i64
+  ring[int(ringN mod int64(RingSize))] = int32(us)
+  ringN += 1'i64
+  let nowSec = nowNanos() div 1_000_000_000'i64
+  winCur = nowSec
+  rwAdd(win, nowSec, durationNs)
+  if not gOn:
+    return
+  var domId = -1
+  var domNs = 0'i64
+  if gInTick:
+    for i in 0 ..< MaxScopes:
+      if tCalls[i] != 0'i64:
+        sSelf[i] += tSelf[i]
+        sIncl[i] += tIncl[i]
+        sCalls[i] += tCalls[i]
+        if tSelf[i] > domNs:
+          domNs = tSelf[i]
+          domId = i
+        tSelf[i] = 0'i64
+        tIncl[i] = 0'i64
+        tCalls[i] = 0'i64
+    if domId >= 0:
+      sDom[domId] += 1'i64
+  gInTick = false
+  gDepth = 0
+  sTicks += 1'i64
+  sSumNs += durationNs
+  if durationNs > sMaxNs:
+    sMaxNs = durationNs
+  if sDur.len < MaxSession:
+    sDur.add(int32(us))
+  else:
+    sDropped += 1'i64
+  noteSlow(tick, durationNs, domId, domNs)
+  if sDeadlineNs != 0'i64 and nowNanos() >= sDeadlineNs:
+    profStop()
+    echo "[profiler] session finished: ", sTicks, " ticks. /profile report shows it."
+
+# ---- queries ---------------------------------------------------------------------------------------------------------
+
+proc profRingSamples*(): seq[int32] =
+  ## The last up to 18000 tick durations in microseconds (always collected).
+  let n = int(min(ringN, int64(RingSize)))
+  result = newSeq[int32](n)
+  for i in 0 ..< n:
+    result[i] = ring[i]
+
+proc profSessionSamples*(): seq[int32] = sDur
+proc profSessionTicks*(): int64 = sTicks
+proc profSlowTicks*(): seq[SlowTick] = sSlow
+
+proc profWindow*(secs: int): WinStat =
+  rwQuery(win, nowNanos() div 1_000_000_000'i64, secs)
+
+proc scopeRows(inTick: bool): seq[ScopeRow] =
+  result = @[]
+  profInit()
+  for i in 0 ..< gNames.len:
+    let calls = if inTick: sCalls[i] else: oCalls[i]
+    if calls == 0'i64:
+      continue
+    result.add(ScopeRow(id: i, name: gNames[i], selfNs: (if inTick: sSelf[i] else: oSelf[i]),
+      inclNs: (if inTick: sIncl[i] else: oIncl[i]), calls: calls))
+
+proc cmpSelfDesc(a, b: ScopeRow): int =
+  if a.selfNs > b.selfNs: -1
+  elif a.selfNs < b.selfNs: 1
+  else: 0
+
+proc profScopeRows*(inTick: bool): seq[ScopeRow] =
+  ## Rows sorted by self time, largest first.
+  result = scopeRows(inTick)
+  result.sort(cmpSelfDesc)
+
+# ---- text ------------------------------------------------------------------------------------------------------------
+
+proc fmtFixed*(v: float64; decimals: int): string =
+  ## `v` (>= 0) with `decimals` digits after the point.
+  var scale = 1'i64
+  for i in 0 ..< decimals:
+    scale = scale * 10'i64
+  let scaled = int64(max(v, 0.0) * float64(scale) + 0.5)
+  if decimals == 0:
+    return $scaled
+  var frac = $(scaled mod scale)
+  while frac.len < decimals:
+    frac = "0" & frac
+  $(scaled div scale) & "." & frac
+
+proc fmtMs*(ns: int64): string = fmtFixed(float64(ns) / 1_000_000.0, 3)
+proc fmtUsMs*(us: int32): string = fmtFixed(float64(us) / 1000.0, 2)
+
+proc pad(s: string; w: int): string =
+  result = s
+  while result.len < w:
+    result.add(' ')
+
+proc padL(s: string; w: int): string =
+  result = s
+  while result.len < w:
+    result = " " & result
+
+proc statsLine(label: string; st: TickStats): string =
+  label & " (" & $st.n & " ticks): mean " & fmtFixed(st.meanUs / 1000.0, 2) & " ms, p50 " & fmtUsMs(st.p50Us) & ", p95 " &
+    fmtUsMs(st.p95Us) & ", p99 " & fmtUsMs(st.p99Us) & ", max " & fmtUsMs(st.maxUs) & " ms"
+
+proc winLine(label: string; secs: int): string =
+  let w = profWindow(secs)
+  if w.ticks == 0:
+    return label & ": no data"
+  label & ": " & fmtFixed(w.msptMs, 2) & " ms/tick, " & fmtFixed(w.tps, 2) & " TPS" &
+    (if w.seconds < secs: " (over " & $w.seconds & " s)" else: "")
+
+proc profStatusLines*(): seq[string] =
+  result = @[]
+  if gOn:
+    result.add("Profiler: ON for " & fmtFixed(float64(profElapsedNs()) / 1e9, 1) & " s, " & $sTicks & " ticks" &
+      (if sDeadlineNs != 0'i64: ", stops in " & fmtFixed(float64(max(sDeadlineNs - nowNanos(), 0'i64)) / 1e9, 1) & " s" else: ""))
+  elif sHasData:
+    result.add("Profiler: off, last session " & fmtFixed(float64(profElapsedNs()) / 1e9, 1) & " s, " & $sTicks & " ticks (/profile report)")
+  else:
+    result.add("Profiler: off, no session yet (/profile start [seconds])")
+  result.add(winLine("MSPT/TPS 1m", 60))
+  result.add(winLine("MSPT/TPS 5m", 300))
+  result.add(winLine("MSPT/TPS 15m", 900))
+
+proc profReportLines*(): seq[string] =
+  ## The text report: windows, tick percentiles, scopes by self time, per-plugin time, slowest ticks.
+  result = @[]
+  profInit()
+  result.add("=== Server profile ===")
+  result.add(winLine("MSPT/TPS 1m", 60))
+  result.add(winLine("MSPT/TPS 5m", 300))
+  result.add(winLine("MSPT/TPS 15m", 900))
+  result.add(statsLine("Rolling ticks", statsOf(profRingSamples())))
+  if not sHasData:
+    result.add("No profile session yet: /profile start [seconds], then /profile report.")
+    return
+  result.add("Session: " & (if gOn: "running " else: "stopped after ") & fmtFixed(float64(profElapsedNs()) / 1e9, 1) & " s")
+  result.add(statsLine("Session ticks", statsOf(sDur)) & (if sDropped > 0'i64: " (+" & $sDropped & " ticks beyond the sample cap)" else: ""))
+  let rows = profScopeRows(true)
+  result.add("Scopes in the tick, by self time (total self " & fmtMs(sSumNs) & " ms of tick time):")
+  result.add("  " & pad("scope", 20) & padL("self ms", 11) & padL("incl ms", 11) & padL("ms/tick", 9) & padL("% tick", 8) & padL("calls", 9) & padL("dominant", 10))
+  var top = 0
+  for r in rows:
+    if top >= 12:
+      break
+    top += 1
+    let pct = if sSumNs > 0'i64: float64(r.selfNs) * 100.0 / float64(sSumNs) else: 0.0
+    let perTick = if sTicks > 0'i64: float64(r.selfNs) / float64(sTicks) / 1e6 else: 0.0
+    result.add("  " & pad(r.name, 20) & padL(fmtMs(r.selfNs), 11) & padL(fmtMs(r.inclNs), 11) & padL(fmtFixed(perTick, 3), 9) &
+      padL(fmtFixed(pct, 1), 8) & padL($r.calls, 9) & padL($sDom[r.id], 10))
+  if rows.len == 0:
+    result.add("  (no scope was entered during a tick)")
+  var accounted = 0'i64
+  for r in rows:
+    accounted += r.selfNs
+  if sSumNs > accounted:
+    result.add("  " & pad("(untimed rest)", 20) & padL(fmtMs(sSumNs - accounted), 11))
+  let outRows = profScopeRows(false)
+  if outRows.len > 0:
+    let secs = max(float64(profElapsedNs()) / 1e9, 0.001)
+    result.add("Outside the tick (main loop), total ms and share of one core:")
+    for r in outRows:
+      result.add("  " & pad(r.name, 20) & padL(fmtMs(r.selfNs), 11) & padL(fmtFixed(float64(r.selfNs) / 1e9 / secs * 100.0, 1) & " %", 10) &
+        padL($r.calls, 9) & " calls")
+  var anyPlugin = false
+  var allRows = profScopeRows(true)
+  for r in profScopeRows(false):
+    allRows.add(r)
+  for r in allRows:
+    if r.name.startsWith(PluginPrefix):
+      if not anyPlugin:
+        result.add("Per plugin (inclusive ms):")
+        anyPlugin = true
+      result.add("  " & pad(r.name[PluginPrefix.len ..< r.name.len], 24) & padL(fmtMs(r.inclNs), 11) & padL($r.calls, 9) & " calls")
+  if not anyPlugin:
+    result.add("Per plugin: none recorded (the plugin manager tick is the 'plugins' scope above).")
+  result.add("Slowest ticks:")
+  if sSlow.len == 0:
+    result.add("  (none)")
+  for s in sSlow:
+    result.add("  tick " & $s.tick & ": " & fmtMs(s.ns) & " ms" &
+      (if s.domId >= 0: ", dominant: " & profScopeName(s.domId) & " " & fmtMs(s.domNs) & " ms" else: ", no scope data"))
+
+proc jsonStr(s: string): string =
+  result = "\""
+  for c in s:
+    if c == '"': result.add("\\\"")
+    elif c == '\\': result.add("\\\\")
+    elif ord(c) < 32: result.add(" ")
+    else: result.add(c)
+  result.add("\"")
+
+proc statsJson(st: TickStats): string =
+  "{\"ticks\":" & $st.n & ",\"mean_ms\":" & fmtFixed(st.meanUs / 1000.0, 3) & ",\"p50_ms\":" & fmtFixed(float64(st.p50Us) / 1000.0, 3) &
+    ",\"p95_ms\":" & fmtFixed(float64(st.p95Us) / 1000.0, 3) & ",\"p99_ms\":" & fmtFixed(float64(st.p99Us) / 1000.0, 3) &
+    ",\"max_ms\":" & fmtFixed(float64(st.maxUs) / 1000.0, 3) & "}"
+
+proc winJson(secs: int): string =
+  let w = profWindow(secs)
+  "{\"seconds\":" & $w.seconds & ",\"ticks\":" & $w.ticks & ",\"mspt\":" & fmtFixed(w.msptMs, 3) & ",\"tps\":" & fmtFixed(w.tps, 3) & "}"
+
+proc rowsJson(rows: seq[ScopeRow]): string =
+  result = "["
+  for i in 0 ..< rows.len:
+    if i > 0:
+      result.add(",")
+    let r = rows[i]
+    result.add("{\"name\":" & jsonStr(r.name) & ",\"self_ms\":" & fmtMs(r.selfNs) & ",\"incl_ms\":" & fmtMs(r.inclNs) & ",\"calls\":" & $r.calls &
+      ",\"dominant_ticks\":" & $sDom[r.id] & "}")
+  result.add("]")
+
+proc profReportJson*(): string =
+  ## The same data as the text report, for a panel to read. Version 1.
+  profInit()
+  result = "{\"version\":1,\"running\":" & (if gOn: "true" else: "false") & ",\"has_session\":" & (if sHasData: "true" else: "false") &
+    ",\"windows\":{\"1m\":" & winJson(60) & ",\"5m\":" & winJson(300) & ",\"15m\":" & winJson(900) & "}" &
+    ",\"rolling\":" & statsJson(statsOf(profRingSamples()))
+  if sHasData:
+    result.add(",\"session\":{\"seconds\":" & fmtFixed(float64(profElapsedNs()) / 1e9, 3) & ",\"ticks\":" & $sTicks &
+      ",\"tick_time_ms\":" & fmtMs(sSumNs) & ",\"stats\":" & statsJson(statsOf(sDur)) & "}")
+    result.add(",\"scopes\":" & rowsJson(profScopeRows(true)))
+    result.add(",\"outside_tick\":" & rowsJson(profScopeRows(false)))
+    result.add(",\"slowest\":[")
+    for i in 0 ..< sSlow.len:
+      if i > 0:
+        result.add(",")
+      let s = sSlow[i]
+      result.add("{\"tick\":" & $s.tick & ",\"ms\":" & fmtMs(s.ns) & ",\"dominant\":" & (if s.domId >= 0: jsonStr(profScopeName(s.domId)) else: "null") &
+        ",\"dominant_ms\":" & fmtMs(s.domNs) & "}")
+    result.add("]")
+  result.add("}")

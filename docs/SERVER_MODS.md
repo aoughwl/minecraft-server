@@ -12,9 +12,12 @@ Every section starts with its status.
 | Reading and writing blocks | **real** (overworld, one block at a time) |
 | Live scripting console (`/script`) | **real** (JavaScript) |
 | Scenario tests | **real** (`tools/run_scenarios.sh`) |
-| Wind field for a mod | **planned** (the service exists in `src/physics`, plugins cannot reach it yet) |
-| Body stream (`jester:bodies`), fx (`jester:fx`), modsync | **planned** (specified in `overnight/PROTOCOL.md`, the server side is not written) |
-| Custom blocks, items, entities, registries | **planned** |
+| `jester:wind` sender (INIT, UPDATE, TIME_SYNC) | **real** (`src/server/net/jester/windsync.aowl`) |
+| Wind, materials and the structural solver for a mod | **real** (`windAt`, `materialByName`, `materialAt`, `massOf`, `solveRegion`) |
+| Mod sync (`jester-mods.json`, MANIFEST/STATUS, hold the join) | **real** |
+| Body stream and fx: the message encoders and decoders | **real** (`src/server/net/jester/{bodymsg,fxmsg}.aowl`); nothing sends them yet |
+| Bodies as entities, fx sending | **planned** |
+| Custom blocks, items, entities, registries | **planned**, design in `docs/REGISTRIES.md` |
 | Threads and a job system for mods | **planned** |
 
 Where this page and the code disagree, the code is right; `docs/PLUGINS.md` lists the whole plugin API.
@@ -119,28 +122,65 @@ registerEvent(dryOut)
 Per-block events exist as well (`BlockChangeEvent`, `PistonEvent`, `FurnaceSmeltEvent`, ...; see `docs/EVENTS.md`). The block change event is
 busy: the server only offers it while some plugin subscribes.
 
-## 5. A wind-reactive block (planned)
+## 5. A wind-reactive block (real, polling)
 
-The wind field service and the material table are written (`src/physics/`), but no plugin call reads them yet. What a mod will do once it
-does is query the wind at a position and react:
+The server's wind field, the material table and the structural solver are callable from a plugin:
 
 ```nim
-# PLANNED, does not run: there is no windAt in the SDK yet
 proc gust(e: var TickEndEvent) =
   if e.tick mod 20 == 0:
-    let w = windAt(10.0, 70.0, 10.0)       # a vector, blocks per second
+    let w = windAt(10.0, 70.0, 10.0)                  # blocks per second at the overworld's current game time
     if w.speed > 12.0 and blockAt(10, 64, 10) == "minecraft:torch":
-      discard setBlock(10, 64, 10, "minecraft:air")
+      discard setBlock(10, 64, 10, "minecraft:air")   # the storm blows the torch out
 registerEvent(gust)
 ```
 
-Today a plugin can approximate that with its own state and the tick hook; it cannot see the field the physics uses.
+| Call (aowlmony / JavaScript `server.`) | Answers |
+|---|---|
+| `windAt(x, y, z)` | `Wind`: `x, y, z, speed` in blocks/second |
+| `materialByName("stone")`, `materialAt(x, y, z)` | `MaterialInfo`: `known`, `matClass`, `density`, `fill`, `stiffness`, `damping`, `tensile`, `compressive` (MPa), `dragArea`, `breakThreshold`, `flammability`, `ignitability`, `liquid`, `indestructible` |
+| `massOf("stone", volume)` | kilograms of `volume` cubic metres (a full block is 1) |
+| `solveRegion(x, y, z, nx, ny, nz, floorAnchored = true, wind = false)` | `SolveResult`: `ok`, `error`, `maxRatio`, `converged`, `rounds`, `granular`, `caveIns`, `components` and `broken`: a list of `{x, y, z, ratio, kind}` |
+
+`solveRegion` reads the overworld box from its minimum corner (at most 32 768 blocks; unloaded chunks count as air), runs the solver of `src/physics/solver.aowl`
+through its adapter, and reports which blocks would fail and how (`bending`, `shear`, `crush`, `tension`, `hang`, `unsupported`). With `floorAnchored` the bottom
+layer holds the structure up; otherwise only indestructible blocks do. With `wind` the wind field's drag at the cells is added as load. It reports; it does not break
+blocks. The numbers come from the table in `src/physics/materials.aowl`, calibrated in `src/physics/solveradapter.aowl` (its header lists the calibration honestly).
+The call runs on the tick thread: keep regions small or call it rarely.
+
+JavaScript:
+
+```js
+on(TickEndEvent, function (e) {
+  if (e.tick % 100 !== 0) return;
+  var r = server.solveRegion(100, 64, 100, 8, 8, 8, { wind: true });
+  if (r.ok && r.broken.length) server.broadcast(r.broken.length + " blocks would fail, worst ratio " + r.maxRatio.toFixed(2));
+});
+```
 
 ## 6. A custom block (planned)
 
 Registering a new block (state ids, a model for the client, behaviour) needs the registries work: blocks, states, items, entity types, a stable
 per-world id map and synchronisation in the configuration phase. None of that exists, so a plugin can only reuse vanilla blocks. When it
 exists, a custom block will be declared in the plugin and synced to a client that granted `modsync`.
+
+## 6b. Mod sync (real)
+
+A `jester-mods.json` in the server folder lists the client mods the server cares about:
+
+```json
+{ "policy": "advisory",
+  "kick_message": "Install the mods listed on our website.",
+  "mods": [
+    { "id": "aoughwl:wind", "version": "0.9.0", "role": "required", "sha256": "<64 hex digits>", "size": 48213, "url": "" },
+    { "id": "aoughwl:kinetic", "version": "0.3.0", "role": "optional", "sha256": "", "size": 0, "url": "https://example.org/kinetic" } ] }
+```
+
+`policy` is `advisory` (list only) or `enforce` (turn a client away whose `required` mod is missing or does not match). `role` is `required`, `optional` or `server-only`.
+When the file exists and lists mods the server advertises `modsync`. A client that granted it gets the `jester:modsync` MANIFEST in the configuration phase and the join
+waits (up to 15 s) for its STATUS: under `enforce` a missing or mismatched required mod, or no answer in time, ends in a disconnect with `kick_message`; under `advisory`
+the join proceeds. A plugin reads what a client reported with `p.modState(modId)`: 0 ok, 1 missing, 2 hash mismatch, 3 version mismatch, 4 disabled by the player,
+-1 nothing reported. A malformed file is logged and ignored. The file is read at server start. Behaviour depends on the ids you list (data), never on names in code.
 
 ## 7. The scripting console (real, JavaScript)
 

@@ -167,7 +167,7 @@ def capability_handshake(s):
     s.check(wl[0] == 1 and wl[1] == 1, 'welcome format/proto %r' % wl[:2])
     at = 3 + wl[2]
     caps = struct.unpack('>Q', wl[at:at + 8])[0]
-    s.check(caps == 2, 'granted caps %d, wanted wind (2): the plugin advertises only wind' % caps)
+    s.check(caps == 10, 'granted caps %d, wanted wind and modsync (10): the server advertises those' % caps)
     s.check(wl[at + 10:at + 14] == bytes([0x12, 0x34, 0x56, 0x78]), 'the nonce was not echoed')
     s.command('caps')
     s.expect('Jester: wind=true fx=false client=0.9.0', 'the capability report')
@@ -217,6 +217,35 @@ def wind_init(s):
     want = (3.2, 0.0, 0.5, 48.0, 200.0, 0.15, 0.6)
     s.check(all(abs(a - b) < 1e-5 for a, b in zip(floats, want)), 'INIT parameters %r, wanted %r' % (floats, want))
     s.check(init[j + 28] == 0 and len(init) == j + 29, 'INIT flags/length: %r' % init[j + 28:])
+
+
+@scenario('modsync', needs_plugin='showcase')
+def modsync(s):
+    """With a jester-mods.json the welcome announces modsync, the manifest arrives in the configuration phase, the join was held for the
+    STATUS and the server recorded it (the plugin reports it back)."""
+    s.require_plugin()
+    welcome = s.config_payloads('jester:welcome')
+    s.check(len(welcome) == 1, 'no welcome')
+    wl = welcome[0]
+    at = 3 + wl[2]
+    s.check(wl[at + 9] & 2, 'welcome flags %d: bit1 (modsync follows) is not set' % wl[at + 9])
+    manifest = s.config_payloads('jester:modsync')
+    s.check(len(manifest) == 1 and manifest[0][0] == 1, 'no MANIFEST in the configuration phase')
+    s.check(manifest[0][1] == 0, 'the scenario manifest is advisory, got policy %d' % manifest[0][1])
+    s.command('modstate test:present')
+    s.expect('Mod test:present: state 0', 'the reported state of the installed mod')
+    s.command('modstate test:absent')
+    s.expect('Mod test:absent: state 1', 'the reported state of the missing mod')
+    s.command('modstate test:nothing')
+    s.expect('Mod test:nothing: state -1', 'a mod nobody asked about')
+
+
+@scenario('physics_api', needs_plugin='showcase')
+def physics_api(s):
+    """A plugin reaches the material table, the wind field and the structural solver."""
+    s.require_plugin()
+    s.command('physics')
+    s.expect('Physics: stone known=true dense=true air=true massOfStone=true windOk=true solveOk=true broken=0', 'the physics API answers', 30.0)
 
 
 def run(m, c, st, w, biomes, ctx, args):
